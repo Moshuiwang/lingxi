@@ -721,6 +721,26 @@ class MainGateTests(unittest.TestCase):
             )
         return code, err.getvalue()
 
+    def test_an_abbreviated_flag_is_rejected_with_zero_side_effects(self) -> None:
+        """rc25 修复包 F5：``allow_abbrev=False``——``--ap`` 不得被解析成
+        ``--apply``（与 scripts/ops/preprovision.py 同一条纪律：手滑半个词不能
+        等于授权真实写入）。缩写被拒必须退出码非 0 且零写入。"""
+
+        out, err = io.StringIO(), io.StringIO()
+        with redirect_stdout(out), redirect_stderr(err):
+            with self.assertRaises(SystemExit) as caught:
+                TOOL.main(
+                    [
+                        str(self._write(self.GOOD_CSV)),
+                        "--initiated-by", self.ADMIN_OPEN_ID,
+                        "--dsn", "postgresql://unused/unused",
+                        "--ap",
+                    ]
+                )
+
+        self.assertNotEqual(caught.exception.code, 0)
+        self.assertEqual(self.applied, [], "缩写被拒＝零写入")
+
     # ---- P-2：值不干净 → 整份拒绝、退出码非 0、零写入 ----------------------
 
     def test_a_wildcard_metric_value_is_rejected_before_any_write(self) -> None:

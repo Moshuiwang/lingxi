@@ -527,7 +527,10 @@ _CLI_DESCRIPTION = (
 
 
 def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description=_CLI_DESCRIPTION)
+    # allow_abbrev=False（rc25 修复包 F5）：argparse 默认接受前缀缩写，`--a` 会被
+    # 解析成 `--apply`——对一个"传了就真写库"的开关，手滑半个词不能等于授权执行。
+    # 本项目历史上被外部审查抓到过 `--e` 缩写即触发真实执行的同型缺陷。
+    parser = argparse.ArgumentParser(description=_CLI_DESCRIPTION, allow_abbrev=False)
     parser.add_argument("roster", type=Path, help="名单 CSV，三列 email/position/company_scope")
     parser.add_argument(
         "--initiated-by",

@@ -366,6 +366,21 @@ class CommandLineWritePolarityTest(unittest.TestCase):
         "c@d.com,A国家财务总监,1012\n"
     )
 
+    def test_an_abbreviated_flag_is_rejected_with_zero_side_effects(self) -> None:
+        """rc25 修复包 F5：argparse 前缀缩写关闭（``allow_abbrev=False``）。``--a``
+        不得被解析成 ``--apply``——对一个"传了就真写库"的开关，手滑半个词不能等于
+        授权执行（本项目历史上被外部审查抓到过 ``--e`` 缩写即触发真实执行的同型
+        缺陷）。缩写被拒必须：退出码非 0、开通入口一次都不调用、装配一次都不发生。"""
+
+        out, err = io.StringIO(), io.StringIO()
+        with redirect_stdout(out), redirect_stderr(err):
+            with self.assertRaises(SystemExit) as caught:
+                TOOL.main(self._argv(self.ROSTER) + ["--a"])
+
+        self.assertNotEqual(caught.exception.code, 0)
+        self.assertEqual(self.started, [], "缩写被拒＝零副作用：开通入口一次都不调用")
+        self.assertEqual(self.shutdowns, [], "解析都没通过，不应发生任何真实装配")
+
     def test_the_default_run_only_prints_the_plan_and_writes_nothing(self) -> None:
         code, out, _ = self._run(self._argv(self.ROSTER))
         self.assertEqual(code, 0)
