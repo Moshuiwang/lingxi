@@ -111,18 +111,22 @@ class GatewayConfig:
     # 进程需要判断同一份开关，两处读同一个变量名，同 `bot_open_id`/
     # `innertest_roster_open_ids` 不套前缀的理由一致）。默认 `True`（开，
     # Issue #467 执行 PM 裁定：docx 转换已通过 rc21 stage 探针验证，不再需要
-    # 运维每次显式开启）：``apps/gateway/document_delivery.py`` 的
-    # ``_process_docx_claim`` 与 ``adapters/feishu_docx_delivery.py::
-    # LarkDocxDelivery.write_body`` 在这个值为 `True` 时走官方转换路径。显式
-    # 关闭用精确值 `"0"`；历史值 `"1"`（翻转前唯一的开启值，已经写进现网 stage
-    # 配置）**必须继续解析成开启**，翻转默认值不得让这些既有配置的语义漂移。
-    # 打开前提：Bot 权限含 ``docx:document.block:convert``。失败语义（Issue
-    # #499，产品负责人 2026-08-31 裁定）：正文含本仓库不支持的嵌套结构
-    # （``unsupported_nested_blocks``，典型是 markdown 表格）时**降级交付**
-    # ——改走纯文本段落路径写入并如实告知用户格式已简化，不是整次失败；其余
-    # 一切失败仍然一律交付失败/结果不明（失败关闭），**不降级、不静默退回段落
-    # 路径**。见 ``deploy/.env.example`` 对应条目与 ``LarkDocxDelivery.
-    # write_body`` 模块文档「markdown 官方转换开关」一节。
+    # 运维每次显式开启）。**Trace #544 S-7c 换了它管的是哪条路，没有换它本身**：
+    # 现在 `True` ＝ ``apps/gateway/document_delivery.py`` 的
+    # ``_create_docx_body`` 走 ``adapters/feishu_docx_delivery.py::
+    # LarkDocxDelivery.create_document_with_markdown``（服务端 ``docs_ai`` 一次
+    # 建档写全文），`False` ＝ 两步纯文本段落路径。显式关闭用精确值 `"0"`；
+    # 历史值 `"1"`（翻转前唯一的开启值，已经写进现网 stage 配置）**必须继续
+    # 解析成开启**，翻转默认值不得让这些既有配置的语义漂移。
+    # **它保留的理由是止损**：``docs_ai`` 在飞书开放平台没有公开文档页，限流与
+    # 长度上限官方无契约——留一个不改代码、不重新构建镜像就能退回纯段落路径的
+    # 闸门，代价只是一个已经存在的配置项。打开前提**不再包含**
+    # ``docx:document.block:convert``（convert 端点已不再被调用；一次建档用
+    # ``tenant_access_token`` 即可，stage 探针实测无需新增 scope）。失败语义
+    # （Issue #499 裁定，rc25 沿用）：判定为降级时**降级交付**——如实告知用户
+    # 格式已简化，不是整次失败；其余一切失败仍然一律交付失败/结果不明（失败
+    # 关闭），**不静默退回段落路径**。见 ``deploy/.env.example`` 对应条目与
+    # ``feishu_docx_delivery`` 模块文档「服务端一次建档写全文」一节。
     markdown_convert_enabled: bool = True
 
     # 群聊@机器人固定引导（Issue #318，#328 v1.0 裁定 #5）：机器人自身 open_id，

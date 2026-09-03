@@ -15,29 +15,28 @@ https://github.com/Moshuiwang/lingxi/issues/538) 2026-09-03 第三节）。
 
 正文怎么写进飞书，本仓库前后有过两条路：客户端 ``blocks/convert`` ＋
 ``children``/``descendant`` 写块，和服务端 ``docs_ai/v1/documents`` 一次建档
-写全文。**换路不该让样本跟着搬家**，所以本模块分成互不依赖的两层：
+写全文。**换路不该让样本跟着搬家**：本模块的全部内容都**与写入路径无关**——谁来
+交付这段 markdown 都要回答同样的问题：十八种形态在不在、块类型直方图对不对、这
+几段文字有没有被改写。stage 真实回读与本地用例用的是同一份。
 
-- :data:`COMPREHENSIVE_MARKDOWN`、:data:`COMPREHENSIVE_BLOCK_TYPE_HISTOGRAM`、
-  :data:`COMPREHENSIVE_MARKDOWN_SHAPES`、:data:`COMPREHENSIVE_VERBATIM_TEXTS`
-  ——**与路径无关**。谁来交付这段 markdown 都要回答同样的问题：十种形态在不在、
-  块类型直方图对不对、这几段文字有没有被改写。stage 真实回读与本地用例用的是
-  同一份。
-- :func:`comprehensive_convert_response` ——**只服务客户端 convert 那条路**，
-  是 ``blocks/convert`` 响应形状的夹具。换路之后可以整块删掉，上面四项不受影响。
+（原本另有一层 ``comprehensive_convert_response()`` 与
+``COMPREHENSIVE_FIRST_LEVEL_BLOCK_IDS``，只服务客户端 convert 那条路。Trace #544
+S-7c 换成服务端一次建档之后它们失去了全部调用方，按当初的设计整块删除，本模块
+其余部分未受影响——这正是当初分层的目的。）
 
-## 如实标注的证据边界
+## 证据边界
 
 :data:`COMPREHENSIVE_MARKDOWN` 本身只是一段 markdown，没有任何未验证的断言。
-:data:`COMPREHENSIVE_BLOCK_TYPE_HISTOGRAM` 与 :func:`comprehensive_convert_response`
-里的块类型取自飞书 docx 公开的 ``block_type`` 表，嵌套关系按 Issue #538 受控探针
-实测的**表格**形状类推——**表格之外的形态没有真实 convert 响应做过对照**。这两项
-钉住的是本仓库自己的装配与预期，不是"飞书真的会这样返回"。真实形状必须由 stage
-真实回读回答；本模块不发起任何真实调用。
+
+:data:`COMPREHENSIVE_BLOCK_TYPE_HISTOGRAM` **已由 2026-09-03 stage 受控探针
+实测坐实**（Trace #544 P-docs_ai 探针二，Bot-Test 真实调用，受控文档用后删除
+并回读确认）：这份样本经服务端一次建档后回读 45 个块 ＝ 1 个 page 根块 ＋ 本表
+登记的 44 个，**十二种块类型逐项相符、一个不多一个不少**，负号 ``-12.85%``、
+区间 ``3-5%``、单元格内竖线 ``a | b`` 在真实块内容里逐字保真。因此这张表不再
+只是"本仓库自己的预期"，而是一份有真实回读做对照的基线（证据等级 6）。
 """
 
 from __future__ import annotations
-
-from typing import Any
 
 #: 综合样本正文（stage 复验与本地用例共用**同一份**）。
 #:
@@ -155,232 +154,3 @@ COMPREHENSIVE_TABLE_ROWS: tuple[tuple[str, ...], ...] = (
     ("A 公司", "-12.85%", "3-5%", "旧口径 A | B"),
     ("B 公司", "+4.20%", "6-8%", "无"),
 )
-
-#: 综合样本的一级块 ``block_id``，按**文档顺序**（不是 ``blocks`` 数组的物理
-#: 顺序——Issue #442 实测两者不同）。只服务客户端 convert 那条路。
-COMPREHENSIVE_FIRST_LEVEL_BLOCK_IDS: tuple[str, ...] = (
-    "blk-h1",
-    "blk-h2",
-    "blk-h3",
-    "blk-para",
-    "blk-ul-1",
-    "blk-ul-2",
-    "blk-ol-1",
-    "blk-ol-2",
-    "blk-quote",
-    "blk-code",
-    "blk-todo-1",
-    "blk-todo-2",
-    "blk-table",
-    "blk-divider",
-    "blk-tail",
-)
-
-
-def _elements(*runs: object) -> list[dict[str, Any]]:
-    """把 ``文字`` 或 ``(文字, 样式)`` 组装成 convert 响应里的 ``elements`` 数组。"""
-
-    elements: list[dict[str, Any]] = []
-    for run in runs:
-        content, style = run if isinstance(run, tuple) else (run, None)
-        text_run: dict[str, Any] = {"content": content}
-        if style is not None:
-            text_run["text_element_style"] = style
-        elements.append({"text_run": text_run})
-    return elements
-
-
-def comprehensive_convert_response() -> dict[str, Any]:
-    """:data:`COMPREHENSIVE_MARKDOWN` 在 ``blocks/convert`` 端点的响应夹具。
-
-    **只服务客户端 convert 那条路**（``POST /docx/v1/documents/blocks/convert``
-    ＋ ``children``/``descendant`` 写块）；服务端一次建档那条路用不到它，换路
-    之后可以整块删除，本模块其余部分不受影响。
-
-    形状按 Issue #442／#538 的实测口径造：块的物理顺序**不等于**文档顺序（真实
-    顺序由 ``first_level_block_ids`` 给出）、父块用 ``children`` 指向子块的临时
-    ``block_id``、子块不出现在 ``first_level_block_ids`` 里、每个块带恒为空串的
-    ``parent_id``、表格带服务端计算的 ``table.cells`` 与 ``table.property.
-    merge_info``（后者带上就会被 ``descendant`` 端点以 ``1770001`` 整体拒绝）。
-
-    **如实标注**：表格之外的形态没有真实 convert 响应做过对照，见模块文档
-    「如实标注的证据边界」。
-    """
-
-    blocks: list[dict[str, Any]] = [
-        {
-            "block_id": "blk-h1",
-            "parent_id": "",
-            "block_type": 3,
-            "heading1": {"elements": _elements("2026 年 8 月经营简报")},
-        },
-        {
-            "block_id": "blk-h2",
-            "parent_id": "",
-            "block_type": 4,
-            "heading2": {"elements": _elements("整体表现")},
-        },
-        {
-            "block_id": "blk-h3",
-            "parent_id": "",
-            "block_type": 5,
-            "heading3": {"elements": _elements("关键指标")},
-        },
-        {
-            "block_id": "blk-para",
-            "parent_id": "",
-            "block_type": 2,
-            "text": {
-                "elements": _elements(
-                    ("结论", {"bold": True}),
-                    "：整体营收环比 -12.85%，毛利率维持在 3-5% 区间，口径见 ",
-                    ("指标说明", {"link": {"url": "https://example.invalid/metrics"}}),
-                    "。",
-                )
-            },
-        },
-        {
-            "block_id": "blk-ul-1",
-            "parent_id": "",
-            "block_type": 12,
-            "children": ["blk-ul-1-1", "blk-ul-1-2"],
-            "bullet": {"elements": _elements("华东大区")},
-        },
-        {
-            "block_id": "blk-ul-1-1",
-            "parent_id": "",
-            "block_type": 12,
-            "bullet": {"elements": _elements("上海")},
-        },
-        {
-            "block_id": "blk-ul-1-2",
-            "parent_id": "",
-            "block_type": 12,
-            "bullet": {"elements": _elements("杭州")},
-        },
-        {
-            "block_id": "blk-ul-2",
-            "parent_id": "",
-            "block_type": 12,
-            "bullet": {"elements": _elements("华南大区")},
-        },
-        {
-            "block_id": "blk-ol-1",
-            "parent_id": "",
-            "block_type": 13,
-            "children": ["blk-ol-1-1", "blk-ol-1-2"],
-            "ordered": {"elements": _elements("先看营收")},
-        },
-        {
-            "block_id": "blk-ol-1-1",
-            "parent_id": "",
-            "block_type": 13,
-            "ordered": {"elements": _elements("拆到公司")},
-        },
-        {
-            "block_id": "blk-ol-1-2",
-            "parent_id": "",
-            "block_type": 13,
-            "ordered": {"elements": _elements("拆到月份")},
-        },
-        {
-            "block_id": "blk-ol-2",
-            "parent_id": "",
-            "block_type": 13,
-            "ordered": {"elements": _elements("再看毛利")},
-        },
-        {
-            "block_id": "blk-quote",
-            "parent_id": "",
-            "block_type": 34,
-            "children": ["blk-quote-text"],
-            "quote_container": {},
-        },
-        {
-            "block_id": "blk-quote-text",
-            "parent_id": "",
-            "block_type": 2,
-            "text": {"elements": _elements("口径以花名册与正式表为准，历史数据不回溯修正。")},
-        },
-        {
-            "block_id": "blk-code",
-            "parent_id": "",
-            "block_type": 14,
-            "code": {
-                "elements": _elements(
-                    "SELECT company, revenue FROM monthly_revenue WHERE month = '2026-08';"
-                ),
-                "style": {"language": 30, "wrap": False},
-            },
-        },
-        {
-            "block_id": "blk-todo-1",
-            "parent_id": "",
-            "block_type": 17,
-            "todo": {"elements": _elements("核对 8 月毛利口径"), "style": {"done": False}},
-        },
-        {
-            "block_id": "blk-todo-2",
-            "parent_id": "",
-            "block_type": 17,
-            "todo": {"elements": _elements("已导出 7 月对照表"), "style": {"done": True}},
-        },
-    ]
-
-    cell_ids = [f"cell-{row}-{column}" for row in range(3) for column in range(4)]
-    blocks.append(
-        {
-            "block_id": "blk-table",
-            "parent_id": "",
-            "block_type": 31,
-            "children": list(cell_ids),
-            "table": {
-                # 服务端计算、与 children 完全重复的只读键。
-                "cells": list(cell_ids),
-                "property": {
-                    "row_size": 3,
-                    "column_size": 4,
-                    "column_width": [180, 120, 140, 200],
-                    # 带着它调 descendant 端点会被 1770001 整体拒绝（探针实测）。
-                    "merge_info": [{"col_span": 1, "row_span": 1}] * len(cell_ids),
-                },
-            },
-        }
-    )
-    for index, cell_id in enumerate(cell_ids):
-        blocks.append(
-            {
-                "block_id": cell_id,
-                "parent_id": "",
-                "block_type": 32,
-                "children": [f"{cell_id}-text"],
-                "table_cell": {},
-            }
-        )
-        blocks.append(
-            {
-                "block_id": f"{cell_id}-text",
-                "parent_id": "",
-                "block_type": 2,
-                "text": {
-                    "elements": _elements(COMPREHENSIVE_TABLE_ROWS[index // 4][index % 4])
-                },
-            }
-        )
-    blocks.append({"block_id": "blk-divider", "parent_id": "", "block_type": 22, "divider": {}})
-    blocks.append(
-        {
-            "block_id": "blk-tail",
-            "parent_id": "",
-            "block_type": 2,
-            "text": {"elements": _elements("以上口径与正式表一致。")},
-        }
-    )
-    return {
-        "code": 0,
-        "data": {
-            "blocks": blocks,
-            "first_level_block_ids": list(COMPREHENSIVE_FIRST_LEVEL_BLOCK_IDS),
-            "block_id_to_image_urls": {},
-        },
-    }
