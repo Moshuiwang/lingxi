@@ -471,3 +471,60 @@ class SyntheticPendingActionTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class PreprovisionGrantSeamTests(unittest.TestCase):
+    """预授权落库口的**接缝**：调用方与实现方的关键字必须逐字一致。
+
+    这条用例存在的理由是一次真实的接缝缺陷：S-8a（调用方）写 ``grant=``、S-8b
+    （实现方）写 ``plan=``，两边各自的测试都绿——因为调用方测的是假的 importer、
+    实现方测的是直接调自己。真实链路第一次跑到这里才会 ``TypeError``，而那时
+    已经在 stage 或生产。**与 rc25 S-1「装了存量令牌源、没装差集导入口」是同一
+    形状**：装配缝隙不会被任何一侧的单元测试照到，只能由一条专门盯缝的用例守住。
+
+    这里刻意用签名比对而不是「跑一次真链路」：真链路要真库、要装配、要凭据，
+    成本高且容易被跳过；签名比对零依赖、必然执行，而它挡住的正是这次真实发生
+    的那个错法。
+    """
+
+    def _keyword_names(self, function: object) -> tuple[str, ...]:
+        import inspect
+
+        return tuple(
+            name
+            for name, parameter in inspect.signature(function).parameters.items()
+            if parameter.kind is inspect.Parameter.KEYWORD_ONLY
+        )
+
+    def test_the_real_store_and_the_chain_protocol_declare_the_same_keywords(self) -> None:
+        from lingxi.adapters.postgres_local_permission import (
+            PostgresLocalPermissionOverrideStore,
+        )
+        from lingxi.core.identity.preprovision import PositionGrantImporter
+
+        self.assertEqual(
+            self._keyword_names(PostgresLocalPermissionOverrideStore.import_position_grant),
+            self._keyword_names(PositionGrantImporter.import_position_grant),
+            "预授权落库口两侧的关键字漂移了：调用方按 Protocol 传参，实现方对不上就是运行时 TypeError，"
+            "而两侧各自的单元测试都照不到。改任一侧都要同时改另一侧。",
+        )
+
+    def test_the_real_store_binds_the_kwargs_the_chain_actually_passes(self) -> None:
+        import inspect
+
+        from lingxi.adapters.postgres_local_permission import (
+            PostgresLocalPermissionOverrideStore,
+        )
+
+        signature = inspect.signature(
+            PostgresLocalPermissionOverrideStore.import_position_grant
+        )
+        # 这五个关键字逐字抄自真实调用点 core/identity/preprovision.py::import_preprovision_grant。
+        signature.bind(
+            object(),
+            user_id="usr_seam",
+            target_open_id="ou_seam",
+            grant=object(),
+            now=object(),
+            initiated_by_open_id="ou_admin",
+        )

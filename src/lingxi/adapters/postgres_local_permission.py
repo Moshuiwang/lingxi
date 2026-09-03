@@ -636,7 +636,7 @@ class PostgresLocalPermissionOverrideStore:
         *,
         user_id: str,
         target_open_id: str,
-        plan: PositionGrantPlan,
+        grant: PositionGrantPlan,
         now: datetime,
         initiated_by_open_id: str,
     ) -> LegacyImportReport:
@@ -663,14 +663,14 @@ class PostgresLocalPermissionOverrideStore:
         原样上抛、事务整体回滚，调用方按本侧故障失败关闭。
         """
 
-        if not plan.pairs:
+        if not grant.pairs:
             return LegacyImportReport(imported=0, already_present=0)
         with connect(self._dsn, timeouts=self._timeouts) as connection, connection.cursor() as cursor:
             return _apply_position_grant_locked(
                 cursor,
                 user_id=user_id,
                 target_open_id=target_open_id,
-                plan=plan,
+                plan=grant,
                 now=now,
                 initiated_by_open_id=initiated_by_open_id,
             )
