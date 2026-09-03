@@ -157,10 +157,29 @@ grep -n '^LINGXI_DOCX_MARKDOWN_CONVERT' deploy/.env.prod.gateway || echo '未设
 
 ### 2.3 迁移
 
+先完成「三、镜像 digest 固定」的**①显式拉取与②逐份比对**（rc25 起提前到迁移之前），
+全部一致后再跑迁移：
+
 ```bash
 docker compose --env-file deploy/.env.prod \
   -f deploy/compose.yaml -f deploy/compose.prod.yaml \
   --profile job run --rm migrate
+```
+
+**硬规则（rc25 补入）：`run --rm migrate` 退出码非 0 → 当场停止，不得带伤 `up -d`。**
+本批迁移 0085（`app_user` 部分唯一索引）、0086（`publish_outbox` 两个可空列＋回填）、
+0087（`app_user` 三个可空列）**全部是加法且可重跑**：`migrations/alembic/env.py` 的
+`transaction_per_migration=True` 让任一条失败只回滚该条、版本停在前一条，**失败不需要
+downgrade**，处置完原因后重跑原命令即可。已知失败形态：0085 撞上重复邮箱时
+`CREATE UNIQUE INDEX` 报错、版本停在 0084——按迁移文件与 `migrations/README.md` 的
+说明处置重复数据后重跑，**不得改成非唯一索引绕过**。
+
+```bash
+# 迁移后回读版本头：migrate 前应为 0084_management_card_state_cas (head)，
+# 之后必须是 0087_preprovision_seams (head)，不符不得起服务
+docker compose --env-file deploy/.env.prod \
+  -f deploy/compose.yaml -f deploy/compose.prod.yaml \
+  --profile job run --rm migrate current
 ```
 
 ### 2.3.5 起服务前的两道前置（对抗审查 R6-D7 补入）
@@ -179,6 +198,26 @@ docker compose --env-file deploy/.env.prod \
 
 - **`runtime-config` 卷内容自带**（详见 11.2）：`system_prompt.md` 到位并设 `LINGXI_WORKER_SYSTEM_PROMPT_FILE`。**没有安全的「留空」选项**——文件缺失时 worker 静默降级为无提示词执行，三服务照样全 `healthy`、观察期照样全绿，只有答案质量与验证过的不是一回事；
 - **首次授权走通**（详见 11.5）：`reauthorize` 完成、专用授权凭据落到凭据卷。凭据不到位时 scheduler 起来也同步不了花名册，首批用户一个都开不通。
+
+### 2.3.6 升级窗口注意事项（rc25 补入：挑静默窗口，先查在途）
+
+**① 重启/替换 gateway 之前先确认没有在途任务与在途文档交付。** 只读计数（DSN 从
+`/home/bi-ai-deploy/.config/lingxi/supabase-prod.env` 加载进环境变量后引用，值不回显、
+不粘贴进命令行参数或聊天记录）：
+
+```bash
+psql "$LINGXI_POSTGRES_DSN" -Atc "SELECT (SELECT count(*) FROM task WHERE status='running'), (SELECT count(*) FROM task WHERE status='awaiting_delivery'), (SELECT count(*) FROM task_document_delivery_request WHERE status='processing');"
+```
+
+期望 `0|0|0`；任一项非零就等一轮再查（在途文档投递的认领回收周期为 180 秒量级），
+非零不 `up -d`。
+
+**② 在途 docs_ai 建档若仍被重启打断：不需要任何处置动作，但绝不重试建档。** 一次建档
+请求已发出、响应没等到时，飞书服务端可能已经把整篇文档建了出来；重启后该投递行由
+180 秒回收机制退回队列自行续投，**用户仍只收到一份文档、不会重复交付**。代价是机器人
+云空间可能多出一篇**带全文**的孤儿文档（从未授权给任何人、不在九十天擦除范围）——这是
+**留存面的运维卫生**，不是用户可见故障：不要人工重试建档，不要为找回孤儿去翻机器人
+云空间，如实登记发生过一次打断即可。规避办法就是 ①：挑静默窗口执行整个升级。
 
 ### 2.4 起服务（`--profile mvp`）
 
@@ -252,14 +291,29 @@ LINGXI_WORKER_IMAGE_DIGEST=@sha256:<worker 镜像本批次 digest>
 LINGXI_MIGRATE_IMAGE_DIGEST=@sha256:<migrate 镜像本批次 digest>
 ```
 
-**部署时核对**：逐份镜像执行
+**部署时核对（2026-09-03 修订，rc25 审核③：核对从事后判据提前为事前闸）**：此前这一步
+只能在 `up -d` 之后做——镜像到起服务才被拉下来，「digest 不符不得判成功」因此只能事后
+判。现改为**「①显式拉取 → ②逐份比对 → 才 migrate / up -d」**，顺序不得颠倒；11.3
+第 2 条记录的首发临时办法（用 `config` 看渲染引用）不再需要。
 
 ```bash
+# ① 显式拉取本批全部镜像（job + mvp 两个 profile 一起给即覆盖四份镜像；
+#    .env.prod 已写四个 digest 变量时拉的就是钉住的 digest，值写错会当场报错）
+docker compose --env-file deploy/.env.prod \
+  -f deploy/compose.yaml -f deploy/compose.prod.yaml \
+  --profile job --profile mvp pull
+
+# ② 逐份镜像回读 digest（scheduler / gateway / worker / migrate 同构，各一次）
 docker image inspect --format='{{index .RepoDigests 0}}' \
-  ghcr.io/moshuiwang/lingxi-scheduler:<本批 tag>   # gateway / worker / migrate 同构，各一次
+  ghcr.io/moshuiwang/lingxi-scheduler:<本批 tag>
 ```
 
-输出形如 `ghcr.io/moshuiwang/lingxi-scheduler@sha256:…`，取 `@` 之后的部分与上面四个变量固定的值逐字比对。不一致说明本机存在同 tag 不同 digest 的缓存污染，必须先 `docker image prune` 或显式 `docker pull` 该 digest 后重新 `up -d`，不得在 digest 不匹配的状态下继续判定部署成功。
+② 的输出形如 `ghcr.io/moshuiwang/lingxi-scheduler@sha256:<64 位十六进制>`：从 `@` 起
+（含 `@sha256:` 前缀）与 `.env.prod` 里对应的 `LINGXI_<服务组>_IMAGE_DIGEST` 值**逐字
+相同**才算通过。① 失败或 ② 任一份不一致 → **停止，不得进入 §2.3 迁移与 §2.4 起服务**；
+不一致说明本机存在同 tag 不同 digest 的缓存污染，先 `docker image prune` 或显式
+`docker pull` 该 digest，重新走 ①②，四份全部一致后才继续。tag→digest 的解析（往
+`.env.prod` 写四行时用）仍按上文「把 tag 解析为 digest」二选一执行。
 
 > **为什么不用 `docker compose … images`**（2026-09-02 首发实测，实录见 11.3 第 2 条）：那条命令列的是**本项目当前存在的容器**，`migrate` 这类 `--profile job run --rm` 的一次性作业跑完不留容器，输出为空，`migrate` 这一步因此核不到任何东西。`docker image inspect` 读的是本机镜像元数据，不依赖容器是否存在，`up -d` 前后都能用。
 
@@ -304,6 +358,12 @@ docker image inspect --format='{{index .RepoDigests 0}}' \
 ```
 
 **回滚不触碰数据库与持久卷**：不执行 `down` 移除 volumes，不执行任何迁移降级操作。这一前提成立的条件是迁移遵守「先加后删」——破坏性变更必须拆成两次发布，否则回滚就从「切镜像重启」变成「恢复数据库备份」；该前提由 `V-部署-05`（[验收矩阵「部署与迁移」分册](../docs/技术设计/验收矩阵-部署与迁移.md#三部署与迁移断言)）在每次 CI 上机械核对，2026-08-23 已有 `biai-stage` 真实回滚演练证据（整队切回旧候选、三容器在当前库结构上全部 healthy）。
+
+> **已知边界（rc25 登记，本批不修）**：rc25 这一批（迁移 0085-0087）的回滚安全性是
+> **静态论证**——三条迁移全为加法、旧镜像 `20260902-5500bfb725aa` 不读不写新列与新索引，
+> 据此判定「切回旧 tag 不碰库」成立；**未针对本批做真实回滚演练**。且 `V-部署-05` 的
+> CI 实测（`scripts/ci/verify_old_image_new_schema.sh`）用的是运行时**合成**的加列迁移、
+> 不是本批真实的 0085-0087，CI 绿不构成对本批的实测覆盖。
 
 ## 七、观察期
 
