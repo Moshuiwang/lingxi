@@ -278,7 +278,14 @@ class CommandLineWritePolarityTest(unittest.TestCase):
 
         self._patch(TOOL, "resolve_admin_registry_lookup", lambda dsn: object())
         self._patch(TOOL, "initiated_by_is_registered_admin", lambda lookup, open_id: True)
-        self._patch(TOOL, "resolve_start_system", lambda dsn: start_system)
+        # `resolve_start_system` 现在返回 (入口, 收尾) 两个可调用：收尾必须被调用一次
+        # ——真实装配里 `build_loop` 已经 start() 了开通执行器的线程池（谁建谁清）。
+        self.shutdowns: list[int] = []
+        self._patch(
+            TOOL,
+            "resolve_start_system",
+            lambda dsn: (start_system, lambda: self.shutdowns.append(1)),
+        )
 
     def _patch(self, module: Any, name: str, value: Any) -> None:
         original = getattr(module, name)
@@ -352,6 +359,7 @@ class CommandLineWritePolarityTest(unittest.TestCase):
             {"preprovision_2_0"},
         )
         self.assertIn("成功 2、跳过 0、失败 0", out)
+        self.assertEqual(len(self.shutdowns), 1, "跑完必须停掉并 join 开通执行器线程池")
 
     def test_a_malformed_roster_is_rejected_before_anything_runs(self) -> None:
         """名单写错 → 退出码 2、开通入口一次都没被调用（零写入）。"""
@@ -508,6 +516,35 @@ class PreprovisionGrantSeamTests(unittest.TestCase):
             "预授权落库口两侧的关键字漂移了：调用方按 Protocol 传参，实现方对不上就是运行时 TypeError，"
             "而两侧各自的单元测试都照不到。改任一侧都要同时改另一侧。",
         )
+
+    def test_the_real_start_system_binds_the_kwargs_the_script_actually_passes(self) -> None:
+        """脚本 → 开通链的另一半接缝：``run_preprovision`` 传的五个关键字必须能被
+        ``AutoOnboardingRunner.start_system`` bind。上一条守的是"链 → 落库口"，这条
+        守的是"脚本 → 链"——同一类缺陷（两侧单测都绿、真实链路才 ``TypeError``）在
+        这条边上同样存在：脚本侧测的是假 ``start_system``，链侧测的是自己直接调。"""
+
+        import inspect
+
+        from lingxi.core.identity.onboarding_runner import AutoOnboardingRunner
+
+        signature = inspect.signature(AutoOnboardingRunner.start_system)
+        # 这五个关键字逐字抄自 scripts/ops/preprovision.py::run_preprovision 的调用点。
+        signature.bind(
+            object(),
+            email="a@b.com",
+            trace_id="trace",
+            origin=TOOL.ORIGIN_PREPROVISION,
+            initiated_by_open_id="ou_admin",
+            preprovision_grant=object(),
+        )
+
+    def test_the_scripts_origin_is_the_chains_own_constant(self) -> None:
+        """``origin`` 在链侧是失败关闭判据（不等于它就 ``ValueError``），且决定合成
+        事件标识前缀＝「静默 / 记账」的判据。脚本必须用链的那个常量，不是同值字面量。"""
+
+        from lingxi.core.identity.preprovision import ORIGIN_PREPROVISION
+
+        self.assertIs(TOOL.ORIGIN_PREPROVISION, ORIGIN_PREPROVISION)
 
     def test_the_real_store_binds_the_kwargs_the_chain_actually_passes(self) -> None:
         import inspect

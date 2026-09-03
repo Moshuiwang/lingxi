@@ -7,12 +7,31 @@
         env PYTHONPATH=/app/src python3 -B /app/scripts/ops/preprovision.py \\
         /path/to/roster.csv --initiated-by ou_xxx
 
-这条链要签发/采纳问数令牌（需要 MCP 加密主密钥）、写用户环境 `.mcp.json`（需要用户
-环境卷）、做在职状态实时回读（需要专用授权主体的派生令牌，**该令牌全系统只允许一个
-消费者**）。**这三样只有 `lingxi-scheduler` 进程持有。** 在宿主机上另起一个进程去做
-同样的事，正是仓库明令禁止的「共享外部通道第二消费者」形状——2026-08-08 的真实事故
-里，一个临时进程静默劫持并烧掉了产品负责人的一次性授权码。本脚本不自己检测运行环境
-（容器内外没有可靠且不误伤的判据），这一条靠运行方式保证。
+本脚本按 `SchedulerConfig.from_env()` + `build_loop(...)` **原样重建一遍 scheduler
+启动时那条装配**（见 :func:`resolve_start_system`），因此它要的东西与常驻 scheduler
+一字不差。逐项列清单，不只给结论：
+
+| 需要什么 | 谁提供 | 不在容器内跑会怎样 |
+| --- | --- | --- |
+| `LINGXI_MCP_TOKEN_KEY`（问数令牌加解密主密钥） | scheduler 容器的 secret 注入 | 存量令牌解不开 → `stock_token_decrypt_failed` 整条链失败关闭；新签的令牌用户环境写不出来 |
+| 用户环境卷（写 `<user_env_root>/<user>/.mcp.json`） | scheduler 容器的挂载 | 路径不存在 → 建档之后卡在环境创建，人停在 `provisioning` |
+| 凭据文件 + `LINGXI_CREDENTIAL_KEY`（在职状态实时回读所需的专用主体派生令牌） | scheduler 容器挂的持久凭据路径 | 拿不到在职状态 → 身份定位失败关闭，一个人也开不出来 |
+| `LINGXI_POSTGRES_DSN`、飞书 app_id/secret、管理群 chat_id 等 | scheduler 容器的环境 | `SchedulerConfig.from_env()` 直接 `ValueError`，脚本退出码 2、零写入 |
+| 随包发布的两份映射（角色→职能、公司+职能→指标） | 镜像内的 `lingxi/config/` | 与容器内常驻进程读的是同一份，不会出现"名单按 A 版映射核对、链按 B 版展开" |
+
+**关于「一次性 refresh_token 全系统只允许一个消费者」这条红线**：`docker exec` 起的
+是同一容器内的**第二个进程**，它有自己的 `DerivedAccessTokenHolder`（进程内、重启即
+空），所以在职回读第一次取令牌时会走
+`CredentialRotationLoop.refresh_for_supply()` 真的消费一次续期。这**不是** 2026-08-08
+那个事故形状：那次是两个客户端抢同一条 OAuth Bridge 长连接，后来者静默踢掉先来者；
+而这里的频率上界由 `HostFileDelegatedCredentialVault.claim_due()` 在**凭据文件自己的
+文件锁内**判定，该方法文档写明「进程重启、崩溃重启循环、**同一宿主机上的第二个实例**
+都绕不过它」。**已知代价（如实登记，不是零成本）**：本脚本跑一批可能占用当天续期预算
+里的一次，常驻 scheduler 的日报侧那一次因此可能被推迟到下一个窗口。批量预开通不是
+高频操作，这个代价可接受；但它是真的，不要在文档里说成"没有影响"。
+
+本脚本**不自己检测运行环境**（容器内外没有可靠且不误伤的判据），这一条靠运行方式保证；
+上表里任何一项缺失的表现都是**失败关闭**，不会静默半开。
 
 ## 产品裁定（产品负责人 2026-09-02，Issue #541）
 
@@ -82,18 +101,21 @@ li.si@example.com,A国家财务总监,全部
 
 ## 与开通链的接口
 
-本脚本**不自己跑开通链**：它解析名单、把每一行冻结成一个
-`PositionGrantPlan`，逐人调用开通编排的系统触发入口，然后汇总结果。预授权必须**随链
-落库**（在链内的零银河权限判定与权限发布**之前**），理由与存量差集导入挂在零银河判定
-之前完全相同：名单本身带了新权限的人不该被判成零权限而整批拒绝。因此本脚本期望的入口
-形状是同步执行、返回终态结果：
+本脚本**不自己跑开通链、也不自己 new 一个编排**：它解析名单、把每一行冻结成一个
+`PositionGrantPlan`，逐人调用 `AutoOnboardingRunner.start_system(...)`，然后汇总结果。
+拿到那个编排的**唯一受支持方式**是 `resolve_start_system()` —— 走 scheduler 真实启动
+路径、从 `duty.onboarding_runner` 取句柄，见该函数文档。
 
     start_system(*, email, trace_id, origin="preprovision",
                  initiated_by_open_id: str,
                  preprovision_grant: PositionGrantPlan | None) -> OnboardingResult
 
-`start()` 那种「立刻返回 STARTED、真正的链在线程池里跑」的语义在这里不适用——批量脚本
-必须拿到逐人终态才能出清单。
+- **同步返回终态**（不是 `start()` 那种「立刻返回 STARTED、链在线程池里跑」）：批量
+  脚本必须拿到逐人终态才出得了清单。
+- **预授权随链落库**，落在链内零银河权限判定与权限发布**之前**（与存量差集导入同一
+  挂点）：名单本身带了新权限的人不该被判成零权限而整批拒绝。
+- `origin` 只接受 `"preprovision"`，`initiated_by_open_id` 不接受空白——两条都是链侧
+  的失败关闭判据，本脚本在 CLI 闸就先挡一次，不把明知会被拒的输入送进去。
 """
 
 from __future__ import annotations
@@ -107,6 +129,9 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from lingxi.core.identity.preprovision import (
+    ORIGIN_PREPROVISION as _CHAIN_ORIGIN_PREPROVISION,
+)
 from lingxi.core.permission.account_match import normalize_email
 from lingxi.core.permission.position_override import (
     PREPROVISION_PENDING_ACTION_REASON,
@@ -115,8 +140,12 @@ from lingxi.core.permission.position_override import (
     expand_position_scope,
 )
 
-#: 贯穿审计与通知抑制判据的来源标记；开通链按它分辨这条链不是真实首聊。
-ORIGIN_PREPROVISION = "preprovision"
+#: 贯穿审计与通知抑制判据的来源标记。**从开通链现读，不在脚本里另立一个同值字面量**：
+#: `core/identity/preprovision.run_system_onboarding` 对它是**失败关闭**的（不是
+#: `ORIGIN_PREPROVISION` 就 `ValueError`），而它同时决定合成事件标识的前缀，也就是
+#: 「要不要静默、要不要记账」的判据——两处各写一份字面量，漂移的后果是整批预开通当场
+#: 报错，或更糟：变成一条"不静默但也没有账本"的第三形态。
+ORIGIN_PREPROVISION = _CHAIN_ORIGIN_PREPROVISION
 
 #: 名单 CSV 的表头，必须逐字相等（多一列少一列都算名单写错）。
 ROSTER_COLUMNS = ("email", "position", "company_scope")
@@ -382,17 +411,76 @@ def initiated_by_is_registered_admin(lookup: Any, open_id: str) -> bool:
     return is_authorized_admin(lookup.active_entry(open_id=open_id))
 
 
-def resolve_start_system(dsn: str) -> Callable[..., Any]:
-    """真实装配：拿到开通编排的**系统触发**入口。
+def resolve_start_system(dsn: str) -> tuple[Callable[..., Any], Callable[[], None]]:
+    """真实装配：走 **scheduler 启动时那条一模一样的路径**建出编排，返回
+    ``(start_system, 收尾)``。
 
-    住在 scheduler 的装配层（``apps/scheduler/assembly.py``）——本脚本必须在
-    `lingxi-scheduler` 容器内运行，正是因为这条链的密钥、用户环境卷与在职回读令牌
-    都只有那个进程持有（见模块文档第一节）。
+    **不另写一套简化版装配。** 这里逐行照抄 ``apps/scheduler/__init__.py::main()``
+    的前半段（``SchedulerConfig.from_env()`` → ``build_alerting_duty`` →
+    ``build_loop``），然后从 ``loop.duties`` 里取那个被断言过的公开句柄
+    ``duty.onboarding_runner``（``apps/scheduler/onboarding.py`` 结尾把它挂上去，
+    ``tests/test_scheduler_onboarding_assembly.py::test_a_wired_duty_exposes_the_
+    onboarding_runner_for_the_preprovision_entry`` 钉住）。理由是这条链的**装配
+    不变量**远不止一个 DSN：发布闸与 ``metric_translation_map`` 必须与每日重算共用
+    同一个对象、X-1 同邮箱回读口必填（漏接是构造期 ``TypeError``）、存量令牌源与
+    差集导入口必须成对、内测名单闸、在职回读的令牌供给……自己 ``new`` 一个
+    ``AutoOnboardingRunner``，或者做一个"只吃 dsn"的简化入口，等于在装配层再开一个
+    「参数不全也能起来」的口子，而那正是本批在堵的那类缺口。
+
+    **两处刻意与 main() 不同，都不是简化，是必须**：
+
+    1. **不传 ``heartbeat``。** ``main()`` 传的是 ``_combined_heartbeat(...)``，它会
+       ``touch_liveness("scheduler")`` —— 同容器内 ``python -m lingxi.apps.healthcheck``
+       正是靠这个文件判断常驻主循环还在不在跳。本脚本是 ``docker exec`` 起的第二个
+       进程；让它去戳那个文件，等于在常驻 scheduler 已经死掉时替它伪造心跳。
+    2. **不 ``run_forever()``、不装信号处理。** 只需要编排这一个句柄；其余职责
+       （凭据轮换、清理、重算、发布、快照同步……）**一次都不会 tick**，因为从头到尾
+       没有人调用 ``loop.run_once()``。
+
+    ``build_loop`` 唯一有副作用的一步是 ``_build_onboarding_duty`` 里的
+    ``executor.start()``（开通执行器的线程池）。返回的收尾函数按 ``main()`` 的
+    ``finally`` 同一姿态 ``request_stop()`` + ``join_onboarding_executors(...)``，
+    调用方**必须**在 ``finally`` 里调它——谁建谁清。
+
+    ``dsn`` 只用来核对一件事：``--initiated-by`` 的管理员闸查的那个库，与开通链
+    实际要写的库是不是同一个。不一致就整次运行拒绝——否则会出现"在 A 库确认了责任人、
+    把授权写进 B 库"这种审计上无法解释的组合。
     """
 
-    from lingxi.apps.scheduler.assembly import build_system_onboarding_entry
+    from lingxi.apps.scheduler.alerting_assembly import build_alerting_duty
+    from lingxi.apps.scheduler.assembly import build_loop
+    from lingxi.apps.scheduler.audit import StructuredLogAuditSink
+    from lingxi.apps.scheduler.config import SchedulerConfig
+    from lingxi.apps.scheduler.onboarding import join_onboarding_executors
 
-    return build_system_onboarding_entry(dsn)
+    config = SchedulerConfig.from_env()
+    if str(config.postgres_dsn) != dsn:
+        raise RuntimeError(
+            "--dsn/LINGXI_POSTGRES_DSN 与 scheduler 配置读到的数据库不是同一个："
+            "管理员闸与开通链会落在两个库上，拒绝运行"
+        )
+    alerting_duty = build_alerting_duty(config, audit=StructuredLogAuditSink())
+    loop = build_loop(config, alerting_duty=alerting_duty)
+
+    runners = [
+        runner
+        for duty in loop.duties
+        if (runner := getattr(duty, "onboarding_runner", None)) is not None
+    ]
+    if len(runners) != 1:
+        # 零个＝前置不齐，`_build_onboarding_duty` 整条职责没装配（发布闸没接、
+        # 翻译映射不可用、令牌供给缺失……原因它自己已经留过审计）。多于一个＝装配层
+        # 变了形状，这里不猜该用哪一个。两种都失败关闭，不退回一个半成品编排。
+        raise RuntimeError(
+            f"scheduler 装配里的首次开通编排句柄有 {len(runners)} 个（应为 1）："
+            "前置不齐时整条职责不装配，此时不能预开通任何人"
+        )
+
+    def shutdown() -> None:
+        loop.request_stop()
+        join_onboarding_executors(loop.duties)
+
+    return runners[0].start_system, shutdown
 
 
 # ---------------------------------------------------------------------------
@@ -507,13 +595,24 @@ def main(argv: list[str] | None = None) -> int:
 
     from lingxi.core.ids import new_id
 
-    report = run_preprovision(
-        items,
-        start_system=resolve_start_system(dsn),
-        initiated_by_open_id=initiated_by_open_id,
-        # 追溯号与入站事件那条路径同形（裸 ULID，不带前缀），见 adapters/feishu_events.py。
-        trace_id_factory=lambda: new_id("trc").split("_", 1)[1],
-    )
+    try:
+        start_system, shutdown = resolve_start_system(dsn)
+    except Exception as error:  # noqa: BLE001 - 装配起不来一律 fail-closed
+        print(f"开通编排装配失败，未执行任何一人：{type(error).__name__}: {error}", file=sys.stderr)
+        return 2
+
+    # 谁建谁清：`build_loop` 已经 `start()` 了开通执行器的线程池，无论这一批跑成什么
+    # 样都必须停掉并等它收工（与 `apps/scheduler/__init__.py::main()` 的 finally 同姿态）。
+    try:
+        report = run_preprovision(
+            items,
+            start_system=start_system,
+            initiated_by_open_id=initiated_by_open_id,
+            # 追溯号与入站事件那条路径同形（裸 ULID，不带前缀），见 adapters/feishu_events.py。
+            trace_id_factory=lambda: new_id("trc").split("_", 1)[1],
+        )
+    finally:
+        shutdown()
     print_report(report)
     return 0
 
