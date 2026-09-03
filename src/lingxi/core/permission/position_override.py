@@ -14,6 +14,14 @@ from dataclasses import dataclass
 
 ALL_COMPANIES_SCOPE = "*"
 
+#: 预开通预授权（Issue #541，rc25 S-8b）合成 ``pending_action`` 的 ``reason``。
+#: 与存量差集导入的 ``legacy_import_2_0`` **分开**：审计要一眼分得清「首聊时按旧表
+#: 导入」与「首聊前按名单预授权」，这是两次来源不同、责任人不同的授权。
+PREPROVISION_PENDING_ACTION_REASON = "preprovision_2_0"
+
+#: 预授权落到 ``local_permission_override.reason`` 的展示原因（管理卡会显示它）。
+PREPROVISION_OVERRIDE_REASON = "预开通预授权"
+
 
 @dataclass(frozen=True)
 class PositionPermissionExpansion:
@@ -90,4 +98,52 @@ def expand_position_scope(
     )
 
 
-__all__ = ["ALL_COMPANIES_SCOPE", "PositionPermissionExpansion", "expand_position_scope"]
+@dataclass(frozen=True)
+class PositionGrantPlan:
+    """一笔「职位＋公司范围」预授权的落库计划（Issue #541，rc25 S-8b）。
+
+    :func:`expand_position_scope` 已经把职位与公司范围确定性地展开成公司×指标对；
+    本类型只是把那份展开**冻结**成"要写哪些行、按什么原因写"，随后原样穿过开通链
+    交给落库口（``adapters/postgres_local_permission.import_position_grant``）。
+    冻结的理由与管理卡确认事务一致：展开结果在准备时算一次，落库时不重新解释配置，
+    否则名单核对过的内容与真正写进去的内容之间会多出一个会漂移的解释步骤。
+
+    ``pending_action_reason`` 随计划走而不是写死在落库口里：这条 reason 是审计上
+    "这批授权是哪条路径产生的"的唯一答案，让它跟着计划一起被构造、被断言，比藏在
+    适配器内部更难被无声改掉。
+    """
+
+    position_name: str
+    company_scope: str
+    pairs: tuple[tuple[str, str], ...]
+    pending_action_reason: str = PREPROVISION_PENDING_ACTION_REASON
+    override_reason: str = PREPROVISION_OVERRIDE_REASON
+
+
+def build_preprovision_grant_plan(expansion: PositionPermissionExpansion) -> PositionGrantPlan:
+    """把一次职位范围展开冻结成预开通预授权计划。
+
+    展开为空（映射覆盖不全时 :func:`expand_position_scope` 已经响亮失败，这里只是
+    结构性兜底）一律拒绝：一笔"零行"的预授权写进去会得到一条谁也解释不了的空组。
+    """
+
+    if not expansion.pairs:
+        raise ValueError("职位范围展开为空，不构造预授权计划")
+    return PositionGrantPlan(
+        position_name=expansion.position_name,
+        company_scope=expansion.company_scope,
+        pairs=tuple(expansion.pairs),
+        pending_action_reason=PREPROVISION_PENDING_ACTION_REASON,
+        override_reason=PREPROVISION_OVERRIDE_REASON,
+    )
+
+
+__all__ = [
+    "ALL_COMPANIES_SCOPE",
+    "PREPROVISION_OVERRIDE_REASON",
+    "PREPROVISION_PENDING_ACTION_REASON",
+    "PositionGrantPlan",
+    "PositionPermissionExpansion",
+    "build_preprovision_grant_plan",
+    "expand_position_scope",
+]
