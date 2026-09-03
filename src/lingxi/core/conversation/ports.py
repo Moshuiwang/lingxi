@@ -145,11 +145,19 @@ class OnboardingMessage:
 
 @dataclass(frozen=True)
 class OnboardingResult:
-    """自动匹配/开通编排返回给 gateway 的受控结果。"""
+    """自动匹配/开通编排返回给 gateway 的受控结果。
+
+    ``grant_not_applied``（rc25 修复包 F2，只供批量清单口径）：系统触发（预开通）
+    本轮带着名单预授权、却因为用户**已经 active** 在续行前复核处提前收口时为真——
+    终态仍是 ``completed``（这个人确实开通着，不是失败），但名单答应的那笔授权
+    **没有**落库。ops 清单据此单独归类，不计入"成功预开通"；要不要给已 active
+    用户补上名单权限是产品语义，由产品负责人另行裁定，这里绝不静默扩权。首聊
+    路径（无预授权）恒为 ``False``，gateway 不读它。"""
 
     state: OnboardingState
     messages: tuple[OnboardingMessage, ...] = ()
     failure_reason: str | None = None
+    grant_not_applied: bool = False
 
 
 #: **可重试的不受理原因**：编排根本没有开始跑（或明确让位），因此这条事件的认领必须被

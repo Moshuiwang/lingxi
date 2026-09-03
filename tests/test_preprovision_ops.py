@@ -259,6 +259,45 @@ class PerPersonFailureIsolationTest(unittest.TestCase):
         self.assertEqual((report.provisioned, report.skipped, report.failed), (0, 1, 0))
         self.assertEqual(report.outcomes[0].reason, "email_multiple_personnel")
 
+    def test_an_already_active_user_with_an_unapplied_grant_is_not_a_success(self) -> None:
+        """rc25 修复包 F2：开通链对已 active 的人提前收口（终态 completed 但
+        ``grant_not_applied=True``）时，清单必须单列 ``already_active_grant_not_
+        applied``、不计入成功——把「名单答应的权限没落」报成 provisioned，产品负责人
+        就会拿着一份写着"都办妥了"的清单收工。"""
+
+        items = TOOL.plan_preprovision(
+            (TOOL.RosterRow(email="a@b.com", position_name="A国家总经理", company_scope="1011"),),
+            role_function_map=ROLE_MAP,
+            company_function_metric_map=COMPANY_MAP,
+        )
+
+        class _Result:
+            state = "completed"
+            failure_reason = None
+            grant_not_applied = True
+
+        report = TOOL.run_preprovision(
+            items,
+            start_system=lambda **_: _Result(),
+            initiated_by_open_id="ou_admin",
+            trace_id_factory=lambda: "trace",
+        )
+
+        self.assertEqual(
+            (report.provisioned, report.skipped, report.failed, report.grant_not_applied),
+            (0, 0, 0, 1),
+        )
+        self.assertEqual(
+            report.outcomes[0].outcome, TOOL.OUTCOME_ALREADY_ACTIVE_GRANT_NOT_APPLIED
+        )
+        rendered = io.StringIO()
+        with redirect_stdout(rendered):
+            TOOL.print_report(report)
+        printed = rendered.getvalue()
+        self.assertIn("already_active_grant_not_applied", printed)
+        self.assertIn("成功 0", printed, "不计入 provisioned 成功数")
+        self.assertIn("未应用", printed, "汇总必须醒目提示，不靠人肉逐行看")
+
 
 class CommandLineWritePolarityTest(unittest.TestCase):
     """写入极性：默认只出清单、零写入；`--apply` 才真正执行。"""
