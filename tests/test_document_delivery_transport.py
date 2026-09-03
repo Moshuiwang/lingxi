@@ -1915,6 +1915,13 @@ class DocxOneShotCreateGatewayWiringTest(unittest.TestCase):
         self.assertEqual(len(notifier.sent), 1)
         self.assertIn("格式做了简化", notifier.sent[0][1])
         self.assertEqual(notifier.sent[0][2], "document-ready:tdd-wire-1")
+        # rc25 S-5c：服务端自陈降级走 delivery.document_ready_simplified，
+        # **不得**出现段落路径那条文案里的两句——文档其实仍然带格式（"已按纯文本
+        # 段落交付"是假话），而服务端静默丢块时"内容本身没有删减"可能失实。
+        # 把分派改回单条文案 → 这两句断言变红。
+        self.assertNotIn("内容本身没有删减", notifier.sent[0][1])
+        self.assertNotIn("已按纯文本段落交付", notifier.sent[0][1])
+        self.assertIn("个别不支持的结构可能没有呈现出来", notifier.sent[0][1])
 
     def test_an_over_long_body_degrades_before_the_one_shot_call_and_takes_the_paragraph_path(self) -> None:
         """**长度前置守卫**：正文超过 ``MAX_MARKDOWN_CHARS`` 时**一次建档调用
@@ -1970,6 +1977,10 @@ class DocxOneShotCreateGatewayWiringTest(unittest.TestCase):
         self.assertEqual(events, ["degrade_checkpoint", "write_paragraphs"], "降级检查点必须在写正文之前提交")
         self.assertEqual(store.succeeded, ["tdd-wire-1"])
         self.assertIn("格式做了简化", notifier.sent[0][1])
+        # rc25 S-5c：前置守卫这一路**仍走** delivery.document_ready_degraded——
+        # 它确实是我们主动改走的段落路径，内容一个字没少，那句担保对它成立。
+        # 把两路都改成新文案 → 这条断言变红。
+        self.assertIn("内容本身没有删减", notifier.sent[0][1])
 
     def test_a_gateway_timeout_is_uncertain_and_never_creates_a_second_document(self) -> None:
         """**超时一律不重试建档**：一次建档返回 HTTP 504（响应体带

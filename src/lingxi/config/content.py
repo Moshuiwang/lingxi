@@ -152,6 +152,10 @@ REQUIRED_TEXT_KEYS: tuple[str, ...] = (
     # 文档投递独立消费循环成功后的追加消息（Issue #341 S-ES-3）。
     "delivery.document_ready",
     "delivery.document_ready_degraded",
+    # rc25 S-5c（Trace #544）：服务端自陈降级（server_simplified_body）专用文案，
+    # 不与上一条共用——上一条担保「内容本身没有删减」，那句话在服务端静默丢块时
+    # 可能失实，理由见 content.toml 该键上方注释。
+    "delivery.document_ready_simplified",
     # 文档投递终态失败/结果不明后的追加消息（opus 审查 R-1 第 3 条）：此前只有
     # 成功会追加消息，用户请求生成文档失败后从未收到任何后续消息。
     "delivery.document_failed",

@@ -14,15 +14,24 @@ Create Date: 2026-08-29
 做好、开关默认关"（Issue #408 上一批）到"真正接进生产调用路径"（本批）之间
 缺的最后一块持久化。
 
+**rc25 后记（Trace #544 S-7c，2026-09-03）——本文件头部保留的是当时的事实，
+不改写历史，只声明哪些符号已经不存在**：正文写入机制此后整条换成飞书**服务端
+一次建档**（``POST /open-apis/docs_ai/v1/documents``，把整段 markdown 原文一次
+交给飞书，由服务端建档并排版）。因此本文件里提到的
+``LarkDocxDelivery.write_body``、``MAX_CONVERTED_BLOCKS`` 与客户端
+markdown→blocks 转换这条路径**在当前代码里都已删除**，按名字去仓库里找会找不到
+——这是本条后记存在的唯一理由。**本列本身一个字没变，而且更要紧了**：一次建档吃
+的就是 ``markdown`` 这一列的原文；``markdown IS NULL`` 的历史行仍然无条件走两步
+段落路径，与下文描述逐字一致。
+
 ## 为什么是新增列而不是复用/替换 ``paragraphs``
 
 ``paragraphs``（迁移 0074）继续是两件事的唯一依据，两者都不能被 markdown
 替代：
 
 1. **段落路径的兜底内容**——转换开关关闭、或转换失败关闭（业务错误码/结果
-   不明/超过 :data:`~lingxi.adapters.feishu_docx_delivery.MAX_CONVERTED_BLOCKS`
-   一律失败关闭，见该模块「markdown 官方转换开关」一节，不静默退回段落路径）
-   时，``write_paragraphs`` 仍然只认 ``paragraphs``；
+   不明/超过当时那条 ``MAX_CONVERTED_BLOCKS`` 块数上限一律失败关闭，不静默
+   退回段落路径）时，``write_paragraphs`` 仍然只认 ``paragraphs``；
 2. **检查点幂等判据的既有语义**——``adapters/feishu_docx_delivery.py::
    read_body_children`` 判断"是否已经写过正文"看的是飞书那一侧根 block 的
    子块是否非空，与本地存的是段落还是 markdown 无关，因此新增列不影响这条
