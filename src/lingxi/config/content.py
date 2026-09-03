@@ -41,6 +41,14 @@ class ContentSafetyError(ContentError):
 
 # 这些键构成当前 Story 的登记表。增加一个键必须同时增加调用方与测试，不能让配置
 # 文件悄悄长出没人消费的文案；调整文字本身则只需修改 content.toml。
+#: 预开通用户首聊时补的那一句（Issue #541，产品负责人裁定 4：预开通期间静默）。
+#: 常量定义在这里、消费点在 ``core/conversation/pipeline.py`` 的 ``ACTIVE`` 分支：
+#: 键名是内容目录与代码之间的接缝，放在内容目录这一侧才只有一个真相来源。
+#: **正文与 ``REQUIRED_TEXT_KEYS`` 登记由 rc25 S-8b 落**（``content.toml`` /
+#: ``content.lock.toml`` / 本文件的登记表三处必须同一次改完，内容目录加载期要求键
+#: 集合完全相等）；在那之前消费点按 ``ContentRenderError`` 优雅跳过，见消费点注释。
+KEY_PREPROVISIONED_FIRST_CHAT = "onboarding.preprovisioned_first_chat"
+
 REQUIRED_TEXT_KEYS: tuple[str, ...] = (
     "onboarding.checking",
     "onboarding.matched",

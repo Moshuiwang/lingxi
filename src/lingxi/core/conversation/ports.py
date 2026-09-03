@@ -244,6 +244,16 @@ class GatewayTransaction(Protocol):
         """该话题是否有尚未提示过的「投递已过期」任务；命中即原子标记为已提示
         （Issue #152、`V-投递-06` 后半句）。"""
 
+    def consume_preprovision_notice(self, *, user_id: str) -> bool:
+        """这个人有没有一句"你已经被提前开通了"还没说；命中即原子标记为已提示
+        （Issue #541 预开通，产品负责人裁定 4）。
+
+        与 :meth:`consume_delivery_expired_notice` 同型：查询与标记落在同一条
+        ``UPDATE``，与调用方所在的入站消息事务一起提交或回滚，因此"只提示一次"不依赖
+        任何额外的读锁。**按用户**而不是按话题：预开通是给这个人开的，他第一次说话
+        落在哪个话题上都算首聊。挂起端见
+        ``core/identity/onboarding_ports.UserStateStore.mark_preprovision_notice_pending``。"""
+
     def list_user_memory(self, *, user_id: str) -> list[UserMemoryEntry]:
         """按用户取全部记忆，``/memory list`` 用（Issue #357 S-H3-3）。"""
 

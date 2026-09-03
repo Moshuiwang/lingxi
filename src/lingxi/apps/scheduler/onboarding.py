@@ -98,6 +98,7 @@ from lingxi.adapters.postgres_local_permission import (
     PostgresLocalPermissionOverrideStore,
     local_override_reader,
 )
+from lingxi.core.identity.innertest_roster_gate import build_innertest_roster_gate
 from lingxi.core.permission.mcp_readiness import ReadinessSchedule
 from lingxi.core.permission.metric_translation import metric_translation_available
 
@@ -863,6 +864,11 @@ def _build_onboarding_duty(
             if stock_tokens is not None
             else None
         ),
+        # 预授权落库口（Issue #541 预开通）：与上面那个存量差集导入口是**同一张表、
+        # 同一份适配器**，只是合成 ``pending_action`` 的 ``reason`` 不同（审计要一眼
+        # 分得清"首聊时导入"与"首聊前预授权"）。**无条件装配**：它与存量令牌源无关，
+        # 而系统触发带了预授权却发现它没装时是整链失败关闭，不该由部署配置决定。
+        position_grants=PostgresLocalPermissionOverrideStore(dsn, timeouts=timeouts),
         decisions=PostgresPermissionPublishStore(dsn, timeouts=timeouts),
         readiness=McpReadinessConfirmation(
             probe=guarded_probe,
@@ -893,7 +899,7 @@ def _build_onboarding_duty(
         # 发布行的值列表（#346 坐实的缺陷）。
         metric_translation_map=metric_translation_map,
         # 内测名单闸（Issue #302 S-N-01）：判据与理由见该静态方法与 innertest_roster_gate 模块文档。
-        innertest_roster_gate=AutoOnboardingRunner.build_innertest_roster_gate(config.innertest_roster_open_ids),
+        innertest_roster_gate=build_innertest_roster_gate(config.innertest_roster_open_ids),
         # 每次判定现读一次登记表（只读 `feishu_delegated_subject`，不碰凭据文件、不碰
         # refresh_token）：换主体之后旧值会让新的专用授权账号落回普通员工路径。
         delegated_subject=lambda: registered_delegated_subject_open_id(dsn, timeouts=timeouts),
@@ -959,6 +965,12 @@ def _build_onboarding_duty(
     # 用 `join_onboarding_executors` 接线 stop()/join()——不改 `OnboardingReconciler`
     # 的类定义，见模块文档「停机接线」一节。
     duty.onboarding_executor = executor
+    # 预开通（Issue #541 / rc25 S-8b 的 ops 入口）：把已经装配好的编排挂成一个**公开**
+    # 属性，供「系统触发」的批量入口按名单逐人调用 ``start_system(open_id=…, trace_id=…)``。
+    # 形状照上一行的执行器挂载，不改 ``OnboardingReconciler`` 的类定义；**这是脚本拿到
+    # 编排的唯一受支持方式**——自己 new 一个 ``AutoOnboardingRunner`` 会绕过这里十几个
+    # 装配不变量（发布闸、X-1 回读口、存量令牌源与差集导入口成对、内测名单闸）。
+    duty.onboarding_runner = runner
     logger.info(
         "首次开通编排已装配 线程数=%s 队列深度=%s 认领窗口=%s 就绪节奏=0/%s/%s",
         config.onboarding_workers,

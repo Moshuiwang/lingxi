@@ -165,6 +165,17 @@ class StalledProvisioningPostgresTestCase(unittest.TestCase):
                 ),
             )
 
+    def _start_provisioning_at(self, moment: datetime, *, user_id: str = USER_A) -> None:
+        """写 ``app_user.provisioning_started_at``（迁移 ``0087``）：预开通没有
+        ``inbound_event`` 行时唯一可用的租约起点。真实写入点是
+        ``advance_provisioning_state(to='provisioning')`` 的同一条 UPDATE。"""
+
+        with connect(self._dsn) as connection, connection.cursor() as cursor:
+            cursor.execute(
+                "UPDATE app_user SET provisioning_started_at = %s WHERE id = %s",
+                (moment, user_id),
+            )
+
     def _bump_permission_version(self, user_id: str, version: int) -> None:
         """`mcp_sync_check.permission_version` 必须与 `app_user.permission_version`
         对齐——候选查询的 `NOT EXISTS` 子句按这两列相等联结，版本不对齐会让一条真实
@@ -187,6 +198,11 @@ class StalledProvisioningPostgresTestCase(unittest.TestCase):
                 error_code="budget_exhausted",
             )
         )
+
+    def scalar_count(self, table: str) -> int:
+        with connect(self._dsn) as connection, connection.cursor() as cursor:
+            cursor.execute(f"SELECT count(*) FROM {table}")  # 表名是本文件写死的字面量
+            return int(cursor.fetchone()[0])
 
     def _candidates(self, *, lease_seconds: int = LEASE_SECONDS, limit: int = 50):
         return self.store.stalled_provisioning_candidates(lease_seconds=lease_seconds, limit=limit)
@@ -306,6 +322,77 @@ class CandidateQueryTest(StalledProvisioningPostgresTestCase):
         candidates = self._candidates()
 
         self.assertEqual([c.user_id for c in candidates], [USER_A, USER_B])
+
+
+class PreprovisionedCandidateTest(StalledProvisioningPostgresTestCase):
+    """Issue #541 / rc25 S-8a：**没有任何 ``inbound_event`` 行**的用户也必须被捞到。
+
+    预开通是「系统触发」的开通——名单里的人在与 BI Plus 发生任何对话之前就被开通完，
+    因此 ``inbound_event`` 里一行都没有（刻意不插假事件行）。此前候选查询 INNER 关联
+    ``inbound_event``，这类人**结构上**永远捞不到，会永久停在
+    ``provisioning``/``mcp_syncing``；他一发消息 pipeline 只会照发「正在完成…请稍候」，
+    与 Issue #282 修复前的形状逐字相同。
+
+    只有真库能证伪这一组：`LEFT JOIN LATERAL` 与 `JOIN LATERAL` 的差别、以及"有事件
+    但未认领时**不**退回 ``provisioning_started_at``"这条 P2-5 保持性，都是 SQL 语义
+    本身的属性，在假 store 上无论实现怎么写都是绿的。
+    """
+
+    def test_a_preprovisioned_user_without_any_inbound_event_is_a_candidate(self) -> None:
+        self._set_state(state="provisioning")
+        self._start_provisioning_at(self._expired())
+
+        candidates = self._candidates()
+
+        self.assertEqual([c.user_id for c in candidates], [USER_A])
+        self.assertEqual(self.scalar_count("inbound_event"), 0, "前提：这个人一条入站事件都没有")
+        # 没有真实事件标识可返回，合成成 ``preprovision:<user_id>``——只用作通知去重键
+        # 与审计/落库的追溯号，不回写任何表。
+        self.assertEqual(candidates[0].event_id, f"preprovision:{USER_A}")
+        self.assertEqual(candidates[0].trace_id, f"preprovision:{USER_A}")
+
+    def test_a_preprovisioned_user_still_inside_the_lease_is_never_selected(self) -> None:
+        """**否定断言**：正在跑的预开通链不能被判成僵尸。"""
+
+        self._set_state(state="provisioning")
+        self._start_provisioning_at(datetime.now(timezone.utc) - timedelta(seconds=LEASE_SECONDS - 1))
+
+        self.assertEqual(self._candidates(), ())
+
+    def test_a_user_without_an_event_and_without_a_start_stamp_is_never_selected(self) -> None:
+        """**否定断言**：没有租约起点就没有"超期"这件事——绝不拿 ``updated_at``
+        之类会被无关更新刷新的列兜底，那会让租约永远不到期或永远立即到期。"""
+
+        self._set_state(state="provisioning")
+
+        self.assertEqual(self._candidates(), ())
+
+    def test_an_unclaimed_event_never_falls_back_to_the_start_stamp(self) -> None:
+        """**这一条钉住外部审查 P2-5 修复不被本次改动作废**：最新事件存在但还没被
+        认领时，那个窗口属 ``OnboardingReconciler``；如果这里退回
+        ``provisioning_started_at``，一条正在被对账重新认领的正常链会被误判成停摆。"""
+
+        self._set_state(state="provisioning")
+        self._start_provisioning_at(self._expired())
+        self._dispatch("evt_a", dispatched_at=None)
+
+        self.assertEqual(self._candidates(), ())
+
+    def test_an_existing_event_wins_over_the_start_stamp(self) -> None:
+        """有事件行时租约起点仍然是认领代次，与改动前逐字节一致：这里让两者相反
+        （事件刚认领、开通起点很久以前），断言按事件走 ⇒ 不选中。"""
+
+        self._set_state(state="provisioning")
+        self._start_provisioning_at(self._expired())
+        self._dispatch("evt_a", dispatched_at=datetime.now(timezone.utc))
+
+        self.assertEqual(self._candidates(), ())
+
+    def test_a_disabled_preprovisioned_account_is_still_never_selected(self) -> None:
+        self._set_state(state="provisioning", account_state="suspended")
+        self._start_provisioning_at(self._expired())
+
+        self.assertEqual(self._candidates(), ())
 
 
 class ComplementaryCandidateSetsTest(StalledProvisioningPostgresTestCase):

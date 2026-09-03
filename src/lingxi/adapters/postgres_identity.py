@@ -235,6 +235,38 @@ class PostgresOrgSnapshotStore:
         只是我们暂时看不见，判定必须走终态而不是"定位不到"。
         """
 
+        return self._lookup_by("open_id", open_id, now=now)
+
+    def lookup_by_user_id(self, user_id: str, *, now: datetime | None = None) -> DirectoryLookup:
+        """按飞书 ``user_id``（＝花名册「人员ID」）在最近一轮完成快照里取候选成员。
+
+        **反方向的定位，只有预开通需要**（Issue #541，见
+        :mod:`lingxi.core.identity.preprovision`）。正式首聊路径是
+        ``open_id`` → 成员 → ``user_id`` → 花名册 → 银河，单向；预开通的名单给的是
+        **邮箱**，只能经花名册的 ``personnel_id`` 反查回飞书身份，此前组织快照适配器
+        没有这条查询。
+
+        ``user_id`` 在同一轮快照里**不设唯一约束**（``app_user`` 也不给它建唯一索引，
+        理由见 ``migrations/008_create_app_user.sql``：账号复用换人按 #34 方案 C 留给
+        管理员侧审计）。因此这里可能返回多条候选，调用方必须把"多条"当成失败关闭
+        （:func:`~lingxi.core.identity.preprovision.locate_by_email` 就是这么做的），
+        不许自己挑一条——挑错人在迁移 ``0085`` 的部分唯一索引之后**不可自愈**。
+        """
+
+        return self._lookup_by("user_id", user_id, now=now)
+
+    def _lookup_by(
+        self, column: str, value: str, *, now: datetime | None = None
+    ) -> DirectoryLookup:
+        """两条定位查询共用的实现：取最近一轮完成快照 → 判可用性 → 按一列取成员。
+
+        ``column`` **只接受本类自己写死的两个字面量**（``open_id``/``user_id``），
+        绝不来自外部输入——它被拼进 SQL，参数化占位符不能用在列名上。守卫写在这里
+        而不是靠调用点自觉：多一个调用点就多一次漏判的机会。
+        """
+
+        if column not in ("open_id", "user_id"):
+            raise ValueError("组织快照只支持按 open_id / user_id 定位")
         moment = now or datetime.now(timezone.utc)
         with connect(self._dsn, timeouts=self._timeouts) as connection, connection.cursor() as cursor:
             cursor.execute(
@@ -248,8 +280,8 @@ class PostgresOrgSnapshotStore:
                 """SELECT tenant_key, member_key, open_id, user_id, union_id,
                           display_name, display_name_locale, department_names
                      FROM feishu_org_member_snapshot
-                    WHERE sync_run_id = %s AND open_id = %s""",
-                (run[0], open_id),
+                    WHERE sync_run_id = %s AND {column} = %s""".format(column=column),
+                (run[0], value),
             )
             rows = cursor.fetchall()
         members = tuple(
@@ -485,16 +517,53 @@ class PostgresAppUserStore:
         # 里而不是在 Python 里先读后写——先读后写之间还有一个窗口，而这一步的后果是把
         # 一个已经被停用的人标成"开通完成"。
         guard = " AND account_state = 'enabled'" if to == "active" else ""
+        # 进入分水岭（``provisioning``）的**同一条 UPDATE** 里记下这一次开通尝试的起点
+        # （迁移 ``0087``）：它是停摆兜底在**没有 ``inbound_event`` 行**时唯一可用的租约
+        # 起点（Issue #541 预开通）。写在这里而不是另开一次 UPDATE，是因为"推进到中途格"
+        # 与"这次尝试从什么时候开始算"必须同真同假——两次写入之间崩溃会留下一个进了中途格
+        # 却没有租约起点的人，而那正是本列要消灭的那种永久卡住。**不复用 ``updated_at``**：
+        # 那一列会被任何无关更新刷新，租约永远不到期。
+        stamp = ", provisioning_started_at = now()" if to == "provisioning" else ""
         with connect(self._dsn, timeouts=self._timeouts) as connection, connection.cursor() as cursor:
             cursor.execute(
-                "UPDATE app_user SET provisioning_state = %s, updated_at = now() "
-                "WHERE id = %s AND provisioning_state = ANY(%s)" + guard,
+                "UPDATE app_user SET provisioning_state = %s, updated_at = now()" + stamp
+                + " WHERE id = %s AND provisioning_state = ANY(%s)" + guard,
                 (to, user_id, list(allowed)),
             )
             changed = cursor.rowcount
         if changed:
             logger.info("开通状态推进 user=%s state=%s", user_id, to)
         return bool(changed)
+
+    def mark_preprovision_notice_pending(self, *, open_id: str) -> bool:
+        """挂起「你的 BI Plus 已经开通」这一句，等该用户首聊时再补（Issue #541 预开通）。
+
+        合同见 ``core/identity/onboarding_ports.UserStateStore.mark_preprovision_notice_
+        pending``。两道守卫都写在 ``WHERE`` 里，不在 Python 里先读后写：
+
+        - ``preprovision_notice_armed_at IS NULL``——**只挂起一次**。同一份名单重跑是
+          验收硬条件里的"零变化"，这一条让重跑成为一次 0 行的空写；已经被首聊消费掉的
+          人也不会被重新挂起（``sent_at`` 非空时 ``armed_at`` 必然也非空）。
+        - ``NOT EXISTS (SELECT 1 FROM inbound_event ...)``——这个人名下**一条入站事件都
+          没有**，也就是从来没跟我们说过话。那句解释的全部意义是"你没经历过开通等待，
+          是我们提前替你办好的"；对一个已经在聊的人说它只会莫名其妙。判据放在 SQL 里
+          而不是调用点，是因为调用点（开通链的通知出口）结构上看不到入站事件。
+
+        返回是否真的挂起了（影响行数）。
+        """
+
+        with connect(self._dsn, timeouts=self._timeouts) as connection, connection.cursor() as cursor:
+            cursor.execute(
+                """UPDATE app_user SET preprovision_notice_armed_at = now()
+                    WHERE feishu_open_id = %s
+                      AND preprovision_notice_armed_at IS NULL
+                      AND NOT EXISTS (
+                            SELECT 1 FROM inbound_event WHERE user_open_id = %s
+                          )""",
+                (open_id, open_id),
+            )
+            armed = cursor.rowcount
+        return bool(armed)
 
     def abort_stalled_provisioning(
         self, *, user_id: str, expected_states: Sequence[str], reason: str

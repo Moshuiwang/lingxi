@@ -839,6 +839,19 @@ class ShutdownWiringTests(unittest.TestCase):
         self.assertIsInstance(executor, OnboardingExecutor)
         self.assertTrue(executor.alive, "装配之后执行器必须已经 start() 过")
 
+    def test_a_wired_duty_exposes_the_onboarding_runner_for_the_preprovision_entry(self) -> None:
+        """Issue #541 / rc25 S-8b 的接缝：ops 侧的预开通批量入口只能拿这个句柄跑
+        「系统触发」的开通（``start_system``）。自己 new 一个 ``AutoOnboardingRunner``
+        会绕过本文件其余用例守着的十几个装配不变量（发布闸、X-1 回读口、存量令牌源
+        与差集导入口成对、内测名单闸），因此把它钉成一个被断言过的公开句柄。"""
+
+        duty, _ = build(WIRED_ENV, token=lambda: "u-token")
+        self.addCleanup(join_onboarding_executors, [duty])
+
+        runner = getattr(duty, "onboarding_runner", None)
+        self.assertIsNotNone(runner, "装配必须把编排挂成公开句柄")
+        self.assertTrue(callable(getattr(runner, "start_system", None)))
+
     def test_join_onboarding_executors_stops_and_joins_the_executor(self) -> None:
         """行为级证据（变异锚点）：调用 ``join_onboarding_executors`` 之后，执行器的
         全部工作线程必须真的退出（``alive`` 变 ``False``），且必须已经停止领取新链

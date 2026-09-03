@@ -56,7 +56,9 @@ from datetime import datetime, timezone
 from typing import Any, Callable
 
 from lingxi.config.content import (
+    KEY_PREPROVISIONED_FIRST_CHAT,
     ContentCatalog,
+    ContentRenderError,
     ContentSafetyError,
     RenderedContent,
     default_content_catalog,
@@ -653,6 +655,26 @@ class EventPipeline:
             # 只提示一次，不主动推送、不重放旧答案。
             if tx.consume_delivery_expired_notice(conversation_id=conversation.conversation_id):
                 deferred.append(self._texts.catalog.text("gateway.delivery_expired"))
+
+            # 预开通用户的首聊补一句（Issue #541，产品负责人裁定 4：预开通期间静默）。
+            # 与上面那条过期提示**逐字同一条纪律**：消费一次、只提示一次，且**不影响**
+            # 这条消息接下来按第 6～8 步的正常处理——该入队入队、该判忙碌判忙碌。
+            # 挂起是谁写的、为什么只可能挂给"从没跟我们说过话的人"，见
+            # ``core/identity/onboarding_ports.UserStateStore.mark_preprovision_notice_pending``。
+            if tx.consume_preprovision_notice(user_id=user.user_id):
+                try:
+                    deferred.append(self._texts.catalog.text(KEY_PREPROVISIONED_FIRST_CHAT))
+                except ContentRenderError:
+                    # 文案键还没登记进内容目录。**不能因为一句附加提示打断这个人的问数**
+                    # ——他这条消息的正常处理与这句话无关。生产上走不到这里：内容目录
+                    # 加载期就要求键集合完全相等（``config/content._require_exact_keys``），
+                    # 缺键的构建根本起不来；这条分支覆盖的是内容目录与代码分两次合入的
+                    # 中间态。
+                    self._audit.record(
+                        "onboarding.preprovision_notice_content_missing",
+                        event_id=message.event_id,
+                        trace_id=message.trace_id,
+                    )
 
             # —— 第 6 步：解析命令。在忙碌判定**之前**，因为 /stop 不受忙碌拦截。
             command = parse_command(message.text)

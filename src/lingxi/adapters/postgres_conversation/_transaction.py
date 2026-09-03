@@ -461,6 +461,28 @@ class _Transaction:
         )
         return cursor.fetchone() is not None
 
+    def consume_preprovision_notice(self, *, user_id: str) -> bool:
+        """这个人有没有一句"你已经被提前开通了"还没说；命中即原子标记为已提示。
+
+        合同见 ``core/conversation/ports.ConversationTransaction.consume_preprovision_
+        notice``。挂起（``preprovision_notice_armed_at``）由预开通链在静默完成时写下，
+        本方法只把它消费成 ``preprovision_notice_sent_at``——两列而不是一个布尔的理由
+        见迁移 ``0087``：一个布尔分不清"从来没挂起过"与"挂起过、已经提示掉了"，同一份
+        名单重跑会把已经提示过的人重新挂起。
+        """
+
+        cursor = self._execute(
+            """
+            UPDATE app_user SET preprovision_notice_sent_at = now()
+             WHERE id = %s
+               AND preprovision_notice_armed_at IS NOT NULL
+               AND preprovision_notice_sent_at IS NULL
+            RETURNING id
+            """,
+            (user_id,),
+        )
+        return cursor.fetchone() is not None
+
     # ------------------------------------------------------------------
     # 用户记忆（Issue #357 S-H3-3，D1 显式登记范围）
     # ------------------------------------------------------------------

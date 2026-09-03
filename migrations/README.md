@@ -11,7 +11,7 @@
 | 当前事实 | 值 |
 | --- | --- |
 | 基线 revision（链首） | `20260806_baseline` |
-| head revision | `0086_publish_outbox_digest` |
+| head revision | `0087_preprovision_seams` |
 | 配置文件 | 仓库根目录 `alembic.ini` |
 | revision 目录 | `migrations/alembic/versions/` |
 | 连接串环境变量 | `LINGXI_MIGRATION_DSN`（缺失即失败，无默认值） |
@@ -593,6 +593,27 @@ Trace #544 P-3。`publish_outbox` 新增 `content_digest` 与 `permissions_diges
 邮箱、姓名或权限内容）。升级同时按同一算法回填**尚未被擦除**的存量行；已经擦过的历史
 行没有内容可回填，保持 `NULL`，读侧遇到 `NULL` 退回原来的 `payload` 比较，行为与本
 迁移之前逐字相同。downgrade 删除两列（有损但不删除业务行）。
+
+## `0087_preprovision_seams`（预开通的两处接缝：停摆租约起点 + 首聊补一句）
+
+Issue #541 / rc25 S-8a。`app_user` 新增三列，全部服务同一件事：**预开通是「系统触发」
+的开通，名单里的人没有任何 `inbound_event` 行**。
+
+- `provisioning_started_at`：由 `advance_provisioning_state(to='provisioning')` 在
+  推进到分水岭的同一条 UPDATE 里写上。它是开通中途停摆兜底
+  （`StalledProvisioningDuty`）在**没有入站事件**时唯一可用的租约起点——此前候选查询
+  INNER 关联 `inbound_event`，预开通失败的人结构上永远捞不到，会永久停在
+  `provisioning`/`mcp_syncing`。**刻意不复用 `updated_at`**：那一列会被任何无关更新
+  刷新，租约永远不到期。
+- `preprovision_notice_armed_at` / `preprovision_notice_sent_at`：预开通期间静默，
+  名单内用户**第一次发消息时**才补一句「你的 BI Plus 已经开通……」。形状照
+  `task.delivery_expired_notice_sent_at` 的一次性提示。两列而不是一个布尔，是因为
+  布尔分不清「从来没挂起过」与「挂起过、已经提示掉了」，于是同一份名单重跑会把已经
+  提示过的人重新挂起，用户第二次收到同一句话——而「同名单重跑零变化」是本卡的验收
+  硬条件。
+
+三列都可空、都不进任何对外发布内容、都不参与九十天擦除。downgrade 删除三列
+（有损但不删除业务行）。
 
 ## `0054_retention_cleanup` 的三条越界边界（保留清理）
 
