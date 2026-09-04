@@ -44,7 +44,7 @@ CI_WORKFLOW = REPOSITORY_ROOT / ".github" / "workflows" / "ci.yml"
 STORY_WORKFLOW = REPOSITORY_ROOT / ".github" / "workflows" / "story.yml"
 PUBLISH_WORKFLOW = REPOSITORY_ROOT / ".github" / "workflows" / "publish.yml"
 
-FEISHU_DIRECTORY = REPOSITORY_ROOT / "src" / "lingxi" / "adapters" / "feishu_directory.py"
+FEISHU_PAGED_CLIENT = REPOSITORY_ROOT / "src" / "lingxi" / "adapters" / "feishu_paged_client.py"
 POSTGRES_ADAPTER = REPOSITORY_ROOT / "src" / "lingxi" / "adapters" / "postgres.py"
 # #237 拆分后 `SAVE_RETRY_BACKOFF_SECONDS` 与消费它的 `_save_with_retry` 同在
 # credential_rotation 子模块，不再是包的 __init__.py（那里现在只重导出这个名字）。
@@ -286,7 +286,7 @@ def _worker_worst_case_seconds() -> float:
 def _worst_case_seconds() -> float:
     """一次在途轮换在最坏情况下还要跑多久（秒）。读不到常量时抛 ValueError。"""
 
-    http_timeout = module_constant(FEISHU_DIRECTORY, "REQUEST_TIMEOUT_SECONDS")
+    http_timeout = module_constant(FEISHU_PAGED_CLIENT, "REQUEST_TIMEOUT_SECONDS")
     backoff = module_constant(SCHEDULER_CREDENTIAL_ROTATION, "SAVE_RETRY_BACKOFF_SECONDS")
     if not isinstance(http_timeout, (int, float)):
         raise ValueError("读不到 REQUEST_TIMEOUT_SECONDS")
@@ -311,10 +311,10 @@ def check_stop_grace_period() -> list[str]:
     """
 
     failures: list[str] = []
-    http_timeout = module_constant(FEISHU_DIRECTORY, "REQUEST_TIMEOUT_SECONDS")
+    http_timeout = module_constant(FEISHU_PAGED_CLIENT, "REQUEST_TIMEOUT_SECONDS")
     backoff = module_constant(SCHEDULER_CREDENTIAL_ROTATION, "SAVE_RETRY_BACKOFF_SECONDS")
     if not isinstance(http_timeout, (int, float)):
-        return [f"读不到 {FEISHU_DIRECTORY.name} 的 REQUEST_TIMEOUT_SECONDS，无法核算停止宽限期"]
+        return [f"读不到 {FEISHU_PAGED_CLIENT.name} 的 REQUEST_TIMEOUT_SECONDS，无法核算停止宽限期"]
     if not isinstance(backoff, (tuple, list)) or not all(
         isinstance(x, (int, float)) for x in backoff
     ):
@@ -353,7 +353,7 @@ def check_stop_grace_period() -> list[str]:
         failures.append(
             f"scheduler 的 stop_grace_period 是 {match.group(1)}（{actual:.0f} 秒），"
             f"低于要求的 {required} 秒。\n"
-            f"      算法：续期 HTTP 超时 {http_timeout}s（feishu_directory.py 的 "
+            f"      算法：续期 HTTP 超时 {http_timeout}s（feishu_paged_client.py 的 "
             f"REQUEST_TIMEOUT_SECONDS）+ 落盘重试退避 {sum(backoff)}s"
             f"（scheduler 的 SAVE_RETRY_BACKOFF_SECONDS）+ 数据库往返预算 "
             f"{database_roundtrip_budget_seconds:.0f}s = {worst_case:.1f}s，"
@@ -2119,7 +2119,7 @@ def main() -> int:
             print(f"  - {line}", file=sys.stderr)
         return 1
 
-    http_timeout = module_constant(FEISHU_DIRECTORY, "REQUEST_TIMEOUT_SECONDS")
+    http_timeout = module_constant(FEISHU_PAGED_CLIENT, "REQUEST_TIMEOUT_SECONDS")
     backoff = module_constant(SCHEDULER_CREDENTIAL_ROTATION, "SAVE_RETRY_BACKOFF_SECONDS")
     _, max_timeout = _postgres_timeout_facts()
     default_database_operation_seconds = _default_database_operation_seconds()

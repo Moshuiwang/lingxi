@@ -550,7 +550,7 @@ class HasMoreLeniencyTest(unittest.TestCase):
         transport = RecordingTransport([{"code": 0, "data": {"has_more": "false"}}])
         client = _client(transport)
 
-        with self.assertLogs("lingxi.adapters.feishu_directory", level="WARNING") as captured:
+        with self.assertLogs("lingxi.adapters.feishu_paged_client", level="WARNING") as captured:
             with self.assertRaises(FeishuDirectoryError):
                 client.list_collaboration_tenants(token="fake-user-token")
         self.assertTrue(any("has_more" in line for line in captured.output))
@@ -1317,7 +1317,7 @@ class RequestThrottleTest(unittest.TestCase):
         调用过，直接证伪"套件会被节流拖慢"这个顾虑，而不是只凭套件跑得快
         去推测。"""
 
-        with mock.patch("lingxi.adapters.feishu_directory.time.sleep") as real_sleep:
+        with mock.patch("lingxi.adapters.feishu_paged_client.time.sleep") as real_sleep:
             transport = RecordingTransport(
                 [page([{"tenant_key": "tenant_a"}], key="target_tenant_list")]
             )
