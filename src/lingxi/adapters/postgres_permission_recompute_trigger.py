@@ -1,80 +1,17 @@
-"""``core/admin/card_callback.py`` 的 ``PermissionRecomputeTrigger`` 端口的唯一真实
-实现（Issue #438）：确认卡执行成功后，对目标用户即时触发一次定向重算/发布。
+"""``core/admin/card_callback.py`` 的 ``PermissionRecomputeTrigger`` 端口的唯一真实实现。
 
-## 为什么住在 ``adapters/``，不是 ``apps/gateway`` 内联一段
+确认卡执行成功后，对目标用户即时触发一次定向重算/发布。住在 ``adapters/``
+而不是 ``apps/gateway`` 内联一段：六个依赖全部是既有
+Postgres 适配器，独立成模块能让真实装配点只 import 一个类，且能脱离整段
+gateway 装配代码单独测试。gateway 进程能安全构造这六个依赖——纯 Postgres
+读写只需要既有 DSN，两份静态映射随包发布、无需任何密钥；**刻意不接**令牌
+密文读取口（需要只活在 scheduler 进程里的 MCP 加密主密钥）——为一个纵深字段
+把钥匙也接进暴露在飞书长连接的 gateway 进程不成比例，固定传
+``token_cipher=None``，真撞上时 ``ValueError`` 原样冒泡按降级回每日批处理；
+这条系统边界选择留给产品/架构另行评估。
 
-``core/permission/targeted_recompute.py`` 只编排纯业务规则（模块文档），需要的
-六个只读/读写口全部是既有 Postgres 适配器（模块级函数/类），把它们逐个构造起来
-再喂给 ``TargetedPermissionRecompute`` 是"装配"而不是"业务规则"——按代码框架
-第二节，这类装配可以留在 ``apps/`` 里做，但独立成一个 ``adapters/`` 模块能让
-``card_callback.py`` 的真实装配点（``apps/gateway/__init__.py``）只 import 一个
-类，且这个类可以脱离 gateway 的整段装配代码单独被测试（真库集成测试只需要
-``PermissionRecomputeAdapter`` 一个对象）。
-
-## 为什么 gateway 进程可以安全构造这些 store（不新增任何密钥/凭据面）
-
-六个依赖分两类：
-
-- **纯 Postgres 读写**（``PostgresRosterBaselineReader``、``PostgresRosterSnapshot
-  Store``、``PostgresGalaxySnapshotReader``、``PostgresPermissionPublishStore``、
-  ``local_override_reader``）：构造只需要 ``dsn``/``timeouts``，gateway 进程本来
-  就持有一份用于待确认操作状态机的 Postgres DSN（同一个数据库）。
-- **静态映射文件**（``load_role_function_map``/``load_company_function_metric_map``）：
-  随包发布、无需任何密钥，任何进程都能安全读取。指标映射还可以被
-  ``LINGXI_COMPANY_FUNCTION_METRIC_MAP_PATH`` 指向一份外置文件——**那个变量的值
-  由装配层注入本类**（构造参数 ``metric_map_path``，Trace #544 S-2c 修复对抗审查
-  P-1）：此前本类无条件读随包默认映射，而 scheduler 的每日重算读外置文件，于是
-  同一个人的权限范围会在"管理动作立即发布"与"次日日批"之间来回翻转，每次翻转都
-  是用户可见的真实权限变化。
-
-**刻意不接的一项**：令牌密文读取口（``PostgresMcpTokenStore``）需要 MCP 令牌
-加密主密钥（``LINGXI_MCP_TOKEN_ENCRYPT_KEY``）——这把主密钥目前只活在 scheduler
-进程里，是首次开通编排解密专用凭据的同一把钥匙。为了这一个纵深字段（``token_
-cipher`` 只在**新建**发布行时才需要，见 ``core/permission/publish_row.py``）把
-它也接进 gateway（一个直接暴露在飞书长连接、处理外部回调的进程），是明显不成
-比例的攻击面扩大，因此 ``TargetedPermissionRecompute`` 固定传 ``token_cipher=
-None``（见该模块文档「三处刻意不同」第 3 条）——真的撞上"要新建行却没有密文"，
-``PermissionRecomputeAdapter.trigger`` 会让 ``ValueError`` 原样冒泡，调用方
-（``BackgroundPermissionRecomputeTrigger`` 或 ``card_callback.py`` 的
-best-effort 包裹，取决于是否接了下面这层异步执行器）按「降级回每日批」处理。
-**这条选择改变的是系统边界（哪个进程持有哪把密钥），本卡不擅自扩大，本模块也
-因此明确排除了这一角，留给产品/架构在需要时另行评估。**
-
-## ``BackgroundPermissionRecomputeTrigger``：把同步触发包成"提交即返回"（Trace #445 opus 审查坐实并修复）
-
-``card_callback.py::AdminCardCallbackHandler._trigger_recompute`` 在
-``handle()`` 的主路径里**同步**调用注入的 ``recompute_trigger.trigger(pending)``
-——而 ``PermissionRecomputeAdapter.trigger`` 内部有五到六次网络往返的 Postgres
-查询/写入（花名册基线、花名册快照、银河快照、权限发布表读写、本地覆盖读取），
-一旦数据库这一刻抖动变慢，管理员点确认按钮之后就要一直等到这整条重算链路跑完
-才能收到卡片应答——``handle()`` 的返回值就是飞书要的应答帧（``card_callback.py``
-模块文档「载体 #96」），这条延迟直接体现为飞书卡片按钮转圈。定向重算是「即时
-生效」这一层纵深，每日批本来就是保底，没有理由让它的延迟拖累回调应答本身。
-
-**为什么在这里包一层，不让 ``card_callback.py`` 自己起线程**：``card_callback.py``
-只依赖注入的 ``PermissionRecomputeTrigger`` Protocol 端口，不该知道"这个端口的
-真实实现要不要异步执行"这种装配层细节——``_trigger_recompute`` 的 EXECUTED-only、
-幂等去重判据一个字都不改（仍然只在这次点击首次让操作执行成功时调用一次
-``trigger()``），本类只是装配层塞进另一层的 ``PermissionRecomputeTrigger``
-实现：``card_callback.py`` 看到的仍然是"调用 ``trigger()``，失败会抛异常"这同一个
-契约，只是这次 ``trigger()`` 本身从不冒泡异常（只做入队）——真正可能失败的执行
-在后台线程里跑，用与 ``card_callback.py`` 同一个动作名/字段形状记一条审计（见
-:meth:`_run`），运维检索方式不需要跟着改。
-
-**有界队列 + 丢弃，不是无界排队**：单工作线程按入队顺序串行执行——真实数据库
-连接不该被并发重算请求以不可控并发数打满。队列容量固定在 1~4 之间（默认 4）：
-管理员确认卡片是低频人工操作，正常情况下队列几乎总是空的，容量存在的意义是
-"扛住短时间内连续几次点击"，不是"扛住持续高吞吐"。真的堆满时选择**丢弃并响亮
-审计**，不是无界增长——无界队列会把"数据库变慢"变成"进程内存持续增长直到
-OOM"，且被丢弃的这一条重算本来就有每日批兜底，不丢反而更不安全。
-
-**daemon 线程**：与 gateway 进程既有的两条投递消费线程同一姿态
-（``apps/gateway/__init__.py`` 的 ``delivery_thread``/``document_delivery_
-thread`` 均 ``daemon=True``）——进程收到停机信号时不应该被一条卡在数据库调用里
-的后台重算线程拖住退出，`V-部署-03` 的停机预算只覆盖长连接与两条投递消费循环，
-本类新增的这条后台线程不参与那份预算记账——它本来就是"尽力而为"的纵深，不是
-必须完成才能安全退出的在途工作（真正的业务写入已经在 ``confirm()``/``cancel()``
-那次数据库事务里落定，重算只是让结果更快对外可见）。
+:class:`BackgroundPermissionRecomputeTrigger` 把同步触发包成"提交即返回、后台
+单线程串行执行"，避免同步调用拖慢飞书卡片应答；完整取舍见该类自己的 docstring。
 """
 
 from __future__ import annotations
@@ -105,13 +42,12 @@ from lingxi.core.permission.targeted_recompute import (
 
 
 class _BaselineIdentityLookup:
-    """把 ``PostgresRosterBaselineReader.load_active_baseline()`` 的全量结果适配成
-    按单个 ``user_id`` 查询的形状——不新增 SQL，只做客户端过滤（模块文档「刻意
-    不同」第 1 条已经说明本卡不追加新的花名册查询口径）。
+    """把全量结果适配成按单个 ``user_id`` 查询的形状。
 
-    定向重算只在**罕见的管理员点击**时触发，不在任何高频路径上；一次全表扫描
-    换来"不用再写、再维护第二条与 `V-花名册-10`/`V-花名册-11` 口径必须逐字保持
-    一致的 SQL"，这笔账划算。
+    包装 ``PostgresRosterBaselineReader.load_active_baseline()``，不新增 SQL，
+    只做客户端过滤。定向重算只在罕见的管理员点击时触发，不在任何高频路径上；
+    一次全表扫描换来"不用再写、再维护第二条口径必须逐字保持一致的 SQL"，
+    这笔账划算。
     """
 
     def __init__(self, baseline: Sequence[ArchivedIdentity]) -> None:
@@ -121,10 +57,10 @@ class _BaselineIdentityLookup:
         return self._by_id.get(user_id)
 
 
-#: 撤权专用身份查询（Trace #544 P-6）：与 ``postgres_roster_audit.ACTIVE_BASELINE_SQL``
-#: 取同样五列，但**不要求 ``provisioning_state = 'active'``**——停用要服务的是任何还
-#: 可能有一条发布内容在外面的人，包括首聊开通到一半就被停用的那个。仍然排除已删除
-#: 账号：那些行的内容已经随删除流程清理，不该再为它们排一条撤权意图。理由全文见
+#: 撤权专用身份查询：与 ``postgres_roster_audit.ACTIVE_BASELINE_SQL`` 取同样五列，
+#: 但不要求 ``provisioning_state = 'active'``——停用要服务的是任何还可能有一条
+#: 发布内容在外面的人，包括首聊开通到一半就被停用的那个。仍然排除已删除账号：
+#: 那些行的内容已经随删除流程清理。理由全文见
 #: ``core/permission/targeted_recompute.TargetedPermissionRecompute.force_revoke``。
 _REVOCATION_IDENTITY_SQL = """
 SELECT id, feishu_user_id, display_name, employee_no, email
@@ -165,7 +101,6 @@ class _RevocationIdentityLookup:
 
 def _identity_text(value: object) -> str:
     """``NULL`` 与空白归一成空串——与 ``adapters/postgres_roster_audit._text`` 同口径。"""
-
     if value is None:
         return ""
     if isinstance(value, str):
@@ -201,32 +136,27 @@ class PermissionRecomputeAdapter:
         audit: AuditSink,
         metric_map_path: Path | None,
     ) -> None:
-        """``metric_map_path``：「公司+职能→指标名」映射的外置路径，由装配层从
-        ``LINGXI_COMPANY_FUNCTION_METRIC_MAP_PATH`` 读出后注入；``None`` = 这台
-        机器没配外置文件，落回随包默认（生产当前正是这一支）。
+        """``metric_map_path``：「公司+职能→指标名」映射的外置路径。
 
-        **刻意没有默认值**（Trace #544 S-2c）：本类翻译出来的指标集合会被
-        ``TargetedPermissionRecompute`` 直接发布成用户的真实权限范围，一个"忘了
-        传"的默认值就是双真相本身。
+        由装配层从 ``LINGXI_COMPANY_FUNCTION_METRIC_MAP_PATH`` 读出后注入；
+        ``None`` 表示这台机器没配外置文件，落回随包默认。**刻意没有默认值**：
+        本类翻译出来的指标集合会被直接发布成用户的真实权限范围，一个"忘了传"
+        的默认值就是双真相本身。
         """
-
         self._dsn = dsn
         self._timeouts = timeouts
         self._audit = audit
         self._metric_map_path = metric_map_path
 
-    def trigger(self, pending: PendingAction) -> TargetedRecomputeOutcome:
-        """``card_callback.py`` 在确认执行成功后调用，best-effort（异常由调用方
-        捕获并降级，见该模块「载体 #96」旁的执行成功钩子）。本方法自己**不**吞
-        任何异常——吞了调用方就没有机会记"这次触发失败了"这条响亮审计。
-        """
+    def _build_recompute(
+        self, *, role_function_map: Any, metric_translation_map: Any
+    ) -> TargetedPermissionRecompute:
+        """用已加载的两份静态映射，装配一次 :class:`TargetedPermissionRecompute`。
 
-        # 延迟导入：与仓库既有的 Postgres 适配器同一惯例（构造时不连接数据库，
-        # 调用时才建连接），也让"哪些依赖真的被这条调用路径用到"在 import 时机
-        # 上一目了然。
-        from lingxi.adapters.company_function_metric_map_file import (
-            load_company_function_metric_map,
-        )
+        延迟导入：与仓库既有的 Postgres 适配器同一惯例（构造时不连接数据库，
+        调用时才建连接），也让"哪些依赖真的被这条调用路径用到"在 import
+        时机上一目了然。
+        """
         from lingxi.adapters.postgres_galaxy_snapshot import PostgresGalaxySnapshotReader
         from lingxi.adapters.postgres_local_permission import (
             PostgresLocalPermissionOverrideStore,
@@ -235,34 +165,12 @@ class PermissionRecomputeAdapter:
         from lingxi.adapters.postgres_permission_publish import PostgresPermissionPublishStore
         from lingxi.adapters.postgres_roster_audit import PostgresRosterBaselineReader
         from lingxi.adapters.postgres_roster_snapshot import PostgresRosterSnapshotStore
-        from lingxi.adapters.role_function_map_file import load_role_function_map
-
-        # 两份静态映射**先读**，读不出来就一次库都不碰、一行权限都不发布
-        # （Trace #544 S-2c）：语义与 scheduler 侧
-        # ``_build_permission_refresh_duty`` 的失败关闭一致——那边"职责不注册"，
-        # 这边"这次定向重算整体不发生"，异常原样冒泡给调用方，由
-        # ``BackgroundPermissionRecomputeTrigger``/``card_callback.py`` 记下
-        # ``admin.card_callback.recompute_trigger_failed`` 并降级回每日批。
-        # **不静默回落随包默认映射**：那正是本项要消灭的第二个真相。放在最前面
-        # 而不是原来的构造行里，是为了让"配置坏了"在任何数据库读写、任何发布
-        # 之前就失败，不留下半步做完的痕迹。
-        role_function_map = load_role_function_map()
-        metric_translation_map = load_company_function_metric_map(self._metric_map_path)
-
-        user_id = _resolve_target_user_id(self._dsn, self._timeouts, pending)
-        if user_id is None:
-            self._audit.record(
-                "permission_targeted_recompute.target_unresolved",
-                pending_action_id=pending.id,
-                action_type=pending.action_type.value,
-            )
-            return TargetedRecomputeOutcome(kind=RecomputeKind.SKIPPED, reason="target_unresolved")
 
         baseline = PostgresRosterBaselineReader(
             self._dsn, timeouts=self._timeouts
         ).load_active_baseline()
         publish_store = PostgresPermissionPublishStore(self._dsn, timeouts=self._timeouts)
-        recompute = TargetedPermissionRecompute(
+        return TargetedPermissionRecompute(
             identities=_BaselineIdentityLookup(baseline),
             roster_snapshot=_RosterRowsAdapter(
                 PostgresRosterSnapshotStore(self._dsn, timeouts=self._timeouts)
@@ -280,6 +188,36 @@ class PermissionRecomputeAdapter:
             revocation_identities=_RevocationIdentityLookup(self._dsn, timeouts=self._timeouts),
         )
 
+    def trigger(self, pending: PendingAction) -> TargetedRecomputeOutcome:
+        """``card_callback.py`` 在确认执行成功后调用，best-effort。
+
+        本方法自己**不**吞任何异常——吞了调用方就没有机会记"这次触发失败了"
+        这条响亮审计。
+        """
+        from lingxi.adapters.company_function_metric_map_file import (
+            load_company_function_metric_map,
+        )
+        from lingxi.adapters.role_function_map_file import load_role_function_map
+
+        # 两份静态映射先读，读不出来就一次库都不碰、一行权限都不发布：异常原样
+        # 冒泡给调用方，由 BackgroundPermissionRecomputeTrigger/card_callback.py
+        # 记审计并降级回每日批。不静默回落随包默认映射——放在最前面而不是原来
+        # 的构造行里，是为了让"配置坏了"在任何数据库读写之前就失败。
+        role_function_map = load_role_function_map()
+        metric_translation_map = load_company_function_metric_map(self._metric_map_path)
+
+        user_id = _resolve_target_user_id(self._dsn, self._timeouts, pending)
+        if user_id is None:
+            self._audit.record(
+                "permission_targeted_recompute.target_unresolved",
+                pending_action_id=pending.id,
+                action_type=pending.action_type.value,
+            )
+            return TargetedRecomputeOutcome(kind=RecomputeKind.SKIPPED, reason="target_unresolved")
+
+        recompute = self._build_recompute(
+            role_function_map=role_function_map, metric_translation_map=metric_translation_map
+        )
         if pending.action_type is PendingActionType.SUSPEND_USER:
             return recompute.force_revoke(user_id=user_id)
         return recompute.recompute_and_publish(user_id=user_id)
@@ -331,12 +269,12 @@ class _ExecutionWatch:
 
 
 class BackgroundPermissionRecomputeTrigger:
-    """把任意 ``PermissionRecomputeTrigger`` 实现（生产环境即
-    :class:`PermissionRecomputeAdapter`）包成"提交即返回、后台单线程串行执行"
-    的异步执行器（Trace #445 opus 审查坐实并修复）。完整取舍见模块文档
-    「``BackgroundPermissionRecomputeTrigger``」一节；本类只编排排队与执行，
-    不编排也不修改任何定向重算的业务判定——那些规则完全在被包装的
-    ``delegate`` 里。
+    """把任意 ``PermissionRecomputeTrigger`` 实现包成异步执行器。
+
+    生产环境即 :class:`PermissionRecomputeAdapter`；包成"提交即返回、后台
+    单线程串行执行"是为了不让同步调用拖慢飞书卡片应答（见模块 docstring）。
+    本类只编排排队与执行，不编排也不修改任何定向重算的业务判定——那些规则
+    完全在被包装的 ``delegate`` 里。
     """
 
     def __init__(
@@ -348,18 +286,15 @@ class BackgroundPermissionRecomputeTrigger:
         on_completed: Callable[[PendingAction], None] | None = None,
         on_queued: Callable[[PendingAction, TargetedRecomputeOutcome], None] | None = None,
         on_failed: Callable[[PendingAction, Exception | None], None] | None = None,
-        #: ``SKIPPED`` 专用回调（Trace #521 F5，#493 P1-3）。定向重算的 ``SKIPPED``
-        #: 是**常态出口**，不是故障——最典型的一种是管理员对一个已停用用户做本地
-        #: 权限动作（``account_not_enabled``）。此前它与真正的执行失败共用
-        #: ``on_failed``，调用方拿不到 ``reason``，只能渲染同一句"将在次日批处理
-        #: 修正"，而停用用户根本不进日批遍历集合，那句话是假承诺。传入这个回调后
-        #: ``SKIPPED`` 走它并带上完整 outcome，调用方自己决定怎么如实告知；
-        #: **不传（``None``）时行为与本参数加入之前逐字节一致**——仍然回落
-        #: ``on_failed(pending, None)``。本类不解释任何 ``reason``，只负责分流。
+        #: ``SKIPPED`` 专用回调：定向重算的 ``SKIPPED`` 是常态出口，不是故障
+        #: （例如管理员对一个已停用用户做本地权限动作）。传入后 ``SKIPPED`` 走
+        #: 它并带上完整 outcome；不传（``None``）时行为与本参数加入之前逐字节
+        #: 一致，仍回落 ``on_failed(pending, None)``。本类不解释 ``reason``。
         on_skipped: Callable[[PendingAction, TargetedRecomputeOutcome], None] | None = None,
         on_timeout: Callable[[PendingAction], None] | None = None,
         timeout_seconds: float = _DEFAULT_RECOMPUTE_TIMEOUT_SECONDS,
     ) -> None:
+        """校验队列容量与超时配置，装配委托对象与各回调，并启动工作线程。"""
         if not _MIN_QUEUE_MAXSIZE <= queue_maxsize <= _MAX_QUEUE_MAXSIZE:
             raise ValueError(
                 f"queue_maxsize 必须在 {_MIN_QUEUE_MAXSIZE}~{_MAX_QUEUE_MAXSIZE} 之间"
@@ -389,11 +324,11 @@ class BackgroundPermissionRecomputeTrigger:
         self._worker.start()
 
     def trigger(self, pending: PendingAction) -> None:
-        """立即返回：只把这条待确认操作放进队列，真正的重算在后台线程里跑
-        （:meth:`_run`）。队列已满时丢弃并响亮审计，从不阻塞调用方，也从不
-        向调用方冒泡任何异常——``card_callback.py`` 因此不需要跟着改一个字。
-        """
+        """立即返回：只把这条待确认操作放进队列，真正的重算在后台线程里跑。
 
+        队列已满时丢弃并响亮审计，从不阻塞调用方，也从不向调用方冒泡任何
+        异常——``card_callback.py`` 因此不需要跟着改一个字。
+        """
         watch = _ExecutionWatch()
         timer = threading.Timer(
             self._timeout_seconds, self._on_timeout_fired, args=(pending, watch)
@@ -439,77 +374,90 @@ class BackgroundPermissionRecomputeTrigger:
                     error=type(error).__name__,
                 )
 
-    def _run(self) -> None:
-        """工作线程主体：按入队顺序串行执行，单条失败只记审计、不影响下一条。"""
+    def _handle_trigger_exception(
+        self, pending: PendingAction, watch: _ExecutionWatch, error: Exception
+    ) -> None:
+        """``_delegate.trigger`` 抛出异常时的记账与回调。
 
-        while True:
-            pending, watch, timer = self._queue.get()
+        与 card_callback.py 同一条 best-effort 姿态。
+        """
+        self._audit.record(
+            _RECOMPUTE_TRIGGER_FAILED_ACTION,
+            pending_action_id=pending.id,
+            error=type(error).__name__,
+        )
+        if watch.finish() and self._on_failed is not None:
             try:
-                outcome = self._delegate.trigger(pending)
-            except Exception as error:  # 与 card_callback.py 同一条 best-effort 姿态
+                self._on_failed(pending, error)
+            except Exception as callback_error:  # callback must not kill worker
+                self._audit.record(
+                    _RECOMPUTE_TRIGGER_FAILED_ACTION,
+                    pending_action_id=pending.id,
+                    error=type(callback_error).__name__,
+                )
+
+    def _dispatch_outcome(
+        self, pending: PendingAction, watch: _ExecutionWatch, outcome: Any
+    ) -> None:
+        """``_delegate.trigger`` 正常返回时按结果种类分流到对应回调。
+
+        TargetedPermissionRecompute only records a publish *intent* here;
+        ENQUEUED/REVOKED don't mean the external table has read back the
+        row, so treat those as waiting, not effective. Only legacy
+        delegates without a typed outcome keep the old completed callback.
+        """
+        typed_outcome = outcome if isinstance(outcome, TargetedRecomputeOutcome) else None
+        completed = typed_outcome is None
+        queued = typed_outcome is not None and typed_outcome.kind is not RecomputeKind.SKIPPED
+        # ``SKIPPED`` 只有在调用方显式登记 ``on_skipped`` 时才单独分流；未登记
+        # 时仍走下面那条 ``on_failed`` 老路（见 ``on_skipped`` 参数文档）。
+        skipped = typed_outcome is not None and typed_outcome.kind is RecomputeKind.SKIPPED
+        if not watch.finish():
+            return
+        if queued:
+            try:
+                if self._on_queued is not None:
+                    self._on_queued(pending, typed_outcome)  # type: ignore[arg-type]
+            except Exception as error:  # callback must not kill worker
                 self._audit.record(
                     _RECOMPUTE_TRIGGER_FAILED_ACTION,
                     pending_action_id=pending.id,
                     error=type(error).__name__,
                 )
-                if watch.finish() and self._on_failed is not None:
-                    try:
-                        self._on_failed(pending, error)
-                    except Exception as callback_error:
-                        self._audit.record(
-                            _RECOMPUTE_TRIGGER_FAILED_ACTION,
-                            pending_action_id=pending.id,
-                            error=type(callback_error).__name__,
-                        )
-            else:
-                # ``TargetedPermissionRecompute`` only records a publish *intent* here;
-                # ``ENQUEUED``/``REVOKED`` do not mean the external permission table has
-                # accepted and read back the row.  Treat those outcomes as waiting, not
-                # effective.  ``UNCHANGED`` is also left to the status observer: an old
-                # in-flight intent may still be pending.  Only legacy delegates that do
-                # not return a typed outcome retain the historical completed callback.
-                typed_outcome = outcome if isinstance(outcome, TargetedRecomputeOutcome) else None
-                completed = typed_outcome is None
-                queued = (
-                    typed_outcome is not None and typed_outcome.kind is not RecomputeKind.SKIPPED
+        elif skipped and self._on_skipped is not None:
+            try:
+                self._on_skipped(pending, typed_outcome)  # type: ignore[arg-type]
+            except Exception as error:  # callback must not kill worker
+                self._audit.record(
+                    _RECOMPUTE_TRIGGER_FAILED_ACTION,
+                    pending_action_id=pending.id,
+                    error=type(error).__name__,
                 )
-                # ``SKIPPED`` 只有在调用方**显式登记** ``on_skipped`` 时才单独分流；
-                # 未登记时仍走下面那条 ``on_failed`` 老路（见 ``on_skipped`` 文档）。
-                skipped = typed_outcome is not None and typed_outcome.kind is RecomputeKind.SKIPPED
-                if watch.finish():
-                    if queued:
-                        try:
-                            if self._on_queued is not None:
-                                self._on_queued(pending, typed_outcome)  # type: ignore[arg-type]
-                        except Exception as error:  # callback must not kill worker
-                            self._audit.record(
-                                _RECOMPUTE_TRIGGER_FAILED_ACTION,
-                                pending_action_id=pending.id,
-                                error=type(error).__name__,
-                            )
-                    elif skipped and self._on_skipped is not None:
-                        try:
-                            self._on_skipped(pending, typed_outcome)  # type: ignore[arg-type]
-                        except Exception as error:  # callback must not kill worker
-                            self._audit.record(
-                                _RECOMPUTE_TRIGGER_FAILED_ACTION,
-                                pending_action_id=pending.id,
-                                error=type(error).__name__,
-                            )
+        else:
+            callback = self._on_completed if completed else self._on_failed
+            if callback is not None:
+                try:
+                    if completed:
+                        callback(pending)  # type: ignore[misc]
                     else:
-                        callback = self._on_completed if completed else self._on_failed
-                        if callback is not None:
-                            try:
-                                if completed:
-                                    callback(pending)  # type: ignore[misc]
-                                else:
-                                    callback(pending, None)  # type: ignore[misc]
-                            except Exception as error:  # callback must not kill worker
-                                self._audit.record(
-                                    _RECOMPUTE_TRIGGER_FAILED_ACTION,
-                                    pending_action_id=pending.id,
-                                    error=type(error).__name__,
-                                )
+                        callback(pending, None)  # type: ignore[misc]
+                except Exception as error:  # callback must not kill worker
+                    self._audit.record(
+                        _RECOMPUTE_TRIGGER_FAILED_ACTION,
+                        pending_action_id=pending.id,
+                        error=type(error).__name__,
+                    )
+
+    def _run(self) -> None:
+        """工作线程主体：按入队顺序串行执行，单条失败只记审计、不影响下一条。"""
+        while True:
+            pending, watch, timer = self._queue.get()
+            try:
+                outcome = self._delegate.trigger(pending)
+            except Exception as error:
+                self._handle_trigger_exception(pending, watch, error)
+            else:
+                self._dispatch_outcome(pending, watch, outcome)
             finally:
                 timer.cancel()
                 self._queue.task_done()
