@@ -22,7 +22,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from lingxi.adapters.claude_agent_session import (
-    AgentSessionInterrupted,
+    AgentSessionInterruptedError,
     DrainTimeoutError,
     build_agent_options,
     is_message_buffer_overflow,
@@ -513,7 +513,7 @@ class WorkerTurnExecutor:
                 local_interrupt=local_interrupt,
                 task_id=task_id,
             )
-        except AgentSessionInterrupted as error:
+        except AgentSessionInterruptedError as error:
             return _failure("interrupted", error)
         except DrainTimeoutError as error:  # 收尾超过独立宽限，不得混报成 turn_timeout
             del error

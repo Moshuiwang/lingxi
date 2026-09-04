@@ -274,7 +274,3 @@ class RosterAccessTokenProvider:
                 mode="on_demand",
                 report_date=now.date().isoformat(),
             )
-
-
-#: 向后兼容别名，供既有导入方使用。
-AccessTokenUnavailable = AccessTokenUnavailableError

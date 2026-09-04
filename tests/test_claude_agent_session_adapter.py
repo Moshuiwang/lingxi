@@ -675,7 +675,7 @@ class LocalInterruptCausalityTest(_StubSDK):
     def test_the_interrupt_fact_is_recorded_before_the_call_can_return(self) -> None:
         """SDK 抢在 ``interrupt()`` 返回之前就收完这一轮时，事实仍然成立。
 
-        这是 #201 的竞态形状：``AgentSessionInterrupted`` 不会抛出，回合看起来
+        这是 #201 的竞态形状：``AgentSessionInterruptedError`` 不会抛出，回合看起来
         完全就是"SDK 自己 abort 掉了"。把回调挪到 ``await result`` 之后（或删掉
         它）必须让本用例变红。
         """

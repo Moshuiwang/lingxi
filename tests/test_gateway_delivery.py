@@ -23,7 +23,7 @@ from postgres_schema import ensure_production_schema, psycopg_available, reset_p
 from lingxi.adapters.postgres_conversation import PostgresTaskQueue
 from lingxi.apps.gateway.delivery import DeliveryConsumer
 from lingxi.config.content import default_content_catalog
-from lingxi.core.execution.card_stream import CardCreated, DeliveryRejected
+from lingxi.core.execution.card_stream import CardCreated, DeliveryRejectedError
 
 SKIP_REASON = (
     "跳过：未设置 LINGXI_POSTGRES_DSN，Gateway 投递消费的数据库约束类断言未验证"
@@ -34,10 +34,10 @@ SKIP_REASON = (
 
 class RecordingCards:
     """记录调用；``fail_at`` 控制第几次调用（1-based）开始抛出同步异常，
-    ``fail_error`` 控制抛出的异常类型（默认 ``DeliveryRejected``，模拟服务端明确
+    ``fail_error`` 控制抛出的异常类型（默认 ``DeliveryRejectedError``，模拟服务端明确
     拒绝；传入其它任何异常类型——``TimeoutError`` 等 ``OSError`` 子类、
     ``json.JSONDecodeError``、或任何未预期的异常——都模拟独立审核 R-1 的"结果
-    不明"场景：白名单反转后，只有 ``DeliveryRejected`` 才是"明确失败"，除它以外
+    不明"场景：白名单反转后，只有 ``DeliveryRejectedError`` 才是"明确失败"，除它以外
     的一切都不确定服务端是否已经处理）。
     """
 
@@ -45,7 +45,7 @@ class RecordingCards:
         self,
         *,
         fail_at: int | None = None,
-        fail_error: type[BaseException] = DeliveryRejected,
+        fail_error: type[BaseException] = DeliveryRejectedError,
     ) -> None:
         self._fail_at = fail_at
         self._fail_error = fail_error
@@ -78,7 +78,7 @@ class RecordingCards:
 
 
 class RecordingText:
-    """``fail_error`` 默认 ``DeliveryRejected``（明确失败）；传入其它异常类型模拟
+    """``fail_error`` 默认 ``DeliveryRejectedError``（明确失败）；传入其它异常类型模拟
     独立审核 R-1 的"结果不明"场景，见 ``RecordingCards`` 的类文档。
     """
 
@@ -87,7 +87,7 @@ class RecordingText:
         *,
         fail: bool = False,
         message_id: str = "msg-text-1",
-        fail_error: type[BaseException] = DeliveryRejected,
+        fail_error: type[BaseException] = DeliveryRejectedError,
     ) -> None:
         self.fail = fail
         self.message_id = message_id
@@ -487,7 +487,7 @@ class CardFailureFallsBackToTextTests(DeliveryConsumerTestCase):
 class CardFailureInjectionAcceptanceFixtureTests(DeliveryConsumerTestCase):
     """S-A-07 受控验收缺口专用注入开关（Issue #152 验收缺口、#154 评论
     5306860510、#162 E-022）：``apps.gateway._RejectingCards`` 命中被选中的那一步
-    时确定性抛出 ``DeliveryRejected``，走的正是 ``CardFailureFallsBackToTextTests``
+    时确定性抛出 ``DeliveryRejectedError``，走的正是 ``CardFailureFallsBackToTextTests``
     已经验证过的既有降级路径——这里额外验证的是注入开关本身"命中步骤即拒绝、
     未命中步骤直通真实 transport"这条装配契约，而不是重新验证降级路径本身。
     """
@@ -704,14 +704,14 @@ class CrashRecoveryDoesNotDuplicateDeliveryTests(DeliveryConsumerTestCase):
 
 class NetworkResultUnknownDoesNotDuplicateDeliveryTests(DeliveryConsumerTestCase):
     """独立审核 B-1（红线，P1）首次修复、独立审核 R-1（红线家族）反转为白名单：
-    只有 ``DeliveryRejected``（服务端已经给出完整响应且业务错误码明确拒绝）才是
+    只有 ``DeliveryRejectedError``（服务端已经给出完整响应且业务错误码明确拒绝）才是
     "明确失败"；除它以外的一切——`requests` 的超时/连接类异常（真实 adapter 走
     lark-oapi，其 transport 是 ``requests.request(...)``，全部继承内置
     ``OSError``）、JSON 解析失败（``json.JSONDecodeError``）、响应结构缺失
     （``success()`` 为真但拿不到可回读标识）、任何其它未预期的异常——都不得被
     当成"明确失败"清预留位、降级或重试，必须转入 ``uncertain``、告警、预留位
     原样保留。用 ``TimeoutError``、``json.JSONDecodeError``、``LookupError``
-    （模拟"success 真但缺可回读标识"）分别覆盖这几类成因，与 ``DeliveryRejected``
+    （模拟"success 真但缺可回读标识"）分别覆盖这几类成因，与 ``DeliveryRejectedError``
     模拟的"服务端明确拒绝"区分开（后者行为不变，见其余测试类）。
     """
 
@@ -793,7 +793,7 @@ class NetworkResultUnknownDoesNotDuplicateDeliveryTests(DeliveryConsumerTestCase
         self.start_task("tsk-1")
         self.finish_task("tsk-1", content="已产生的答案")
 
-        # create 本身明确失败（DeliveryRejected，行为不变），直接走文本通道；
+        # create 本身明确失败（DeliveryRejectedError，行为不变），直接走文本通道；
         # 文本发送这一步改为超时。
         cards = RecordingCards(fail_at=1)
         texts = RecordingText(fail=True, fail_error=TimeoutError)
@@ -815,7 +815,7 @@ class NetworkResultUnknownDoesNotDuplicateDeliveryTests(DeliveryConsumerTestCase
         self.assertEqual(len(texts.calls), 1, "结果不明不得自动重发")
 
     def test_an_explicit_rejection_is_unaffected_and_still_retries(self) -> None:
-        """明确失败路径行为不变：`DeliveryRejected`（服务端明确拒绝，独立审核
+        """明确失败路径行为不变：`DeliveryRejectedError`（服务端明确拒绝，独立审核
         R-1 用它取代此前注入 ``RuntimeError`` 的既有测试写法）仍然立即清预留位、
         允许下一轮重试——与上面几条"结果不明"用例对照，证明白名单反转只改变了
         判别方向，没有改变既有的"明确失败"语义。
@@ -824,7 +824,7 @@ class NetworkResultUnknownDoesNotDuplicateDeliveryTests(DeliveryConsumerTestCase
         self.seed_running_task(task_id="tsk-1", conversation_id="cnv-1")
         self.start_task("tsk-1")
 
-        cards = RecordingCards(fail_at=1, fail_error=DeliveryRejected)
+        cards = RecordingCards(fail_at=1, fail_error=DeliveryRejectedError)
         texts = RecordingText()
         consumer = DeliveryConsumer(queue=self.queue, cards=cards, texts=texts)
         consumer.run_once()
@@ -840,7 +840,7 @@ class NetworkResultUnknownDoesNotDuplicateDeliveryTests(DeliveryConsumerTestCase
     def test_a_json_decode_error_during_card_create_does_not_retry_automatically(self) -> None:
         """独立审核 R-1 新增：`lark_oapi` 内部响应体解析失败时抛出的
         `json.JSONDecodeError` 不是黑名单能挡住的 `OSError`——旧的黑名单实现会把它
-        当成"明确失败"清预留位、立即降级；白名单反转后，除 `DeliveryRejected`
+        当成"明确失败"清预留位、立即降级；白名单反转后，除 `DeliveryRejectedError`
         以外的一切异常默认归"结果不明"，这条用例正是证伪旧实现、证明新实现的
         对照组。
         """
@@ -877,7 +877,7 @@ class NetworkResultUnknownDoesNotDuplicateDeliveryTests(DeliveryConsumerTestCase
     ) -> None:
         """独立审核 R-1 新增：`response.success()` 为真但拿不到 `message_id`
         （真实 adapter 遇到这种响应形状时显式抛出 `LookupError`，见
-        `adapters.feishu_delivery` 的模块说明）同样不是 `DeliveryRejected`——
+        `adapters.feishu_delivery` 的模块说明）同样不是 `DeliveryRejectedError`——
         没有任何证据表明服务端拒绝了这次调用，反而它可能已经受理，只是响应缺失
         可回读标识，必须归"结果不明"，不得当成"明确失败"清预留位后按退避重发。
         """

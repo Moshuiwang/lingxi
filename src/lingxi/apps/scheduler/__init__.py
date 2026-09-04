@@ -20,6 +20,7 @@ import logging
 import sys
 import traceback
 
+from lingxi.adapters.postgres import close_idle_connections
 from lingxi.apps.scheduler.alerting_assembly import _combined_heartbeat, build_alerting_duty
 from lingxi.apps.scheduler.assembly import (
     _build_late_readiness_recovery_duty,
@@ -199,5 +200,13 @@ def main(argv: list[str] | None = None) -> int:
                 "lingxi-scheduler 收尾 join_onboarding_executors 失败 error=%s\n调用栈（不含异常正文）：\n%s",
                 type(error).__name__,
                 "".join(traceback.format_tb(error.__traceback__)),
+            )
+        # 定时职责与开通执行器线程池都已收口：显式关闭本进程空闲栈里的连接，
+        # 不再只靠 atexit（D-17）。同上，清理本身的异常不得覆盖原始故障。
+        try:
+            close_idle_connections()
+        except Exception as error:
+            logger.error(
+                "lingxi-scheduler 停机清理空闲数据库连接失败 error=%s", type(error).__name__
             )
     return 0

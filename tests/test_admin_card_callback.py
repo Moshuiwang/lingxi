@@ -24,9 +24,9 @@ from lingxi.core.admin.notification import DECISION_CANCEL, DECISION_CONFIRM
 from lingxi.core.admin.pending_action import (
     ConfirmResultKind,
     PendingAction,
-    PendingActionAuditWriteFailed,
+    PendingActionAuditWriteFailedError,
     PendingActionStatus,
-    PendingActionTransientFailure,
+    PendingActionTransientFailureError,
     PendingActionType,
 )
 
@@ -529,7 +529,7 @@ class AuditWriteFailureTests(unittest.TestCase):
     def test_audit_write_failure_does_not_touch_card_or_group(self) -> None:
         pending_actions = _FakePendingActions()
         pending_actions.set_confirm_result(
-            PendingActionAuditWriteFailed("确认操作的审计写入失败，事务已回滚，操作未执行")
+            PendingActionAuditWriteFailedError("确认操作的审计写入失败，事务已回滚，操作未执行")
         )
         cards = _FakeCardTransport()
         group = _FakeGroupNotifier()
@@ -563,7 +563,7 @@ class TransientFailureTests(unittest.TestCase):
 
     def test_transient_failure_does_not_touch_card_or_group(self) -> None:
         pending_actions = _FakePendingActions()
-        pending_actions.set_confirm_result(PendingActionTransientFailure("DeadlockDetected"))
+        pending_actions.set_confirm_result(PendingActionTransientFailureError("DeadlockDetected"))
         cards = _FakeCardTransport()
         group = _FakeGroupNotifier()
         handler, audit = _build_handler(
@@ -595,7 +595,7 @@ class TransientFailureTests(unittest.TestCase):
         有人为了"看起来一致"把两条 toast 文案悄悄合并成同一句。"""
 
         pending_actions = _FakePendingActions()
-        pending_actions.set_confirm_result(PendingActionTransientFailure("LockNotAvailable"))
+        pending_actions.set_confirm_result(PendingActionTransientFailureError("LockNotAvailable"))
         handler, _audit = _build_handler(pending_actions=pending_actions)
 
         outcome = handler.handle(
@@ -610,7 +610,7 @@ class TransientFailureTests(unittest.TestCase):
 
     def test_cancel_path_also_translates_transient_failure(self) -> None:
         pending_actions = _FakePendingActions()
-        pending_actions.set_cancel_result(PendingActionTransientFailure("OperationalError"))
+        pending_actions.set_cancel_result(PendingActionTransientFailureError("OperationalError"))
         handler, audit = _build_handler(pending_actions=pending_actions)
 
         outcome = handler.handle(

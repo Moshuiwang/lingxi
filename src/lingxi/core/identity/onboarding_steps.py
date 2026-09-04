@@ -51,13 +51,13 @@ from lingxi.core.identity.provisioning import ProvisioningRejection, Provisionin
 from lingxi.core.identity.stock_token_source import ADOPTABLE, DECRYPT_FAILED, StockTokenLookup
 from lingxi.core.permission.account_match import MATCHED, match_galaxy_account
 from lingxi.core.permission.local_override import ResolvedLocalOverrides, resolve_local_overrides
-from lingxi.core.permission.mcp_readiness import ReadinessBinding, ReadinessOutcome
+from lingxi.core.permission.mcp_readiness_base import ReadinessBinding, ReadinessOutcome
 from lingxi.core.permission.merge_sources import (
     REASON_LOCAL_OVERRIDE_READ_FAILED,
     merge_permission_sources,
 )
 from lingxi.core.permission.notification import describe_scope
-from lingxi.core.permission.publish import PermissionGrantBlockedByAccountState
+from lingxi.core.permission.publish import PermissionGrantBlockedByAccountStateError
 from lingxi.core.permission.publish_row import (
     ADMIN_FULL_ACCESS_FUNCTION,
     STATUS_APPROVED,
@@ -505,7 +505,7 @@ class OnboardingSteps:
                 require_enabled_account=True,
                 decided_at=self._clock(),
             )
-        except PermissionGrantBlockedByAccountState as blocked:
+        except PermissionGrantBlockedByAccountStateError as blocked:
             self._audit.record(
                 "onboarding.halted_account_state",
                 user=user_id,

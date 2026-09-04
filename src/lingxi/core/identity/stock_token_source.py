@@ -24,7 +24,7 @@ NO_ROW = "no_row"
 #: 正式表有这一行，但 ``token_cipher`` 列是空的：没有可采纳的东西，同样走原签发路径。
 NO_CIPHER = "no_cipher"
 #: 正式表有这一行、有密文，且已用受控主密钥解密成功：:attr:`StockTokenLookup.secret`
-#: 是可以直接拿去采纳（``TokenIssuer.adopt_token``）的明文。
+#: 是可以直接拿去采纳（供令牌签发端 ``adopt_token`` 使用）的明文。
 ADOPTABLE = "adoptable"
 #: 正式表有这一行、有密文，但解密失败：主密钥配错或数据本身损坏。**必须响亮失败、
 #: 绝不回退签新**——签新会让这个人的用户环境令牌与正式表错位。

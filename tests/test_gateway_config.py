@@ -682,6 +682,54 @@ class LoggingAuditLevelTests(unittest.TestCase):
         self.assertTrue(captured.output[0].startswith("INFO"))
 
 
+class RunShutdownClosesIdleConnectionsTests(unittest.TestCase):
+    """D-17（#593 元守护审核 P2-b）：``_run()`` 停机路径必须在两条后台线程
+    join 之后显式调用一次 ``lingxi.adapters.postgres.close_idle_connections``，
+    不能只靠进程退出时的 ``atexit``。用轻量桩顶掉真实装配（后台循环、supervisor、
+    告警职责、信号安装），只把这一段接线暴露成断言，不真的建长连接或后台线程。
+
+    变异验红：把 ``lingxi/apps/gateway/__init__.py`` 里 ``close_idle_connections()``
+    那一行删掉重跑本用例，``close_mock.assert_called_once_with()`` 会因为从未被
+    调用而失败。
+    """
+
+    def test_run_calls_close_idle_connections_once_after_shutdown(self) -> None:
+        from unittest import mock
+
+        config = load_config(VALID_ENV)
+
+        class _StubLoops:
+            watchdogs: list = []
+
+            def start(self) -> None:
+                return None
+
+            def join_within(self, clock: object, budget_seconds: float) -> None:
+                del clock, budget_seconds
+
+        class _StubSupervisor:
+            def run(self, *, should_stop: object) -> object:
+                del should_stop
+                from lingxi.adapters.feishu_longconn import TerminationReason
+
+                return TerminationReason.STOPPED
+
+        with (
+            mock.patch("lingxi.apps.gateway.install_signal_handlers"),
+            mock.patch("lingxi.apps.gateway.build_alerting_duty", return_value=mock.MagicMock()),
+            mock.patch("lingxi.apps.gateway._start_background_loops", return_value=_StubLoops()),
+            mock.patch("lingxi.apps.gateway.build_supervisor", return_value=_StubSupervisor()),
+            mock.patch("lingxi.apps.gateway.assert_gateway_onboarding_is_inert"),
+            mock.patch("lingxi.apps.gateway.close_idle_connections") as close_mock,
+        ):
+            from lingxi.apps.gateway import _run
+
+            code = _run(config)
+
+        self.assertEqual(code, 0)
+        close_mock.assert_called_once_with()
+
+
 class EntryPointTests(unittest.TestCase):
     def test_main_refuses_an_empty_configuration(self) -> None:
         self.assertEqual(main(env={}), 2, "缺配置必须以退出码 2 拒绝启动")

@@ -27,7 +27,7 @@ from postgres_schema import ensure_production_schema, psycopg_available, reset_p
 from lingxi.adapters.mcp_token_cipher import McpTokenCipher, McpTokenCipherError, new_token
 from lingxi.adapters.postgres import connect
 from lingxi.adapters.postgres_mcp_token import PostgresMcpTokenStore
-from lingxi.core.permission.mcp_readiness import (
+from lingxi.core.permission.mcp_readiness_base import (
     ReadinessAttempt,
     ReadinessBinding,
     ReadinessOutcome,

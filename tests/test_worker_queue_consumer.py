@@ -62,7 +62,7 @@ from lingxi.core.execution.card_stream import (
     CardCreated,
     CardRateLimiter,
     CardStream,
-    DeliveryRejected,
+    DeliveryRejectedError,
     ProgressStepSnapshot,
     decode_progress_action,
     encode_progress_action,
@@ -134,13 +134,13 @@ def worker_config(**overrides: object) -> WorkerConfig:
 
 
 class RecordingCards:
-    """``error`` 默认 ``DeliveryRejected``（明确失败，独立审核 R-1 白名单）；传入
+    """``error`` 默认 ``DeliveryRejectedError``（明确失败，独立审核 R-1 白名单）；传入
     ``TimeoutError`` 等其它任何异常类型模拟"结果不明"，见
     ``core.execution.card_stream`` 模块说明。
     """
 
     def __init__(
-        self, *, fail: str | None = None, error: type[BaseException] = DeliveryRejected
+        self, *, fail: str | None = None, error: type[BaseException] = DeliveryRejectedError
     ) -> None:
         self.fail = fail
         self._error = error
@@ -169,7 +169,7 @@ class RecordingCards:
 
 class RecordingText:
     def __init__(
-        self, *, fail: bool = False, error: type[BaseException] = DeliveryRejected
+        self, *, fail: bool = False, error: type[BaseException] = DeliveryRejectedError
     ) -> None:
         self.texts: list[str] = []
         self.calls: list[dict[str, object]] = []
@@ -918,7 +918,7 @@ class CardStreamTests(unittest.TestCase):
     def test_create_timeout_is_not_swallowed_into_a_fallback_downgrade(self) -> None:
         """独立审核 B-1/R-1：``TimeoutError``（真实 adapter 走 ``requests``，其网络
         异常全部是内置 ``OSError`` 的子类）不是"明确失败"——``start()`` 必须原样把
-        它抛出去，不能像 ``DeliveryRejected`` 那样吞掉并置位 ``fallback_needed``
+        它抛出去，不能像 ``DeliveryRejectedError`` 那样吞掉并置位 ``fallback_needed``
         （那会让调用方误以为已经拿到"应该改走文本通道"这个明确结论）。
         """
 
@@ -965,7 +965,7 @@ class CardStreamTests(unittest.TestCase):
     def test_close_timeout_still_does_not_fall_back_like_any_other_close_failure(self) -> None:
         """``close()`` 步骤的异常分类不延伸到这里（见 ``card_stream.py`` 注释）：
         无论关闭失败是明确拒绝还是网络类异常，都不改变"更新已经成功、答案已对
-        用户可见"这个结论，``TimeoutError`` 与 ``DeliveryRejected`` 在这一步行为
+        用户可见"这个结论，``TimeoutError`` 与 ``DeliveryRejectedError`` 在这一步行为
         一致。
         """
 
@@ -2415,7 +2415,7 @@ class WorkerServiceTests(unittest.TestCase):
         状态，不依赖真实操作系统信号的时序抖动。
 
         **Trace #544 S-2b 之后的口径变化（不是放宽断言，是如实说明）**：巡检
-        已改走 ``await asyncio.to_thread(self._housekeep)``（见
+        已改走 ``await asyncio.to_thread(self._housekeeper.run)``（见
         ``apps/worker/service.py`` 的 ``process_once``），因此这个替身跑在**工作
         线程**上，拿不到 running loop，改用
         预先捕获的循环 + ``call_soon_threadsafe`` 排队。同一个原因也让
@@ -2455,14 +2455,14 @@ class WorkerServiceTests(unittest.TestCase):
             # 精确模拟"SIGTERM 的自管道回调已经在事件循环就绪队列里排队、
             # 但还没被处理"：这次同步的 `_housekeep()` 调用期间，操作系统
             # 送达了信号，`loop.call_soon` 把 `stop.set` 排进了就绪队列。
-            original_housekeep = service._housekeep
+            original_housekeep = service._housekeeper.run
             loop = asyncio.get_running_loop()
 
             def housekeeping_that_races_with_sigterm() -> list[object]:
                 loop.call_soon_threadsafe(stop.set)
                 return original_housekeep()
 
-            service._housekeep = housekeeping_that_races_with_sigterm  # type: ignore[method-assign]
+            service._housekeeper.run = housekeeping_that_races_with_sigterm  # type: ignore[method-assign]
 
             run_task = asyncio.ensure_future(service.run(stop_event=stop))
             await asyncio.wait_for(run_task, timeout=2.0)
@@ -2606,7 +2606,7 @@ class WorkerServiceTests(unittest.TestCase):
             executor_factory=lambda config, marker: Executor(),
         )
 
-        original_housekeep = service._housekeep
+        original_housekeep = service._housekeeper.run
         signal_sent = False
 
         def housekeeping_that_sends_a_real_sigterm() -> list[object]:
@@ -2622,7 +2622,7 @@ class WorkerServiceTests(unittest.TestCase):
                 os.kill(os.getpid(), signal.SIGTERM)
             return result
 
-        service._housekeep = housekeeping_that_sends_a_real_sigterm  # type: ignore[method-assign]
+        service._housekeeper.run = housekeeping_that_sends_a_real_sigterm  # type: ignore[method-assign]
 
         err = io.StringIO()
 
@@ -2996,7 +2996,7 @@ class WorkerServiceTests(unittest.TestCase):
         ``blocked_db_grace_seconds`` 秒的兜底（同时也保证退化时用例不会挂死）。
 
         变异验红：把 ``process_once()`` 里的
-        ``await asyncio.to_thread(self._housekeep)`` 改回裸调 ``self._housekeep()``，
+        ``await asyncio.to_thread(self._housekeeper.run)`` 改回裸调 ``self._housekeeper.run()``，
         ``answered_while_blocked`` 变成 ``False``（钩子要等那次数据库往返自己超时
         返回才轮得上应答）。
 
@@ -3008,8 +3008,8 @@ class WorkerServiceTests(unittest.TestCase):
         **为什么选线程池而不是异步化**：队列适配器
         （``adapters/postgres_conversation/*``）是同步 psycopg 实现，没有 async
         变体。异步化要么整包重写、要么引入第二套数据库驱动，两者都远超本项范围
-        且不可逆。线程池是最小、可回滚的形态——``_housekeep()`` 本身一个字节都
-        不用改，既有白盒调用方（直接调 ``service._housekeep()`` 的用例）逐字节
+        且不可逆。线程池是最小、可回滚的形态——``QueueHousekeeper.run()`` 本身一个字节都
+        不用改，既有白盒调用方（直接调 ``service._housekeeper.run()`` 的用例）逐字节
         不变，回滚只需把两个调用点的 ``await asyncio.to_thread(...)`` 改回裸调。
 
         **为什么这样搬是线程安全的**（逐条核对，不是"看起来没问题"）：
@@ -3203,6 +3203,30 @@ class WorkerServiceTests(unittest.TestCase):
                 ".exception()/.result()），否则 asyncio 会在垃圾回收时打一条 "
                 "'Task exception was never retrieved' 噪音日志",
             )
+
+    def test_run_closes_idle_connections_once_after_the_claim_loop_exits(self) -> None:
+        """D-17（#593 元守护审核 P2-b）：``run()`` 的领取循环彻底退出之后必须显式
+        调用一次 ``lingxi.adapters.postgres.close_idle_connections``，不能只靠
+        进程退出时的 ``atexit``。停机信号在 ``run()`` 入口前就已置位，模拟"领取
+        循环一轮都没跑就直接收口"的边界，只把这段收尾接线暴露成断言。
+
+        变异验红：把 ``WorkerService.run()`` 里包住领取循环的 ``try``/``finally``
+        去掉（或删掉 ``finally`` 里那次 ``close_idle_connections`` 调用）重跑本
+        用例，``close_mock.assert_called_once_with()`` 会因为从未被调用而失败。
+        """
+        from unittest.mock import patch
+
+        service = WorkerService(config=worker_config(), queue=FakeWorkerQueue())
+
+        async def scenario() -> None:
+            stop = asyncio.Event()
+            stop.set()
+            await service.run(stop_event=stop)
+
+        with patch("lingxi.apps.worker.service.close_idle_connections") as close_mock:
+            asyncio.run(scenario())
+
+        close_mock.assert_called_once_with()
 
 
 class SemanticProgressTests(unittest.TestCase):
@@ -4373,7 +4397,7 @@ class SessionCleanupPipelineIntegrationTests(unittest.TestCase):
     """Issue #153：从"数据库里排了一条待清理"到"物理文件真的被删、行被标记完成"
     的完整链路——真库 + 真实临时目录，不在任何一段打桩。三个触发点各自排队的
     正确性已在 ``tests/test_delivery_outbox.py`` 的 ``AgentSessionCleanupQueueTests``
-    覆盖，本文件只覆盖 ``WorkerService._cleanup_agent_sessions`` 这一段消费。
+    覆盖，本文件只覆盖 ``QueueHousekeeper._cleanup_agent_sessions``（经 ``WorkerService._housekeeper``）这一段消费。
     """
 
     @classmethod
@@ -4419,7 +4443,7 @@ class SessionCleanupPipelineIntegrationTests(unittest.TestCase):
                 queue=self.queue,
                 session_cleanup=SessionCleanupSettings(root=session_root),
             )
-            service._cleanup_agent_sessions()
+            service._housekeeper._cleanup_agent_sessions()
 
             self.assertFalse(jsonl.exists())
             with connect(DSN) as connection:
@@ -4442,7 +4466,7 @@ class SessionCleanupPipelineIntegrationTests(unittest.TestCase):
                 queue=self.queue,
                 session_cleanup=SessionCleanupSettings(root=Path(tmp)),
             )
-            service._cleanup_agent_sessions()
+            service._housekeeper._cleanup_agent_sessions()
 
             with connect(DSN) as connection:
                 done = connection.execute(
@@ -4460,7 +4484,7 @@ class SessionCleanupPipelineIntegrationTests(unittest.TestCase):
             queue=self.queue,
             session_cleanup=SessionCleanupSettings(root=None),
         )
-        service._cleanup_agent_sessions()
+        service._housekeeper._cleanup_agent_sessions()
 
         with connect(DSN) as connection:
             row = connection.execute(
@@ -4490,7 +4514,7 @@ class SessionCleanupPipelineIntegrationTests(unittest.TestCase):
                 queue=self.queue,
                 session_cleanup=SessionCleanupSettings(root=missing_root),
             )
-            service._cleanup_agent_sessions()
+            service._housekeeper._cleanup_agent_sessions()
 
         with connect(DSN) as connection:
             row = connection.execute(

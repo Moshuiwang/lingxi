@@ -6,7 +6,7 @@
 按自己的节奏（约十五分钟一次）拉取发布表，一次错过窗口的用户可能几分钟后
 就真的就绪了。本模块周期性回看这些候选、重新探测；就绪就写 ``active`` 并
 主动通知「开通完成」，在此之前绝不给任何暗示已经可用的消息。
-判定复用 :class:`~lingxi.core.permission.mcp_readiness.ReadinessRecoveryTicker`
+判定复用 :class:`~lingxi.core.permission.mcp_readiness_tick.ReadinessRecoveryTicker`
 （与阻塞/tick 式就绪确认同一份判定实现，不认终态防线），不新造"就绪"定义。
 重试没有主动放弃期限，但实际生效窗口受 ``publish_outbox`` 内容快照九十天
 保留期约束——超期候选查询会静默排除，因为渲染通知所需内容已被到期擦除。
@@ -26,7 +26,7 @@ from typing import Any, Protocol
 from lingxi.apps.scheduler.audit import AuditSink
 from lingxi.apps.scheduler.config import SchedulerConfig
 from lingxi.core.identity.onboarding_runner import KEY_COMPLETED
-from lingxi.core.permission.mcp_readiness import (
+from lingxi.core.permission.mcp_readiness_base import (
     ReadinessAttempt,
     ReadinessBinding,
     ReadinessOutcome,
@@ -59,7 +59,7 @@ class _Candidates(Protocol):
 
 
 class _Ticker(Protocol):
-    """就绪复检探针（``core/permission/mcp_readiness.ReadinessRecoveryTicker``）。
+    """就绪复检探针（``core/permission/mcp_readiness_tick.ReadinessRecoveryTicker``）。
 
     **可选**：缺问数 MCP 端点或令牌主密钥时装配层传 ``None``，需要真探针的候选本轮
     不推进、不落任何记录（模块文档「节奏」一节同一条纪律）。
@@ -242,7 +242,7 @@ class LateReadinessRecoveryDuty:
     待发通知。**通知阶段**：认领到期的待发通知 → 发送 → 送达就标记 ``delivered``，
     失败留错误码等下一次到期重试。语义与边界见模块文档；本类**只编排**：候选查询、
     原子推进、通知 outbox 在 :mod:`lingxi.adapters.postgres_late_readiness_recovery`，
-    判定在 :mod:`lingxi.core.permission.mcp_readiness`，这里一条规则都不复制。
+    判定在 :mod:`lingxi.core.permission.mcp_readiness_base`，这里一条规则都不复制。
     """
 
     name = "迟到就绪恢复"
@@ -619,7 +619,7 @@ def _build_late_readiness_ticker(config: SchedulerConfig, *, audit: AuditSink) -
     from lingxi.adapters.postgres_mcp_token import PostgresMcpTokenStore, token_cipher_provider
     from lingxi.adapters.query_mcp_probe import QueryMcpProbe, content_text_metrics_reader
     from lingxi.apps.scheduler.onboarding import assert_probe_timeouts_agree
-    from lingxi.core.permission.mcp_readiness import ReadinessRecoveryTicker
+    from lingxi.core.permission.mcp_readiness_tick import ReadinessRecoveryTicker
 
     dsn = config.postgres_dsn
     timeouts = config.postgres_timeouts

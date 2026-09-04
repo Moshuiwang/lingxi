@@ -49,13 +49,13 @@ from lingxi.apps.scheduler.permission_refresh import (
     PERMISSION_REFRESH_REASON,
     PERMISSION_REVOKE_REASON,
 )
-from lingxi.core.permission.mcp_readiness import (
+from lingxi.core.permission.mcp_readiness_base import (
     CONTRACT_SCHEDULE,
     ReadinessAttempt,
     ReadinessBinding,
     ReadinessOutcome,
-    ReadinessProgress,
 )
+from lingxi.core.permission.mcp_readiness_tick import ReadinessProgress
 from lingxi.core.permission.notification import NoticeKind, NoticeResult
 
 REPOSITORY_ROOT = pathlib.Path(__file__).parents[1]
@@ -1193,7 +1193,7 @@ class DutyRegistrationTest(unittest.TestCase):
         from lingxi.apps.scheduler import _build_permission_publish_duty
         from lingxi.core.permission.table_access_token_supply import (
             PermissionTableAccessTokenProvider,
-            PermissionTableAccessTokenUnavailable,
+            PermissionTableAccessTokenUnavailableError,
         )
 
         config = self._wired_config()
@@ -1211,7 +1211,7 @@ class DutyRegistrationTest(unittest.TestCase):
         del missing
 
         def always_failing() -> str:
-            raise PermissionTableAccessTokenUnavailable("fetch_unavailable")
+            raise PermissionTableAccessTokenUnavailableError("fetch_unavailable")
 
         failing_audit = RecordingAudit()
         registered = _build_permission_publish_duty(

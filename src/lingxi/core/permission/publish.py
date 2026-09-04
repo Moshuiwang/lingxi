@@ -708,12 +708,6 @@ class PermissionPublishExecutor:
         return attempt
 
 
-#: 向后兼容别名：两个异常类已改名以满足异常类命名规则（须以 Error 结尾），跨模块
-#: 引用未同步改名前继续可用，全仓统一改名后再清理。
-PermissionDecisionTransientFailure = PermissionDecisionTransientFailureError
-PermissionGrantBlockedByAccountState = PermissionGrantBlockedByAccountStateError
-
-
 __all__ = [
     "ACCOUNT_STATE_ENABLED",
     "DEFAULT_MAX_ATTEMPTS",

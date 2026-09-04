@@ -3,7 +3,7 @@
 一轮 tick 依次做四件事，次序不可调换：**收殓**崩溃留下的 ``publishing`` 意图放回
 ``pending``（发布本身幂等，重入安全）→ **发布**驱动执行器消费待发布意图（写发布表
 → 逐字段读回核对）→ **就绪确认**对已发布读回一致、尚未收口的每一条按 tick 节奏
-推进至多一步（:class:`~lingxi.core.permission.mcp_readiness.ReadinessTicker`，只
+推进至多一步（:class:`~lingxi.core.permission.mcp_readiness_tick.ReadinessTicker`，只
 替换阻塞式确认的"等待"实现，判定与落库全部复用同一份代码，避免一个未就绪用户占住
 整个 :class:`SchedulerLoop` 十五分钟）→ **通知**探针成功发「范围已更新」、权限为空
 （撤权）发「暂无可用范围」，终态记录先落库、通知失败不回头改任何状态。与每日权限
@@ -29,12 +29,12 @@ from lingxi.apps.scheduler.permission_refresh import (
     PERMISSION_REFRESH_REASON,
     PERMISSION_REVOKE_REASON,
 )
-from lingxi.core.permission.mcp_readiness import (
+from lingxi.core.permission.mcp_readiness_base import (
     ReadinessAttempt,
     ReadinessBinding,
     ReadinessOutcome,
-    ReadinessProgress,
 )
+from lingxi.core.permission.mcp_readiness_tick import ReadinessProgress
 from lingxi.core.permission.notification import NoticeResult
 
 logger = logging.getLogger(__name__)
@@ -224,7 +224,7 @@ class PermissionPublishDuty:
 
     语义与边界见模块文档。本类**只编排**：发布判定在
     :mod:`lingxi.core.permission.publish`，就绪判定在
-    :mod:`lingxi.core.permission.mcp_readiness`，通知正文与重试在
+    :mod:`lingxi.core.permission.mcp_readiness_base`，通知正文与重试在
     :mod:`lingxi.core.permission.notification`，这里一条规则都不复制。
     """
 

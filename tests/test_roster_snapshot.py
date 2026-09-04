@@ -455,7 +455,7 @@ class SnapshotReadbackConsistencyTest(unittest.TestCase):
         self.assertEqual(len(stored.rows), 3)
 
     def test_rows_lost_to_a_concurrent_replacement_are_rejected_not_returned(self) -> None:
-        from lingxi.adapters.postgres_roster_snapshot import RosterSnapshotInconsistent
+        from lingxi.adapters.postgres_roster_snapshot import RosterSnapshotInconsistentError
 
         for rows, label in (
             ([], "并发替换已删掉旧行"),
@@ -463,7 +463,7 @@ class SnapshotReadbackConsistencyTest(unittest.TestCase):
         ):
             with self.subTest(label=label):
                 store = self._store(self.HEADER, rows)
-                with self.assertRaises(RosterSnapshotInconsistent) as raised:
+                with self.assertRaises(RosterSnapshotInconsistentError) as raised:
                     store.load()
                 # 只报两个数字，不报任何行内容。
                 message = str(raised.exception)

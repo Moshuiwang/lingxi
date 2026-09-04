@@ -1,7 +1,7 @@
 """应用身份令牌的进程内缓存与按需续期（Issue #226 裁定 3）。
 
 认领：手上有新鲜令牌就不重新请求；没有或临期就换一次；换回来的令牌寿命未知/一到手
-就临期时失败关闭（``PermissionTableAccessTokenUnavailable("fetch_unavailable")``，
+就临期时失败关闭（``PermissionTableAccessTokenUnavailableError("fetch_unavailable")``，
 与 :mod:`lingxi.core.permission.table_access_token_supply` 既有的失败词表同一套，
 不新增分类）；不设"每日至多一次"的频率上界（与花名册的
 ``RosterAccessTokenProvider`` 唯一的实质差异，理由见模块文档）。
@@ -18,7 +18,7 @@ from lingxi.core.identity.access_token_supply import (
 )
 from lingxi.core.identity.credentials import DerivedAccessToken, SecretToken
 from lingxi.core.permission.table_access_token_supply import (
-    PermissionTableAccessTokenUnavailable,
+    PermissionTableAccessTokenUnavailableError,
 )
 from lingxi.core.permission.tenant_token_supply import TenantAccessTokenSupply
 
@@ -129,7 +129,7 @@ class FailClosedTest(unittest.TestCase):
 
         supply, fetch, _clock = build_supply(outcomes=[derived(lifetime=None)])
 
-        with self.assertRaises(PermissionTableAccessTokenUnavailable) as raised:
+        with self.assertRaises(PermissionTableAccessTokenUnavailableError) as raised:
             supply()
 
         self.assertEqual(raised.exception.reason, "fetch_unavailable")
@@ -146,10 +146,10 @@ class FailClosedTest(unittest.TestCase):
 
     def test_never_returns_an_empty_or_placeholder_string(self) -> None:
         supply, _fetch, _clock = build_supply(
-            outcomes=[PermissionTableAccessTokenUnavailable("fetch_unavailable")]
+            outcomes=[PermissionTableAccessTokenUnavailableError("fetch_unavailable")]
         )
 
-        with self.assertRaises(PermissionTableAccessTokenUnavailable):
+        with self.assertRaises(PermissionTableAccessTokenUnavailableError):
             token = supply()
             self.fail(f"不该拿到任何返回值，却拿到了 {token!r}")
 

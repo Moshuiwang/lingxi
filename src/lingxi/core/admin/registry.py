@@ -86,11 +86,6 @@ class AdminRegistrySeedConflictError(RuntimeError):
         )
 
 
-#: 向后兼容别名：本批清理把异常类改名以满足 N818（须以 Error 结尾），跨模块
-#: 引用仍在别处；收官批统一清理全部旧名引用后移除本别名。
-AdminRegistrySeedConflict = AdminRegistrySeedConflictError
-
-
 def is_authorized_admin(entry: AdminRegistryEntry | None) -> bool:
     """默认拒绝谓词：条目不存在、非 active，或三类角色没有全部授予，一律不是管理员。
 

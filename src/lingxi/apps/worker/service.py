@@ -17,6 +17,7 @@ from collections.abc import Callable
 from dataclasses import replace
 from typing import Any
 
+from lingxi.adapters.postgres import close_idle_connections
 from lingxi.adapters.postgres_conversation import ClaimedTask, TerminalTask
 from lingxi.adapters.user_mcp_config import UserMcpConfigError, load_user_mcp_servers
 from lingxi.apps.worker.config import WorkerConfig
@@ -114,7 +115,7 @@ class WorkerService:
         self._tick_alerts()
         # 巡检搬离事件循环：占住循环＝只读屏障唯一判定层的工具前置钩子应答不了，而钩子
         # 超时是失败关闭。
-        terminal_tasks = await asyncio.to_thread(self._housekeep)
+        terminal_tasks = await asyncio.to_thread(self._housekeeper.run)
 
         # 紧贴 claim() 之前再判一次停机信号（见 `_STOP_SIGNAL_DRAIN_YIELDS`）：判定与
         # claim() 之间几乎全同步，信号若落在那段窗口里，标志位读到的还是旧值——会把一条
@@ -162,7 +163,7 @@ class WorkerService:
                 if now - last_housekeep_at >= self._config.poll_interval_seconds:
                     last_housekeep_at = now
                     self._tick_alerts()
-                    terminal_tasks.extend(await asyncio.to_thread(self._housekeep))
+                    terminal_tasks.extend(await asyncio.to_thread(self._housekeeper.run))
         except BaseException:
             for task in pending:
                 task.cancel()
@@ -201,14 +202,6 @@ class WorkerService:
         errors = [error for task in done if (error := task.exception()) is not None]
         if errors:
             raise errors[0]
-
-    def _housekeep(self) -> list[TerminalTask]:
-        """每一轮的巡检；实现见 :class:`~lingxi.apps.worker.housekeeping.QueueHousekeeper`。"""
-        return self._housekeeper.run()
-
-    def _cleanup_agent_sessions(self) -> None:
-        """会话清理转发口；实现见 :class:`~lingxi.apps.worker.housekeeping.QueueHousekeeper`。"""
-        self._housekeeper._cleanup_agent_sessions()
 
     def _emit_heartbeat(self) -> None:
         """戳一次活性；失败只记异常类型，不能因为告警输入失败而让 worker 停止消费。"""
@@ -559,12 +552,27 @@ class WorkerService:
         stop = stop_event or asyncio.Event()
         # 在途任务据此把"进程正在停机"与"用户按了停止"同等看待，见 :meth:`_monitor`。
         self._global_stop = stop
-        if self._listener_factory is None:
+        try:
+            if self._listener_factory is None:
+                while not stop.is_set():
+                    await self._poll_once(stop)
+                return
             while not stop.is_set():
-                await self._poll_once(stop)
-            return
-        while not stop.is_set():
-            await self._consume_with_listener(stop)
+                await self._consume_with_listener(stop)
+        finally:
+            # 领取循环已经彻底退出（监听/轮询两条路径都已收口）：显式关闭本进程
+            # 空闲栈里的连接，不再只靠 atexit（D-17）。挪去线程池执行，避免同步
+            # 数据库调用占住事件循环；清理本身的异常只记日志，不覆盖原始故障
+            # （run() 若是异常退出，让那个异常原样传播）。
+            await asyncio.to_thread(self._close_idle_connections_quietly)
+
+    @staticmethod
+    def _close_idle_connections_quietly() -> None:
+        """停机收尾：关闭空闲数据库连接，失败只记日志。"""
+        try:
+            close_idle_connections()
+        except Exception as error:
+            logger.error("worker 停机清理空闲数据库连接失败 error=%s", type(error).__name__)
 
     async def _poll_once(self, stop: asyncio.Event) -> None:
         """跑一轮；无事可做就睡一个轮询间隔。"""

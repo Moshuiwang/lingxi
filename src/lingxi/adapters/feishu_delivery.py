@@ -5,7 +5,7 @@
 ``platform_message_id``，两者失败语义不同，不共用同一个类。
 
 **下面几个方法按白名单分类外发结果，不捕获任何未预期异常，都是刻意的**：
-只有 ``response.success()`` 为假时才显式抛出 ``DeliveryRejected``；响应
+只有 ``response.success()`` 为假时才显式抛出 ``DeliveryRejectedError``；响应
 成功但缺失可回读标识时显式抛 ``LookupError``；其余一律不捕获、原样向上
 传播，判定为"结果不明"。
 
@@ -20,7 +20,7 @@ import json
 from typing import Any
 
 from lingxi.config.content import RenderedCard
-from lingxi.core.execution.card_stream import CardCreated, DeliveryRejected
+from lingxi.core.execution.card_stream import CardCreated, DeliveryRejectedError
 
 # 卡片模板里唯一的可流式更新元素；标题与正文合并渲染进它的 content（见模块说明）。
 _STATUS_ELEMENT_ID = "lingxi_status"
@@ -84,7 +84,7 @@ def _create_card(client: Any, card: RenderedCard) -> str:
     )
     create_response = client.cardkit.v1.card.create(create_request)
     if not create_response.success():
-        raise DeliveryRejected(
+        raise DeliveryRejectedError(
             f"建卡失败：code={create_response.code} msg={create_response.msg} "
             f"log_id={create_response.get_log_id()}",
             code=create_response.code,
@@ -92,7 +92,7 @@ def _create_card(client: Any, card: RenderedCard) -> str:
         )
     if create_response.data is None or not create_response.data.card_id:
         # 结果不明：响应本身表示成功，但拿不到可回读标识——不能确定服务端是否
-        # 真的建好了卡片，不属于 DeliveryRejected。
+        # 真的建好了卡片，不属于 DeliveryRejectedError。
         raise LookupError(
             "建卡响应缺少可回读标识 card_id："
             f"code={create_response.code} msg={create_response.msg} "
@@ -122,7 +122,7 @@ def _reply_with_card(
     )
     send_response = client.im.v1.message.reply(send_request)
     if not send_response.success():
-        raise DeliveryRejected(
+        raise DeliveryRejectedError(
             f"卡片发送失败：code={send_response.code} msg={send_response.msg} "
             f"log_id={send_response.get_log_id()}",
             code=send_response.code,
@@ -189,7 +189,7 @@ class LarkCardTransport:
         )
         response = self._client.cardkit.v1.card_element.content(request)
         if not response.success():
-            raise DeliveryRejected(
+            raise DeliveryRejectedError(
                 f"卡片流式更新失败：code={response.code} msg={response.msg} "
                 f"log_id={response.get_log_id()}",
                 code=response.code,
@@ -223,7 +223,7 @@ class LarkCardTransport:
         )
         response = self._client.cardkit.v1.card.settings(request)
         if not response.success():
-            raise DeliveryRejected(
+            raise DeliveryRejectedError(
                 f"卡片关闭流式失败：code={response.code} msg={response.msg} "
                 f"log_id={response.get_log_id()}",
                 code=response.code,
@@ -276,7 +276,7 @@ class LarkDeliveryText:
         )
         response = self._client.im.v1.message.reply(request)
         if not response.success():
-            raise DeliveryRejected(
+            raise DeliveryRejectedError(
                 f"发送投递文本失败：code={response.code} msg={response.msg} "
                 f"log_id={response.get_log_id()}",
                 code=response.code,

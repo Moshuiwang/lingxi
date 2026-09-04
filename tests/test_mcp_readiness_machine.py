@@ -8,7 +8,7 @@
 
 `V-权限-06` 的措辞 2026-08-17 由「回读版本比对」改写为「探针法」：发布表侧没有版本字段
 （G-155 终判，全表回源核对），回读比对不可行。改写依据与新判定见
-``src/lingxi/core/permission/mcp_readiness.py`` 模块文档。
+``src/lingxi/core/permission/mcp_readiness_base.py`` 模块文档。
 
 **一秒都不用真的等**：时钟与 ``sleep`` 都是注入的，用例里用假时钟把十五分钟走完。
 
@@ -41,7 +41,7 @@ import textwrap
 import unittest
 from datetime import UTC, datetime, timedelta
 
-from lingxi.core.permission.mcp_readiness import (
+from lingxi.core.permission.mcp_readiness_base import (
     CONTRACT_SCHEDULE,
     DEFAULT_BUDGET_SECONDS,
     DEFAULT_INTERVAL_SECONDS,
@@ -52,13 +52,15 @@ from lingxi.core.permission.mcp_readiness import (
     ReadinessAttempt,
     ReadinessBinding,
     ReadinessOutcome,
-    ReadinessProgress,
-    ReadinessRecoveryTicker,
     ReadinessSchedule,
     ReadinessSession,
-    ReadinessTicker,
     classify_probe,
     evaluate_permission_presence,
+)
+from lingxi.core.permission.mcp_readiness_tick import (
+    ReadinessProgress,
+    ReadinessRecoveryTicker,
+    ReadinessTicker,
     next_probe_due,
 )
 

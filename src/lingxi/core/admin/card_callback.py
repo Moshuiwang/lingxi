@@ -49,9 +49,9 @@ from lingxi.core.admin.notification import (
 )
 from lingxi.core.admin.pending_action import (
     PendingAction,
-    PendingActionAuditWriteFailed,
+    PendingActionAuditWriteFailedError,
     PendingActionStatus,
-    PendingActionTransientFailure,
+    PendingActionTransientFailureError,
     PendingActionType,
 )
 from lingxi.core.admin.views import AdminUserStatusView
@@ -151,14 +151,14 @@ class AdminCardCallbackHandler(_ManagementCardCallbackMixin):
                 outcome = self._pending_actions.cancel(
                     pending_action_id=pending_action_id, clicker_open_id=operator_open_id
                 )
-        except PendingActionAuditWriteFailed:
+        except PendingActionAuditWriteFailedError:
             self._audit.record(
                 "admin.card_callback.audit_write_failed",
                 pending_action_id=pending_action_id,
                 trace_id=trace_id,
             )
             return _toast_error("系统繁忙请重试")
-        except PendingActionTransientFailure as error:
+        except PendingActionTransientFailureError as error:
             self._audit.record(
                 "admin.card_callback.transient_failure",
                 pending_action_id=pending_action_id,

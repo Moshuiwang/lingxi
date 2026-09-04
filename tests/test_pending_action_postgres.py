@@ -31,13 +31,13 @@ from lingxi.adapters.postgres_conversation import _Transaction
 from lingxi.adapters.postgres_local_permission import PostgresLocalPermissionOverrideStore
 from lingxi.adapters.postgres_pending_action import (
     TARGET_HAS_PENDING_ACTION_CODE,
-    PendingActionAuditWriteFailed,
+    PendingActionAuditWriteFailedError,
     PostgresPendingActionStore,
 )
 from lingxi.core.admin.pending_action import (
     ConfirmResultKind,
     PendingActionStatus,
-    PendingActionTransientFailure,
+    PendingActionTransientFailureError,
     PendingActionType,
 )
 from lingxi.core.ids import new_id
@@ -436,7 +436,7 @@ class AuditWriteFailureRealDbTests(PendingActionPostgresTestCase):
             self._dsn, audit=failing_audit, metric_map_path=None
         )
 
-        with self.assertRaises(PendingActionAuditWriteFailed):
+        with self.assertRaises(PendingActionAuditWriteFailedError):
             failing_store.confirm(pending_action_id=pending_id, clicker_open_id=ADMIN_OPEN_ID)
 
         self.assertEqual(self.current_account_state(), "enabled", "审计失败后目标账号必须保持不变")
@@ -462,7 +462,7 @@ class AuditWriteFailureRealDbTests(PendingActionPostgresTestCase):
             self._dsn, audit=_RecordingAudit(raise_error=True), metric_map_path=None
         )
 
-        with self.assertRaises(PendingActionAuditWriteFailed):
+        with self.assertRaises(PendingActionAuditWriteFailedError):
             failing_store.cancel(pending_action_id=pending_id, clicker_open_id=ADMIN_OPEN_ID)
 
         status_rows = self.query("SELECT status FROM pending_action WHERE id = %s", (pending_id,))
@@ -1361,7 +1361,7 @@ class TransientFailureRealDbTests(PendingActionPostgresTestCase):
     被另一个事务（本用例模拟 gateway 入站事务）持锁超过 ``lock_timeout``
     （2 秒，``adapters/postgres.py`` 的 ``PostgresTimeouts`` 默认值），
     ``confirm()`` 必须把裸 psycopg 的 ``LockNotAvailable`` 转译成
-    :class:`~lingxi.core.admin.pending_action.PendingActionTransientFailure`
+    :class:`~lingxi.core.admin.pending_action.PendingActionTransientFailureError`
     （事务已回滚、可重试），不能让它一路抛到调用方，也不能无界等待——「停用一个
     正在聊天的用户」最容易撞见这一种。
     """
@@ -1445,7 +1445,7 @@ class TransientFailureRealDbTests(PendingActionPostgresTestCase):
 
         started_at = time.monotonic()
         try:
-            with self.assertRaises(PendingActionTransientFailure) as raised:
+            with self.assertRaises(PendingActionTransientFailureError) as raised:
                 self.store.confirm(pending_action_id=pending_id, clicker_open_id=ADMIN_OPEN_ID)
         finally:
             release_lock.set()
@@ -1477,7 +1477,7 @@ class LocalPermissionGrantSuppressRealDbTests(PendingActionPostgresTestCase):
     （本文件只覆盖 adapter 层）；②"未确认不落行"；③漂移黑盒（SAVEPOINT 降级）；
     ⑥同目标在途互斥覆盖新类型。变异锚点（登记后已还原，见任务收口说明）：删
     SAVEPOINT 降级会让 ``test_confirm_downgrades_to_target_drifted_when_key_
-    is_taken_before_confirm`` 变红（未捕获的 ``DuplicateActiveOverride``
+    is_taken_before_confirm`` 变红（未捕获的 ``DuplicateActiveOverrideError``
     直接从 ``confirm()`` 冒泡）；把 ``VALID_SOURCE_STATES[GRANT]`` 改成
     ``{"present"}`` 会让 prepare 阶段本身直接拒绝，本类多个用例连锁变红。
     """

@@ -50,7 +50,7 @@ from lingxi.adapters.admin_registry import (
 from lingxi.adapters.postgres import connect
 from lingxi.adapters.postgres_local_permission import PostgresLocalPermissionOverrideStore
 from lingxi.adapters.postgres_onboarding_failure import PostgresFailureReasonRecorder
-from lingxi.core.admin.registry import ALL_ADMIN_ROLES, AdminRegistrySeedConflict
+from lingxi.core.admin.registry import ALL_ADMIN_ROLES, AdminRegistrySeedConflictError
 from lingxi.core.ids import new_id
 from lingxi.core.permission.local_override import OverrideDirection
 
@@ -258,7 +258,7 @@ class SeedConflictDetectionTests(AdminRegistryPostgresTestCase):
     def test_an_existing_row_with_a_different_label_raises_a_conflict(self) -> None:
         seed_admin_registry_entry(self._dsn, feishu_open_id="ou_relabeled", label="original-label")
 
-        with self.assertRaises(AdminRegistrySeedConflict) as raised:
+        with self.assertRaises(AdminRegistrySeedConflictError) as raised:
             seed_admin_registry_entry(
                 self._dsn, feishu_open_id="ou_relabeled", label="a-different-label"
             )

@@ -14,7 +14,7 @@ Epic D/E 联合验收要用到的受控失败旅程列为四类夹具，本模�
 2. **MCP 同步超时夹具——只用于窗口前的纯单测验证，不能注入真实 Stage 进程**
    （2026-08-18 编排者修复包 P2-11 更正；此前的措辞暗示它可以让验收现场跳过
    真实等待，这是错的）。合同节奏由
-   ``lingxi.core.permission.mcp_readiness.ReadinessSchedule`` 承载，最小合法
+   ``lingxi.core.permission.mcp_readiness_base.ReadinessSchedule`` 承载，最小合法
    配置不是本模块另起一套数字，而是该模块文档已经写明、且
    ``tests/test_mcp_readiness_machine.py`` 已在用的
    ``ReadinessSchedule(interval_seconds=1, budget_seconds=1,
@@ -194,7 +194,7 @@ NEGATIVE_IDENTITY_FIXTURES: tuple[NegativeIdentityFixture, ...] = (
 # 二、MCP 同步超时夹具：验收窗口用的「最小合法配置」节奏
 # ---------------------------------------------------------------------------
 
-#: 与 ``core.permission.mcp_readiness`` 模块文档「节奏与预算是受控可配置的
+#: 与 ``core.permission.mcp_readiness_base`` 模块文档「节奏与预算是受控可配置的
 #: 合法值」一节记录的配方逐字段相同——本模块不重新决定这三个数字，只给它一个
 #: 稳定、可 import 的名字，避免验收现场从文档散文里手抄参数。
 MCP_READINESS_MINIMUM_LEGAL_SCHEDULE_KWARGS: Mapping[str, int] = {

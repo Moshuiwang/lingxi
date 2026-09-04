@@ -32,7 +32,7 @@ from lingxi.adapters.postgres_conversation import _Transaction
 from lingxi.adapters.postgres_permission_publish import (
     DecisionOutcome,
     PostgresPermissionPublishStore,
-    PublishClaimLost,
+    PublishClaimLostError,
 )
 from lingxi.apps.scheduler.permission_publish import DEFAULT_PUBLISH_LIMIT
 from lingxi.core.ids import new_id
@@ -40,8 +40,8 @@ from lingxi.core.permission.publish import (
     DEFAULT_MAX_ATTEMPTS,
     STATUS_FAILED,
     STATUS_PUBLISHED,
-    PermissionDecisionTransientFailure,
-    PermissionGrantBlockedByAccountState,
+    PermissionDecisionTransientFailureError,
+    PermissionGrantBlockedByAccountStateError,
     PermissionPublishExecutor,
     PermissionTableError,
     PublishAttempt,
@@ -996,7 +996,7 @@ class TransientFailureRealDbTest(PermissionPublishPostgresTestCase):
     FOR UPDATE`` 锁 ``app_user`` 行，若这一行恰好被另一个事务持锁超过
     ``lock_timeout``（2 秒，``adapters/postgres.py`` 的 ``PostgresTimeouts``
     默认值），必须把裸 psycopg 的 ``LockNotAvailable`` 转译成
-    :class:`~lingxi.core.permission.publish.PermissionDecisionTransientFailure`
+    :class:`~lingxi.core.permission.publish.PermissionDecisionTransientFailureError`
     （事务已回滚、可重试），不能让它一路抛到调用方、也不能无界等待。"""
 
     def test_record_decision_raises_transient_failure_when_the_user_row_is_held_past_lock_timeout(
@@ -1028,7 +1028,7 @@ class TransientFailureRealDbTest(PermissionPublishPostgresTestCase):
 
         started_at = time.monotonic()
         try:
-            with self.assertRaises(PermissionDecisionTransientFailure) as raised:
+            with self.assertRaises(PermissionDecisionTransientFailureError) as raised:
                 self.store.record_decision(
                     require_enabled_account=True,
                     user_id=USER_A,
@@ -1231,7 +1231,7 @@ class CompleteTest(PermissionPublishPostgresTestCase):
     def test_a_lost_claim_cannot_be_written_back(self) -> None:
         outbox_id = self._claimed()
         self.store.reclaim_stale(older_than=timedelta(microseconds=1))
-        with self.assertRaises(PublishClaimLost):
+        with self.assertRaises(PublishClaimLostError):
             self.store.complete(_attempt(outbox_id), status=STATUS_PUBLISHED)
         stored = self.store.load(outbox_id)
         assert stored is not None
@@ -1242,7 +1242,7 @@ class CompleteTest(PermissionPublishPostgresTestCase):
 
         只判 ``status='publishing'`` 时的错法：旧认领者迟到的记账会命中**新认领者**
         正在进行的那一行，把它改写成 ``published``；而新认领者随后的记账反而扑空，
-        合法的那一方被报成 :class:`PublishClaimLost`。加上 ``attempts`` 守卫之后，
+        合法的那一方被报成 :class:`PublishClaimLostError`。加上 ``attempts`` 守卫之后，
         两边各自归位——旧的失败，新的成功。
         """
 
@@ -1252,7 +1252,7 @@ class CompleteTest(PermissionPublishPostgresTestCase):
         assert again is not None
         self.assertEqual(again.attempts, 2)
 
-        with self.assertRaises(PublishClaimLost):
+        with self.assertRaises(PublishClaimLostError):
             self.store.complete(_attempt(outbox_id, attempts=1), status=STATUS_PUBLISHED)
         stale = self.store.load(outbox_id)
         assert stale is not None
@@ -1500,7 +1500,7 @@ class AwaitingReadinessTest(PermissionPublishPostgresTestCase):
         """
 
         from lingxi.adapters.postgres_mcp_token import PostgresMcpTokenStore
-        from lingxi.core.permission.mcp_readiness import (
+        from lingxi.core.permission.mcp_readiness_base import (
             ReadinessAttempt,
             ReadinessBinding,
             ReadinessOutcome,
@@ -1968,7 +1968,7 @@ class AccountStateGuardTest(PermissionPublishPostgresTestCase):
 
         self._set_states(account_state="suspended")
 
-        with self.assertRaises(PermissionGrantBlockedByAccountState) as raised:
+        with self.assertRaises(PermissionGrantBlockedByAccountStateError) as raised:
             self.store.record_decision(
                 user_id=USER_A,
                 row=_row(),
@@ -1996,7 +1996,7 @@ class AccountStateGuardTest(PermissionPublishPostgresTestCase):
         ):
             with self.subTest(account_state=account_state):
                 self._set_states(user_id, account_state=account_state)
-                with self.assertRaises(PermissionGrantBlockedByAccountState) as raised:
+                with self.assertRaises(PermissionGrantBlockedByAccountStateError) as raised:
                     self.store.record_decision(
                         user_id=user_id,
                         row=_row(email),
@@ -2113,7 +2113,7 @@ class AccountStateGuardConcurrencyTest(PermissionPublishPostgresTestCase):
 
     #: A 持锁的上限。B 的 ``lock_timeout`` 是 2 秒（``adapters/postgres.py`` 的
     #: ``DEFAULT_LOCK_TIMEOUT_SECONDS``），A 必须在此之内提交，否则 B 会以
-    #: ``PermissionDecisionTransientFailure`` 退出——那是另一条已有用例
+    #: ``PermissionDecisionTransientFailureError`` 退出——那是另一条已有用例
     #: （``TransientFailureRealDbTest``）覆盖的形状，不是本条要证的东西。
     HOLD_BUDGET_SECONDS = 1.0
 
@@ -2225,7 +2225,7 @@ class AccountStateGuardConcurrencyTest(PermissionPublishPostgresTestCase):
         blocked = decision_errors[0]
         self.assertIsInstance(
             blocked,
-            PermissionGrantBlockedByAccountState,
+            PermissionGrantBlockedByAccountStateError,
             "B 必须被账号状态守卫挡住（拿到锁之后读的是 A 刚提交的 suspended）；"
             f"实际是 {type(blocked).__name__}: {blocked}",
         )

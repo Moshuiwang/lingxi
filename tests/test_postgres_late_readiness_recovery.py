@@ -36,7 +36,7 @@ from lingxi.adapters.postgres import connect
 from lingxi.adapters.postgres_late_readiness_recovery import PostgresLateReadinessStore
 from lingxi.adapters.postgres_mcp_token import PostgresMcpTokenStore
 from lingxi.adapters.postgres_permission_publish import PostgresPermissionPublishStore
-from lingxi.core.permission.mcp_readiness import (
+from lingxi.core.permission.mcp_readiness_base import (
     ReadinessAttempt,
     ReadinessBinding,
     ReadinessOutcome,

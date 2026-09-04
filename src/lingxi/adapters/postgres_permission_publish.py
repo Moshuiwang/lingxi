@@ -33,7 +33,7 @@ from lingxi.adapters.postgres_permission_publish_decision import (
 )
 from lingxi.adapters.postgres_permission_publish_decision import _DecisionMixin
 from lingxi.core.identity.roster_audit import ArchivedIdentity
-from lingxi.core.permission.mcp_readiness import TERMINAL_OUTCOMES
+from lingxi.core.permission.mcp_readiness_base import TERMINAL_OUTCOMES
 from lingxi.core.permission.publish import ClaimedPublish, PublishAttempt, PublishOutcome
 
 logger = logging.getLogger(__name__)
@@ -96,9 +96,6 @@ class PublishClaimLostError(RuntimeError):
     """
 
 
-#: 向后兼容别名：迁移前的名字不满足 ruff N818（异常类需以 ``Error`` 结尾）。
-PublishClaimLost = PublishClaimLostError
-
 #: 本文件正文不直接调用它（真正的调用在 postgres_permission_publish_decision.py），
 #: 但 tests/test_permission_publish_postgres.py 按
 #: postgres_permission_publish._ConversationTransaction 这个路径打桩注入清理
@@ -158,7 +155,7 @@ _REDACT_EXPIRED_PAYLOADS_SQL = """UPDATE publish_outbox
 # 三条筛选缺一不可：status='published' 只有发布读回一致的那一版才进入就绪
 # 确认与通知；「该用户没有更新的意图」防止据一份已经过时的版本发通知；
 # 「没有终态就绪记录」是这条链唯一的"已经处理过"水位。到期时刻算法须与
-# `core.permission.mcp_readiness.next_probe_due` 一致（起点 + 已判定次数
+# `core.permission.mcp_readiness_tick.next_probe_due` 一致（起点 + 已判定次数
 # × 间隔，预算封顶）。
 
 # 跨读 mcp_sync_check（属 postgres_mcp_token 的表）是一处知情的例外，只读，

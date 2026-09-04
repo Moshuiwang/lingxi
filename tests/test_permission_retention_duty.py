@@ -447,7 +447,7 @@ class RetentionSweepPostgresTest(unittest.TestCase):
         return outbox_id
 
     def _check(self, user_id: str, *, age_days: int, version: int = 1) -> str:
-        from lingxi.core.permission.mcp_readiness import (
+        from lingxi.core.permission.mcp_readiness_base import (
             ReadinessAttempt,
             ReadinessBinding,
             ReadinessOutcome,

@@ -35,15 +35,15 @@ from lingxi.apps.scheduler import CredentialRotationLoop, RotationReport
 from lingxi.core.identity.access_token_supply import (
     DEFAULT_ACCESS_TOKEN_SAFETY_MARGIN,
     SUPPLY_FAILURE_REASONS,
-    AccessTokenUnavailable,
+    AccessTokenUnavailableError,
     DerivedAccessTokenHolder,
     RosterAccessTokenProvider,
 )
 from lingxi.core.identity.credentials import (
     AuthorizationGrant,
     DerivedAccessToken,
-    RefreshDailyLimitReached,
-    RefreshMinIntervalNotElapsed,
+    RefreshDailyLimitReachedError,
+    RefreshMinIntervalNotElapsedError,
     SecretToken,
 )
 
@@ -449,11 +449,11 @@ class SupplyFailureReasonTest(unittest.TestCase):
         ):
             with self.subTest(reason=smuggled[:16]):
                 with self.assertRaises(ValueError) as raised:
-                    AccessTokenUnavailable(smuggled)
+                    AccessTokenUnavailableError(smuggled)
                 self.assertNotIn(FAKE_ACCESS_TOKEN, str(raised.exception))
 
     def test_the_exception_text_is_exactly_the_classification(self) -> None:
-        error = AccessTokenUnavailable("refresh_failed")
+        error = AccessTokenUnavailableError("refresh_failed")
 
         self.assertEqual(str(error), "refresh_failed")
         self.assertEqual(error.reason, "refresh_failed")
@@ -548,10 +548,10 @@ class ProviderTest(unittest.TestCase):
         `access_token_missing` 的**读取失败**，把排障指向源头而不是凭据。"""
 
         provider, _holder, _clock, _audit, _refresh = build_provider(
-            outcomes=[AccessTokenUnavailable("no_credential_available")]
+            outcomes=[AccessTokenUnavailableError("no_credential_available")]
         )
 
-        with self.assertRaises(AccessTokenUnavailable):
+        with self.assertRaises(AccessTokenUnavailableError):
             provider()
 
     def test_an_unknown_exception_is_folded_into_a_single_classification(self) -> None:
@@ -562,7 +562,7 @@ class ProviderTest(unittest.TestCase):
             outcomes=[RuntimeError(f"boom {FAKE_ACCESS_TOKEN}")]
         )
 
-        with self.assertRaises(AccessTokenUnavailable) as raised:
+        with self.assertRaises(AccessTokenUnavailableError) as raised:
             provider()
 
         self.assertEqual(raised.exception.reason, "refresh_error")
@@ -577,7 +577,7 @@ class ProviderTest(unittest.TestCase):
             outcomes=[derived(lifetime=None)]
         )
 
-        with self.assertRaises(AccessTokenUnavailable) as raised:
+        with self.assertRaises(AccessTokenUnavailableError) as raised:
             provider()
 
         self.assertEqual(raised.exception.reason, "derived_token_unusable")
@@ -588,11 +588,11 @@ class ProviderTest(unittest.TestCase):
         """拒绝会在每一轮定时循环里重复发生（默认 60 秒一轮），逐次记会把审计淹掉。"""
 
         provider, _holder, clock, audit, _refresh = build_provider(
-            outcomes=[AccessTokenUnavailable("no_credential_available")] * 6
+            outcomes=[AccessTokenUnavailableError("no_credential_available")] * 6
         )
 
         for _ in range(5):
-            with self.assertRaises(AccessTokenUnavailable):
+            with self.assertRaises(AccessTokenUnavailableError):
                 provider()
             clock.advance(timedelta(minutes=1))
 
@@ -603,7 +603,7 @@ class ProviderTest(unittest.TestCase):
         )
 
         clock.advance(timedelta(days=1))
-        with self.assertRaises(AccessTokenUnavailable):
+        with self.assertRaises(AccessTokenUnavailableError):
             provider()
         self.assertEqual(len(audit.records), 2, "新的一天重新记一条")
 
@@ -613,13 +613,13 @@ class ProviderTest(unittest.TestCase):
 
         provider, _holder, _clock, audit, _refresh = build_provider(
             outcomes=[
-                AccessTokenUnavailable("no_credential_available"),
-                AccessTokenUnavailable("refresh_indeterminate"),
+                AccessTokenUnavailableError("no_credential_available"),
+                AccessTokenUnavailableError("refresh_indeterminate"),
             ]
         )
 
         for _ in range(2):
-            with self.assertRaises(AccessTokenUnavailable):
+            with self.assertRaises(AccessTokenUnavailableError):
                 provider()
 
         self.assertEqual(
@@ -650,7 +650,7 @@ class ProviderTest(unittest.TestCase):
             outcomes=[ResponseCarryingError(f"body={{'access_token': '{FAKE_ACCESS_TOKEN}'}}")]
         )
 
-        with self.assertRaises(AccessTokenUnavailable) as raised:
+        with self.assertRaises(AccessTokenUnavailableError) as raised:
             provider()
 
         self.assertIsNone(raised.exception.__cause__, "不得保留原因链")
@@ -735,9 +735,9 @@ class ScriptedVault:
 
         if for_supply:
             if self.consumed_at is not None and moment - self.consumed_at < self._min_interval:
-                raise RefreshMinIntervalNotElapsed(consumed_at=self.consumed_at)
+                raise RefreshMinIntervalNotElapsedError(consumed_at=self.consumed_at)
             if count_today >= self._daily_limit:
-                raise RefreshDailyLimitReached(consumed_at=self.consumed_at)
+                raise RefreshDailyLimitReachedError(consumed_at=self.consumed_at)
             pending_count = count_today + 1
         else:
             # 到期驱动不做频率判据，但把当日计数原样带过去——与真实凭据库
@@ -958,7 +958,7 @@ class OnDemandRefreshTest(unittest.TestCase):
         fixture = build_supply_loop(claims=[_Claim(), _Claim()])
         fixture.loop.refresh_for_supply()
 
-        with self.assertRaises(AccessTokenUnavailable) as raised:
+        with self.assertRaises(AccessTokenUnavailableError) as raised:
             fixture.loop.refresh_for_supply()
 
         self.assertEqual(raised.exception.reason, "refresh_min_interval_not_elapsed")
@@ -972,7 +972,7 @@ class OnDemandRefreshTest(unittest.TestCase):
         fixture = build_supply_loop(claims=[_Claim(), _Claim()])
         fixture.loop.refresh_for_supply()
 
-        with self.assertRaises(AccessTokenUnavailable) as raised:
+        with self.assertRaises(AccessTokenUnavailableError) as raised:
             fixture.restart().refresh_for_supply()
 
         self.assertEqual(raised.exception.reason, "refresh_min_interval_not_elapsed")
@@ -1004,7 +1004,7 @@ class OnDemandRefreshTest(unittest.TestCase):
         fixture.loop.refresh_for_supply()
 
         fixture.clock.advance(timedelta(minutes=6))  # 间隔已过，不撞最小间隔
-        with self.assertRaises(AccessTokenUnavailable) as raised:
+        with self.assertRaises(AccessTokenUnavailableError) as raised:
             fixture.loop.refresh_for_supply()
 
         self.assertEqual(raised.exception.reason, "refresh_daily_limit_reached")
@@ -1041,7 +1041,7 @@ class OnDemandRefreshTest(unittest.TestCase):
         self.assertEqual(fixture.authorization.calls, 1)
 
         # 当天再问一次：被凭据自己的消费标记拒绝。
-        with self.assertRaises(AccessTokenUnavailable):
+        with self.assertRaises(AccessTokenUnavailableError):
             fixture.loop.refresh_for_supply()
 
         fixture.vault.reauthorize()  # 产品负责人当天补了授权
@@ -1056,7 +1056,7 @@ class OnDemandRefreshTest(unittest.TestCase):
         fixture = build_supply_loop(claims=[_Claim()], superseded=True)
 
         with self.assertLogs("lingxi.apps.scheduler", level="WARNING"):
-            with self.assertRaises(AccessTokenUnavailable):
+            with self.assertRaises(AccessTokenUnavailableError):
                 fixture.loop.refresh_for_supply()
 
         fixture.vault.reauthorize()
@@ -1075,7 +1075,7 @@ class OnDemandRefreshTest(unittest.TestCase):
 
         with no_retry_backoff():
             with self.assertLogs("lingxi.apps.scheduler", level="ERROR") as captured:
-                with self.assertRaises(AccessTokenUnavailable) as raised:
+                with self.assertRaises(AccessTokenUnavailableError) as raised:
                     loop.refresh_for_supply()
 
         self.assertEqual(raised.exception.reason, "credential_persist_failed")
@@ -1105,7 +1105,7 @@ class OnDemandRefreshTest(unittest.TestCase):
             outcome=FeishuDirectoryError("feishu_code_20037")
         )
 
-        with self.assertRaises(AccessTokenUnavailable) as raised:
+        with self.assertRaises(AccessTokenUnavailableError) as raised:
             loop.refresh_for_supply()
 
         self.assertEqual(raised.exception.reason, "refresh_failed")
@@ -1117,7 +1117,7 @@ class OnDemandRefreshTest(unittest.TestCase):
             outcome=TimeoutError("模拟回程超时")
         )
 
-        with self.assertRaises(AccessTokenUnavailable) as raised:
+        with self.assertRaises(AccessTokenUnavailableError) as raised:
             loop.refresh_for_supply()
 
         self.assertEqual(raised.exception.reason, "refresh_indeterminate")
@@ -1126,7 +1126,7 @@ class OnDemandRefreshTest(unittest.TestCase):
     def test_no_claimable_credential_is_not_disguised_as_anything_else(self) -> None:
         loop, vault, _holder, _events, _clock, authorization = build_supply_loop(claims=[None])
 
-        with self.assertRaises(AccessTokenUnavailable) as raised:
+        with self.assertRaises(AccessTokenUnavailableError) as raised:
             loop.refresh_for_supply()
 
         self.assertEqual(raised.exception.reason, "no_credential_available")
@@ -1140,7 +1140,7 @@ class OnDemandRefreshTest(unittest.TestCase):
         loop, vault, _holder, _events, _clock, authorization = build_supply_loop()
         loop.request_stop()
 
-        with self.assertRaises(AccessTokenUnavailable) as raised:
+        with self.assertRaises(AccessTokenUnavailableError) as raised:
             loop.refresh_for_supply()
 
         self.assertEqual(raised.exception.reason, "scheduler_stopping")
@@ -1152,7 +1152,7 @@ class OnDemandRefreshTest(unittest.TestCase):
 
         loop, vault, holder, _events, _clock, _authorization = build_supply_loop(lifetime=None)
 
-        with self.assertRaises(AccessTokenUnavailable) as raised:
+        with self.assertRaises(AccessTokenUnavailableError) as raised:
             loop.refresh_for_supply()
 
         self.assertEqual(raised.exception.reason, "derived_token_unusable")
@@ -1175,7 +1175,7 @@ class OnDemandRefreshTest(unittest.TestCase):
         loop, vault, holder, events, _clock, _authorization = build_supply_loop(superseded=True)
 
         with self.assertLogs("lingxi.apps.scheduler", level="WARNING") as captured:
-            with self.assertRaises(AccessTokenUnavailable) as raised:
+            with self.assertRaises(AccessTokenUnavailableError) as raised:
                 loop.refresh_for_supply()
 
         self.assertEqual(raised.exception.reason, "no_credential_available")
@@ -1195,7 +1195,7 @@ class OnDemandRefreshTest(unittest.TestCase):
 
         fixture = build_supply_loop(claims=[None, _Claim()])
 
-        with self.assertRaises(AccessTokenUnavailable) as raised:
+        with self.assertRaises(AccessTokenUnavailableError) as raised:
             fixture.loop.refresh_for_supply()
 
         self.assertEqual(raised.exception.reason, "no_credential_available")
@@ -1209,7 +1209,7 @@ class OnDemandRefreshTest(unittest.TestCase):
         fixture = build_supply_loop()
         fixture.loop.request_stop()
 
-        with self.assertRaises(AccessTokenUnavailable) as raised:
+        with self.assertRaises(AccessTokenUnavailableError) as raised:
             fixture.loop.refresh_for_supply()
 
         self.assertEqual(raised.exception.reason, "scheduler_stopping")
@@ -1237,7 +1237,7 @@ class OnDemandRefreshTest(unittest.TestCase):
 
                 with no_retry_backoff():
                     with self.assertLogs("lingxi.apps.scheduler"):
-                        with self.assertRaises(AccessTokenUnavailable) as raised:
+                        with self.assertRaises(AccessTokenUnavailableError) as raised:
                             fixture.loop.refresh_for_supply()
 
                 self.assertEqual(raised.exception.reason, expected)
@@ -1257,7 +1257,7 @@ class OnDemandRefreshTest(unittest.TestCase):
             outcome=FeishuDirectoryErrorForTests(f"body-with-{FAKE_ACCESS_TOKEN}")
         )
 
-        with self.assertRaises(AccessTokenUnavailable) as raised:
+        with self.assertRaises(AccessTokenUnavailableError) as raised:
             fixture.loop.refresh_for_supply()
 
         self.assertTrue(raised.exception.__suppress_context__, "标准 traceback 不得展示原始异常")
@@ -1322,7 +1322,7 @@ class OnDemandRefreshTest(unittest.TestCase):
         self.assertFalse(holder.has_token)
         self.assertEqual(len(vault.saved), 1, "凭据照常落盘，消费标记也已经写下")
 
-        with self.assertRaises(AccessTokenUnavailable) as raised:
+        with self.assertRaises(AccessTokenUnavailableError) as raised:
             loop.refresh_for_supply()
 
         self.assertEqual(raised.exception.reason, "derived_token_unusable")
@@ -1341,7 +1341,7 @@ class OnDemandRefreshTest(unittest.TestCase):
         )
 
         with self.assertLogs("lingxi.apps.scheduler", level="WARNING"):
-            with self.assertRaises(AccessTokenUnavailable) as raised:
+            with self.assertRaises(AccessTokenUnavailableError) as raised:
                 fixture.loop.refresh_for_supply()
 
         self.assertEqual(raised.exception.reason, "derived_token_unusable")
@@ -1349,7 +1349,7 @@ class OnDemandRefreshTest(unittest.TestCase):
         self.assertEqual(len(fixture.vault.saved), 1, "凭据照常落盘，不撤销")
 
         # 当天后续每一轮都继续报真实原因，而不是例行的"今天已经换过了"。
-        with self.assertRaises(AccessTokenUnavailable) as again:
+        with self.assertRaises(AccessTokenUnavailableError) as again:
             fixture.loop.refresh_for_supply()
         self.assertEqual(again.exception.reason, "derived_token_unusable")
 
@@ -1365,7 +1365,7 @@ class OnDemandRefreshTest(unittest.TestCase):
         fixture = build_supply_loop(claims=[_Claim(), _Claim()], lifetime=None)
 
         with self.assertLogs("lingxi.apps.scheduler", level="WARNING"):
-            with self.assertRaises(AccessTokenUnavailable):
+            with self.assertRaises(AccessTokenUnavailableError):
                 fixture.loop.refresh_for_supply()
 
         # 第二天：别人先完成了一次消费，凭据上记着的是**那一次**的时刻（距现在仅
@@ -1373,7 +1373,7 @@ class OnDemandRefreshTest(unittest.TestCase):
         fixture.clock.advance(timedelta(days=1))
         fixture.vault.consumed_at = fixture.clock.now
 
-        with self.assertRaises(AccessTokenUnavailable) as raised:
+        with self.assertRaises(AccessTokenUnavailableError) as raised:
             fixture.loop.refresh_for_supply()
 
         self.assertEqual(raised.exception.reason, "refresh_min_interval_not_elapsed")
@@ -1387,10 +1387,10 @@ class OnDemandRefreshTest(unittest.TestCase):
         fixture = build_supply_loop(claims=[_Claim(), _Claim()], lifetime=None)
 
         with self.assertLogs("lingxi.apps.scheduler", level="WARNING"):
-            with self.assertRaises(AccessTokenUnavailable):
+            with self.assertRaises(AccessTokenUnavailableError):
                 fixture.loop.refresh_for_supply()
 
-        with self.assertRaises(AccessTokenUnavailable) as raised:
+        with self.assertRaises(AccessTokenUnavailableError) as raised:
             fixture.restart().refresh_for_supply()
 
         self.assertEqual(raised.exception.reason, "refresh_min_interval_not_elapsed")
@@ -1401,7 +1401,7 @@ class OnDemandRefreshTest(unittest.TestCase):
         fixture = build_supply_loop(claims=[_Claim()], lifetime=None)
 
         with self.assertLogs("lingxi.apps.scheduler", level="WARNING"):
-            with self.assertRaises(AccessTokenUnavailable):
+            with self.assertRaises(AccessTokenUnavailableError):
                 fixture.loop.refresh_for_supply()
 
         fixture.vault.reauthorize()
@@ -1422,7 +1422,7 @@ class OnDemandRefreshTest(unittest.TestCase):
         fixture = build_supply_loop(claims=[_Claim(), _Claim()], lifetime=None)
 
         with self.assertLogs("lingxi.apps.scheduler", level="WARNING"):
-            with self.assertRaises(AccessTokenUnavailable):
+            with self.assertRaises(AccessTokenUnavailableError):
                 fixture.loop.refresh_for_supply()
         self.assertIsNotNone(fixture.loop._derived_unusable_at)  # noqa: SLF001
 
@@ -1656,9 +1656,9 @@ class SupplyFailureSemanticsTest(unittest.TestCase):
         from lingxi.adapters.feishu_roster_bitable import read_roster_snapshot
 
         def failing() -> str:
-            raise AccessTokenUnavailable("no_credential_available")
+            raise AccessTokenUnavailableError("no_credential_available")
 
-        with self.assertRaises(AccessTokenUnavailable) as raised:
+        with self.assertRaises(AccessTokenUnavailableError) as raised:
             read_roster_snapshot(self._pages(failing))
 
         self.assertEqual(raised.exception.reason, "no_credential_available")
@@ -1676,7 +1676,7 @@ class SupplyFailureSemanticsTest(unittest.TestCase):
 
             def run_once(self):
                 self.rounds += 1
-                raise AccessTokenUnavailable("credential_persist_failed")
+                raise AccessTokenUnavailableError("credential_persist_failed")
 
         class OtherDuty:
             name = "保留清理"
@@ -1849,7 +1849,7 @@ class AssembledSupplyTest(unittest.TestCase):
         rotation = loop.duties[0]
         self.assertFalse(rotation.derived_token_holder.has_token)
 
-        with self.assertRaises(AccessTokenUnavailable) as raised:
+        with self.assertRaises(AccessTokenUnavailableError) as raised:
             supply()
 
         self.assertEqual(raised.exception.reason, "no_credential_available")
@@ -1873,7 +1873,7 @@ class AssembledSupplyTest(unittest.TestCase):
             return None
 
         with mock.patch.object(HostFileDelegatedCredentialVault, "claim_due", spy):
-            with self.assertRaises(AccessTokenUnavailable) as raised:
+            with self.assertRaises(AccessTokenUnavailableError) as raised:
                 supply()
 
         self.assertEqual(raised.exception.reason, "no_credential_available")

@@ -117,12 +117,8 @@ class PermissionTableAccessTokenProvider:
             )
 
 
-#: 向后兼容别名，供既有导入方使用。
-PermissionTableAccessTokenUnavailable = PermissionTableAccessTokenUnavailableError
-
 __all__ = [
     "TABLE_TOKEN_SUPPLY_FAILURE_REASONS",
     "PermissionTableAccessTokenProvider",
-    "PermissionTableAccessTokenUnavailable",
     "PermissionTableAccessTokenUnavailableError",
 ]

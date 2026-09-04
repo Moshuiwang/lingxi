@@ -15,7 +15,7 @@ from typing import Any, Protocol
 
 from lingxi.apps.scheduler.config import DEFAULT_INTERVAL_SECONDS
 from lingxi.core.identity.access_token_supply import (
-    AccessTokenUnavailable,
+    AccessTokenUnavailableError,
     DerivedAccessTokenHolder,
 )
 from lingxi.core.identity.credentials import (
@@ -23,10 +23,10 @@ from lingxi.core.identity.credentials import (
     CredentialAction,
     CredentialSaveOutcome,
     DerivedAccessToken,
-    RefreshDailyLimitReached,
-    RefreshMinIntervalNotElapsed,
+    RefreshDailyLimitReachedError,
+    RefreshMinIntervalNotElapsedError,
     RefreshOutcome,
-    RefreshRateLimited,
+    RefreshRateLimitedError,
     decide_after_refresh,
 )
 from lingxi.core.identity.identifiers import redact_identifier
@@ -237,18 +237,18 @@ class CredentialRotationLoop:
         ``for_supply=True``：由凭据库在自己的文件锁内、用锁内的当前时刻判定
         两道频率上界（最小间隔、每日次数），因此上界只有一份判据、一个时钟，
         进程重启、崩溃循环、同宿主机第二实例都绕不过它。失败一律抛
-        :class:`AccessTokenUnavailable`，只带分类、不带值。
+        :class:`AccessTokenUnavailableError`，只带分类、不带值。
         """
         if self._stop.is_set():
             # 停止中不再开启任何一次续期：半途中断的续期等于凭据丢失（模块头注释）。
-            raise AccessTokenUnavailable("scheduler_stopping")
+            raise AccessTokenUnavailableError("scheduler_stopping")
         try:
             claim = self._vault.claim_due(for_supply=True)
-        except RefreshRateLimited as error:
-            raise AccessTokenUnavailable(self._refusal_reason(error)) from None
+        except RefreshRateLimitedError as error:
+            raise AccessTokenUnavailableError(self._refusal_reason(error)) from None
         if claim is None:
             # 没有可领取的凭据（未授权、已撤销、或正被另一条链消费中）。
-            raise AccessTokenUnavailable("no_credential_available")
+            raise AccessTokenUnavailableError("no_credential_available")
         consumed_at = getattr(claim, "consumed_at", None) or self._clock()
         # 这次领取之后应有的当日消费计数，由凭据库在锁内算好并随领取交出；
         # 原样写回，不在这里另算一份。
@@ -269,7 +269,7 @@ class CredentialRotationLoop:
             self._vault.revoke(reason=f"refresh_{outcome.value}", generation=claim_generation)
             # from None：原始异常留在 __cause__ 里，任何一次 traceback 打印都会把响应
             # 正文（可能含令牌）带进日志。排障信息以净化过的类名走上面那行日志。
-            raise AccessTokenUnavailable(f"refresh_{outcome.value}") from None
+            raise AccessTokenUnavailableError(f"refresh_{outcome.value}") from None
 
         self._finish_supply_refresh(
             claim,
@@ -292,7 +292,7 @@ class CredentialRotationLoop:
     ) -> None:
         """把按需续期的新凭据落盘并交出派生令牌（:meth:`refresh_for_supply` 拆出）。
 
-        任何非成功结果都转成 :class:`AccessTokenUnavailable`，不静默返回。
+        任何非成功结果都转成 :class:`AccessTokenUnavailableError`，不静默返回。
         """
         saved = self._save_with_retry(
             subject_open_id=claim.subject_open_id,
@@ -309,7 +309,7 @@ class CredentialRotationLoop:
             self._vault.revoke(reason="rotation_persist_failed", generation=claim_generation)
             # 落盘失败就**不交出令牌**：让日报这一轮失败，好过在凭据已经丢失的情况下
             # 照常发出日报、把丢失掩盖到下一次轮换才被发现。
-            raise AccessTokenUnavailable("credential_persist_failed")
+            raise AccessTokenUnavailableError("credential_persist_failed")
         if saved is CredentialSaveOutcome.SUPERSEDED:
             # 期间有新授权：本链的新凭据被丢弃，旧的已在飞书那边作废。不撤销（新凭据
             # 不能被旧链连带删掉），但同样**什么都不交出**——这条链已经没有活着的凭据了。
@@ -317,14 +317,14 @@ class CredentialRotationLoop:
                 "按需续期的结果已被期间的新授权取代，本链结果作废，派生短期令牌不予交出 subject=%s",
                 redact_identifier(claim.subject_open_id),
             )
-            raise AccessTokenUnavailable("no_credential_available")
+            raise AccessTokenUnavailableError("no_credential_available")
 
         logger.info("专用授权凭据已按需轮换 subject=%s", redact_identifier(claim.subject_open_id))
         if not self._remember_derived(derived, consumed_at=consumed_at):
             # 凭据没有丢（已落盘），只是这份派生令牌不可用。不撤销、不重试。
-            raise AccessTokenUnavailable("derived_token_unusable")
+            raise AccessTokenUnavailableError("derived_token_unusable")
 
-    def _refusal_reason(self, error: RefreshRateLimited) -> str:
+    def _refusal_reason(self, error: RefreshRateLimitedError) -> str:
         """被频率上界拒绝时，对外报哪个分类。
 
         默认按异常的具体类型报对应上界（最小间隔 / 当日上界，两者是不同的运维
@@ -337,9 +337,9 @@ class CredentialRotationLoop:
         """
         if self._derived_unusable_at is not None and self._derived_unusable_at == error.consumed_at:
             return "derived_token_unusable"
-        if isinstance(error, RefreshMinIntervalNotElapsed):
+        if isinstance(error, RefreshMinIntervalNotElapsedError):
             return "refresh_min_interval_not_elapsed"
-        if isinstance(error, RefreshDailyLimitReached):
+        if isinstance(error, RefreshDailyLimitReachedError):
             return "refresh_daily_limit_reached"
         raise AssertionError(
             f"未覆盖的频率上界异常类型：{type(error).__name__}"

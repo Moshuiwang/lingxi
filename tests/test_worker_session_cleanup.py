@@ -1,7 +1,7 @@
 """Issue #153：Agent 会话 JSONL 物理清理的文件系统层断言（真实临时目录）。
 
 只覆盖 ``apps/worker/session_cleanup.py`` 本身——数据库侧三个触发点（``/new``、
-空闲到点、停用/权限变化）的排队逻辑与 ``WorkerService._cleanup_agent_sessions``
+空闲到点、停用/权限变化）的排队逻辑与 ``QueueHousekeeper._cleanup_agent_sessions``（经 ``WorkerService._housekeeper``）
 的认领/标记完成逻辑分别在 ``tests/test_delivery_outbox.py``（真库）与
 ``tests/test_worker_queue_consumer.py`` 覆盖。
 
@@ -216,7 +216,7 @@ class ArchiveOnCleanupTests(unittest.TestCase):
     """Issue #291 L6 取证结论（2026-08-22）：验收现场的一次 ``/new`` 触发
     ``agent_session_cleanup``，把出事那次回合的会话 JSONL 物理删除、毁了取证
     现场。这组用例覆盖"删除前先归档"这条新行为，夹具用真实调用形状——
-    ``WorkerService._cleanup_agent_sessions`` 会传 ``user_env_root``/``user_id``，
+    ``QueueHousekeeper._cleanup_agent_sessions``（经 ``WorkerService._housekeeper``）会传 ``user_env_root``/``user_id``，
     见 ``tests/test_worker_queue_consumer.py`` 里对应的接线断言。"""
 
     def test_archives_instead_of_deleting_when_user_env_root_and_user_id_are_given(

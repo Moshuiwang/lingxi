@@ -31,7 +31,7 @@ from lingxi.core.identity.onboarding_runner import (
     STATE_PROVISIONING,
 )
 from lingxi.core.identity.preprovision import is_system_trigger
-from lingxi.core.permission.mcp_readiness import ReadinessSchedule
+from lingxi.core.permission.mcp_readiness_base import ReadinessSchedule
 
 logger = logging.getLogger(__name__)
 

@@ -35,9 +35,9 @@ from lingxi.core.admin.pending_action import (
     CancelDecision,
     ConfirmDecision,
     PendingAction,
-    PendingActionAuditWriteFailed,
+    PendingActionAuditWriteFailedError,
     PendingActionStatus,
-    PendingActionTransientFailure,
+    PendingActionTransientFailureError,
     PendingActionType,
     PrepareDecision,
     decide_cancel,
@@ -74,7 +74,7 @@ class AuditSink(Protocol):
     签名本身不接收连接对象，"审计与状态变更同事务"由
     :meth:`~PostgresPendingActionStore.confirm`/:meth:`~.cancel` 在同一个
     ``with connection.transaction()`` 块内调用它来实现：调用失败即异常向上
-    传播，事务整体回滚（见两个方法的实现与 :class:`PendingActionAuditWriteFailed`）。
+    传播，事务整体回滚（见两个方法的实现与 :class:`PendingActionAuditWriteFailedError`）。
     """
 
     def record(self, action: str, /, **fields: object) -> None:
@@ -382,12 +382,12 @@ class PostgresPendingActionStore(_ExecutionMixin):
     ) -> ConfirmOutcome:
         """确认卡片"确认执行"按钮的完整事务，详见 ``decide_confirm`` 分支文档。
 
-        审计写入失败时整个事务回滚，包装为 :class:`PendingActionAuditWriteFailed`
+        审计写入失败时整个事务回滚，包装为 :class:`PendingActionAuditWriteFailedError`
         向上抛出。**"同一事务"只在失败方向成立**：``audit.record()`` 是结构化
         日志出口，不参与 PostgreSQL 的提交/回滚（全仓 ``AuditSink`` 抽象的
         既有性质）。角色核对同样在这个事务、这个连接内完成（见
         :meth:`_lock_admin_registry_entry`），消除 TOCTOU 窗口；数据库瞬时
-        故障转译为 ``PendingActionTransientFailure``；执行体是
+        故障转译为 ``PendingActionTransientFailureError``；执行体是
         :meth:`_confirm_locked`。
         """
         from psycopg.errors import OperationalError
@@ -399,7 +399,7 @@ class PostgresPendingActionStore(_ExecutionMixin):
                 now=now,
             )
         except OperationalError as error:
-            raise PendingActionTransientFailure(type(error).__name__) from error
+            raise PendingActionTransientFailureError(type(error).__name__) from error
 
         if pending is None:
             return ConfirmOutcome(decision=decision, pending=None)
@@ -492,7 +492,7 @@ class PostgresPendingActionStore(_ExecutionMixin):
                 now=now,
             )
         except OperationalError as error:
-            raise PendingActionTransientFailure(type(error).__name__) from error
+            raise PendingActionTransientFailureError(type(error).__name__) from error
 
         if pending is None:
             return CancelOutcome(decision=decision, pending=None)
@@ -533,7 +533,7 @@ class PostgresPendingActionStore(_ExecutionMixin):
                                 clicker=clicker_open_id,
                             )
                         except Exception as error:  # 见 confirm() 同一姿态
-                            raise PendingActionAuditWriteFailed(
+                            raise PendingActionAuditWriteFailedError(
                                 "取消操作的审计写入失败，事务已回滚，操作未执行"
                             ) from error
 

@@ -1309,7 +1309,7 @@ class AgentSessionCleanupQueueTests(DeliveryOutboxTestCase):
 
 
 class WorkerServiceHousekeepingIntegrationTests(DeliveryOutboxTestCase):
-    """WorkerService._housekeep() 真的接线了到期清理，不只是 adapter 层有方法。"""
+    """WorkerService（经 QueueHousekeeper）真的接线了到期清理，不只是 adapter 层有方法。"""
 
     def test_process_once_expires_stale_awaiting_delivery_tasks(self) -> None:
         self.seed_running_task(task_id="tsk-1", conversation_id="cnv-1", status="awaiting_delivery")

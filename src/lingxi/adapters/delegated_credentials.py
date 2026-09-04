@@ -31,8 +31,8 @@ from lingxi.adapters.delegated_subject_lookup import (
 from lingxi.adapters.postgres import DEFAULT_POSTGRES_TIMEOUTS, PostgresTimeouts, connect
 from lingxi.core.identity.credentials import (
     AuthorizationGrant,
-    RefreshDailyLimitReached,
-    RefreshMinIntervalNotElapsed,
+    RefreshDailyLimitReachedError,
+    RefreshMinIntervalNotElapsedError,
     SecretToken,
     expiry_moment,
     rotation_deadline,
@@ -546,9 +546,9 @@ def _check_supply_rate_limits(
     继续被同一道上界拒绝。
     """
     if last_consumed_at is not None and moment - last_consumed_at < min_interval:
-        raise RefreshMinIntervalNotElapsed(consumed_at=last_consumed_at)
+        raise RefreshMinIntervalNotElapsedError(consumed_at=last_consumed_at)
     if count_today >= daily_limit:
-        raise RefreshDailyLimitReached(consumed_at=last_consumed_at)
+        raise RefreshDailyLimitReachedError(consumed_at=last_consumed_at)
     return count_today + 1
 
 

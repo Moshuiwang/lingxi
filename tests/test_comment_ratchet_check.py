@@ -117,9 +117,17 @@ class RealBaselineIsHonestTest(unittest.TestCase):
             self.assertIn(category, CHECK.CATEGORIES)
             self.assertTrue(path.startswith("src/lingxi/"), path)
 
-    def test_committed_baseline_is_not_accidentally_empty(self) -> None:
+    def test_committed_baseline_is_empty_after_the_cleanup(self) -> None:
+        """自证：rc25 B-8a 收官批把最后 4 条 provenance 登记清零之后，基线回到空
+        文件——这是棘轮的目标终态（与 function_size_ratchet 归零时同一姿态）。
+
+        空基线下棘轮退化为「任何 (类别, 路径) 首次出现非零计数即判红」，
+        「未登记判红」这条规则由 :class:`EvaluateTest` 的固定样本用例覆盖，
+        不再依赖真实仓库里恰好存在非零登记。
+        """
+
         baseline = CHECK.load_baseline(CHECK.BASELINE_PATH)
-        self.assertGreater(len(baseline), 0)
+        self.assertEqual(baseline, {})
 
 
 class RunRefreshClassificationTest(unittest.TestCase):

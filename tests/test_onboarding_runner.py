@@ -67,14 +67,14 @@ from lingxi.core.identity.stock_token_source import (
     StockTokenLookup,
 )
 from lingxi.core.permission.local_override import LocalPermissionOverrideEntry, OverrideDirection
-from lingxi.core.permission.mcp_readiness import ReadinessOutcome
+from lingxi.core.permission.mcp_readiness_base import ReadinessOutcome
 from lingxi.core.permission.merge_sources import (
     REASON_GRANT_REDUNDANT_WILDCARD,
     REASON_LOCAL_OVERRIDE_READ_FAILED,
     REASON_SUPPRESS_INAPPLICABLE_WILDCARD,
 )
 from lingxi.core.permission.metric_translation import translate_company_functions
-from lingxi.core.permission.publish import PermissionGrantBlockedByAccountState
+from lingxi.core.permission.publish import PermissionGrantBlockedByAccountStateError
 from lingxi.core.permission.publish_row import ADMIN_FULL_ACCESS_FUNCTION
 
 UTC = UTC
@@ -453,7 +453,7 @@ class FakeDecisions:
         self.reasons: list[str] = []
         self.require_enabled_account: list[bool] = []
         self.loads = 0
-        # Issue #483：非空时照真实实现抛 ``PermissionGrantBlockedByAccountState``，
+        # Issue #483：非空时照真实实现抛 ``PermissionGrantBlockedByAccountStateError``，
         # 用来钉死"开通链被账号状态挡住时收敛到既有停用终态"这条收口。
         self._blocked_account_state = blocked_account_state
 
@@ -471,7 +471,7 @@ class FakeDecisions:
         assert require_enabled_account is True, "首次开通必须声明需要账号有效"
         self.require_enabled_account.append(require_enabled_account)
         if self._blocked_account_state is not None:
-            raise PermissionGrantBlockedByAccountState(self._blocked_account_state)
+            raise PermissionGrantBlockedByAccountStateError(self._blocked_account_state)
         self.rows.append(row)
         self.reasons.append(reason)
         return FakeDecision(enqueued=self._enqueued, permission_version=7, outbox_id="pub_1")

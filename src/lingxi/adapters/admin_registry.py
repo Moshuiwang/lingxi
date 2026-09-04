@@ -23,7 +23,7 @@ from lingxi.adapters.postgres_local_permission import PostgresLocalPermissionOve
 from lingxi.adapters.postgres_onboarding_failure import fetch_failure_reason
 from lingxi.core.admin.registry import (
     AdminRegistryEntry,
-    AdminRegistrySeedConflict,
+    AdminRegistrySeedConflictError,
     AdminRole,
 )
 from lingxi.core.admin.views import (
@@ -570,7 +570,7 @@ def seed_admin_registry_entry(
     不存在，没有"部分角色"的中间态（与迁移 ``0067`` 的 ``CHECK`` 同一约束
     两层编码）。``ON CONFLICT`` 命中时不插入不覆盖，但"没插入"不能直接当
     "幂等成功"——须回读逐字段核验，不通过抛 :class:`~lingxi.core.admin.
-    registry.AdminRegistrySeedConflict`。返回 ``True`` 表示新插入；``False``
+    registry.AdminRegistrySeedConflictError`。返回 ``True`` 表示新插入；``False``
     表示既有行核验通过。这是本表**唯一**的写入口。
     """
     if not feishu_open_id or not feishu_open_id.strip():
@@ -620,7 +620,9 @@ def _verify_seeded_row(existing: tuple | None, *, normalized_label: str) -> None
         # 结构上不应该发生：ON CONFLICT 命中即说明上面那一刻这一行存在，而本表
         # 唯一的写入口就是本函数本身，两条语句之间没有任何删除路径。响亮失败，
         # 好过把"读不到"悄悄当成某种默认结论。
-        raise AdminRegistrySeedConflict(mismatched_fields=("row_disappeared_between_statements",))
+        raise AdminRegistrySeedConflictError(
+            mismatched_fields=("row_disappeared_between_statements",)
+        )
 
     # 不再核对 entry_status：上面那条 SELECT 已经用 `entry_status = 'active'`
     # 过滤，读到行就意味着它是 'active'，再比一次是永远为真的死分支。
@@ -631,4 +633,4 @@ def _verify_seeded_row(existing: tuple | None, *, normalized_label: str) -> None
     if not (permission_granted and ops_granted and super_granted):
         mismatched.append("roles")
     if mismatched:
-        raise AdminRegistrySeedConflict(mismatched_fields=tuple(mismatched))
+        raise AdminRegistrySeedConflictError(mismatched_fields=tuple(mismatched))

@@ -23,8 +23,8 @@ from lingxi.adapters.postgres_conversation import _Transaction as _ConversationT
 from lingxi.core.ids import new_id
 from lingxi.core.permission.publish import (
     ACCOUNT_STATE_ENABLED,
-    PermissionDecisionTransientFailure,
-    PermissionGrantBlockedByAccountState,
+    PermissionDecisionTransientFailureError,
+    PermissionGrantBlockedByAccountStateError,
 )
 from lingxi.core.permission.publish_row import (
     CREATED_FIELD_NAMES,
@@ -111,7 +111,7 @@ class _DecisionMixin:
         交给 :meth:`_record_decision_locked` 执行；输入校验见 :meth:`_validate_decision_inputs`；``require_enabled_account``
         的账号有效性核对发生在已持有的行锁内，见 :meth:`_lock_target_user`
         文档。数据库瞬时故障转译为
-        :class:`~lingxi.core.permission.publish.PermissionDecisionTransientFailure`
+        :class:`~lingxi.core.permission.publish.PermissionDecisionTransientFailureError`
         （事务已整体回滚），不向上传播成裸 psycopg 异常。
         """
         self._validate_decision_inputs(row, require_enabled_account)
@@ -131,7 +131,7 @@ class _DecisionMixin:
                 clear_delivered_content=clear_delivered_content,
             )
         except OperationalError as error:
-            raise PermissionDecisionTransientFailure(type(error).__name__) from error
+            raise PermissionDecisionTransientFailureError(type(error).__name__) from error
 
     @staticmethod
     def _validate_decision_inputs(row: PublishRow, require_enabled_account: bool) -> None:
@@ -239,7 +239,7 @@ class _DecisionMixin:
                 account_state,
                 reason,
             )
-            raise PermissionGrantBlockedByAccountState(account_state)
+            raise PermissionGrantBlockedByAccountStateError(account_state)
         return version, account_state
 
     @staticmethod

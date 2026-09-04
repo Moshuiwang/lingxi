@@ -34,7 +34,7 @@ from lingxi.core.admin.pending_action import (
     ConfirmDecision,
     ConfirmResultKind,
     PendingAction,
-    PendingActionAuditWriteFailed,
+    PendingActionAuditWriteFailedError,
     PendingActionStatus,
     PendingActionType,
     PrepareDecision,
@@ -852,7 +852,7 @@ class _ExecutionMixin:
                 clicker=clicker_open_id,
             )
         except Exception as error:  # 见类文档，失败即整体回滚
-            raise PendingActionAuditWriteFailed(
+            raise PendingActionAuditWriteFailedError(
                 "确认操作的审计写入失败，事务已回滚，操作未执行"
             ) from error
 
