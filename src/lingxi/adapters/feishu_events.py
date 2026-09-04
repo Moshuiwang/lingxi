@@ -22,8 +22,8 @@ from lingxi.core.conversation.ports import InboundMessage
 from lingxi.core.ids import new_id
 
 # 本切片消费的事件类型。``im.chat.member.bot.deleted_v1`` 仍不在本批处理，但收到时
-# 不得让长连接崩溃（`V-接入-12`）。``card.action.trigger`` 自 Issue #96 S-M-02 起
-# 由 :func:`parse_card_action_event` 解析（管理员确认卡片的按钮回调）。
+# 不得让长连接崩溃（`V-接入-12`）。``card.action.trigger`` 由
+# :func:`parse_card_action_event` 解析（管理员确认卡片的按钮回调）。
 MESSAGE_RECEIVE_EVENT = "im.message.receive_v1"
 
 #: 管理员确认卡片按钮点击回调（合同"待确认操作"闭环）。真实事件体字段未经真实
@@ -54,11 +54,10 @@ class NonPrivateChatError(EventParseError):
     单独成类而不是复用 ``EventParseError``：这不是"读不懂"，是"读懂了、而且明确
     不该受理"。调用方要能把它记成一条**越界拒绝**的审计，而不是混进解析失败里。
 
-    ``mentioned_open_ids``/``chat_id``/``message_id``（Issue #318 群聊@机器人固定
-    引导）：三者只服务"要不要回一句固定引导"这一个判定，不是任务归属来源——
-    `V-接入-11` 仍然只认 ``sender.sender_id.open_id`` 一个键，本类完全不参与任务
-    归属。三者都按"读不出就是没有"处理：缺字段、类型不对时一律取空值，绝不会
-    因为这几个新字段读取失败而改变本类原有的抛出行为或 ``chat_type``/消息文案。
+    ``mentioned_open_ids``/``chat_id``/``message_id``：三者只服务"要不要回
+    一句固定引导"这一个判定，不是任务归属来源——`V-接入-11` 仍然只认
+    ``sender.sender_id.open_id`` 一个键。三者都按"读不出就是没有"处理，绝不
+    会因为这几个新字段读取失败而改变本类原有的抛出行为或消息文案。
     """
 
     def __init__(
@@ -69,6 +68,7 @@ class NonPrivateChatError(EventParseError):
         chat_id: str | None = None,
         message_id: str | None = None,
     ) -> None:
+        """记录被拒绝的 chat_type，及群聊@固定引导判定要用的三个可选字段。"""
         super().__init__(f"非私聊消息，本产品只服务飞书私聊：chat_type={chat_type!r}")
         self.chat_type = chat_type
         self.mentioned_open_ids = mentioned_open_ids
@@ -113,16 +113,14 @@ def message_text(content: object, message_type: object) -> str:
 
 
 def _mentioned_open_ids(message: Mapping[str, Any] | None) -> tuple[str, ...]:
-    """从消息体的 ``mentions`` 段读出被 @ 的飞书用户 open_id（Issue #318）。
+    """从消息体的 ``mentions`` 段读出被 @ 的飞书用户 open_id。
 
     只服务群聊@机器人固定引导这一条判定路径，不是任务归属来源——`V-接入-11`
     的唯一来源仍然是 ``sender.sender_id.open_id``，本函数读到的值从不进入
-    ``InboundMessage``。**证据等级 1**：字段形状（``message.mentions[].id.open_id``）
-    依据飞书《接收消息》事件回调的公开文档结构
-    （https://open.feishu.cn/document/server-docs/im-v1/message/events/receive），
-    真实群聊 @ 事件体是否逐字段吻合未经真实回调验证。结构不对、字段缺失一律返回
-    空元组而不是抛错——读不出被 @ 的人只意味着"当作没有人被 @"，不能因为这一段
-    可选信息影响 ``NonPrivateChatError`` 本身的抛出（见该类文档）。
+    ``InboundMessage``。**证据等级 1**：字段形状依据飞书公开文档结构，真实
+    群聊 @ 事件体是否逐字段吻合未经真实回调验证。结构不对、字段缺失一律
+    返回空元组而不是抛错，不能因为这一段可选信息影响
+    ``NonPrivateChatError`` 本身的抛出。
     """
     if not isinstance(message, Mapping):
         return ()
@@ -137,6 +135,24 @@ def _mentioned_open_ids(message: Mapping[str, Any] | None) -> tuple[str, ...]:
         if open_id is not None:
             open_ids.append(open_id)
     return tuple(open_ids)
+
+
+def _reject_non_private_chat(message: Mapping[str, Any]) -> None:
+    """群聊边界：在构造 ``InboundMessage`` 之前拒绝，非私聊消息因此进不了管线。
+
+    只认显式的 ``p2p``，缺字段也拒绝——默认放行的代价是把群聊内容当私聊
+    处理（越界，且可能泄漏到不该看见的人面前），默认拒绝的代价只是漏收，
+    前者不可逆、后者可观察可修。抛出之前顺手带上 mentions/chat_id/
+    message_id 只服务"要不要回一句群聊@固定引导"，不改变本函数的抛出行为。
+    """
+    chat_type = _text(message, "chat_type")
+    if chat_type != PRIVATE_CHAT_TYPE:
+        raise NonPrivateChatError(
+            chat_type,
+            mentioned_open_ids=_mentioned_open_ids(message),
+            chat_id=_text(message, "chat_id"),
+            message_id=_text(message, "message_id"),
+        )
 
 
 def parse_message_event(
@@ -170,27 +186,7 @@ def parse_message_event(
     if not isinstance(message, Mapping):
         raise EventParseError("事件体缺少 message 段")
 
-    # 群聊边界：在构造 ``InboundMessage`` **之前**拒绝，因此非私聊消息进不了管线,
-    # 既不加表情也不回复、更不会入队。放在这里而不是管线里，是因为管线的每一步
-    # 都已经预设了私聊语义（话题串行按 conversation 一行、/new 清当前对话），
-    # 让群聊消息走进去再判定，等于给它们建了一条只差最后一步的通路。
-    #
-    # **只认显式的 `p2p`，缺字段也拒绝。** 与仓库既有的拒绝式白名单同一姿态：
-    # 默认放行的代价是把群聊内容当私聊处理（越界、且可能泄漏到不该看见的人面前），
-    # 默认拒绝的代价只是漏收——后者可观察、可修，前者不可逆。
-    #
-    # 抛出之前顺手读一份 mentions/chat_id/message_id（Issue #318 群聊@机器人固定
-    # 引导）：只能在这里读，`NonPrivateChatError` 一旦抛出，调用方手里就只有异常
-    # 对象本身，没有别的机会再摸一次原始事件体。三者都经 `_text`/`_mentioned_
-    # open_ids`——两者都不会抛错，因此这几行不改变本分支原有的抛出行为。
-    chat_type = _text(message, "chat_type")
-    if chat_type != PRIVATE_CHAT_TYPE:
-        raise NonPrivateChatError(
-            chat_type,
-            mentioned_open_ids=_mentioned_open_ids(message),
-            chat_id=_text(message, "chat_id"),
-            message_id=_text(message, "message_id"),
-        )
+    _reject_non_private_chat(message)
 
     message_id = _require(_text(message, "message_id"), "message_id")
     chat_id = _require(_text(message, "chat_id"), "chat_id")
@@ -213,8 +209,10 @@ def parse_message_event(
 
 
 class CardActionParseError(EventParseError):
-    """``card.action.trigger`` 事件体缺少必需字段或形状不对。与 ``EventParseError``
-    同一处理姿态：调用方记审计后继续收下一条，不当作连接故障。
+    """``card.action.trigger`` 事件体缺少必需字段或形状不对。
+
+    与 ``EventParseError`` 同一处理姿态：调用方记审计后继续收下一条，不
+    当作连接故障。
     """
 
 
@@ -222,25 +220,13 @@ class CardActionParseError(EventParseError):
 class CardActionEvent:
     """一条已从飞书卡片回调事件体里解析出来的按钮点击。
 
-    ``operator_open_id`` 是唯一的点击身份来源——与 ``parse_message_event`` 对
-    ``sender_open_id`` 的既有取舍相同（只信事件体里飞书自己标注的操作者字段，不
-    信任回传值 ``action_value`` 里任何自称的身份）。``action_value`` 只保留
-    :func:`~lingxi.core.admin.notification.render_confirm_card` 建卡时写进按钮的
-    ``pending_action_id``/``decision`` 两个键，或
-    :mod:`~lingxi.core.admin.management_card` 建卡时写进按钮的
-    ``admin_action``/``identifier``/``override_id`` 若干键（原样透传，具体校验
-    交给 ``core/admin/card_callback.py``——本函数只负责"读出这段事件体写了
-    什么"，不做业务判断）。
-
-    ``action_name``/``form_value``（W0-1 追加结论，2026-08-30，真实点击实测）：
-    分别是按钮自身的 ``action.name``（建卡时写入的 ``grant_submit``/
-    ``suppress_submit`` 等）与 form 容器提交的字段值（``action.form_value``，
-    ``{字段 name: 已填值}``）。真实回调坐实：form 内提交按钮的 ``action.value``
-    经常不以 Mapping 形态到达（缺失或需要反序列化的字符串），下游
-    （``apps/gateway/__init__.py``）因此需要 ``action_name`` 作为不依赖
-    ``value`` 内容的路由后备判据；``form_value`` 原本由 gateway 自己从原始
-    payload 里另行读取，现在与 ``action_value`` 一起在本函数集中解析，单一
-    出处，不留第二份解析逻辑。
+    ``operator_open_id`` 是唯一的点击身份来源——与 ``parse_message_event``
+    对 ``sender_open_id`` 的既有取舍相同（只信事件体里飞书自己标注的操作者
+    字段）。``action_value`` 原样透传建卡时写进按钮的键，具体校验交给
+    ``core/admin/card_callback.py``。``action_name`` 是按钮自身的
+    ``action.name``；``form_value`` 是 form 容器提交的字段值——form 内提交
+    按钮的 ``action.value`` 经常不以 Mapping 形态到达，下游需要
+    ``action_name`` 作为不依赖 ``value`` 内容的路由后备判据。
     """
 
     event_id: str
@@ -252,10 +238,11 @@ class CardActionEvent:
 
 
 def _stringify_scalars(mapping: Mapping[str, Any]) -> dict[str, str]:
-    """只保留字符串/数字这类简单标量并统一转成字符串。不信任事件体里出现的
-    任何嵌套结构或意料之外的类型（结构上不给伪造回调可乘之机，即便真的出现了
-    也不会在这里崩溃，只会被 ``core/admin/card_callback.py`` 当成缺少必需
-    字段拒绝）。``action.value`` 与 ``action.form_value`` 共用这一份过滤。
+    """只保留字符串/数字这类简单标量并统一转成字符串。
+
+    不信任事件体里出现的任何嵌套结构或意料之外的类型（结构上不给伪造回调
+    可乘之机，即便真的出现了也不会在这里崩溃，只会被
+    ``core/admin/card_callback.py`` 当成缺少必需字段拒绝）。
     """
     return {
         str(key): str(value)
@@ -265,34 +252,21 @@ def _stringify_scalars(mapping: Mapping[str, Any]) -> dict[str, str]:
 
 
 # ``action.value`` 是字符串形态时允许的最大字节数。真实表单回调里 value 只装
-# render 建卡时写进去的少量标量键（admin_action/identifier/override_id 一类），
-# 正常在几百字节内；给一个宽松但有限的上限，专门挡住"伪造回调塞一大段畸形
-# JSON"这类可用性攻击（Issue #469 rc22 codex 外审第 1 轮抓到：深层嵌套 JSON 会
-# 触发 RecursionError，逃出下面的解析捕获升级成 gateway 未处理异常）。
+# 少量标量键，正常在几百字节内；给一个宽松但有限的上限，专门挡住"伪造回调
+# 塞一大段畸形 JSON"这类可用性攻击（深层嵌套 JSON 会触发 RecursionError，
+# 逃出解析捕获会升级成 gateway 未处理异常）。
 _MAX_ACTION_VALUE_JSON_BYTES = 8192
 
 
 def _parse_action_value(raw_value: object) -> Mapping[str, Any] | None:
-    """把 ``action.value`` 解析成 Mapping；三种到达形态兼容（W0-1 追加结论，
-    2026-08-30，真实点击实测坐实）：
+    """把 ``action.value`` 解析成 Mapping；三种到达形态兼容。
 
-    1. 已经是 Mapping——直接用（此前唯一认识的形态）。
-    2. 是一段字符串——尝试 ``json.loads``；解析结果是 Mapping 才采纳，否则
-       视为不可用（不是本函数应该猜测语义的场景）。
-    3. 缺失或其它类型——返回 ``None``，交给调用方决定是否还有
-       ``action.form_value`` 可以兜底（见 :func:`parse_card_action_event`）。
-
-    飞书官方文档（《卡片回传交互回调》）的示例把 ``value`` 标注为对象，与真实
-    表单提交回调实测到的字符串/缺失形态不一致——按"文档不明处以真实行为为准"
-    处理，本函数因此比文档描述更宽松，不因为文档只写了一种形态就拒绝其余两种
-    真实观察到的形态。
-
-    **加固（Issue #469 rc22 codex 外审第 1 轮）**：字符串形态先卡长度上限，再
-    ``json.loads``；捕获面从 ``(TypeError, ValueError)`` 扩到并含
-    ``RecursionError``——深层嵌套 JSON（``[[[…]]]``）抛的是 ``RecursionError``
-    （``RuntimeError`` 子类，不是 ``ValueError``），此前会逃出捕获、被上层当成
-    代码 bug 型未处理异常，让一条伪造回调升级成可重复的 gateway 可用性攻击。
-    任何解析失败一律按"不可用"返回 ``None``，与其余畸形形态同一失败关闭姿态。
+    已经是 Mapping 直接用；是字符串先卡长度上限（``_MAX_ACTION_VALUE_
+    JSON_BYTES``）再 ``json.loads``，解析结果是 Mapping 才采纳（捕获面含
+    ``RecursionError``：深层嵌套 JSON 抛的是它，任由它逃出会把一条伪造
+    回调升级成 gateway 可用性攻击）；缺失或其它类型返回 ``None``，交给
+    调用方决定是否还有 ``action.form_value`` 可以兜底。任何解析失败一律
+    按"不可用"返回 ``None``，同一失败关闭姿态。
     """
     if isinstance(raw_value, Mapping):
         return raw_value
@@ -312,32 +286,10 @@ def parse_card_action_event(
 ) -> CardActionEvent:
     """把一条 ``card.action.trigger`` 事件体解析成 :class:`CardActionEvent`。
 
-    **证据等级 1→部分 L4a**：``operator_open_id``/``event_id``/``action`` 段
-    结构本身仍未经真实回调验证；但 ``action.value`` 的到达形态（W0-1 追加
-    结论，2026-08-30）**已由真实点击坐实**——4 个 form 内提交按钮的真实回调
-    ``action.value`` 全部不以 Mapping 形态到达（缺失或字符串），此前的实现
-    （硬性要求 Mapping）会让这类真实回调在这里被整体拒绝
-    （``CardActionParseError``），管理卡表单提交因此从未真正到达
-    ``core/admin/card_callback.py``——这是本次要修的具体缺陷，不是假设性
-    加固。修复后的兼容策略见 :func:`_parse_action_value`。
-
-    **反伪造姿态不放宽**：``action.value`` 解析不出 Mapping、且
-    ``action.form_value`` 也不是 Mapping（两者都没有可用内容）时仍然
-    ``CardActionParseError``——"完全没有可用回传内容"与"有 form_value 说明这是
-    一次表单提交、只是 value 恰好没带上 admin_action"是两种不同的情况，前者
-    继续失败关闭，不猜测这是不是一次合法的卡片交互。
-
-    **2026-08-25 与 ``adapters/feishu_admin_card._card_payload`` 的按钮改动（顶层
-    元素 + ``behaviors`` 回调，替换此前的 ``action`` 容器）核对兼容性**：飞书
-    《配置卡片交互》与《卡片回传交互回调》两篇官方文档
-    （https://open.feishu.cn/document/feishu-cards/configuring-card-interactions、
-    https://open.feishu.cn/document/feishu-cards/card-callback-communication）的
-    示例代码都把 ``behaviors: [{"type": "callback", "value": {...}}]`` 里的
-    ``value`` 标注为回调事件 ``event.action.value`` 字段的来源，与本函数已经在读
-    的路径（``payload["event"]["action"]["value"]``）一致；两篇文档都没有把这个
-    路径描述成随按钮是否套 ``action`` 容器、或按钮是新 2.0 顶层形态还是旧形态而
-    变化。本函数因此不需要为新按钮形状新增兼容分支或改动解析路径本身（只改了
-    "读出来的值不是 Mapping 时怎么办"这一步，见上文）。
+    **证据等级 1→部分 L4a**：结构本身仍未经真实回调验证；``action.value``
+    的到达形态已由真实点击坐实——可能不以 Mapping 形态到达，兼容策略见
+    :func:`_parse_action_value`。反伪造姿态不放宽：两者都没有可用内容时
+    仍然抛 ``CardActionParseError``，不猜测这是不是一次合法的卡片交互。
     """
     if not isinstance(payload, Mapping):
         raise CardActionParseError("事件体不是一个对象")
@@ -360,16 +312,7 @@ def parse_card_action_event(
     if not isinstance(action, Mapping):
         raise CardActionParseError("事件体缺少 action 段")
 
-    value_mapping = _parse_action_value(action.get("value"))
-    raw_form_value = action.get("form_value")
-    form_value_mapping = raw_form_value if isinstance(raw_form_value, Mapping) else None
-
-    if value_mapping is None and form_value_mapping is None:
-        raise CardActionParseError("action 段缺少可用的 value 或 form_value")
-
-    action_value = _stringify_scalars(value_mapping or {})
-    form_value = _stringify_scalars(form_value_mapping or {})
-    action_name = _text(action, "name")
+    action_value, form_value, action_name = _parsed_action_fields(action)
 
     return CardActionEvent(
         event_id=event_id,
@@ -378,4 +321,28 @@ def parse_card_action_event(
         action_name=action_name,
         form_value=form_value,
         trace_id=trace_id or new_id("trc").split("_", 1)[1],
+    )
+
+
+def _parsed_action_fields(
+    action: Mapping[str, Any],
+) -> tuple[dict[str, str], dict[str, str], str | None]:
+    """从 ``action`` 段取出 ``(action_value, form_value, action_name)``。
+
+    两者都没有可用内容（``value`` 解析不出 Mapping 且 ``form_value`` 也
+    不是 Mapping）时抛 :class:`CardActionParseError`——"完全没有可用回传
+    内容"与"有 form_value 说明这是一次表单提交、只是 value 恰好没带上
+    admin_action"是两种不同的情况，前者继续失败关闭。
+    """
+    value_mapping = _parse_action_value(action.get("value"))
+    raw_form_value = action.get("form_value")
+    form_value_mapping = raw_form_value if isinstance(raw_form_value, Mapping) else None
+
+    if value_mapping is None and form_value_mapping is None:
+        raise CardActionParseError("action 段缺少可用的 value 或 form_value")
+
+    return (
+        _stringify_scalars(value_mapping or {}),
+        _stringify_scalars(form_value_mapping or {}),
+        _text(action, "name"),
     )
