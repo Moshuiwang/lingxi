@@ -5013,7 +5013,7 @@ class YearGroundingSuspectAlertTests(unittest.TestCase):
             start_date="2025-01-01",
             end_date="2025-08-25",
         )
-        with patch("lingxi.apps.worker.service.detect_year_grounding_suspect") as mock_detect:
+        with patch("lingxi.apps.worker.content_capture.detect_year_grounding_suspect") as mock_detect:
             queue = self._run_with_record(record)  # 不传 on_year_grounding_suspect
 
         mock_detect.assert_not_called()
@@ -5060,7 +5060,7 @@ class YearGroundingSuspectAlertTests(unittest.TestCase):
         )
         received: list[Mapping[str, object]] = []
         with patch(
-            "lingxi.apps.worker.service.detect_year_grounding_suspect",
+            "lingxi.apps.worker.content_capture.detect_year_grounding_suspect",
             side_effect=RuntimeError("模拟纯判定函数异常"),
         ):
             queue = self._run_with_record(record, on_year_grounding_suspect=received.append)

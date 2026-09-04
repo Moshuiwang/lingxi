@@ -7,9 +7,8 @@ import logging
 import time
 from collections.abc import Callable, Mapping
 from dataclasses import replace
-from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Any, Protocol
+from typing import Any
 
 from lingxi.adapters.postgres_conversation import ClaimedTask, TerminalTask
 from lingxi.adapters.user_mcp_config import UserMcpConfigError, load_user_mcp_servers
@@ -29,8 +28,23 @@ from lingxi.apps.worker.report_extraction import (
     failure_with_signature,
     sanitize_failure_signature,
 )
-from lingxi.apps.worker.session_cleanup import delete_agent_session_files, run_session_transcript_reclaim
-from lingxi.apps.worker.turn import MCP_BAD_GATEWAY_FAILURE_CODE, WorkerTurnExecutor
+from lingxi.apps.worker.content_capture import ContentCaptureRecorder
+from lingxi.apps.worker.housekeeping import QueueHousekeeper
+from lingxi.apps.worker.service_ports import (
+    ExecutorFactory,
+    HeartbeatCallback,
+    QueueListener,
+    TaskStuckCallback,
+    TerminalOutcomeCallback,
+    UserMemoryReader,
+    YearGroundingSuspectCallback,
+)
+from lingxi.apps.worker.terminal_outcome import (
+    _MODEL_PROTOCOL_BREAKDOWN_FAILURE_CODE,
+    TerminalOutcomeAudit,
+    failure_content,
+)
+from lingxi.apps.worker.turn import WorkerTurnExecutor
 from lingxi.config.content import ContentCatalog, RenderedContent, default_content_catalog
 from lingxi.core.delivery.ports import DeliveryEventType, TerminalKind, assert_content_allowed
 from lingxi.core.execution.card_stream import (
@@ -41,8 +55,6 @@ from lingxi.core.execution.card_stream import (
     encode_progress_action,
 )
 from lingxi.core.innertest_content_capture import ContentCaptureRecord
-from lingxi.core.user_memory import RenderedUserMemoryPrompt
-from lingxi.core.year_grounding_guard import detect_year_grounding_suspect
 
 logger = logging.getLogger(__name__)
 
@@ -116,41 +128,6 @@ _PROGRESS_MIN_UPDATE_INTERVAL_SECONDS = 5.0
 _PROGRESS_FALLBACK_SECONDS = 12.0
 
 
-class QueueListener(Protocol):
-    def wait(self, *, timeout_seconds: float) -> bool: ...
-
-
-class UserMemoryReader(Protocol):
-    """用户记忆注入口（Issue #357 S-H3-3 d 节）。真实实现是
-    ``adapters.postgres_user_memory.PostgresUserMemoryReader``；本模块只依赖这个
-    签名，鸭子类型足够，不 import 具体的 adapters 类型（与 `queue: Any` 同一姿态，
-    保持 `apps/worker` 对 `adapters` 的依赖只经装配层注入，不在类型签名里写死）。
-    """
-
-    def fetch_prompt_segment(self, *, user_id: str) -> RenderedUserMemoryPrompt | None: ...
-
-
-ExecutorFactory = Callable[[WorkerConfig, Callable[[], None]], Any]
-HeartbeatCallback = Callable[[], None]
-TaskStuckCallback = Callable[[str, int], None]
-# 终态收口低敏审计事件（Issue #90 评论 5306860255 的独立复核 P1）：字段名与取值
-# 见 ``WorkerService._log_terminal_outcome``。``WorkerService`` 是纯组装对象，
-# 不知道自己会被哪个进程入口装配，也不该假设 stdlib ``logging`` 有 handler——
-# 真实队列 worker 的 `apps/worker/cli.py` 刻意从不调用 `logging.basicConfig()`
-# （见该文件 `_LogOnlyAlertSender` 的说明：未配置 handler 时默认阈值
-# `WARNING` 会把 `logging.info(...)` 悄悄吞掉），因此这条低敏审计事件必须像
-# `heartbeat`/`on_task_stuck`/`on_alert_tick` 一样由装配层注入真正的输出出口，
-# 不能自己直接调 `logging`。
-TerminalOutcomeCallback = Callable[[Mapping[str, object]], None]
-# 年份接地护栏第二层的结构化告警出口（Issue #326）：与 ``TerminalOutcomeCallback``
-# 同一条纪律——``WorkerService`` 不直接调 stdlib ``logging``（理由同上），检测到
-# 的信号必须交给装配层注入的回调，由 ``apps/worker/cli.py`` 接到既有的结构化
-# stderr 出口（``worker.year_grounding_suspect``，带 trace_id）。``None`` 时
-# ``_check_year_grounding_suspect`` 整体跳过，不做检测、不产生任何额外开销。
-YearGroundingSuspectCallback = Callable[[Mapping[str, object]], None]
-_MODEL_PROTOCOL_BREAKDOWN_FAILURE_CODE = "model_protocol_breakdown"
-
-
 class WorkerService:
     """一个进程持续消费一个固定 target version 的任务。
 
@@ -219,26 +196,34 @@ class WorkerService:
         # 会话根目录（例如缺 ``HOME``），此时 ``_cleanup_agent_sessions`` 整体跳过，
         # 不触碰清理队列——留着排队等下一个配置正确的进程来处理，而不是假装已清理。
         self._session_root = session_root
-        self._session_cleanup_batch_limit = session_cleanup_batch_limit
-        # Issue #494：独立的容量回收路径按配置节流，None 表示首轮立即回收。
-        self._last_session_reclaim_at: float | None = None
+        self._housekeeper = QueueHousekeeper(
+            config=config,
+            queue=queue,
+            monotonic=self._monotonic,
+            session_root=session_root,
+            session_cleanup_batch_limit=session_cleanup_batch_limit,
+            on_task_stuck=on_task_stuck,
+        )
         # 告警状态机的恢复计时与重试投递都需要被定期"戳一下"（Issue #153）；worker
         # 没有 scheduler 那种专门的定时职责循环，借用每轮收口顺便调用。
         self._on_alert_tick = on_alert_tick
         # 终态收口低敏审计事件的真正输出出口（Issue #90 评论 5306860255 独立复核
         # P1）：``None`` 时 `_log_terminal_outcome` 整体跳过——没有装配方就没有
         # 输出，不假装写了一条实际被吞掉的日志。
-        self._on_terminal_outcome = on_terminal_outcome
+        self._terminal_audit = TerminalOutcomeAudit(on_terminal_outcome)
         # 内测轮内容级采集的落库出口（Issue #251/#304 批次 3）：``None`` 时
         # `_capture_content_if_enabled` 整体跳过，不构造记录、不尝试写库——与
         # `_on_terminal_outcome` 同一姿态，没有装配方就没有输出。真正的装配
         # 判断（是否按开关构造一个真实写入方）在 `apps/worker/cli.py`。
-        self._content_capture_writer = content_capture_writer
+        self._capture = ContentCaptureRecorder(
+            config=config,
+            content_capture_writer=content_capture_writer,
+            on_year_grounding_suspect=on_year_grounding_suspect,
+        )
         # 年份接地护栏第二层（Issue #326）：``None`` 时 `_check_year_grounding_
         # suspect` 整体跳过——没有装配方就不做检测，与 `_on_terminal_outcome`/
         # `_content_capture_writer` 同一姿态。真正的装配（是否接一个真实 sink）
         # 在 `apps/worker/cli.py`。
-        self._on_year_grounding_suspect = on_year_grounding_suspect
         # 用户记忆注入（Issue #357 S-H3-3 d 节）：``None`` 时 ``_process_task``
         # 整体跳过——没有装配方就不查、不拼，行为与本项加入之前逐字节一致。真正
         # 的装配（是否构造一个真实的 `PostgresUserMemoryReader`）在
@@ -392,141 +377,8 @@ class WorkerService:
         return claimed_any or bool(terminal_tasks)
 
     def _housekeep(self) -> list[TerminalTask]:
-        terminals: list[TerminalTask] = []
-        fail_versions = getattr(self._queue, "fail_unavailable_versions", None)
-        if fail_versions is not None:
-            unavailable = fail_versions(
-                available_versions=(self._config.target_worker_version,),
-                unavailable_for=timedelta(
-                    seconds=self._config.worker_version_unavailable_seconds
-                )
-            )
-            terminals.extend(unavailable)
-            # 独立于"排队太久"（queued_stuck）：这一类是"目标 worker 版本压根没有
-            # 可用实例"，运维需要看到的诊断动作不同（部署缺一个版本 vs 单纯积压），
-            # 因此用独立的告警类型（Issue #153 最小可观测性第四类）。
-            self._report_task_stuck("worker_version_unavailable", len(unavailable))
-        reclaim_queued = getattr(self._queue, "reclaim_queued", None)
-        if reclaim_queued is not None:
-            queued = reclaim_queued(
-                max_wait=timedelta(seconds=self._config.queue_max_wait_seconds)
-            )
-            terminals.extend(queued)
-            self._report_task_stuck("queued_stuck", len(queued))
-        reclaim_stale = getattr(self._queue, "reclaim_stale_with_outcomes", None)
-        if reclaim_stale is not None:
-            requeued, stale_terminals = reclaim_stale(
-                older_than=timedelta(seconds=self._config.running_heartbeat_timeout_seconds),
-                max_auto_retries=self._config.max_auto_retries,
-            )
-            terminals.extend(stale_terminals)
-            self._report_task_stuck(
-                "running_heartbeat_timeout", len(requeued) + len(stale_terminals)
-            )
-            self._report_task_stuck(
-                "retry_exhausted",
-                sum(item.error_kind == "retry_exhausted" for item in stale_terminals),
-            )
-        # 二十四小时到期仍未确认送达的投递终态：状态合同第 8 条、V-投递-06。
-        # 这一步只强制收敛任务状态、释放话题并清空事件正文；把清理结果对外展现
-        # 为"投递已过期，请重新提问"仍是 Gateway（下一次用户主动消息触发）的职责。
-        # 二十四小时上限不接受这里传参：它由迁移 0059 的触发器锁定在
-        # task_delivery_event.expires_at 列上，调用方不再持有另一份可以让它
-        # 漂移的窗口配置（内审 P2-1）。
-        expire_undelivered = getattr(self._queue, "expire_undelivered_terminals", None)
-        if expire_undelivered is not None:
-            expired = expire_undelivered()
-            terminals.extend(expired)
-            # 与 core.alerting.AlertKind.AWAITING_DELIVERY_STUCK 对齐（Issue #153
-            # 最小可观测性第二类：queued/running/awaiting-delivery 滞留三选一）。
-            self._report_task_stuck("awaiting_delivery_stuck", len(expired))
-        self._cleanup_agent_sessions()
-        self._reclaim_session_transcripts()
-        return terminals
-
-    def _reclaim_session_transcripts(self) -> None:
-        """Run the independent, throttled Issue #494 capacity-reclaim path."""
-        if self._session_root is None or self._config.session_disk_budget_bytes <= 0:
-            return
-        now = self._monotonic()
-        last = self._last_session_reclaim_at
-        if last is not None and now - last < self._config.session_reclaim_interval_seconds:
-            return
-        self._last_session_reclaim_at = now
-        run_session_transcript_reclaim(
-            self._session_root,
-            budget_bytes=self._config.session_disk_budget_bytes,
-            low_water_ratio=self._config.session_disk_low_water_ratio,
-            min_age_seconds=self._config.session_reclaim_min_age_seconds,
-        )
-
-    def _cleanup_agent_sessions(self) -> None:
-        """认领并（先归档、再）物理清理一批到期的 Agent 会话 JSONL（Issue #153；
-        归档见 Issue #291 L6 取证结论、``session_cleanup.py`` 模块文档「删除前先
-        归档」——``/new`` 等触发点排的清理不再直接销毁原始转录）。
-
-        没有配置可用的会话根目录，或队列适配器不支持这组方法（旧测试用的假队列）
-        时整体跳过——不半途认领又做不了事，让请求继续排队给下一个真正能处理它的
-        进程。单条处理失败不清 ``done_at``：下一轮的十分钟软领取窗口会重试，见迁移
-        0061 头部注释。
-        """
-
-        if self._session_root is None:
-            return
-        claim = getattr(self._queue, "claim_session_cleanups", None)
-        mark_done = getattr(self._queue, "mark_session_cleanups_done", None)
-        if claim is None or mark_done is None:
-            return
-        try:
-            pending = claim(limit=self._session_cleanup_batch_limit)
-        except Exception as error:  # noqa: BLE001 - 清理认领失败不能带走任务职责
-            logger.error("Agent 会话清理队列认领失败 error=%s", type(error).__name__)
-            return
-        if not pending:
-            return
-        # 根目录本身不存在与"根目录存在、这个会话确实没有文件"是两件不同的事
-        # （PR #173 独立复核 P2-6）：`delete_agent_session_files` 对两者都返回
-        # `0`（幂等设计，理由见该函数文档），但把这两种情况合并成同一个"标记
-        # 完成"分支是错的——`.env.example` 里一个写错的 `LINGXI_WORKER_
-        # SESSION_ROOT`（例如示例值 `/var/lib/lingxi/users/.claude/projects`，
-        # 而镜像固定 `HOME=/tmp`）会让这一批本该被清理的会话被静默标记完成；
-        # `agent_session_cleanup.agent_session_id` 是唯一索引 +
-        # `ON CONFLICT DO NOTHING`，标记完成的行不会被重新排队，事后改对配置
-        # 也补不回来。这里已经认领（`claimed_at`/`worker_id` 已写），因此不能
-        # 简单地什么都不做就返回——十分钟软领取窗口本来就是为这类"认领了但
-        # 这次处理不了"设计的重试兜底，只需要不调用 `mark_done` 即可让它到点
-        # 被下一个进程重新认领。
-        if not self._session_root.is_dir():
-            logger.error(
-                "Agent 会话清理根目录不存在，本轮跳过、不标记完成 pending=%d",
-                len(pending),
-            )
-            return
-        done_ids: list[str] = []
-        for item in pending:
-            try:
-                # 归档先于删除（Issue #291 L6 取证结论，见 session_cleanup.py
-                # 模块文档「删除前先归档」）：`/new` 等触发点排的清理如果直接
-                # 物理删除，会把验收/取证现场需要的原始 JSONL 一并销毁。
-                delete_agent_session_files(
-                    self._session_root,
-                    item.agent_session_id,
-                    user_env_root=self._config.user_env_root,
-                    user_id=item.user_id,
-                )
-            except Exception as error:  # noqa: BLE001 - 单条失败不影响本轮其余条目
-                logger.error(
-                    "Agent 会话 JSONL 归档/物理删除失败 reason=%s error=%s",
-                    item.reason,
-                    type(error).__name__,
-                )
-                continue
-            done_ids.append(item.id)
-        if done_ids:
-            try:
-                mark_done(ids=done_ids)
-            except Exception as error:  # noqa: BLE001 - 标记失败只影响是否重试，不影响正确性
-                logger.error("Agent 会话清理标记完成失败 error=%s", type(error).__name__)
+        """每一轮的巡检；实现见 :class:`~lingxi.apps.worker.housekeeping.QueueHousekeeper`。"""
+        return self._housekeeper.run()
 
     def _emit_heartbeat(self) -> None:
         if self._heartbeat is None:
@@ -559,18 +411,6 @@ class WorkerService:
 
             logging.getLogger(__name__).error(
                 "worker 告警状态机推进失败，任务职责继续运行 error=%s", type(error).__name__
-            )
-
-    def _report_task_stuck(self, kind: str, count: int) -> None:
-        if self._on_task_stuck is None or count <= 0:
-            return
-        try:
-            self._on_task_stuck(kind, count)
-        except Exception as error:  # noqa: BLE001 - 告警失败不应改变任务状态
-            import logging
-
-            logging.getLogger(__name__).error(
-                "任务滞留告警记录失败，任务状态保持由队列收口 error=%s", type(error).__name__
             )
 
     async def _process_task(self, claimed: ClaimedTask) -> None:
@@ -999,7 +839,7 @@ class WorkerService:
                 token_usage=token_usage_for_report,
             )
         elif not deliverable:
-            error_kind, content = self._failure_content(failure_code)
+            error_kind, content = failure_content(self._catalog, failure_code)
             terminal_kind = (
                 TerminalKind.TIMEOUT.value if failure_code == "turn_timeout" else TerminalKind.FAILED.value
             )
@@ -1034,7 +874,7 @@ class WorkerService:
             # `trace_id`，在 worker 这条队列消费链路上不可达，因此不额外编造一个
             # 走不通的追溯号占位符——用户看到的仍是通用失败文案，真实原因只进
             # `failure_code`/审计日志，供运维用 `worker.task.terminal` 查询。
-            error_kind, content = self._failure_content(_MODEL_PROTOCOL_BREAKDOWN_FAILURE_CODE)
+            error_kind, content = failure_content(self._catalog, _MODEL_PROTOCOL_BREAKDOWN_FAILURE_CODE)
             self._finish_terminal(
                 claimed,
                 terminal_kind=TerminalKind.FAILED.value,
@@ -1109,84 +949,7 @@ class WorkerService:
         # 分析缺陷"要看的信号，不只是成功回合才有采集价值。必须排在全部终态
         # 分支之后：终态收口（用户结果）优先于采集（旁路观测），即使这里失败
         # 也不能影响上面已经写好的终态。
-        self._capture_content_if_enabled(claimed, executor=executor, question=context.prompt)
-
-    def _capture_content_if_enabled(
-        self, claimed: ClaimedTask, *, executor: WorkerTurnExecutor | None, question: str
-    ) -> None:
-        """内测轮内容级采集的写入点（Issue #251/#304 批次 3）。
-
-        失败必须整体降级为一条结构化审计日志、不得向上抛——采集是旁路观测，
-        不是任务能否完成的一部分（结构约束「采集失败不影响任务主流程」，见
-        docs/技术设计/数据库设计.md 与 apps/worker/config.py 的模块文档）。
-
-        ``executor`` 为 ``None``（进入 try 主体前就失败——例如
-        ``UserMcpConfigError`` 从未走到构造 executor 那一步，或任务在开头就
-        因带着 ``stop_requested`` 提前收口）时没有任何可采集的回合内容，直接
-        跳过；``self._content_capture_writer`` 为 ``None``（未装配写入方，见
-        ``apps/worker/cli.py`` 只在开关开启时才构造）同样跳过——两个判断分别
-        兜住"这次没有回合内容"与"这次没有落库出口"，都不是错误，不记日志。
-
-        成功构造出记录后还会调用 :meth:`_check_year_grounding_suspect`（Issue
-        #326 批次 5 卡 E，年份接地护栏第二层检测），复用同一个 ``record`` 里
-        已经解析好的问句与工具调用，不重新解析一遍。
-        """
-
-        if executor is None or self._content_capture_writer is None:
-            return
-        record: ContentCaptureRecord | None = None
-        try:
-            record = executor.build_content_capture_record(
-                task_id=claimed.task_id,
-                worker_id=self._config.worker_id,
-                question=question,
-            )
-            if record is not None:
-                self._content_capture_writer(record)
-        except Exception as error:  # noqa: BLE001 - 采集失败降级为日志，不丢用户结果
-            logger.error(
-                "内测轮内容级采集写入失败，任务结果不受影响 task_id=%s error=%s",
-                claimed.task_id,
-                type(error).__name__,
-            )
-        # 年份接地护栏第二层（Issue #326）：独立于上面采集写入的 try/except——
-        # 检测本身的缺陷不能连带影响"记录有没有落库"的判断，也不能与写库失败
-        # 共用同一条日志、分不清是采集坏了还是检测坏了。写库失败但记录已经在
-        # 内存里构造出来时（`record is not None`）仍然照常检测：本护栏只依赖
-        # 内存中的问句与工具调用，不依赖这次落库是否成功。
-        if record is not None:
-            self._check_year_grounding_suspect(record)
-
-    def _check_year_grounding_suspect(self, record: ContentCaptureRecord) -> None:
-        """年份接地护栏第二层：结构性检测 + 告警（Issue #326，批次 5 卡 E）。
-
-        只做检测与告警，**不拦截、不改答案投递路径**——调用方
-        ``_capture_content_if_enabled`` 已经在全部终态分支收口之后才调用本方法
-        （见该方法末尾的调用点），本方法自身再包一层独立 try/except，双重保证
-        检测代码的任何异常都不可能影响任务终态或已经完成的内容采集写入。
-
-        判定逻辑（相对时间词表、年份提取、三条件与）全部在 ``core/
-        year_grounding_guard.py``——本方法只负责"取当前年份、调用纯逻辑判定、
-        把结果交给装配层注入的告警出口"这三步组装，不重复任何判定规则。
-        """
-
-        if self._on_year_grounding_suspect is None:
-            return
-        try:
-            suspect = detect_year_grounding_suspect(
-                task_id=record.task_id,
-                question=record.question_content,
-                tool_calls=record.tool_calls,
-                current_year=datetime.now().year,
-            )
-            if suspect is not None:
-                self._on_year_grounding_suspect(suspect.to_alert_fields())
-        except Exception as error:  # noqa: BLE001 - 检测是旁路，异常不得影响任务终态
-            logger.error(
-                "年份接地护栏检测异常，任务结果不受影响 task_id=%s error=%s",
-                record.task_id,
-                type(error).__name__,
-            )
+        self._capture.capture(claimed, executor=executor, question=context.prompt)
 
     def _append_event(
         self,
@@ -1276,7 +1039,7 @@ class WorkerService:
         分类签名（如 ``mcp.query.http_502``）进两个出口；原始异常类型名和正文不进入。
         """
         safe_failure_signature = sanitize_failure_signature(failure_signature) if failure_signature is not None else None
-        self._log_terminal_outcome(
+        self._terminal_audit.log(
             task_id=claimed.task_id,
             failure_code=failure_code,
             failure_signature=safe_failure_signature,
@@ -1305,98 +1068,6 @@ class WorkerService:
             document_request=document_request,
             sheet_request=sheet_request,
         )
-
-    def _log_terminal_outcome(
-        self,
-        *,
-        task_id: str,
-        failure_code: object,
-        failure_signature: str | None,
-        error_kind: str | None,
-        terminal_kind: str,
-        output_safety: Mapping[str, Any] | None,
-        denied_count: int = 0,
-        denied_tool_names: tuple[str, ...] = (),
-        tool_result_count: int = 0,
-        system_prompt_digest: str | None = None,
-    ) -> None:
-        """queue 收口低敏结构化审计事件（Issue #90 评论 5306860255）：queue 链路
-        此前失败码与安全命中规则完全不可回读，r13 只能靠猜直接原因。这里只记
-        分类性的失败码、落库 ``error_kind``、``terminal_kind``、安全判定的
-        布尔/原因码、本回合被 ``ToolPolicy`` 拒绝的调用计数与工具名，以及这一轮
-        真实的工具调用次数——**严禁**记录正文内容、用户 open_id、prompt、模型
-        输出片段或工具入参正文。
-
-        ``denied_count``/``denied_tool_names`` 是 Issue #291 独立审查补的一项：
-        ``tool_policy.py`` 的拒绝文案对用户承诺"这是系统侧的临时限制、问题
-        已经被记录"，但此前 queue 链路从未把 ``report["audit"]["denied_count"]``
-        （早就算出来了，见 ``report.py``）写进任何运维可见的地方——白名单配错
-        导致的拒绝只能像 #291 真实事故那样，靠用户反馈才会被发现。
-        ``failure_signature``/``failure_code``（#495/#496）与 ``tool_result_count``（#291）仅
-        提供低敏固定类别/分类线索，不记录动态类型、异常正文或工具入参。
-        独立复核 P1：事件经装配层 ``on_terminal_outcome`` 接入结构化 stderr；没有
-        装配方（``None``）时跳过，不假装写出实际不存在的日志。
-        """
-        if self._on_terminal_outcome is None:
-            return
-
-        blocked = bool(isinstance(output_safety, Mapping) and output_safety.get("blocked"))
-        withheld = bool(isinstance(output_safety, Mapping) and output_safety.get("withheld"))
-        reasons: tuple[str, ...] = ()
-        if isinstance(output_safety, Mapping):
-            raw_reasons = output_safety.get("reasons")
-            if isinstance(raw_reasons, (list, tuple)):
-                reasons = tuple(str(reason) for reason in raw_reasons)
-
-        # P3-2：失败码与每个原因码入日志前截到长度上界，避免未来某次改动不小心
-        # 把自由文本塞进这两个字段时，审计日志变成新的正文泄漏面。被拒工具名
-        # 同一惯例：内置工具名/已知 MCP 工具名很短，真正会撑长的是模型臆造的
-        # 畸形名字或凭据形态的字符串，同样不能不设上界。
-        truncated = False
-        capped_failure_code: str | None = None
-        if failure_code is not None:
-            capped_failure_code, code_truncated = _cap_log_token(str(failure_code))
-            truncated = truncated or code_truncated
-        capped_failure_signature: str | None = None
-        if failure_signature is not None:
-            capped_failure_signature, signature_truncated = _cap_log_token(sanitize_failure_signature(failure_signature))
-            truncated = truncated or signature_truncated
-        capped_reasons: list[str] = []
-        for reason in reasons:
-            capped_reason, reason_truncated = _cap_log_token(reason)
-            capped_reasons.append(capped_reason)
-            truncated = truncated or reason_truncated
-        capped_denied_tool_names: list[str] = []
-        for name in denied_tool_names:
-            capped_name, name_truncated = _cap_log_token(name)
-            capped_denied_tool_names.append(capped_name)
-            truncated = truncated or name_truncated
-
-        fields = {
-            "task_id": task_id,
-            "failure_code": capped_failure_code,
-            "failure_signature": capped_failure_signature,
-            "error_kind": error_kind,
-            "terminal_kind": terminal_kind,
-            "output_safety_blocked": blocked,
-            "output_safety_withheld": withheld,
-            "output_safety_reasons": tuple(capped_reasons),
-            "denied_count": denied_count,
-            "denied_tool_names": tuple(capped_denied_tool_names),
-            "tool_result_count": tool_result_count,
-            # 「这一轮**选定**的默认提示词版本」的唯一追溯依据（sha256 前 12 位；
-            # 未配置提示词文件或本轮降级时为 None；口径见 _process_task 的初始化
-            # 注释——记录"选定并交给执行器装配的版本"，不声称模型已收到）。摘要
-            # 是固定形态短标识，不过 _cap_log_token——它不可能携带自由文本。
-            "system_prompt_digest": system_prompt_digest,
-            "truncated": truncated,
-        }
-        try:
-            self._on_terminal_outcome(fields)
-        except Exception as error:  # noqa: BLE001 - 观测失败不能带走任务职责，参照 _append_event
-            logger.error(
-                "终态收口审计事件回调失败，任务收口继续 error=%s", type(error).__name__
-            )
 
     async def _monitor(
         self,
@@ -1443,36 +1114,6 @@ class WorkerService:
                         type(error).__name__,
                     )
             await self._sleep(self._config.stop_poll_interval_seconds)
-
-    def _failure_content(self, code: object) -> tuple[str, RenderedContent]:
-        if code == "context_too_long":
-            return "context_too_long", self._catalog.text("worker.context_too_long")
-        if code == "turn_timeout":
-            return "running_timeout", self._catalog.text("worker.running_timeout")
-        if code == "side_effect_uncertain":
-            return "side_effect_uncertain", self._catalog.text("worker.side_effect_uncertain")
-        if code == "max_turns_exceeded":
-            # Issue #90 评论 5306860255：turn 模式（apps/worker/turn.py 的
-            # `_sdk_termination_failure`）早已把撞满 Agent 轮数上限分类为
-            # `max_turns_exceeded`，但 queue 收口此前落进这里的默认分支，
-            # 被压平成通用 `session_failed` 文案——用户看到的是「请稍后重试」，
-            # 而重试对"问题本身步骤太多"这种失败原因没有意义。这里给它一个
-            # 独立、可查询的 error_kind 和产品负责人定稿的专属文案。
-            return "max_turns_exceeded", self._catalog.text("worker.max_turns")
-        if code == _MODEL_PROTOCOL_BREAKDOWN_FAILURE_CODE:
-            # Issue #291 L6 取证结论：不新增专属用户文案——「模型把工具调用协议
-            # 写成了正文」是运维需要知道的事实，不是用户需要（或应该）知道的
-            # 过程细节；把它说给用户听本身就是又一次过程泄漏。复用通用失败文案，
-            # 专属性只保留在 `failure_code`（审计/日志可查）。
-            return _MODEL_PROTOCOL_BREAKDOWN_FAILURE_CODE, self._catalog.text("worker.failed")
-        if code == "result_too_large":
-            # 2026-08-23 真实故障：未加窄过滤的指标查询回执超过 SDK 读流缓冲上限
-            # （分类在 apps/worker/turn.py）。与 max_turns_exceeded 同一姿态——
-            # 「请稍后重试」对确定性失败是误导，专属文案给出可行动的建议。
-            return "result_too_large", self._catalog.text("worker.result_too_large")
-        if code == MCP_BAD_GATEWAY_FAILURE_CODE:
-            return MCP_BAD_GATEWAY_FAILURE_CODE, self._catalog.text("worker.mcp_bad_gateway")
-        return "session_failed", self._catalog.text("worker.failed")
 
     async def run(self, *, stop_event: asyncio.Event | None = None) -> None:
         stop = stop_event or asyncio.Event()
