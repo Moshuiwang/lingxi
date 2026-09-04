@@ -1478,23 +1478,56 @@ class WorkerService:
         stop = stop_event or asyncio.Event()
         # 见 `_monitor`：在途任务据此把"进程正在停机"与"用户发了 /stop"同等看待。
         self._global_stop = stop
-        listener_context = self._listener_factory() if self._listener_factory else None
-        if listener_context is None:
+        if self._listener_factory is None:
             while not stop.is_set():
                 did_work = await self.process_once()
                 if not did_work:
                     await self._sleep(self._config.poll_interval_seconds)
             return
 
-        with listener_context as listener:
-            while not stop.is_set():
-                did_work = await self.process_once()
-                if did_work:
-                    continue
-                await asyncio.to_thread(
-                    listener.wait,
-                    timeout_seconds=self._config.poll_interval_seconds,
+        # LISTEN 连接是一条长期持有的独占连接（`adapters/postgres_conversation/
+        # _listener.py`）。服务端掐断它（pooler 回收、数据库重启、
+        # `pg_terminate_backend`）时 `listener.wait` 会抛 OperationalError——此前
+        # 这个异常一路冲出 `run()`，整个 worker 进程退出、靠容器重启复活（#593
+        # 完成标准 2 实测复现于 main）。监听只是"更早醒来"的优化，兜底轮询才是
+        # 正确性来源（见 `_transaction.py` 的 TASK_QUEUED_CHANNEL 说明），所以监听
+        # 断开的正确反应是：丢掉这条连接、重建监听；重建失败就退回纯轮询一个
+        # 周期再试。`process_once()` 的异常仍原样向上抛——领取路径已有自己的
+        # 重试与失败语义，这里不替它兜底。
+        while not stop.is_set():
+            try:
+                listener_context = self._listener_factory()
+                listener = listener_context.__enter__()
+            except Exception as error:  # noqa: BLE001 - 监听建不起来退回轮询，不带走进程
+                logger.warning(
+                    "task_queued 监听不可用，本轮退回轮询后重试建立监听：%s",
+                    type(error).__name__,
                 )
+                did_work = await self.process_once()
+                if not did_work:
+                    await self._sleep(self._config.poll_interval_seconds)
+                continue
+            try:
+                while not stop.is_set():
+                    did_work = await self.process_once()
+                    if did_work:
+                        continue
+                    try:
+                        await asyncio.to_thread(
+                            listener.wait,
+                            timeout_seconds=self._config.poll_interval_seconds,
+                        )
+                    except Exception as error:  # noqa: BLE001 - 监听连接断开只重建监听
+                        logger.warning(
+                            "task_queued 监听连接断开，重建监听：%s", type(error).__name__
+                        )
+                        # 退避一拍再重建：监听一建好就断（服务端持续拒绝）时不能
+                        # 形成"建连→LISTEN→抛→重建"的热循环——那正是本卡要消灭的
+                        # 建连风暴形态。
+                        await self._sleep(self._config.poll_interval_seconds)
+                        break
+            finally:
+                listener_context.__exit__(None, None, None)
 
 
 WorkerQueueConsumer = WorkerService

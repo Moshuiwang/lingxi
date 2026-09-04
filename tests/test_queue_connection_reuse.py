@@ -106,7 +106,7 @@ class ConnectionReuseHelperTests(unittest.TestCase):
         connections: list[_FakeConnection] = []
         seen: list[_FakeConnection] = []
 
-        def fake_connect(dsn: str, *, timeouts: object = None) -> _FakeConnection:
+        def fake_connect(dsn: str, *, timeouts: object = None, dedicated: bool = False) -> _FakeConnection:
             connection = _FakeConnection()
             connections.append(connection)
             return connection
@@ -133,7 +133,7 @@ class ConnectionReuseHelperTests(unittest.TestCase):
         connections: list[_FakeConnection] = []
         seen: list[_FakeConnection] = []
 
-        def fake_connect(dsn: str, *, timeouts: object = None) -> _FakeConnection:
+        def fake_connect(dsn: str, *, timeouts: object = None, dedicated: bool = False) -> _FakeConnection:
             connection = _FakeConnection()
             connections.append(connection)
             return connection
@@ -163,7 +163,7 @@ class ConnectionReuseHelperTests(unittest.TestCase):
 
         connections: list[_FakeConnection] = []
 
-        def fake_connect(dsn: str, *, timeouts: object = None) -> _FakeConnection:
+        def fake_connect(dsn: str, *, timeouts: object = None, dedicated: bool = False) -> _FakeConnection:
             connection = _FakeConnection()
             connections.append(connection)
             return connection
@@ -205,7 +205,7 @@ class ConnectionReuseHelperTests(unittest.TestCase):
 
         connections: list[_FakeConnection] = []
 
-        def fake_connect(dsn: str, *, timeouts: object = None) -> _FakeConnection:
+        def fake_connect(dsn: str, *, timeouts: object = None, dedicated: bool = False) -> _FakeConnection:
             connection = _FakeConnection()
             connections.append(connection)
             return connection
@@ -234,7 +234,7 @@ class ConnectionReuseHelperTests(unittest.TestCase):
 
         calls = {"count": 0}
 
-        def flaky_connect(dsn: str, *, timeouts: object = None) -> _FakeConnection:
+        def flaky_connect(dsn: str, *, timeouts: object = None, dedicated: bool = False) -> _FakeConnection:
             calls["count"] += 1
             if calls["count"] == 1:
                 return _FakeConnection()
@@ -263,7 +263,7 @@ class ConnectionReuseHelperTests(unittest.TestCase):
 
         connections: list[_FakeConnection] = []
 
-        def fake_connect(dsn: str, *, timeouts: object = None) -> _FakeConnection:
+        def fake_connect(dsn: str, *, timeouts: object = None, dedicated: bool = False) -> _FakeConnection:
             connection = _FakeConnection()
             connections.append(connection)
             return connection
@@ -299,7 +299,7 @@ class ConnectionReuseHelperTests(unittest.TestCase):
 
         connections: list[_FakeConnection] = []
 
-        def fake_connect(dsn: str, *, timeouts: object = None) -> _FakeConnection:
+        def fake_connect(dsn: str, *, timeouts: object = None, dedicated: bool = False) -> _FakeConnection:
             connection = _FakeConnection()
             connections.append(connection)
             return connection
@@ -339,7 +339,7 @@ class ConnectionReuseHelperTests(unittest.TestCase):
 
         connections: list[_FakeConnection] = []
 
-        def fake_connect(dsn: str, *, timeouts: object = None) -> _FakeConnection:
+        def fake_connect(dsn: str, *, timeouts: object = None, dedicated: bool = False) -> _FakeConnection:
             connection = _FakeConnection()
             connections.append(connection)
             return connection
@@ -352,7 +352,7 @@ class ConnectionReuseHelperTests(unittest.TestCase):
             self.assertEqual(len(connections), 1)
 
             # 第二条连接（重试用）的 operation 阶段能成功，但 commit() 会抛错。
-            def flaky_connect(dsn: str, *, timeouts: object = None) -> _FakeConnection:
+            def flaky_connect(dsn: str, *, timeouts: object = None, dedicated: bool = False) -> _FakeConnection:
                 connection = _FakeConnection(commit_error=RuntimeError("重试后 COMMIT 依然失败"))
                 connections.append(connection)
                 return connection
@@ -385,7 +385,7 @@ class QueueHotPathWiringTests(unittest.TestCase):
     def test_claim_reuses_the_same_connection_across_polls(self) -> None:
         connections: list[_FakeConnection] = []
 
-        def fake_connect(dsn: str, *, timeouts: object = None) -> _FakeConnection:
+        def fake_connect(dsn: str, *, timeouts: object = None, dedicated: bool = False) -> _FakeConnection:
             connection = _FakeConnection(rows=[])
             connections.append(connection)
             return connection
@@ -405,7 +405,7 @@ class QueueHotPathWiringTests(unittest.TestCase):
     def test_gateway_delivery_discovery_queries_reuse_the_same_connection(self) -> None:
         connections: list[_FakeConnection] = []
 
-        def fake_connect(dsn: str, *, timeouts: object = None) -> _FakeConnection:
+        def fake_connect(dsn: str, *, timeouts: object = None, dedicated: bool = False) -> _FakeConnection:
             connection = _FakeConnection(rows=[])
             connections.append(connection)
             return connection
@@ -439,7 +439,7 @@ class QueueHotPathWiringTests(unittest.TestCase):
                     raise RuntimeError("模拟服务端悄悄断开这条复用连接")
                 return super().cursor()
 
-        def fake_connect(dsn: str, *, timeouts: object = None) -> _FakeConnection:
+        def fake_connect(dsn: str, *, timeouts: object = None, dedicated: bool = False) -> _FakeConnection:
             # 新建的连接一律健康；第一条连接会在第一次 claim() 之后被外部手动
             # 标记为"已断开"，模拟服务端在两次轮询之间悄悄掐断它。
             connection = _DroppingThenFakeConnection(fail=False, rows=[])

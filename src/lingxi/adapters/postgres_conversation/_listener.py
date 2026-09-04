@@ -21,7 +21,7 @@ class PostgresTaskQueueListener:
         self._connection: Any | None = None
 
     def __enter__(self) -> "PostgresTaskQueueListener":
-        self._connection = connect(self._dsn, timeouts=self._timeouts, autocommit=True)
+        self._connection = connect(self._dsn, timeouts=self._timeouts, autocommit=True, dedicated=True)
         self._connection.execute(f"LISTEN {TASK_QUEUED_CHANNEL}")
         return self
 
