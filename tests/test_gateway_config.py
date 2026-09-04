@@ -574,7 +574,8 @@ class AssembleDeliveryConsumerCardInjectionTests(unittest.TestCase):
         self.assertEqual(builder.call_args.kwargs["queue_delay_hint_seconds"], 15.0)
 
     def test_injected_configuration_wires_the_rejecting_transport(self) -> None:
-        from lingxi.apps.gateway import _RejectingCards, assemble_delivery_consumer
+        from lingxi.apps.gateway import assemble_delivery_consumer
+        from lingxi.apps.gateway.delivery_assembly import RejectingCards
 
         env = dict(VALID_ENV, **{f"{ENV_PREFIX}CARD_FAILURE_INJECT": "close"})
         config = load_config(env)
@@ -582,7 +583,7 @@ class AssembleDeliveryConsumerCardInjectionTests(unittest.TestCase):
             assemble_delivery_consumer(config, queue=object())
 
         cards = builder.call_args.kwargs["cards"]
-        self.assertIsInstance(cards, _RejectingCards)
+        self.assertIsInstance(cards, RejectingCards)
         self.assertEqual(cards._inject, "close")
 
     def test_injected_configuration_logs_a_visible_startup_warning(self) -> None:
@@ -612,10 +613,10 @@ class LoggingAuditLevelTests(unittest.TestCase):
     """
 
     def test_failed_actions_log_at_warning(self) -> None:
-        from lingxi.apps.gateway import _LoggingAudit
+        from lingxi.apps.gateway.audit_log import LoggingAudit
 
         with self.assertLogs("lingxi.apps.gateway", level="WARNING") as captured:
-            _LoggingAudit().record("reaction.failed", error="RuntimeError: 加表情失败")
+            LoggingAudit().record("reaction.failed", error="RuntimeError: 加表情失败")
         self.assertTrue(captured.output[0].startswith("WARNING"))
         self.assertIn("reaction.failed", captured.output[0])
 
@@ -624,10 +625,10 @@ class LoggingAuditLevelTests(unittest.TestCase):
         "用户发了消息却什么都没发生"的唯一入站侧证据（r19 首轮误判正是这一类），
         必须进 WARNING 显式名单。"""
 
-        from lingxi.apps.gateway import _LoggingAudit
+        from lingxi.apps.gateway.audit_log import LoggingAudit
 
         with self.assertLogs("lingxi.apps.gateway", level="WARNING") as captured:
-            _LoggingAudit().record("message.unsupported_type")
+            LoggingAudit().record("message.unsupported_type")
         self.assertTrue(captured.output[0].startswith("WARNING"))
 
     def test_the_new_onboarding_diagnostics_land_at_warning(self) -> None:
@@ -639,7 +640,7 @@ class LoggingAuditLevelTests(unittest.TestCase):
         后缀，靠既有后缀规则升级，不再往显式名单里加条目。
         """
 
-        from lingxi.apps.gateway import _LoggingAudit
+        from lingxi.apps.gateway.audit_log import LoggingAudit
 
         for action in (
             "onboarding.dispatch_record_failed",
@@ -649,24 +650,24 @@ class LoggingAuditLevelTests(unittest.TestCase):
         ):
             with self.subTest(action=action):
                 with self.assertLogs("lingxi.apps.gateway", level="WARNING") as captured:
-                    _LoggingAudit().record(action)
+                    LoggingAudit().record(action)
                 self.assertTrue(captured.output[0].startswith("WARNING"))
 
     def test_a_deferred_onboarding_stays_at_info(self) -> None:
         """停机中推迟触发开通属正常停机路径（与 ``reply.skipped_while_stopping``
         同类），不是诊断缺口，维持 INFO。"""
 
-        from lingxi.apps.gateway import _LoggingAudit
+        from lingxi.apps.gateway.audit_log import LoggingAudit
 
         with self.assertLogs("lingxi.apps.gateway", level="INFO") as captured:
-            _LoggingAudit().record("onboarding.deferred_while_stopping")
+            LoggingAudit().record("onboarding.deferred_while_stopping")
         self.assertTrue(captured.output[0].startswith("INFO"))
 
     def test_normal_actions_stay_at_info(self) -> None:
-        from lingxi.apps.gateway import _LoggingAudit
+        from lingxi.apps.gateway.audit_log import LoggingAudit
 
         with self.assertLogs("lingxi.apps.gateway", level="INFO") as captured:
-            _LoggingAudit().record("reply.sent")
+            LoggingAudit().record("reply.sent")
         self.assertTrue(captured.output[0].startswith("INFO"))
 
     def test_group_chat_rejection_stays_at_info(self) -> None:
@@ -675,10 +676,10 @@ class LoggingAuditLevelTests(unittest.TestCase):
         是产品选择而不是诊断缺口，因此维持 INFO。WARNING 名单只收"用户本应得到
         回应却什么都没发生"的动作。"""
 
-        from lingxi.apps.gateway import _LoggingAudit
+        from lingxi.apps.gateway.audit_log import LoggingAudit
 
         with self.assertLogs("lingxi.apps.gateway", level="INFO") as captured:
-            _LoggingAudit().record("event.rejected_non_private_chat", chat_type="group")
+            LoggingAudit().record("event.rejected_non_private_chat", chat_type="group")
         self.assertTrue(captured.output[0].startswith("INFO"))
 
 

@@ -89,7 +89,7 @@ class PostgresTimeouts:
     lock_timeout_seconds: int = DEFAULT_LOCK_TIMEOUT_SECONDS
 
     def __post_init__(self) -> None:
-        """校验三项等待边界均为非负整数。"""
+        """校验三项等待边界均为正整数且不超过上限。"""
         for name in (
             "connect_timeout_seconds",
             "statement_timeout_seconds",
@@ -172,8 +172,8 @@ class _IdleConnectionPool:
                 connection, released_at = stack.pop()
                 connection._lingxi_idle = False
             if connection.closed:
-                # 已经物理关闭的连接不能只是跳过：底层 PGconn 必须显式释放，
-                # 否则要等 GC 才收。
+                # 已经物理关闭的连接不能只是跳过：显式 discard() 把释放交给驱动，
+                # 不依赖引用计数的回收时机（驱动对已关闭连接会直接返回）。
                 connection.discard()
                 continue
             suspicious = (
@@ -226,7 +226,13 @@ class _IdleConnectionPool:
         closed = 0
         for stack in stacks:
             for connection, _released_at in stack:
-                connection.discard()
+                try:
+                    connection.discard()
+                except Exception as error:
+                    logger.warning(
+                        "关闭空闲连接失败，继续清理其余连接 error=%s", type(error).__name__
+                    )
+                    continue
                 closed += 1
         return closed
 

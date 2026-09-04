@@ -181,13 +181,13 @@ def _parse_json_strictly(text: str) -> Any:
 
 
 def default_metrics_reader(result: Mapping[str, Any]) -> int:
-    """默认的指标计数：只认一种形状——``result.structuredContent.metrics`` 是一个列表，其余一切（缺键、类型不对、列表挂在别的键上）一律抛 ``unrecognized_result_shape``。
+    """默认的指标计数：只认一种形状。
 
-    窄到这个程度是刻意的：假就绪是唯一不可
-    犯的方向，依次尝试多个候选键会让一份与指标毫无关系的响应也数出条数、
-    判成就绪；真实形状未实测时，猜多种形状不比猜一种更接近真相，只是把
-    猜错的后果从响亮失败换成静默假成功。永远不数 ``content`` 的块数：那
-    通常是一个文本块，数块数会让"没有任何指标"的空回答也被判成就绪。
+    ``result.structuredContent.metrics`` 必须是一个列表；其余一切（缺键、类型不对、
+    列表挂在别的键上）一律抛 ``unrecognized_result_shape``。窄到这个程度是刻意的：
+    假就绪是唯一不可犯的方向——依次尝试多个候选键会让与指标无关的响应也数出条数、
+    判成就绪；真实形状未实测时猜多种形状只是把猜错的后果从响亮失败换成静默假成功。
+    永远不数 ``content`` 的块数：那通常是一个文本块，会让空回答也被判成就绪。
     """
     structured = result.get(STRUCTURED_CONTENT_KEY)
     if isinstance(structured, Mapping):

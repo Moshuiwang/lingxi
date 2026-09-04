@@ -202,7 +202,7 @@ def main(argv: list[str] | None = None) -> int:
                 "".join(traceback.format_tb(error.__traceback__)),
             )
         # 定时职责与开通执行器线程池都已收口：显式关闭本进程空闲栈里的连接，
-        # 不再只靠 atexit（D-17）。同上，清理本身的异常不得覆盖原始故障。
+        # 不再只靠 atexit。同上，清理本身的异常不得覆盖原始故障。
         try:
             close_idle_connections()
         except Exception as error:

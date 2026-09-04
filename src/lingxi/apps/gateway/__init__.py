@@ -55,15 +55,6 @@ from .onboarding import _RecordingOnboarding, assert_gateway_onboarding_is_inert
 
 logger = logging.getLogger(__name__)
 
-# 搬走的符号在本包入口保留转发，既有调用方与测试的 import 路径不变。
-_LoggingAudit = LoggingAudit
-_LogOnlyAlertSender = LogOnlyAlertSender
-_RejectingCards = RejectingCards
-_GatewayManagementCardRefresher = ManagementCardRefresher
-_ManagementCardRecoveryScanner = ManagementCardRecoveryScanner
-_combined_heartbeat = combined_heartbeat
-_combined_watchdog = combined_watchdog
-
 __all__ = [
     "ADMIN_NOTICE_UUID_PREFIX",
     "GroupMentionHintResponder",
@@ -341,8 +332,7 @@ def _run(config: GatewayConfig) -> int:
         stop_event.set()
         loops.join_within(shutdown, config.shutdown_timeout_seconds)
         # 所有职责与后台线程都已收口：显式关闭本进程空闲栈里的连接，不再只靠
-        # atexit（D-17）。清理本身的异常不得覆盖上面可能已经在传播的真实故障，
-        # 因此只记日志不重抛。
+        # atexit。清理本身的异常不得覆盖上面可能已经在传播的真实故障，只记日志不重抛。
         try:
             close_idle_connections()
         except Exception as error:

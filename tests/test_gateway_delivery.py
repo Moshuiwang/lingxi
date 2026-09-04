@@ -486,21 +486,21 @@ class CardFailureFallsBackToTextTests(DeliveryConsumerTestCase):
 
 class CardFailureInjectionAcceptanceFixtureTests(DeliveryConsumerTestCase):
     """S-A-07 受控验收缺口专用注入开关（Issue #152 验收缺口、#154 评论
-    5306860510、#162 E-022）：``apps.gateway._RejectingCards`` 命中被选中的那一步
+    5306860510、#162 E-022）：``apps.gateway.RejectingCards`` 命中被选中的那一步
     时确定性抛出 ``DeliveryRejectedError``，走的正是 ``CardFailureFallsBackToTextTests``
     已经验证过的既有降级路径——这里额外验证的是注入开关本身"命中步骤即拒绝、
     未命中步骤直通真实 transport"这条装配契约，而不是重新验证降级路径本身。
     """
 
     def test_create_injection_falls_back_to_a_single_text_terminal(self) -> None:
-        from lingxi.apps.gateway import _RejectingCards
+        from lingxi.apps.gateway.delivery_assembly import RejectingCards
 
         self.seed_running_task(task_id="tsk-1", conversation_id="cnv-1")
         self.start_task("tsk-1")
         self.finish_task("tsk-1", content="已产生的答案")
 
         real_cards = RecordingCards()
-        cards = _RejectingCards(real_cards, inject="create")
+        cards = RejectingCards(real_cards, inject="create")
         texts = RecordingText()
         consumer = DeliveryConsumer(queue=self.queue, cards=cards, texts=texts)
         consumer.run_once()
@@ -520,17 +520,17 @@ class CardFailureInjectionAcceptanceFixtureTests(DeliveryConsumerTestCase):
 
     def test_only_the_configured_step_is_rejected(self) -> None:
         """`update` 命中时 create 仍直通真实 transport——只有被选中的那一步拒绝，
-        这是 ``_RejectingCards`` 文档写明的设计取舍，必须能被证伪。
+        这是 ``RejectingCards`` 文档写明的设计取舍，必须能被证伪。
         """
 
-        from lingxi.apps.gateway import _RejectingCards
+        from lingxi.apps.gateway.delivery_assembly import RejectingCards
 
         self.seed_running_task(task_id="tsk-1", conversation_id="cnv-1")
         self.start_task("tsk-1")
         self.finish_task("tsk-1", content="已产生的答案")
 
         real_cards = RecordingCards()
-        cards = _RejectingCards(real_cards, inject="update")
+        cards = RejectingCards(real_cards, inject="update")
         texts = RecordingText()
         consumer = DeliveryConsumer(queue=self.queue, cards=cards, texts=texts)
         consumer.run_once()

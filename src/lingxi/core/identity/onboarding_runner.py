@@ -52,7 +52,7 @@ from lingxi.core.identity.onboarding_terminal import (
     STATE_MCP_SYNCING,
     STATE_PROVISIONING,
     OnboardingChainError,
-    _ChainAborted,
+    _ChainAbortedError,
     _internal,
     _Terminal,
     _with_reference,
@@ -299,7 +299,7 @@ class AutoOnboardingRunner(OnboardingSteps):
             terminal = self._run(
                 event_id=event_id, open_id=open_id, trace_id=trace_id, stalled=stalled, grant=grant
             )
-        except _ChainAborted:
+        except _ChainAbortedError:
             # 停机中止：放回认领，下一轮（或下次启动）从头重跑。整条链的每一步都幂等，
             # 重跑不会重复建档、重复发布或重复通知。
             self._audit.record(
@@ -544,7 +544,7 @@ class AutoOnboardingRunner(OnboardingSteps):
     def _stop_guard(self) -> None:
         """每一步之间问一次停机。**在发起下一个带外部副作用的动作之前**问。"""
         if self._should_stop():
-            raise _ChainAborted()
+            raise _ChainAbortedError()
 
     def _run(
         self,

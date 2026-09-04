@@ -561,10 +561,12 @@ class WorkerService:
                 await self._consume_with_listener(stop)
         finally:
             # 领取循环已经彻底退出（监听/轮询两条路径都已收口）：显式关闭本进程
-            # 空闲栈里的连接，不再只靠 atexit（D-17）。挪去线程池执行，避免同步
-            # 数据库调用占住事件循环；清理本身的异常只记日志，不覆盖原始故障
-            # （run() 若是异常退出，让那个异常原样传播）。
-            await asyncio.to_thread(self._close_idle_connections_quietly)
+            # 空闲栈里的连接，不再只靠 atexit。挪去线程池执行，避免同步数据库调用
+            # 占住事件循环；清理与调度本身的异常只记日志，不覆盖原始故障。
+            try:
+                await asyncio.to_thread(self._close_idle_connections_quietly)
+            except Exception as error:
+                logger.error("worker 停机清理调度失败 error=%s", type(error).__name__)
 
     @staticmethod
     def _close_idle_connections_quietly() -> None:
@@ -641,6 +643,3 @@ def _failure_only_report(code: str, signature: str, error: Exception) -> dict[st
         "turn": {"closed": False, "final_text": "", "session_id": None},
         "failure": failure_with_signature(code, signature, error),
     }
-
-
-WorkerQueueConsumer = WorkerService

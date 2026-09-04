@@ -309,6 +309,31 @@ class IdleConnectionPoolDiscardsClosedConnectionsTests(unittest.TestCase):
             stale.discard_calls, 1, "已关闭的连接必须被显式 discard()，不能只是 continue"
         )
 
+    def test_close_all_keeps_closing_after_one_discard_fails(self) -> None:
+        """停机清理必须逐连接隔离异常：一条 discard() 抛错不得让其余连接漏关。"""
+
+        class _FakeConnection:
+            def __init__(self, *, explode: bool) -> None:
+                self.explode = explode
+                self.discard_calls = 0
+                self._lingxi_idle = True
+
+            def discard(self) -> None:
+                self.discard_calls += 1
+                if self.explode:
+                    raise RuntimeError("boom")
+
+        pool = postgres._IdleConnectionPool()
+        key = ("postgresql://test/db", PostgresTimeouts())
+        bad, good = _FakeConnection(explode=True), _FakeConnection(explode=False)
+        pool._idle[key] = [(bad, 0.0), (good, 0.0)]
+
+        closed = pool.close_all()
+
+        self.assertEqual((bad.discard_calls, good.discard_calls), (1, 1))
+        self.assertEqual(closed, 1, "只统计真正关闭成功的连接数")
+        self.assertEqual(pool._idle, {}, "清理后空闲栈必须为空")
+
 
 class DedicatedCallSiteWiringTests(unittest.TestCase):
     """三处长期手工持有连接的调用点必须声明 ``dedicated=True``，不进空闲栈。"""

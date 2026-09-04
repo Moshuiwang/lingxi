@@ -141,11 +141,9 @@ convention = "google"
 [tool.ruff.lint.pylint]
 max-args = 10
 
-# 存量 D（docstring 结构）与 PLR0913（参数个数）违规文件的登记表：由
-# `ruff check --statistics` / `--output-format concise` 实测生成，清单收窄是
-# 后续清理批的工作，本批只保证「登记完整、接线后零告警」。收官目标是把这张表
-# 清空。集成者收口，施工者不得手改。D 强制范围 = src/lingxi/，其余目录级豁免
-# 见决策清单 D-21。
+# 逐文件豁免表，只许变短：D 强制范围 = src/lingxi/（tests/migrations/scripts 三条目录 glob
+# 整体豁免 D，见决策清单 D-21）；src/lingxi/ 下只剩 PLR0913 存量（合同 §3 登记不做）与
+# 有意保留的 N818。任何新增条目都会被 tests/test_ruff_config.py 判红。集成者收口。
 [tool.ruff.lint.per-file-ignores]
 "migrations/**" = ["D"]
 "migrations/alembic/env.py" = ["I001"]
@@ -165,6 +163,7 @@ max-args = 10
 "src/lingxi/core/admin/card_callback.py" = ["PLR0913"]
 "src/lingxi/core/admin/card_callback_management.py" = ["PLR0913"]
 "src/lingxi/core/admin/card_dispatch.py" = ["PLR0913"]
+# AdminCardDeliveryRejected 有意保留旧名：审计字段写的是类名，改名会让既有审计断言失效，理由见该文件类定义处。
 "src/lingxi/core/admin/notification.py" = ["N818"]
 "src/lingxi/core/execution/card_stream.py" = ["PLR0913"]
 "src/lingxi/core/permission/targeted_recompute.py" = ["PLR0913"]
@@ -182,8 +181,6 @@ max-args = 10
 "tests/test_targeted_permission_recompute.py" = ["PLR0913"]
 "tests/test_worker_entry.py" = ["PLR0913"]
 
-# 六个贴线/冻结文件（结构性拆分之前的暂缓对象）暂不参与全仓格式化：它们各自
-# 贴着文件体量棘轮阈值，ruff format 的重排（引号风格、换行）会改动行数，可能顶穿
-# 阈值或让棘轮基线数字对不上。批 1 拆分完成后再移出本清单、纳入格式化。
+# 全仓每个 .py 都参与格式化；本清单为空并由 tests/test_ruff_config.py 钉住，新增排除项即红。
 [tool.ruff.format]
 exclude = []
