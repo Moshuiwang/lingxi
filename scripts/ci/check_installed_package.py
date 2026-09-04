@@ -141,6 +141,9 @@ REQUIRED_MODULES = (
     "lingxi.core.permission.publish_row",
     "lingxi.core.permission.publish",
     "lingxi.adapters.postgres_permission_publish",
+    # 权限决定/发布意图写入路径，从上一条按体量棘轮纯移动拆出（#592 可读性批）；
+    # postgres_permission_publish.py 顶层 import 它，随它同一条发布理由。
+    "lingxi.adapters.postgres_permission_publish_decision",
     "lingxi.adapters.feishu_permission_bitable",
     # MCP 令牌签发与就绪状态机（Issue #156 / S-C-02）：五路分流状态机在 core，
     # 加解密、令牌与就绪记录读写、问数 MCP 探针在 adapters。与上面四个同一姿态——
@@ -633,6 +636,9 @@ PROCESS_RUNTIME_IMPORTS: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {
             "lingxi.adapters.postgres_galaxy_snapshot",
             "lingxi.adapters.galaxy_import",
             "lingxi.adapters.postgres_permission_publish",
+            # 权限决定/发布意图写入路径，随 postgres_permission_publish 同一条
+            # 发布理由（#592 可读性批体量棘轮纯移动拆出）。
+            "lingxi.adapters.postgres_permission_publish_decision",
             "lingxi.adapters.mcp_token_cipher",
             "lingxi.adapters.postgres_mcp_token",
             "lingxi.adapters.role_function_map_file",
@@ -1129,6 +1135,9 @@ PROCESS_RUNTIME_IMPORTS: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {
             "lingxi.core.permission.mcp_readiness",
             "lingxi.core.permission.role_function",
             "lingxi.adapters.postgres_permission_publish",
+            # 权限决定/发布意图写入路径，随 postgres_permission_publish 同一条
+            # 发布理由（#592 可读性批体量棘轮纯移动拆出）。
+            "lingxi.adapters.postgres_permission_publish_decision",
             "lingxi.adapters.role_function_map_file",
             "lingxi.core.alerting",
             "lingxi.core.identity",
