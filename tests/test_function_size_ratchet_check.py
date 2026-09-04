@@ -118,13 +118,15 @@ class RealBaselineIsHonestTest(unittest.TestCase):
             self.assertTrue(key.startswith("src/lingxi/"), key)
             self.assertIn("::", key, key)
 
-    def test_committed_baseline_is_not_accidentally_empty(self) -> None:
-        """自证：真实仓库当前确实存在超阈值函数（结构性拆分是后续批的工作），
-        基线不应该是空的——空基线会让「未登记函数首次超阈值判红」这条规则
-        看起来"从没被真正跑到过"。"""
+    def test_committed_baseline_is_empty_after_the_cleanup(self) -> None:
+        """自证：七批结构性拆分之后基线回到空文件——这是棘轮的目标终态。
+
+        空基线下棘轮退化为「任何函数首次超过 60 行即判红」，「未登记函数判红」
+        这条规则由上面的固定样本用例覆盖，不再依赖真实仓库里恰好存在超阈值函数。
+        """
 
         baseline = CHECK.load_baseline(CHECK.BASELINE_PATH)
-        self.assertGreater(len(baseline), 0)
+        self.assertEqual(baseline, {})
 
 
 class RunRefreshClassificationTest(unittest.TestCase):
