@@ -171,8 +171,6 @@
 88	src/lingxi/core/execution/document_delivery.py::build_sheet_request
 75	src/lingxi/core/execution/hooks.py::ToolGateway._on_pre_tool_use
 62	src/lingxi/core/execution/input_safety.py::constrain_output
-86	src/lingxi/core/identity/legacy_permission_import.py::import_legacy_permissions
-92	src/lingxi/core/identity/onboarding_guards.py::reject_email_bound_to_another_person
 132	src/lingxi/core/identity/onboarding_runner.py::AutoOnboardingRunner.__init__
 99	src/lingxi/core/identity/onboarding_runner.py::AutoOnboardingRunner._execute
 96	src/lingxi/core/identity/onboarding_runner.py::AutoOnboardingRunner._publish
