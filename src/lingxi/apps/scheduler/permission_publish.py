@@ -1,95 +1,17 @@
-"""权限发布消费与就绪确认职责（Issue [#156](https://github.com/Moshuiwang/lingxi/issues/156) 的 S-C-03b）。
+"""权限发布消费与就绪确认职责。
 
-这是 Epic C 从"一组各自可用的组件"变成"一条会自己转的链"的那一处接线。一轮 tick 做四件
-事，次序不可调换：
-
-1. **收殓**：把崩溃留下的 ``publishing`` 意图放回 ``pending``
-   （:meth:`~lingxi.adapters.postgres_permission_publish.PostgresPermissionPublishStore.
-   reclaim_stale`）。发布本身幂等（先查后写），因此重入安全；不收殓的话，一次进程崩溃会
-   把那个用户的后续发布一直堵着。
-2. **发布**：驱动 :class:`~lingxi.core.permission.publish.PermissionPublishExecutor`
-   消费待发布意图（写发布表 → 逐字段读回核对）。S-C-01 交付了这个执行器，但在本 Story
-   之前**它没有任何生产调用方**。
-3. **就绪确认**：对"已经发布读回一致、确认还没收口"的每一条，按 tick 节奏推进**至多
-   一步**（:class:`~lingxi.core.permission.mcp_readiness.ReadinessTicker`）。
-4. **通知**：探针成功 → 发一条「范围已更新」；权限为空（撤权）→ 在读回一致后直接发
-   一条「暂无可用范围」。
-
-## 为什么与「每日权限重算」是两个职责
-
-重算（:mod:`lingxi.apps.scheduler.permission_refresh`）是**每天一次的决定面**，靠一个
-当日水位保证同日至多一轮；发布消费是**每轮都要跑的消费面**。合并成一个职责，那个当日
-水位就会把每分钟的发布消费也一起关掉——当天第一轮之后，任何新排进来的意图都要等到第二
-天才会被消费。两个职责共用同一个停止标志与同一个进程（**单一写入负责人**：发布执行、
-就绪探针、通知都在 ``lingxi-scheduler`` 这一个进程里），因此并发边界仍然只有 outbox 认领
-那一道。
-
-装配顺序上本职责排在重算**之后**：同一轮里重算先把当天的意图排进来，发布消费紧接着就能
-把它推出去，而不是白等一个调度周期。
-
-## 就绪确认为什么必须是 tick 形态
-
-S-C-02 的 :class:`~lingxi.core.permission.mcp_readiness.McpReadinessConfirmation` 是**阻塞**
-引擎（注入 ``sleep``，立即 / 每 180 秒 / 900 秒预算）。把它直接放进本职责的 ``run_once``，
-一个还没就绪的用户就会把整个 :class:`~lingxi.apps.scheduler.SchedulerLoop` 占住十五分钟
-——凭据轮换、保留清理、空闲会话清理全部停摆。因此本职责用同一模块里的
-:class:`~lingxi.core.permission.mcp_readiness.ReadinessTicker`：**只替换"等待"的实现**，
-判定、五路取值、绑定、落库与审计全部复用同一份代码，节奏也仍然是同一张计划表。
-"这一条下一次什么时候到期"由 ``mcp_sync_check`` 里已有的记录重建
-（:class:`~lingxi.core.permission.mcp_readiness.ReadinessProgress`），**不新增表、不新增
-进程内状态**，因此重启不丢任何一条确认。
-
-## 通知只发一次，靠的是就绪记录的终态
-
-同一 ``(用户, 权限版本)`` 走到终态（``ready`` / ``no_permission`` / ``timed_out``）之后，
-:meth:`~lingxi.adapters.postgres_permission_publish.PostgresPermissionPublishStore.
-published_awaiting_readiness` 的 SQL 就不再把它取回来。因此"这条变化的通知发过了"这个
-事实没有第二个载体，也不需要第二张表。
-
-次序也是刻意的：**先把终态记录落库，再发通知**。反过来（先发再记）会让一次记账失败变成
-"用户已经收到通知、系统却认为还没处理完"，下一轮再发一条。通知失败则**不回头改任何状态**
-——产品负责人 2026-08-18 裁定 4：通知失败记审计与计数，不阻塞权限生效。
-
-## 四条边界
-
-- **只确认自己排出来的那两类意图**（:data:`FOLLOW_UP_REASONS`）。首次开通那条
-  （``first_onboarding``）由 Epic D 的开通编排自己确认并发"开通完成"——两边都捞的话，
-  一个刚开通的用户会在"开通完成"之外再收到一条措辞完全不同的"可用范围已更新"，
-  而且两个确认还会对同一个 ``(用户, 权限版本)`` 并发发探针。**发布面不分**：待发布意图
-  由本职责统一消费（发布本身与谁排的无关），分的只有"谁负责确认与通知"。
-- **超时不发通知**。``timed_out`` 表示我们没能确认这个人真的可以问数，此时说一句"你的
-  可用范围已更新"就是一句我们没验证过的话。它落审计与计数（转运维的编排属 Epic D）。
-- **收件人不可用不发通知**：``provisioning_state`` 不是 ``active``、账号正在删除或已删除
-  的人一律跳过并计数（判据在 :meth:`~lingxi.adapters.postgres_permission_publish.
-  PostgresPermissionPublishStore.notice_recipient_open_id` 的 SQL 里）。
-- **三个面各按自身依赖装配，缺谁只停谁**（二级审查 N6，见
-  :func:`lingxi.apps.scheduler._build_permission_publish_duty`）：**发布面**要权限表
-  坐标与令牌供给；**通知面**（含撤权通知）要 MCP 令牌主密钥——不是为了解密，而是因为
-  "这条变化通知过了"这个水位就落在 ``mcp_sync_check`` 上；**探针面**才要问数 MCP 端点。
-  缺端点时撤权通知照常发（它本来就不探针），缺权限表令牌时已发布的那些照常推进确认。
-  一个装了却每轮都炸的假探针会把"还没接线"伪装成"接线了但一直失败"，因此宁可不装。
-  **缺端点时候选查询也随之收窄成只取撤权那一类**，否则授权候选会把窗口占死、饿死撤权
-  通知（:data:`REVOKE_ONLY_REASONS`）。
-
-## 单轮的两个上界
-
-条数预算（:data:`DEFAULT_PUBLISH_LIMIT` / :data:`DEFAULT_READINESS_LIMIT`）挡的是外部
-接口配额，**时间预算**（:data:`DEFAULT_ROUND_BUDGET_SECONDS`）挡的是外部劣化：两个条数
-预算刷满可以到几十分钟，而 scheduler 的活性心跳每轮才跳一次。两个预算都是"本轮止步、
-下轮继续"，发布与就绪都可重入。停止信号与时间预算在**每一条**之前各查一次——发布面也
-一样（`V-部署-03`「停止领取新工作」）。
-
-**发布条数预算数的是"多少条不同的意图"，不是"认领了多少次"**（Epic C 冻结缺陷 F2）：本轮
-认领过的 ``outbox_id`` 由 :meth:`PermissionPublishDuty._publish` 记下并在下一次认领时排除，
-因此一条反复失败的意图不会把预算吃掉 5 份。修复前它会——同一个人的 5 次快失败重试挤在同
-一轮里，``publish_limit=50`` 实际只覆盖约 10 个用户，而这恰恰发生在全局劣化（发布表整体
-不可写）的时候，也就是最需要每个人都被试一次的时候。
-
-## 单实例假设
-
-本职责按 **``lingxi-scheduler`` 只有一个实例**设计。同时跑两个实例时，两边会各自取到
-同一批候选并各发一次探针；``mcp_sync_check`` 的 advisory 锁保证取号不撞，但同一条变化
-可能被通知两次。当前部署编排里 scheduler 是单副本，此处按已知假设登记，不做分布式租约。
+一轮 tick 依次做四件事，次序不可调换：**收殓**崩溃留下的 ``publishing`` 意图放回
+``pending``（发布本身幂等，重入安全）→ **发布**驱动执行器消费待发布意图（写发布表
+→ 逐字段读回核对）→ **就绪确认**对已发布读回一致、尚未收口的每一条按 tick 节奏
+推进至多一步（:class:`~lingxi.core.permission.mcp_readiness.ReadinessTicker`，只
+替换阻塞式确认的"等待"实现，判定与落库全部复用同一份代码，避免一个未就绪用户占住
+整个 :class:`SchedulerLoop` 十五分钟）→ **通知**探针成功发「范围已更新」、权限为空
+（撤权）发「暂无可用范围」，终态记录先落库、通知失败不回头改任何状态。与每日权限
+重算是两个职责：重算靠当日水位保证同日至多一轮，发布消费必须每轮都跑。只确认自己
+排出来的两类意图（首次开通由开通编排自己确认），超时或收件人不可用一律不发通知、
+只留审计。发布/就绪通知/探针三个面各按自身依赖独立装配，缺一面只停那一面；两个
+上界（条数挡外部接口配额、时间挡外部劣化拖慢心跳评估）都是"本轮止步、下轮继续"，
+发布条数预算数的是"多少条不同的意图"而非认领次数。按单实例设计，不做分布式租约。
 """
 
 from __future__ import annotations
@@ -126,17 +48,11 @@ _UTC = UTC
 #: 并发发探针。新增一种 ``reason`` 时必须显式决定它归谁，不给默认归属。
 FOLLOW_UP_REASONS: tuple[str, ...] = (PERMISSION_REFRESH_REASON, PERMISSION_REVOKE_REASON)
 
-#: **探针未接线时**只认领撤权那一类（定向终核 Q1）。
-#:
-#: 缺了这条会饿死撤权通知：候选查询把"还没探过"的排在最前面，而 ``probe=None`` 时授权
-#: 候选每轮都只得到 ``None``——不落记录，于是**永远保持"还没探过"这个最高优先级**。
-#: 只要积压了 ``readiness_limit`` 条更早的授权候选，后发布的撤权行就再也进不了窗口，
-#: 而每一轮都在重复取回同一批毫无进展的候选。撤权通知本来就不依赖探针，把授权候选
-#: 整个排除在查询之外，它们就不再占用 ``LIMIT``；端点配好后它们自然回到窗口里
-#: （进度全在库里，一条都没丢）。
-#:
-#: ``ReadinessTicker`` 里那道"权限为空才走 no_permission"的防线**保留**：这里收窄的是
-#: 取哪些候选，不是放宽哪条能收口——一条 reason 写错的授权意图仍然探不出就绪。
+#: **探针未接线时**只认领撤权那一类。缺了这条会饿死撤权通知：候选查询把"还没
+#: 探过"的排在最前面，而 ``probe=None`` 时授权候选每轮都只得到 ``None``、不落
+#: 记录，于是永远保持最高优先级，后发布的撤权行再也进不了窗口。撤权通知本来
+#: 就不依赖探针，把授权候选整个排除在查询之外，它们就不再占用 ``LIMIT``；
+#: 端点配好后自然回到窗口里（进度全在库里，一条都没丢）。
 REVOKE_ONLY_REASONS: tuple[str, ...] = (PERMISSION_REVOKE_REASON,)
 
 #: 单轮发布预算：一轮最多消费多少条待发布意图。挡的是"一轮把整张表刷完"占住外部接口
@@ -408,41 +324,55 @@ class PermissionPublishDuty:
 
         readiness = self._readiness
         if readiness is not None and not interrupted and not self._stop.is_set():
-            # 探针没接线时**只取撤权那一类**：授权候选这一轮推进不了，留在查询之外才不会
-            # 把窗口占死（:data:`REVOKE_ONLY_REASONS` 的文档写明了饿死是怎么发生的）。
-            reasons = FOLLOW_UP_REASONS if readiness.ticker.probe_wired else REVOKE_ONLY_REASONS
-            pending = tuple(
-                self._intents.published_awaiting_readiness(
-                    reasons=reasons,
-                    interval_seconds=readiness.ticker.schedule.interval_seconds,
-                    budget_seconds=readiness.ticker.schedule.budget_seconds,
-                    limit=self._readiness_limit,
-                )
+            interrupted = self._advance_readiness(readiness, tally, started)
+
+        return self._finish_round(tally, interrupted, readiness)
+
+    def _advance_readiness(
+        self, readiness: ReadinessFollowUp, tally: _Tally, started: datetime
+    ) -> bool:
+        """取待确认候选并逐条推进一步；返回本轮是否被停止信号或时间预算中断。"""
+
+        # 探针没接线时**只取撤权那一类**：授权候选这一轮推进不了，留在查询之外才不会
+        # 把窗口占死（:data:`REVOKE_ONLY_REASONS` 的文档写明了饿死是怎么发生的）。
+        reasons = FOLLOW_UP_REASONS if readiness.ticker.probe_wired else REVOKE_ONLY_REASONS
+        pending = tuple(
+            self._intents.published_awaiting_readiness(
+                reasons=reasons,
+                interval_seconds=readiness.ticker.schedule.interval_seconds,
+                budget_seconds=readiness.ticker.schedule.budget_seconds,
+                limit=self._readiness_limit,
             )
-            tally.pending_readiness = len(pending)
-            for item in pending:
-                if self._stop.is_set() or self._out_of_time(started):
-                    # 停止信号或时间预算落在遍历中间：不再为后面的人发探针或发通知。
-                    # 已经落库的判定各自是一个完整事务；下一次启动会从库里把进度原样
-                    # 读回来。
-                    interrupted = True
-                    break
-                try:
-                    self._advance(readiness, item, tally)
-                except Exception as error:  # 一个人的失败不得带走整轮
-                    # 只记异常类型：异常正文可能带上被处理对象的内容。
-                    tally.failed += 1
-                    self._audit.record(
-                        "permission_publish.user_failed",
-                        user=item.user_id,
-                        permission_version=item.permission_version,
-                        error=type(error).__name__,
-                    )
-                    logger.error(
-                        "单个用户的就绪确认失败，其余用户继续 user=%s error=%s",
-                        item.user_id,
-                        type(error).__name__,
-                    )
+        )
+        tally.pending_readiness = len(pending)
+        for item in pending:
+            if self._stop.is_set() or self._out_of_time(started):
+                # 停止信号或时间预算落在遍历中间：不再为后面的人发探针或发通知。
+                # 已经落库的判定各自是一个完整事务；下一次启动会从库里把进度原样
+                # 读回来。
+                return True
+            try:
+                self._advance(readiness, item, tally)
+            except Exception as error:  # 一个人的失败不得带走整轮
+                # 只记异常类型：异常正文可能带上被处理对象的内容。
+                tally.failed += 1
+                self._audit.record(
+                    "permission_publish.user_failed",
+                    user=item.user_id,
+                    permission_version=item.permission_version,
+                    error=type(error).__name__,
+                )
+                logger.error(
+                    "单个用户的就绪确认失败，其余用户继续 user=%s error=%s",
+                    item.user_id,
+                    type(error).__name__,
+                )
+        return False
+
+    def _finish_round(
+        self, tally: _Tally, interrupted: bool, readiness: ReadinessFollowUp | None
+    ) -> PermissionPublishReport:
+        """冻结报告、记完成审计、触发管理卡补偿观察、写摘要日志。"""
 
         report = tally.freeze(
             interrupted=interrupted,
@@ -450,9 +380,8 @@ class PermissionPublishDuty:
             readiness_wired=self.readiness_wired,
             # 探针没接线时，需要探针的那一路本轮不推进——报告里必须看得出来，
             # 否则"待确认一直是 20 条、本轮推进 0"读起来像卡死。
-            # **整面都没装配时它同样是 False**（定向终核 Q2）：给出
-            # ``readiness_wired=False, probe_wired=True`` 会让读报告的人以为探针是好的、
-            # 只是别处出了问题。
+            # **整面都没装配时它同样是 False**：给出 ``readiness_wired=False,
+            # probe_wired=True`` 会让读报告的人以为探针是好的、只是别处出了问题。
             probe_wired=readiness is not None and readiness.ticker.probe_wired,
         )
         self._audit.record("permission_publish.completed", **report.audit_facts())
@@ -494,21 +423,12 @@ class PermissionPublishDuty:
     def _publish(self, tally: _Tally, started: datetime) -> bool:
         """消费待发布意图，返回"本轮是不是被中断了"。
 
-        **逐条认领而不是一次 ``limit=50``**（二级审查 N4）：执行器的批量循环里没有停止
-        钩子，SIGTERM 之后它会把整批新意图继续认领完——违反"停止领取新工作"
-        （`V-部署-03`），而同一进程里的重算面与就绪面都是逐条检查的。改成每次只认领一条、
-        每条之前重新看一眼停止标志与时间预算，语义就与另外两面对齐了；``limit`` 从"一次
-        取多少"退化为"这一轮最多取多少条"，含义不变。
-
-        **"一轮"的边界因此在这里，本轮已认领清单也必须由这里持有**（Epic C 冻结缺陷 F2）。
-        逐条形态下每次 ``run_once(limit=1)`` 都是一次全新调用，执行器自己的本轮集合每次
-        只有一个元素、等于没有；把累积的清单传下去，"一条意图一轮最多认领一次"才在**生产
-        形态**下成立。少了它，一条快失败的意图（http_500 / 飞书业务错误码）会在同一轮里被
-        连续认领 5 次、零点几秒内烧完重试额度转 ``failed``，同时把 ``publish_limit`` 的
-        50 条预算放大成只覆盖约 10 个用户。
-
-        清单是**每轮新建**的局部变量，不是职责的字段：跨轮持有会让一条意图在这个进程里
-        再也轮不到，那比原缺陷更糟。
+        **逐条认领而不是一次 ``limit=50``**：执行器的批量循环里没有停止钩子，
+        SIGTERM 之后它会把整批新意图继续认领完，违反"停止领取新工作"。改成每次
+        只认领一条、每条之前重新看一眼停止标志与时间预算。**本轮已认领清单必须
+        由这里持有**：不把累积清单传下去的话，一条快失败的意图会在同一轮里被
+        反复认领、烧完重试额度。清单是每轮新建的局部变量，跨轮持有会让一条
+        意图在这个进程里再也轮不到。
         """
 
         if self._executor is None:
@@ -540,16 +460,11 @@ class PermissionPublishDuty:
         """把一条确认推进至多一步，并在它收口时决定要不要通知。
 
         ``readiness`` 由 :meth:`run_once` 取好再传进来，而不是在这里读 ``self``：
-        那一面可能整个没装配，把"它一定在"写成断言，等于让一条只在 ``-O`` 之外成立的
-        保证承担类型收窄。
-
-        **收件人先查，再推进**（二级审查 N2）。次序反过来的话，收件人查询的一次瞬时
-        数据库异常会发生在**终态判定已经落库之后**——那条确认从此被候选集永久排除，
-        用户永远收不到通知，而留下的只有一条泛化的 ``user_failed``。先查则相反：查询
-        失败 → 本轮不推进、终态不落、下一轮原样重来。代价是"还没到期"的候选也会多一次
-        只读查询，而 :meth:`~lingxi.adapters.postgres_permission_publish.
-        PostgresPermissionPublishStore.published_awaiting_readiness` 已经只返回到期的
-        那些，代价因此是有界的。
+        那一面可能整个没装配，把"它一定在"写成断言等于让一条不总成立的保证承担
+        类型收窄。**收件人先查，再推进**：次序反过来的话，收件人查询的一次瞬时
+        数据库异常会发生在终态判定已经落库之后，那条确认从此被候选集永久排除、
+        用户永远收不到通知。先查则相反：查询失败就本轮不推进、终态不落、下一轮
+        原样重来，代价只是"还没到期"的候选多一次只读查询，是有界的。
         """
 
         binding = ReadinessBinding(user_id=item.user_id, permission_version=item.permission_version)
@@ -568,8 +483,7 @@ class PermissionPublishDuty:
             self._notify(readiness, item, open_id, tally)
             return
         if attempt.outcome is ReadinessOutcome.NO_PERMISSION:
-            # 撤权那一路：没有可等的就绪，发布读回一致本身就是通知的触发点
-            # （产品负责人 2026-08-18 裁定 1）。
+            # 撤权那一路：没有可等的就绪，发布读回一致本身就是通知的触发点。
             tally.revoked += 1
             self._notify(readiness, item, open_id, tally)
             return
@@ -585,21 +499,12 @@ class PermissionPublishDuty:
     ) -> None:
         """发一条权限变化通知。**这一步失败不回头改任何状态。**
 
-        通知的种类由 :func:`lingxi.core.permission.notification.render_scope_notice`
-        从 ``permissions`` 文本自己判定，与就绪结论用的是**同一个**存在性判据
-        （``lookup_metrics(document)``）。因此"探针成功却发出一条撤权通知"这种自相矛盾
-        的组合在结构上不可能出现，不需要在这里再判一次。
-
-        **发送前的每一条异常路径都留一条 ``permission_notice.failed``**（二级审查 N2）：
-        渲染失败、端口自身崩溃，都要在通知这条链上可见，而不是只剩一条泛化的
-        ``permission_publish.user_failed``。记完之后照常上抛——渲染失败是本侧缺陷，
-        吞掉它等于把一个可修的 bug 变成"这个人偶尔收不到通知"。
-
-        **残余的 at-most-once 窗口，如实登记**：终态记录已经落库、通知还没发出去时进程
-        崩溃，这一条通知就永久丢了（候选集不会再取回它）。不做通知 outbox 是刻意的——
-        产品负责人 2026-08-18 裁定 4 要求的是"有限重试 + 审计"，不是 exactly-once；
-        为一条告知型消息再建一张 outbox，代价与收益不成比例。该窗口写进验收矩阵的未验证
-        清单。
+        通知种类由 ``render_scope_notice`` 从 ``permissions`` 文本自己判定，与
+        就绪结论用同一个存在性判据，因此不会出现自相矛盾的组合。发送前的每一条
+        异常路径都留一条 ``permission_notice.failed`` 再照常上抛——吞掉它等于
+        把可修的 bug 变成"这个人偶尔收不到通知"。**残余窗口，如实登记**：终态
+        已落库、通知还没发出去时进程崩溃，这条通知就永久丢了；不做通知 outbox
+        是刻意的，要求的是"有限重试 + 审计"，不是 exactly-once。
         """
 
         if not open_id:
@@ -653,58 +558,18 @@ def _build_permission_publish_duty(
     permission_table_access_token: Callable[[], str] | None,
     on_management_corrections: Callable[[], None] | None = None,
 ) -> PermissionPublishDuty | None:
-    """装配权限发布消费职责；**三个面各按自身依赖装配，缺谁只停谁**（二级审查 N6）。
+    """装配权限发布消费职责；**三个面各按自身依赖装配，缺谁只停谁**。
 
-    形状照 :func:`_build_roster_audit_duty`（`V-花名册-29` 的同一条纪律：缺项只报变量名、
-    每一面**恰一条**审计、其余职责照常运行）。
-
-    **发布面**的三个前置：
-
-    1. **权限发布 Base ``app_token``** 与 2. **表 ``table_id``**：写哪张表不能进代码，
-       只从环境变量来。
-    3. **发布表读写所用的短期令牌供给**。产品负责人 2026-08-18 就 Issue
-       [#226](https://github.com/Moshuiwang/lingxi/issues/226) 裁定方向 3（应用身份），
-       ``build_loop`` 因此**总能**建出一条默认供给（见 ``build_loop`` 文档）——``None``
-       现在的含义与花名册那条同一条（Issue #215 之后确立的口径）：**"调用方真的没有
-       交出任何供给"**，不再是"这条链还没接线"，正式装配路径不会走到这一分支。
-       ``permission_table_access_token_unwired`` 这条原因码因此仍然存在（供直接构造
-       本函数的测试与非默认调用方使用），但生产 `main()` → `build_loop` 这条路径上不再
-       触发。
-
-    **缺发布面前置时职责仍然注册**，只要就绪/通知那一面装得起来：已经发布出去的那些
-    权限还等着被确认、被通知，没有理由因为"暂时写不了新的一行"就把它们一起停掉。
-    反过来也一样——MCP 端点没配时发布照常。两个面都装不起来才不注册。
+    形状照 :func:`_roster_audit_missing_prerequisite`：缺项只报变量名、每一面
+    恰一条审计、其余职责照常运行。**缺发布面前置时职责仍然注册**，只要就绪/
+    通知那一面装得起来：已经发布出去的权限还等着被确认、被通知，没有理由因为
+    "暂时写不了新的一行"就把它们一起停掉；反过来 MCP 端点没配时发布照常。
+    两个面都装不起来才不注册。
     """
 
-    executor = None
-    unwired: tuple[str, str] | None = None
-    for variable, value in (
-        ("LINGXI_PERMISSION_BITABLE_APP_TOKEN", config.permission_app_token),
-        ("LINGXI_PERMISSION_BITABLE_TABLE_ID", config.permission_table_id),
-    ):
-        if not value:
-            unwired = ("missing_environment_variable", variable)
-            break
-    if unwired is None and permission_table_access_token is None:
-        unwired = ("permission_table_access_token_unwired", "")
-
-    from lingxi.adapters.postgres_permission_publish import PostgresPermissionPublishStore
-
-    store = PostgresPermissionPublishStore(config.postgres_dsn, timeouts=config.postgres_timeouts)
-    if unwired is None:
-        from lingxi.adapters.feishu_permission_bitable import BitablePermissionTable
-        from lingxi.core.permission.publish import PermissionPublishExecutor
-
-        executor = PermissionPublishExecutor(
-            store=store,
-            transport=BitablePermissionTable(
-                base_url=config.feishu_base_url,
-                app_token=config.permission_app_token,
-                table_id=config.permission_table_id,
-                access_token=permission_table_access_token,
-            ),
-            audit=audit,
-        )
+    executor, unwired, store = _build_publish_executor(
+        config, permission_table_access_token, audit=audit
+    )
 
     # 延迟导入（而不是模块顶层）：`permission_readiness_assembly` 反向 import 本模块的
     # `ReadinessFollowUp`（构造它要用到），模块顶层互相 import 会成环；两个模块分开
@@ -742,18 +607,61 @@ def _build_permission_publish_duty(
     )
 
 
+def _build_publish_executor(
+    config: SchedulerConfig,
+    permission_table_access_token: Callable[[], str] | None,
+    *,
+    audit: AuditSink,
+) -> tuple[Any, tuple[str, str] | None, Any]:
+    """装配发布面执行器；返回 ``(executor 或 None, 缺项原因, intents 存取口)``。
+
+    发布 Base ``app_token``/``table_id`` 写哪张表不能进代码，只从环境变量来；
+    第三个前置是发布表读写所用的短期令牌供给（``build_loop`` 默认总能建出一条，
+    ``None`` 的含义是"调用方真的没有交出任何供给"，不是"还没接线"）。存取口
+    ``store`` 无论发布面是否装得起来都要返回——就绪/通知面复用同一个实例。
+    """
+
+    unwired: tuple[str, str] | None = None
+    for variable, value in (
+        ("LINGXI_PERMISSION_BITABLE_APP_TOKEN", config.permission_app_token),
+        ("LINGXI_PERMISSION_BITABLE_TABLE_ID", config.permission_table_id),
+    ):
+        if not value:
+            unwired = ("missing_environment_variable", variable)
+            break
+    if unwired is None and permission_table_access_token is None:
+        unwired = ("permission_table_access_token_unwired", "")
+
+    from lingxi.adapters.postgres_permission_publish import PostgresPermissionPublishStore
+
+    store = PostgresPermissionPublishStore(config.postgres_dsn, timeouts=config.postgres_timeouts)
+    if unwired is not None:
+        return None, unwired, store
+
+    from lingxi.adapters.feishu_permission_bitable import BitablePermissionTable
+    from lingxi.core.permission.publish import PermissionPublishExecutor
+
+    executor = PermissionPublishExecutor(
+        store=store,
+        transport=BitablePermissionTable(
+            base_url=config.feishu_base_url,
+            app_token=config.permission_app_token,
+            table_id=config.permission_table_id,
+            access_token=permission_table_access_token,
+        ),
+        audit=audit,
+    )
+    return executor, unwired, store
+
+
 def _permission_readiness_alert(audit: AuditSink) -> Callable[[str, str], None]:
     """刷新链就绪超时的告警出口：一条**可告警的结构化事实**。
 
-    **刻意不接 ``core/alerting.py`` 的状态机**（与 ``core/permission/publish.py`` 的
-    ``on_alert`` 同一条已登记理由，也与 ``_log_snapshot_alert`` 同一姿态）：那套状态机
-    只认心跳、任务滞留与飞书发送连续失败三类信号，把"某个用户的权限同步没能在十五分钟
-    内确认"塞进其中任何一类，都会让那一类的阈值、去重与恢复计时同时失真——尤其是塞进
-    ``FEISHU_SEND_FAILED``，会让真正的发送故障被权限超时淹没。
-
-    它属于"权限发布失败是新增一类信号还是复用一类"这个尚未做出的决定；在那之前，这里
-    先把事实**留成可 grep、可进工单的一条审计 + 一条 WARNING**，而不是让刷新链的超时
-    只剩计数。用户标识是内部 ULID，不含人员资料。
+    **刻意不接** ``core/alerting.py`` **的状态机**：那套状态机只认心跳、任务
+    滞留与飞书发送连续失败三类信号，把"权限同步没能在十五分钟内确认"塞进其中
+    任何一类，都会让阈值、去重与恢复计时同时失真。是否新增一类信号还是复用
+    一类尚未决定；在那之前，先把事实留成可 grep、可进工单的一条审计 +
+    一条 WARNING，不让刷新链的超时只剩计数。用户标识是内部 ULID，不含资料。
     """
 
     def report(kind: str, user_id: str) -> None:

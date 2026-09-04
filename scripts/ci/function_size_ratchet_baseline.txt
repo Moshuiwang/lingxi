@@ -100,8 +100,6 @@
 192	src/lingxi/apps/scheduler/org_snapshot_sync.py::OrgSnapshotSyncDuty._run_round
 100	src/lingxi/apps/scheduler/org_snapshot_sync.py::OrgSnapshotSyncDuty.run_once
 86	src/lingxi/apps/scheduler/org_snapshot_sync.py::_build_org_snapshot_sync_duty
-96	src/lingxi/apps/scheduler/permission_publish.py::PermissionPublishDuty.run_once
-95	src/lingxi/apps/scheduler/permission_publish.py::_build_permission_publish_duty
 69	src/lingxi/apps/scheduler/permission_refresh.py::PermissionRefreshDuty._enqueue_publish
 112	src/lingxi/apps/scheduler/permission_refresh.py::PermissionRefreshDuty._refresh_user
 78	src/lingxi/apps/scheduler/permission_refresh.py::PermissionRefreshDuty._refresh_zero_galaxy_user
