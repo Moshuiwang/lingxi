@@ -959,6 +959,52 @@ class MainExitJoinsOnboardingExecutorsTests(unittest.TestCase):
         join_mock.assert_called_once_with(sentinel_duties)
 
 
+class MainExitClosesIdleConnectionsTests(unittest.TestCase):
+    """D-17（#593 元守护审核 P2-b）：``main()`` 停机路径必须在
+    ``join_onboarding_executors`` 之后显式调用一次
+    ``lingxi.adapters.postgres.close_idle_connections``，不能只靠进程退出时的
+    ``atexit``。同上一组用例的姿态：轻量桩顶掉真实装配，只把这一段接线暴露成
+    断言，不真的连数据库。
+
+    变异验红：把 ``lingxi/apps/scheduler/__init__.py`` 里
+    ``close_idle_connections()`` 那一行删掉重跑本用例，
+    ``close_mock.assert_called_once_with()`` 会因为从未被调用而失败。
+    """
+
+    def test_main_calls_close_idle_connections_once_after_shutdown(self) -> None:
+        import types
+        from unittest import mock
+
+        class _StubLoop:
+            duties = ()
+
+            def run_forever(self) -> None:
+                return None
+
+            def request_stop(self) -> None:
+                return None
+
+        stub_loop = _StubLoop()
+        stub_config = types.SimpleNamespace(interval_seconds=5)
+
+        with (
+            mock.patch("lingxi.apps.scheduler.SchedulerConfig") as config_cls,
+            mock.patch("lingxi.apps.scheduler.build_alerting_duty", return_value=mock.MagicMock()),
+            mock.patch("lingxi.apps.scheduler.build_loop", return_value=stub_loop),
+            mock.patch("lingxi.apps.scheduler.install_signal_handlers"),
+            mock.patch("lingxi.apps.scheduler.join_onboarding_executors"),
+            mock.patch("lingxi.apps.scheduler.close_idle_connections") as close_mock,
+        ):
+            config_cls.from_env.return_value = stub_config
+
+            from lingxi.apps.scheduler import main
+
+            code = main([])
+
+        self.assertEqual(code, 0)
+        close_mock.assert_called_once_with()
+
+
 class MainExceptionExitStillJoinsOnboardingExecutorsTests(unittest.TestCase):
     """P1-B（codex 外审 · Trace #373 H1 批终修复包②）：``main()`` 里
     ``join_onboarding_executors(loop.duties)`` 此前放在 ``loop.run_forever()``

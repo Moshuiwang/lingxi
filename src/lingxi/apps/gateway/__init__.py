@@ -26,6 +26,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from lingxi.adapters.feishu_longconn import TerminationReason
+from lingxi.adapters.postgres import close_idle_connections
 from lingxi.core.conversation.ports import OnboardingRunner
 
 from .alerting import LogOnlyAlertSender, build_alerting_duty
@@ -339,6 +340,13 @@ def _run(config: GatewayConfig) -> int:
         # 再在停机预算内等它们退出——不能让进程在后台还在跑外部调用时直接走人。
         stop_event.set()
         loops.join_within(shutdown, config.shutdown_timeout_seconds)
+        # 所有职责与后台线程都已收口：显式关闭本进程空闲栈里的连接，不再只靠
+        # atexit（D-17）。清理本身的异常不得覆盖上面可能已经在传播的真实故障，
+        # 因此只记日志不重抛。
+        try:
+            close_idle_connections()
+        except Exception as error:
+            logger.error("gateway 停机清理空闲数据库连接失败 error=%s", type(error).__name__)
 
     if reason is TerminationReason.TERMINAL_ERROR:
         # 终止型错误（凭据被拒、超连接数上限）：进入明确的终止态，退出码非 0，由编排层

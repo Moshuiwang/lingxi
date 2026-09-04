@@ -3204,6 +3204,30 @@ class WorkerServiceTests(unittest.TestCase):
                 "'Task exception was never retrieved' 噪音日志",
             )
 
+    def test_run_closes_idle_connections_once_after_the_claim_loop_exits(self) -> None:
+        """D-17（#593 元守护审核 P2-b）：``run()`` 的领取循环彻底退出之后必须显式
+        调用一次 ``lingxi.adapters.postgres.close_idle_connections``，不能只靠
+        进程退出时的 ``atexit``。停机信号在 ``run()`` 入口前就已置位，模拟"领取
+        循环一轮都没跑就直接收口"的边界，只把这段收尾接线暴露成断言。
+
+        变异验红：把 ``WorkerService.run()`` 里包住领取循环的 ``try``/``finally``
+        去掉（或删掉 ``finally`` 里那次 ``close_idle_connections`` 调用）重跑本
+        用例，``close_mock.assert_called_once_with()`` 会因为从未被调用而失败。
+        """
+        from unittest.mock import patch
+
+        service = WorkerService(config=worker_config(), queue=FakeWorkerQueue())
+
+        async def scenario() -> None:
+            stop = asyncio.Event()
+            stop.set()
+            await service.run(stop_event=stop)
+
+        with patch("lingxi.apps.worker.service.close_idle_connections") as close_mock:
+            asyncio.run(scenario())
+
+        close_mock.assert_called_once_with()
+
 
 class SemanticProgressTests(unittest.TestCase):
     """Issue #321 方向 C：语义化等待进度——工具调用阶段文案 + 兜底刷新
