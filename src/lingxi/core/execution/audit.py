@@ -651,7 +651,7 @@ def _dump(value: Any) -> str:
     except (TypeError, ValueError, RecursionError):
         try:
             return str(value)
-        except Exception:  # noqa: BLE001 - 审计取值绝不能反过来打断判定
+        except Exception:  # 审计取值绝不能反过来打断判定
             return "<unrepresentable>"
 
 

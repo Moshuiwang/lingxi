@@ -429,7 +429,7 @@ class PermissionPublishDuty:
                     break
                 try:
                     self._advance(readiness, item, tally)
-                except Exception as error:  # noqa: BLE001 - 一个人的失败不得带走整轮
+                except Exception as error:  # 一个人的失败不得带走整轮
                     # 只记异常类型：异常正文可能带上被处理对象的内容。
                     tally.failed += 1
                     self._audit.record(
@@ -462,7 +462,7 @@ class PermissionPublishDuty:
             # 汇总做成幂等投递，异常不能带走本轮发布/就绪结果。
             try:
                 self._on_management_corrections()
-            except Exception as error:  # noqa: BLE001 - observer is best effort
+            except Exception as error:  # observer is best effort
                 self._audit.record(
                     "admin.management_correction_settlement_failed",
                     error=type(error).__name__,
@@ -622,7 +622,7 @@ class PermissionPublishDuty:
                 permission_version=item.permission_version,
                 permissions=item.permissions,
             )
-        except Exception as error:  # noqa: BLE001 - 记完通知侧的痕迹再上抛
+        except Exception as error:  # 记完通知侧的痕迹再上抛
             tally.notices_failed += 1
             self._audit.record(
                 "permission_notice.failed",
@@ -645,7 +645,7 @@ class PermissionPublishDuty:
             return
         try:
             self._on_alert(kind, item.user_id)
-        except Exception as error:  # noqa: BLE001 - 观察者不是这条链的一部分
+        except Exception as error:  # 观察者不是这条链的一部分
             logger.error("权限就绪告警回调失败 error=%s", type(error).__name__)
 
 

@@ -379,12 +379,12 @@ def render_management_card(
     companies_available = True
     try:
         companies = tuple(catalog.companies())
-    except Exception:  # noqa: BLE001 - 目录不可用不得让整张卡渲染失败
+    except Exception:  # 目录不可用不得让整张卡渲染失败
         companies = ()
         companies_available = False
     try:
         metrics = tuple(catalog.metrics())
-    except Exception:  # noqa: BLE001 - 同上
+    except Exception:  # 同上
         metrics = ()
 
     # #493 的产品字段是银河职位+公司范围。旧目录假实现没有 ``positions``，
@@ -396,7 +396,7 @@ def render_management_card(
         positions_reader = None
     try:
         positions = tuple(positions_reader()) if callable(positions_reader) else ()
-    except Exception:  # noqa: BLE001 - 目录不可用仍要显示卡片
+    except Exception:  # 目录不可用仍要显示卡片
         positions = ()
     position_form = callable(positions_reader)
 
@@ -447,7 +447,7 @@ def render_management_card(
     if callable(user_label_reader):
         try:
             candidate = user_label_reader(open_id=status.identifier)
-        except Exception:  # noqa: BLE001 - display lookup must not break the card
+        except Exception:  # display lookup must not break the card
             candidate = ""
         if isinstance(candidate, str) and candidate.strip():
             user_label = candidate.strip()

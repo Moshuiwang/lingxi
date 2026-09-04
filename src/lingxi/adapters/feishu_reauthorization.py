@@ -45,7 +45,7 @@ from urllib.parse import urlencode, urlparse
 
 from lingxi.core.identity.credentials import AuthorizationGrant
 
-from .delegated_credentials import _FileLock  # noqa: SLF001 - 复用同一宿主机文件锁
+from .delegated_credentials import _FileLock  # 复用同一宿主机文件锁
 from .feishu_directory import AuthorizationExchange, scope_covers
 
 logger = logging.getLogger(__name__)
@@ -374,7 +374,7 @@ class FeishuReauthorizationEntry:
                 redirect_uri=self._redirect_uri,
                 required_scope=self._scope,
             )
-        except Exception as caught:  # noqa: BLE001 - 外部失败只能按安全失败关闭
+        except Exception as caught:  # 外部失败只能按安全失败关闭
             logger.warning("正式重授权换码失败 error=%s", type(caught).__name__)
             return self._failure(
                 "exchange_failed",
@@ -406,7 +406,7 @@ class FeishuReauthorizationEntry:
         # 不允许旧 state 把新主体覆盖回去。
         try:
             registered_subject = self._vault.registered_subject_open_id()
-        except Exception as caught:  # noqa: BLE001 - 不把数据库异常带到外部
+        except Exception as caught:  # 不把数据库异常带到外部
             logger.warning("正式重授权读取主体登记失败 error=%s", type(caught).__name__)
             return self._failure(
                 "persistence_failed",
@@ -451,7 +451,7 @@ class FeishuReauthorizationEntry:
                 grant=exchange.grant,
                 **save_condition,
             )
-        except Exception as caught:  # noqa: BLE001 - vault 必须原子失败关闭
+        except Exception as caught:  # vault 必须原子失败关闭
             logger.warning("正式重授权凭据未安全保存 error=%s", type(caught).__name__)
             return self._failure(
                 "persistence_failed",

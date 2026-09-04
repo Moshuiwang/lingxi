@@ -320,7 +320,7 @@ class _OutboxMixin:
                                 delivery_request=delivery_request,
                                 delivery_type=delivery_type,
                             )
-                    except Exception as error:  # noqa: BLE001 - 降级但绝不吞声
+                    except Exception as error:  # 降级但绝不吞声
                         # 审计事件名沿用既有 ``worker.document_request_insert_failed``
                         # ——docx 观测口径不变；``delivery_type`` 是新增的附加字段
                         # （Issue #354 S-H3-2），只是多一个可过滤维度，不改变事件

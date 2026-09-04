@@ -217,7 +217,7 @@ class PostgresAdminQueries:
                 functions=aggregate.functions,
                 all_companies=aggregate.all_companies,
             )
-        except Exception:  # noqa: BLE001 - display-only source must fail closed
+        except Exception:  # display-only source must fail closed
             return GalaxySourceSummary(granted=False, reason="galaxy_snapshot_unavailable")
 
     def recent_events(

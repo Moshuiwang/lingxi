@@ -545,7 +545,7 @@ class CardStream:
             # 明确失败（白名单，独立审核 R-1）：卡片路径统一走同话题文本回退。
             self._notify_send("card_non_final", False)
             self._fallback_needed = True
-        except Exception:  # noqa: BLE001 - 结果不明：建卡是否已经在服务端生效不可知，
+        except Exception:  # 结果不明：建卡是否已经在服务端生效不可知，
             # 不能假装明确失败——原样抛给调用方，不降级、不清预留位、不重试。
             raise
 
@@ -587,7 +587,7 @@ class CardStream:
             self._transport.update(card_id=self._card_id, sequence=self._sequence, card=card)
             self._notify_send("card_non_final", True)
             self._last_update = now
-        except Exception:  # noqa: BLE001
+        except Exception:
             self._notify_send("card_non_final", False)
             self._fallback_needed = True
 
@@ -710,7 +710,7 @@ class CardStream:
             self._transport.update(card_id=self._card_id, sequence=self._sequence, card=card)
             self._notify_send("card_non_final", True)
             self._last_update = now
-        except Exception:  # noqa: BLE001 - 见方法文档：发送失败不改变既定降级动作
+        except Exception:  # 见方法文档：发送失败不改变既定降级动作
             self._notify_send("card_non_final", False)
         finally:
             self._fallback_needed = True
@@ -779,7 +779,7 @@ class CardStream:
             self._notify_send("card_final", False)
             self._fallback_needed = True
             return
-        except Exception:  # noqa: BLE001 - 结果不明：终态正文是否已经写进卡片对进程
+        except Exception:  # 结果不明：终态正文是否已经写进卡片对进程
             # 不可知——绝不能当"明确失败"整体降级为文本兜底，那正是本次复现的跨
             # 通道重复投递。原样抛给调用方，不降级、不清预留位、不重试。
             raise
@@ -790,7 +790,7 @@ class CardStream:
             self._rate_limiter.record(topic=self._topic, now=self._monotonic())
             self._transport.close(card_id=self._card_id, sequence=self._sequence, card=card)
             self._notify_send("card_final", True)
-        except Exception:  # noqa: BLE001 - 见上面的方法说明：不降级，避免重复投递
+        except Exception:  # 见上面的方法说明：不降级，避免重复投递
             # 独立审核 B-1/R-1 均不延伸到这里：关闭失败——无论是 DeliveryRejected
             # 还是任何其它异常——都不改变"更新已经成功、答案对用户可见"这个结论，
             # 本身就与异常是否属于结果不明无关，因此不单独拆出 ``except DeliveryRejected``。

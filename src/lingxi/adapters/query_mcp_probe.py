@@ -151,7 +151,7 @@ def _no_redirect_opener() -> Any:
     from urllib.request import HTTPRedirectHandler, build_opener
 
     class _NoRedirect(HTTPRedirectHandler):
-        def redirect_request(self, req, fp, code, msg, headers, newurl):  # noqa: D102 - 见外层文档
+        def redirect_request(self, req, fp, code, msg, headers, newurl):  # 见外层文档
             return None
 
     return build_opener(_NoRedirect())
@@ -184,7 +184,7 @@ def urllib_mcp_transport(
         headers["Authorization"] = f"Bearer {token}"
     request = Request(url, data=payload, headers=headers, method=method)
     try:
-        with _no_redirect_opener().open(request, timeout=timeout) as response:  # noqa: S310 - 地址来自受控配置
+        with _no_redirect_opener().open(request, timeout=timeout) as response:  # 地址来自受控配置
             return McpHttpResponse(int(response.status), _load_json(response.read()))
     except HTTPError as error:
         return McpHttpResponse(int(error.code), _load_json(_read_quietly(error)))
@@ -196,7 +196,7 @@ def urllib_mcp_transport(
 def _read_quietly(error: Any) -> bytes:
     try:
         return error.read()
-    except Exception:  # noqa: BLE001 - 读不到就当空响应，状态码已经够分类了
+    except Exception:  # 读不到就当空响应，状态码已经够分类了
         return b""
 
 
@@ -567,7 +567,7 @@ class QueryMcpProbe:
     def _token(self, user_id: str) -> str:
         try:
             token = self._token_provider(user_id)
-        except Exception as error:  # noqa: BLE001 - 失败形态由注入的 provider 决定
+        except Exception as error:  # 失败形态由注入的 provider 决定
             # 只记类型，不记消息也不接 traceback 链：provider 的异常可能带着连接串或
             # 响应片段。这一路落技术失败——可分辨、被独立记录，且绝不会被读成就绪。
             logger.warning("就绪探针取令牌失败 user=%s error=%s", user_id, type(error).__name__)

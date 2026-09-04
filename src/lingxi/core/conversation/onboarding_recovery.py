@@ -160,7 +160,7 @@ class OnboardingReconciler:
                 break
             try:
                 pending = self._store.claim_stale_onboarding(older_than=self._stale_after)
-            except Exception as error:  # noqa: BLE001 - 认领失败只降级这一轮
+            except Exception as error:  # 认领失败只降级这一轮
                 self._audit.record(
                     "onboarding.reconcile_scan_failed",
                     error=type(error).__name__,
@@ -202,7 +202,7 @@ class OnboardingReconciler:
             )
             if not isinstance(result, OnboardingResult):
                 raise TypeError("onboarding runner returned an invalid result")
-        except Exception as error:  # noqa: BLE001 - 见 docstring
+        except Exception as error:  # 见 docstring
             self._audit.record(
                 "onboarding.dispatch_failed",
                 event_id=pending.event_id,
@@ -236,7 +236,7 @@ class OnboardingReconciler:
             self._store.release_onboarding_claim(
                 event_id=pending.event_id, claim_token=pending.claim_token
             )
-        except Exception as error:  # noqa: BLE001
+        except Exception as error:
             self._audit.record(
                 "onboarding.release_claim_failed",
                 event_id=pending.event_id,

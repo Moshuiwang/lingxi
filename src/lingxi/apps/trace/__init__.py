@@ -254,7 +254,7 @@ def run(
 
     connect_fn = connect
     if connect_fn is None:
-        from lingxi.adapters.postgres import connect as connect_fn  # noqa: PLC0415
+        from lingxi.adapters.postgres import connect as connect_fn
 
     try:
         with connect_fn(dsn) as connection:
@@ -274,7 +274,7 @@ def run(
                         readiness[event.feishu_event_id] = _fetch_readiness(
                             cursor, user.user_id
                         )
-    except Exception as error:  # noqa: BLE001 - 查询失败只需要区分"能不能查"
+    except Exception as error:  # 查询失败只需要区分"能不能查"
         print(f"查询失败：{type(error).__name__}", file=err)
         return 1
 

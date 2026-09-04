@@ -326,14 +326,14 @@ class DeliveryConsumer:
         loop_healthy = True
         try:
             self._notify_stale_queued()
-        except Exception as error:  # noqa: BLE001 - 见方法文档：只降级这一段，不带走本轮
+        except Exception as error:  # 见方法文档：只降级这一段，不带走本轮
             self._note_loop_failure(error, stage="queue_delay_hint")
             loop_healthy = False
         try:
             uncertain_tasks = self._queue.list_uncertain_delivery_tasks(
                 limit=self._uncertain_limit
             )
-        except Exception as error:  # noqa: BLE001 - 见方法文档：只降级这一段，不带走本轮
+        except Exception as error:  # 见方法文档：只降级这一段，不带走本轮
             self._note_loop_failure(error, stage="list_uncertain")
             uncertain_tasks = []
             loop_healthy = False
@@ -353,13 +353,13 @@ class DeliveryConsumer:
 
         try:
             tasks = self._queue.list_pending_delivery_tasks(limit=self._limit)
-        except Exception as error:  # noqa: BLE001 - 见方法文档：本轮无事可做，下一轮重来
+        except Exception as error:  # 见方法文档：本轮无事可做，下一轮重来
             self._note_loop_failure(error, stage="list_pending")
             return 0
         for task in tasks:
             try:
                 self._process_task(task)
-            except Exception as error:  # noqa: BLE001 - 一个任务的异常不能带走同一轮的其他任务
+            except Exception as error:  # 一个任务的异常不能带走同一轮的其他任务
                 logger.error(
                     "投递消费单个任务异常，本轮其余任务不受影响 task_id=%s error=%s",
                     task.task_id,
@@ -433,7 +433,7 @@ class DeliveryConsumer:
                     reply_to_message_id=row.reply_to_message_id or "",
                     text=content.text,
                 )
-            except Exception as error:  # noqa: BLE001 - 单条发送失败不影响其余候选，下一轮重试
+            except Exception as error:  # 单条发送失败不影响其余候选，下一轮重试
                 logger.error(
                     "排队提示发送失败，下一轮重试 task_id=%s error=%s",
                     row.task_id,
@@ -470,7 +470,7 @@ class DeliveryConsumer:
             return ()
         try:
             full_history = self._queue.read_delivery_events(task_id=task.task_id, after_sequence=0)
-        except Exception as error:  # noqa: BLE001 - 重建失败不能带走本轮正常消费；
+        except Exception as error:  # 重建失败不能带走本轮正常消费；
             # 退回空历史——最坏情况是这一次的卡片正文从当前信号重新开始累积
             # （与本 Story 改动前的单行行为一致），不是任务失败、不影响终态。
             logger.error(
@@ -554,7 +554,7 @@ class DeliveryConsumer:
                 return False
             try:
                 stream.start()
-            except Exception as error:  # noqa: BLE001 - 白名单反转（独立审核 R-1）：
+            except Exception as error:  # 白名单反转（独立审核 R-1）：
                 # `CardStream.start()` 只吞掉 `DeliveryRejected`（明确失败），其余
                 # 一切异常（JSON 解析失败/响应缺失可回读标识/网络类异常等）都原样
                 # 抛出到这里——服务端可能已经处理，不清预留位、不推进游标、不降级。
@@ -599,7 +599,7 @@ class DeliveryConsumer:
                 card_sequence=stream.sequence,
                 fallback_text=stream.fallback_needed,
             )
-        except Exception as error:  # noqa: BLE001 - 记一条告警后照常向上抛，交给 run_once 隔离
+        except Exception as error:  # 记一条告警后照常向上抛，交给 run_once 隔离
             # 独立审核 P2-3（已知残留风险，未完全消除）：`stream.update()` 的外部
             # 调用已经真实发出、序号已经在内存里前进，但这次持久化失败意味着
             # `card_seq` 没有落库。下一轮如果把这个 progress 事件当正常候选重放，
@@ -643,7 +643,7 @@ class DeliveryConsumer:
                     stream.finish(result=event.content or "", elapsed_seconds=elapsed)
                 else:
                     stream.finish(failure=content, elapsed_seconds=elapsed)
-            except Exception as error:  # noqa: BLE001 - 白名单反转（独立审核 R-1）：
+            except Exception as error:  # 白名单反转（独立审核 R-1）：
                 # `CardStream.finish()` 的终态更新只吞掉 `DeliveryRejected`（明确
                 # 失败），其余一切异常都原样抛出到这里——平台可能已经处理，不能猜
                 # 是成功还是失败。不清预留位、不降级、不推进游标，转入既有
@@ -712,7 +712,7 @@ class DeliveryConsumer:
             self._record_fallback_attempt_failed(task.task_id)
             self._alert_deduped("fallback_send_failed:" + type(error).__name__, task.task_id)
             return _FallbackOutcome.RETRY_LATER
-        except Exception as error:  # noqa: BLE001 - 结果不明（白名单反转，独立审核
+        except Exception as error:  # 结果不明（白名单反转，独立审核
             # R-1）：JSON 解析失败/响应缺失可回读标识/网络类异常等，服务端可能
             # 已经受理并投递——不清预留位、不进入重试退避（那等于"下一轮原样
             # 重试"，正是本次复现的重复投递）。转入既有 uncertain 告警路径。
@@ -746,7 +746,7 @@ class DeliveryConsumer:
                 platform_message_kind=kind,
                 platform_message_id=stream.message_id,
             )
-        except Exception as error:  # noqa: BLE001 - 记录后交给下一轮重试
+        except Exception as error:  # 记录后交给下一轮重试
             logger.error(
                 "confirm_delivery 调用异常，下一轮重试 task_id=%s error=%s",
                 task.task_id,
@@ -798,16 +798,16 @@ class DeliveryConsumer:
             if heartbeat is not None:
                 try:
                     heartbeat()
-                except Exception as error:  # noqa: BLE001 - 心跳失败不能带走投递职责
+                except Exception as error:  # 心跳失败不能带走投递职责
                     logger.error("投递消费心跳记录失败 error=%s", type(error).__name__)
             if on_tick is not None:
                 try:
                     on_tick()
-                except Exception as error:  # noqa: BLE001 - 告警自身失败不能带走投递职责
+                except Exception as error:  # 告警自身失败不能带走投递职责
                     logger.error("投递消费告警状态机推进失败 error=%s", type(error).__name__)
             try:
                 self.run_once()
-            except Exception as error:  # noqa: BLE001 - Issue #191：一轮异常不得带走整条循环
+            except Exception as error:  # Issue #191：一轮异常不得带走整条循环
                 # `run_once` 内部已经隔离了两条循环级查询与每个任务，走到这里的是
                 # 它们之外的异常（例如注入的告警回调自己抛错）。同样只降级这一轮。
                 self._note_loop_failure(error, stage="run_once")

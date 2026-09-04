@@ -60,27 +60,14 @@ fi
 ruff check --no-cache "${tracked_python_files[@]}"
 printf 'ruff check：通过\n'
 
-# src/lingxi/ 内不允许"裸"抑制注释：门禁本身就是要挡"越线判红"，留一个能自己
-# 关掉门禁的口子等于门禁形同虚设。per-file-ignores 是集成者在 pyproject.toml
-# 里唯一合法的**跨规则族**抑制入口。大小写不敏感、`#` 后有无空格都要命中
-# （#noqa、# NOQA、#  ruff:noqa 均需命中）。`fmt: off`/`fmt: skip` 没有按规则
-# 限定的写法，一律禁止。
-#
-# **裸 noqa 与限定 noqa 区别对待**：本仓存量已有大量 `# noqa: <CODE>`（多数
-# 是 `BLE001` 阻断异常兜底，少量 `S310`/`PLC0415`/`SLF001`/`SIM115`/`D102`），
-# 逐条带中文理由，是为将来扩大 ruff 规则族（当前 select 尚未纳入
-# BLE/S/SIM/SLF/PLC）预留的、有据可查的例外——不构成对当前已接线规则
-# （E/W/F/I/UP/T10/N/D/PLR0913）的绕过：命中 `# noqa: D102` 的文件本身已经在
-# per-file-ignores 里整体免检 D，限定 noqa 现在不产生任何实际抑制效果。真正
-# 的门禁绕过口只有**裸** noqa（不写规则码，抑制该行全部规则，包括未来新选中
-# 的规则族）——这才是本检查要挡的东西；`grep -v` 精确排除"noqa 后紧跟冒号+
-# 真实规则码"的限定形态。
+# src/lingxi/ 不允许任何抑制注释，唯一合法入口是 pyproject.toml 的
+# per-file-ignores。大小写不敏感、`#` 后有无空格都要命中（#noqa、# NOQA、
+# #  ruff:noqa 均需命中），限定到具体规则码的 `# noqa: CODE` 同样不放行。
 suppression_comments=$(
-  git grep -rniE '#\s*(noqa|fmt:\s*(off|skip)|ruff:\s*noqa)' -- 'src/lingxi/*.py' |
-    grep -viE 'noqa\s*:\s*[A-Za-z0-9]' || true
+  git grep -rniE '#\s*(noqa|fmt:\s*(off|skip)|ruff:\s*noqa)' -- 'src/lingxi/*.py' || true
 )
 if [[ -n "${suppression_comments}" ]]; then
-  printf 'src/lingxi/ 内发现裸门禁抑制注释，不允许（合法入口是 pyproject.toml 的 per-file-ignores；限定到具体规则码的 `# noqa: CODE` 不受本检查影响）：\n%s\n' \
+  printf 'src/lingxi/ 内发现门禁抑制注释，不允许（合法入口是 pyproject.toml 的 per-file-ignores）：\n%s\n' \
     "${suppression_comments}" >&2
   exit 1
 fi

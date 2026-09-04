@@ -62,7 +62,7 @@ class SchedulerLoop:
         if self._heartbeat is not None:
             try:
                 self._heartbeat()
-            except Exception as error:  # noqa: BLE001 - 心跳失败不能跳过定时职责
+            except Exception as error:  # 心跳失败不能跳过定时职责
                 logger.error("scheduler 心跳记录失败，职责继续运行 error=%s", type(error).__name__)
         for duty in self._duties:
             if self._stop.is_set():
@@ -71,7 +71,7 @@ class SchedulerLoop:
                 continue
             try:
                 reports.append(duty.run_once())
-            except Exception as error:  # noqa: BLE001 - 一个职责失败不能带走另一个
+            except Exception as error:  # 一个职责失败不能带走另一个
                 # 只记异常类型，不记异常正文：正文可能带上被处理对象的内容。
                 logger.error(
                     "定时职责本轮异常，其余职责与下一轮不受影响 duty=%s error=%s",

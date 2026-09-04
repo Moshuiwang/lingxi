@@ -123,7 +123,7 @@ class PermissionTableAccessTokenProvider:
         except PermissionTableAccessTokenUnavailable as error:
             self._record(error.reason)
             raise
-        except Exception as error:  # noqa: BLE001 - 只保留分类，异常正文可能带响应内容
+        except Exception as error:  # 只保留分类，异常正文可能带响应内容
             self._record("fetch_error", error_type=type(error).__name__)
             raise PermissionTableAccessTokenUnavailable("fetch_error") from None
         if not token:

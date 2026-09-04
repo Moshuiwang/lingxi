@@ -372,7 +372,7 @@ def _check_database(
             with connection.cursor() as cursor:
                 cursor.execute("SELECT 1")
                 cursor.fetchone()
-    except Exception as error:  # noqa: BLE001 - 健康检查只需要区分"能不能连上"
+    except Exception as error:  # 健康检查只需要区分"能不能连上"
         raise HealthcheckError(f"数据库不可达：{type(error).__name__}") from error
     # 只在真正探测成功时刷新缓存——探测失败绝不写入，保证故障期间每一轮都会
     # 重新做真实探测，直到真的恢复为止。

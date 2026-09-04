@@ -334,7 +334,7 @@ class RosterAccessTokenProvider:
         except AccessTokenUnavailable as error:
             self._record(error.reason, now)
             raise
-        except Exception as error:  # noqa: BLE001 - 只保留分类，异常正文可能带响应内容
+        except Exception as error:  # 只保留分类，异常正文可能带响应内容
             self._record("refresh_error", now, error_type=type(error).__name__)
             raise AccessTokenUnavailable("refresh_error") from None
 

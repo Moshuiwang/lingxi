@@ -1050,7 +1050,7 @@ class PostgresPendingActionStore:
                                 initiated_by=pending.initiated_by_open_id,
                                 clicker=clicker_open_id,
                             )
-                        except Exception as error:  # noqa: BLE001 - 见类文档，失败即整体回滚
+                        except Exception as error:  # 见类文档，失败即整体回滚
                             raise PendingActionAuditWriteFailed(
                                 "确认操作的审计写入失败，事务已回滚，操作未执行"
                             ) from error
@@ -1143,7 +1143,7 @@ class PostgresPendingActionStore:
                                 initiated_by=pending.initiated_by_open_id,
                                 clicker=clicker_open_id,
                             )
-                        except Exception as error:  # noqa: BLE001 - 见 confirm() 同一姿态
+                        except Exception as error:  # 见 confirm() 同一姿态
                             raise PendingActionAuditWriteFailed(
                                 "取消操作的审计写入失败，事务已回滚，操作未执行"
                             ) from error

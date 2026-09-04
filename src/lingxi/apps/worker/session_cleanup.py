@@ -512,7 +512,7 @@ def run_session_transcript_reclaim(
             low_water_ratio=low_water_ratio,
             min_age_seconds=min_age_seconds,
         )
-    except Exception as error:  # noqa: BLE001 - 维护动作失败不能带走任务职责
+    except Exception as error:  # 维护动作失败不能带走任务职责
         logger.error("会话转录容量回收失败 error=%s", type(error).__name__)
         return None
     if outcome.files_deleted:

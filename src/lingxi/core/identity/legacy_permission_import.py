@@ -116,7 +116,7 @@ def import_legacy_permissions(
         return
     try:
         report = importer.import_plan(user_id=user_id, target_open_id=open_id, plan=plan, now=now)
-    except Exception as error:  # noqa: BLE001 - 落库失败一律 fail-closed
+    except Exception as error:  # 落库失败一律 fail-closed
         # 异常类型进审计理由码；调用栈只进日志（不含原文/公司键/指标名），
         # 让运维能区分「接口漏接」与「库故障」。
         #

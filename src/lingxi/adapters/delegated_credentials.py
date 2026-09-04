@@ -648,7 +648,7 @@ class _FileLock:
 
     def __enter__(self) -> _FileLock:
         self._path.parent.mkdir(parents=True, exist_ok=True)
-        self._handle = open(self._path, "a+b")  # noqa: SIM115 - 锁的生命周期由上下文管理
+        self._handle = open(self._path, "a+b")  # 锁的生命周期由上下文管理
         os.fchmod(self._handle.fileno(), 0o600)
         fcntl.flock(self._handle.fileno(), fcntl.LOCK_EX)
         return self

@@ -215,7 +215,7 @@ class HardDeadlineProbe:
         def call() -> None:
             try:
                 outcome.append(self._probe.list_metrics(user_id=user_id))
-            except BaseException as error:  # noqa: BLE001 - 原样带回主线程再抛
+            except BaseException as error:  # 原样带回主线程再抛
                 failure.append(error)
 
         worker = threading.Thread(
@@ -392,7 +392,7 @@ class OnboardingExecutor:
                 return
             try:
                 task()
-            except BaseException as error:  # noqa: BLE001 - 一条链的失败不得带走这条线程
+            except BaseException as error:  # 一条链的失败不得带走这条线程
                 # C-6：不用 `logger.exception`——它会把异常正文写进日志，而这条
                 # 兜底捕获的是**整条开通链**的任意异常，psycopg 的唯一键冲突正文里
                 # 带着 `Key (feishu_open_id)=(ou_…)`。只记类型名与调用栈帧。

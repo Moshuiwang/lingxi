@@ -225,7 +225,7 @@ def describe_scope(
         if company_names is not None:
             try:
                 name_by_id = company_names.names_for(company_ids=company_ids)
-            except Exception:  # noqa: BLE001 - 展示层降级：解析口本身故障不阻塞通知发送
+            except Exception:  # 展示层降级：解析口本身故障不阻塞通知发送
                 logger.warning(
                     "permission_notice.company_name_lookup_failed_batch company_count=%d",
                     len(company_ids),
@@ -409,7 +409,7 @@ class PermissionNoticeDispatcher:
                 self._sender.send_text(
                     open_id=open_id, text=notice.text, dedupe_key=dedupe_key
                 )
-            except Exception as error:  # noqa: BLE001 - 通知失败不得阻塞权限生效
+            except Exception as error:  # 通知失败不得阻塞权限生效
                 last_error = _error_code(error)
                 logger.warning(
                     "权限变化通知发送失败 user=%s version=%s 第%s次 error=%s",

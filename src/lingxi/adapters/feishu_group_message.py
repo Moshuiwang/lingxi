@@ -162,7 +162,7 @@ class FeishuGroupMessages:
             return
         try:
             self._on_send_outcome(operation, succeeded)
-        except Exception as error:  # noqa: BLE001 - 观察者不是发送链路的一部分
+        except Exception as error:  # 观察者不是发送链路的一部分
             logger.error(
                 "飞书发送结果观察失败，发送结果不变 operation=%s error=%s",
                 operation,

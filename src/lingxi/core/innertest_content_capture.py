@@ -295,7 +295,7 @@ def _safe_json_dumps(value: Any) -> str:
     except (TypeError, ValueError, RecursionError):
         try:
             return str(value)
-        except Exception:  # noqa: BLE001 - 采集是旁路，取值失败不得向上传播中断任务
+        except Exception:  # 采集是旁路，取值失败不得向上传播中断任务
             return "<unrepresentable>"
 
 

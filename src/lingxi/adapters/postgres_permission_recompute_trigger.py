@@ -398,7 +398,7 @@ class BackgroundPermissionRecomputeTrigger:
             if self._on_failed is not None:
                 try:
                     self._on_failed(pending, None)
-                except Exception as error:  # noqa: BLE001 - callback must not kill worker
+                except Exception as error:  # callback must not kill worker
                     self._audit.record(
                         _RECOMPUTE_TRIGGER_FAILED_ACTION,
                         pending_action_id=pending.id,
@@ -421,7 +421,7 @@ class BackgroundPermissionRecomputeTrigger:
         if self._on_timeout is not None:
             try:
                 self._on_timeout(pending)
-            except Exception as error:  # noqa: BLE001 - timeout callback must not kill timer
+            except Exception as error:  # timeout callback must not kill timer
                 self._audit.record(
                     _RECOMPUTE_TRIGGER_FAILED_ACTION,
                     pending_action_id=pending.id,
@@ -435,7 +435,7 @@ class BackgroundPermissionRecomputeTrigger:
             pending, watch, timer = self._queue.get()
             try:
                 outcome = self._delegate.trigger(pending)
-            except Exception as error:  # noqa: BLE001 - 与 card_callback.py 同一条 best-effort 姿态
+            except Exception as error:  # 与 card_callback.py 同一条 best-effort 姿态
                 self._audit.record(
                     _RECOMPUTE_TRIGGER_FAILED_ACTION,
                     pending_action_id=pending.id,
@@ -444,7 +444,7 @@ class BackgroundPermissionRecomputeTrigger:
                 if watch.finish() and self._on_failed is not None:
                     try:
                         self._on_failed(pending, error)
-                    except Exception as callback_error:  # noqa: BLE001
+                    except Exception as callback_error:
                         self._audit.record(
                             _RECOMPUTE_TRIGGER_FAILED_ACTION,
                             pending_action_id=pending.id,
@@ -470,7 +470,7 @@ class BackgroundPermissionRecomputeTrigger:
                         try:
                             if self._on_queued is not None:
                                 self._on_queued(pending, typed_outcome)  # type: ignore[arg-type]
-                        except Exception as error:  # noqa: BLE001 - callback must not kill worker
+                        except Exception as error:  # callback must not kill worker
                             self._audit.record(
                                 _RECOMPUTE_TRIGGER_FAILED_ACTION,
                                 pending_action_id=pending.id,
@@ -479,7 +479,7 @@ class BackgroundPermissionRecomputeTrigger:
                     elif skipped and self._on_skipped is not None:
                         try:
                             self._on_skipped(pending, typed_outcome)  # type: ignore[arg-type]
-                        except Exception as error:  # noqa: BLE001 - callback must not kill worker
+                        except Exception as error:  # callback must not kill worker
                             self._audit.record(
                                 _RECOMPUTE_TRIGGER_FAILED_ACTION,
                                 pending_action_id=pending.id,
@@ -493,7 +493,7 @@ class BackgroundPermissionRecomputeTrigger:
                                     callback(pending)  # type: ignore[misc]
                                 else:
                                     callback(pending, None)  # type: ignore[misc]
-                            except Exception as error:  # noqa: BLE001 - callback must not kill worker
+                            except Exception as error:  # callback must not kill worker
                                 self._audit.record(
                                     _RECOMPUTE_TRIGGER_FAILED_ACTION,
                                     pending_action_id=pending.id,

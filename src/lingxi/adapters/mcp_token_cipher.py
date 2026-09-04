@@ -170,7 +170,7 @@ class McpTokenCipher:
             padded = decryptor.update(ciphertext) + decryptor.finalize()
             unpadder = padding.PKCS7(BLOCK_BYTES * 8).unpadder()
             plaintext = unpadder.update(padded) + unpadder.finalize()
-        except Exception:  # noqa: BLE001 - 失败形态由 cryptography 决定
+        except Exception:  # 失败形态由 cryptography 决定
             # 只保留错误码：异常正文可能带上密文片段或填充细节（填充预言的经典入口）。
             raise McpTokenCipherError("decrypt_failed") from None
         try:

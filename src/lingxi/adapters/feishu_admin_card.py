@@ -256,7 +256,7 @@ class TomlCompanyMetricCatalog:
 
         try:
             return tuple(sorted(load_role_function_map().keys()))
-        except Exception as error:  # noqa: BLE001 - 管理卡降级为空目录
+        except Exception as error:  # 管理卡降级为空目录
             logger.warning(
                 "admin.management_card.position_catalog_load_failed error=%s",
                 type(error).__name__,
@@ -270,7 +270,7 @@ class TomlCompanyMetricCatalog:
 
         try:
             return dict(load_company_function_metric_map(self._metric_map_path))
-        except Exception as error:  # noqa: BLE001 - 展示层降级，不让管理卡渲染失败
+        except Exception as error:  # 展示层降级，不让管理卡渲染失败
             logger.warning(
                 "admin.management_card.catalog_load_failed error=%s", type(error).__name__
             )

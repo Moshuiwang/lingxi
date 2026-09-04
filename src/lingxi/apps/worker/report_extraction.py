@@ -456,7 +456,7 @@ def exception_failure_signature(error: BaseException) -> str:
     try:
         module = getattr(error_type, "__module__", None)
         name = getattr(error_type, "__qualname__", None)
-    except Exception:  # noqa: BLE001 - 恶意元类不得阻断失败收口
+    except Exception:  # 恶意元类不得阻断失败收口
         return UNKNOWN_FAILURE_SIGNATURE
     if not isinstance(module, str) or not isinstance(name, str) or not module or not name:
         return UNKNOWN_FAILURE_SIGNATURE

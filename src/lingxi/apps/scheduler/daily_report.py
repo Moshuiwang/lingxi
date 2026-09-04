@@ -336,7 +336,7 @@ class DailyReportDuty:
 
         try:
             return factory(), None
-        except Exception as error:  # noqa: BLE001 - 单段失败不得带走其余段落
+        except Exception as error:  # 单段失败不得带走其余段落
             reason = f"{section} 本轮读取失败（{type(error).__name__}）"
             # 动作名以 `failed` 结尾，被 `StructuredLogAuditSink` 自动升级到 WARNING
             # （`apps/scheduler/audit.py` 的既有规则，与 `roster_audit.send_failed`
@@ -372,7 +372,7 @@ class DailyReportDuty:
 
         try:
             already_sent = self._watermark.already_sent(chat_id=self._chat_id, report_date=today)
-        except Exception as error:  # noqa: BLE001 - 查不了水位时保守跳过本轮，不冒泡
+        except Exception as error:  # 查不了水位时保守跳过本轮，不冒泡
             # fail-closed（#325 尾账，opus 批次 5 审查留痕）：这是主线程里唯一没有
             # 被 `_fetch` 那套「单段失败」保护包住的库调用——不包会被循环层的通用
             # except 静默吞掉、留不下任何 `daily_report.*` 审计。查不到持久水位就
@@ -419,7 +419,7 @@ class DailyReportDuty:
                     delivery_window_start=delivery_window_start,
                     delivery_window_end=delivery_window_end,
                 )
-            except Exception as error:  # noqa: BLE001 - 后台线程异常不能无声消失
+            except Exception as error:  # 后台线程异常不能无声消失
                 logger.error(
                     "内测每日通报：后台聚合线程出现未预期异常，本轮未完成 error=%s",
                     type(error).__name__,
@@ -681,7 +681,7 @@ class DailyReportDuty:
             self._sender.send_text(
                 chat_id=self._chat_id, text=text, dedupe_key=f"daily-report:{today.isoformat()}"
             )
-        except Exception as error:  # noqa: BLE001 - 发送失败不得带走同一轮的其他职责
+        except Exception as error:  # 发送失败不得带走同一轮的其他职责
             reason = _classify_send_failure(error)
             self._audit.record(
                 "daily_report.send_failed",
@@ -719,7 +719,7 @@ class DailyReportDuty:
         watermark_persisted = True
         try:
             self._watermark.mark_sent(chat_id=self._chat_id, report_date=today)
-        except Exception as error:  # noqa: BLE001 - 水位写入失败不得掩盖"消息已发出"
+        except Exception as error:  # 水位写入失败不得掩盖"消息已发出"
             watermark_persisted = False
             self._audit.record(
                 "daily_report.watermark_persist_failed",

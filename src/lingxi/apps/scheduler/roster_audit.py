@@ -222,7 +222,7 @@ class RosterAuditDuty:
             self._sender.send_text(
                 chat_id=self._chat_id, text=content.text, dedupe_key=today.isoformat()
             )
-        except Exception as error:  # noqa: BLE001 - 发送失败不得带走同一轮的其他职责
+        except Exception as error:  # 发送失败不得带走同一轮的其他职责
             # 只记审计与异常类型：异常正文可能带上群 ID 或响应体。水位不置位，
             # 因此这一天**不算已发送**，下一轮会重试（`V-花名册-30`）。
             self._audit.record(

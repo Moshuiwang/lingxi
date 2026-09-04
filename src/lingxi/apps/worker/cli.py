@@ -700,7 +700,7 @@ async def _run_queue_worker(
             run_task.cancel()
             try:
                 await run_task
-            except (asyncio.CancelledError, Exception):  # noqa: BLE001 - 停机路径，只记录不重抛
+            except (asyncio.CancelledError, Exception):  # 停机路径，只记录不重抛
                 pass
     finally:
         for sig in installed_signals:

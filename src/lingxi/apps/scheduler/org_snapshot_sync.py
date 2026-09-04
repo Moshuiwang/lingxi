@@ -366,7 +366,7 @@ class OrgSnapshotSyncDuty:
             self._checked_persisted_watermark_for = today
             try:
                 already_done = self._store.has_complete_run_on(today)
-            except Exception as error:  # noqa: BLE001 - 只记异常类型
+            except Exception as error:  # 只记异常类型
                 self._audit.record("org_snapshot_sync.watermark_check_failed", error=type(error).__name__)
                 logger.warning(
                     "组织快照当日持久化水位检查失败，按未知处理、继续尝试本轮 error=%s",
@@ -391,7 +391,7 @@ class OrgSnapshotSyncDuty:
 
         try:
             batch = self._read_snapshot()
-        except Exception as error:  # noqa: BLE001 - 只记异常类型，正文可能带响应内容
+        except Exception as error:  # 只记异常类型，正文可能带响应内容
             fields: dict[str, object] = {"error": type(error).__name__}
             supply = getattr(error, "supply", None)
             if isinstance(supply, str) and supply:
@@ -485,7 +485,7 @@ class OrgSnapshotSyncDuty:
                 ",".join(problem.value for problem in error.report.problems),
             )
             return None
-        except Exception as error:  # noqa: BLE001 - 只记异常类型，写库失败原样上抛前先留痕
+        except Exception as error:  # 只记异常类型，写库失败原样上抛前先留痕
             # 也推进退避（独立审查 2026-08-20 必修 D）：这里与 `integrity_rejected`
             # 处在流水线同一个位置——同样是两条身份路径都已经读完一整轮（数百次
             # 分页请求）之后才撞上的失败，贴着 tick 立即重试的外部成本同一个量级，
@@ -597,7 +597,7 @@ class OrgSnapshotSyncDuty:
         def worker() -> None:
             try:
                 result["run_id"] = self._run_round(now, today)
-            except BaseException as error:  # noqa: BLE001 - 线程异常不能无声消失
+            except BaseException as error:  # 线程异常不能无声消失
                 # 只记异常类型，不记正文——同 `loop.py::SchedulerLoop.run_once`
                 # 逐职责隔离异常时的同一条纪律（那里因为本轮读一整份组织通讯录、
                 # 已经整体挪进了这条后台线程，`SchedulerLoop` 自己再也看不到这个
@@ -722,11 +722,11 @@ def _build_org_snapshot_sync_duty(
         # 因果链，只是审计只读安全的 `supply` 标签。
         try:
             app_token = app_access_token()
-        except Exception as error:  # noqa: BLE001 - 立即重分类，不吞
+        except Exception as error:  # 立即重分类，不吞
             raise TokenSupplyFailure("app_access_token") from error
         try:
             user_token = user_access_token()
-        except Exception as error:  # noqa: BLE001 - 立即重分类，不吞
+        except Exception as error:  # 立即重分类，不吞
             raise TokenSupplyFailure("user_access_token") from error
         # 整轮预算（Issue #284 A 组 #2；取值可运维配置，见
         # `config.org_snapshot_round_budget_seconds` 与

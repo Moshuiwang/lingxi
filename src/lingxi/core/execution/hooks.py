@@ -131,7 +131,7 @@ def _tool_result_text(tool_response: Any) -> str:
         import json
 
         return json.dumps(tool_response, ensure_ascii=False, default=str)
-    except Exception:  # noqa: BLE001 - 拿不出文本时退回"不识别"
+    except Exception:  # 拿不出文本时退回"不识别"
         return ""
 
 
@@ -347,7 +347,7 @@ class ToolGateway:
             return
         try:
             self._mark_external_side_effect()
-        except Exception:  # noqa: BLE001 - 失败也必须保守地继续记审计
+        except Exception:  # 失败也必须保守地继续记审计
             self._audit.record_audit_fault(tool_name="external_side_effect", tool_use_id=None)
 
     @staticmethod
@@ -376,12 +376,12 @@ class ToolGateway:
         if self._raw_pre_tool_use is not None:
             try:
                 self._raw_pre_tool_use(call_id, tool_input)
-            except Exception:  # noqa: BLE001 - 采集失败不得影响工具判定本身
+            except Exception:  # 采集失败不得影响工具判定本身
                 pass
         if self._on_tool_call is not None:
             try:
                 self._on_tool_call(verdict.tool_name)
-            except Exception:  # noqa: BLE001 - 进度通知失败不得影响工具判定本身
+            except Exception:  # 进度通知失败不得影响工具判定本身
                 pass
         # 先把响应算出来，再记账：记账处理的是模型可控的入参，一旦它抛异常，
         # 异常会沿 hook 回调向上抛，把这次拒绝一起带走。审计可以失败，拒绝不能。
@@ -401,7 +401,7 @@ class ToolGateway:
                 tool_use_id=call_id,
                 verdict=verdict,
             )
-        except Exception:  # noqa: BLE001 - 见上：审计失败不得降级为放行
+        except Exception:  # 见上：审计失败不得降级为放行
             self._audit.record_audit_fault(tool_name=verdict.tool_name, tool_use_id=call_id)
         # 包装拒绝熔断（Issue #352）：计数口径是「非 MCP 工具被拒」——真实事故里
         # 模型用 `Bash: claude mcp call …` 之类的内置工具包装调用问数 MCP，一律
@@ -434,7 +434,7 @@ class ToolGateway:
                 if self._on_wrapper_fuse_tripped is not None:
                     try:
                         self._on_wrapper_fuse_tripped(self._wrapper_denial_count)
-                    except Exception:  # noqa: BLE001 - 熔断通知失败不得影响工具判定本身
+                    except Exception:  # 熔断通知失败不得影响工具判定本身
                         pass
         elif not verdict.denied and verdict.tool_name.startswith("mcp__"):
             # 熔断合取项计数：本回合放行过至少一次原生 MCP 调用，说明模型没有

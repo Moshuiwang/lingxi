@@ -435,7 +435,7 @@ class StalledProvisioningDuty:
             # 一个候选时上报，只传聚合计数——见模块文档「停摆计数送达管理群」。
             try:
                 self._alert(report.aborted)
-            except Exception as error:  # noqa: BLE001 - 告警失败不得带走已完成的收口
+            except Exception as error:  # 告警失败不得带走已完成的收口
                 self._audit.record(
                     "stalled_provisioning.alert_callback_failed",
                     error=type(error).__name__,
@@ -479,7 +479,7 @@ class StalledProvisioningDuty:
             processed += 1
             try:
                 self._process_one(item, tally)
-            except Exception as error:  # noqa: BLE001 - 一个用户的失败不得带走整轮
+            except Exception as error:  # 一个用户的失败不得带走整轮
                 tally.failed += 1
                 self._audit.record(
                     "stalled_provisioning.user_failed",
@@ -520,7 +520,7 @@ class StalledProvisioningDuty:
                     values={"reference": item.trace_id},
                     dedupe_key=dedupe_key,
                 )
-            except Exception as error:  # noqa: BLE001 - 通知失败：留在原状态，下一轮重来
+            except Exception as error:  # 通知失败：留在原状态，下一轮重来
                 tally.notify_failed += 1
                 self._audit.record(
                     "stalled_provisioning.notify_failed",
@@ -575,7 +575,7 @@ class StalledProvisioningDuty:
                 failure_reason="stalled_lease_expired",
                 event_type="stalled_provisioning.aborted",
             )
-        except Exception as error:  # noqa: BLE001 - 落库失败不得带走已完成的收口
+        except Exception as error:  # 落库失败不得带走已完成的收口
             self._audit.record(
                 "stalled_provisioning.failure_reason_record_failed",
                 error=type(error).__name__,

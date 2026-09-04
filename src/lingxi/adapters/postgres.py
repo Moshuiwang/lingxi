@@ -365,7 +365,7 @@ def _build_reusable_connection_type() -> type:
                     self.isolation_level = None
                 if self.deferrable is not None:
                     self.deferrable = None
-            except Exception as error:  # noqa: BLE001 - 复位失败只意味着不复用，不需要区分原因
+            except Exception as error:  # 复位失败只意味着不复用，不需要区分原因
                 logger.info("数据库连接归还前复位失败，改为关闭：%s", type(error).__name__)
                 return False
             return True
@@ -391,7 +391,7 @@ def _build_reusable_connection_type() -> type:
                         cursor.fetchone()
                 finally:
                     self.autocommit = False
-            except Exception:  # noqa: BLE001 - 探活失败的原因不重要，结论都是丢弃
+            except Exception:  # 探活失败的原因不重要，结论都是丢弃
                 return False
             return True
 

@@ -212,7 +212,7 @@ class LongConnectionSupervisor:
                     source=error.failure.source.value,
                     status_code=error.failure.status_code,
                 )
-            except Exception as error:  # noqa: BLE001 - 传输层任何异常都按可重试处理
+            except Exception as error:  # 传输层任何异常都按可重试处理
                 self._audit("longconn.stream_failed", error=f"{type(error).__name__}: {error}")
 
             if should_stop():
@@ -233,10 +233,10 @@ class LongConnectionSupervisor:
             return
         try:
             self._heartbeat()
-        except Exception as error:  # noqa: BLE001 - 心跳观察失败不能断开长连接
+        except Exception as error:  # 心跳观察失败不能断开长连接
             try:
                 self._audit("longconn.heartbeat_failed", error=type(error).__name__)
-            except Exception as audit_error:  # noqa: BLE001 - 审计观察失败也不能断流
+            except Exception as audit_error:  # 审计观察失败也不能断流
                 logger.error(
                     "长连接心跳失败且审计失败 error=%s audit_error=%s",
                     type(error).__name__,
@@ -268,7 +268,7 @@ class LongConnectionSupervisor:
         response: dict | None = None
         try:
             response = self._handle_event(payload)
-        except Exception as caught:  # noqa: BLE001 - 见 docstring
+        except Exception as caught:  # 见 docstring
             error = caught
             self._audit("event.handler_failed", error=f"{type(caught).__name__}: {caught}")
         finally:
@@ -498,7 +498,7 @@ class LarkEventTransport:
         def pump() -> None:
             try:
                 client.start()
-            except BaseException as error:  # noqa: BLE001 - 交给主线程分类
+            except BaseException as error:  # 交给主线程分类
                 failure.append(error)
             finally:
                 events.put(finished)

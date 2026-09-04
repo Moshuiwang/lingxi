@@ -530,7 +530,7 @@ class LateReadinessRecoveryDuty:
             tally.examined += 1
             try:
                 self._recover_one(item, tally)
-            except Exception as error:  # noqa: BLE001 - 一个用户的失败不得带走整轮
+            except Exception as error:  # 一个用户的失败不得带走整轮
                 # 只记异常类型：异常正文可能带上被处理对象的内容。
                 tally.failed += 1
                 self._audit.record(
@@ -575,7 +575,7 @@ class LateReadinessRecoveryDuty:
             attempt = self._ticker.probe_after_timeout(
                 binding, attempt_no=item.next_attempt_no
             )
-        except Exception as error:  # noqa: BLE001 - 占住窗口，再让外层记 failed 并上抛
+        except Exception as error:  # 占住窗口，再让外层记 failed 并上抛
             self._ticker.record_processing_failure(
                 binding,
                 attempt_no=item.next_attempt_no,
@@ -615,7 +615,7 @@ class LateReadinessRecoveryDuty:
                 # 事务里改挂首聊补一句。用户自己发起的链一字不变。
                 silent_system_trigger=item.system_triggered,
             )
-        except Exception as error:  # noqa: BLE001 - 占住窗口，再让外层记 failed 并上抛
+        except Exception as error:  # 占住窗口，再让外层记 failed 并上抛
             self._ticker.record_processing_failure(
                 binding,
                 attempt_no=item.next_attempt_no + 1,
@@ -660,7 +660,7 @@ class LateReadinessRecoveryDuty:
             tally.notices_claimed += 1
             try:
                 self._send_notice(notice, tally)
-            except Exception as error:  # noqa: BLE001 - 一条通知的失败不得带走整轮
+            except Exception as error:  # 一条通知的失败不得带走整轮
                 tally.failed += 1
                 self._audit.record(
                     "late_readiness_recovery.notice_processing_failed",
@@ -700,7 +700,7 @@ class LateReadinessRecoveryDuty:
                 },
                 dedupe_key=notice.dedupe_key,
             )
-        except Exception as error:  # noqa: BLE001 - 记完错误码再留在 pending 等下次到期
+        except Exception as error:  # 记完错误码再留在 pending 等下次到期
             self._notices.mark_notice_failed(notice.notice_id, error=type(error).__name__)
             tally.notice_failed += 1
             self._audit.record(

@@ -639,7 +639,7 @@ class AlertDispatcher:
                     text=notice.text,
                     dedupe_key=notice.dedupe_key,
                 )
-            except Exception as error:  # noqa: BLE001 - 告警失败只进入本地重试队列
+            except Exception as error:  # 告警失败只进入本地重试队列
                 delay = self._policy.retry_delay(pending.attempt)
                 pending.attempt += 1
                 pending.next_attempt_at = now + timedelta(seconds=delay)
@@ -673,7 +673,7 @@ class AlertDispatcher:
             return
         try:
             self._audit.record(action, **fields)
-        except Exception as error:  # noqa: BLE001 - 审计观察失败不能改变告警重试
+        except Exception as error:  # 审计观察失败不能改变告警重试
             logger.error("运行告警审计失败 action=%s error=%s", action, type(error).__name__)
 
 
@@ -914,5 +914,5 @@ class AlertingDuty:
                     count=notice.count,
                     trace_id=notice.trace_id or "-",
                 )
-            except Exception as error:  # noqa: BLE001 - 审计失败不能丢待投递告警
+            except Exception as error:  # 审计失败不能丢待投递告警
                 logger.error("运行告警记录失败 action=%s error=%s", action, type(error).__name__)

@@ -156,7 +156,7 @@ class GroupMentionHintResponder:
     def maybe_respond(self, error: NonPrivateChatError) -> None:
         try:
             self._maybe_respond(error)
-        except Exception as failure:  # noqa: BLE001 - 引导是尽力而为的旁路，
+        except Exception as failure:  # 引导是尽力而为的旁路，
             # 失败不得带走事件 ack、不得让飞书判定为处理失败而重投（见类文档）。
             logger.error(
                 "gateway.group_mention_hint.failed chat_id=%s error=%s",

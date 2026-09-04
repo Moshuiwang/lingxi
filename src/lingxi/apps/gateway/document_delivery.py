@@ -325,7 +325,7 @@ class DocumentDeliveryConsumer:
 
         try:
             exhausted = self._store.fail_exhausted_pending()
-        except Exception as error:  # noqa: BLE001 - 见类文档：只降级这一段
+        except Exception as error:  # 见类文档：只降级这一段
             logger.error("文档投递：清理耗尽重试预算的待认领行失败 error=%s", type(error).__name__)
         else:
             if exhausted > 0:
@@ -340,7 +340,7 @@ class DocumentDeliveryConsumer:
 
         try:
             requeued, reclaim_failed = self._store.reclaim_stale_processing()
-        except Exception as error:  # noqa: BLE001 - 见类文档：只降级这一段
+        except Exception as error:  # 见类文档：只降级这一段
             logger.error("文档投递：回收卡住的处理中行失败 error=%s", type(error).__name__)
         else:
             del requeued  # 退回 pending 等下一轮重来，不是失败结果，不必上报。
@@ -358,7 +358,7 @@ class DocumentDeliveryConsumer:
         # （同上面两段），不阻塞新行的正常认领与处理。
         try:
             pending_notices = self._store.claim_unnotified_succeeded(limit=self._limit)
-        except Exception as error:  # noqa: BLE001 - 见类文档：只降级这一段
+        except Exception as error:  # 见类文档：只降级这一段
             logger.error("文档投递：查询待补发通知的行失败 error=%s", type(error).__name__)
         else:
             for item in pending_notices:
@@ -374,7 +374,7 @@ class DocumentDeliveryConsumer:
 
         try:
             claims = self._store.claim_pending(limit=self._limit)
-        except Exception as error:  # noqa: BLE001 - 本轮无事可做，下一轮重来
+        except Exception as error:  # 本轮无事可做，下一轮重来
             logger.error("文档投递：认领待处理行失败 error=%s", type(error).__name__)
             return 0
 
@@ -384,7 +384,7 @@ class DocumentDeliveryConsumer:
             )
             try:
                 self._process_claim(claim)
-            except Exception as error:  # noqa: BLE001 - 一行失败不得带走同一轮的其他行
+            except Exception as error:  # 一行失败不得带走同一轮的其他行
                 logger.error(
                     "文档投递单行处理异常，本轮其余行不受影响 task_id=%s error=%s",
                     claim.task_id,
@@ -465,7 +465,7 @@ class DocumentDeliveryConsumer:
             # 没有硬性防线保证）。
             self._fail(claim, last_error=type(error).__name__)
             return
-        except Exception as error:  # noqa: BLE001 - 白名单反转（同 delivery.py R-1）：
+        except Exception as error:  # 白名单反转（同 delivery.py R-1）：
             # 只有上面显式捕获的 definite FeishuDocxDeliveryError 与确定性入参
             # 校验错误（ValueError）才归 failed，其余一切（LookupError、未预期
             # 异常）都归结果不明——不能假设一次有副作用的调用在异常时一定没有
@@ -612,7 +612,7 @@ class DocumentDeliveryConsumer:
             # HTTP 请求之前**就会失败，没有"可能已经生效"的空间，归 failed。
             self._fail(claim, last_error=type(error).__name__)
             return
-        except Exception as error:  # noqa: BLE001 - 白名单反转，同 docx 分支
+        except Exception as error:  # 白名单反转，同 docx 分支
             self._uncertain(claim, last_error=type(error).__name__)
             return
 
@@ -662,7 +662,7 @@ class DocumentDeliveryConsumer:
                 claim.task_id,
             )
             return
-        except Exception as error:  # noqa: BLE001 - 落库失败仍按结果不明处理，不假装成功
+        except Exception as error:  # 落库失败仍按结果不明处理，不假装成功
             self._uncertain(claim, last_error=type(error).__name__)
             return
 
@@ -696,7 +696,7 @@ class DocumentDeliveryConsumer:
                 claim.task_id,
             )
             return
-        except Exception as error:  # noqa: BLE001 - 记录失败不能让异常逃出本方法
+        except Exception as error:  # 记录失败不能让异常逃出本方法
             logger.error(
                 "文档投递终态写入失败（failed）task_id=%s error=%s", claim.task_id, type(error).__name__
             )
@@ -738,7 +738,7 @@ class DocumentDeliveryConsumer:
                 claim.task_id,
             )
             return
-        except Exception as error:  # noqa: BLE001 - 记录失败不能让异常逃出本方法
+        except Exception as error:  # 记录失败不能让异常逃出本方法
             logger.error(
                 "文档投递终态写入失败（uncertain）task_id=%s error=%s", claim.task_id, type(error).__name__
             )
@@ -861,7 +861,7 @@ class DocumentDeliveryConsumer:
                 dedupe_key=f"{dedupe_prefix}:{request_id}",
             )
             self._store.mark_notified(request_id=request_id)
-        except Exception as error:  # noqa: BLE001 - 通知失败不得回滚已经确认的交付结果
+        except Exception as error:  # 通知失败不得回滚已经确认的交付结果
             logger.error(
                 "文档投递完成通知发送失败，交付结果不受影响 task_id=%s error=%s",
                 task_id,
@@ -899,7 +899,7 @@ class DocumentDeliveryConsumer:
                 text=content.text,
                 dedupe_key=f"{dedupe_prefix}:{claim.id}",
             )
-        except Exception as error:  # noqa: BLE001 - 通知失败不得回滚已经落库的终态
+        except Exception as error:  # 通知失败不得回滚已经落库的终态
             logger.error(
                 "文档投递终态通知发送失败 task_id=%s key=%s error=%s",
                 claim.task_id,
@@ -924,16 +924,16 @@ class DocumentDeliveryConsumer:
             if heartbeat is not None:
                 try:
                     heartbeat()
-                except Exception as error:  # noqa: BLE001 - 心跳失败不能带走投递职责
+                except Exception as error:  # 心跳失败不能带走投递职责
                     logger.error("文档投递心跳记录失败 error=%s", type(error).__name__)
             if on_tick is not None:
                 try:
                     on_tick()
-                except Exception as error:  # noqa: BLE001 - 告警自身失败不能带走投递职责
+                except Exception as error:  # 告警自身失败不能带走投递职责
                     logger.error("文档投递告警状态机推进失败 error=%s", type(error).__name__)
             try:
                 self.run_once()
-            except Exception as error:  # noqa: BLE001 - 一轮异常不得带走整条循环
+            except Exception as error:  # 一轮异常不得带走整条循环
                 logger.error("文档投递循环级异常，本轮降级后继续 error=%s", type(error).__name__)
             stop.wait(poll_interval_seconds)
         logger.info("文档投递消费循环已停止")

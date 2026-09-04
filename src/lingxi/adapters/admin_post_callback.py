@@ -91,12 +91,12 @@ class BackgroundPostCallbackExecutor:
             task = self._queue.get()
             try:
                 task()
-            except Exception as error:  # noqa: BLE001 - 单个任务失败不得带走 worker
+            except Exception as error:  # 单个任务失败不得带走 worker
                 try:
                     self._audit.record(
                         POST_CALLBACK_TASK_FAILED_ACTION, error=type(error).__name__
                     )
-                except Exception:  # noqa: BLE001 - 审计器自身故障同样不得带走 worker
+                except Exception:  # 审计器自身故障同样不得带走 worker
                     pass
             finally:
                 self._queue.task_done()

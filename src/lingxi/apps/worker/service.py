@@ -479,7 +479,7 @@ class WorkerService:
             return
         try:
             pending = claim(limit=self._session_cleanup_batch_limit)
-        except Exception as error:  # noqa: BLE001 - 清理认领失败不能带走任务职责
+        except Exception as error:  # 清理认领失败不能带走任务职责
             logger.error("Agent 会话清理队列认领失败 error=%s", type(error).__name__)
             return
         if not pending:
@@ -514,7 +514,7 @@ class WorkerService:
                     user_env_root=self._config.user_env_root,
                     user_id=item.user_id,
                 )
-            except Exception as error:  # noqa: BLE001 - 单条失败不影响本轮其余条目
+            except Exception as error:  # 单条失败不影响本轮其余条目
                 logger.error(
                     "Agent 会话 JSONL 归档/物理删除失败 reason=%s error=%s",
                     item.reason,
@@ -525,7 +525,7 @@ class WorkerService:
         if done_ids:
             try:
                 mark_done(ids=done_ids)
-            except Exception as error:  # noqa: BLE001 - 标记失败只影响是否重试，不影响正确性
+            except Exception as error:  # 标记失败只影响是否重试，不影响正确性
                 logger.error("Agent 会话清理标记完成失败 error=%s", type(error).__name__)
 
     def _emit_heartbeat(self) -> None:
@@ -533,7 +533,7 @@ class WorkerService:
             return
         try:
             self._heartbeat()
-        except Exception as error:  # noqa: BLE001 - 心跳失败不能带走任务职责
+        except Exception as error:  # 心跳失败不能带走任务职责
             # 只记异常类型；心跳是告警输入，不能因为告警输入失败而让 worker 停止消费。
             import logging
 
@@ -554,7 +554,7 @@ class WorkerService:
             return
         try:
             self._on_alert_tick()
-        except Exception as error:  # noqa: BLE001 - 告警自身失败不能带走任务职责
+        except Exception as error:  # 告警自身失败不能带走任务职责
             import logging
 
             logging.getLogger(__name__).error(
@@ -566,7 +566,7 @@ class WorkerService:
             return
         try:
             self._on_task_stuck(kind, count)
-        except Exception as error:  # noqa: BLE001 - 告警失败不应改变任务状态
+        except Exception as error:  # 告警失败不应改变任务状态
             import logging
 
             logging.getLogger(__name__).error(
@@ -823,7 +823,7 @@ class WorkerService:
                         self._user_memory_reader.fetch_prompt_segment,
                         user_id=claimed.user_id,
                     )
-                except Exception as error:  # noqa: BLE001 - fail-open，见上方说明
+                except Exception as error:  # fail-open，见上方说明
                     logger.warning(
                         "worker.user_memory.degraded error=%s task_id=%s（本任务不带记忆继续执行）",
                         type(error).__name__,
@@ -876,7 +876,7 @@ class WorkerService:
                     "user_mcp_config_unavailable", f"user_mcp_config:{error.code}", error
                 ),
             }
-        except Exception as error:  # noqa: BLE001 - worker 绝不留下 running
+        except Exception as error:  # worker 绝不留下 running
             # `turn.py` 兜底 `except` 之外的**第二条**兜底（Issue #495）：失败码
             # 保持 `session_failed`（用户文案不变），固定类别摘要进 `signature`。
             report = {
@@ -1143,7 +1143,7 @@ class WorkerService:
             )
             if record is not None:
                 self._content_capture_writer(record)
-        except Exception as error:  # noqa: BLE001 - 采集失败降级为日志，不丢用户结果
+        except Exception as error:  # 采集失败降级为日志，不丢用户结果
             logger.error(
                 "内测轮内容级采集写入失败，任务结果不受影响 task_id=%s error=%s",
                 claimed.task_id,
@@ -1181,7 +1181,7 @@ class WorkerService:
             )
             if suspect is not None:
                 self._on_year_grounding_suspect(suspect.to_alert_fields())
-        except Exception as error:  # noqa: BLE001 - 检测是旁路，异常不得影响任务终态
+        except Exception as error:  # 检测是旁路，异常不得影响任务终态
             logger.error(
                 "年份接地护栏检测异常，任务结果不受影响 task_id=%s error=%s",
                 record.task_id,
@@ -1215,7 +1215,7 @@ class WorkerService:
                 elapsed_seconds=elapsed_seconds,
                 content=content,
             )
-        except Exception as error:  # noqa: BLE001 - 事件是可恢复的运行信号，不能带走任务
+        except Exception as error:  # 事件是可恢复的运行信号，不能带走任务
             import logging
 
             logging.getLogger(__name__).error(
@@ -1393,7 +1393,7 @@ class WorkerService:
         }
         try:
             self._on_terminal_outcome(fields)
-        except Exception as error:  # noqa: BLE001 - 观测失败不能带走任务职责，参照 _append_event
+        except Exception as error:  # 观测失败不能带走任务职责，参照 _append_event
             logger.error(
                 "终态收口审计事件回调失败，任务收口继续 error=%s", type(error).__name__
             )
@@ -1437,7 +1437,7 @@ class WorkerService:
             if on_stall_tick is not None:
                 try:
                     on_stall_tick()
-                except Exception as error:  # noqa: BLE001 - 兜底刷新失败不能带走任务职责
+                except Exception as error:  # 兜底刷新失败不能带走任务职责
                     logger.error(
                         "语义化进度兜底刷新失败，任务职责继续运行 error=%s",
                         type(error).__name__,
@@ -1498,7 +1498,7 @@ class WorkerService:
             try:
                 listener_context = self._listener_factory()
                 listener = listener_context.__enter__()
-            except Exception as error:  # noqa: BLE001 - 监听建不起来退回轮询，不带走进程
+            except Exception as error:  # 监听建不起来退回轮询，不带走进程
                 logger.warning(
                     "task_queued 监听不可用，本轮退回轮询后重试建立监听：%s",
                     type(error).__name__,
@@ -1517,7 +1517,7 @@ class WorkerService:
                             listener.wait,
                             timeout_seconds=self._config.poll_interval_seconds,
                         )
-                    except Exception as error:  # noqa: BLE001 - 监听连接断开只重建监听
+                    except Exception as error:  # 监听连接断开只重建监听
                         logger.warning(
                             "task_queued 监听连接断开，重建监听：%s", type(error).__name__
                         )

@@ -327,7 +327,7 @@ class AdminCommandRouter:
         try:
             self._audit.record(action, **fields)
             return True
-        except Exception as error:  # noqa: BLE001 - 审计器本身的异常不得向上传染
+        except Exception as error:  # 审计器本身的异常不得向上传染
             logger.error(
                 "admin.router.audit_failed original_action=%s error=%s",
                 action,
@@ -375,7 +375,7 @@ class AdminCommandRouter:
 
         try:
             entry = self._registry.active_entry(open_id=open_id)
-        except Exception as error:  # noqa: BLE001 - 判定失败必须失败关闭，不得放行
+        except Exception as error:  # 判定失败必须失败关闭，不得放行
             return self._record_or_reject(
                 "admin.command.lookup_failed",
                 AdminRouteOutcome(handled=False),
@@ -406,7 +406,7 @@ class AdminCommandRouter:
                 message_id=message_id,
                 origin_card_message_id=origin_card_message_id,
             )
-        except Exception as error:  # noqa: BLE001 - 已确认是管理员，失败也必须有回复
+        except Exception as error:  # 已确认是管理员，失败也必须有回复
             return self._record_or_reject(
                 "admin.command.internal_error",
                 AdminRouteOutcome(
@@ -922,7 +922,7 @@ class AdminCommandRouter:
             self._management_cards.send(
                 **send_kwargs,
             )
-        except Exception as error:  # noqa: BLE001 - 管理卡发送失败不影响文本回复
+        except Exception as error:  # 管理卡发送失败不影响文本回复
             self._safe_record(
                 "admin.command.management_card_send_failed",
                 target=display_identifier,

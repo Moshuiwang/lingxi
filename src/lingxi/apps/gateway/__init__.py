@@ -380,7 +380,7 @@ class _ManagementCardRecoveryScanner:
     def scan(self) -> int:
         try:
             contexts = self._context_store.list_needing_refresh(limit=20)
-        except Exception as error:  # noqa: BLE001 - preserve watermark for retry
+        except Exception as error:  # preserve watermark for retry
             self._audit.record(
                 "admin.management_card.recovery_scan_failed", error=type(error).__name__
             )
@@ -401,7 +401,7 @@ class _ManagementCardRecoveryScanner:
                 if refreshed is False:
                     continue
                 recovered += 1
-            except Exception as error:  # noqa: BLE001 - retry this row next scan
+            except Exception as error:  # retry this row next scan
                 self._audit.record(
                     "admin.management_card.recovery_refresh_failed",
                     error=type(error).__name__,
@@ -869,7 +869,7 @@ def build_supervisor(
                     state=state,
                     dispatch_status=dispatch_status,
                 )
-        except Exception as error:  # noqa: BLE001 - result refresh is best effort
+        except Exception as error:  # result refresh is best effort
             audit.record(
                 "admin.card_callback.management_card_refresh_failed",
                 error=type(error).__name__,
@@ -898,7 +898,7 @@ def build_supervisor(
                     publish_state = management_card_context_store.latest_publish_state_for_message(
                         message_id=origin_message_id
                     )
-                except Exception as error:  # noqa: BLE001 - transient reads are retried
+                except Exception as error:  # transient reads are retried
                     audit.record(
                         "admin.card_callback.management_publish_state_lookup_failed",
                         error=type(error).__name__,
@@ -1031,7 +1031,7 @@ def build_supervisor(
         delegated_subject_open_id = registered_delegated_subject_open_id(
             str(config.postgres_dsn), timeouts=config.postgres_timeouts
         )
-    except Exception as error:  # noqa: BLE001 - 见上方注释，读取失败按"本次无此防护"处理
+    except Exception as error:  # 见上方注释，读取失败按"本次无此防护"处理
         delegated_subject_open_id = None
         audit.record(
             "gateway.delegated_subject_lookup_failed", error=type(error).__name__
@@ -1338,7 +1338,7 @@ def main(argv: list[str] | None = None, env: Mapping[str, str] | None = None) ->
         try:
             delivery_alert("delivery_loop_dead:" + cause, LOOP_ALERT_TRACE_ID)
             alerting_duty.run_once()
-        except Exception as error:  # noqa: BLE001 - 告警自身失败不能再抛回退出路径
+        except Exception as error:  # 告警自身失败不能再抛回退出路径
             logger.error("投递线程退出告警发送失败 error=%s", type(error).__name__)
 
     document_delivery_death_reported: list[bool] = [False]
@@ -1364,7 +1364,7 @@ def main(argv: list[str] | None = None, env: Mapping[str, str] | None = None) ->
                 "document_delivery_loop_dead:" + cause, DOCUMENT_DELIVERY_LOOP_ALERT_TRACE_ID
             )
             alerting_duty.run_once()
-        except Exception as error:  # noqa: BLE001 - 告警自身失败不能再抛回退出路径
+        except Exception as error:  # 告警自身失败不能再抛回退出路径
             logger.error("文档投递线程退出告警发送失败 error=%s", type(error).__name__)
 
     # 首次开通（Epic D / S-D-02）：**gateway 只记事件**。真正的编排住在

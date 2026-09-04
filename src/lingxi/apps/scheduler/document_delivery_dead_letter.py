@@ -133,7 +133,7 @@ class DocumentDeliveryMaintenanceDuty:
     def _sweep_dead_letters(self) -> int:
         try:
             count = self._store.fail_expired_pending()
-        except Exception as error:  # noqa: BLE001 - 只降级这一段，见类文档
+        except Exception as error:  # 只降级这一段，见类文档
             self._audit.record(
                 "document_delivery_maintenance.dead_letter_sweep_failed",
                 error=type(error).__name__,
@@ -151,14 +151,14 @@ class DocumentDeliveryMaintenanceDuty:
                     # 信号（见 ``AlertingDuty.delivery_alert_callback`` 对空/非法
                     # task_id 的既有容错）。
                     self._alert("document_delivery_pending_expired", "")
-                except Exception as error:  # noqa: BLE001 - 告警失败不得带走已完成的扫描
+                except Exception as error:  # 告警失败不得带走已完成的扫描
                     logger.error("文档投递死信告警发送失败 error=%s", type(error).__name__)
         return count
 
     def _sweep_expired_content(self) -> int:
         try:
             return self._store.redact_expired_content()
-        except Exception as error:  # noqa: BLE001 - 只降级这一段，见类文档
+        except Exception as error:  # 只降级这一段，见类文档
             self._audit.record(
                 "document_delivery_maintenance.content_redaction_failed",
                 error=type(error).__name__,

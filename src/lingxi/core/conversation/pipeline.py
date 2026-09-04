@@ -313,7 +313,7 @@ class EventPipeline:
             return self._handle_unexpected_failure(
                 message, error.__cause__ or error, retryable=True
             )
-        except Exception as error:  # noqa: BLE001 - 见上方 docstring：这是全函数的最后一道防线
+        except Exception as error:  # 见上方 docstring：这是全函数的最后一道防线
             return self._handle_unexpected_failure(message, error)
 
     def _handle_unexpected_failure(
@@ -391,7 +391,7 @@ class EventPipeline:
                     content_version=content.version,
                     trace_id=message.trace_id,
                 )
-            except Exception as send_error:  # noqa: BLE001 - 已经在兜底路径，发送失败只记审计
+            except Exception as send_error:  # 已经在兜底路径，发送失败只记审计
                 self._audit.record(
                     "reply.failed",
                     event_id=message.event_id,
@@ -435,7 +435,7 @@ class EventPipeline:
                             content_version=content.version,
                             trace_id=message.trace_id,
                         )
-                    except Exception as send_error:  # noqa: BLE001 - 结论已回滚，提示尽力而为
+                    except Exception as send_error:  # 结论已回滚，提示尽力而为
                         self._audit.record(
                             "reply.failed",
                             event_id=message.event_id,
@@ -501,7 +501,7 @@ class EventPipeline:
                     content_version=content.version,
                     trace_id=message.trace_id,
                 )
-            except Exception as error:  # noqa: BLE001 - 回复失败不改变已提交的结论
+            except Exception as error:  # 回复失败不改变已提交的结论
                 self._audit.record(
                     "reply.failed",
                     event_id=message.event_id,
@@ -528,7 +528,7 @@ class EventPipeline:
                     user_open_id=message.sender_open_id,
                     trace_id=message.trace_id,
                 )
-            except Exception as error:  # noqa: BLE001 - 见 _InboundEventInsertFailure 文档
+            except Exception as error:  # 见 _InboundEventInsertFailure 文档
                 # 这一次调用本身失败：幂等记录还没有落库，是 handle_message 顶层
                 # 兜底里唯一"重投能真正带来恢复"的出口（Issue #469 opus 独立审查
                 # P2-1，见 _handle_unexpected_failure 的 retryable 参数文档）。
@@ -851,7 +851,7 @@ class EventPipeline:
             rendered = self._render_onboarding_result(
                 result, checking_key=checking.key, message=message
             )
-        except Exception as error:  # noqa: BLE001 - 失败必须落到统一终态文案
+        except Exception as error:  # 失败必须落到统一终态文案
             # 独立审查 codex P1-2（已核实，见 commit 说明的核实证据）：这条分支发的
             # 「已转交管理员处理」不像 onboarding_runner.py 的同名文案那样接了
             # ONBOARDING_FAILED 管理员告警回调。**防御性分支，生产不可达**：
@@ -917,7 +917,7 @@ class EventPipeline:
 
         try:
             self._store.mark_onboarding_dispatched(event_id=message.event_id)
-        except Exception as error:  # noqa: BLE001 - 见 docstring
+        except Exception as error:  # 见 docstring
             self._audit.record(
                 "onboarding.dispatch_record_failed",
                 event_id=message.event_id,
@@ -1072,7 +1072,7 @@ class EventPipeline:
 
         try:
             self._reactions.add(message_id=message.message_id)
-        except Exception as error:  # noqa: BLE001 - 见 docstring
+        except Exception as error:  # 见 docstring
             self._audit.record(
                 "reaction.failed",
                 event_id=message.event_id,
@@ -1455,7 +1455,7 @@ class EventPipeline:
                 target_worker_version=version,
                 reply_to_message_id=message.message_id,
             )
-        except Exception as error:  # noqa: BLE001 - 事务外只做一次失败提示
+        except Exception as error:  # 事务外只做一次失败提示
             raise QueueInsertFailure("task insert failed") from error
         tx.mark_handled_as(event_id=message.event_id, handled_as=HandledAs.TASK_QUEUED)
         tx.notify_task_queued()

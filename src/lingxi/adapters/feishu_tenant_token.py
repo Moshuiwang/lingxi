@@ -91,7 +91,7 @@ def urllib_transport(method: str, url: str, *, body: Mapping[str, Any] | None = 
     headers = {"Content-Type": "application/json; charset=utf-8"} if body is not None else {}
     request = Request(url, data=payload, headers=headers, method=method)
     try:
-        with urlopen(request, timeout=REQUEST_TIMEOUT_SECONDS) as response:  # noqa: S310 - 地址来自受控配置
+        with urlopen(request, timeout=REQUEST_TIMEOUT_SECONDS) as response:  # 地址来自受控配置
             return json.loads(response.read())
     except HTTPError as error:
         try:

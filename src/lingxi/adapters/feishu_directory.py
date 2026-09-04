@@ -191,7 +191,7 @@ def urllib_transport(method: str, url: str, *, body: Mapping[str, Any] | None = 
         headers["Authorization"] = f"Bearer {token}"
     request = Request(url, data=payload, headers=headers, method=method)
     try:
-        with urlopen(request, timeout=REQUEST_TIMEOUT_SECONDS) as response:  # noqa: S310 - 地址来自受控配置
+        with urlopen(request, timeout=REQUEST_TIMEOUT_SECONDS) as response:  # 地址来自受控配置
             return json.loads(response.read())
     except HTTPError as error:
         try:

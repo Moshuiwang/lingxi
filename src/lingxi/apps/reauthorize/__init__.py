@@ -152,14 +152,14 @@ def _runtime_actor() -> str:
 
     try:
         return getpass.getuser()
-    except Exception:  # noqa: BLE001 - 容器里没有 passwd 条目时不能因此中断审计
+    except Exception:  # 容器里没有 passwd 条目时不能因此中断审计
         return f"uid:{os.getuid()}"
 
 
 def _runtime_host() -> str:
     try:
         return socket.gethostname()
-    except Exception:  # noqa: BLE001 - 同上
+    except Exception:  # 同上
         return "unknown-host"
 
 
@@ -220,7 +220,7 @@ def _write_audit(
             outcome,
             extra={"audit_event": BOOTSTRAP_AUDIT_EVENT},
         )
-    except Exception as error:  # noqa: BLE001 - 审计出口失败只报类别
+    except Exception as error:  # 审计出口失败只报类别
         _report_audit_failure(action, type(error).__name__, errors=errors)
         return False
     if handler.written == before:
@@ -233,7 +233,7 @@ def _report_audit_failure(action: str, reason: str, *, errors: TextIO) -> None:
     logger.error("首次建立审计留痕失败 action=%s reason=%s", action, reason)
     try:
         print(f"审计留痕失败（{reason}）：首次建立的 {action} 记录未能写下。", file=errors)
-    except Exception:  # noqa: BLE001 - 终端也不可写时至少 logger 已经报过
+    except Exception:  # 终端也不可写时至少 logger 已经报过
         pass
 
 
@@ -406,7 +406,7 @@ def _run(
         def receive_bridge_message(message: OAuthBridgeMessage) -> None:
             try:
                 results.append(handle_bridge_message(entry, bridge, message))
-            except Exception as error:  # noqa: BLE001 - 入口只暴露脱敏失败类别
+            except Exception as error:  # 入口只暴露脱敏失败类别
                 logger.warning("正式重授权 Bridge 回调处理失败 error=%s", type(error).__name__)
                 results.append(
                     ReauthorizationResult(
@@ -418,7 +418,7 @@ def _run(
                 )
                 try:
                     bridge.send_result(message.state, "retry")
-                except Exception as send_error:  # noqa: BLE001 - 只记录错误类别
+                except Exception as send_error:  # 只记录错误类别
                     logger.warning("OAuth Bridge 结果回传失败 error=%s", type(send_error).__name__)
             finally:
                 completed.set()
@@ -471,7 +471,7 @@ def _run(
                 errors=errors,
             )
         return 1
-    except Exception as error:  # noqa: BLE001 - 终端只报告失败类别
+    except Exception as error:  # 终端只报告失败类别
         print(f"重授权入口失败：{type(error).__name__}", file=errors)
         if mode == MODE_BOOTSTRAP:
             _write_audit(

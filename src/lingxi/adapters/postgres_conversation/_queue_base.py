@@ -142,7 +142,7 @@ class _TaskQueueBase:
             self._pooled_connection = None
         try:
             connection.close()
-        except Exception:  # noqa: BLE001 - 关闭一条已经坏掉的连接失败，不需要覆盖原始异常
+        except Exception:  # 关闭一条已经坏掉的连接失败，不需要覆盖原始异常
             pass
 
     @staticmethod

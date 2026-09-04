@@ -769,7 +769,7 @@ class PermissionRefreshDuty:
             tally.examined += 1
             try:
                 self._refresh_user(identity, snapshot.rows, galaxy, now, tally)
-            except Exception as error:  # noqa: BLE001 - 一个用户的失败不得带走整轮
+            except Exception as error:  # 一个用户的失败不得带走整轮
                 # 只记异常类型：异常正文可能带上被处理对象的内容（邮箱、姓名）。
                 tally.failed += 1
                 tally.count(f"failed_{type(error).__name__}")
@@ -1115,7 +1115,7 @@ class PermissionRefreshDuty:
             return None
         try:
             entries = tuple(self._local_overrides.effective_entries(user_id=user_id))
-        except Exception as error:  # noqa: BLE001 - 本地源读取失败只降级，不整轮/整人失败
+        except Exception as error:  # 本地源读取失败只降级，不整轮/整人失败
             self._audit.record(
                 "permission_refresh.local_override_skipped",
                 user=user_id,
@@ -1150,7 +1150,7 @@ class PermissionRefreshDuty:
                 added = self._legacy_all_scope.expand_all_scope_group(
                     user_id=user_id, group_id=group_id, metrics=metrics, now=self._clock()
                 )
-            except Exception as error:  # noqa: BLE001 - 补行失败不影响本轮既有合并
+            except Exception as error:  # 补行失败不影响本轮既有合并
                 self._audit.record(
                     "permission_refresh.legacy_all_scope_refresh_failed",
                     user=user_id,
@@ -1165,7 +1165,7 @@ class PermissionRefreshDuty:
             return entries
         try:
             return tuple(self._local_overrides.effective_entries(user_id=user_id))
-        except Exception:  # noqa: BLE001 - 重读失败：新行下一轮自然生效
+        except Exception:  # 重读失败：新行下一轮自然生效
             return entries
 
     def _revoke(

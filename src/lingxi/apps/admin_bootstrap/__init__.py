@@ -91,7 +91,7 @@ def run(
         return 1
 
     if lookup_delegated_subject is None:
-        from lingxi.adapters.delegated_credentials import (  # noqa: PLC0415
+        from lingxi.adapters.delegated_credentials import (
             registered_delegated_subject_open_id,
         )
 
@@ -99,7 +99,7 @@ def run(
             return registered_delegated_subject_open_id(dsn)
 
     if seed is None:
-        from lingxi.adapters.admin_registry import seed_admin_registry_entry  # noqa: PLC0415
+        from lingxi.adapters.admin_registry import seed_admin_registry_entry
 
         def seed(open_id: str) -> bool:
             # 三类角色固定合并授予：seed_admin_registry_entry 自 opus 批量审查
@@ -113,7 +113,7 @@ def run(
 
     try:
         subject_open_id = lookup_delegated_subject()
-    except Exception as error:  # noqa: BLE001 - 读取失败必须响亮报告，不能静默当作缺失
+    except Exception as error:  # 读取失败必须响亮报告，不能静默当作缺失
         print(f"读取专用授权主体登记失败：{type(error).__name__}", file=err)
         return 1
 
@@ -158,7 +158,7 @@ def run(
             error.mismatched_fields,
         )
         return 1
-    except Exception as error:  # noqa: BLE001 - 写入失败必须响亮报告
+    except Exception as error:  # 写入失败必须响亮报告
         print("登记写入失败，详情已记入日志。", file=err)
         logger.error(
             "admin_bootstrap.failed subject=%s error=%s",

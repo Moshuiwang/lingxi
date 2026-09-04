@@ -105,7 +105,7 @@ def _no_redirect_opener() -> Any:
     from urllib.request import HTTPRedirectHandler, build_opener
 
     class _NoRedirect(HTTPRedirectHandler):
-        def redirect_request(self, req, fp, code, msg, headers, newurl):  # noqa: D102 - 见外层文档
+        def redirect_request(self, req, fp, code, msg, headers, newurl):  # 见外层文档
             return None
 
     return build_opener(_NoRedirect())
@@ -135,7 +135,7 @@ def no_redirect_transport(
         headers["Authorization"] = f"Bearer {token}"
     request = Request(url, data=payload, headers=headers, method=method)
     try:
-        with _no_redirect_opener().open(  # noqa: S310 - 地址来自受控配置且已校验 https
+        with _no_redirect_opener().open(  # 地址来自受控配置且已校验 https
             request, timeout=REQUEST_TIMEOUT_SECONDS
         ) as response:
             return json.loads(response.read())
@@ -143,7 +143,7 @@ def no_redirect_transport(
         # 3xx 也走这里（opener 不跟随），与其它非 2xx 一样按响应体分类。
         try:
             return json.loads(error.read())
-        except Exception as parse_error:  # noqa: BLE001 - 读不出响应体就只剩状态码
+        except Exception as parse_error:  # 读不出响应体就只剩状态码
             raise FeishuUserMessageError(f"http_{error.code}") from parse_error
     except (URLError, OSError, TimeoutError) as error:
         raise FeishuUserMessageError("transport_error") from error

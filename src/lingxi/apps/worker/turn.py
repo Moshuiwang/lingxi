@@ -693,7 +693,7 @@ class WorkerTurnExecutor:
                     failure = _failure_message("cancelled", "任务已取消，未继续执行")
                 except KeyboardInterrupt as error:
                     failure = _failure("interrupted", error)
-                except Exception as error:  # noqa: BLE001 - 入口必须把任何失败变成一份报告
+                except Exception as error:  # 入口必须把任何失败变成一份报告
                     if is_message_buffer_overflow(error):
                         # 工具回执大到超过 SDK 读流缓冲上限（典型：未加窄过滤条件的全量
                         # 指标查询，2026-08-23 真实故障）。这不是"稍后重试"能解决的瞬态

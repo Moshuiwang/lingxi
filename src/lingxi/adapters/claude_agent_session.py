@@ -302,7 +302,7 @@ async def _probe_mcp_status(
 
     try:
         status = await client.get_mcp_status()
-    except Exception as error:  # noqa: BLE001 - 决不能让观测探针拖垮整个回合
+    except Exception as error:  # 决不能让观测探针拖垮整个回合
         stderr_sink = getattr(options, "stderr", None)
         if callable(stderr_sink):
             stderr_sink(f"get_mcp_status probe failed: {type(error).__name__}: {error}")

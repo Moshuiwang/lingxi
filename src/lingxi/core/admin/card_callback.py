@@ -367,7 +367,7 @@ class AdminCardCallbackHandler:
             try:
                 if self._post_callback_executor.submit(task):
                     return
-            except Exception as error:  # noqa: BLE001 - 执行器自身故障不得吞掉这批后处理
+            except Exception as error:  # 执行器自身故障不得吞掉这批后处理
                 self._audit.record(
                     "admin.card_callback.post_callback_submit_failed",
                     pending_action_id=pending.id,
@@ -594,7 +594,7 @@ class AdminCardCallbackHandler:
             return _ManagementContextCheck(context=None, status=None)
         try:
             context = store.lookup_context(message_id=message_id)
-        except Exception as error:  # noqa: BLE001 - 读上下文失败不得放行
+        except Exception as error:  # 读上下文失败不得放行
             self._audit.record(
                 "admin.card_callback.management_context_lookup_failed",
                 error=type(error).__name__,
@@ -649,7 +649,7 @@ class AdminCardCallbackHandler:
         if self._management_state_lookup is not None:
             try:
                 status = self._management_state_lookup(context.identifier)
-            except Exception as error:  # noqa: BLE001 - fail closed on state read errors
+            except Exception as error:  # fail closed on state read errors
                 self._audit.record(
                     "admin.card_callback.management_state_lookup_failed",
                     error=type(error).__name__,
@@ -671,7 +671,7 @@ class AdminCardCallbackHandler:
                         snapshot_fingerprint=fingerprint,
                         last_trace_id=trace_id,
                     ) or context
-                except Exception as error:  # noqa: BLE001 - card refresh is best effort
+                except Exception as error:  # card refresh is best effort
                     self._audit.record(
                         "admin.card_callback.management_context_close_failed",
                         error=type(error).__name__,
@@ -715,7 +715,7 @@ class AdminCardCallbackHandler:
                     dispatch_status="publishing",
                     trace_id=trace_id,
                 )
-        except Exception as error:  # noqa: BLE001 - database/card update is best effort
+        except Exception as error:  # database/card update is best effort
             self._audit.record(
                 "admin.card_callback.management_card_refresh_failed",
                 error=type(error).__name__,
@@ -742,7 +742,7 @@ class AdminCardCallbackHandler:
                 dispatch_status=dispatch_status,
                 status_message=status_message,
             )
-        except Exception as error:  # noqa: BLE001 - management card is best effort
+        except Exception as error:  # management card is best effort
             self._audit.record(
                 "admin.card_callback.management_card_refresh_failed",
                 error=type(error).__name__,
@@ -789,7 +789,7 @@ class AdminCardCallbackHandler:
                     state="closed",
                     trace_id=trace_id,
                 )
-        except Exception as error:  # noqa: BLE001
+        except Exception as error:
             self._audit.record(
                 "admin.card_callback.management_cancel_failed",
                 error=type(error).__name__,
@@ -1132,7 +1132,7 @@ class AdminCardCallbackHandler:
             # 递增的 sequence，见 adapters/feishu_admin_card.py 该方法的文档。
             sequence = self._pending_actions.next_card_sequence(pending_action_id=pending.id)
             self._confirm_cards.update(card_id=pending.card_id, sequence=sequence, card=card)
-        except Exception as error:  # noqa: BLE001 - 卡片视觉更新失败不影响已经落库的业务结果
+        except Exception as error:  # 卡片视觉更新失败不影响已经落库的业务结果
             self._audit.record(
                 "admin.card_callback.card_update_failed",
                 pending_action_id=pending.id,
@@ -1144,7 +1144,7 @@ class AdminCardCallbackHandler:
             return
         try:
             self._recompute_trigger.trigger(pending)
-        except Exception as error:  # noqa: BLE001 - 失败降级回每日批，不影响已经落库的确认结果
+        except Exception as error:  # 失败降级回每日批，不影响已经落库的确认结果
             self._audit.record(
                 "admin.card_callback.recompute_trigger_failed",
                 pending_action_id=pending.id,
@@ -1192,7 +1192,7 @@ class AdminCardCallbackHandler:
                     dispatch_status=None if state == "ready" else dispatch_status,
                     trace_id=trace_id,
                 )
-        except Exception as error:  # noqa: BLE001 - refresh is best effort after commit
+        except Exception as error:  # refresh is best effort after commit
             self._audit.record(
                 "admin.card_callback.management_card_refresh_failed",
                 error=type(error).__name__,
@@ -1218,7 +1218,7 @@ class AdminCardCallbackHandler:
             self._group_notifier.send_text(
                 chat_id=self._group_chat_id, text=text, dedupe_key=pending.id
             )
-        except Exception as error:  # noqa: BLE001 - 群通知失败不影响已经落库的业务结果
+        except Exception as error:  # 群通知失败不影响已经落库的业务结果
             self._audit.record(
                 "admin.card_callback.group_notify_failed",
                 pending_action_id=pending.id,

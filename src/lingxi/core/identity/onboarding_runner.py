@@ -484,7 +484,7 @@ class AutoOnboardingRunner:
         accepted = False
         try:
             accepted = bool(self._submit(task))
-        except Exception as error:  # noqa: BLE001 - 提交失败必须撤销登记
+        except Exception as error:  # 提交失败必须撤销登记
             self._audit.record(
                 "onboarding.submit_failed",
                 event_id=event_id,
@@ -553,7 +553,7 @@ class AutoOnboardingRunner:
             return
         try:
             self._onboarding_failed(reason, trace_id)
-        except Exception as error:  # noqa: BLE001 - 告警是锦上添花，不是链的一部分
+        except Exception as error:  # 告警是锦上添花，不是链的一部分
             self._audit.record(
                 "onboarding.alert_callback_failed",
                 event_id=event_id,
@@ -576,7 +576,7 @@ class AutoOnboardingRunner:
             self._failure_reasons.record_failure(
                 trace_id=trace_id, failure_reason=failure_reason, event_type=event_type
             )
-        except Exception as error:  # noqa: BLE001 - 落库失败不得带走已经决定的终态
+        except Exception as error:  # 落库失败不得带走已经决定的终态
             self._audit.record(
                 "onboarding.failure_reason_record_failed",
                 error=type(error).__name__,
@@ -616,7 +616,7 @@ class AutoOnboardingRunner:
             return
         except OnboardingChainError as error:
             terminal = _internal(error.code)
-        except Exception as error:  # noqa: BLE001 - 未预料的失败也必须有用户结论
+        except Exception as error:  # 未预料的失败也必须有用户结论
             self._audit.record(
                 "onboarding.chain_failed", event_id=event_id, error=type(error).__name__, trace_id=trace_id
             )
@@ -678,7 +678,7 @@ class AutoOnboardingRunner:
             # 但**不再**把它当成"当场收口"的触发条件（见上）。
             try:
                 ledger.mark_onboarding_dispatched(event_id=event_id)
-            except Exception as error:  # noqa: BLE001 - 记不上账最坏只是被下一轮再捞一次
+            except Exception as error:  # 记不上账最坏只是被下一轮再捞一次
                 self._audit.record(
                     "onboarding.dispatch_record_failed",
                     event_id=event_id,
@@ -717,7 +717,7 @@ class AutoOnboardingRunner:
                     open_id=open_id, key=key, values=dict(values), dedupe_key=dedupe_key
                 )
                 return True
-            except Exception as error:  # noqa: BLE001
+            except Exception as error:
                 self._audit.record(
                     "onboarding.notify_failed",
                     event_id=event_id,
@@ -738,7 +738,7 @@ class AutoOnboardingRunner:
             self._ledger.release_onboarding_claim(
                 event_id=event_id, claim_token=claim_token
             )
-        except Exception as error:  # noqa: BLE001
+        except Exception as error:
             self._audit.record(
                 "onboarding.release_claim_failed",
                 event_id=event_id,
@@ -769,7 +769,7 @@ class AutoOnboardingRunner:
             self._ledger.release_onboarding_claim(
                 event_id=event_id, claim_token=claim_token
             )
-        except Exception as error:  # noqa: BLE001 - 放不回去只能记账收口
+        except Exception as error:  # 放不回去只能记账收口
             self._audit.record(
                 "onboarding.release_claim_failed",
                 event_id=event_id,
@@ -820,7 +820,7 @@ class AutoOnboardingRunner:
                 expected_states=(STATE_PROVISIONING, STATE_MCP_SYNCING),
                 reason=terminal.reason or terminal.key,
             )
-        except Exception as error:  # noqa: BLE001 - 收口失败不改写已经决定的终态
+        except Exception as error:  # 收口失败不改写已经决定的终态
             self._audit.record(
                 "onboarding.stalled_abort_failed",
                 user=user_id,
@@ -1007,7 +1007,7 @@ class AutoOnboardingRunner:
     def _locate(self, open_id: str) -> _Terminal | SnapshotMember:
         try:
             lookup = self._directory.lookup(open_id)
-        except Exception as error:  # noqa: BLE001 - 读不到组织资料是本侧故障
+        except Exception as error:  # 读不到组织资料是本侧故障
             raise OnboardingChainError(
                 f"directory_read_failed_{type(error).__name__}"
             ) from error
@@ -1029,14 +1029,14 @@ class AutoOnboardingRunner:
                 employment = self._employment.status(
                     tenant_key=location.member.tenant_key, open_id=open_id
                 )
-            except Exception as error:  # noqa: BLE001
+            except Exception as error:
                 raise OnboardingChainError(
                     f"employment_read_failed_{type(error).__name__}"
                 ) from error
 
         try:
             delegated_subject_open_id = self._delegated_subject()
-        except Exception as error:  # noqa: BLE001 - 读不到登记不等于"没有专用主体"
+        except Exception as error:  # 读不到登记不等于"没有专用主体"
             # 失败开放会让专用授权账号落回普通员工路径并被建档（`V-身份-02` 的反面）。
             raise OnboardingChainError(
                 f"delegated_subject_read_failed_{type(error).__name__}"
@@ -1188,7 +1188,7 @@ class AutoOnboardingRunner:
             return None
         try:
             return self._stock_tokens.lookup(email)
-        except Exception as error:  # noqa: BLE001
+        except Exception as error:
             raise OnboardingChainError(
                 f"stock_token_lookup_failed_{type(error).__name__}"
             ) from error
@@ -1236,13 +1236,13 @@ class AutoOnboardingRunner:
             )
         try:
             return self._tokens.issue_token(user_id)
-        except Exception as error:  # noqa: BLE001
+        except Exception as error:
             raise OnboardingChainError(f"token_issue_failed_{type(error).__name__}") from error
 
     def _adopt_token(self, user_id: str, lookup: StockTokenLookup) -> Any:
         try:
             adopted = self._tokens.adopt_token(user_id, lookup.secret)
-        except Exception as error:  # noqa: BLE001
+        except Exception as error:
             raise OnboardingChainError(f"token_adopt_failed_{type(error).__name__}") from error
         # 权限面由银河同步权威决定，不由本步裁量——这里只审计标注，不改变采纳与否
         # （#281 改道裁定第四条）。旧行的 ``permissions`` 由 `_import_legacy_permissions`
@@ -1264,7 +1264,7 @@ class AutoOnboardingRunner:
 
         try:
             self._environment.ensure(user_id=user_id, mcp_token=issued.reveal())
-        except Exception as error:  # noqa: BLE001
+        except Exception as error:
             # **透传实现给的错误码**（它已经脱敏，只有 errno 符号名）：`ENOENT`（卷没挂）
             # 与 `EACCES`（权限不对）是两种完全不同的运维动作，把它们一起压成
             # `UserEnvironmentError` 等于让排查从头再来一遍。
@@ -1391,7 +1391,7 @@ class AutoOnboardingRunner:
             return None
         try:
             entries = tuple(self._local_overrides.effective_entries(user_id=user_id))
-        except Exception as error:  # noqa: BLE001 - 本地源读取失败只降级，不整链失败
+        except Exception as error:  # 本地源读取失败只降级，不整链失败
             self._audit.record("onboarding.local_override_skipped", user=user_id, reason=REASON_LOCAL_OVERRIDE_READ_FAILED)
             logger.error("本地权限覆盖读取失败，本次开通跳过本地源 user=%s error=%s", user_id, type(error).__name__)
             return None

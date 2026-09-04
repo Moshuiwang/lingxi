@@ -134,7 +134,7 @@ def _build_management_correction_callback(
                 text=text,
                 dedupe_key=dedupe_key,
             )
-        except Exception as error:  # noqa: BLE001 - 下一轮继续用同一批次重试
+        except Exception as error:  # 下一轮继续用同一批次重试
             audit.record(
                 "admin.management_correction_summary_failed",
                 count=len(message_ids),

@@ -170,7 +170,7 @@ class CredentialRotationLoop:
         try:
             replacement, derived = self._authorization.refresh(claim.grant)
             outcome = RefreshOutcome.ROTATED
-        except Exception as error:  # noqa: BLE001 - 任何异常都不足以证明"旧凭据还能用"
+        except Exception as error:  # 任何异常都不足以证明"旧凭据还能用"
             replacement = None
             outcome = RefreshOutcome.FAILED if _is_definite_failure(error) else RefreshOutcome.INDETERMINATE
             logger.warning("专用授权续期未成功 outcome=%s error=%s", outcome.value, type(error).__name__)
@@ -258,7 +258,7 @@ class CredentialRotationLoop:
         claim_generation = getattr(claim, "generation", None) or None
         try:
             replacement, derived = self._authorization.refresh(claim.grant)
-        except Exception as error:  # noqa: BLE001 - 任何异常都不足以证明"旧凭据还能用"
+        except Exception as error:  # 任何异常都不足以证明"旧凭据还能用"
             outcome = RefreshOutcome.FAILED if _is_definite_failure(error) else RefreshOutcome.INDETERMINATE
             logger.warning("按需续期未成功 outcome=%s error=%s", outcome.value, type(error).__name__)
             self._vault.revoke(reason=f"refresh_{outcome.value}", generation=claim_generation)
@@ -373,7 +373,7 @@ class CredentialRotationLoop:
                     # 对撤销判定来说这算已妥善收尾，对派生令牌来说这条链已经死了。
                     return CredentialSaveOutcome.SUPERSEDED
                 return CredentialSaveOutcome.SAVED
-            except Exception as error:  # noqa: BLE001 - 记录后重试，最终失败由调用方处置
+            except Exception as error:  # 记录后重试，最终失败由调用方处置
                 logger.warning("新凭据写库失败，将重试 error=%s", type(error).__name__)
         return CredentialSaveOutcome.FAILED
 
@@ -381,7 +381,7 @@ class CredentialRotationLoop:
         while not self._stop.is_set():
             try:
                 self.run_once()
-            except Exception as error:  # noqa: BLE001 - 定时职责不因一轮异常而终止
+            except Exception as error:  # 定时职责不因一轮异常而终止
                 logger.error("本轮续期扫描异常，下一轮继续 error=%s", type(error).__name__)
             if self._stop.is_set():
                 break

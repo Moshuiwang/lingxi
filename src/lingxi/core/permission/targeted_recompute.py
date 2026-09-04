@@ -513,7 +513,7 @@ class TargetedPermissionRecompute:
             return None
         try:
             entries = tuple(self._local_overrides.effective_entries(user_id=user_id))
-        except Exception:  # noqa: BLE001 - 本地源读取失败只降级，不带走整次调用
+        except Exception:  # 本地源读取失败只降级，不带走整次调用
             self._audit.record(
                 "permission_targeted_recompute.local_override_skipped",
                 user=user_id,
@@ -541,7 +541,7 @@ class TargetedPermissionRecompute:
                 added = self._legacy_all_scope.expand_all_scope_group(
                     user_id=user_id, group_id=group_id, metrics=metrics, now=self._clock()
                 )
-            except Exception as error:  # noqa: BLE001
+            except Exception as error:
                 self._audit.record(
                     "permission_targeted_recompute.legacy_all_scope_refresh_failed",
                     user=user_id,
@@ -558,7 +558,7 @@ class TargetedPermissionRecompute:
             return entries
         try:
             return tuple(self._local_overrides.effective_entries(user_id=user_id))
-        except Exception:  # noqa: BLE001
+        except Exception:
             return entries
 
     def _skip(
