@@ -368,7 +368,7 @@ GROUNDED_ATTRIBUTIONS: tuple[GroundedAttribution, ...] = (
     ),
     GroundedAttribution(
         "src/lingxi/apps/gateway/log_redaction.py",
-        "凭据不得进日志是产品合同明令（代码框架「三、横切约定」）；第三方 SDK 的这个",
+        "产品合同明令，唯一能做的是在进入任何 handler 之前拦截、改写。",
         "统一用户记录与权限变化",
     ),
     GroundedAttribution(
@@ -383,7 +383,7 @@ GROUNDED_ATTRIBUTIONS: tuple[GroundedAttribution, ...] = (
     ),
     GroundedAttribution(
         "src/lingxi/apps/worker/report.py",
-        '``obtained`` 就是产品合同明令禁止的"伪装成功"。原始的工具调用分类改名保留在',
+        '"用户是否拿到内容"，继续展示 ``obtained`` 就是合同明令禁止的"伪装成功"。',
         "交付规则",
     ),
     GroundedAttribution(
@@ -486,7 +486,7 @@ GROUNDED_ATTRIBUTIONS: tuple[GroundedAttribution, ...] = (
     ),
     GroundedAttribution(
         "src/lingxi/apps/gateway/onboarding.py",
-        "2. 立刻回一条合同要求的「已收到，正在核对」。",
+        "以及立刻回一条合同要求的「已收到，正在核对」。",
         "首次对话与自动准入",
     ),
     GroundedAttribution(

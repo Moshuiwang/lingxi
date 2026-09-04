@@ -66,10 +66,6 @@
 3	docstring_over	src/lingxi/apps/gateway/config.py
 6	docstring_over	src/lingxi/apps/gateway/delivery.py
 6	docstring_over	src/lingxi/apps/gateway/document_delivery.py
-3	docstring_over	src/lingxi/apps/gateway/group_mention_hint.py
-2	docstring_over	src/lingxi/apps/gateway/log_redaction.py
-1	docstring_over	src/lingxi/apps/gateway/management_status.py
-1	docstring_over	src/lingxi/apps/gateway/onboarding.py
 4	docstring_over	src/lingxi/apps/healthcheck/__init__.py
 2	docstring_over	src/lingxi/apps/liveness.py
 2	docstring_over	src/lingxi/apps/reauthorize/__init__.py
@@ -90,11 +86,8 @@
 4	docstring_over	src/lingxi/apps/scheduler/roster_audit.py
 3	docstring_over	src/lingxi/apps/scheduler/stalled_provisioning.py
 1	docstring_over	src/lingxi/apps/trace/__init__.py
-1	docstring_over	src/lingxi/apps/worker/__init__.py
-1	docstring_over	src/lingxi/apps/worker/__main__.py
 7	docstring_over	src/lingxi/apps/worker/cli.py
 4	docstring_over	src/lingxi/apps/worker/config.py
-2	docstring_over	src/lingxi/apps/worker/report.py
 7	docstring_over	src/lingxi/apps/worker/report_extraction.py
 7	docstring_over	src/lingxi/apps/worker/service.py
 3	docstring_over	src/lingxi/apps/worker/session_cleanup.py
@@ -189,7 +182,6 @@
 8	hash_block_over	src/lingxi/apps/gateway/config.py
 5	hash_block_over	src/lingxi/apps/gateway/delivery.py
 5	hash_block_over	src/lingxi/apps/gateway/document_delivery.py
-1	hash_block_over	src/lingxi/apps/gateway/management_status.py
 5	hash_block_over	src/lingxi/apps/healthcheck/__init__.py
 2	hash_block_over	src/lingxi/apps/scheduler/__init__.py
 4	hash_block_over	src/lingxi/apps/scheduler/assembly.py
@@ -314,10 +306,6 @@
 25	provenance	src/lingxi/apps/gateway/config.py
 45	provenance	src/lingxi/apps/gateway/delivery.py
 44	provenance	src/lingxi/apps/gateway/document_delivery.py
-13	provenance	src/lingxi/apps/gateway/group_mention_hint.py
-3	provenance	src/lingxi/apps/gateway/log_redaction.py
-3	provenance	src/lingxi/apps/gateway/management_status.py
-3	provenance	src/lingxi/apps/gateway/onboarding.py
 14	provenance	src/lingxi/apps/healthcheck/__init__.py
 2	provenance	src/lingxi/apps/liveness.py
 2	provenance	src/lingxi/apps/reauthorize/__init__.py
@@ -340,11 +328,8 @@
 22	provenance	src/lingxi/apps/scheduler/roster_audit.py
 28	provenance	src/lingxi/apps/scheduler/stalled_provisioning.py
 3	provenance	src/lingxi/apps/trace/__init__.py
-2	provenance	src/lingxi/apps/worker/__init__.py
-1	provenance	src/lingxi/apps/worker/__main__.py
 25	provenance	src/lingxi/apps/worker/cli.py
 47	provenance	src/lingxi/apps/worker/config.py
-9	provenance	src/lingxi/apps/worker/report.py
 26	provenance	src/lingxi/apps/worker/report_extraction.py
 95	provenance	src/lingxi/apps/worker/service.py
 12	provenance	src/lingxi/apps/worker/session_cleanup.py

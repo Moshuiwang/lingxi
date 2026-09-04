@@ -127,7 +127,6 @@
 61	src/lingxi/apps/worker/config.py::_innertest_content_capture
 68	src/lingxi/apps/worker/config.py::_read_only_tools
 89	src/lingxi/apps/worker/config.py::load_config
-185	src/lingxi/apps/worker/report.py::build_report
 79	src/lingxi/apps/worker/report_extraction.py::_load_task_system_prompt
 83	src/lingxi/apps/worker/service.py::WorkerService.__init__
 67	src/lingxi/apps/worker/service.py::WorkerService._cleanup_agent_sessions
