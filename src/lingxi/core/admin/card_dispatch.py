@@ -3,28 +3,13 @@
 只依赖注入的 ``Protocol`` 端口，不 import ``adapters/``。真实装配见
 ``apps/gateway/__init__.py``。
 
-## 为什么"发送 + 落库标记"合成一个方法
-
-合同"卡片发送失败时本次操作不执行"要求"发送结果"与"待确认操作是否可被确认"两件
-事不能出现中间态（发了但没记、记了但其实没发）。把两步都放进同一个类的同一次调用
-里，让调用方（``core/admin/router.py``）只需要处理一个返回值（"是否已确认送达"），
-不需要自己记得"发送成功之后一定要调 ``mark_card_delivered``"这类跨对象的调用顺序。
-
-## 为什么 ``send()`` 的失败分支现在需要注入 ``AuditSink``
-
-此前 ``except Exception:`` 只把结果归一为"未送达"再调用 ``mark_send_failed``，
-异常本身（类名、若是 ``AdminCardDeliveryRejected`` 则还有 ``code``/``log_id``）
-从未落到任何审计或日志里。2026-08-25 定位一次真实走查报告的"确认卡片发送失败"
-故障时，唯一能读到的痕迹只有 ``pending_action.status='failed'`` 这一行，没有任何
-字段能回答"到底是哪一类失败"，被迫改用受控探针直接打 CardKit 接口才定位到
-``action`` 容器被 schema 2.0 拒绝（见 ``adapters/feishu_admin_card.py`` 模块文档
-"建卡环节已被真实探针证伪并修复"）。这个类现在注入与 ``core/admin/router.
-AuditSink``/``core/admin/card_callback.AuditSink`` 结构相同的独立 ``AuditSink``，
-在失败分支记一条 ``admin.card_dispatch.send_failed`` 审计（异常类名 + 明确拒绝时
-的 ``code``/``log_id``），不带卡片正文、不带 ``chat_id``/``reply_to_message_id``/
-目标 ``open_id`` 等外部标识明文——与 ``card_callback.py`` 的
-``_update_card_to_terminal``/``_notify_group`` 两处失败分支同一姿态（只记异常
-类名，不记可能带资料的异常消息全文）。
+"发送 + 落库标记"合成一个方法：合同"卡片发送失败时本次操作不执行"要求"发送
+结果"与"待确认操作是否可被确认"两件事不能出现中间态。两步放进同一次调用，
+让调用方只需要处理一个返回值，不需要自己记得"发送成功之后一定要调
+``mark_card_delivered``"这类跨对象的调用顺序。``send()`` 的失败分支需要注入
+``AuditSink``：只把结果归一为"未送达"不够，诊断故障时唯一能读到的痕迹只有
+``pending_action.status='failed'`` 这一行，因此在失败分支记一条审计（异常类名
++ 明确拒绝时的 ``code``/``log_id``），不带卡片正文或外部标识明文。
 """
 
 from __future__ import annotations
@@ -71,7 +56,6 @@ def bounded_management_card_ttl_seconds(value: float) -> float:
     已经过期的历史上下文，应传一个显式的过去 ``context_deadline_at``，而不是配置
     一个非法 TTL。
     """
-
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         raise ValueError("管理卡上下文 TTL 必须是有限正数")
     number = float(value)
@@ -84,7 +68,6 @@ def bounded_management_card_deadline(
     *, now: datetime, requested: datetime | None, ttl_seconds: float
 ) -> datetime:
     """返回不晚于 ``now + 24h`` 的管理卡上下文截止时间。"""
-
     if now.tzinfo is None:
         now = now.replace(tzinfo=UTC)
     elif now.utcoffset() is None:
@@ -106,7 +89,6 @@ def management_card_fingerprint(status: AdminUserStatusView) -> str:
     身份。回调在执行写操作前重新取当前状态并比较它，防止旧卡在数据已经变化后继续
     写入；排序只用于稳定序列化，不改变权限语义。
     """
-
     payload = {
         "identifier": status.identifier,
         "provisioning_state": status.provisioning_state,
@@ -141,31 +123,36 @@ def management_card_fingerprint(status: AdminUserStatusView) -> str:
 
 
 class PendingActionDeliveryTracker(Protocol):
-    """卡片发送结果的落库口——与
-    ``adapters.postgres_pending_action.PostgresPendingActionStore`` 的
-    ``mark_card_delivered``/``mark_send_failed`` 两个方法结构相同。"""
+    """卡片发送结果的落库口，与生产适配器的对应两个方法结构相同。"""
 
-    def mark_card_delivered(self, *, pending_action_id: str, card_id: str) -> None: ...
+    def mark_card_delivered(self, *, pending_action_id: str, card_id: str) -> None:
+        """记下这次卡片已经确认送达，附带 CardKit 分配的卡片 ID。"""
+        ...
 
-    def mark_send_failed(self, *, pending_action_id: str) -> None: ...
+    def mark_send_failed(self, *, pending_action_id: str) -> None:
+        """记下这次卡片发送未能确认送达。"""
+        ...
 
 
 class AuditSink(Protocol):
-    """与 ``core/admin/router.AuditSink``/``core/admin/card_callback.AuditSink``/
-    ``adapters/postgres_pending_action.AuditSink`` 结构相同的独立 Protocol——四处
-    不互相 import，见各自模块文档。"""
+    """与其余三处结构相同的独立审计出口 Protocol，四处不互相 import。"""
 
-    def record(self, action: str, /, **fields: object) -> None: ...
+    def record(self, action: str, /, **fields: object) -> None:
+        """记一条结构化审计。"""
+        ...
 
 
 @dataclass(frozen=True)
 class CardDispatchResult:
+    """一次确认卡发送的结果：卡片是否已确认送达。"""
+
     delivered: bool
 
 
 class ConfirmCardDispatcher:
-    """把一条刚 ``prepare`` 好的待确认操作渲染成确认卡片，发到发起管理员本人
-    私聊（作为触发这条命令的消息的回复），并把发送结果同步落回待确认操作表。
+    """把一条刚 ``prepare`` 好的待确认操作渲染成确认卡片并发到发起管理员本人私聊。
+
+    作为触发这条命令的消息的回复，并把发送结果同步落回待确认操作表。
     """
 
     def __init__(
@@ -176,13 +163,13 @@ class ConfirmCardDispatcher:
         audit: AuditSink,
         display_names: AdminDisplayNames,
     ) -> None:
+        """装配确认卡发送所需的传输、落库口、审计与展示名端口。"""
         self._transport = transport
         self._tracker = tracker
         self._audit = audit
-        # 必填（Trace #469 S-1）：确认卡「目标：」字段自本批起一律显示姓名+
-        # 邮箱，不能有一条"未装配则退回 open_id"的安全兜底路径——那正是本批
-        # 要消灭的行为，见 core/admin/display_names.AdminDisplayNames 模块文档
-        # 「安全边界」一节。
+        # 必填：确认卡「目标：」字段一律显示姓名+邮箱，不能有一条"未装配则退回
+        # open_id"的安全兜底路径，见 core/admin/display_names.AdminDisplayNames
+        # 模块文档「安全边界」一节。
         self._display_names = display_names
 
     def send(
@@ -193,6 +180,7 @@ class ConfirmCardDispatcher:
         thread_id: str | None,
         reply_to_message_id: str,
     ) -> CardDispatchResult:
+        """渲染并发送这条待确认操作的确认卡，把结果同步落回待确认操作表。"""
         target_label = self._display_names.user_label(open_id=pending.target_open_id)
         scope_ids = permission_scope_ids(pending)
         company_label = (
@@ -215,17 +203,11 @@ class ConfirmCardDispatcher:
                 card=card,
             )
         except Exception as error:
-            # 与 core.execution.card_stream 同一白名单纪律：明确拒绝
-            # （AdminCardDeliveryRejected）与结果不明（其余异常）在这里得到同一个
-            # 处理——两者都不能确定卡片已经送达，一律按"未送达"处理，让本次操作
-            # 作废（合同"卡片发送失败时本次操作不执行，不根据失败原因推断人员
-            # 状态"）。区分"明确拒绝"与"结果不明"只影响未来是否值得重试发送这个
-            # 决策，不影响当前这条待确认操作的可用性判定。
-            #
-            # 诊断缺口修复（见模块文档"为什么 send() 的失败分支现在需要注入
-            # AuditSink"）：下面的分类判断只影响审计带不带 code/log_id，不改变
-            # 上面这条"一律按未送达处理"的判定——两类失败在 tracker 这一侧仍然
-            # 完全同构。
+            # 明确拒绝（AdminCardDeliveryRejected）与结果不明（其余异常）在这里
+            # 得到同一处理——两者都不能确定卡片已经送达，一律按"未送达"处理，
+            # 让本次操作作废（合同"卡片发送失败时本次操作不执行，不根据失败
+            # 原因推断人员状态"）。下面的分类判断只影响审计带不带 code/log_id，
+            # 不改变这条"一律按未送达处理"的判定。
             if isinstance(error, AdminCardDeliveryRejected):
                 self._audit.record(
                     "admin.card_dispatch.send_failed",
@@ -249,6 +231,8 @@ class ConfirmCardDispatcher:
 
 @dataclass(frozen=True)
 class ManagementCardDispatchResult:
+    """一次管理卡发送的结果：卡片是否已确认送达。"""
+
     delivered: bool
 
 
@@ -292,41 +276,12 @@ class ManagementCardContext:
 class ManagementCardContextStore:
     """兼容旧调用方/测试的 ``message_id -> identifier`` 内存 TTL 映射。
 
-    生产 gateway 使用 ``adapters.postgres_management_card_context`` 的持久实现；
-    本类保留为纯逻辑适配器，便于旧调用方和无数据库单测验证同一套回调语义。
-    （Trace #469 修复包 B，B-1。）
-
-    ## 要解决的问题
-
-    真实点击实测坐实：管理卡「新增授权/新增抑制」表单提交回调的
-    ``action.value`` 经常不带 ``identifier``（缺失或需要反序列化的 JSON 字符串，
-    见 ``apps/gateway/__init__.py`` ``make_event_handler`` 文档）——``identifier``
-    此前唯一的载体就是这个字段，缺失时 ``card_callback.py``
-    ``handle_management_form_submit`` 只能给出「未识别到目标用户标识，请重新
-    查询 /admin user 后再操作」，管理卡头号交付在这一形态下不可用。
-
-    ## 为什么是发送侧登记，而不是从回调事件体的其它字段反查
-
-    管理卡的 ``context.open_message_id``（回调事件体里这张卡片自己的消息 ID，见
-    ``apps/gateway/__init__.py`` ``_management_card_context`` 文档）与建卡成功后
-    ``ManagementCardTransport.create()`` 返回的 ``ManagementCardCreated.
-    message_id`` 是同一个值——飞书回调把"这次点击发生在哪条消息上"如实回传，而
-    这条消息正是管理卡自己。因此发送成功那一刻就能确定性地知道"这条 message_id
-    对应哪一次 ``/admin user`` 查询、查的是谁"，不需要在回调时反查任何外部状态。
-
-    ## 内存实现的边界
-
-    本实现仅用于兼容旧调用方和不接数据库的单测；生产实现把完整上下文（含
-    ``card_id``、发起人、快照指纹和 sequence）落在 PostgreSQL，以支持重启恢复。
-    因此这里的 TTL/容量仅是测试适配器的内部默认值，不构成产品承诺。
-
-    TTL 默认 40 分钟（管理卡查询后不太可能拖到四十分钟之后才提交表单，超时后
-    退回既有拒绝路径不算体验回退）；条目数上限默认 512，超过时逐出**最早写入**
-    的一条（``OrderedDict`` + ``move_to_end`` 的最简单可行策略，不需要按最近
-    访问时间重新排序——本映射只在"写入"与"回调时读一次"两个时机被触碰，读取
-    不应该影响谁被优先保留）。查不到（未登记/已过期/已被逐出）与「已存在但
-    identifier 为空」在调用方（``apps/gateway/__init__.py``）眼里是同一件事：
-    维持现有「请重新查询 /admin user」文案。
+    生产 gateway 使用持久实现；本类保留为纯逻辑适配器，便于旧调用方和无数据库
+    单测验证同一套回调语义。发送侧登记：建卡成功后拿到的 ``message_id`` 与
+    回调事件体里这张卡片自己的消息 ID 是同一个值，发送成功那一刻就能确定性地
+    知道这条 ``message_id`` 对应哪一次查询、查的是谁，不需要在回调时反查任何
+    外部状态。TTL 默认 40 分钟、条目数上限默认 512（超过逐出最早写入的一条），
+    仅是测试适配器的内部默认值，不构成产品承诺。
     """
 
     def __init__(
@@ -336,6 +291,7 @@ class ManagementCardContextStore:
         max_entries: int = 512,
         clock: Callable[[], float] = time.monotonic,
     ) -> None:
+        """按给定的 TTL、容量上限与时钟建立一个空的内存映射。"""
         self._ttl_seconds = bounded_management_card_ttl_seconds(ttl_seconds)
         self._max_entries = max_entries
         self._clock = clock
@@ -361,20 +317,54 @@ class ManagementCardContextStore:
         dispatch_status: str = "idle",
         last_trace_id: str | None = None,
     ) -> None:
-        """管理卡发送成功后登记一条映射。``message_id``/``identifier`` 任一为空
-        都不登记——空 ``message_id`` 无法在回调时被查到，空 ``identifier``
-        登记了也没有意义（回调侧本来就是靠它非空才判定"命中"，见调用方
-        ``apps/gateway/__init__.py`` 的查表姿态）。"""
+        """管理卡发送成功后登记一条映射。
 
+        ``message_id``/``identifier`` 任一为空都不登记——空 ``message_id`` 无法
+        在回调时被查到，空 ``identifier`` 登记了也没有意义（回调侧本来就是靠它
+        非空才判定"命中"）。
+        """
         if not message_id or not identifier:
             return
+        context = self._build_context(
+            message_id=message_id,
+            card_id=card_id,
+            identifier=identifier,
+            chat_id=chat_id,
+            initiated_by_open_id=initiated_by_open_id,
+            snapshot_fingerprint=snapshot_fingerprint,
+            card_sequence=card_sequence,
+            state_version=state_version,
+            context_deadline_at=context_deadline_at,
+            state=state,
+            dispatch_status=dispatch_status,
+            last_trace_id=last_trace_id,
+        )
         expires_at = self._clock() + self._ttl_seconds
+        self._store_or_merge(message_id, context, expires_at)
+
+    def _build_context(
+        self,
+        *,
+        message_id: str,
+        card_id: str,
+        identifier: str,
+        chat_id: str,
+        initiated_by_open_id: str,
+        snapshot_fingerprint: str,
+        card_sequence: int,
+        state_version: int,
+        context_deadline_at: datetime | None,
+        state: str,
+        dispatch_status: str,
+        last_trace_id: str | None,
+    ) -> ManagementCardContext:
+        """按 :meth:`remember` 的入参构造一条新上下文；不接触共享状态。"""
         deadline = bounded_management_card_deadline(
             now=datetime.now(UTC),
             requested=context_deadline_at,
             ttl_seconds=self._ttl_seconds,
         )
-        context = ManagementCardContext(
+        return ManagementCardContext(
             message_id=message_id,
             card_id=card_id,
             identifier=identifier,
@@ -390,13 +380,20 @@ class ManagementCardContextStore:
             visual_sequence=max(1, int(card_sequence)),
             state_version=max(1, int(state_version)),
         )
-        # 同一个 message_id 重复登记（理论上不会发生——每次 `/admin user`
-        # 都会建一张新卡、拿到新的 message_id）只允许抬高 sequence 并延续
-        # 已有状态；不能让一次重放把已关闭/已提交的卡重新变成 ready。
+
+    def _store_or_merge(
+        self, message_id: str, context: ManagementCardContext, expires_at: float
+    ) -> None:
+        """把新构造的上下文写入映射，或与既有条目合并；随后按容量上限逐出最旧项。
+
+        同一个 message_id 重复登记（理论上不会发生——每次 `/admin user` 都会
+        建一张新卡、拿到新的 message_id）只允许抬高 sequence 并延续已有状态；
+        不能让一次重放把已关闭/已提交的卡重新变成 ready。
+        """
         with self._lock:
             existing = self._entries.get(message_id)
             if existing is not None:
-                previous, _previous_expires_at = existing
+                previous, previous_expires_at = existing
                 if context.card_sequence > previous.card_sequence:
                     previous = ManagementCardContext(
                         **{**previous.__dict__, "card_sequence": context.card_sequence}
@@ -405,16 +402,18 @@ class ManagementCardContextStore:
                     previous = ManagementCardContext(
                         **{**previous.__dict__, "state_version": context.state_version}
                     )
-                self._entries[message_id] = (previous, _previous_expires_at)
+                self._entries[message_id] = (previous, previous_expires_at)
             else:
                 self._entries[message_id] = (context, expires_at)
             while len(self._entries) > self._max_entries:
                 self._entries.popitem(last=False)
 
     def lookup(self, *, message_id: str) -> str | None:
-        """回调侧按 ``message_id`` 查回 ``identifier``；未登记、已过期都返回
-        ``None``，不抛异常——调用方把 ``None`` 与"从未登记过"同等对待。"""
+        """回调侧按 ``message_id`` 查回 ``identifier``。
 
+        未登记、已过期都返回 ``None``，不抛异常——调用方把 ``None`` 与"从未
+        登记过"同等对待。
+        """
         if not message_id:
             return None
         with self._lock:
@@ -432,7 +431,6 @@ class ManagementCardContextStore:
         这里保留已过内部缓存窗口的上下文，供回调层做一次惰性关闭/刷新；严格的
         ``lookup()`` 仍会把过期项视为未命中。容量上限负责避免这类保留无限增长。
         """
-
         if not message_id:
             return None
         with self._lock:
@@ -454,11 +452,10 @@ class ManagementCardContextStore:
         带上它读到的 CardKit 序号；序号在渲染期间被任何写入方推进就返回
         ``None``，调用方不得把旧卡片发给 CardKit。
 
-        与生产适配器同构：只用 ``card_sequence`` 一把 CAS（#493 收敛，rc25 S-4a）。
-        状态写入把两列写在同一处（见 :meth:`update_state`），而本方法只推进
+        与生产适配器同构：只用 ``card_sequence`` 一把 CAS。状态写入把两列写在
+        同一处（见 :meth:`update_state`），而本方法只推进
         ``card_sequence``，所以 ``card_sequence`` 的判别力严格覆盖 ``state_version``。
         """
-
         if expected_card_sequence is not None and (
             isinstance(expected_card_sequence, bool)
             or not isinstance(expected_card_sequence, int)
@@ -494,6 +491,7 @@ class ManagementCardContextStore:
         snapshot_fingerprint: str | None = None,
         last_trace_id: str | None = None,
     ) -> ManagementCardContext | None:
+        """就地更新一条上下文的状态字段，非空传入的字段覆盖旧值。"""
         with self._lock:
             entry = self._entries.get(message_id)
             if entry is None:
@@ -543,7 +541,6 @@ class ManagementCardContextStore:
 
     def list_needing_refresh(self, *, limit: int = 20) -> tuple[ManagementCardContext, ...]:
         """返回尚未被 CardKit 成功回写的上下文。"""
-
         if limit < 1:
             return ()
         with self._lock:
@@ -563,9 +560,8 @@ class ManagementCardContextStore:
         恢复路径传入本次实际领到的 CardKit 序号。任何写入方（状态写入或另一个
         恢复者领号）推进了 ``card_sequence``，CAS 就失败并保留 ``needs_refresh``，
         让下一轮从当前行重新渲染。状态写入必然同时推进 ``card_sequence``，因此
-        不再单独判 ``state_version``（#493 收敛，rc25 S-4a）。
+        不再单独判 ``state_version``。
         """
-
         if isinstance(sequence, bool) or not isinstance(sequence, int) or sequence <= 0:
             raise ValueError("sequence 必须是正整数")
         if expected_card_sequence is not None and (
@@ -600,34 +596,34 @@ class ManagementCardContextStore:
             self._entries[message_id] = (updated, expires_at)
             return True
 
-    # The in-memory compatibility store has no publish outbox to observe.  Keep the
-    # production adapter's optional observation surface available so gateway tests and
-    # old callers can inject this store without a special branch.
+    # 内存兼容实现没有可观测的发布 outbox，以下四个方法只是保留生产适配器的
+    # 可选观测面，让 gateway 测试与旧调用方能不带分支地注入本类。
     def latest_publish_state_for_message(self, *, message_id: str) -> str | None:
+        """内存实现没有发布 outbox 可观测，恒返回 ``None``。"""
         del message_id
         return None
 
     def settle_published_contexts(self) -> tuple[str, ...]:
+        """内存实现没有待结算的发布上下文，恒返回空元组。"""
         return ()
 
     def unreported_daily_correction_ids(self) -> tuple[str, ...]:
+        """内存实现没有每日纠偏待上报项，恒返回空元组。"""
         return ()
 
     def mark_daily_corrections_reported(self, *, message_ids: tuple[str, ...]) -> None:
+        """内存实现无需记录每日纠偏上报状态，空操作。"""
         del message_ids
 
 
 class ManagementCardDispatcher:
-    """把 ``/admin user`` 查到的用户权限管理卡（#439 B 档）渲染并发到发起管理员
-    本人私聊，作为触发这条查询命令的消息的回复。
+    """把 ``/admin user`` 查到的用户权限管理卡渲染并发到发起管理员本人私聊。
 
     与 :class:`ConfirmCardDispatcher` 是两个独立类：管理卡不是一次待确认操作，
-    没有"发送结果需要落回某一行状态"这一步（见 ``core/admin/management_card.py``
-    模块文档"两张不同的卡"）——发送成功与否只影响这次查询是否额外附带了一张卡，
-    不影响任何数据库行的状态机，因此不需要注入 ``PendingActionDeliveryTracker``
-    这一类落库口。发送失败只记一条审计，调用方（``core/admin/router.
-    AdminCommandRouter._send_management_card``）据此把失败当 best-effort 处理，
-    不影响 ``/admin user`` 既有的文本回复。
+    没有"发送结果需要落回某一行状态"这一步——发送成功与否只影响这次查询是否
+    额外附带了一张卡，不影响任何数据库行的状态机，因此不需要注入
+    ``PendingActionDeliveryTracker`` 这一类落库口。发送失败只记一条审计，
+    调用方据此把失败当 best-effort 处理，不影响既有的文本回复。
     """
 
     def __init__(
@@ -639,13 +635,14 @@ class ManagementCardDispatcher:
         display_names: AdminDisplayNames,
         context_store: ManagementCardContextStore | None = None,
     ) -> None:
+        """装配管理卡发送所需的传输、目录、审计、展示名与可选上下文登记口。"""
         self._transport = transport
         self._catalog = catalog
         self._audit = audit
         self._display_names = display_names
-        # 发送侧登记上下文（Trace #469 B-1）：``None``（既有调用点、未升级的
-        # 测试）时行为与本参数加入之前逐字节一致——不登记任何映射，回调侧
-        # ``identifier`` 缺失时维持既有「请重新查询 /admin user」拒绝路径。
+        # 发送侧登记上下文：``None``（既有调用点、未升级的测试）时行为与本参数
+        # 加入之前逐字节一致——不登记任何映射，回调侧 ``identifier`` 缺失时
+        # 维持既有「请重新查询 /admin user」拒绝路径。
         self._context_store = context_store
 
     def send(
@@ -658,6 +655,7 @@ class ManagementCardDispatcher:
         reply_to_message_id: str,
         initiated_by_open_id: str = "",
     ) -> ManagementCardDispatchResult:
+        """渲染并发送这个用户的管理卡；发送成功时按需登记回调上下文。"""
         card = render_management_card(
             status,
             display_identifier=display_identifier,
@@ -691,9 +689,9 @@ class ManagementCardDispatcher:
                 )
             return ManagementCardDispatchResult(delivered=False)
         if self._context_store is not None:
-            # 只在真正发出去之后登记（Trace #469 B-1）：发送失败/结果不明的
-            # 分支已经在上面 return，不会走到这里——没有实际送达的卡片就没有
-            # "这条 message_id 对应哪次查询"这件事可以登记。
+            # 只在真正发出去之后登记：发送失败/结果不明的分支已经在上面
+            # return，不会走到这里——没有实际送达的卡片就没有"这条 message_id
+            # 对应哪次查询"这件事可以登记。
             self._context_store.remember(
                 message_id=created.message_id,
                 identifier=display_identifier,
