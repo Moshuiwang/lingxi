@@ -187,11 +187,20 @@ class RealBaselineIsHonestTest(unittest.TestCase):
         修复包范围内不做编排器结构性拆分（风险远大于收益），按门禁「确有
         理由」路径人工登记 1502 为封顶——此后只许变小；下一次增长触发门禁时
         应优先拆分。下一次这条测试失效时，同样在此登记理由。
+        2026-09-04 新增 `apps/worker/service.py`（1533 行，#593 热修 PR #595）：main
+        恰好 1500 行；`run()` 增加「task_queued 监听连接断开 → 重建监听、建不起来
+        退回轮询、失败退避一拍」（净增 33 行，含说明为什么监听断开不能带走进程的
+        注释）。这是完成标准 2（断线不重启进程）的必要改动，在 main 上用
+        pg_terminate_backend 实测复现进程退出。结构性拆分不塞进热修窗口，作为
+        后续技术债登记在 #593。
         """
 
         self.assertEqual(
             CHECK.load_baseline(CHECK.BASELINE_PATH),
-            {"src/lingxi/core/identity/onboarding_runner.py": 1502},
+            {
+                "src/lingxi/core/identity/onboarding_runner.py": 1502,
+                "src/lingxi/apps/worker/service.py": 1533,
+            },
         )
 
 

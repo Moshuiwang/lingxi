@@ -1521,6 +1521,10 @@ class WorkerService:
                         logger.warning(
                             "task_queued 监听连接断开，重建监听：%s", type(error).__name__
                         )
+                        # 退避一拍再重建：监听一建好就断（服务端持续拒绝）时不能
+                        # 形成"建连→LISTEN→抛→重建"的热循环——那正是本卡要消灭的
+                        # 建连风暴形态。
+                        await self._sleep(self._config.poll_interval_seconds)
                         break
             finally:
                 listener_context.__exit__(None, None, None)

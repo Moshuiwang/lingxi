@@ -82,10 +82,12 @@ class ConnectionReuseTests(unittest.TestCase):
 
     def test_close_without_commit_discards_uncommitted_work(self) -> None:
         connection = connect(DSN)
+        pid = _backend_pid(connection)
         connection.execute("CREATE TEMP TABLE reuse_probe_close (x int)")
         connection.close()
+        self.assertEqual(idle_connection_count(), 1)
         with connect(DSN) as reused:
-            self.assertEqual(_backend_pid(reused), _backend_pid(reused))
+            self.assertEqual(_backend_pid(reused), pid, "close() 归还的必须是同一条物理连接")
             gone = reused.execute("SELECT to_regclass('reuse_probe_close') IS NULL").fetchone()[0]
             self.assertTrue(gone)
 
@@ -135,10 +137,16 @@ class ConnectionReuseTests(unittest.TestCase):
 
     def test_idle_stack_is_bounded_and_the_overflow_is_really_closed(self) -> None:
         connections = [connect(DSN) for _ in range(MAX_IDLE_CONNECTIONS_PER_KEY + 2)]
+        pids = [_backend_pid(connection) for connection in connections]
         for connection in connections:
             connection.close()
         self.assertEqual(idle_connection_count(), MAX_IDLE_CONNECTIONS_PER_KEY)
-        self.assertEqual(sum(1 for c in connections if c.closed), 2)
+        self.assertTrue(all(c.closed for c in connections), "归还后对借用者一律是已关闭")
+        with connect(DSN, dedicated=True) as observer:
+            alive = observer.execute(
+                "SELECT count(*) FROM pg_stat_activity WHERE pid = ANY(%s)", (pids,)
+            ).fetchone()[0]
+        self.assertEqual(alive, MAX_IDLE_CONNECTIONS_PER_KEY, "超出上限的两条必须真关")
 
     def test_session_attributes_are_reset_before_reuse(self) -> None:
         with connect(DSN) as connection:
@@ -168,6 +176,112 @@ class ConnectionReuseTests(unittest.TestCase):
                 "SELECT count(*) FROM pg_stat_activity WHERE pid = %s", (pid,)
             ).fetchone()[0]
         self.assertEqual(alive, 0)
+
+
+    def test_close_is_idempotent_and_the_object_enters_the_idle_stack_once(self) -> None:
+        """审核 P1-1：重复 close() 不得把同一对象压栈两次（否则两位借用者共用一条连接）。"""
+
+        connection = connect(DSN)
+        connection.close()
+        connection.close()
+        self.assertEqual(idle_connection_count(), 1)
+        self.assertTrue(connection.closed, "归还后对借用者而言就是已关闭")
+        first = connect(DSN)
+        second = connect(DSN)
+        try:
+            self.assertIsNot(first, second)
+            self.assertNotEqual(_backend_pid(first), _backend_pid(second))
+        finally:
+            first.close()
+            second.close()
+
+    def test_close_inside_with_block_is_safe(self) -> None:
+        with connect(DSN) as connection:
+            _backend_pid(connection)
+            connection.close()
+        self.assertEqual(idle_connection_count(), 1)
+        with connect(DSN) as again:
+            with connect(DSN) as other:
+                self.assertNotEqual(_backend_pid(again), _backend_pid(other))
+
+    def test_a_returned_connection_cannot_be_used_again(self) -> None:
+        connection = connect(DSN)
+        connection.close()
+        for action in (connection.cursor, connection.commit, connection.rollback):
+            with self.assertRaises(Exception, msg=action.__name__):
+                action()
+        with self.assertRaises(Exception):
+            connection.execute("SELECT 1")
+        self.assertEqual(idle_connection_count(), 1, "误用不得把连接弄坏或弄丢")
+
+    def test_concurrent_threads_never_share_a_physical_connection(self) -> None:
+        import threading
+
+        lock = threading.Lock()
+        in_use: dict[int, int] = {}
+        violations: list[str] = []
+        errors: list[BaseException] = []
+
+        def worker() -> None:
+            try:
+                for _ in range(40):
+                    with connect(DSN) as connection:
+                        pid = _backend_pid(connection)
+                        with lock:
+                            if in_use.get(pid):
+                                violations.append(f"pid {pid} 被两个线程同时持有")
+                            in_use[pid] = in_use.get(pid, 0) + 1
+                        _backend_pid(connection)
+                        with lock:
+                            in_use[pid] -= 1
+            except BaseException as error:  # noqa: BLE001 - 收集后在主线程断言
+                errors.append(error)
+
+        threads = [threading.Thread(target=worker) for _ in range(8)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=30)
+        self.assertEqual(errors, [])
+        self.assertEqual(violations, [])
+        self.assertLessEqual(idle_connection_count(), MAX_IDLE_CONNECTIONS_PER_KEY)
+
+    def test_connections_idle_for_too_long_are_closed_on_the_next_release(self) -> None:
+        """审核 P2-2：后进先出让栈底连接永远轮不到，按空闲时长回收。"""
+
+        with connect(DSN) as outer:
+            with connect(DSN) as inner:
+                outer_pid, inner_pid = _backend_pid(outer), _backend_pid(inner)
+        # inner 先归还（栈底、更旧），outer 后归还（栈顶）
+        self.assertEqual(idle_connection_count(), 2)
+        with mock.patch.object(postgres, "MAX_IDLE_AGE_SECONDS", 0.0):
+            with connect(DSN) as connection:
+                self.assertEqual(_backend_pid(connection), outer_pid, "栈顶先出")
+            # 归还时栈底（inner）已超龄 → 真关；刚归还的 outer 仍在
+        self.assertEqual(idle_connection_count(), 1)
+        with connect(DSN, dedicated=True) as observer:
+            alive = observer.execute(
+                "SELECT count(*) FROM pg_stat_activity WHERE pid = %s", (inner_pid,)
+            ).fetchone()[0]
+        self.assertEqual(alive, 0)
+
+    def test_tcp_keepalive_is_fixed_and_prepared_statements_stay_off(self) -> None:
+        """审核 P2-1 / P2-4：保活参数由入口固定；复用连接不预编译，保持改前逐位相同。"""
+
+        with connect(DSN) as connection:
+            parameters = connection.info.get_parameters()
+            self.assertEqual(parameters.get("keepalives_idle"), "30")
+            self.assertEqual(parameters.get("tcp_user_timeout"), "15000")
+            self.assertIsNone(connection.prepare_threshold)
+            for _ in range(7):
+                connection.execute("SELECT 42").fetchone()
+            prepared = connection.execute("SELECT count(*) FROM pg_prepared_statements").fetchone()[0]
+            self.assertEqual(prepared, 0)
+        with connect(DSN, dedicated=True) as dedicated:
+            self.assertEqual(dedicated.info.get_parameters().get("keepalives_idle"), "30")
+            self.assertEqual(dedicated.prepare_threshold, 5, "独占连接保持驱动默认")
+        with self.assertRaises(TypeError):
+            connect(DSN, keepalives_idle=1)
 
 
 class DedicatedCallSiteWiringTests(unittest.TestCase):
