@@ -381,6 +381,15 @@ REQUIRED_MODULES = (
     "lingxi.apps.gateway",
     "lingxi.apps.gateway.config",
     "lingxi.apps.gateway.__main__",
+    # gateway 入口拆分（#592 B-1）：装配、事件入口、后台循环存活保障、审计与告警
+    # 出口、管理卡收敛、投递装配，全部由 `apps/gateway/__init__.py` 模块级 import。
+    "lingxi.apps.gateway.alerting",
+    "lingxi.apps.gateway.assembly",
+    "lingxi.apps.gateway.audit_log",
+    "lingxi.apps.gateway.background_loops",
+    "lingxi.apps.gateway.delivery_assembly",
+    "lingxi.apps.gateway.event_handler",
+    "lingxi.apps.gateway.management_cards",
     # Gateway 投递消费循环（Issue #152）：CardKit 流式卡片/文本兜底 adapter 与
     # 消费循环编排，各自都在制品里必须能 import。
     "lingxi.adapters.feishu_delivery",
@@ -989,7 +998,14 @@ PROCESS_RUNTIME_IMPORTS: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {
             "lingxi",
             "lingxi.apps",
             "lingxi.apps.gateway",
+            "lingxi.apps.gateway.alerting",
+            "lingxi.apps.gateway.assembly",
+            "lingxi.apps.gateway.audit_log",
+            "lingxi.apps.gateway.background_loops",
             "lingxi.apps.gateway.config",
+            "lingxi.apps.gateway.delivery_assembly",
+            "lingxi.apps.gateway.event_handler",
+            "lingxi.apps.gateway.management_cards",
             "lingxi.apps.gateway.__main__",
             "lingxi.apps.liveness",
             "lingxi.apps.healthcheck",

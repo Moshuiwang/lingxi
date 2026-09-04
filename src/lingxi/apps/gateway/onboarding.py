@@ -22,6 +22,8 @@ from __future__ import annotations
 
 from typing import Any
 
+from lingxi.core.conversation.ports import OnboardingResult, OnboardingState
+
 #: gateway 允许接到管线上的开通实现类名。**白名单而不是黑名单**：将来有人在这里接一个
 #: 新的执行型实现时，默认结果是启动即失败，而不是静默把分钟级等待放回长连接线程。
 INERT_ONBOARDING_TYPES: frozenset[str] = frozenset({"_RecordingOnboarding"})
@@ -50,3 +52,27 @@ def assert_gateway_onboarding_is_inert(*runners: Any) -> None:
                 "gateway 只能接「只记事件」的开通实现："
                 "任何会产生外部副作用的编排都会把分钟级等待放回长连接线程"
             )
+
+
+class _RecordingOnboarding:
+    """gateway 侧的开通"编排"：**只记事件，一个外部动作都不做**。
+
+    产品负责人 2026-08-18 裁定把首次开通编排整体移进 ``lingxi-scheduler``（决策记录见
+    ``docs/决策记录/2026-08-18-首次开通编排住在scheduler.md``）。gateway 从此只做两件事：
+    把首聊事件落进 ``inbound_event`` 并标成 ``auto_provisioning``（这一步由管线的事务完成），
+    以及立刻回一条合同要求的「已收到，正在核对」。真正的编排由 scheduler 按
+    ``claim_stale_onboarding`` 认领。
+
+    因此本类返回 ``STARTED``：它的字面含义正是"编排已异步接手、这一轮没有别的话要说"
+    （见 ``ports.OnboardingState``），而管线对 ``started`` **刻意不记账**——账本留给真正
+    跑完的那一方，中途崩溃的链因此仍然可以被重新认领。
+
+    **不是失败关闭桩。** 桩会返回 ``INTERNAL_ERROR``，让每个未开通用户当场看到
+    ``LX-ONBOARD-001``；而这里的语义是"收到了、正在处理"，是真话。
+    """
+
+    def start(
+        self, *, event_id: str, open_id: str, trace_id: str, claim_token: Any = None
+    ) -> OnboardingResult:
+        del event_id, open_id, trace_id, claim_token
+        return OnboardingResult(state=OnboardingState.STARTED)

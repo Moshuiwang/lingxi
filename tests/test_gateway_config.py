@@ -405,7 +405,7 @@ class BuildSupervisorTests(unittest.TestCase):
         config = load_config(VALID_ENV)
         runner = FakeOnboarding()
 
-        with patch("lingxi.apps.gateway.EventPipeline") as pipeline_class:
+        with patch("lingxi.apps.gateway.assembly.EventPipeline") as pipeline_class:
             build_supervisor(config, transport=object(), onboarding=runner)
 
         self.assertIs(
@@ -424,7 +424,7 @@ class BuildSupervisorTests(unittest.TestCase):
 
         config = load_config(VALID_ENV)
 
-        with patch("lingxi.apps.gateway.EventPipeline") as pipeline_class:
+        with patch("lingxi.apps.gateway.assembly.EventPipeline") as pipeline_class:
             build_supervisor(config, transport=object())
 
         fallback = pipeline_class.call_args.kwargs["onboarding"]
@@ -476,7 +476,7 @@ class GatewayOnboardingIsInertTests(unittest.TestCase):
     def test_the_default_onboarding_only_records(self) -> None:
         config = load_config(VALID_ENV)
 
-        with patch("lingxi.apps.gateway.EventPipeline") as pipeline_class:
+        with patch("lingxi.apps.gateway.assembly.EventPipeline") as pipeline_class:
             build_supervisor(config, transport=object())
 
         fallback = pipeline_class.call_args.kwargs["onboarding"]
