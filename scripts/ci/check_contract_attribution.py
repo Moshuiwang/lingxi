@@ -500,12 +500,12 @@ GROUNDED_ATTRIBUTIONS: tuple[GroundedAttribution, ...] = (
         "首次对话与自动准入",
     ),
     GroundedAttribution(
-        "src/lingxi/core/identity/onboarding_runner.py",
+        "src/lingxi/core/identity/onboarding_steps.py",
         '# - 也不能"先建档建环境、发布那步以后再补"：合同要求成功以发布 + 就绪确认',
         "开通流程",
     ),
     GroundedAttribution(
-        "src/lingxi/core/identity/onboarding_runner.py",
+        "src/lingxi/core/identity/onboarding_steps.py",
         "# **只有到这里才写 active**：产品合同要求成功提示在环境创建、权限发布与当前",
         "开通流程",
     ),

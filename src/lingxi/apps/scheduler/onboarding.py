@@ -218,9 +218,7 @@ class HardDeadlineProbe:
             except BaseException as error:  # noqa: BLE001 - 原样带回主线程再抛
                 failure.append(error)
 
-        worker = threading.Thread(
-            target=call, name="lingxi-gateway-mcp-probe", daemon=True
-        )
+        worker = threading.Thread(target=call, name="lingxi-gateway-mcp-probe", daemon=True)
         worker.start()
         worker.join(timeout=self._timeout_seconds)
         if worker.is_alive():
@@ -267,9 +265,7 @@ class OnboardingExecutor:
             raise ValueError("停机轮询间隔必须是正数秒")
         self._workers = workers
         self._backlog = backlog if backlog is not None else workers * 2
-        self._queue: queue.Queue[Callable[[], None] | None] = queue.Queue(
-            maxsize=self._backlog
-        )
+        self._queue: queue.Queue[Callable[[], None] | None] = queue.Queue(maxsize=self._backlog)
         self._stop_poll_seconds = float(stop_poll_seconds)
         self._inflight = 0
         self._inflight_lock = threading.Lock()
@@ -481,8 +477,6 @@ class CatalogNotifier:
     ) -> None:
         content = self._catalog.text(key, **values)
         self._sender.send_text(open_id=open_id, text=content.text, dedupe_key=dedupe_key)
-
-
 
 
 # ----------------------------------------------------------------------
@@ -768,6 +762,13 @@ def _build_onboarding_duty(
     from lingxi.adapters.user_environment import LocalUserEnvironment, UserEnvironmentError
     from lingxi.config.content import default_content_catalog
     from lingxi.core.conversation.onboarding_recovery import OnboardingReconciler
+    from lingxi.core.identity.onboarding_config import (
+        OnboardingActions,
+        OnboardingPolicy,
+        OnboardingRecords,
+        OnboardingRuntime,
+        OnboardingSources,
+    )
     from lingxi.core.identity.onboarding_runner import AutoOnboardingRunner
     from lingxi.core.permission.mcp_readiness import McpReadinessConfirmation
 
@@ -835,119 +836,76 @@ def _build_onboarding_duty(
     store = PostgresGatewayStore(dsn, timeouts=timeouts)
     executor = OnboardingExecutor(workers=config.onboarding_workers, should_stop=should_stop)
     runner = AutoOnboardingRunner(
-        directory=PostgresOrgSnapshotStore(dsn, timeouts=timeouts),
-        employment=FeishuEmploymentReader(
-            # `sleep=stop.wait`（Issue #284 A 组 #4）：节流/限频退避里的等待能被
-            # SIGTERM 立刻打断。这里刻意用裸传，不像组织快照那侧包
-            # `_stop_aware_sleep` 中止（登记不修，独立审查二轮 P2-B1）：开通链
-            # 工作线程处理的是**已认领的用户**，停机预算内完成当前链避免用户
-            # 结果丢失（重启不得造成结果丢失的红线）；其单用户请求量级小（数次
-            # 调用），与组织快照整轮数百次不同；置位后等待归零的暴露窗口有界。
-            # `test_scheduler_onboarding_assembly.py::…uses_stop_wait_as_its_sleeper`
-            # 已锁定此行为是刻意的。
-            client=FeishuDirectoryClient(base_url=config.feishu_base_url, sleep=stop.wait),
-            access_token=employment_access_token,
-        ),
-        roster=RosterRows(PostgresRosterSnapshotStore(dsn, timeouts=timeouts)),
-        galaxy=PostgresGalaxySnapshotReader(dsn, timeouts=timeouts),
-        provisioning=PostgresAppUserStore(dsn, timeouts=timeouts),
-        users=PostgresAppUserStore(dsn, timeouts=timeouts),
-        environment=environment,
-        tokens=tokens,
-        stock_tokens=stock_tokens,
-        # 存量差集导入口（rc25 S-1，Issue #540）：与存量令牌源**同进同出**——源装了、
-        # 导入口没装时 ``AutoOnboardingRunner`` 构造期直接 ``TypeError``（与
-        # ``full_access_wildcard`` 必填同一条结构性防漏接纪律），不会静默退回
-        # "只复制令牌不读权限"的旧行为。
-        legacy_importer=(
-            PostgresLocalPermissionOverrideStore(dsn, timeouts=timeouts)
-            if stock_tokens is not None
-            else None
-        ),
-        # 预授权落库口（Issue #541 预开通）：与上面那个存量差集导入口是**同一张表、
-        # 同一份适配器**，只是合成 ``pending_action`` 的 ``reason`` 不同（审计要一眼
-        # 分得清"首聊时导入"与"首聊前预授权"）。**无条件装配**：它与存量令牌源无关，
-        # 而系统触发带了预授权却发现它没装时是整链失败关闭，不该由部署配置决定。
-        position_grants=PostgresLocalPermissionOverrideStore(dsn, timeouts=timeouts),
-        decisions=PostgresPermissionPublishStore(dsn, timeouts=timeouts),
-        readiness=McpReadinessConfirmation(
-            probe=guarded_probe,
-            store=tokens,
-            audit=audit,
-            clock=clock,
-            # 阻塞式确认真的会等三分钟，但它跑在开通执行器**自己的**线程上，不挡住
-            # SchedulerLoop 的任何一轮 tick。用 `stop.wait` 而不是 `time.sleep`：
-            # SIGTERM 能立刻打断等待（同 `PermissionNoticeDispatcher`）。
-            sleep=stop.wait,
-            schedule=schedule,
-        ),
-        notifier=CatalogNotifier(
-            sender=FeishuUserMessages(
-                base_url=config.feishu_base_url,
-                app_id=config.feishu_app_id,
-                app_secret=config.feishu_app_secret,
+        sources=OnboardingSources(
+            directory=PostgresOrgSnapshotStore(dsn, timeouts=timeouts),
+            employment=FeishuEmploymentReader(
+                # `sleep=stop.wait`（Issue #284 A 组 #4）：节流/限频退避里的等待能被
+                # SIGTERM 立刻打断。这里刻意用裸传，不像组织快照那侧包
+                # `_stop_aware_sleep` 中止（登记不修，独立审查二轮 P2-B1）：开通链
+                # 工作线程处理的是**已认领的用户**，停机预算内完成当前链避免用户
+                # 结果丢失（重启不得造成结果丢失的红线）；其单用户请求量级小（数次
+                # 调用），与组织快照整轮数百次不同；置位后等待归零的暴露窗口有界。
+                # `test_scheduler_onboarding_assembly.py::…uses_stop_wait_as_its_sleeper`
+                # 已锁定此行为是刻意的。
+                client=FeishuDirectoryClient(base_url=config.feishu_base_url, sleep=stop.wait),
+                access_token=employment_access_token,
             ),
-            catalog=default_content_catalog(),
+            roster=RosterRows(PostgresRosterSnapshotStore(dsn, timeouts=timeouts)),
+            galaxy=PostgresGalaxySnapshotReader(dsn, timeouts=timeouts),
+            stock_tokens=stock_tokens,
+            legacy_importer=PostgresLocalPermissionOverrideStore(dsn, timeouts=timeouts)
+            if stock_tokens is not None
+            else None,
+            local_overrides=local_override_reader(dsn, timeouts=timeouts),
+            email_bindings=PostgresEmailBindingSource(dsn, timeouts=timeouts),
         ),
-        ledger=store,
-        audit=audit,
-        role_function_map=role_function_map,
-        # 「公司+职能→指标名」翻译映射（Issue #227 / #346 修复）：与下面 ``publish_
-        # allowed`` 闸门共用**同一个已加载对象**（不在这里另读一份文件），供
-        # ``AutoOnboardingRunner._publish`` 调用 ``translate_company_functions`` 时
-        # 使用——此前 ``_publish`` 只用这个对象构造了布尔闸门、从未真正拿它翻译过
-        # 发布行的值列表（#346 坐实的缺陷）。
-        metric_translation_map=metric_translation_map,
-        # 内测名单闸（Issue #302 S-N-01）：判据与理由见该静态方法与 innertest_roster_gate 模块文档。
-        innertest_roster_gate=build_innertest_roster_gate(config.innertest_roster_open_ids),
-        # 每次判定现读一次登记表（只读 `feishu_delegated_subject`，不碰凭据文件、不碰
-        # refresh_token）：换主体之后旧值会让新的专用授权账号落回普通员工路径。
-        delegated_subject=lambda: registered_delegated_subject_open_id(dsn, timeouts=timeouts),
-        submit=executor.submit,
-        sleep=stop.wait,
-        clock=clock,
-        should_stop=should_stop,
-        publish_wait_seconds=config.onboarding_publish_wait_seconds,
-        # ------------------------------------------------------------------
-        # **发布闸门（Issue #227 开通侧整合）。**
-        # ------------------------------------------------------------------
-        # 「职能标签 → 指标名」的翻译层判据是「翻译映射整体为空时，本轮一条发布意图
-        # 都不排，撤权也不例外」（见 ``permission_refresh`` 模块文档「翻译」一节，
-        # 外部独立审查 2026-08-18 坐实的 P1）。本编排是 ``record_decision`` 的**第三个**
-        # 调用点（前两个是每日重算的授权与撤权），因此必须自己带同一道闸，否则它就是
-        # 那条判据的绕行入口，而绕过去的后果是往正式权限表写一行消费方读不懂的记录
-        # ——外部表不可回滚。
-        #
-        # 判据实现是 :func:`~lingxi.core.permission.metric_translation.
-        # metric_translation_available`——两个独立写入点共用的**唯一**一份；
-        # ``metric_translation_map`` 是**同一个已加载对象**：``build_loop`` 只调用
-        # :func:`_build_permission_refresh_duty` 读取一次
-        # ``lingxi/config/company_function_metric_map.toml``，本函数收到的是那次读取
-        # 的返回值，不在这里另读一份文件、不另做一次解析（两份来源迟早会漂移，而漂移
-        # 的方向是错误发布）。**不碰 ``core``**：``AutoOnboardingRunner`` 只认一个
-        # ``Callable[[], bool]``，判据属装配层。
-        #
-        # 变异锚点见 ``tests/test_onboarding_runner.PublishGateTests``：把这一行改回
-        # ``lambda: True`` 必须让它变红；映射为空时，一个身份与权限都正常的用户走完
-        # ``_match`` 后必须停在 ``permission_translation_unavailable``（用户看到
-        # ``LX-ONBOARD-001``，已转交管理员，**不是**「没有银河权限」——后者会把一个
-        # 权限完全正常的人引去银河申请一个他已经有的权限），**且 ``publish_outbox``
-        # 零新增行、``app_user`` 零新增行**；映射非空时同一个用户照常推进到发布等待。
-        publish_allowed=lambda: metric_translation_available(metric_translation_map),
-        # 管理员送达（Issue #280 §7.3）：调用方（``build_loop``）没有装配告警职责时
-        # 保持 ``None``——「已转交管理员处理」这句话此前就是这个默认值，行为不变；
-        # 生产 main() 总会传一份真实回调（见 ``build_loop`` 调用点）。
-        onboarding_failed=onboarding_failed,
-        # 失败原因落库（Issue #337）：供 `/admin trace <追溯号>` 消费，见
-        # `core/identity/onboarding_ports.FailureReasonRecorder` 协议文档。
-        failure_reasons=PostgresFailureReasonRecorder(dsn, timeouts=timeouts),
-        local_overrides=local_override_reader(dsn, timeouts=timeouts),
-        # 「同邮箱已绑给另一个人」的只读回读口（rc25 S-2a，对抗审查 X-1）。
-        # **必填、没有哨兵值**：漏接在 ``AutoOnboardingRunner`` 构造期就是 TypeError，
-        # 不会静默退回"这道闸不存在"的旧行为。判定层见
-        # ``core/identity/onboarding_guards.reject_email_bound_to_another_person``，
-        # 数据库侧的结构性保证是迁移 ``0085`` 的部分唯一索引，两者是纵深关系。
-        email_bindings=PostgresEmailBindingSource(dsn, timeouts=timeouts),
+        actions=OnboardingActions(
+            provisioning=PostgresAppUserStore(dsn, timeouts=timeouts),
+            users=PostgresAppUserStore(dsn, timeouts=timeouts),
+            environment=environment,
+            tokens=tokens,
+            position_grants=PostgresLocalPermissionOverrideStore(dsn, timeouts=timeouts),
+            decisions=PostgresPermissionPublishStore(dsn, timeouts=timeouts),
+            readiness=McpReadinessConfirmation(
+                probe=guarded_probe,
+                store=tokens,
+                audit=audit,
+                clock=clock,
+                # 阻塞式确认真的会等三分钟，但它跑在开通执行器**自己的**线程上，不挡住
+                # SchedulerLoop 的任何一轮 tick。用 `stop.wait` 而不是 `time.sleep`：
+                # SIGTERM 能立刻打断等待（同 `PermissionNoticeDispatcher`）。
+                sleep=stop.wait,
+                schedule=schedule,
+            ),
+            notifier=CatalogNotifier(
+                sender=FeishuUserMessages(
+                    base_url=config.feishu_base_url,
+                    app_id=config.feishu_app_id,
+                    app_secret=config.feishu_app_secret,
+                ),
+                catalog=default_content_catalog(),
+            ),
+        ),
+        records=OnboardingRecords(
+            ledger=store,
+            audit=audit,
+            onboarding_failed=onboarding_failed,
+            failure_reasons=PostgresFailureReasonRecorder(dsn, timeouts=timeouts),
+        ),
+        policy=OnboardingPolicy(
+            role_function_map=role_function_map,
+            metric_translation_map=metric_translation_map,
+            innertest_roster_gate=build_innertest_roster_gate(config.innertest_roster_open_ids),
+            delegated_subject=lambda: registered_delegated_subject_open_id(dsn, timeouts=timeouts),
+            publish_wait_seconds=config.onboarding_publish_wait_seconds,
+            publish_allowed=lambda: metric_translation_available(metric_translation_map),
+        ),
+        runtime=OnboardingRuntime(
+            submit=executor.submit,
+            sleep=stop.wait,
+            clock=clock,
+            should_stop=should_stop,
+        ),
     )
     duty = OnboardingReconciler(
         store=store,

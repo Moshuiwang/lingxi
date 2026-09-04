@@ -74,6 +74,9 @@ REQUIRED_MODULES = (
     # `apps/gateway/onboarding.py` 在函数内 import，后者同理——两者都必须随制品发布，
     # 否则「本地测试全绿但 wheel 里没有这个模块」会在部署当天才暴露（`V-部署-10`）。
     "lingxi.core.identity.onboarding_runner",
+    # onboarding_runner 拆分（#592 B-1）：注入口的参数对象与链上各步的实现。
+    "lingxi.core.identity.onboarding_config",
+    "lingxi.core.identity.onboarding_steps",
     # Trace #358 S-H-1（Issue #350 Gate G-3 裁定 Option A）纯移动拆分：14 个
     # Protocol + `EnvironmentResult` 搬进本模块，`onboarding_runner.py` 顶部
     # `from .onboarding_ports import (...)`。随 `onboarding_runner.py` 同一条
@@ -556,7 +559,9 @@ PROCESS_RUNTIME_IMPORTS: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {
             # 它的适配器，因此必须显式登记——不列进来，extras 那条干净环境的腿永远
             # 不会红（与本文件其余「函数内 import」条目同一条理由）。
             "lingxi.apps.scheduler.onboarding",
+            "lingxi.core.identity.onboarding_config",
             "lingxi.core.identity.onboarding_runner",
+            "lingxi.core.identity.onboarding_steps",
             # Trace #358 S-H-1（Issue #350 Gate G-3 裁定 Option A）纯移动拆分：
             # `onboarding_runner.py` 顶部**模块级** import 本模块，因此它随
             # `onboarding_runner.py` 一起进了 scheduler 的静态 import 闭包
