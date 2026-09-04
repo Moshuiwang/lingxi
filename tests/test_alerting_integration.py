@@ -20,8 +20,8 @@ from lingxi.apps.scheduler import (
     SchedulerLoop,
 )
 from lingxi.apps.worker.config import WorkerConfig
-from lingxi.apps.worker.service_ports import SessionCleanupSettings, WorkerObservers
 from lingxi.apps.worker.service import WorkerService
+from lingxi.apps.worker.service_ports import WorkerObservers
 from lingxi.config.content import default_content_catalog
 from lingxi.core.alerting import AlertManager, AlertPolicy
 from lingxi.core.execution.card_stream import CardCreated, CardStream, DeliveryRejected

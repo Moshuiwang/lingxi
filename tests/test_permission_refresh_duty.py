@@ -43,7 +43,6 @@ from lingxi.apps.scheduler import (
     build_loop,
 )
 from lingxi.apps.scheduler.permission_refresh import (
-    PermissionRefreshSources,
     REASON_FULLY_SUPPRESSED,
     SKIP_ACCOUNT_NOT_ENABLED,
     SKIP_ARCHIVED_IDENTITY_INCOMPLETE,
@@ -55,6 +54,7 @@ from lingxi.apps.scheduler.permission_refresh import (
     SKIP_NO_PUBLISHED_ROW,
     SKIP_STALE_SNAPSHOT,
     TRIGGER_REVOKE,
+    PermissionRefreshSources,
 )
 from lingxi.core.identity.roster_audit import ArchivedIdentity
 from lingxi.core.identity.roster_snapshot import StoredSnapshotFacts

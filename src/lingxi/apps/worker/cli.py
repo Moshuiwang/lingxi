@@ -30,10 +30,10 @@ from pathlib import Path
 from typing import Any, TextIO
 
 from lingxi.adapters.postgres_content_capture import PostgresContentCaptureWriter
-from lingxi.apps.worker.service_ports import SessionCleanupSettings, WorkerObservers
 from lingxi.adapters.postgres_conversation import PostgresTaskQueue, PostgresTaskQueueListener
 from lingxi.adapters.postgres_user_memory import PostgresUserMemoryReader
 from lingxi.apps.liveness import touch_liveness
+from lingxi.apps.worker.service_ports import SessionCleanupSettings, WorkerObservers
 from lingxi.core.execution.audit import redact_free_text
 from lingxi.core.ids import is_ulid, new_ulid
 

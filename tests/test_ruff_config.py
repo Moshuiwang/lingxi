@@ -484,6 +484,7 @@ class PerFileIgnoresOnlyShrinksTest(unittest.TestCase):
     """per-file-ignores 只许变短：新文件、新规则码都判红。"""
 
     def test_every_registered_file_is_within_the_pinned_set(self) -> None:
+        """登记表里出现钉住快照没有的新文件即判红。"""
         actual = _load_ruff_config()["lint"]["per-file-ignores"]
         unpinned_files = sorted(set(actual) - set(PINNED_PER_FILE_IGNORES))
         self.assertEqual(
@@ -495,6 +496,7 @@ class PerFileIgnoresOnlyShrinksTest(unittest.TestCase):
         )
 
     def test_every_registered_codes_list_is_within_the_pinned_codes(self) -> None:
+        """某个文件的豁免码里出现钉住快照没有的新码即判红。"""
         actual = _load_ruff_config()["lint"]["per-file-ignores"]
         overflowing: dict[str, list[str]] = {}
         for path, codes in actual.items():
@@ -510,9 +512,11 @@ class PerFileIgnoresOnlyShrinksTest(unittest.TestCase):
         )
 
     def test_pinned_snapshot_itself_is_not_accidentally_empty(self) -> None:
-        """自证：钉住快照本身不能是空字典——那样两条子集断言会永远空判通过，
-        起不到钉住的作用（防止本文件被后续改动悄悄改成永远绿的空壳）。"""
+        """自证：钉住快照本身不能是空字典。
 
+        空字典会让两条子集断言永远空判通过，起不到钉住的作用——防止本文件被后续改动
+        悄悄改成永远绿的空壳。
+        """
         self.assertGreater(len(PINNED_PER_FILE_IGNORES), 0)
 
 
@@ -520,6 +524,7 @@ class FormatExcludeOnlyShrinksTest(unittest.TestCase):
     """format.exclude 只许变短；本批是空集，全仓格式化批接线后同步更新钉住快照。"""
 
     def test_format_exclude_is_within_the_pinned_set(self) -> None:
+        """format.exclude 出现钉住快照没有的新条目即判红。"""
         format_section = _load_ruff_config().get("format", {})
         actual = frozenset(format_section.get("exclude", []))
         extra = sorted(actual - PINNED_FORMAT_EXCLUDE)

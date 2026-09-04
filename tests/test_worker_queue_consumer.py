@@ -47,8 +47,8 @@ from lingxi.adapters.postgres_conversation import (
     _Transaction,
 )
 from lingxi.apps.worker.config import WorkerConfig
-from lingxi.apps.worker.service_ports import SessionCleanupSettings, WorkerObservers
 from lingxi.apps.worker.service import WorkerService
+from lingxi.apps.worker.service_ports import SessionCleanupSettings, WorkerObservers
 from lingxi.config.content import default_content_catalog
 from lingxi.core.conversation import EventPipeline, InboundMessage
 from lingxi.core.delivery.ports import PROGRESS_CONTENT_MAX_LENGTH

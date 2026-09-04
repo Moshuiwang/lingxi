@@ -41,12 +41,12 @@ from lingxi.adapters.postgres_permission_publish import (
 )
 from lingxi.adapters.postgres_roster_snapshot import PostgresRosterSnapshotStore
 from lingxi.apps.scheduler.permission_refresh import (
-    PermissionRefreshSources,
     PERMISSION_REVOKE_REASON,
     REASON_FULLY_SUPPRESSED,
     SKIP_ACCOUNT_NOT_ENABLED,
     SKIP_NO_PUBLISHED_ROW,
     PermissionRefreshDuty,
+    PermissionRefreshSources,
 )
 from lingxi.core.ids import new_id
 from lingxi.core.permission.publish import (
