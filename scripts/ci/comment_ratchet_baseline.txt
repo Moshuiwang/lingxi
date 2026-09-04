@@ -129,7 +129,6 @@
 2	docstring_over	src/lingxi/core/identity/first_contact.py
 2	docstring_over	src/lingxi/core/identity/innertest_roster_gate.py
 3	docstring_over	src/lingxi/core/identity/onboarding_guards.py
-3	docstring_over	src/lingxi/core/identity/onboarding_ports.py
 3	docstring_over	src/lingxi/core/identity/onboarding_runner.py
 3	docstring_over	src/lingxi/core/identity/preprovision.py
 4	docstring_over	src/lingxi/core/identity/provisioning.py
@@ -375,7 +374,6 @@
 7	provenance	src/lingxi/core/identity/innertest_roster_gate.py
 6	provenance	src/lingxi/core/identity/legacy_permission_import.py
 4	provenance	src/lingxi/core/identity/onboarding_guards.py
-11	provenance	src/lingxi/core/identity/onboarding_ports.py
 64	provenance	src/lingxi/core/identity/onboarding_runner.py
 5	provenance	src/lingxi/core/identity/org_snapshot.py
 7	provenance	src/lingxi/core/identity/preprovision.py
