@@ -91,9 +91,6 @@
 166	src/lingxi/apps/reauthorize/__init__.py::_run
 86	src/lingxi/apps/scheduler/assembly.py::_build_management_correction_callback
 300	src/lingxi/apps/scheduler/assembly.py::build_loop
-211	src/lingxi/apps/scheduler/config.py::SchedulerConfig.from_env
-87	src/lingxi/apps/scheduler/credential_rotation.py::CredentialRotationLoop.refresh_for_supply
-79	src/lingxi/apps/scheduler/credential_rotation.py::CredentialRotationLoop.run_once
 335	src/lingxi/apps/scheduler/daily_report.py::DailyReportDuty._aggregate_and_send
 89	src/lingxi/apps/scheduler/daily_report.py::DailyReportDuty.run_once
 68	src/lingxi/apps/scheduler/daily_report.py::_build_daily_report_duty
@@ -107,17 +104,12 @@
 86	src/lingxi/apps/scheduler/org_snapshot_sync.py::_build_org_snapshot_sync_duty
 96	src/lingxi/apps/scheduler/permission_publish.py::PermissionPublishDuty.run_once
 95	src/lingxi/apps/scheduler/permission_publish.py::_build_permission_publish_duty
-115	src/lingxi/apps/scheduler/permission_readiness_assembly.py::_build_readiness_follow_up
 69	src/lingxi/apps/scheduler/permission_refresh.py::PermissionRefreshDuty._enqueue_publish
 112	src/lingxi/apps/scheduler/permission_refresh.py::PermissionRefreshDuty._refresh_user
 78	src/lingxi/apps/scheduler/permission_refresh.py::PermissionRefreshDuty._refresh_zero_galaxy_user
 82	src/lingxi/apps/scheduler/permission_refresh.py::PermissionRefreshDuty._revoke
 118	src/lingxi/apps/scheduler/permission_refresh.py::PermissionRefreshDuty.run_once
 133	src/lingxi/apps/scheduler/permission_refresh.py::_build_permission_refresh_duty
-67	src/lingxi/apps/scheduler/retention.py::_build_permission_retention_duty
-115	src/lingxi/apps/scheduler/roster_audit.py::RosterAuditDuty.run_once
-86	src/lingxi/apps/scheduler/roster_audit.py::_build_roster_audit_duty
-69	src/lingxi/apps/scheduler/roster_audit.py::_build_roster_snapshot_sync_duty
 65	src/lingxi/apps/scheduler/stalled_provisioning.py::StalledProvisioningDuty._process_one
 67	src/lingxi/apps/scheduler/stalled_provisioning.py::_build_stalled_provisioning_duty
 63	src/lingxi/apps/trace/__init__.py::_render

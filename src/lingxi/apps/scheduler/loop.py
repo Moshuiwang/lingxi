@@ -1,7 +1,7 @@
 """按同一周期驱动多个定时职责的 :class:`SchedulerLoop`，以及信号安装。
 
-从 :mod:`lingxi.apps.scheduler`（#237 拆分）搬出。逐职责隔离异常、``SIGTERM``/
-``SIGINT`` 只设一次停止标志这两条规则的完整理由见包的 ``__init__.py`` 模块文档。
+逐职责隔离异常、``SIGTERM``/``SIGINT`` 只设一次停止标志这两条规则的完整理由
+见包的 ``__init__.py`` 模块文档。
 """
 
 from __future__ import annotations
