@@ -2,28 +2,16 @@
 
 这不是通用内容审核器，也不是把模型行为假设成可靠的 prompt firewall。它只做三件
 确定性的事：把外部系统返回的自由文本包成不可伪造的「待分析内容」数据段；在用户
-问题交给执行层前，把「第一个字符是 /」的文本中性化，防止 Agent SDK 底层的 Claude
-Code CLI 把它解析成系统斜杠命令而不是用户问题（见 ``compose_agent_prompt``，
-Trace #304 批次 5 直修）；并在 worker 输出离开进程前移除已知的敏感值、内部工具
-标识和系统提示。工具是否能执行仍由 ``ToolGateway`` 判定；这里不复制工具白名单或
-权限规则。
-
-模块保持在 ``core``，不读环境、不访问网络或文件，便于用固定夹具证明负向边界。
-
-出口约束的产品合同（[#141](https://github.com/Moshuiwang/lingxi/issues/141)、
-[#142](https://github.com/Moshuiwang/lingxi/issues/142)、
-[#149](https://github.com/Moshuiwang/lingxi/issues/149)，产品负责人 2026-08-13 拍板）：
-
-1. 能确定边界的敏感片段只替换对应片段，一次命中不得让整段有效结论消失。
-2. 只有在已知敏感内容覆盖了全部可展示正文、没有任何有效业务内容幸存时，
-   才整段拒发（``withheld``），使用独立终态，不伪装成功。
-3. 系统提示类标记检测覆盖 ASCII 大小写变体、全角折叠、有界零宽字符穿插与
-   繁简变体（见 ``_SYSTEM_PROMPT_MARKERS``），但这是**针对已知复现样本的定向
-   加固**，不是通用 NFKC/同形字防护。片段切分只施加于 ``system_prompt``——
-   它是唯一「哪怕泄露一句也不允许」的敏感来源；``forbidden_values``（生产上
-   即 ``external_texts``）不做片段切分，因为那类内容是模型被期望原样引用的
-   合法业务依据，片段级匹配会把正常问答整体遮蔽。检测方式是**确定性的结构化
-   切分**（换行、句末标点、固定长度下界），不是语义相似度或模糊匹配。
+问题交给执行层前把「第一个字符是 /」的文本中性化，防止底层 CLI 解析成系统斜杠
+命令（见 ``compose_agent_prompt``）；并在 worker 输出离开进程前移除已知的敏感值、
+内部工具标识和系统提示。工具能否执行仍由 ``ToolGateway`` 判定，这里不复制
+权限规则；模块保持在 ``core``，便于用固定夹具证明负向边界。出口约束的产品
+合同：1) 敏感片段只替换对应片段，一次命中不得让整段有效结论
+消失；2) 只有已知敏感内容覆盖全部可展示正文、没有任何有效业务内容幸存时才
+整段拒发（``withheld``），使用独立终态，不伪装成功；3) 系统提示类标记检测
+覆盖大小写、全角折叠、零宽字符穿插与繁简变体，是针对已知复现样本的定向加固，
+不是通用同形字防护；片段切分只施加于 ``system_prompt``（模型被期望原样引用
+``forbidden_values`` 的合法业务依据不做片段切分）。
 """
 
 from __future__ import annotations
@@ -38,26 +26,22 @@ from typing import NamedTuple, TypeAlias
 EXTERNAL_TEXT_LABEL = "待分析内容"
 SAFE_OUTPUT_FALLBACK = "本次未取得可确认结果，请稍后重试。"
 # 与 SAFE_OUTPUT_FALLBACK 刻意不同：后者是"模型没给出内容"，与安全无关；这一条
-# 专门用于"已知敏感内容覆盖了全部正文，没有可安全展示的业务结论"（#141 的
-# withheld 终态）。两者语义不同，不能共用同一句文案，否则运营无法从文案本身
-# 区分"这轮到底发生了什么"。
+# 专门用于"已知敏感内容覆盖了全部正文，没有可安全展示的业务结论"这一 withheld
+# 终态。两者语义不同，不能共用同一句文案，否则运营无法区分这轮到底发生了什么。
 WITHHELD_MESSAGE = "本次结果涉及需要保护的内容，已被安全策略拦截，未能提供结果。"
 
 ExternalTextItems: TypeAlias = Mapping[str, object] | Iterable[tuple[str, object]]
 
 _SOURCE_NAME = re.compile(r"\A[A-Za-z0-9][A-Za-z0-9_.-]{0,63}\Z")
-# 英文分支沿用原有 system[_ -]?prompt，放宽到 0-4 个空白/连接符，覆盖
-# "System_Prompt"、"system - prompt" 这类轻微变体；中文分支是 #142 缺口二的
-# 修复——原实现只认英文，中文用户反而没有防护。两个分支都是**字面 token 匹配**，
-# 不做语义判断——这是本模块自身的从紧约定（模块文档「出口约束的产品合同」第 3 条，
-# #141/#142/#149 产品负责人拍板），不是产品合同与外部边界正文的规定：合同里唯一的
-# "不允许模糊匹配"专指身份匹配环节（银河账号匹配），与此处的输出安全无关
-# （2026-08-19 归属核对更正，见 Issue #238）。
-#
-# 归一化绕过面（复查发现，#149 修复）：模型可以被诱导用全角字母、在字符间插入
-# 零宽字符、或用繁体「系統」代替简体「系统」来吐出标记，逃过纯字面匹配。以下
-# 只针对这三类具体复现样本（全角、零宽插入、繁简变体），不是通用 NFKC/同形字
-# 防护——那需要更大范围的评估，不在本次修复范围内。
+# 英文分支沿用 system[_ -]?prompt，放宽到 0-4 个空白/连接符，覆盖
+# "System_Prompt"、"system - prompt" 这类轻微变体；中文分支覆盖同一类标记的
+# 中文写法。两个分支都是**字面 token 匹配**，不做语义判断——这是本模块自身
+# 的从紧约定（模块文档「出口约束的产品合同」第 3 条），不是产品合同与外部
+# 边界正文的规定：合同里唯一的"不允许模糊匹配"专指身份匹配环节，与此处无关。
+
+# 归一化绕过面：模型可以被诱导用全角字母、在字符间插入零宽字符、或用繁体
+# 代替简体来吐出标记，逃过纯字面匹配。以下只针对这三类具体复现样本，不是
+# 通用 NFKC/同形字防护——那需要更大范围的评估。
 
 # 全角折叠：把 U+FF01-FF5E（全角 ASCII，含全角字母/数字/标点）与 U+3000
 # （全角空格）逐字符折成对应半角字符。这是**逐字符 1:1** 映射，不改变字符串
@@ -71,7 +55,6 @@ _FULLWIDTH_FOLD = str.maketrans(
 
 def _fold_for_marker_matching(text: str) -> str:
     """只为系统提示标记检测折叠全角字符；不改变正文本身，也不改变长度。"""
-
     return text.translate(_FULLWIDTH_FOLD)
 
 
@@ -90,7 +73,6 @@ _ZW_GAP = f"[{_ZERO_WIDTH_CHARS}]{{0,{_ZW_GAP_MAX}}}"
 
 def _zw_tolerant(literal: str) -> str:
     """把字面量拆成字符间允许穿插有界零宽字符的正则片段。"""
-
     return _ZW_GAP.join(re.escape(char) for char in literal)
 
 
@@ -98,16 +80,11 @@ def _zw_tolerant(literal: str) -> str:
 # ``mcp__bi-metric__list_metrics``（约 30 字符），留有余量又不至于让流式场景的
 # "跨块保留窗口"膨胀到拖慢正常短回答——已知工具名另由 internal_tool_names 的
 # 匹配兜底，这条正则只是捕捉未登记名称的通用背兜。
-#
-# 对抗审查 2026-09-02 W-6：这条正则原来在**原文**上匹配，既不折全角也不容忍零宽，
-# 于是 `ｔｒａｃｅ＿ｉｄ＝…`（全角）与 `mcp<零宽>__query__…` 两种写法都是
-# blocked=False。系统提示标记那一支早就同时做了这两件事（#149），过程标记与工具名
-# 却一直没跟上——同一个绕过手法在同一个模块里一半有效、一半无效。现在三支统一在
-# **折叠副本**上匹配，且逐字符容忍有界零宽穿插。
-#
-# 折叠副本是逐字符 1:1 的（``_fold_for_marker_matching``），因此在它上面拿到的
-# 偏移量可以直接当原文偏移量用；零宽字符不做剥离（剥离会改长度），而是让正则
-# 自己在字符之间容忍它们。
+
+# 三支标记（工具名、过程标记、系统提示标记）统一在**折叠副本**上匹配，且逐
+# 字符容忍有界零宽穿插，堵住全角写法与零宽字符插入两类绕过——折叠副本是
+# 逐字符 1:1 的，因此在它上面拿到的偏移量可以直接当原文偏移量用；零宽字符
+# 不做剥离（剥离会改长度），而是让正则自己在字符之间容忍它们。
 _MCP_TOOL_SUFFIX_MAX = 60
 _PROCESS_MARKERS = re.compile(
     r"(?:\b"
@@ -163,10 +140,9 @@ _MIN_FRAGMENT_CHARS = 6
 _FRAGMENT_BOUNDARY = re.compile(r"[\n。！？.!?;；]+")
 
 # "命中区间之外是否还幸存真实业务内容"的判定不能用 ``str.strip()``——它只剔除
-# 空白，遮蔽后残留的孤立标点（比如整段被替换后只剩一个句号）会被误判成"幸存
-# 的业务结论"，进而放弃本该触发的 withheld 终态（复查发现，见 #149 修复说明）。
-# 改用"是否存在至少一个词/数字/CJK 字符"：\w 在 Python 的 Unicode 正则里覆盖
-# 字母、数字与 CJK 表意文字，恰好排除纯标点/空白残渣。
+# 空白，遮蔽后残留的孤立标点（比如整段被替换后只剩一个句号）会被误判成幸存的
+# 业务结论，进而放弃本该触发的 withheld 终态。改用"是否存在至少一个词/数字/
+# CJK 字符"：\w 在 Python 的 Unicode 正则里恰好排除纯标点/空白残渣。
 _MEANINGFUL_CONTENT = re.compile(r"\w", re.UNICODE)
 
 _PLACEHOLDER_VALUE = "【已隐藏】"
@@ -204,13 +180,10 @@ class OutputConstraintResult:
     """输出约束的结果；只保留原因码，不把被拦截的原文带到出口。
 
     ``blocked`` 表示发生过任何改写（局部遮蔽、整段拒发或空产出兜底三选一）；
-    ``withheld`` 单独标记"整段拒发"这一类——需要它有独立、可查询的判定这一点
-    是本模块自身的从紧约定（模块文档「出口约束的产品合同」第 2 条，#141/#142/
-    #149 产品负责人拍板），不是产品合同与外部边界正文的规定（2026-08-19 归属
-    核对更正，见 Issue #238）；但"不伪装成功"这个动机本身确有合同依据（结果
-    与交付「交付规则」、问数结果的可信标准，与 `apps/worker/report.py` 的
-    ``obtained`` 同一条登记），只是"要不要单独一个字段来查询它"是工程实现
-    选择。不能靠"blocked=True 且 text 恰好等于某个字符串"这种脆弱的隐式约定
+    ``withheld`` 单独标记"整段拒发"这一类——需要独立、可查询的判定，是本模块
+    自身的从紧约定（模块文档「出口约束的产品合同」第 2 条）；"不伪装成功"这
+    个动机本身有合同依据，与 `apps/worker/report.py` 的 ``obtained`` 同一条
+    登记。不能靠"blocked=True 且 text 恰好等于某个字符串"这种脆弱的隐式约定
     去猜。
     """
 
@@ -232,7 +205,6 @@ def normalize_external_texts(values: ExternalTextItems | None) -> tuple[tuple[st
     MCP / 花名册字段的来源名是受控的调用方元数据，文本本身完全不可信。映射输入
     按来源名排序，避免调用方把 ``set`` / ``dict`` 的遍历顺序带进 prompt 或证据。
     """
-
     if values is None:
         return ()
     if isinstance(values, Mapping):
@@ -258,7 +230,6 @@ def wrap_external_text(source: str, text: object) -> str:
     ``[/待分析内容]``，也只能成为数据字符，不能闭合本侧边界。这里保留可读正文，
     不把外部输入丢弃或当成权限授予。
     """
-
     normalized = normalize_external_texts(((source, text),))
     safe_source, safe_text = normalized[0]
     escaped_text = _escape_external_payload(safe_text)
@@ -273,19 +244,16 @@ def wrap_external_text(source: str, text: object) -> str:
 
 def render_external_context(values: ExternalTextItems | None) -> str:
     """渲染一组外部文本；来源顺序固定，内容边界逐段独立。"""
-
     return "\n\n".join(
         wrap_external_text(source, text) for source, text in normalize_external_texts(values)
     )
 
 
-# Trace #304 批次 5 直修：gateway 管线（`core/conversation/pipeline.py` 第 6 步）
-# 是主防线，业务用户以 / 开头的消息在入队前就被拦下、根本到不了这里。这个前缀是
-# 纵深防御——万一文本经其他路径入队（历史任务重试、未来新入口），交给执行层前仍
-# 要保证它不可能被 CLI 解析成命令。不用零宽字符或删除首字符：那类做法要么可能被
-# CLI 自身的归一化/裁剪逆转，要么会改写用户原始问题的可读内容；前置一段不可能是
-# 空白、不可能是 / 的中文短语，无论 CLI 内部是否再做一次 strip，整串的第一个非空白
-# 字符都不会是 /。
+# gateway 管线是主防线，业务用户以 / 开头的消息在入队前就被拦下、根本到不了
+# 这里；这个前缀是纵深防御，万一文本经其他路径入队，交给执行层前仍要保证它
+# 不可能被 CLI 解析成命令。不用零宽字符或删除首字符：那类做法要么可能被 CLI
+# 自身的归一化/裁剪逆转，要么会改写用户原始问题的可读内容；前置一段不可能是
+# 空白、不可能是 / 的中文短语，无论 CLI 内部是否再做一次 strip 都不受影响。
 _SLASH_NEUTRALIZATION_PREFIX = "用户消息："
 
 
@@ -298,7 +266,6 @@ def _neutralize_leading_slash(question: str) -> str:
     ——这是哨兵测试（``test_input_safety.py``）钉住的不变量，正常问答（含中间
     出现的 /，如日期、URL）不受任何影响。
     """
-
     if question.strip().startswith("/"):
         return f"{_SLASH_NEUTRALIZATION_PREFIX}{question}"
     return question
@@ -310,7 +277,6 @@ def compose_agent_prompt(question: str, external_texts: ExternalTextItems | None
     ``question`` 在拼接外部上下文之前先经过 :func:`_neutralize_leading_slash`——
     这一步只影响「/ 开头」的问题，其余输入不变。
     """
-
     if not isinstance(question, str):
         raise InputSafetyError("Agent 问题必须是字符串")
     safe_question = _neutralize_leading_slash(question)
@@ -330,20 +296,13 @@ def constrain_output(
     """约束模型最终正文，使已知内部 / 敏感内容不能离开 worker。
 
     调用方把固定假凭据、其他用户标识、外部注入原文和系统提示作为
-    ``forbidden_values`` 传入；内部工具名单独列出，便于报告同时覆盖放行与拒绝的
-    调用。检测在原文上一次性定位全部命中区间后合并重叠区间再统一替换——不再
-    按值逐个 ``str.replace()``，因为那种做法在命中多个值时结果依赖执行顺序，
-    也无法回答"这段文字替换后还剩多少真实内容"（#141 的核心缺陷）。
-
-    - 局部命中：只替换命中的区间，其余正文原样保留（合同第 1 条）。
-    - 整段命中：合并去重后，若原文里**不属于任何命中区间**的字符全部是空白，
-      说明没有任何可安全展示的业务结论，此时才整段拒发（合同第 2 条），
-      ``withheld=True``，正文替换为 ``withheld_text``。
-    - 模型确实没给出任何内容（空产出）与"内容被安全拦截"是两件不同的事，前者
-      用 ``fallback_text`` 且不计入 ``withheld``，避免运营把"模型没查到数据"
-      和"结果被安全策略拦下"混为一谈。
+    ``forbidden_values`` 传入；内部工具名单独列出。检测在原文上一次性定位全部
+    命中区间后合并重叠区间再统一替换，不再按值逐个 ``str.replace()``（那种
+    做法结果依赖执行顺序，也无法回答"替换后还剩多少真实内容"）。局部命中只
+    替换命中区间（合同第 1 条）；命中覆盖全部非空白字符时整段拒发（合同第 2
+    条，``withheld=True``）；模型确实没给出任何内容（空产出）用
+    ``fallback_text`` 且不计入 ``withheld``，与"内容被安全拦截"分开呈现。
     """
-
     candidate = text if isinstance(text, str) else ""
     spans = _find_spans(
         candidate,
@@ -392,26 +351,14 @@ class StreamRelease:
 
 
 class StreamingOutputGuard:
-    """跨事件边界的增量输出安全处理（#149 流式出口补充合同）。
+    """跨事件边界的增量输出安全处理，面向"回答区逐步更新"场景。
 
-    面向 #151/#152 打算做的"回答区逐步更新"：调用方每收到模型的一段文本就
-    ``feed()`` 一次，只有确认不会与后续内容组成禁止片段的部分才会被放行；
-    ``finish()`` 在回合结束时处理剩余缓冲，并给出"这一整轮到底有没有幸存的真实
-    业务内容"的最终判定。
-
-    实现方式是一个**有界尾部缓冲**：已知敏感值/片段/工具名/标记里最长的一条
-    决定了"最坏情况下一个命中还需要多少字符才能拼完"，缓冲区只保留这么多"尚未
-    确认安全"的尾部字符，更早的部分一旦经过检测就可以释放。这是**确定性**的
-    窗口计算，不是对模型输出做语义预测；配置的敏感文本越长，能开始流式释放前
-    需要攒的字符也越多——宁可多等，不猜测（与合同"无法确定安全边界时才整段
-    拒发"同一立场）。
-
-    ``withheld`` 只能在 ``finish()`` 里被判定：只有看到全文，才能回答"这一整轮
-    有没有任何真实内容幸存"。命中前已经放行的占位符替换文本不受影响——占位符
-    本身永远不包含被拦截的原文，"事后判定为 withheld"改变的只是"如何呈现这轮
-    结果"，不构成已经发生的泄露。调用方如果要在最终判定为 withheld 时撤回
-    已经展示的中间内容（例如编辑掉已发送的飞书卡片），由消费方自行处理，这不是
-    本对象的职责范围。
+    调用方每收到模型的一段文本就 ``feed()`` 一次，只有确认不会与后续内容组成
+    禁止片段的部分才会被放行；``finish()`` 处理剩余缓冲并给出最终判定。实现
+    方式是一个**有界尾部缓冲**：已知命中里最长的一条决定缓冲区要保留多少
+    "尚未确认安全"的尾部字符，更早部分一旦经过检测就可以释放，这是确定性
+    窗口计算，不是语义预测。``withheld`` 只能在 ``finish()`` 里判定；命中前
+    已放行的占位符永远不包含被拦截的原文，事后判定不构成已发生的泄露。
     """
 
     def __init__(
@@ -423,6 +370,7 @@ class StreamingOutputGuard:
         fallback_text: str = SAFE_OUTPUT_FALLBACK,
         withheld_text: str = WITHHELD_MESSAGE,
     ) -> None:
+        """按同一组敏感规则建立空缓冲，并算出有界尾部保留窗口。"""
         self._forbidden_values = tuple(forbidden_values)
         self._internal_tool_names = tuple(internal_tool_names)
         self._system_prompt = system_prompt
@@ -439,15 +387,16 @@ class StreamingOutputGuard:
 
     @property
     def withheld(self) -> bool:
+        """本轮是否已判定为整段拒发。"""
         return self._withheld
 
     @property
     def reasons(self) -> tuple[str, ...]:
+        """本轮累计命中过的原因码，按固定优先级排序。"""
         return tuple(self._reasons)
 
     def feed(self, chunk: object) -> str:
         """喂入一段增量文本，返回本次可以安全对外释放的部分（可能为空串）。"""
-
         if self._finished:
             raise InputSafetyError("StreamingOutputGuard 已经 finish，不能再 feed")
         if self._withheld:
@@ -486,7 +435,6 @@ class StreamingOutputGuard:
 
     def finish(self) -> StreamRelease:
         """处理剩余缓冲并给出本轮的最终判定；只能调用一次。"""
-
         if self._finished:
             raise InputSafetyError("StreamingOutputGuard 已经 finish，不能重复调用")
         self._finished = True
@@ -543,7 +491,6 @@ class StreamingOutputGuard:
 
 def _has_meaningful_content(text: str) -> bool:
     """判断命中区间之外幸存的文本里是否还有真实业务内容（而不只是标点残渣）。"""
-
     return _MEANINGFUL_CONTENT.search(text) is not None
 
 
@@ -560,25 +507,20 @@ def _find_spans(
         for start in _iter_substring_positions(candidate, value):
             spans.append(_Span(start, start + len(value), "forbidden_value"))
 
-    # 片段切分（#142 缺口一）只施加于 ``system_prompt``：它是唯一"绝不允许被
-    # 引用哪怕一句"的敏感来源。``forbidden_values`` 在生产上唯一来源是
-    # ``external_texts``（指标描述等外部业务文本），这类内容是模型回答问题时
-    # 被期望原样引用的合法依据——对它做片段级匹配会把"这个指标怎么定义的"这
-    # 类正常问答整体遮蔽，超出 #142 缺口一的范围（复查发现）。整串精确匹配
-    # （上面的 ``forbidden_value``）仍然覆盖 ``forbidden_values``，只是不再对
-    # 它们做结构化切分。
+    # 片段切分只施加于 ``system_prompt``：它是唯一"绝不允许被引用哪怕一句"的
+    # 敏感来源。``forbidden_values`` 在生产上唯一来源是外部业务文本（指标描述
+    # 等），模型被期望原样引用它们作为回答依据，对它做片段级匹配会把正常问答
+    # 整体遮蔽；整串精确匹配（上面的 ``forbidden_value``）仍然覆盖它们，只是
+    # 不再对其做结构化切分。
     for fragment in _derive_fragments(system_prompt) if system_prompt else ():
         for start in _iter_substring_positions(candidate, fragment):
             spans.append(_Span(start, start + len(fragment), "forbidden_fragment"))
 
-    # 三类标记全部在**全角折叠后**的副本上匹配（W-6）：折叠是逐字符 1:1 映射
-    # （见 ``_fold_for_marker_matching``），不改变长度或位置，因此这里得到的
-    # 偏移量可以直接当作原文 ``candidate`` 上的偏移量使用。
-    #
-    # ``forbidden_values``/``forbidden_fragment`` 仍在原文上做整串匹配，**有意
-    # 不折叠**：那两类是外部业务文本（指标描述等），模型被期望原样引用它们，
-    # 在折叠副本上匹配会把"全角写法的正常业务文本"也算成命中；而标记类三支要挡
-    # 的恰恰是"故意换个写法把同一个内部标识吐出来"，两者的取舍方向相反。
+    # 三类标记全部在**全角折叠后**的副本上匹配：折叠是逐字符 1:1 映射，不改变
+    # 长度或位置，这里得到的偏移量可以直接当原文偏移量用。``forbidden_values``/
+    # ``forbidden_fragment`` 仍在原文上做整串匹配、有意不折叠：那两类是外部
+    # 业务文本，折叠副本匹配会把全角写法的正常业务文本也算成命中，而标记类
+    # 要挡的恰恰是"换个写法吐出同一个内部标识"，两者取舍方向相反。
     folded_for_markers = _fold_for_marker_matching(candidate)
 
     for name in _unique_texts(internal_tool_names):
@@ -621,7 +563,6 @@ def _apply_spans(
     （用于判定是否还有真实业务内容）。``window_end`` 允许流式场景只对缓冲区里
     已确认安全的前缀做替换，其余部分留在缓冲区等待下一次判定。
     """
-
     result: list[str] = []
     kept: list[str] = []
     reasons_used: set[str] = set()
@@ -661,7 +602,6 @@ def _zw_tolerant_pattern(literal: str) -> re.Pattern[str]:
 
     带缓存：工具名集合在一个进程里是稳定的少数几个，每次回合重编译没有意义。
     """
-
     return re.compile(_zw_tolerant(literal))
 
 
@@ -678,13 +618,12 @@ def _iter_substring_positions(candidate: str, needle: str) -> Iterable[int]:
 
 
 def _derive_fragments(value: str) -> tuple[str, ...]:
-    """把较长的敏感文本切成可独立命中的片段（#142 缺口一：只泄露一段不拦）。
+    """把较长的敏感文本切成可独立命中的片段：只泄露其中一段也要能拦住。
 
     只按结构性边界切分（换行、中英文句末标点），不做语义判断；短于下界的片段
     不参与匹配。太短的整体不值得切分——切出来的任何一段要么等于原值（已被整串
     匹配覆盖），要么短于下界，两种情况都没有增量价值。
     """
-
     if len(value) < _MIN_FRAGMENT_CHARS * 2:
         return ()
     fragments: list[str] = []

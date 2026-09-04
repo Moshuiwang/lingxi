@@ -167,7 +167,6 @@
 309	src/lingxi/core/conversation/pipeline.py::EventPipeline._within_transaction
 88	src/lingxi/core/execution/card_stream.py::CardStream._render_step_line
 80	src/lingxi/core/execution/card_stream.py::CardStream.finish
-62	src/lingxi/core/execution/input_safety.py::constrain_output
 83	src/lingxi/core/identity/first_contact.py::decide_first_contact
 86	src/lingxi/core/identity/legacy_permission_import.py::import_legacy_permissions
 92	src/lingxi/core/identity/onboarding_guards.py::reject_email_bound_to_another_person
