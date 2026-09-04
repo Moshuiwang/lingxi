@@ -271,6 +271,10 @@ REQUIRED_MODULES = (
     "lingxi.apps.scheduler.retention",
     "lingxi.apps.scheduler.roster_audit",
     "lingxi.apps.scheduler.daily_report",
+    # 内测每日通报的段落组装/渲染纯函数，从 `daily_report.py` 拆出来把它压回文件
+    # 体量棘轮阈值以内（本批可读性重构）——不是 `__init__.py` 直接 import，而是被
+    # `daily_report.py` 模块级 import，因此同样在 scheduler 进程起来时必然已装入。
+    "lingxi.apps.scheduler.daily_report_sections",
     "lingxi.apps.scheduler.loop",
     "lingxi.apps.scheduler.assembly",
     "lingxi.apps.scheduler.alerting_assembly",
@@ -619,6 +623,8 @@ PROCESS_RUNTIME_IMPORTS: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {
             "lingxi.adapters.postgres_content_capture_retention",
             "lingxi.apps.scheduler.roster_audit",
             "lingxi.apps.scheduler.daily_report",
+            # 理由见 REQUIRED_MODULES 同名条目：`daily_report.py` 模块级 import 它。
+            "lingxi.apps.scheduler.daily_report_sections",
             "lingxi.apps.scheduler.loop",
             "lingxi.apps.scheduler.assembly",
             "lingxi.apps.scheduler.alerting_assembly",
