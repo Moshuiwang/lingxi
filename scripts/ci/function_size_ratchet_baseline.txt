@@ -186,9 +186,6 @@
 68	src/lingxi/core/permission/galaxy_export.py::_normalize_table
 66	src/lingxi/core/permission/galaxy_export.py::validate_export
 68	src/lingxi/core/permission/galaxy_scope.py::resolve_company_scope
-62	src/lingxi/core/permission/mcp_readiness.py::McpReadinessConfirmation.confirm
-69	src/lingxi/core/permission/mcp_readiness.py::ReadinessTicker.advance
-79	src/lingxi/core/permission/mcp_readiness.py::_ReadinessProbeRunner._probe_once
 133	src/lingxi/core/permission/merge_sources.py::merge_permission_sources
 69	src/lingxi/core/permission/metric_translation.py::build_company_function_metric_map
 71	src/lingxi/core/permission/notification.py::PermissionNoticeDispatcher.notify

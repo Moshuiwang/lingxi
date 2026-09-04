@@ -417,23 +417,8 @@ GROUNDED_ATTRIBUTIONS: tuple[GroundedAttribution, ...] = (
         "系统与外部依赖边界",
     ),
     GroundedAttribution(
-        "src/lingxi/core/permission/mcp_readiness.py",
+        "src/lingxi/core/permission/mcp_readiness_base.py",
         "产品合同要求「明确确认该用户应有的公司和职能权限已经同步且可以问数后，才宣告开通成功」。",
-        "开通流程",
-    ),
-    GroundedAttribution(
-        "src/lingxi/core/permission/mcp_readiness.py",
-        "``now`` 必然略大于 ``started + 900``，于是合同要求的最后一次探针永远被跳过，",
-        "开通流程",
-    ),
-    GroundedAttribution(
-        "src/lingxi/core/permission/mcp_readiness.py",
-        "``now`` 必然略大于 ``started + 900``，于是合同要求的最后一次探针**永远被跳过**，",
-        "开通流程",
-    ),
-    GroundedAttribution(
-        "src/lingxi/core/permission/mcp_readiness.py",
-        "# 累计到第六次时 ``now`` 必然略过 ``started + 900``，合同要求的最后一次探针",
         "开通流程",
     ),
     GroundedAttribution(

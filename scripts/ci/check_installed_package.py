@@ -146,6 +146,8 @@ REQUIRED_MODULES = (
     # 加解密、令牌与就绪记录读写、问数 MCP 探针在 adapters。与上面四个同一姿态——
     # 生产调用方是 Epic D 的 OnboardingRunner 与每日刷新职责，本 Story 不接进程。
     "lingxi.core.permission.mcp_readiness",
+    "lingxi.core.permission.mcp_readiness_base",
+    "lingxi.core.permission.mcp_readiness_tick",
     "lingxi.adapters.mcp_token_cipher",
     "lingxi.adapters.postgres_mcp_token",
     "lingxi.adapters.query_mcp_probe",
@@ -669,6 +671,8 @@ PROCESS_RUNTIME_IMPORTS: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {
             "lingxi.core.permission.galaxy_export",
             "lingxi.core.permission.galaxy_scope",
             "lingxi.core.permission.mcp_readiness",
+            "lingxi.core.permission.mcp_readiness_base",
+            "lingxi.core.permission.mcp_readiness_tick",
             "lingxi.core.permission.publish",
             "lingxi.core.permission.publish_row",
             "lingxi.core.permission.role_function",
@@ -1121,6 +1125,8 @@ PROCESS_RUNTIME_IMPORTS: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {
             "lingxi.core.permission.notification",
             "lingxi.core.permission.publish",
             "lingxi.core.permission.mcp_readiness",
+            "lingxi.core.permission.mcp_readiness_base",
+            "lingxi.core.permission.mcp_readiness_tick",
             "lingxi.core.permission.role_function",
             "lingxi.adapters.postgres_permission_publish",
             "lingxi.adapters.role_function_map_file",

@@ -144,7 +144,6 @@
 1	docstring_over	src/lingxi/core/permission/galaxy_scope.py
 1	docstring_over	src/lingxi/core/permission/legacy_diff.py
 5	docstring_over	src/lingxi/core/permission/local_override.py
-15	docstring_over	src/lingxi/core/permission/mcp_readiness.py
 3	docstring_over	src/lingxi/core/permission/merge_sources.py
 6	docstring_over	src/lingxi/core/permission/metric_translation.py
 3	docstring_over	src/lingxi/core/permission/notification.py
@@ -239,7 +238,6 @@
 1	hash_block_over	src/lingxi/core/identity/roster_audit.py
 1	hash_block_over	src/lingxi/core/identity/roster_snapshot.py
 1	hash_block_over	src/lingxi/core/mcp_naming.py
-1	hash_block_over	src/lingxi/core/permission/mcp_readiness.py
 2	hash_block_over	src/lingxi/core/permission/merge_sources.py
 1	hash_block_over	src/lingxi/core/permission/metric_translation.py
 2	hash_block_over	src/lingxi/core/permission/notification.py
@@ -405,7 +403,6 @@
 4	provenance	src/lingxi/core/permission/galaxy_scope.py
 9	provenance	src/lingxi/core/permission/legacy_diff.py
 5	provenance	src/lingxi/core/permission/local_override.py
-14	provenance	src/lingxi/core/permission/mcp_readiness.py
 35	provenance	src/lingxi/core/permission/merge_sources.py
 9	provenance	src/lingxi/core/permission/metric_translation.py
 21	provenance	src/lingxi/core/permission/notification.py
