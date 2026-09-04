@@ -43,6 +43,7 @@ from lingxi.apps.scheduler import (
     build_loop,
 )
 from lingxi.apps.scheduler.permission_refresh import (
+    PermissionRefreshSources,
     REASON_FULLY_SUPPRESSED,
     SKIP_ACCOUNT_NOT_ENABLED,
     SKIP_ARCHIVED_IDENTITY_INCOMPLETE,
@@ -476,22 +477,22 @@ def build_duty(
     )
     galaxy_reader = FakeGalaxy(galaxy_snapshot() if galaxy is None else galaxy)
     duty = PermissionRefreshDuty(
-        baseline_reader=FakeBaseline(*identities),
-        roster_snapshot=snapshot_store,
-        galaxy=galaxy_reader,
-        decisions=decisions,
-        publish_history=history,
-        token_ciphers=tokens,
-        role_function_map=ROLE_FUNCTION_MAP if role_function_map is None else role_function_map,
-        metric_translation_map=(
-            METRIC_TRANSLATION_MAP if metric_translation_map is None else metric_translation_map
-        ),
-        audit=audit,
-        clock=clock or FixedClock(TODAY),
-        stop=stop,
-        local_overrides=local_overrides,
-        legacy_all_scope=legacy_all_scope,
-    )
+               sources=PermissionRefreshSources(
+                   baseline_reader=FakeBaseline(*identities),
+                   roster_snapshot=snapshot_store,
+                   galaxy=galaxy_reader,
+                   decisions=decisions,
+                   publish_history=history,
+                   token_ciphers=tokens,
+                   local_overrides=local_overrides,
+                   legacy_all_scope=legacy_all_scope,
+               ),
+               role_function_map=ROLE_FUNCTION_MAP if role_function_map is None else role_function_map,
+               metric_translation_map=METRIC_TRANSLATION_MAP if metric_translation_map is None else metric_translation_map,
+               audit=audit,
+               clock=clock or FixedClock(TODAY),
+               stop=stop,
+           )
     return duty, {
         "audit": audit,
         "tokens": tokens,

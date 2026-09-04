@@ -30,10 +30,9 @@ from lingxi.adapters.postgres_local_permission import (
 from lingxi.apps.scheduler.audit import AuditSink
 from lingxi.apps.scheduler.config import SchedulerConfig
 from lingxi.apps.scheduler.permission_refresh_ports import (
-    LocalOverrideReadError,
+    _ROUND_SKIP_ACTIONS,
     PERMISSION_REFRESH_REASON,
     PERMISSION_REVOKE_REASON,
-    PermissionRefreshReport,
     REASON_FULLY_SUPPRESSED,
     SKIP_ACCOUNT_NOT_ENABLED,
     SKIP_ARCHIVED_IDENTITY_INCOMPLETE,
@@ -52,6 +51,9 @@ from lingxi.apps.scheduler.permission_refresh_ports import (
     STAGE_TRANSLATE,
     TRIGGER_GRANT,
     TRIGGER_REVOKE,
+    LocalOverrideReadError,
+    PermissionRefreshReport,
+    PermissionRefreshSources,
     _AuditSink,
     _BaselineReader,
     _DecisionStore,
@@ -59,7 +61,6 @@ from lingxi.apps.scheduler.permission_refresh_ports import (
     _LegacyAllScopeExpander,
     _LocalOverrideReader,
     _PublishHistory,
-    _ROUND_SKIP_ACTIONS,
     _RosterSnapshotStore,
     _Tally,
     _TokenCipherReader,
@@ -110,61 +111,48 @@ class PermissionRefreshDuty:
     def __init__(
         self,
         *,
-        baseline_reader: _BaselineReader,
-        roster_snapshot: _RosterSnapshotStore,
-        galaxy: _GalaxySnapshotReader,
-        decisions: _DecisionStore,
-        publish_history: _PublishHistory,
-        token_ciphers: _TokenCipherReader,
+        sources: PermissionRefreshSources,
         role_function_map: Mapping[str, str],
         metric_translation_map: Mapping[str, Mapping[str, Sequence[str]]],
         audit: _AuditSink,
         clock: Callable[[], datetime] | None = None,
         stop: threading.Event | None = None,
-        local_overrides: _LocalOverrideReader | None = None,
-        legacy_all_scope: _LegacyAllScopeExpander | None = None,
     ) -> None:
-        self._baseline_reader = baseline_reader
-        self._roster_snapshot = roster_snapshot
-        self._galaxy = galaxy
-        self._decisions = decisions
-        self._publish_history = publish_history
-        self._token_ciphers = token_ciphers
+        """装配一轮重算需要的读写端口、两份映射与时钟。"""
+        self._baseline_reader = sources.baseline_reader
+        self._roster_snapshot = sources.roster_snapshot
+        self._galaxy = sources.galaxy
+        self._decisions = sources.decisions
+        self._publish_history = sources.publish_history
+        self._token_ciphers = sources.token_ciphers
+        self._local_overrides = sources.local_overrides
+        self._legacy_all_scope = sources.legacy_all_scope
         self._role_function_map = role_function_map
         self._metric_translation_map = metric_translation_map
         self._audit = audit
-        # 本地权限覆盖读取口（S-P-3）：``None`` 表示装配层还没接这个 store——本轮/
-        # 本用户的合并按"没有本地源"处理，产出与今天逐字节一致（模块文档「翻译」
-        # 一节旁的「本地覆盖」小节 :func:`merge_permission_sources` 对 ``local=None``
-        # 恒等的性质）。装配层的真实实现见 ``apps/scheduler/assembly.py``。
-        self._local_overrides = local_overrides
-        # 「全部」组补行口（rc25 S-1 方案 E）：``None``＝未装配，不补行。
-        self._legacy_all_scope = legacy_all_scope
         # 时钟注入：跨轮判重与"今天"的用例要能自己决定日期，不能靠等到明天。
         self._clock = clock or (lambda: datetime.now(_UTC))
-        # 与同一进程内的其他职责共享停止标志：SIGTERM 一次让所有职责停止领取新工作。
+        # 与同一进程内的其他职责共享停止标志：一次信号让所有职责停止领取新工作。
         self._stop = threading.Event() if stop is None else stop
         self._completed_on: date | None = None
-        # 跳过类审计的**当日去重水位**：当天已经记过哪些原因。顺序判据在当前部署下每轮
-        # 都不成立，而调度周期是一分钟——不去重的话，一天会刷出一千四百多条内容完全相同
-        # 的审计，真正的信号会被埋掉。
-        #
-        # 存的是**原因集合**而不是"最后一个原因"：同一天里原因会来回变（花名册快照到了
-        # 又被换成旧的、银河批次过期又重导），只记最后一个的话 A→B→A 会把 A 记两次，
-        # 去重就在最需要它的那条路径上失效了。
+        # 跳过类审计的**当日去重水位**：当天已经记过哪些原因。顺序判据在某些部署下每轮
+        # 都不成立，而调度周期是一分钟——不去重的话一天会刷出上千条内容完全相同的审计，
+        # 真正的信号会被埋掉。存的是**原因集合**而不是"最后一个原因"：同一天里原因会
+        # 来回变，只记最后一个的话 A→B→A 会把 A 记两次，去重就在最需要它的路径上失效。
         self._skip_audited: tuple[date, set[str]] | None = None
 
     @property
     def stopping(self) -> bool:
+        """是否已经收到停止信号。"""
         return self._stop.is_set()
 
     @property
     def completed_on(self) -> date | None:
         """已完成重算的那一天。``None`` 表示本进程实例今天还没跑完过。"""
-
         return self._completed_on
 
     def request_stop(self) -> None:
+        """请求停止：本轮不再领取新的用户。"""
         self._stop.set()
 
     # ------------------------------------------------------------------
@@ -172,8 +160,11 @@ class PermissionRefreshDuty:
     # ------------------------------------------------------------------
 
     def run_once(self) -> PermissionRefreshReport | None:
-        """跑一轮。返回 ``None`` 表示本轮没有重算（停止中、今天已跑完，或前置不成立）。"""
+        """跑一轮。
 
+        Returns:
+            这一轮的报告；停止中、今天已跑完、或任一前置判据不成立时返回 ``None``。
+        """
         if self._stop.is_set():
             # 已经在停止中：一轮都不开，一条发布意图都不排。
             return None
@@ -181,7 +172,26 @@ class PermissionRefreshDuty:
         today = _utc_date(now)
         if self._completed_on == today:
             return None
+        inputs = self._load_round_inputs(today)
+        if inputs is None:
+            return None
+        snapshot, galaxy = inputs
+        tally, interrupted = self._refresh_all(snapshot, galaxy, now, today)
+        return self._finish_round(tally, galaxy, today, interrupted=interrupted)
 
+    def _load_round_inputs(self, today: date) -> tuple[Any, Any] | None:
+        """三条整轮前置判据；任一不过就整轮不跑，只留一条可分辨的审计。
+
+        花名册的元信息与整份快照分两条语句读，中间可能有一次并发替换（花名册审计职责就在
+        同一进程里）。读到"元信息说有、整份却没有"时唯一安全的动作是本轮不跑，下一轮那份
+        新快照会自己把日期判据带过来。
+
+        **顺序判据成立之后才碰银河**：花名册不新鲜的那一轮一次银河读取都不发起。翻译层
+        整体不可用时同样整轮停下——见 :meth:`_translation_available`。
+
+        Returns:
+            ``(花名册快照, 银河批次)``；任一判据不过时返回 ``None``。
+        """
         facts = self._roster_snapshot.load_facts()
         if facts is None:
             self._audit_skip(today, SKIP_MISSING_SNAPSHOT)
@@ -191,12 +201,8 @@ class PermissionRefreshDuty:
                 today, SKIP_STALE_SNAPSHOT, snapshot_date=_utc_date(facts.captured_at).isoformat()
             )
             return None
-
         snapshot = self._roster_snapshot.load()
         if snapshot is None:
-            # 元信息与整份快照分两条语句读，中间可能有一次并发替换（花名册审计职责
-            # 就在同一进程里）。这里不是防御式编程：读到"元信息说有、整份却没有"时，
-            # 唯一安全的动作是本轮不跑，下一轮那份新快照会自己把日期判据带过来。
             self._audit_skip(today, SKIP_MISSING_SNAPSHOT)
             return None
         if _utc_date(snapshot.facts.captured_at) != today:
@@ -206,47 +212,53 @@ class PermissionRefreshDuty:
                 snapshot_date=_utc_date(snapshot.facts.captured_at).isoformat(),
             )
             return None
-
-        # 顺序判据成立之后才碰银河：花名册不新鲜的那一轮**一次银河读取都不发起**。
         galaxy = self._galaxy.load_current()
         if galaxy is None:
             self._audit_skip(today, SKIP_NO_GALAXY_BATCH)
             return None
-
-        if not metric_translation_available(self._metric_translation_map):
-            # 外部独立审查 2026-08-18 坐实的 P1：翻译层映射整体为空时，**整轮**
-            # 一条发布意图都不排——撤权也不例外。``_revoke`` 从不调用翻译（它写的
-            # 是不含指标名的 ``{}``），因此把这条判据放在逐用户层面挡不住撤权；
-            # 唯一挡得住的位置是**遍历开始之前**：判据是"翻译层这一轮可不可用"，
-            # 不是"这一行要不要翻译"。模块文档「翻译」一节有完整理由——映射为空时
-            # 若只挡授权、放行撤权，权限在内容到位之前只能单向减少、不能恢复，
-            # 这是最危险的那种不对称。
-            #
-            # ``metric_translation_available`` 是唯一允许存在的判据实现（见其
-            # docstring）：首次开通编排（``apps.scheduler.assembly`` 的
-            # ``publish_allowed``，Issue #227 开通侧整合）对同一个已加载对象调用
-            # 同一个函数，两个独立写入点因此不会漂移出两套看起来等价的检查。
-            self._audit_skip(today, SKIP_METRIC_TRANSLATION_UNAVAILABLE)
+        if not self._translation_available(today):
             return None
+        return snapshot, galaxy
 
-        baseline = self._baseline_reader.load_active_baseline()
+    def _translation_available(self, today: date) -> bool:
+        """翻译映射整体为空时，**整轮**一条发布意图都不排——撤权也不例外。
+
+        撤权从不调用翻译（它写的是不含指标名的空对象），因此把这条判据放在逐用户层面挡不住
+        撤权；唯一挡得住的位置是**遍历开始之前**：判据是"翻译层这一轮可不可用"，不是"这一行
+        要不要翻译"。映射为空时若只挡授权、放行撤权，权限在内容到位之前只能单向减少、不能
+        恢复——这是最危险的那种不对称。
+
+        判据实现是**唯一允许存在的那一份**：首次开通的发布闸对同一个已加载对象调用同一个
+        函数，两个独立写入点因此不会漂移出两套看起来等价的检查。
+        """
+        if metric_translation_available(self._metric_translation_map):
+            return True
+        self._audit_skip(today, SKIP_METRIC_TRANSLATION_UNAVAILABLE)
+        return False
+
+    def _refresh_all(
+        self, snapshot: Any, galaxy: Any, now: datetime, today: date
+    ) -> tuple[_Tally, bool]:
+        """遍历这一轮的全部已开通用户；单个用户的失败不得带走整轮。
+
+        计数在**领取时**递增，不在遍历前按基线行数一次性写死：被停止信号挡在外面的人从来
+        没有被看过一眼，把他们算进"已检查"会让中断轮的报告读起来像是"全都查过了、只是什么
+        都没做"。停止信号落在遍历中间时不再为后面的人排新意图；已经落库的决定各自是一个
+        完整事务，不存在半态。
+
+        Returns:
+            ``(计数器, 是否被停止信号中断)``。
+        """
+        del today
         tally = _Tally()
-        interrupted = False
-        for identity in baseline:
+        for identity in self._baseline_reader.load_active_baseline():
             if self._stop.is_set():
-                # 停止信号落在遍历中间：不再为后面的人排新的发布意图。已经落库的那些
-                # 决定各自是一个完整事务，不存在半态；水位不置位，因此下一次启动会把
-                # 这一轮重跑一遍——重跑对已经处理过的人是 ``UNCHANGED``，不产生第二条意图。
-                interrupted = True
-                break
-            # 计数在**领取时**递增，不在遍历前按基线行数一次性写死：被停止信号挡在外面
-            # 的那些人从来没有被看过一眼，把他们算进"已检查"会让中断轮的报告读起来像是
-            # "全都查过了、只是什么都没做"。
+                return tally, True
             tally.examined += 1
             try:
                 self._refresh_user(identity, snapshot.rows, galaxy, now, tally)
-            except Exception as error:  # noqa: BLE001 - 一个用户的失败不得带走整轮
-                # 只记异常类型：异常正文可能带上被处理对象的内容（邮箱、姓名）。
+            except Exception as error:
+                # 只记异常类型：异常正文可能带上被处理对象的姓名或邮箱。
                 tally.failed += 1
                 tally.count(f"failed_{type(error).__name__}")
                 self._audit.record(
@@ -259,26 +271,31 @@ class PermissionRefreshDuty:
                     identity.app_user_id,
                     type(error).__name__,
                 )
+        return tally, False
 
+    def _finish_round(
+        self, tally: _Tally, galaxy: Any, today: date, *, interrupted: bool
+    ) -> PermissionRefreshReport:
+        """收口一轮：记一条只含计数的报告审计，并决定要不要置位当日水位。
+
+        **水位在一轮走完之后置位，即使这一轮里有个别用户失败**：失败已经逐条留痕并计入
+        报告，而"有失败就整轮重来"会让一次持续的数据库故障变成每分钟重跑一遍全员——既救不了
+        那个用户，又会把其余职责的时间预算吃掉。被停止信号中断的那一轮**不置位**：它没走完，
+        下一次启动会重跑，而重跑对已经处理过的人是"无变化"，不产生第二条意图。
+        """
         report = tally.freeze(interrupted=interrupted)
-        if interrupted:
-            self._audit.record(
-                "permission_refresh.interrupted",
-                report_date=today.isoformat(),
-                **galaxy.audit_facts(),
-                **report.audit_facts(),
-            )
-            logger.info("停止信号在权限重算期间到达，本轮未走完，水位不置位")
-            return report
-
+        action = "interrupted" if interrupted else "completed"
         self._audit.record(
-            "permission_refresh.completed",
+            f"permission_refresh.{action}",
             report_date=today.isoformat(),
             **galaxy.audit_facts(),
             **report.audit_facts(),
         )
+        if interrupted:
+            logger.info("停止信号在权限重算期间到达，本轮未走完，水位不置位")
+            return report
         self._completed_on = today
-        # 摘要只有计数（`V-花名册-33` 的同一条纪律：日志流向排障、CI 输出与工单）。
+        # 摘要只有计数：日志流向排障、CI 输出与工单，不含任何业务内容。
         logger.info(
             "每日权限重算完成 已开通用户=%s 新发布意图=%s 无变化=%s 无可用权限=%s "
             "其中已排撤权=%s 输入不完整=%s 失败=%s",
@@ -304,8 +321,12 @@ class PermissionRefreshDuty:
         now: datetime,
         tally: _Tally,
     ) -> None:
-        """重算一个已开通用户。任何"不发布"的出口都在这里显式返回，不落到默认分支。"""
+        """重算一个已开通用户。任何"不发布"的出口都在这里显式返回，不落到默认分支。
 
+        匹配阶段的失败只跳过、不撤权：它说的是"我们认不出这个人是谁"，不是"银河说他没有
+        权限"。据一次花名册歧义或数据陈旧去清空一个人的权限，方向与花名册那一侧「查无此人
+        仅提示、不做任何自动处置」的既定口径正好相反。
+        """
         if not identity.personnel_id:
             # 建档合同要求人员 ID 必填，但存档里真的没有时，匹配层会直接抛错。
             # 在这里归类成"输入不完整"，而不是让它冒充一次技术故障。
@@ -314,9 +335,6 @@ class PermissionRefreshDuty:
 
         match = match_galaxy_account(identity.personnel_id, roster_rows, galaxy.user_rows)
         if match.state != MATCHED or not match.galaxy_user_id:
-            # 匹配不上就是"没有可用的银河权限"（`V-开通-02/03/06/09` 的统一出口）。
-            # 原因码由匹配层给出且可分辨（``roster_not_found``、``key_conflict`` …），
-            # 但用户侧的产品语义是同一个，本职责在这里只跳过并计数。
             self._skip(tally, identity, STAGE_MATCH, match.reason, revoked=True)
             return
 
@@ -328,89 +346,91 @@ class PermissionRefreshDuty:
             role_function_map=self._role_function_map,
         )
         if not aggregate.granted:
-            # **零银河权限：不再无条件撤权**（PM 2026-08-29 裁定，Issue #419，消
-            # `V-权限-15` 此前登记的已知限制）。管理员的本地授权是「银河之外的兜底
-            # 赋权」，产品语义上与用户此刻有没有银河权限无关——挂在 `aggregate.
-            # granted` 判据之后只是实现上的历史顺序，不是产品裁定。因此这里把「银河
-            # 这一侧完全没有可翻译的内容」当成 `merge_permission_sources` 的一个
-            # 合法空输入（`galaxy={}`），查一次本地授权，合并结果非空才算
-            # 数——既无银河也无本地授权（或本地授权已被同键抑制清空）时，合并结果
-            # 仍是空字典，维持现行撤权语义不变，`_revoke` 一个字节都不改。
             self._refresh_zero_galaxy_user(tally, identity, aggregate, now)
             return
 
         if not identity.email or not identity.display_name:
-            # 发布行的 ``record_key``/``email``/``name`` 三列都来自存档身份。缺了就
-            # 没有"这一行是谁的"的答案——先归类，而不是让 ``build_translated_publish_row``
-            # 抛错之后被当成一次技术故障。
+            # 发布行的三列都来自存档身份。缺了就没有"这一行是谁的"的答案——先归类，
+            # 而不是让渲染函数抛错之后被当成一次技术故障。
             self._skip(
                 tally, identity, STAGE_IDENTITY, SKIP_ARCHIVED_IDENTITY_INCOMPLETE, revoked=False
             )
             return
 
-        # 翻译「公司 + 职能」→ 指标名（Issue #227）。未覆盖就跳过——不发布、不撤权，
-        # 详见模块文档「翻译」一节。放在令牌读取之前：既然本轮不会发布，没有必要为
-        # 一个注定要跳过的人去查令牌表。
+        company_metrics = self._translate(tally, identity, aggregate)
+        if company_metrics is None:
+            return
+        self._publish_or_revoke(tally, identity, aggregate, company_metrics, now)
+
+    def _translate(
+        self, tally: _Tally, identity: ArchivedIdentity, aggregate: Any
+    ) -> Mapping[str, Sequence[str]] | None:
+        """把「公司 + 职能」翻成指标名；未覆盖就跳过这一个人——不发布，也不撤权。
+
+        放在令牌读取之前：既然本轮不会发布，没必要为一个注定要跳过的人去查令牌表。
+
+        整轮判据已经确保走到这里时映射非空，因此"映射为空"实践中恒假；这个分支仍然按真实
+        取值分类而不是硬编码，是为了不让这条逐用户判据的正确性依赖"调用方一定会先做整轮
+        判据"这条外部不变量——翻译本身是纯函数，直接调用它时映射完全可能是空的。
+
+        Returns:
+            翻译结果；未覆盖时返回 ``None``（已经记过跳过）。
+        """
         try:
-            company_metrics = translate_company_functions(
+            return translate_company_functions(
                 companies=aggregate.companies,
                 functions=aggregate.functions,
                 all_companies=aggregate.all_companies,
                 mapping=self._metric_translation_map,
             )
         except UncoveredPermissionCombination as error:
-            # `run_once` 的整轮判据已经确保走到这里时映射非空，因此
-            # `error.mapping_is_empty` 实践中恒为 False；这个分支仍然按它的真实值
-            # 分类而不是硬编码，是为了不让这条逐用户判据的正确性依赖"调用方一定会先
-            # 做整轮判据"这条外部不变量——`translate_company_functions` 是纯函数，
-            # 直接调用它时映射完全可能是空的（模块文档「翻译」一节两层判据分工）。
             reason = (
                 SKIP_METRIC_TRANSLATION_UNAVAILABLE
                 if error.mapping_is_empty
                 else SKIP_METRIC_TRANSLATION_UNCOVERED
             )
             self._skip(tally, identity, STAGE_TRANSLATE, reason, revoked=False)
-            return
+            return None
 
-        # 本地权限覆盖合并（S-P-3 本地覆盖 #319）：真实权限 =
-        # (银河 ∪ 本地授权) − 本地抑制。挂在「翻译完成之后、结算发布行
-        # 之前」——`company_metrics` 就是银河那一侧已经翻译好的 `{公司: (指标名, …)}`。
-        # 见 `core/permission/merge_sources.py` 模块文档。
+    def _publish_or_revoke(
+        self,
+        tally: _Tally,
+        identity: ArchivedIdentity,
+        aggregate: Any,
+        company_metrics: Mapping[str, Sequence[str]],
+        now: datetime,
+    ) -> None:
+        """合并本地覆盖之后决定发布还是撤权：真实权限 =（银河 ∪ 本地授权）− 本地抑制。
+
+        通配全指标有两个互相独立的成因（范围覆盖全部国家，或持有全量访问职能），只有后者
+        是真的全指标通配——合并函数自己不猜，调用方必须显式声明。
+
+        合并结果被本地抑制压光到空时**走撤权出口**：这个人银河这一侧原本是有效授权，本地
+        行政性地收回到零，语义上等同于撤权，因此复用同一套机制但带一个**可分辨**的原因码。
+        不这么做的话，空字典会让渲染函数抛错，被记成一条不可分辨的通用失败——审计上完全
+        看不出"这个人是被本地抑制清空的"。
+        """
         local = self._resolve_local_overrides(identity.app_user_id)
-        # 通配角 v2（Issue #440）：`all_companies=True` 有两个互相独立的成因
-        # （`scope.all_countries` 或持有 `ADMIN_FULL_ACCESS_FUNCTION`），只有后者
-        # 是「真全指标通配」——`merge_permission_sources` 自己不猜测，调用方必须
-        # 显式声明（见该函数「通配角 v2」文档）。
         merged = merge_permission_sources(
             galaxy=company_metrics,
             local=local,
             full_access_wildcard=ADMIN_FULL_ACCESS_FUNCTION in aggregate.functions,
         )
         for reason in merged.skipped_reasons:
-            # 通配角 v1：本地源在 `all_companies=True` 下整体不参与合并，见
-            # `merge_permission_sources` 模块文档「通配角」一节。
+            # 通配全指标时本地源整体不参与合并，逐条留痕。
             self._audit.record(
                 "permission_refresh.local_override_skipped",
                 user=identity.app_user_id,
                 reason=reason,
             )
-
         if merged.unrepresentable_companies:
             self._skip(
                 tally, identity, STAGE_AGGREGATE, SKIP_SUPPRESSION_UNREPRESENTABLE, revoked=False
             )
             return
-
         if not merged.permissions:
-            # 红线-2（Trace #328 opus 审查）：银河这一侧原本是有效授权
-            # （company_metrics 非空，翻译已经成功），但本地抑制把合并结果压光到
-            # 空字典——这个人此刻没有任何可发布内容，语义上等同于撤权。走
-            # `_revoke` 同一套机制（保行清空、只对发布链上留过足迹的人发），但带一个
-            # 可分辨的原因码，不落到 `build_translated_publish_row` 对空输入的
-            # `ValueError` → 通用 `user_failed`（模块文档「全抑制」一节）。
             self._revoke(tally, identity, REASON_FULLY_SUPPRESSED, now)
             return
-
         self._enqueue_publish(tally, identity, merged.permissions, now)
 
     def _refresh_zero_galaxy_user(
@@ -420,39 +440,19 @@ class PermissionRefreshDuty:
         aggregate: Any,
         now: datetime,
     ) -> None:
-        """银河这一侧判定"无可用权限"（`no_galaxy_roles`/`no_supported_function`/
-        `no_company_scope`）时的新分支（PM 2026-08-29 裁定，Issue #419）：查一次
-        **本地授权**，合并结果非空就发布，仍为空才撤权。
+        """银河这一侧判定"无可用权限"时：查一次**本地授权**，非空就发布、仍为空才撤权。
 
-        **存档不全时直接走撤权、不先查本地覆盖**：撤权行与发布行都需要
-        `email`/`display_name` 这两列，任何合并结果都救不了一个存档不全的人，提前
-        判掉能省一次读放大——`_revoke` 自己的完整性检查本就在查发布足迹之前短路
-        （模块文档「撤权」一节），这里保持与它逐字节一致的观测行为
-        （`tests/test_permission_refresh_duty.py::RevocationPublishTest.
-        test_a_revoked_user_with_an_incomplete_archive_is_skipped` 钉住
-        "存档不全时连发布足迹都不查"，本方法不得破坏这条既有断言）。
+        管理员的本地授权是「银河之外的兜底赋权」，产品语义上与这个人此刻有没有银河权限
+        无关；把合并挂在"有银河权限"判据之后只是实现上的历史顺序。
 
-        **本地授权读取失败＝本轮跳过这个人，不落撤权（P1-1，独立审查坐实并
-        修复）**：银河对这条分支的合并贡献恒为 `{}`（不翻译，见下），因此本地
-        授权是否读到直接决定"发布还是撤权"这件事本身——修复前读取失败与"没有
-        本地授权"落到同一个 `None`，会让一次纯粹的数据库抖动被误判成"这个人
-        没有权限"，真的撤权并同事务清空已送达正文（不可逆）。改为
-        `self._resolve_local_overrides(..., raise_on_failure=True)`，捕获
-        :class:`LocalOverrideReadError` 后**本轮直接返回**：不发布、不撤权、
-        不清正文，等下一轮数据库恢复后再重新判定；`_resolve_local_overrides`
-        已经记过一条 `local_override_skipped` 审计，这里只补计数，不重复记审计
-        （见该方法文档）。**否定用例**：读失败 → 零发布行为变化 + 恰一条审计
-        （`ZeroGalaxyLocalGrantTest.
-        test_a_local_override_read_failure_skips_the_user_without_revoking`）。
+        **存档不全时直接走撤权、不先查本地覆盖**：撤权行与发布行都需要邮箱和姓名，任何
+        合并结果都救不了一个存档不全的人，提前判掉能省一次读放大，也与撤权自己"完整性
+        检查在查发布足迹之前短路"的既有观测行为逐字节一致。
 
-        **不翻译**：`aggregate.granted` 为假时 `aggregate.companies`/`functions`
-        恒为空（`PermissionAggregate.__post_init__` 的不变式），银河这一侧对合并
-        的贡献直接是 `galaxy={}`——不调用 `translate_company_functions`（对空输入
-        它会直接拒绝，那是"参数缺失"，不是"没有内容"），因此这条分支与翻译层整轮/
-        逐用户两层判据（模块文档「翻译」一节）完全没有交集：翻译层不可用不影响它，
-        它也不消费翻译结果。
+        **不翻译**：这条分支上银河的公司与职能恒为空，对合并的贡献直接是空字典——不调用
+        翻译（对空输入它会直接拒绝，那是"参数缺失"不是"没有内容"），因此它与翻译层的两层
+        判据完全没有交集。
         """
-
         if not identity.email or not identity.display_name:
             self._revoke(tally, identity, aggregate.reason, now)
             return
@@ -460,16 +460,17 @@ class PermissionRefreshDuty:
         try:
             local = self._resolve_local_overrides(identity.app_user_id, raise_on_failure=True)
         except LocalOverrideReadError:
+            # 读取失败＝本轮跳过这个人：银河贡献恒为空，本地授权是否读到直接决定"发布
+            # 还是撤权"这件事本身。把读失败折叠成"没有本地授权"，会让一次纯粹的数据库
+            # 抖动变成真的撤权并同事务清空已送达正文——不可逆。读取口已经记过一条跳过
+            # 审计，这里只补计数。
             tally.count(SKIP_LOCAL_OVERRIDE_READ_FAILED)
             return
 
-        # `full_access_wildcard` 现在是必填关键字参数（Trace #445 结构性防复发：
-        # 默认值曾是一次真实漏接的根因）——这条分支 `galaxy` 恒为空字典，不含
-        # `ALL_COMPANIES_KEY`，取值对结果没有作用面，仍必须显式传参。
+        # 通配标志现在是必填关键字参数（默认值曾是一次真实漏接的根因）——这条分支的银河
+        # 侧恒为空字典，取值对结果没有作用面，仍必须显式传参。
         merged = merge_permission_sources(galaxy={}, local=local, full_access_wildcard=True)
         for reason in merged.skipped_reasons:
-            # 通配角 v1 结构上不会在这条分支出现（`galaxy` 恒为空字典，不含
-            # `ALL_COMPANIES_KEY`），保留同一姿态只是让两条分支的代码形状一致。
             self._audit.record(
                 "permission_refresh.local_override_skipped",
                 user=identity.app_user_id,
@@ -481,15 +482,11 @@ class PermissionRefreshDuty:
                 tally, identity, STAGE_AGGREGATE, SKIP_SUPPRESSION_UNREPRESENTABLE, revoked=False
             )
             return
-
         if not merged.permissions:
-            # 既无银河也无本地授权（或本地授权已被同键抑制清空）：维持现行撤权
-            # 语义不变，`_revoke` 一个字节都不改。
+            # 既无银河也无本地授权（或本地授权已被同键抑制清空）：维持撤权语义。
             self._revoke(tally, identity, aggregate.reason, now)
             return
-
-        # 本地授权非空：管理员的兜底赋权生效，发布内容=合并结果（精确等于本地
-        # 授权集合，因为 galaxy 一侧贡献为空）。
+        # 本地授权非空：发布内容精确等于合并结果，因为银河一侧贡献为空。
         self._enqueue_publish(tally, identity, merged.permissions, now)
 
     def _enqueue_publish(
@@ -499,55 +496,39 @@ class PermissionRefreshDuty:
         company_metrics: Mapping[str, Sequence[str]],
         now: datetime,
     ) -> None:
-        """结算并落一次授权发布决定，供 `_refresh_user`（银河授权路径）与
-        `_refresh_zero_galaxy_user`（零银河 + 本地授权兜底路径）共用同一段收尾——
-        两条路径殊途同归：都在四源合并之后拿到非空的 `company_metrics`，剩下的
-        （只读令牌密文、结算发布行、落决定、计数、清送达正文）与"这份内容是从
-        银河翻译来的还是纯本地授权来的"无关。
-        """
+        """结算并落一次授权发布决定，两条授权路径共用这一段收尾。
 
-        # 只取**已有**密文，取不到就是 None（发布层随后以 ``missing_token_cipher``
-        # 失败关闭）。这里没有、也不允许有任何签发路径。
-        token_cipher = self._token_ciphers.token_cipher(identity.app_user_id)
+        银河授权路径与"零银河 ＋ 本地授权兜底"路径殊途同归：都在合并之后拿到非空内容，
+        剩下的（只读令牌密文、结算发布行、落决定、计数、清已送达正文）与"这份内容是从银河
+        翻译来的还是纯本地授权来的"无关。
+
+        令牌只取**已有**密文，取不到就留空，由发布执行器失败关闭；这里没有、也不允许有
+        任何签发路径。
+        """
         row = build_translated_publish_row(
             company_metrics=company_metrics,
             email=identity.email,
             display_name=identity.display_name,
             decided_at=now,
-            token_cipher=token_cipher,
+            token_cipher=self._token_ciphers.token_cipher(identity.app_user_id),
         )
         try:
             decision = self._decisions.record_decision(
                 user_id=identity.app_user_id,
                 row=row,
                 reason=PERMISSION_REFRESH_REASON,
-                # Issue #483：这是一份**需要账号有效**的授权。基线读取到轮到这个人
-                # 被处理之间，管理员可能刚把他停用并排空了权限——判据必须落在
-                # ``record_decision`` 那把已经持有的行锁里（同一行、同一把锁 = 与
-                # 停用写入串行），不是这里先查一次账号状态（那只会把窗口缩小）。
+                # 这是一份**需要账号有效**的授权。基线读取到轮到这个人被处理之间，管理员
+                # 可能刚把他停用并排空了权限——判据必须落在落决定那把已经持有的行锁里
+                # （同一行同一把锁＝与停用写入串行），而不是这里先查一次账号状态（那只会
+                # 把窗口缩小）。
                 require_enabled_account=True,
                 decided_at=now,
-                # 权限确实变化时，在 record_decision 自己的同一个事务里顺带清空该用户
-                # 已送达、随会话保留的投递正文（S-P-5，Trace #328）。
+                # 权限确实变化时，在落决定自己的同一个事务里顺带清空这个人已送达、随会话
+                # 保留的投递正文。
                 clear_delivered_content=True,
             )
         except PermissionGrantBlockedByAccountState as blocked:
-            # **被挡是正确结果，不是故障**：``tally.failed`` 不加一（那一列是"处理这个
-            # 人时抛了异常"，运维按它判断本轮健康度）。这个人本轮什么都没写——事务整体
-            # 回滚，版本没推进、意图没入队；他的撤权由停用那一刻的即时撤销路径负责。
-            tally.count(SKIP_ACCOUNT_NOT_ENABLED)
-            self._audit.record(
-                "permission_refresh.grant_blocked_account_state",
-                user=identity.app_user_id,
-                stage=STAGE_IDENTITY,
-                reason=SKIP_ACCOUNT_NOT_ENABLED,
-                account_state=blocked.account_state,
-            )
-            logger.warning(
-                "本轮基线读取之后该用户已被停用，授权决定整体回滚 user=%s account_state=%s",
-                identity.app_user_id,
-                blocked.account_state,
-            )
+            self._count_grant_blocked(tally, identity, blocked)
             return
         if decision.enqueued:
             tally.enqueued += 1
@@ -558,9 +539,29 @@ class PermissionRefreshDuty:
                 trigger=TRIGGER_GRANT,
             )
         else:
-            # ``UNCHANGED``：权限内容与上一条仍然有效的意图逐字段相同。不推进版本、
-            # 不排新意图、不清理——判定在 ``record_decision`` 里，本职责只如实计数。
+            # 权限内容与上一条仍然有效的意图逐字段相同：不推进版本、不排新意图、不清理。
             tally.unchanged += 1
+
+    def _count_grant_blocked(self, tally: _Tally, identity: ArchivedIdentity, blocked: Any) -> None:
+        """基线读取之后这个人才被停用：**被挡是正确结果，不是故障**。
+
+        失败计数不加一——那一列是"处理这个人时抛了异常"，运维按它判断本轮健康度。这个人
+        本轮什么都没写：事务整体回滚，版本没推进、意图没入队；他的撤权由停用那一刻的即时
+        撤销路径负责。
+        """
+        tally.count(SKIP_ACCOUNT_NOT_ENABLED)
+        self._audit.record(
+            "permission_refresh.grant_blocked_account_state",
+            user=identity.app_user_id,
+            stage=STAGE_IDENTITY,
+            reason=SKIP_ACCOUNT_NOT_ENABLED,
+            account_state=blocked.account_state,
+        )
+        logger.warning(
+            "本轮基线读取之后该用户已被停用，授权决定整体回滚 user=%s account_state=%s",
+            identity.app_user_id,
+            blocked.account_state,
+        )
 
     def _resolve_local_overrides(
         self, user_id: str, *, raise_on_failure: bool = False
@@ -579,7 +580,7 @@ class PermissionRefreshDuty:
           异常，这里提前捕获是为了把"翻译失败"与"本地覆盖读取失败"两种原因分开
           审计，而不是让两者都落进同一个笼统的 ``permission_refresh.user_failed``）。
 
-        ``raise_on_failure``（``False`` 默认，P1-1 独立审查修复新增）：``False`` 时
+        ``raise_on_failure``（默认 ``False``）：``False`` 时
         读取失败与"未装配"对调用方同样返回 ``None``——`_refresh_user` 银河已授权
         路径用这个默认值，理由是银河已经贡献了非空内容，本地源读取失败不改变
         "要不要发布"这件事本身，只是让合并少了本地这一份，行为与改动前逐字节
@@ -590,12 +591,11 @@ class PermissionRefreshDuty:
         这里记过同一条 ``local_override_skipped`` 审计，调用方不需要也不应该
         再重复记一条。
         """
-
         if self._local_overrides is None:
             return None
         try:
             entries = tuple(self._local_overrides.effective_entries(user_id=user_id))
-        except Exception as error:  # noqa: BLE001 - 本地源读取失败只降级，不整轮/整人失败
+        except Exception as error:  # 本地源读取失败只降级，不整轮/整人失败
             self._audit.record(
                 "permission_refresh.local_override_skipped",
                 user=user_id,
@@ -615,10 +615,11 @@ class PermissionRefreshDuty:
     def _expand_legacy_all_scope(
         self, user_id: str, entries: tuple[LocalPermissionOverrideEntry, ...]
     ) -> tuple[LocalPermissionOverrideEntry, ...]:
-        """「2.0 迁移导入·全部」组随当前映射补齐新指标（rc25 S-1 方案 E）：缺才补、
-        同组 ID、撤销过的组不参与（只看生效条目）；补行成功后重读一次条目让本轮合并
-        直接带上新行，补行或重读失败都只审计、不影响本轮既有结果。"""
+        """给「全部」组随当前映射补齐新指标。
 
+        缺才补、同组标识、撤销过的组不参与（只看生效条目）；补行成功后重读一次条目让本轮
+        合并直接带上新行。补行或重读失败都只审计，不影响本轮既有结果。
+        """
         if self._legacy_all_scope is None:
             return entries
         missing = missing_all_scope_metrics(entries, self._metric_translation_map)
@@ -630,7 +631,7 @@ class PermissionRefreshDuty:
                 added = self._legacy_all_scope.expand_all_scope_group(
                     user_id=user_id, group_id=group_id, metrics=metrics, now=self._clock()
                 )
-            except Exception as error:  # noqa: BLE001 - 补行失败不影响本轮既有合并
+            except Exception as error:  # 补行失败不影响本轮既有合并
                 self._audit.record(
                     "permission_refresh.legacy_all_scope_refresh_failed",
                     user=user_id,
@@ -645,7 +646,7 @@ class PermissionRefreshDuty:
             return entries
         try:
             return tuple(self._local_overrides.effective_entries(user_id=user_id))
-        except Exception:  # noqa: BLE001 - 重读失败：新行下一轮自然生效
+        except Exception:  # 重读失败：新行下一轮自然生效
             return entries
 
     def _revoke(
@@ -655,21 +656,18 @@ class PermissionRefreshDuty:
         reason: str,
         now: datetime,
     ) -> None:
-        """银河侧明确判定这个人现在没有可用权限：该清空的清空，该跳过的跳过。
+        """这个人现在没有可用权限：该清空的清空，该跳过的跳过。
 
-        三条出口按次序判，**每一条都显式返回**，不落到默认分支：
+        撤权是**保行、清空权限内容**：发布表那一行留着，权限写成空对象，状态不动、令牌密文
+        不碰。三条出口按次序判，**每一条都显式返回**：存档缺邮箱或姓名 → 跳过（撤权行同样
+        需要"这一行是谁的"，且这一步在查库之前，因为它不需要查库）；在发布链上一点足迹都
+        没有 → 跳过（不为一个没有发布行的人新建一行空权限：问数对查无此人本来就默认拒绝，
+        而新建还需要一份令牌密文）；否则结算撤权行并落一次权限决定。
 
-        1. **存档缺邮箱或姓名** → 跳过。撤权行的 ``record_key``/``email``/``name``
-           三列同样来自存档身份，缺了就没有"这一行是谁的"的答案。这一步在查库之前，
-           因为它不需要查库。
-        2. **在发布链上一点足迹都没有**（既没发布成功过、也没有在途意图）→ 跳过
-           （:data:`SKIP_NO_PUBLISHED_ROW`）。理由见模块文档「撤权」一节：不为一个
-           没有发布行的人新建一行空权限。
-        3. 否则结算撤权行并落一次权限决定。是否真的排出新意图由
-           ``record_decision`` 的内容比对决定——第二天仍然无权限时判 ``UNCHANGED``，
-           因此撤权**不会每天重发一次**。
+        "在途也算足迹"这一半是必需的：昨天排的授权意图还堵在待发布、今天这个人被撤权时若
+        跳过，等发布面消费积压时**已经被收回的范围**会被写进外部表并触发一条"范围已更新"
+        通知。算进来之后，撤权决定推进版本、旧意图被认领时判"已被取代"，两条路都安全。
         """
-
         tally.revoked += 1
         tally.count(reason)
         if not identity.email or not identity.display_name:
@@ -691,25 +689,31 @@ class PermissionRefreshDuty:
                 revocation=SKIP_NO_PUBLISHED_ROW,
             )
             return
+        self._record_revocation(tally, identity, reason, now)
 
-        row = build_revocation_row(
-            email=identity.email,
-            display_name=identity.display_name,
-            decided_at=now,
-        )
+    def _record_revocation(
+        self, tally: _Tally, identity: ArchivedIdentity, reason: str, now: datetime
+    ) -> None:
+        """落一次撤权决定。是否真的排出新意图由落决定的内容比对决定。
+
+        第二天仍然无权限时判"无变化"，因此撤权**不会每天重发一次**。
+
+        撤权**任何账号状态都必须放行**：挡住撤权＝停用彻底失效，是方向相反、后果最严重的
+        那种错误——强制撤权的服务对象本来就是已停用用户。声明放行时实现侧还会断言这一行
+        确实是空权限撤权行，传错在运行期就写不出来。
+        """
         decision = self._decisions.record_decision(
             user_id=identity.app_user_id,
-            row=row,
+            row=build_revocation_row(
+                email=identity.email,
+                display_name=identity.display_name,
+                decided_at=now,
+            ),
             reason=PERMISSION_REVOKE_REASON,
-            # Issue #483：撤权**任何账号状态都必须放行**。挡住撤权 = 停用彻底失效，
-            # 是本次修复方向相反的那个、后果最严重的错误——``force_revoke`` 的服务
-            # 对象本来就是已停用用户。声明 ``False`` 时实现侧还会断言这一行确实是
-            # 空权限撤权行，传错在运行期就写不出来。
             require_enabled_account=False,
             decided_at=now,
-            # 权限确实变化（真的排出撤权意图）时，在 record_decision 自己的同一个
-            # 事务里顺带清空该用户已送达、随会话保留的投递正文（S-P-5，Trace #328），
-            # 与授权侧同一个开关、同一条理由。
+            # 与授权侧同一个开关、同一条理由：权限确实变化时在同一个事务里顺带清空这个人
+            # 已送达、随会话保留的投递正文。
             clear_delivered_content=True,
         )
         if decision.enqueued:
@@ -746,7 +750,6 @@ class PermissionRefreshDuty:
         离开数据库就映射不到人；邮箱、姓名、工号、银河账号、公司编号与职能标签
         一个都不写（`V-花名册-33` 的同一条纪律）。
         """
-
         if revoked:
             tally.revoked += 1
         else:
@@ -770,7 +773,6 @@ class PermissionRefreshDuty:
         就立刻开跑。**同一天里出现过的每一种原因都会被记到**，包括来回切换后又回到
         先前那一种（A→B→A 只留 A、B 各一条，不会因为"最后一次记的不是 A"而把 A 记两次）。
         """
-
         day, reasons = (
             self._skip_audited
             if self._skip_audited is not None and self._skip_audited[0] == today
@@ -796,58 +798,35 @@ def _build_permission_refresh_duty(
 ]:
     """装配每日权限重算职责；前置不齐就**不注册**并留下**恰一条**审计。
 
-    返回 ``(duty, metric_translation_map)``：第二个元素是本函数**唯一一次**读取
-    ``lingxi/config/company_function_metric_map.toml`` 得到的对象（前置不齐、连
-    读取都没发生时是 ``None``）。``build_loop`` 把它原样转给
-    :func:`_build_onboarding_duty` 构造 ``publish_allowed``——**同一个已加载对象**，
-    不在开通侧另开一次文件 I/O（见 Issue #227 开通侧整合的取舍说明，
-    ``build_loop`` 内注入点上方的注释）。
+    数据库连接串不构成能变红的前置——进程起得来就一定有；真正的运行前置（花名册今天更新
+    过、银河有当前有效批次）是**数据**而不是配置，由每一轮重新判定。
 
-    形状照 :func:`_build_roster_audit_duty`（`V-花名册-29` 的同一条纪律：缺项只报变量名、
-    审计恰一条、其余职责照常运行）。前置有三个，逐个说明为什么它是真前置：
-
-    1. **MCP 令牌主密钥**（``LINGXI_MCP_TOKEN_ENCRYPT_KEY``）。重算要读该用户**已有**的
-       令牌密文，而唯一的读取口
-       :class:`~lingxi.adapters.postgres_mcp_token.PostgresMcpTokenStore` 只接受已经校验
-       过主密钥的加解密对象（它同时承载解密路径，构造时就要求密钥）。**没有它就没有令牌
-       读取口**，而"读不到"与"这个人没有令牌"在下游是同一个 ``None``——那会让每个需要
-       新建发布行的人都以 ``missing_token_cipher`` 失败关闭，表现成"接线了但一直失败"，
-       正是 R3 那条注释要避免的伪装。因此这里显式不注册并留痕。
-
-       **本职责一次都不解密、也不签发**：密钥在这里只用于构造那个读取口
-       （见 :mod:`lingxi.apps.scheduler.permission_refresh` 的模块文档）。
-    2. **角色职能映射配置**。它随包发布（``lingxi/config/galaxy_role_function_map.toml``）。
-       读不出来时**不能**退化成空映射——那会让所有角色变成"未映射"，于是全员被算成无可用
-       权限，是一种看起来正常的失败（``role_function_map_file`` 的模块文档同一条理由）。
-    3. **公司+职能→指标名翻译映射配置**（Issue #227）。它同样随包发布
-       （``lingxi/config/company_function_metric_map.toml``），**文件读不出来或格式不对**
-       才不注册——**空映射本身是合法内容**（``[companies]`` 表存在但没有条目，代表映射
-       内容尚未由产品负责人填入），不是一种要拒绝注册的前置缺失：职责本该正常跑起来，
-       只是每个人都会在翻译那一步 fail-closed 并跳过（模块文档「翻译」一节），这与"配置
-       文件本身损坏"是两件不同的事，必须分开判断——前者是"内容还没到"，后者是"部署配置
-       本身有问题"，把两者混在一起会让"运维发现配置文件语法错了"和"产品负责人还没填映射"
-       表现成同一种"职责不注册"，无从分辨该找谁。
-
-    数据库连接串是必需配置，进程起得来就一定有，因此它不构成一个能变红的前置判定；
-    职责真正的运行前置（花名册今天更新过、银河有当前有效批次）是**数据**而不是配置，
-    由 ``run_once`` 每轮重新判定。
+    Returns:
+        ``(职责, 翻译映射)``。第二个元素是本函数**唯一一次**读取翻译映射文件得到的对象，
+        供装配层原样转给首次开通的发布闸，不在开通侧另开一次文件 I/O。
     """
-
     if not config.mcp_token_encrypt_key:
-        from lingxi.adapters.mcp_token_cipher import MASTER_KEY_ENV
-
-        # 只报变量名，不回显任何值（`V-花名册-29` 的同一条纪律；它还是一把主密钥）。
-        audit.record(
-            "permission_refresh.duty_not_registered",
-            reason="missing_environment_variable",
-            variable=MASTER_KEY_ENV,
-        )
-        logger.warning("未配置 %s，每日权限重算职责不注册；其余定时职责照常运行", MASTER_KEY_ENV)
+        return _refuse_registration(audit, missing_master_key=True)
+    maps = _load_permission_maps(audit, config)
+    if maps is None:
         return None, None
-
-    from lingxi.adapters.company_function_metric_map_file import (
-        load_company_function_metric_map,
+    role_function_map, metric_translation_map = maps
+    duty = PermissionRefreshDuty(
+        sources=_build_sources(config),
+        role_function_map=role_function_map,
+        metric_translation_map=metric_translation_map,
+        audit=audit,
+        stop=stop,
     )
+    return duty, metric_translation_map
+
+
+def _build_sources(config: SchedulerConfig) -> PermissionRefreshSources:
+    """把八个读写端口接到真库上。
+
+    同一个存储对象喂两个字段：一个只写权限决定，一个只读"发布过没有"。分成两个字段是为了
+    让撤权那条判据在类型上说得清楚。
+    """
     from lingxi.adapters.mcp_token_cipher import McpTokenCipher
     from lingxi.adapters.postgres_galaxy_snapshot import PostgresGalaxySnapshotReader
     from lingxi.adapters.postgres_mcp_token import PostgresMcpTokenStore
@@ -856,12 +835,72 @@ def _build_permission_refresh_duty(
         PostgresPermissionRefreshBaselineReader,
     )
     from lingxi.adapters.postgres_roster_snapshot import PostgresRosterSnapshotStore
+
+    dsn = config.postgres_dsn
+    timeouts = config.postgres_timeouts
+    publish_store = PostgresPermissionPublishStore(dsn, timeouts=timeouts)
+    return PermissionRefreshSources(
+        baseline_reader=PostgresPermissionRefreshBaselineReader(dsn, timeouts=timeouts),
+        roster_snapshot=PostgresRosterSnapshotStore(dsn, timeouts=timeouts),
+        galaxy=PostgresGalaxySnapshotReader(dsn, timeouts=timeouts),
+        decisions=publish_store,
+        publish_history=publish_store,
+        token_ciphers=PostgresMcpTokenStore(
+            dsn,
+            cipher=McpTokenCipher(config.mcp_token_encrypt_key),
+            timeouts=timeouts,
+        ),
+        local_overrides=local_override_reader(dsn, timeouts=timeouts),
+        legacy_all_scope=PostgresLocalPermissionOverrideStore(dsn, timeouts=timeouts),
+    )
+
+
+def _refuse_registration(audit: AuditSink, *, missing_master_key: bool) -> tuple[None, None]:
+    """缺令牌主密钥时不注册。
+
+    重算要读这个人**已有**的令牌密文，而唯一的读取口只接受已经校验过主密钥的加解密对象。
+    没有密钥就没有读取口，而"读不到"与"这个人没有令牌"在下游是同一个空值——那会让每个需要
+    新建发布行的人都失败关闭，表现成"接线了但一直失败"。本职责一次都不解密、也不签发，
+    密钥在这里只用于构造那个读取口。审计只报变量名，不回显任何值：它还是一把主密钥。
+    """
+    del missing_master_key
+    from lingxi.adapters.mcp_token_cipher import MASTER_KEY_ENV
+
+    audit.record(
+        "permission_refresh.duty_not_registered",
+        reason="missing_environment_variable",
+        variable=MASTER_KEY_ENV,
+    )
+    logger.warning("未配置 %s，每日权限重算职责不注册；其余定时职责照常运行", MASTER_KEY_ENV)
+    return None, None
+
+
+def _load_permission_maps(
+    audit: AuditSink, config: SchedulerConfig
+) -> tuple[Mapping[str, str], Mapping[str, Mapping[str, Sequence[str]]]] | None:
+    """读两份随包发布的映射；任一读不出来就不注册。
+
+    角色职能映射读不出来时**不能**退化成空映射——那会让所有角色变成"未映射"，于是全员被
+    算成无可用权限，是一种看起来正常的失败。
+
+    翻译映射只有**文件缺失或格式不对**才不注册：**空映射本身是合法内容**（表存在但没有
+    条目，代表内容尚未填入），职责本该正常跑起来，只是每个人都会在翻译那一步失败关闭并
+    跳过。两者必须分开判断——把"内容还没到"和"部署配置本身有问题"混成同一种"职责不注册"，
+    就无从分辨该找谁。
+
+    审计与日志只记异常类型：配置解析失败的正文可能带上文件内容片段。
+
+    Returns:
+        ``(角色职能映射, 翻译映射)``；任一不可用时返回 ``None``。
+    """
+    from lingxi.adapters.company_function_metric_map_file import (
+        load_company_function_metric_map,
+    )
     from lingxi.adapters.role_function_map_file import load_role_function_map
 
     try:
         role_function_map = load_role_function_map()
     except (OSError, ValueError) as error:
-        # 只记异常类型：配置解析失败的正文可能带上文件内容片段。
         audit.record(
             "permission_refresh.duty_not_registered",
             reason="role_function_map_unavailable",
@@ -870,12 +909,10 @@ def _build_permission_refresh_duty(
         logger.error(
             "角色职能映射配置不可用，每日权限重算职责不注册 error=%s", type(error).__name__
         )
-        return None, None
-
+        return None
     try:
         metric_translation_map = load_company_function_metric_map(config.metric_map_path)
     except (OSError, ValueError) as error:
-        # 同上：只记异常类型。**空映射不会走到这里**——它是合法内容，解析成功即返回；这里挡的是文件缺失或格式不对，二者都是部署配置问题，不是"内容还没填"。
         audit.record(
             "permission_refresh.duty_not_registered",
             reason="metric_translation_map_unavailable",
@@ -885,40 +922,8 @@ def _build_permission_refresh_duty(
             "公司+职能→指标名翻译映射配置不可用，每日权限重算职责不注册 error=%s",
             type(error).__name__,
         )
-        return None, None
-
-    publish_store = PostgresPermissionPublishStore(
-        config.postgres_dsn, timeouts=config.postgres_timeouts
-    )
-    duty = PermissionRefreshDuty(
-        baseline_reader=PostgresPermissionRefreshBaselineReader(
-            config.postgres_dsn, timeouts=config.postgres_timeouts
-        ),
-        roster_snapshot=PostgresRosterSnapshotStore(
-            config.postgres_dsn, timeouts=config.postgres_timeouts
-        ),
-        galaxy=PostgresGalaxySnapshotReader(config.postgres_dsn, timeouts=config.postgres_timeouts),
-        decisions=publish_store,
-        # 同一个存储对象喂两个端口：一个只写权限决定，一个只读"发布过没有"。分成两个
-        # 参数是为了让撤权那条判据在类型上说得清楚（见 permission_refresh 的两个协议）。
-        publish_history=publish_store,
-        token_ciphers=PostgresMcpTokenStore(
-            config.postgres_dsn,
-            cipher=McpTokenCipher(config.mcp_token_encrypt_key),
-            timeouts=config.postgres_timeouts,
-        ),
-        role_function_map=role_function_map,
-        metric_translation_map=metric_translation_map,
-        audit=audit,
-        stop=stop,
-        local_overrides=local_override_reader(
-            config.postgres_dsn, timeouts=config.postgres_timeouts
-        ),
-        legacy_all_scope=PostgresLocalPermissionOverrideStore(
-            config.postgres_dsn, timeouts=config.postgres_timeouts
-        ),
-    )
-    return duty, metric_translation_map
+        return None
+    return role_function_map, metric_translation_map
 
 
 #: 端口协议、原因码与报告形状搬到 ``permission_refresh_ports``；旧 import 路径继续可用。
@@ -934,4 +939,13 @@ __all__ = [
     "SKIP_NO_PUBLISHED_ROW",
     "TRIGGER_GRANT",
     "TRIGGER_REVOKE",
+    "PermissionRefreshSources",
+    "_BaselineReader",
+    "_DecisionStore",
+    "_GalaxySnapshotReader",
+    "_LegacyAllScopeExpander",
+    "_LocalOverrideReader",
+    "_PublishHistory",
+    "_RosterSnapshotStore",
+    "_TokenCipherReader",
 ]
