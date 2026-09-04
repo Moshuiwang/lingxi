@@ -89,8 +89,6 @@
 67	src/lingxi/apps/gateway/document_delivery.py::assemble_document_delivery_consumer
 107	src/lingxi/apps/healthcheck/__init__.py::run
 166	src/lingxi/apps/reauthorize/__init__.py::_run
-86	src/lingxi/apps/scheduler/assembly.py::_build_management_correction_callback
-300	src/lingxi/apps/scheduler/assembly.py::build_loop
 69	src/lingxi/apps/scheduler/permission_refresh.py::PermissionRefreshDuty._enqueue_publish
 112	src/lingxi/apps/scheduler/permission_refresh.py::PermissionRefreshDuty._refresh_user
 78	src/lingxi/apps/scheduler/permission_refresh.py::PermissionRefreshDuty._refresh_zero_galaxy_user
