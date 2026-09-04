@@ -6,10 +6,9 @@
 
 from __future__ import annotations
 
+import tomllib
 from collections.abc import Mapping
 from pathlib import Path
-
-import tomllib
 
 from lingxi.core.permission.role_function import build_role_function_map
 
