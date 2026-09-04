@@ -1,41 +1,16 @@
-"""飞书应用身份令牌（``tenant_access_token``）的获取（Issue #226 裁定 3）。
+"""飞书应用身份令牌（``tenant_access_token``）的获取。
 
-产品负责人 2026-08-18 裁定：权限发布表用**应用身份**写入。理由（产品负责人原文）：
-「没有凭据生命周期——不需要他再点授权、不会过期、不需要轮换」。2026-08-18 上午刚为
-专用授权凭据到期紧急处理过一次（部署 scheduler 接管轮换），再增加一条会轮换的凭据是
-代价最高的选项。已知代价（产品负责人已知情）：写入不绑定到某个具体授权人；需要把
-应用加为该 Base 的协作者。
+权限发布表用应用身份写入：没有凭据生命周期，不需要人再点授权、不会过期、
+不需要轮换，代价是写入不绑定到某个具体授权人、需要把应用加为该 Base 协作者。
+与专用授权凭据的区别：这里没有一次性凭据。``tenant_access_token`` 由
+``app_id``/``app_secret`` 换取，这两个值静态、可重复使用，是 scheduler 的
+必需配置，其余 Feishu 适配器早已在用——零新增凭据材料，也不是消费一次就
+换代、丢了要人工重新授权的 ``refresh_token`` 那一类；本模块因此不碰它。
 
-## 与专用授权凭据（#215）的区别：这里**没有一次性凭据**
-
-``tenant_access_token`` 由 ``app_id``/``app_secret`` 换取——这两个值是**静态、可
-重复使用**的应用配置，本来就是 scheduler 的必需配置（``LINGXI_FEISHU_APP_ID`` /
-``LINGXI_FEISHU_APP_SECRET``，见 :class:`~lingxi.apps.scheduler.SchedulerConfig`），
-其余 Feishu 适配器早已在用同一对值。因此：
-
-- **零新增凭据材料**：不新增任何环境变量、不新增任何需要产品负责人操作的授权步骤；
-- **不是一次性凭据**：与 :mod:`lingxi.core.identity.credentials` 的
-  ``refresh_token``（消费一次就换代、丢了要人工重新授权）完全不同类，可以按需
-  重复换取，不需要"唯一消费者"这类频率保护；
-- **本模块因此不碰、也不需要碰** ``refresh_token``——那是另一条完全不同的路
-  （专用授权凭据轮换，见 :mod:`lingxi.core.identity.access_token_supply`）。
-
-## 本模块的边界
-
-只做一件事：POST 一次 ``/auth/v3/tenant_access_token/internal``，解析出令牌与寿命，
-包进 :class:`~lingxi.core.identity.credentials.DerivedAccessToken`。**不缓存、不做
-任何续期节奏判断**——那是 :mod:`lingxi.core.permission.tenant_token_supply` 的事
-（``core/`` 不做网络 I/O，本模块是它唯一的真实调用来源）。
-
-请求路径与响应字段吸收自已受控验证过的 ``scripts/sync_feishu_org_snapshot.py`` 的
-``app_access_token()``，但补上它没做的两件事：解析 ``expire`` 字段（供上层缓存判断
-"这份还能不能用"）与 ``adapters/`` 层统一的传输错误分类（同
-:mod:`lingxi.adapters.feishu_directory` 的 ``urllib_transport`` 姿态）。
-
-**本模块的真实调用不在本次测试范围内**：传输层可注入（见
-``tests/test_feishu_tenant_token.py``），真实链路属 L4a，留给
-`biai-stage` + `Bot-Test`。凭据边界：``app_secret`` 只出现在**请求体**里，不进 URL、
-不进日志、不进异常消息。
+本模块边界：只做一件事——POST 一次换令牌接口，解析令牌与寿命，包进
+:class:`~lingxi.core.identity.credentials.DerivedAccessToken`；不缓存、不做
+续期节奏判断，那是 :mod:`lingxi.core.permission.tenant_token_supply` 的事。
+``app_secret`` 只出现在请求体里，不进 URL、不进日志、不进异常消息。
 """
 
 from __future__ import annotations
