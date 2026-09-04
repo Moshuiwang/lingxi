@@ -1,7 +1,7 @@
 """按同一周期驱动多个定时职责的 :class:`SchedulerLoop`，以及信号安装。
 
-从 :mod:`lingxi.apps.scheduler`（#237 拆分）搬出。逐职责隔离异常、``SIGTERM``/
-``SIGINT`` 只设一次停止标志这两条规则的完整理由见包的 ``__init__.py`` 模块文档。
+逐职责隔离异常、``SIGTERM``/``SIGINT`` 只设一次停止标志这两条规则的完整理由
+见包的 ``__init__.py`` 模块文档。
 """
 
 from __future__ import annotations
@@ -33,6 +33,7 @@ class SchedulerLoop:
         stop: threading.Event | None = None,
         heartbeat: Callable[[], None] | None = None,
     ) -> None:
+        """按注入的职责集合装配一个调度循环；`duties` 不得为空。"""
         if not duties:
             raise ValueError("定时职责进程至少要有一个职责")
         self._duties = tuple(duties)
@@ -42,22 +43,25 @@ class SchedulerLoop:
 
     @property
     def duties(self) -> tuple[Any, ...]:
+        """本循环驱动的全部职责，装配时的顺序原样保留。"""
         return self._duties
 
     @property
     def stop_event(self) -> threading.Event:
+        """本循环使用的停止信号，供调用方与职责共享同一个事件对象。"""
         return self._stop
 
     @property
     def stopping(self) -> bool:
+        """是否已收到停止信号。"""
         return self._stop.is_set()
 
     def request_stop(self) -> None:
+        """置位停止信号：本轮及之后不再有职责领取新工作。"""
         self._stop.set()
 
     def run_once(self) -> tuple[Any, ...]:
         """依次跑一遍每个职责。任何一个职责抛异常都不影响其余职责本轮执行。"""
-
         reports: list[Any] = []
         if self._heartbeat is not None:
             try:
@@ -82,6 +86,7 @@ class SchedulerLoop:
         return tuple(reports)
 
     def run_forever(self) -> None:
+        """按 `interval_seconds` 循环跑 `run_once`，直到停止信号置位。"""
         while not self._stop.is_set():
             self.run_once()
             if self._stop.is_set():
