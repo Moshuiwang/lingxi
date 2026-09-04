@@ -30,6 +30,7 @@ from pathlib import Path
 from typing import Any, TextIO
 
 from lingxi.adapters.postgres_content_capture import PostgresContentCaptureWriter
+from lingxi.apps.worker.service_ports import SessionCleanupSettings, WorkerObservers
 from lingxi.adapters.postgres_conversation import PostgresTaskQueue, PostgresTaskQueueListener
 from lingxi.adapters.postgres_user_memory import PostgresUserMemoryReader
 from lingxi.apps.liveness import touch_liveness
@@ -191,10 +192,7 @@ def main(
         if config.workspace is not None and not _ensure_worker_workspace(
             config.workspace, err=err, trace_id=config.trace_id
         ):
-            message = (
-                f"{ENV_PREFIX}WORKSPACE 不可用：既不存在也无法创建，或存在但不是"
-                "可写目录"
-            )
+            message = f"{ENV_PREFIX}WORKSPACE 不可用：既不存在也无法创建，或存在但不是可写目录"
             _emit(out, config_error_report(trace_id=config.trace_id, message=message))
             return EXIT_CONFIG_ERROR
         _log(
@@ -241,15 +239,20 @@ def main(
             config=config,
             queue=queue,
             listener_factory=lambda: PostgresTaskQueueListener(dsn),
-            heartbeat=_combined_heartbeat(alerting_duty, "worker"),
-            on_task_stuck=alerting_duty.task_stuck_callback(),
-            on_alert_tick=alerting_duty.run_once,
-            on_terminal_outcome=_terminal_outcome_sink(err=err, trace_id=config.trace_id),
-            session_root=session_root,
-            session_cleanup_batch_limit=config.session_cleanup_batch_limit,
-            content_capture_writer=content_capture_writer,
-            on_year_grounding_suspect=_year_grounding_suspect_sink(err=err, trace_id=config.trace_id),
             user_memory_reader=PostgresUserMemoryReader(dsn),
+            observers=WorkerObservers(
+                heartbeat=_combined_heartbeat(alerting_duty, "worker"),
+                on_task_stuck=alerting_duty.task_stuck_callback(),
+                on_alert_tick=alerting_duty.run_once,
+                on_terminal_outcome=_terminal_outcome_sink(err=err, trace_id=config.trace_id),
+                content_capture_writer=content_capture_writer,
+                on_year_grounding_suspect=_year_grounding_suspect_sink(
+                    err=err, trace_id=config.trace_id
+                ),
+            ),
+            session_cleanup=SessionCleanupSettings(
+                root=session_root, batch_limit=config.session_cleanup_batch_limit
+            ),
         )
         try:
             asyncio.run(
@@ -425,7 +428,9 @@ def _terminal_outcome_sink(*, err: TextIO, trace_id: str) -> Callable[[Mapping[s
     return sink
 
 
-def _year_grounding_suspect_sink(*, err: TextIO, trace_id: str) -> Callable[[Mapping[str, Any]], None]:
+def _year_grounding_suspect_sink(
+    *, err: TextIO, trace_id: str
+) -> Callable[[Mapping[str, Any]], None]:
     """年份接地护栏第二层的结构化告警出口（Issue #326，批次 5 卡 E）。
 
     与 :func:`_terminal_outcome_sink` 同一条纪律与同一个理由：``WorkerService``

@@ -86,9 +86,7 @@ _MCP_BAD_GATEWAY_ERROR = re.compile(
 # text` 的长串脱敏规则会先把 32 字符以上的会话 id 盖成 `[REDACTED:N字符]`，固定
 # 前缀不受影响；也不会把其他 session_failed（连接被拒、传输中断等）误判成这一种
 # 可自动恢复的失配。
-_SESSION_RESUME_MISS_PATTERN = re.compile(
-    r"no conversation found with session id", re.IGNORECASE
-)
+_SESSION_RESUME_MISS_PATTERN = re.compile(r"no conversation found with session id", re.IGNORECASE)
 
 
 def _looks_like_session_resume_miss(text: str) -> bool:
@@ -429,11 +427,7 @@ class WorkerTurnExecutor:
             row_count=len(request.rows),
             total_chars=request.total_chars,
         )
-        return {
-            "content": [
-                {"type": "text", "text": "已登记表格请求；若生成失败你会收到通知。"}
-            ]
-        }
+        return {"content": [{"type": "text", "text": "已登记表格请求；若生成失败你会收到通知。"}]}
 
     def _sdk_stderr_sink(self, line: object) -> None:
         """SDK 子进程 stderr 的唯一落点：脱敏、截断、结构化，带 trace_id。
@@ -653,9 +647,15 @@ class WorkerTurnExecutor:
                             stop_event=effective_stop_event,
                             drain_grace_seconds=self._config.drain_grace_seconds,
                             clock=self._clock,
-                            on_business_duration=lambda seconds: business_phase.__setitem__("seconds", seconds),
-                            on_interrupt_requested=lambda: local_interrupt.__setitem__("requested", True),
-                            on_mcp_status=lambda status: self._audit_mcp_status(status, task_id=task_id),
+                            on_business_duration=lambda seconds: business_phase.__setitem__(
+                                "seconds", seconds
+                            ),
+                            on_interrupt_requested=lambda: local_interrupt.__setitem__(
+                                "requested", True
+                            ),
+                            on_mcp_status=lambda status: self._audit_mcp_status(
+                                status, task_id=task_id
+                            ),
                         )
                 except AgentSessionInterrupted as error:
                     failure = _failure("interrupted", error)
@@ -663,14 +663,17 @@ class WorkerTurnExecutor:
                     # 收尾本身超过独立宽限：与业务墙钟超时是不同的失败原因，不得混报
                     # 成 turn_timeout（#143：收尾宽限独立且有界）。
                     failure = _failure_message(
-                        "drain_timeout", "任务已完成业务执行但收尾超过独立宽限，终态或用量可能不完整"
+                        "drain_timeout",
+                        "任务已完成业务执行但收尾超过独立宽限，终态或用量可能不完整",
                     )
                     del error
                 except TimeoutError as error:
                     # 墙钟超时是明确的会话失败：SDK 传输挂住不发终止消息时，
                     # 没有这个分支整个回合会永久等待（Codex 复查发现）。
                     del error
-                    failure = _failure_message("turn_timeout", "任务提前结束：达到墙钟上限，结果可能不完整")
+                    failure = _failure_message(
+                        "turn_timeout", "任务提前结束：达到墙钟上限，结果可能不完整"
+                    )
                 except asyncio.CancelledError:
                     # 默认（一次性 turn 模式 CLI）：BaseException 不接住就没有报告，违反
                     # cli 的 stdout 契约「恰好一个 JSON 对象」；取消也要留下一份可辨认的
@@ -902,7 +905,9 @@ def _sdk_termination_failure(
     """
 
     if recorder.terminal_reason in {"max_turns"} or recorder.result_subtype == "error_max_turns":
-        return _failure_message("max_turns_exceeded", "任务提前结束：达到 Agent 轮数上限，结果可能不完整")
+        return _failure_message(
+            "max_turns_exceeded", "任务提前结束：达到 Agent 轮数上限，结果可能不完整"
+        )
     if recorder.terminal_reason in {"aborted_streaming", "aborted_tools"}:
         if interrupt_requested:
             return _failure_message("interrupted", "任务已按停止请求中断，未继续执行")

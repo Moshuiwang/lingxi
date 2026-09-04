@@ -177,8 +177,10 @@ def _report_document_request(report: Mapping[str, Any]) -> Mapping[str, Any] | N
     paragraphs = request.get("paragraphs")
     if not isinstance(title, str) or not title:
         return None
-    if not isinstance(paragraphs, list) or not paragraphs or not all(
-        isinstance(paragraph, str) for paragraph in paragraphs
+    if (
+        not isinstance(paragraphs, list)
+        or not paragraphs
+        or not all(isinstance(paragraph, str) for paragraph in paragraphs)
     ):
         return None
     markdown = request.get("markdown")
@@ -205,9 +207,13 @@ def _report_sheet_request(report: Mapping[str, Any]) -> Mapping[str, Any] | None
     rows = request.get("rows")
     if not isinstance(title, str) or not title:
         return None
-    if not isinstance(rows, list) or not rows or not all(
-        isinstance(row, list) and row and all(isinstance(cell, str) for cell in row)
-        for row in rows
+    if (
+        not isinstance(rows, list)
+        or not rows
+        or not all(
+            isinstance(row, list) and row and all(isinstance(cell, str) for cell in row)
+            for row in rows
+        )
     ):
         return None
     return {"title": title, "rows": rows}
@@ -478,13 +484,10 @@ def exception_failure_signature(error: BaseException) -> str:
     except (TypeError, UnicodeError):
         return UNKNOWN_FAILURE_SIGNATURE
     signature = (
-        f"{_FAILURE_SIGNATURE_PREFIX}.{family}."
-        f"{digest[:_FAILURE_SIGNATURE_DIGEST_HEX_CHARS]}"
+        f"{_FAILURE_SIGNATURE_PREFIX}.{family}.{digest[:_FAILURE_SIGNATURE_DIGEST_HEX_CHARS]}"
     )
     return (
-        signature
-        if len(signature) <= _MAX_FAILURE_SIGNATURE_CHARS
-        else UNKNOWN_FAILURE_SIGNATURE
+        signature if len(signature) <= _MAX_FAILURE_SIGNATURE_CHARS else UNKNOWN_FAILURE_SIGNATURE
     )
 
 

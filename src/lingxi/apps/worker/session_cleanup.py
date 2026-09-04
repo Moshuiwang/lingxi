@@ -220,9 +220,7 @@ def _resolve_archive_dir(
         archive_dir.mkdir(parents=True, exist_ok=True)
         archive_dir.chmod(_ARCHIVE_DIR_MODE)
     except OSError as error:
-        logger.error(
-            "会话归档目录不可用，本次退回直接物理删除 error=%s", type(error).__name__
-        )
+        logger.error("会话归档目录不可用，本次退回直接物理删除 error=%s", type(error).__name__)
         return None
     return archive_dir
 
@@ -290,9 +288,7 @@ def _prune_archive(archive_dir: Path, *, retention_count: int, retention_days: f
             try:
                 entry.unlink()
             except OSError as error:
-                logger.error(
-                    "会话归档保留上限裁剪失败 error=%s", type(error).__name__
-                )
+                logger.error("会话归档保留上限裁剪失败 error=%s", type(error).__name__)
 
 
 def delete_agent_session_files(

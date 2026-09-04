@@ -336,6 +336,8 @@ REQUIRED_MODULES = (
     "lingxi.apps.worker.service",
     # service.py 拆分（#592 B-1）：端口协议、巡检、终态审计与内容采集。
     "lingxi.apps.worker.content_capture",
+    "lingxi.apps.worker.progress_reporting",
+    "lingxi.apps.worker.task_processing",
     "lingxi.apps.worker.housekeeping",
     "lingxi.apps.worker.service_ports",
     "lingxi.apps.worker.terminal_outcome",
@@ -891,6 +893,8 @@ PROCESS_RUNTIME_IMPORTS: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {
             "lingxi.apps.worker.report",
             "lingxi.apps.worker.turn",
             "lingxi.apps.worker.content_capture",
+            "lingxi.apps.worker.progress_reporting",
+            "lingxi.apps.worker.task_processing",
             "lingxi.apps.worker.housekeeping",
             "lingxi.apps.worker.service",
             "lingxi.apps.worker.service_ports",

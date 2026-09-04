@@ -30,6 +30,7 @@ class ContentCaptureRecorder:
         content_capture_writer: Callable[[ContentCaptureRecord], None] | None,
         on_year_grounding_suspect: YearGroundingSuspectCallback | None,
     ) -> None:
+        """两个出口都可留空：没有装配方就整体跳过，不构造记录、不尝试写库。"""
         self._config = config
         self._content_capture_writer = content_capture_writer
         self._on_year_grounding_suspect = on_year_grounding_suspect
@@ -37,24 +38,16 @@ class ContentCaptureRecorder:
     def capture(
         self, claimed: ClaimedTask, *, executor: WorkerTurnExecutor | None, question: str
     ) -> None:
-        """内测轮内容级采集的写入点（Issue #251/#304 批次 3）。
+        """采集这一轮的内容并顺带跑一次年份接地检测。
 
-        失败必须整体降级为一条结构化审计日志、不得向上抛——采集是旁路观测，
-        不是任务能否完成的一部分（结构约束「采集失败不影响任务主流程」，见
-        docs/技术设计/数据库设计.md 与 apps/worker/config.py 的模块文档）。
+        失败整体降级为一条结构化日志、不得向上抛：采集是旁路观测，不是任务能否完成的
+        一部分。执行器为 ``None``（在构造出它之前就失败，或任务开头就被停止）时没有任何
+        可采集的回合内容；没有装配写入口时同样跳过——两者都不是错误，不记日志。
 
-        ``executor`` 为 ``None``（进入 try 主体前就失败——例如
-        ``UserMcpConfigError`` 从未走到构造 executor 那一步，或任务在开头就
-        因带着 ``stop_requested`` 提前收口）时没有任何可采集的回合内容，直接
-        跳过；``self._content_capture_writer`` 为 ``None``（未装配写入方，见
-        ``apps/worker/cli.py`` 只在开关开启时才构造）同样跳过——两个判断分别
-        兜住"这次没有回合内容"与"这次没有落库出口"，都不是错误，不记日志。
-
-        成功构造出记录后还会调用 :meth:`_check_year_grounding_suspect`（Issue
-        #326 批次 5 卡 E，年份接地护栏第二层检测），复用同一个 ``record`` 里
-        已经解析好的问句与工具调用，不重新解析一遍。
+        年份检测独立于采集写入的异常处理：检测本身的缺陷不能连带影响"记录有没有落库"
+        的判断，也不能与写库失败共用同一条日志、让人分不清是哪一边坏了。写库失败但记录
+        已经构造出来时照常检测——检测只依赖内存里的问句与工具调用。
         """
-
         if executor is None or self._content_capture_writer is None:
             return
         record: ContentCaptureRecord | None = None
@@ -66,33 +59,25 @@ class ContentCaptureRecorder:
             )
             if record is not None:
                 self._content_capture_writer(record)
-        except Exception as error:  # noqa: BLE001 - 采集失败降级为日志，不丢用户结果
+        except Exception as error:
             logger.error(
                 "内测轮内容级采集写入失败，任务结果不受影响 task_id=%s error=%s",
                 claimed.task_id,
                 type(error).__name__,
             )
-        # 年份接地护栏第二层（Issue #326）：独立于上面采集写入的 try/except——
-        # 检测本身的缺陷不能连带影响"记录有没有落库"的判断，也不能与写库失败
-        # 共用同一条日志、分不清是采集坏了还是检测坏了。写库失败但记录已经在
-        # 内存里构造出来时（`record is not None`）仍然照常检测：本护栏只依赖
-        # 内存中的问句与工具调用，不依赖这次落库是否成功。
         if record is not None:
             self._check_year_grounding_suspect(record)
 
     def _check_year_grounding_suspect(self, record: ContentCaptureRecord) -> None:
-        """年份接地护栏第二层：结构性检测 + 告警（Issue #326，批次 5 卡 E）。
+        """年份接地护栏第二层：结构性检测＋告警。
 
-        只做检测与告警，**不拦截、不改答案投递路径**——调用方
-        ``_capture_content_if_enabled`` 已经在全部终态分支收口之后才调用本方法
-        （见该方法末尾的调用点），本方法自身再包一层独立 try/except，双重保证
-        检测代码的任何异常都不可能影响任务终态或已经完成的内容采集写入。
+        只做检测与告警，**不拦截、不改答案投递路径**。调用方已经在全部终态分支收口之后
+        才走到这里，这里再包一层独立的异常处理，双重保证检测代码的任何异常都不可能影响
+        任务终态或已经完成的采集写入。
 
-        判定逻辑（相对时间词表、年份提取、三条件与）全部在 ``core/
-        year_grounding_guard.py``——本方法只负责"取当前年份、调用纯逻辑判定、
-        把结果交给装配层注入的告警出口"这三步组装，不重复任何判定规则。
+        判定规则全部住在纯逻辑层，这里只负责"取当前年份、调用判定、把结果交给装配层注入
+        的告警出口"这三步组装，不重复任何规则。
         """
-
         if self._on_year_grounding_suspect is None:
             return
         try:
@@ -104,7 +89,7 @@ class ContentCaptureRecorder:
             )
             if suspect is not None:
                 self._on_year_grounding_suspect(suspect.to_alert_fields())
-        except Exception as error:  # noqa: BLE001 - 检测是旁路，异常不得影响任务终态
+        except Exception as error:
             logger.error(
                 "年份接地护栏检测异常，任务结果不受影响 task_id=%s error=%s",
                 record.task_id,

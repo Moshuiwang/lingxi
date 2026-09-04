@@ -20,6 +20,7 @@ from lingxi.apps.scheduler import (
     SchedulerLoop,
 )
 from lingxi.apps.worker.config import WorkerConfig
+from lingxi.apps.worker.service_ports import SessionCleanupSettings, WorkerObservers
 from lingxi.apps.worker.service import WorkerService
 from lingxi.config.content import default_content_catalog
 from lingxi.core.alerting import AlertManager, AlertPolicy
@@ -373,13 +374,12 @@ class HeartbeatAndWorkerEntryPointTests(unittest.TestCase):
 
         async def run_once() -> bool:
             return await WorkerService(
-                config=config,
-                queue=queue,
-                heartbeat=lambda: events.append(("heartbeat", 1)),
-                on_task_stuck=lambda kind, count: events.append((kind, count)) or (_ for _ in ()).throw(
+                             config=config,
+                             queue=queue,
+                             observers=WorkerObservers(heartbeat=lambda: events.append(("heartbeat", 1)), on_task_stuck=lambda kind, count: events.append((kind, count)) or (_ for _ in ()).throw(
                     RuntimeError("alert observer")
-                ),
-            ).process_once()
+                )),
+                         ).process_once()
 
         self.assertTrue(asyncio.run(run_once()))
         self.assertEqual(queue.calls, ["unavailable", "queued", "stale", "claim"])
