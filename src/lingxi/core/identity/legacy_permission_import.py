@@ -2,7 +2,7 @@
 
 两个函数都只编排注入进来的协作者，不做 I/O；``AutoOnboardingRunner`` 的同名私有
 方法只是委派。口径见 ``core/permission/legacy_diff.py`` 模块文档，产品裁定见
-``docs/决策记录/2026-09-02-存量用户首开差集导入与发布只在变化时回写.md``。
+决策记录《存量用户首开差集导入与发布只在变化时回写》（见 ``docs/决策记录/README.md`` 索引）。
 """
 
 from __future__ import annotations

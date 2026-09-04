@@ -21,8 +21,8 @@ class _LogOnlyAlertSender:
     """未配置管理群时的告警出口：只记结构化日志，不发起网络请求。
 
     与 ``apps/gateway/__init__.py``、``apps/worker/cli.py`` 的同名类同一姿态——
-    没有配置目标群不等于告警关闭（Issue #153：合同要求"告警不可用时主流程行为
-    有明确定义"，这里的定义是"状态机照常运行，只是暂时没有群通知"）。
+    没有配置目标群不等于告警关闭（合同要求"告警不可用时主流程行为有明确定义"，
+    这里的定义是"状态机照常运行，只是暂时没有群通知"）。
     """
 
     def send_text(self, *, chat_id: str, text: str, dedupe_key: str) -> None:

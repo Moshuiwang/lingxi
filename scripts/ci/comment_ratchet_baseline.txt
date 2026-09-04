@@ -7,7 +7,3 @@
 # --refresh 自动登记进来：先清理；确有理由要接受它作为新的棘轮登记对象，
 # 人工在下面加一行，门禁会核对这一行是否等于实际计数。
 
-1	provenance	src/lingxi/apps/scheduler/alerting_assembly.py
-1	provenance	src/lingxi/core/identity/legacy_permission_import.py
-1	provenance	src/lingxi/core/identity/roster_snapshot.py
-1	provenance	src/lingxi/core/identity/stock_token_source.py
