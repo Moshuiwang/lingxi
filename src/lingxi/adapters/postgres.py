@@ -172,8 +172,8 @@ class _IdleConnectionPool:
                 connection, released_at = stack.pop()
                 connection._lingxi_idle = False
             if connection.closed:
-                # 已经物理关闭的连接不能只是跳过：底层 PGconn 必须显式释放，
-                # 否则要等 GC 才收。
+                # 已经物理关闭的连接不能只是跳过：显式 discard() 把释放交给驱动，
+                # 不依赖引用计数的回收时机（驱动对已关闭连接会直接返回）。
                 connection.discard()
                 continue
             suspicious = (
