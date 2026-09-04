@@ -61,7 +61,9 @@ SUPPLY_FAILURE_REASONS = frozenset(
 class AuditSink(Protocol):
     """审计出口。与 ``core/alerting.py``、``apps/scheduler`` 的同名 Protocol 结构一致。"""
 
-    def record(self, action: str, /, **fields: object) -> None: ...
+    def record(self, action: str, /, **fields: object) -> None:
+        """记一条审计事件。"""
+        ...
 
 
 class AccessTokenUnavailableError(RuntimeError):
@@ -72,6 +74,7 @@ class AccessTokenUnavailableError(RuntimeError):
     """
 
     def __init__(self, reason: str) -> None:
+        """用固定词表里的失败分类构造；分类不在表里时拒绝构造。"""
         if reason not in SUPPLY_FAILURE_REASONS:
             raise ValueError("短期令牌供给的失败分类必须取自固定词表（不回显收到的值）")
         super().__init__(reason)
@@ -99,6 +102,7 @@ class DerivedAccessTokenHolder:
     __slots__ = ("_token", "_expires_at", "_safety_margin", "_lock")
 
     def __init__(self, *, safety_margin: timedelta = DEFAULT_ACCESS_TOKEN_SAFETY_MARGIN) -> None:
+        """新建一个空持有者；`safety_margin` 必须是非负时间长度。"""
         if not isinstance(safety_margin, timedelta) or safety_margin < timedelta(0):
             raise ValueError("短期令牌的安全余量必须是非负的时间长度")
         self._token: SecretToken | None = None
@@ -108,12 +112,12 @@ class DerivedAccessTokenHolder:
 
     @property
     def safety_margin(self) -> timedelta:
+        """构造时确定的安全余量。"""
         return self._safety_margin
 
     @property
     def has_token(self) -> bool:
         """是否持有令牌。**只回答有无，不回答值**，也不判断新鲜与否。"""
-
         with self._lock:
             return self._token is not None
 
@@ -128,7 +132,6 @@ class DerivedAccessTokenHolder:
         两行赋值在锁内完成：``_token``/``_expires_at`` 必须同时对读者可见，不能
         出现半更新组合。
         """
-
         moment = _require_utc(now, "now")
         if not isinstance(derived, DerivedAccessToken):
             raise TypeError("只接受 DerivedAccessToken，避免明文令牌以裸字符串流转")
@@ -148,7 +151,6 @@ class DerivedAccessTokenHolder:
         临期按安全余量提前判死，不是等到过期那一刻。两个字段在同一把锁内成对
         读出（与 :meth:`store` 共用同一把锁），不会读到跨调用拼出来的半更新组合。
         """
-
         moment = _require_utc(now, "now")
         with self._lock:
             token = self._token
@@ -160,11 +162,13 @@ class DerivedAccessTokenHolder:
         return token
 
     def clear(self) -> None:
+        """丢弃当前持有的令牌（若有）。"""
         with self._lock:
             self._token = None
             self._expires_at = None
 
     def __repr__(self) -> str:  # pragma: no cover - 由 HolderTest 的形状断言覆盖
+        """只报告有无令牌，不泄露令牌值。"""
         with self._lock:
             has_token = self._token is not None
         return f"DerivedAccessTokenHolder(has_token={has_token})"
@@ -189,6 +193,7 @@ class RosterAccessTokenProvider:
         audit: AuditSink | None = None,
         clock: Callable[[], datetime] | None = None,
     ) -> None:
+        """接线持有者、受控续期回调、审计出口与可选的时钟替身（测试用）。"""
         if not callable(refresh):
             raise ValueError("refresh 必须是执行一次受控续期的可调用对象")
         self._holder = holder
@@ -203,6 +208,7 @@ class RosterAccessTokenProvider:
         self._audit_lock = threading.Lock()
 
     def __call__(self) -> str:
+        """取一份可用的短期令牌；拿不到时抛 :class:`AccessTokenUnavailableError`。"""
         now = _require_utc(self._clock(), "now")
         token = self._holder.fresh(now=now)
         if token is not None:
@@ -244,7 +250,6 @@ class RosterAccessTokenProvider:
         ``_audited_on`` 更旧的日期到达，只在 ``today`` 严格晚于当前值时才前进/
         重置，避免把日期"倒退"回前一天、重置掉当天已积累的去重集合。
         """
-
         today = now.date()
         with self._audit_lock:
             if self._audited_on is None or today > self._audited_on:

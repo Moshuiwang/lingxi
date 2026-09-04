@@ -1,5 +1,4 @@
-"""预开通：名单里的人在与 BI Plus 任何一次对话之前就完成定位、建档、令牌、权限发布，
-第一次发消息时没有开通等待。
+"""预开通：名单里的人在第一次对话之前就完成开通，首聊没有等待。
 
 只放预开通独有的东西，其余共用 ``AutoOnboardingRunner._run``（邮箱闸/零银河兜底/
 发布闸各只有一份实现，另开链会让防线各出现第二份）。三处差异：系统触发没有
@@ -43,7 +42,6 @@ ORIGIN_FIRST_CHAT = "first_chat"
 
 def system_event_id(trace_id: str) -> str:
     """系统触发这一次的合成事件标识。见 :data:`SYSTEM_EVENT_PREFIX`。"""
-
     return f"{SYSTEM_EVENT_PREFIX}{trace_id}"
 
 
@@ -54,13 +52,11 @@ def is_system_trigger(event_id: str) -> bool:
     ``start`` → 执行线程 → ``_execute`` → ``_notify`` 的每一层，用它判定不需要在这条
     链的四个方法上各加一个参数，也就不存在"某一层忘了往下传"的漏接面。
     """
-
     return str(event_id or "").startswith(SYSTEM_EVENT_PREFIX)
 
 
 def origin_of(event_id: str) -> str:
     """审计用的来源标识。"""
-
     return ORIGIN_PREPROVISION if is_system_trigger(event_id) else ORIGIN_FIRST_CHAT
 
 
@@ -100,7 +96,6 @@ def deliver_silently(*, key: str, open_id: str, users: _NoticeArmer) -> bool:
     ``UserStateStore.mark_preprovision_notice_pending`` 再判一次"此前从没说过话"，
     同一份名单重跑不会重新挂起（幂等）。
     """
-
     if key != KEY_COMPLETED:
         return True
     users.mark_preprovision_notice_pending(open_id=open_id)
@@ -134,6 +129,7 @@ class PreprovisionTarget:
 
     @property
     def open_id(self) -> str:
+        """定位到的组织快照成员的 open_id。"""
         return self.member.open_id
 
 
@@ -153,7 +149,6 @@ class PreprovisionSkip:
         需要半夜叫人的事）。``messages`` 恒为空：预开通失败**没有任何用户可见出口**，
         逐人原因只报告给产品负责人（脚本清单）。
         """
-
         return OnboardingResult(state=OnboardingState.NOT_AUTHORIZED, failure_reason=self.reason)
 
 
@@ -165,7 +160,9 @@ class DirectoryByUserId(Protocol):
     组织快照适配器此前只有按 ``open_id`` 查这一条 SQL；预开通是唯一需要反向走的路径。
     """
 
-    def lookup_by_user_id(self, user_id: str) -> Any: ...
+    def lookup_by_user_id(self, user_id: str) -> Any:
+        """按 ``user_id`` 回读组织快照候选成员。"""
+        ...
 
 
 def locate_by_email(
@@ -183,7 +180,6 @@ def locate_by_email(
     不需要新查询）；邮箱按 ``account_match.normalize_email`` 的同一口径归一，避免
     "名单里大写、花名册里小写"这种纯格式差异被当成查无此人。
     """
-
     needle = normalize_email(email)
     if not needle:
         return PreprovisionSkip(email=email, reason=SKIP_EMAIL_BLANK)
@@ -230,7 +226,6 @@ def plan_preprovision(
     （``scripts/ops`` 的预开通入口）逐人 ``try/except`` 调用
     ``AutoOnboardingRunner.start_system``。
     """
-
     targets: list[PreprovisionTarget] = []
     skips: list[PreprovisionSkip] = []
     seen: set[str] = set()
@@ -289,7 +284,9 @@ class PositionGrantImporter(Protocol):
         grant: Any,
         now: datetime,
         initiated_by_open_id: str,
-    ) -> Any: ...
+    ) -> Any:
+        """把这一笔预授权原子落库。"""
+        ...
 
 
 def import_preprovision_grant(
@@ -308,7 +305,6 @@ def import_preprovision_grant(
     名单答应给他的那部分权限**——他能问数，只是问不出该问的东西，而当天没有任何东西
     会报警。宁可响亮失败。
     """
-
     if importer is None:
         raise OnboardingChainError("preprovision_grant_importer_not_wired")
     report = importer.import_position_grant(
@@ -372,7 +368,6 @@ def run_system_onboarding(
     花名册读不出来（``rows()`` 返回 ``None``）时同样跳过而不是当成"查无此人"：那是
     我们暂时看不见，不是这个邮箱不存在，两者的下一步动作完全不同。
     """
-
     if origin != ORIGIN_PREPROVISION:
         raise ValueError("系统触发目前只有预开通这一个来源")
     if not str(initiated_by_open_id or "").strip():

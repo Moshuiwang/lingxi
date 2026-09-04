@@ -81,7 +81,6 @@ def role_ids_for_user(user_id: str, user_role_rows: Iterable[Mapping[str, Any]])
     只读 `user_id` 列。`source_user_name` 存在于行里也不参与判定——列名误导是
     这张表最危险的地方。
     """
-
     key = _required_text(user_id)
     if not key:
         return ()
@@ -96,7 +95,6 @@ def menu_entries_for_roles(
     role_ids: Iterable[str], role_menu_rows: Iterable[Mapping[str, Any]]
 ) -> tuple[MenuEntry, ...]:
     """按 `role_id` 取菜单授权项，按 `menu_id` 去重（同名不同 id 各算一项）。"""
-
     wanted = {_required_text(role_id) for role_id in role_ids if _required_text(role_id)}
     entries: dict[str, MenuEntry] = {}
     for row in role_menu_rows:
@@ -113,7 +111,6 @@ def menu_ids_for_roles(
     role_ids: Iterable[str], role_menu_rows: Iterable[Mapping[str, Any]]
 ) -> tuple[str, ...]:
     """菜单权限的唯一判定键集合。"""
-
     return tuple(entry.menu_id for entry in menu_entries_for_roles(role_ids, role_menu_rows))
 
 
@@ -124,7 +121,6 @@ def role_names_for_user(
 
     角色名只用于职能标签映射（见 `role_function`），不用于连接，也不能反推公司范围。
     """
-
     key = _required_text(user_id)
     if not key:
         return ()
@@ -139,7 +135,6 @@ def country_keys_for_user(
     user_id: str, datacountry_rows: Iterable[Mapping[str, Any]]
 ) -> tuple[str, ...]:
     """按 `user_id` 取该账号被授权的国家键（源列 `USER_ID` / `DATACOUNTRY_ID`）。"""
-
     key = _required_text(user_id)
     if not key:
         return ()
@@ -158,7 +153,6 @@ def _index_countries(
     它们同样携带 `boss_company_id`：`全非` 展开时若静默丢弃，会让持有通配的
     账号系统性少拿这部分公司的权限。
     """
-
     by_country_key: dict[str, CountryScope] = {}
     unkeyed: list[CountryScope] = []
     for row in country_rows:
@@ -182,7 +176,6 @@ def _validate_sentinel(country_rows: Iterable[Mapping[str, Any]]) -> bool:
     授权表里出现 0 但哨兵行缺失或损坏，说明快照不可信，必须失败关闭（把 0 记为
     unresolved），绝不失败开放为全公司。
     """
-
     sentinel_rows = [
         row for row in country_rows if _text(row.get("country_key")) == SENTINEL_COUNTRY_KEY
     ]
@@ -232,7 +225,6 @@ def resolve_company_scope(
     连接键是 `country_key`，不是主键 `id`；通配（`全非`）只有在哨兵行本身验证
     通过时才展开，见 :func:`_validate_sentinel`。
     """
-
     country_rows = list(country_rows)
     by_country_key, unkeyed = _index_countries(country_rows)
     explicit = _unique(_required_text(key) for key in country_keys)

@@ -33,6 +33,8 @@ class MatchAdvisory:
 
 @dataclass(frozen=True)
 class AccountMatch:
+    """一次匹配的完整结果：状态、原因、命中的银河账号与匹配所用的键。"""
+
     state: str
     reason: str
     galaxy_user_id: str | None
@@ -50,7 +52,6 @@ def _text(value: Any) -> str:
 
 def normalize_email(value: Any) -> str:
     """邮箱比较前的归一：去首尾空白、转小写。"""
-
     return _text(value).lower()
 
 
@@ -88,7 +89,6 @@ def _locate_roster_row(
     返回 ``AccountMatch`` 表示已经是最终结果；返回三元组
     ``(roster_name, employee_no, email)`` 表示定位成功，交给调用方继续按键匹配。
     """
-
     candidates = [row for row in roster_rows if _text(row.get("personnel_id")) == person_key]
     if not candidates:
         return _outcome(NOT_FOUND, "roster_not_found")
@@ -110,7 +110,6 @@ def _match_by_employee_no(
     roster_name: str,
 ) -> AccountMatch | None:
     """按工号判定；返回 ``None`` 表示工号未命中且有邮箱可回退，交给邮箱匹配继续。"""
-
     if len(employee_no_hits) == 1:
         hit = employee_no_hits[0]
         if email and email_hits and hit not in email_hits:
@@ -169,7 +168,6 @@ def _match_by_email(
     roster_name: str,
 ) -> AccountMatch:
     """工号缺失或未命中时的邮箱回退判定，兼作两者都失败时的最终收口。"""
-
     if email and len(email_hits) == 1:
         hit = email_hits[0]
         galaxy_user_id = _text(hit.get("user_id"))
@@ -211,7 +209,6 @@ def match_galaxy_account(
     `roster_rows` 与 `galaxy_user_rows` 都不做预去重：花名册实测存在同一人员 ID 的
     重复行；产品规则要求原始记录必须唯一，因此任何多行都按无可用权限结束。
     """
-
     person_key = _text(feishu_user_id)
     if not person_key:
         raise ValueError("飞书 user_id 不能为空")

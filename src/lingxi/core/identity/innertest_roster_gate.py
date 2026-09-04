@@ -43,6 +43,7 @@ class InnerTestRosterConfigError(ValueError):
     """
 
     def __init__(self, *, invalid_count: int) -> None:
+        """记下不合法条目数量；不接收也不回显原始条目内容。"""
         self.invalid_count = invalid_count
         super().__init__(
             f"内测名单包含 {invalid_count} 条无法识别的条目（必须是 "
@@ -66,7 +67,6 @@ def parse_innertest_roster(raw: str | None) -> frozenset[str]:
     - 全部合法：返回去重后的 open_id 集合（``frozenset``：天然去重，且类型上
       不能被误当成有序列表意外依赖顺序）。
     """
-
     if raw is None:
         return frozenset()
     tokens = [piece.strip() for piece in raw.replace("\n", ",").split(",")]
@@ -86,7 +86,6 @@ def is_open_id_innertest_allowed(open_id: object, roster: frozenset[str]) -> boo
     「比对语义」）。``roster`` 为空集合时对任何输入都返回 ``False``——这就是
     「默认关闭＝全拒」的全部实现，没有单独的开关分支需要另外测试。
     """
-
     if not isinstance(open_id, str):
         return False
     needle = open_id.strip()
@@ -102,5 +101,4 @@ def build_innertest_roster_gate(roster: frozenset[str]) -> Callable[[str], bool]
     一份具体的名单集合。判据、为什么匹配键是 open_id、为什么空集合＝全拒，全部写在
     本模块的文档字符串里，本函数不重复。
     """
-
     return lambda open_id: is_open_id_innertest_allowed(open_id, roster)

@@ -53,6 +53,8 @@ class ColumnSpec:
 
 @dataclass(frozen=True)
 class TableSpec:
+    """一张目标表的列定义与主键。"""
+
     name: str
     columns: tuple[ColumnSpec, ...]
     primary_key: tuple[str, ...]
@@ -138,6 +140,8 @@ class Issue:
 
 @dataclass(frozen=True)
 class ValidationReport:
+    """一次完整校验的结果：是否可写入、全部错误告警，以及规范化后的行。"""
+
     ok: bool
     errors: tuple[Issue, ...]
     warnings: tuple[Issue, ...]
@@ -147,7 +151,6 @@ class ValidationReport:
 
 def normalize_column_name(name: str) -> str:
     """源列名归一：去 BOM、去首尾空白、转小写。"""
-
     return name.replace("﻿", "").strip().lower()
 
 
@@ -268,7 +271,6 @@ def _normalize_table(
 
 def _payload(row) -> dict:
     """比较与落库都不含内部行号字段。"""
-
     return {key: value for key, value in dict(row).items() if key != SOURCE_ROW_KEY}
 
 
@@ -443,7 +445,6 @@ def _check_table_presence(
     raw_tables: Mapping[str, Sequence[Mapping[str, Any]]],
 ) -> tuple[list[str], list[Issue], list[Issue]]:
     """返回缺失表名列表，以及缺表/多余表两类校验结论。"""
-
     missing = [name for name in SOURCE_TABLES if name not in raw_tables]
     errors = [Issue(name, "missing_table", "导出缺少该表") for name in missing]
     unknown = [name for name in raw_tables if name not in TABLE_SPECS]
@@ -496,7 +497,6 @@ def validate_export(raw_tables: Mapping[str, Sequence[Mapping[str, Any]]]) -> Va
 
     `ok` 为假时调用方必须整批放弃，不得写入任何一行。
     """
-
     missing, errors, warnings = _check_table_presence(raw_tables)
     if missing:
         return ValidationReport(False, tuple(errors), tuple(warnings), {}, {})
