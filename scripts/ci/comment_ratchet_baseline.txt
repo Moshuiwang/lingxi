@@ -231,7 +231,6 @@
 1	hash_block_over	src/lingxi/core/identity/innertest_roster_gate.py
 1	hash_block_over	src/lingxi/core/identity/legacy_permission_import.py
 13	hash_block_over	src/lingxi/core/identity/onboarding_runner.py
-1	hash_block_over	src/lingxi/core/identity/onboarding_terminal.py
 1	hash_block_over	src/lingxi/core/identity/roster_audit.py
 1	hash_block_over	src/lingxi/core/identity/roster_snapshot.py
 1	hash_block_over	src/lingxi/core/mcp_naming.py
@@ -373,15 +372,11 @@
 15	provenance	src/lingxi/core/identity/access_token_supply.py
 6	provenance	src/lingxi/core/identity/credentials.py
 4	provenance	src/lingxi/core/identity/first_contact.py
-1	provenance	src/lingxi/core/identity/identifiers.py
 7	provenance	src/lingxi/core/identity/innertest_roster_gate.py
 6	provenance	src/lingxi/core/identity/legacy_permission_import.py
-2	provenance	src/lingxi/core/identity/onboarding.py
 4	provenance	src/lingxi/core/identity/onboarding_guards.py
 11	provenance	src/lingxi/core/identity/onboarding_ports.py
 64	provenance	src/lingxi/core/identity/onboarding_runner.py
-2	provenance	src/lingxi/core/identity/onboarding_support.py
-8	provenance	src/lingxi/core/identity/onboarding_terminal.py
 5	provenance	src/lingxi/core/identity/org_snapshot.py
 7	provenance	src/lingxi/core/identity/preprovision.py
 9	provenance	src/lingxi/core/identity/provisioning.py
