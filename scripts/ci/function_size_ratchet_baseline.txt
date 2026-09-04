@@ -78,7 +78,6 @@
 226	src/lingxi/apps/gateway/__init__.py::main
 205	src/lingxi/apps/gateway/__init__.py::make_event_handler
 121	src/lingxi/apps/gateway/__init__.py::make_event_handler.handle
-69	src/lingxi/apps/gateway/config.py::load_config
 79	src/lingxi/apps/gateway/delivery.py::DeliveryConsumer._handle_terminal
 69	src/lingxi/apps/gateway/delivery.py::DeliveryConsumer._notify_stale_queued
 84	src/lingxi/apps/gateway/document_delivery.py::DocumentDeliveryConsumer._create_docx_body

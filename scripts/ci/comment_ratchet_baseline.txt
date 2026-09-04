@@ -63,7 +63,6 @@
 3	docstring_over	src/lingxi/adapters/user_mcp_config.py
 1	docstring_over	src/lingxi/apps/admin_bootstrap/__init__.py
 10	docstring_over	src/lingxi/apps/gateway/__init__.py
-3	docstring_over	src/lingxi/apps/gateway/config.py
 6	docstring_over	src/lingxi/apps/gateway/delivery.py
 6	docstring_over	src/lingxi/apps/gateway/document_delivery.py
 4	docstring_over	src/lingxi/apps/healthcheck/__init__.py
@@ -178,7 +177,6 @@
 2	hash_block_over	src/lingxi/adapters/user_mcp_config.py
 1	hash_block_over	src/lingxi/apps/admin_bootstrap/__init__.py
 11	hash_block_over	src/lingxi/apps/gateway/__init__.py
-8	hash_block_over	src/lingxi/apps/gateway/config.py
 5	hash_block_over	src/lingxi/apps/gateway/delivery.py
 5	hash_block_over	src/lingxi/apps/gateway/document_delivery.py
 5	hash_block_over	src/lingxi/apps/healthcheck/__init__.py
@@ -301,7 +299,6 @@
 1	provenance	src/lingxi/apps/__init__.py
 6	provenance	src/lingxi/apps/admin_bootstrap/__init__.py
 71	provenance	src/lingxi/apps/gateway/__init__.py
-25	provenance	src/lingxi/apps/gateway/config.py
 45	provenance	src/lingxi/apps/gateway/delivery.py
 44	provenance	src/lingxi/apps/gateway/document_delivery.py
 14	provenance	src/lingxi/apps/healthcheck/__init__.py
