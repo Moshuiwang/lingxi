@@ -86,7 +86,6 @@ def classify_handshake_failure(failure: HandshakeFailure) -> FailureKind:
     抖动直接停掉进程。代价是凭据真错时会一直重试——由审计里的连续失败暴露，不由
     这里替产品负责人做判断。
     """
-
     if failure.status_code == FORBIDDEN:
         return FailureKind.TERMINAL
     if failure.status_code == AUTH_FAILED and failure.auth_errcode == EXCEED_CONN_LIMIT:
@@ -117,7 +116,6 @@ class BackoffPolicy:
 
     def delay_for(self, attempt: int) -> float:
         """第 ``attempt`` 次重连（从 0 起）之前要等多久。"""
-
         if attempt < 0:
             raise ValueError("重连次数不能为负")
         return min(self.base_seconds * (self.factor**attempt), self.ceiling_seconds)
@@ -174,7 +172,6 @@ class LongConnectionSupervisor:
 
     def run(self, *, should_stop: Callable[[], bool]) -> TerminationReason:
         """跑到收到停机信号或遇到终止型错误为止。"""
-
         attempt = 0
         while not should_stop():
             self._emit_heartbeat()
@@ -265,7 +262,6 @@ class LongConnectionSupervisor:
         #96」）。处理器抛异常时 ``response`` 保持 ``None``——失败没有应答可言，
         ``error`` 本身已经足够让传输层向飞书回失败。
         """
-
         error: BaseException | None = None
         response: dict | None = None
         try:
@@ -365,7 +361,6 @@ def translate_sdk_exception(error: BaseException) -> HandshakeFailure:
     两个 514 分支的区分是这段翻译存在的主要理由：SDK 把"超连接数上限"与"其他鉴权
     失败"用异常类型区分开了，而 autherrcode 本身没有出现在异常对象上。
     """
-
     from lark_oapi.ws.exception import ClientException, ServerException
 
     code = getattr(error, "code", None)
@@ -443,9 +438,9 @@ class LarkEventTransport:
     def report(
         self, payload: dict, error: BaseException | None, response: dict | None = None
     ) -> None:
-        """supervisor 处理完一条事件后回填结果（成功时含处理器的返回值，例如卡片
-        回调应答，Issue #96），唤醒还在等 ack 的 SDK 线程。"""
-
+        """Supervisor 处理完一条事件后回填结果（成功时含处理器的返回值，例如卡片
+        回调应答，Issue #96），唤醒还在等 ack 的 SDK 线程。
+        """
         pending = self._pending.pop(id(payload), None)
         if pending is not None:
             pending.complete(error, response)
@@ -458,7 +453,6 @@ class LarkEventTransport:
         不会被看见——supervisor 只在收到一条事件之后才检查停机信号，于是进程一直
         挂到编排层 SIGKILL。空闲时让出控制权之后，这两件事才有机会发生。
         """
-
         import asyncio
         import queue as queue_module
 
@@ -585,7 +579,6 @@ def _connection_liveness(client: object, connected_once: bool) -> tuple[bool, bo
     ``connected_once`` 永远为假，于是本函数永远报「没掉线」——退回到没有断线检测的
     行为（与本次修复前一致），而不是反过来误报掉线、把进程带进重连风暴。
     """
-
     conn = getattr(client, "_conn", None)
     if conn is not None:
         return True, False
@@ -598,7 +591,6 @@ def _real_sleep(seconds: float, should_stop: Callable[[], bool]) -> None:
     一次性 ``time.sleep(60)`` 会把停机拖到退避结束——验收实测 SIGTERM 之后 45 秒
     进程仍未退出，而配置的停机超时是 20 秒。
     """
-
     import time
 
     deadline = time.monotonic() + seconds

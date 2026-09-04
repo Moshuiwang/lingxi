@@ -43,9 +43,10 @@
 from __future__ import annotations
 
 import re
-import tomllib
 from collections.abc import Mapping
 from pathlib import Path
+
+import tomllib
 
 #: 与 ``core/admin/commands.py`` 的 ``_METRIC_TOKEN_PATTERN`` 逐字同一形状——
 #: 不 import 那个模块的私有常量（本仓库既有的"结构相同、不共享导入"惯例，见
@@ -56,7 +57,6 @@ _METRIC_VALUE_PATTERN = re.compile(r"^[A-Za-z0-9_.@:一-鿿-]{1,128}$")
 
 def default_admin_metric_alias_map_path() -> Path:
     """随包发布的配置文件路径。"""
-
     return Path(__file__).resolve().parents[1] / "config" / "admin_metric_alias_map.toml"
 
 
@@ -74,7 +74,6 @@ def load_admin_metric_alias_map(path: Path | None = None) -> Mapping[str, str]:
     这个右值不会再经过任何下游校验（见模块文档同一段），加载器自己是它唯一
     的把关点。
     """
-
     config_path = path or default_admin_metric_alias_map_path()
     try:
         with config_path.open("rb") as config_file:

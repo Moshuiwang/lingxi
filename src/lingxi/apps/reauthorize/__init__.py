@@ -84,7 +84,6 @@ def _lock_path(path: Path) -> Path:
 
 def validate_reauthorization_paths(state_path: str, credential_path: str) -> tuple[Path, Path]:
     """启动前拒绝 state 文件及其锁与凭据文件及其锁的任何重叠。"""
-
     state = _normalized_path(state_path, "重授权 state 文件路径")
     credential = _normalized_path(credential_path, "专用授权凭据文件路径")
     state_paths = {state, _lock_path(state)}
@@ -100,7 +99,6 @@ def parse_arguments(argv: Sequence[str] = ()) -> argparse.Namespace:
     刻意不回落到 ``sys.argv``：``main`` 也能被程序内调用，让它去读宿主进程的
     命令行会把别人的参数解释成一次首次建立。命令行由 ``__main__`` 显式传入。
     """
-
     parser = argparse.ArgumentParser(
         prog="python -m lingxi.apps.reauthorize",
         description="专用授权的一次性受控入口：默认为已登记主体续期；显式确认后可首次建立主体。",
@@ -125,7 +123,6 @@ def resolve_mode(args: argparse.Namespace, env: Mapping[str, str]) -> tuple[str,
     只给主体不给确认、只给确认不给主体，都是"疑似误触"而不是"能猜出意图"，
     因此不猜、不半做，直接失败并说明本次没有任何修改。
     """
-
     subject = (args.bootstrap_subject or "").strip()
     confirmed = bool(args.confirm_bootstrap)
     if not subject and not confirmed:
@@ -149,7 +146,6 @@ def resolve_mode(args: argparse.Namespace, env: Mapping[str, str]) -> tuple[str,
 
 def _runtime_actor() -> str:
     """运行时身份：审计要回答"谁"。取不到时如实写未知，不编造。"""
-
     try:
         return getpass.getuser()
     except Exception:  # 容器里没有 passwd 条目时不能因此中断审计
@@ -203,7 +199,6 @@ def _write_audit(
 
     返回是否确实落地。失败绝不吞掉——调用方据此中止或按不可恢复上报。
     """
-
     moment = (now or datetime.now(UTC)).astimezone(UTC)
     before = handler.written
     try:
@@ -286,7 +281,6 @@ def handle_bridge_message(
     message: OAuthBridgeMessage,
 ) -> ReauthorizationResult:
     """把 Bridge 消息接到 E1 正式回调；传输层不参与建档或凭据判断。"""
-
     if message.type == "oauth_code":
         result = entry.handle_callback(message.state, code=message.code)
     elif message.type == "oauth_cancelled":
@@ -310,7 +304,6 @@ def main(
     审计 handler 只在本次运行、且命令行确实带了首次建立参数时挂上，结束即摘掉，
     不给宿主进程留下长期副作用。
     """
-
     errors = sys.stderr if stderr is None else stderr
     arguments = parse_arguments(argv)
     handler = BootstrapAuditHandler(errors if audit_stream is None else audit_stream)

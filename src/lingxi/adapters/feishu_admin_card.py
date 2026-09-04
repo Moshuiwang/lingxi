@@ -92,7 +92,6 @@ class LarkAdminCardTransport:
         发起管理员本人与机器人的私聊里（合同"卡片只发送到……本人飞书账号，不能
         改发他人"由"回复同一条私聊消息"这个机制天然保证，不依赖额外的收件人校验）。
         """
-
         from lark_oapi.api.cardkit.v1 import CreateCardRequest, CreateCardRequestBody
         from lark_oapi.api.im.v1 import ReplyMessageRequest, ReplyMessageRequestBody
 
@@ -170,7 +169,6 @@ class LarkAdminCardTransport:
         ``PostgresPendingActionStore.next_card_sequence()`` 换取本次要用的号。
         真实网络往返仍未验证，留给 `biai-stage` L4a。
         """
-
         from lark_oapi.api.cardkit.v1 import Card, UpdateCardRequest, UpdateCardRequestBody
 
         request = (
@@ -251,7 +249,6 @@ class TomlCompanyMetricCatalog:
 
     def positions(self) -> Sequence[str]:
         """返回可选择的银河职位名；必须是映射文件中的精确 key。"""
-
         from lingxi.adapters.role_function_map_file import load_role_function_map
 
         try:
@@ -304,8 +301,8 @@ class LarkAdminManagementCardTransport:
     ) -> ManagementCardCreated:
         """建卡并作为消息发出，回复触发 ``/admin user`` 命令的那条消息——与
         :meth:`LarkAdminCardTransport.create` 同一机制，卡片因此结构上只会出现在
-        发起管理员本人与机器人的私聊里。"""
-
+        发起管理员本人与机器人的私聊里。
+        """
         from lark_oapi.api.cardkit.v1 import CreateCardRequest, CreateCardRequestBody
         from lark_oapi.api.im.v1 import ReplyMessageRequest, ReplyMessageRequestBody
 
@@ -366,7 +363,6 @@ class LarkAdminManagementCardTransport:
 
     def update(self, *, card_id: str, sequence: int, card: dict[str, Any]) -> None:
         """原地替换管理卡；``sequence`` 由持久上下文存储原子递增。"""
-
         from lark_oapi.api.cardkit.v1 import Card, UpdateCardRequest, UpdateCardRequestBody
 
         request = (

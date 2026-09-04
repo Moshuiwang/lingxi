@@ -72,7 +72,6 @@ def validate_user_open_id(value: str, *, label: str = "用户 open_id") -> str:
     群 ``chat_id`` 以 ``oc_`` 开头，用户 ``open_id`` 以 ``ou_`` 开头，两者在类型上
     都是字符串，混用不会有任何报错——只会把一个人的权限范围发进一个群。
     """
-
     text = (value or "").strip()
     if not text.startswith(USER_OPEN_ID_PREFIX) or len(text) <= len(USER_OPEN_ID_PREFIX):
         raise ValueError(
@@ -101,7 +100,6 @@ def _no_redirect_opener() -> Any:
     做法是让 ``redirect_request`` 返回 ``None``：``urllib`` 于是把 3xx 当成
     :class:`HTTPError` 抛出，落进下面的错误分类。
     """
-
     from urllib.request import HTTPRedirectHandler, build_opener
 
     class _NoRedirect(HTTPRedirectHandler):
@@ -125,7 +123,6 @@ def no_redirect_transport(
     改默认行为属于本 Story 之外的回归面；这里只让**新增的**这条出站链路从一开始就没有
     转发凭据的路径（同 ``query_mcp_probe`` 的 F4 型处置）。
     """
-
     from urllib.error import HTTPError, URLError
     from urllib.request import Request
 
@@ -185,7 +182,6 @@ class FeishuUserMessages:
         翻译一次，改动面反而落到一个已经交付并验收过的模块上。重复的是 12 行协议细节，
         不是任何判定；两边的行为各自由自己的用例钉住。
         """
-
         response = self._transport(
             "POST",
             f"{self._base_url}/auth/v3/tenant_access_token/internal",
@@ -215,7 +211,6 @@ class FeishuUserMessages:
 
         取令牌那一步没有 ``uuid``：它是幂等的读操作，重复取令牌不产生任何用户可见后果。
         """
-
         receiver = validate_user_open_id(open_id)
         if not isinstance(text, str) or not text.strip():
             # 空正文发出去就是一条噪声消息，而且它一定来自渲染侧的缺陷。

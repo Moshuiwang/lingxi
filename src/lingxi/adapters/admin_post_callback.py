@@ -77,7 +77,6 @@ class BackgroundPostCallbackExecutor:
 
     def submit(self, task: Callable[[], None]) -> bool:
         """立即返回。排进队列返回 ``True``；队列已满返回 ``False``（调用方同步执行）。"""
-
         try:
             self._queue.put_nowait(task)
         except queue.Full:

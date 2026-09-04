@@ -227,7 +227,6 @@ class HostFileDelegatedCredentialVault:
         让新凭据的最小间隔与当日计数都从零开始。判据显式传入而不是从写入路径反推，
         正是为了不让"这次写入算不算消费"变成隐式约定。
         """
-
         if require_absent_registration and expected_registered_subject_open_id is not None:
             raise ValueError("首次建立与既有主体 CAS 不能同时使用")
         if refresh_consumed_at is not None:
@@ -326,8 +325,8 @@ class HostFileDelegatedCredentialVault:
         """删除凭据文件；数据库登记行**保留**（V-身份-02 的数据源不随撤销消失）。
 
         携带 ``generation`` 时只撤销**那一代**：领取之后若发生了新授权，
-        旧链的失败不得把新凭据一起删掉（终轮 Codex）。"""
-
+        旧链的失败不得把新凭据一起删掉（终轮 Codex）。
+        """
         with self._locked():
             existed = self._path.exists()
             if existed and generation is not None:
@@ -351,8 +350,8 @@ class HostFileDelegatedCredentialVault:
         """收殓「已消费但一直没写回新凭据」的文件。
 
         这种文件意味着进程在续期后、落盘前死掉：旧令牌已被飞书作废，留着密文
-        只会诱使未来的代码路径重放它。"""
-
+        只会诱使未来的代码路径重放它。
+        """
         moment = now or datetime.now(UTC)
         with self._locked():
             payload = self._read_payload()
@@ -378,12 +377,10 @@ class HostFileDelegatedCredentialVault:
         ``user_info`` 回读，不能由浏览器参数提供。撤销凭据时登记行保留，
         因此失效后的恢复仍然有明确的比较对象。
         """
-
         return registered_delegated_subject_open_id(self._dsn, timeouts=self._timeouts)
 
     def load(self, *, now: datetime | None = None) -> StoredCredential | None:
         """取出当前凭据供同步使用。解密失败或已失效时撤销并返回 ``None``。"""
-
         moment = now or datetime.now(UTC)
         with self._locked():
             payload = self._read_payload()
@@ -454,7 +451,6 @@ class HostFileDelegatedCredentialVault:
         带回去**——它自己的 ``save()`` 也会重建整份 payload，不带的话会把「按需供给」
         当天已经积累的计数悄悄清零。
         """
-
         del lease_seconds  # 消费标记取代了租期语义；参数保留以兼容调用方。
         if not isinstance(min_interval, timedelta) or min_interval <= timedelta(0):
             # **`<=` 而不是 `<`**（冻结候选审查 2026-08-21 的 F5）：0 是能让这道检查
@@ -543,8 +539,8 @@ class HostFileDelegatedCredentialVault:
 
         主体 A→B 更换途中崩溃会留下「登记指向 B、文件仍是 A」：此时 A 已不在
         登记表里，双向触发器只护着 B，继续用 A 的凭据等于在防线外运行
-        （终轮 Codex）。清除旧文件并要求重新授权是唯一安全的恢复。"""
-
+        （终轮 Codex）。清除旧文件并要求重新授权是唯一安全的恢复。
+        """
         with (
             connect(self._dsn, timeouts=self._timeouts) as connection,
             connection.cursor() as cursor,
@@ -568,7 +564,6 @@ class HostFileDelegatedCredentialVault:
         有效期判定，前两种都不构成删除凭据的依据。返回 ``{}`` 会把「解不开」伪装成
         「解开了、但什么都没有」，让下游的失败关闭分支删掉一份其实完好的密文。
         """
-
         try:
             blob = self._path.read_bytes()
         except FileNotFoundError:
@@ -638,7 +633,6 @@ def _parse_utc(value: Any) -> datetime | None:
     写入方（凭据轮换职责）只写带时区的 UTC 时刻。读不出来时返回 ``None``＝"没有消费
     记录"，上界因此不拦——方向是刻意的：一份读不懂的旧载荷不该把凭据永久锁死。
     """
-
     moment = _parse_moment(value)
     if moment is None:
         return None
@@ -655,7 +649,6 @@ def _parse_supply_count(value: Any) -> int:
     过早触发。写入方（本模块自己）只写非负整数或 ``None``，因此这里遇到的任何
     其他形状都是历史遗留或不受信任的读取路径，一律按"没有计数"处理。
     """
-
     if isinstance(value, bool):
         return 0
     if isinstance(value, int) and value >= 0:

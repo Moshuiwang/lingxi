@@ -11,13 +11,14 @@
 from __future__ import annotations
 
 import re
-import tomllib
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
 from string import Formatter
 from typing import Any
+
+import tomllib
 
 CONTENT_PATH = Path(__file__).with_name("content.toml")
 CONTENT_VERSION_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
@@ -243,7 +244,6 @@ class RenderedCard:
     @property
     def display_fields(self) -> Mapping[str, object]:
         """返回目录允许改变的展示字段，不暴露动作、URL 或权限字段。"""
-
         return {
             "title": self.title,
             "body": self.body,
@@ -288,7 +288,6 @@ class ContentCatalog:
         测试通过这个入口喂缺键、多余键和危险卡片字段，证明失败发生在任何渲染之前。
         错误只包含键名和字段名，不拼接变量值。
         """
-
         if not isinstance(document, Mapping):
             raise ContentValidationError("内容目录必须是对象")
 
@@ -362,7 +361,6 @@ class ContentCatalog:
     @classmethod
     def from_file(cls, path: Path = CONTENT_PATH) -> ContentCatalog:
         """读取随包发布的 TOML 文件；文件损坏时不创建部分可用目录。"""
-
         try:
             with path.open("rb") as stream:
                 document = tomllib.load(stream)
@@ -400,7 +398,6 @@ class ContentCatalog:
         （目前只有 ``worker.stopped_result`` 的 ``result``），出口校验因此只保留
         协议泄漏检查，见 ``_validate_user_visible_text`` 与 Issue #322。
         """
-
         template = self._texts.get(key)
         if template is None:
             raise ContentRenderError("未登记的文案键")
@@ -427,7 +424,6 @@ class ContentCatalog:
         出口校验因此只保留协议泄漏检查、跳过 ``internal_terms``/固定词表，
         见 ``_validate_user_visible_text`` 与 Issue #322。
         """
-
         template = self._cards.get(key)
         if template is None:
             raise ContentRenderError("未登记的卡片键")
@@ -554,7 +550,6 @@ def _validate_user_visible_text(
        加载期仍然无条件过两道检查（见 ``_validate_fixed_template_safety``，
        不受这个参数影响，模板闸不因此放宽）。
     """
-
     if _PROCESS_MARKER_PATTERN.search(text):
         raise ContentSafetyError("用户可见内容包含内部过程标识")
     if contains_model_text:
@@ -568,13 +563,11 @@ def _validate_user_visible_text(
 @lru_cache(maxsize=1)
 def default_content_catalog() -> ContentCatalog:
     """加载当前制品的唯一内容版本；失败时不返回降级目录。"""
-
     return ContentCatalog.from_file()
 
 
 def validate_user_visible_text(text: str, *, internal_terms: Sequence[str] = ()) -> str:
     """供未来问数卡片/文本出口复用的输出侧检查器。"""
-
     if not isinstance(text, str):
         raise ContentSafetyError("用户可见内容必须是文本")
     _validate_user_visible_text(text, internal_terms=internal_terms)

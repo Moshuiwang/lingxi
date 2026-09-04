@@ -68,7 +68,6 @@ _STATUS_ELEMENT_ID = "lingxi_status"
 
 def _card_markdown(card: RenderedCard) -> str:
     """把 ``RenderedCard`` 的标题与正文合并成一段 markdown。"""
-
     return f"**{card.title}**\n\n{card.body}"
 
 
@@ -83,7 +82,6 @@ def _card_payload(card: RenderedCard) -> dict[str, Any]:
     ``streaming_mode=true`` 与建卡时就打开流式，之后靠 ``elements.content`` 增量更新，
     最终用 ``settings`` 把它关闭（G-CARD 实测的生命周期）。
     """
-
     return {
         "schema": "2.0",
         "config": {"update_multi": True, "streaming_mode": True},
@@ -103,7 +101,6 @@ def build_client(*, app_id: str, app_secret: str, timeout_seconds: float) -> Any
     """构造官方 SDK 客户端；理由与 ``feishu_outbound.build_client`` 相同（不复制，
     调用方各自持有一份，见架构设计「Gateway 只持有飞书出站凭据」）。
     """
-
     import lark_oapi as lark
 
     return (
@@ -133,7 +130,6 @@ class LarkCardTransport:
         的持久化提交（Issue #151 审核 P3-6），本方法不负责幂等，只负责把外部调用
         做对。
         """
-
         from lark_oapi.api.cardkit.v1 import CreateCardRequest, CreateCardRequestBody
         from lark_oapi.api.im.v1 import ReplyMessageRequest, ReplyMessageRequestBody
 
@@ -226,7 +222,6 @@ class LarkCardTransport:
         """把 ``streaming_mode`` 关闭；G-CARD 实测确认这一步与 ``update`` 共用同一
         整卡级 ``sequence`` 计数器，必须无缝递增（跨接口拼接见探针记录）。
         """
-
         from lark_oapi.api.cardkit.v1 import (
             Config,
             Settings,
@@ -261,7 +256,6 @@ def _settings_to_dict(settings: Any) -> dict[str, Any]:
     ``Settings`` 模型只提供 builder，没有现成的 to-dict；这里只取本类唯一用到
     的一个布尔字段，不引入通用序列化逻辑。
     """
-
     return {"config": {"streaming_mode": settings.config.streaming_mode}}
 
 

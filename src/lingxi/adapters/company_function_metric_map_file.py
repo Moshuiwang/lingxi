@@ -62,9 +62,10 @@ from __future__ import annotations
 
 import hashlib
 import logging
-import tomllib
 from collections.abc import Mapping
 from pathlib import Path
+
+import tomllib
 
 from lingxi.core.permission.metric_translation import build_company_function_metric_map
 
@@ -75,7 +76,6 @@ _CONFIG_FILE_NAME = "company_function_metric_map.toml"
 
 def default_company_function_metric_map_path() -> Path:
     """随包发布的配置文件路径。"""
-
     return Path(__file__).resolve().parents[1] / "config" / _CONFIG_FILE_NAME
 
 
@@ -104,7 +104,6 @@ def parse_metric_map_path(raw: str | None) -> Path | None:
     :func:`load_company_function_metric_map` 读取时的事（配了却读不到一律响亮失败，
     见下方函数文档）。两处各判一次，判据迟早漂移。
     """
-
     value = (raw or "").strip()
     if not value:
         return None
@@ -130,7 +129,6 @@ def load_company_function_metric_map(
     见模块文档；加载失败（本函数向上抛出之前）不记这一行——digest 只描述"读到了什么"，
     不该在没读到任何东西时也输出一个看似有效的值。
     """
-
     config_path = path or default_company_function_metric_map_path()
     with config_path.open("rb") as config_file:
         raw = config_file.read()

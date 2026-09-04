@@ -155,7 +155,6 @@ class BitableStockTokenSource:
 
     def lookup_raw(self, email: str) -> RawStockTokenRow | None:
         """按邮箱整表分页查找。零命中返回 ``None``；多命中失败关闭（模块文档）。"""
-
         wanted = normalize_email(email)
         if not wanted:
             raise ValueError("按邮箱查存量令牌源必须提供非空邮箱")

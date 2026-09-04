@@ -73,7 +73,6 @@ def delivery_uuid(chat_id: str, dedupe_key: str, *, prefix: str = DELIVERY_UUID_
     投递语义**——两条链共用同一个前缀，会让运维在飞书侧再也分不出一个 uuid 属于日报
     还是权限通知。取值域仍由长度上限守着（下面那一行按实际前缀算，不是按默认值算）。
     """
-
     digest = hashlib.sha256(f"{chat_id}\n{dedupe_key}".encode()).hexdigest()[:32]
     if not isinstance(prefix, str) or not prefix.strip() or prefix.strip() != prefix:
         raise ValueError("投递去重 ID 的前缀必须是不含首尾空白的非空文本")
@@ -105,7 +104,6 @@ def validate_group_chat_id(value: str, *, variable_name: str = "LINGXI_ADMIN_GRO
     `LINGXI_GATEWAY_ADMIN_GROUP_CHAT_ID`，Issue #153），错误消息必须指向调用方
     真正读取的那一个，否则会把运维导向去改一个不存在效果的变量。
     """
-
     text = (value or "").strip()
     if not text.startswith(GROUP_CHAT_ID_PREFIX) or len(text) <= len(GROUP_CHAT_ID_PREFIX):
         raise ValueError(
@@ -155,7 +153,6 @@ class FeishuGroupMessages:
 
     def _notify_send(self, operation: str, succeeded: bool) -> None:
         """把结果交给告警逻辑；告警回调失败不能改变发送语义。"""
-
         if self._on_send_outcome is None:
             return
         try:
@@ -169,8 +166,8 @@ class FeishuGroupMessages:
 
     def _tenant_access_token(self) -> str:
         """取应用身份令牌。每次发送现取：日报一天一次，缓存换不来任何东西，
-        却会多出一份「缓存过期与失效」的失败模式。"""
-
+        却会多出一份「缓存过期与失效」的失败模式。
+        """
         response = self._transport(
             "POST",
             f"{self._base_url}/auth/v3/tenant_access_token/internal",
@@ -199,7 +196,6 @@ class FeishuGroupMessages:
 
         取令牌那一步没有 `uuid`：它是幂等的读操作，重复取令牌不产生任何用户可见后果。
         """
-
         try:
             token = self._tenant_access_token()
             response = self._transport(

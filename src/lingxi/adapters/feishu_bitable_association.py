@@ -98,7 +98,6 @@ def analyze_association(
     snapshot_rows: Iterable[Mapping[str, Any]],
 ) -> dict[str, Any]:
     """返回不包含原始记录的关联统计，供脚本和测试共同使用。"""
-
     bitable = _normalize_bitable_rows(bitable_rows)
     snapshot = _normalize_snapshot_rows(snapshot_rows)
     by_user_id = _index(snapshot, "user_id")

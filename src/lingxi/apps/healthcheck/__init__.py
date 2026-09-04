@@ -161,7 +161,6 @@ def _compute_db_cache_ttl_seconds(role: str) -> float:
     TTL 情形下的 A 类最坏时延 ≤ B 类最坏时延"钉成断言，回归时会在测试阶段
     炸掉，不必等到真实环境才发现下一次类似的网格量化缺陷。
     """
-
     liveness_max_age = _DEFAULT_MAX_LIVENESS_AGE_SECONDS[role]
     interval = _HEALTHCHECK_INTERVAL_SECONDS_BY_ROLE[role]
     return max(0.0, liveness_max_age - 2 * interval)
@@ -249,7 +248,6 @@ def _check_free_space(
     目录都 stat 不了的容器不该被称作健康，退回"看不出问题就算好"正是本段要消灭的
     那种假绿。
     """
-
     # `os.statvfs` 现取而不是绑成默认参数：默认参数在函数定义那一刻就求值，
     # 之后任何替换（测试注入、平台适配）都不会生效，那正是"注入了却没生效"这类
     # 假绿的来源（与 `run()` 里 P1-6 那条 `directory` 显式下传同一条教训）。
@@ -289,7 +287,6 @@ def _read_pids_usage(cgroup_paths: Sequence[tuple[Path, Path]]) -> tuple[int, in
     而 cgroup pids 控制器在容器外根本不存在，把"没有 cgroup"判成不健康会让每一次
     本机运行都红，那不是判据，是噪声。
     """
-
     for current_path, max_path in cgroup_paths:
         try:
             current_raw = current_path.read_text(encoding="utf-8").strip()
@@ -321,7 +318,6 @@ def _check_pids(
     ``pids`` 上限本来就逐服务配置，比例天然按各自的上限缩放（同
     ``_check_free_space`` 用比例而不是固定字节的理由）。
     """
-
     usage = _read_pids_usage(_PIDS_CGROUP_PATHS if cgroup_paths is None else cgroup_paths)
     if usage is None:
         return

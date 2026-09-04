@@ -69,8 +69,8 @@ class RosterRow(NamedTuple):
     def get(self, key: str, default: object = None) -> object:
         """让本行可直接交给 ``match_galaxy_account``（它按 Mapping 的 ``get``
         取值）。NamedTuple 没有 ``get``，此前必须先 ``_asdict()``，文档却声称
-        可直接组合（终轮 Codex 发现的接口不兼容）。"""
-
+        可直接组合（终轮 Codex 发现的接口不兼容）。
+        """
         return getattr(self, key, default)
 
 
@@ -80,7 +80,6 @@ def field_text(value: Any) -> str:
     多维表格的同一列在不同字段类型下可能是字符串、数字、对象或对象数组，
     受控读取中三种形态都真实出现过。
     """
-
     if value is None or value is False:
         return ""
     if isinstance(value, str):
@@ -121,7 +120,6 @@ def normalize_record(record: Any) -> RosterRow:
     非对象项抛 ``invalid_page_item`` 同一姿态：整轮判失败、保留上一份快照，而不是让
     一条坏记录混进一份看起来正常的快照。
     """
-
     if not isinstance(record, Mapping):
         raise RosterReadError("invalid_page_item", definite=False)
     fields = record.get("fields", {})
@@ -257,8 +255,8 @@ class RosterIntegrity:
     def shape_ok(self) -> bool:
         """形态是否通过。**重复行不算形态问题**——它是花名册的实测常态，由比对层
         判 `AMBIGUOUS`（`V-花名册-06`）；把它算成"这轮不可用"会让快照因为两行重复
-        而整轮停更。"""
-
+        而整轮停更。
+        """
         return not self.absent_columns and self.total_matches_rows is not False
 
 
@@ -293,8 +291,8 @@ class RosterReadOutcome:
     @property
     def complete_nonempty(self) -> bool:
         """整轮读完、完整性通过、且非空。这是"可以拿去替换快照"的**必要条件**；
-        是否真的替换、以及空源与失败如何告警，由快照层决定，不在本模块。"""
-
+        是否真的替换、以及空源与失败如何告警，由快照层决定，不在本模块。
+        """
         return self.status is RosterReadStatus.COMPLETE
 
     def audit_facts(self) -> dict[str, Any]:
@@ -304,7 +302,6 @@ class RosterReadOutcome:
         :attr:`rows` 序列化进去。姓名、工号、邮箱、人员 ID 一个都不在这里
         （`V-花名册-33`）。
         """
-
         return {
             "status": self.status.value,
             "rows": self.integrity.row_count,
@@ -327,7 +324,8 @@ class RosterReadOutcome:
 
 class RosterRecordPage(NamedTuple):
     """一页原始记录。除了记录与游标，还带一个 ``total``：完整性判定要拿源头自报的
-    总数与累计行数对账，而那个数字在分页响应里，取不到就传 ``None``。"""
+    总数与累计行数对账，而那个数字在分页响应里，取不到就传 ``None``。
+    """
 
     records: tuple[Any, ...]
     next_page_token: str | None = None
@@ -342,7 +340,6 @@ class RosterPageSource(Protocol):
 
 def _require_https(base_url: object) -> str:
     """飞书出站必须 HTTPS；误配 http:// 会把 Bearer token 明文上路。不回显收到的值。"""
-
     if not isinstance(base_url, str) or not base_url.startswith("https://"):
         raise ValueError("飞书 base_url 必须以 https:// 开头（不回显收到的值）")
     return base_url.rstrip("/")
@@ -350,8 +347,8 @@ def _require_https(base_url: object) -> str:
 
 def _require_identifier(value: object, label: str) -> str:
     """校验 Base / 表标识非空且不含空白。**不回显值**：它们是外部标识，一旦进错误
-    消息就会被日志、CI 输出和工单一路复制出去。"""
-
+    消息就会被日志、CI 输出和工单一路复制出去。
+    """
     if not isinstance(value, str) or not value.strip():
         raise ValueError(f"{label}必须由配置注入，不得为空（不回显收到的值）")
     text = value.strip()
@@ -417,7 +414,6 @@ class BitableRosterPages:
         告警指向错误的地方（去查花名册，而问题在凭据）。只有"provider 正常返回却给了
         空值"这一种才算读取失败——那时确实无法判断源头状态。
         """
-
         token = self._access_token()
         if not isinstance(token, str) or not token:
             raise RosterReadError("access_token_missing", definite=False)
@@ -425,7 +421,6 @@ class BitableRosterPages:
 
     def fetch_page(self, page_token: str | None = None) -> RosterRecordPage:
         """读一页；把飞书的响应形状与错误码翻译成本模块的语义，不泄漏给上层。"""
-
         token = self._token()
         try:
             response = self._transport("GET", self._records_url(page_token), body=None, token=token)
@@ -476,7 +471,6 @@ def _integrity(
     reported_total: int | None,
 ) -> RosterIntegrity:
     """把一轮读取结算成完整性事实。纯计数，不看任何值。"""
-
     row_count = len(rows)
     duplicates: list[DuplicateCount] = []
     for field in duplicate_key_fields:
@@ -512,7 +506,6 @@ def _integrity(
 
 def _row_text(row: Any, field: str) -> str:
     """取归一化行上的一个字段并归一为可比较文本。"""
-
     value = row.get(field) if hasattr(row, "get") else getattr(row, field, "")
     return value.strip() if isinstance(value, str) else ""
 
@@ -535,7 +528,6 @@ def read_roster_snapshot(
     四态的判定次序是刻意的：**先判完整性、再判空**。源头自报 1206 行却一行没给，是
     "读取不完整"而不是"花名册空了"——两者都保旧，但报给管理员的原因不能反。
     """
-
     if not isinstance(max_pages, int) or isinstance(max_pages, bool) or max_pages < 1:
         raise ValueError("max_pages 必须是正整数")
     # 去重且保序（PR #208 二级审查 P3-1）：同一列在清单里出现两次时，下面的空值统计

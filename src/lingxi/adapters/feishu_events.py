@@ -78,7 +78,6 @@ class NonPrivateChatError(EventParseError):
 
 def _text(container: Mapping[str, Any] | None, key: str) -> str | None:
     """取一个非空字符串字段；缺失、类型不对或空白一律当作没有。"""
-
     if not isinstance(container, Mapping):
         return None
     value = container.get(key)
@@ -101,7 +100,6 @@ def message_text(content: object, message_type: object) -> str:
     不了的 content 返回空串而不是抛错：本切片只处理文本问数，收到图片或语音时应当
     照常走完管线（加表情、状态判定），而不是把长连接带下去。
     """
-
     if message_type != "text" or not isinstance(content, str):
         return ""
     try:
@@ -126,7 +124,6 @@ def _mentioned_open_ids(message: Mapping[str, Any] | None) -> tuple[str, ...]:
     空元组而不是抛错——读不出被 @ 的人只意味着"当作没有人被 @"，不能因为这一段
     可选信息影响 ``NonPrivateChatError`` 本身的抛出（见该类文档）。
     """
-
     if not isinstance(message, Mapping):
         return ()
     mentions = message.get("mentions")
@@ -150,7 +147,6 @@ def parse_message_event(
     ``trace_id`` 只为测试可重复而开放；正常调用不传，由本函数生成一个 ULID
     （接口设计「追踪」：每个入站事件生成一个 trace_id，贯穿任务与审计）。
     """
-
     if not isinstance(payload, Mapping):
         raise EventParseError("事件体不是一个对象")
 
@@ -218,7 +214,8 @@ def parse_message_event(
 
 class CardActionParseError(EventParseError):
     """``card.action.trigger`` 事件体缺少必需字段或形状不对。与 ``EventParseError``
-    同一处理姿态：调用方记审计后继续收下一条，不当作连接故障。"""
+    同一处理姿态：调用方记审计后继续收下一条，不当作连接故障。
+    """
 
 
 @dataclass(frozen=True)
@@ -260,7 +257,6 @@ def _stringify_scalars(mapping: Mapping[str, Any]) -> dict[str, str]:
     也不会在这里崩溃，只会被 ``core/admin/card_callback.py`` 当成缺少必需
     字段拒绝）。``action.value`` 与 ``action.form_value`` 共用这一份过滤。
     """
-
     return {
         str(key): str(value)
         for key, value in mapping.items()
@@ -298,7 +294,6 @@ def _parse_action_value(raw_value: object) -> Mapping[str, Any] | None:
     代码 bug 型未处理异常，让一条伪造回调升级成可重复的 gateway 可用性攻击。
     任何解析失败一律按"不可用"返回 ``None``，与其余畸形形态同一失败关闭姿态。
     """
-
     if isinstance(raw_value, Mapping):
         return raw_value
     if isinstance(raw_value, str):
@@ -344,7 +339,6 @@ def parse_card_action_event(
     变化。本函数因此不需要为新按钮形状新增兼容分支或改动解析路径本身（只改了
     "读出来的值不是 Mapping 时怎么办"这一步，见上文）。
     """
-
     if not isinstance(payload, Mapping):
         raise CardActionParseError("事件体不是一个对象")
 

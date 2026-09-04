@@ -93,8 +93,8 @@ def _text(value: Any) -> str | None:
     """取字符串字段；也接受 ``{"default_value": "..."}`` 形态（应用身份路径的成员
     姓名按编排者 2026-08-19 实测是这个结构，用户身份路径的既有实现已验证是纯字符串——
     两条路径分别按各自已确认的形状解析，这里的双形态兼容只服务应用路径可能出现的
-    结构化姓名，不改变用户路径的既有行为）。"""
-
+    结构化姓名，不改变用户路径的既有行为）。
+    """
     if isinstance(value, str):
         text = value.strip()
         return text or None
@@ -120,7 +120,6 @@ def _walk_app_scope(
     相等——这是 F3 的交叉校验输入：只交出成员集合会漏掉"用户路径没走到的空部门"
     这一类问题（那类部门不含任何成员，成员集合两边照样能对上）。
     """
-
     department_keys: set[str] = set()
     member_keys: set[str] = set()
     visited: set[str] = set()
@@ -160,7 +159,6 @@ def _walk_user_scope(
     client: FeishuDirectoryClient, *, token: str, tenant_key: str
 ) -> tuple[tuple[SnapshotDepartment, ...], dict[str, SnapshotMember]]:
     """专用授权用户身份路径：递归遍历可见范围，交出完整的部门与成员标准化投影。"""
-
     departments: list[SnapshotDepartment] = []
     # open_id -> 已知直属部门名集合，最终折进 SnapshotMember.department_names。
     member_department_names: dict[str, set[str]] = {}
@@ -309,7 +307,6 @@ def _tenant_keys(records: list[dict[str, Any]], *, error_code: str) -> set[str]:
     异常。这里改成不猜、不过滤——取不到键就直接抛，交给调用方按读取失败处理
     （不吞、不重试、不返回半截结果，与模块文档顶部的纪律一致）。
     """
-
     keys: set[str] = set()
     for record in records:
         key = _tenant_key(record)
@@ -342,7 +339,6 @@ def read_org_snapshot(
     挡住——``TenantScope`` 现有的两个字段已经足够表达"应用侧看不到"这件事，不需要
     新增判据。
     """
-
     app_tenant_keys = _tenant_keys(
         client.list_collaboration_tenants_as_app(token=app_token),
         error_code="app_scope_tenant_key_missing",

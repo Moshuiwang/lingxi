@@ -69,7 +69,6 @@ DEFAULT_MAX_PAGES = 50
 
 def _require_https(base_url: object) -> str:
     """飞书出站必须 HTTPS；误配 http:// 会把 Bearer token 明文上路。不回显收到的值。"""
-
     if not isinstance(base_url, str) or not base_url.startswith("https://"):
         raise ValueError("飞书 base_url 必须以 https:// 开头（不回显收到的值）")
     return base_url.rstrip("/")
@@ -77,8 +76,8 @@ def _require_https(base_url: object) -> str:
 
 def _require_identifier(value: object, label: str) -> str:
     """校验 Base / 表 / 记录标识非空且不含空白。**不回显值**：它们是外部标识，一旦进
-    错误消息就会被日志、CI 输出和工单一路复制出去。"""
-
+    错误消息就会被日志、CI 输出和工单一路复制出去。
+    """
     if not isinstance(value, str) or not value.strip():
         raise ValueError(f"{label}必须由配置注入，不得为空（不回显收到的值）")
     text = value.strip()
@@ -99,7 +98,6 @@ def _matches(value: Any, wanted: str) -> bool:
     宽松的方向是**安全**的：多命中一行只会让发布走进 CONFLICT 失败关闭，而漏命中会让
     同一个人被写出第二行权限。
     """
-
     return bool(wanted) and readback_text(value).strip().casefold() == wanted.strip().casefold()
 
 
@@ -164,7 +162,6 @@ class BitablePermissionTable:
         指向错误的地方（去查多维表格，而问题在凭据）。只有"provider 正常返回却给了空值"
         才算调用失败——那时确实无法判断外部状态。
         """
-
         token = self._access_token()
         if not isinstance(token, str) or not token:
             raise PermissionTableError("access_token_missing", definite=False)
@@ -172,7 +169,6 @@ class BitablePermissionTable:
 
     def _call(self, method: str, url: str, *, body: Mapping[str, Any] | None) -> dict[str, Any]:
         """发一次调用并把响应解析成 ``data``；错误码翻译在这里，只有这里。"""
-
         token = self._token()
         try:
             response = self._transport(method, url, body=body, token=token)
@@ -199,7 +195,6 @@ class BitablePermissionTable:
         缺可回读标识属**结果不明**而不是明确失败：响应本身说成功，但我们无法确认写进去
         的是哪一行，也就无法读回核对（纪律同 ``feishu_delivery`` 对缺 ``card_id`` 的处理）。
         """
-
         record = data.get("record")
         if not isinstance(record, Mapping):
             raise PermissionTableError("record_missing", definite=False)
@@ -215,7 +210,6 @@ class BitablePermissionTable:
 
     def find_rows(self, *, record_key: str, email: str) -> tuple[ExistingPermissionRow, ...]:
         """整表分页查找 ``record_key`` 或 ``email`` 命中的行（理由见模块文档）。"""
-
         matched: list[ExistingPermissionRow] = []
         page_token: str | None = None
         for _ in range(self._max_pages):
@@ -263,7 +257,6 @@ class BitablePermissionTable:
 
     def update_row(self, record_id: str, fields: Mapping[str, str]) -> None:
         """部分更新：只改给定字段，未列出的列保持原值（模块文档「只写自己的字段」）。"""
-
         self._call("PUT", self._record_url(record_id), body={"fields": dict(fields)})
         logger.info("权限发布行已更新 record=%s", record_id)
 

@@ -40,7 +40,6 @@ def touch_liveness(
     """写入当前时间戳。写失败不抛异常——活性文件写不进去不能带走主循环；
     healthcheck 会因为文件缺失或过期如实变红，这本身就是我们想要的诚实失败。
     """
-
     path = liveness_path(role, directory=directory)
     try:
         path.write_text(repr(clock()), encoding="utf-8")
@@ -64,7 +63,6 @@ def read_liveness_age_seconds(
     个信号：调用方据此退回真实探测/判定不健康，而不是错误地信任一份年龄
     根本无法确定的缓存。
     """
-
     path = liveness_path(role, directory=directory)
     try:
         written_at = float(path.read_text(encoding="utf-8"))

@@ -130,7 +130,6 @@ class McpHttpResponse(NamedTuple):
 
 def _require_https(endpoint: object) -> str:
     """出站必须 HTTPS：误配 ``http://`` 会把 Bearer 令牌明文上路。不回显收到的值。"""
-
     if not isinstance(endpoint, str) or not endpoint.startswith("https://"):
         raise ValueError("问数 MCP 端点必须以 https:// 开头（不回显收到的值）")
     return endpoint.rstrip("/")
@@ -147,7 +146,6 @@ def _no_redirect_opener() -> Any:
     做法是让 ``redirect_request`` 返回 ``None``：``urllib`` 于是把 3xx 当成
     :class:`HTTPError` 抛出，我们在下面按普通非 200 状态处理，落技术失败。
     """
-
     from urllib.request import HTTPRedirectHandler, build_opener
 
     class _NoRedirect(HTTPRedirectHandler):
@@ -172,7 +170,6 @@ def urllib_mcp_transport(
     交由上层按状态码决定它是明确拒绝还是形状错误。3xx 因此也以状态码的形式回到上层，
     落进"既不是 200 也不在拒绝白名单里"那一路——技术失败。
     """
-
     from urllib.error import HTTPError, URLError
     from urllib.request import Request
 
@@ -209,15 +206,15 @@ def _load_json(raw: bytes) -> Any:
 
 def _reject_non_finite_constant(constant: str) -> Any:
     """M3：``json.loads`` 默认把 ``NaN``/``Infinity``/``-Infinity`` 当合法值——那是
-    JSON 标准之外的 Python 扩展，真实合同里没有这种取值的位置。拒绝比容忍更安全。"""
-
+    JSON 标准之外的 Python 扩展，真实合同里没有这种取值的位置。拒绝比容忍更安全。
+    """
     raise ValueError(f"json 载荷含非标准常量: {constant}")
 
 
 def _reject_duplicate_object_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
     """M3：重复键在 JSON 标准下未定义行为，``json`` 模块默认静默取最后一个值——等于让
-    "后一个同名键覆盖前一个"无声通过。逐字失败更安全。"""
-
+    "后一个同名键覆盖前一个"无声通过。逐字失败更安全。
+    """
     seen: set[str] = set()
     for key, _value in pairs:
         if key in seen:
@@ -239,7 +236,6 @@ def _parse_json_strictly(text: str) -> Any:
     "读不懂"，不能说"这个人可以用了"。**不设响应尺寸上限**——那个数字没有产品证据，
     真实问题是"读不懂就说读不懂"而不是"太大就拒绝"。
     """
-
     try:
         return json.loads(
             text,
@@ -272,7 +268,6 @@ def default_metrics_reader(result: Mapping[str, Any]) -> int:
     **永远不数 ``content`` 的块数。** MCP 的 ``content`` 通常是一个文本块，里面装着整份
     回答；数块数会得到 1，于是一次"你没有任何指标"的空回答也会被判成就绪。
     """
-
     structured = result.get(STRUCTURED_CONTENT_KEY)
     if isinstance(structured, Mapping):
         metrics = structured.get(METRIC_LIST_KEY)
@@ -285,8 +280,8 @@ def _require_valid_metric_record(record: Any) -> None:
     """M2：按 2026-08-19 二次实测样本校验一条指标记录——``metric_id``/``name``/
     ``name_en``（:data:`METRIC_RECORD_FIELDS`）三个字段都必须存在且是字符串。缺字段
     或类型不对，一律 ``unrecognized_result_shape``：服务端契约若变了应当被响亮地发现，
-    而不是被静默容忍。"""
-
+    而不是被静默容忍。
+    """
     if not isinstance(record, Mapping):
         raise McpProbeError("unrecognized_result_shape", denied=False)
     for field in METRIC_RECORD_FIELDS:
@@ -346,7 +341,6 @@ def content_text_metrics_reader(result: Mapping[str, Any]) -> int:
     非标准常量、重复键）统一由 :func:`_parse_json_strictly` 收口，详见它自己的
     docstring。
     """
-
     content = result.get(CONTENT_KEY)
     if not isinstance(content, list) or len(content) != 1:
         raise McpProbeError("unrecognized_result_shape", denied=False)
@@ -394,7 +388,6 @@ def content_text_metric_ids_reader(result: Mapping[str, Any]) -> frozenset[str]:
     的集合**——半份指标目录会让日检把"读不懂响应"误判成"这些指标本来就不存在"，
     从而漏报真实存在的未覆盖指标。
     """
-
     content = result.get(CONTENT_KEY)
     if not isinstance(content, list) or len(content) != 1:
         raise McpProbeError("unrecognized_result_shape", denied=False)
@@ -452,7 +445,6 @@ def fetch_metric_catalog(
     ``token`` 明文只进请求头、只在本函数调用栈内存活，与 :class:`QueryMcpProbe`
     同一条纪律；不进日志、不进异常消息。
     """
-
     if not isinstance(token, str) or not token:
         raise ValueError("查询指标目录必须提供令牌")
     request_id = new_ulid()
@@ -528,15 +520,15 @@ class QueryMcpProbe:
     def timeout_seconds(self) -> int:
         """单次传输超时。装配层必须让它与
         :attr:`lingxi.core.permission.mcp_readiness.ReadinessSchedule.probe_timeout_seconds`
-        一致——那边算出来的"结论最晚什么时候落地"就是拿这个数算的。"""
-
+        一致——那边算出来的"结论最晚什么时候落地"就是拿这个数算的。
+        """
         return self._timeout_seconds
 
     @property
     def metrics_reader(self) -> Callable[[Mapping[str, Any]], int]:
         """当前生效的指标计数函数。装配层与测试用它自证接线（Issue #253）：
-        没有它，"装配层是不是真的注入了已验证的 reader"就只能靠读代码相信，读不出来。"""
-
+        没有它，"装配层是不是真的注入了已验证的 reader"就只能靠读代码相信，读不出来。
+        """
         return self._metrics_reader
 
     def list_metrics(self, *, user_id: str) -> int:
@@ -545,7 +537,6 @@ class QueryMcpProbe:
         失败一律抛 :class:`~lingxi.core.permission.mcp_readiness.McpProbeError`，
         ``denied`` 标明是"MCP 明确拒绝"（同步中）还是"结果不明"（技术失败）。
         """
-
         if not isinstance(user_id, str) or not user_id.strip():
             raise ValueError("就绪探针必须指明用户")
         token = self._token(user_id)

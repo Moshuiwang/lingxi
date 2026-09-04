@@ -48,7 +48,6 @@ _MESSAGE_BUFFER_OVERFLOW_PATTERN = re.compile(
 
 def is_message_buffer_overflow(error: BaseException) -> bool:
     """这次失败是否为「单条 SDK 消息超过读流缓冲上限」（工具回执过大的典型形状）。"""
-
     return _MESSAGE_BUFFER_OVERFLOW_PATTERN.search(str(error)) is not None
 
 
@@ -101,7 +100,6 @@ def build_agent_options(
     不再经过我们的 ``PreToolUse``，拒绝在审计里只剩一条"本层未判定"（`V-执行-09`）。
     屏障的证据价值高于多一层重复拦截。
     """
-
     from claude_agent_sdk import ClaudeAgentOptions
 
     kwargs: dict[str, Any] = {
@@ -186,7 +184,6 @@ async def run_single_turn(
     ``get_mcp_status()`` 本身失败时）不影响本函数其余行为，见 ``_probe_mcp_
     status`` 的说明。
     """
-
     from claude_agent_sdk import ClaudeSDKClient
 
     session_options = options
@@ -300,7 +297,6 @@ async def _probe_mcp_status(
     ``WorkerTurnExecutor._sdk_stderr_sink``，最终落 ``worker.sdk.stderr`` 结构化
     审计行），本来就是"这次会话的诊断文本出口"，不是只服务子进程 stderr 一种来源。
     """
-
     try:
         status = await client.get_mcp_status()
     except Exception as error:  # 决不能让观测探针拖垮整个回合
@@ -318,7 +314,6 @@ def normalize_message(message: Any) -> tuple[dict[str, Any], ...]:
     不该覆盖已有的最终正文），而带着空文本块的助手消息产出 ``text=""``——"最后一句
     话是空的"是必须如实上报的失败事实，不能靠跳过空串把它盖掉。
     """
-
     from claude_agent_sdk import (
         AssistantMessage,
         ResultMessage,
@@ -377,7 +372,6 @@ def normalize_message(message: Any) -> tuple[dict[str, Any], ...]:
 
 def load_message_types() -> dict[str, Any]:
     """按名取回本模块依赖的 SDK 类型，供真实 SDK 冒烟核对它们是否还存在。"""
-
     import claude_agent_sdk
 
     return {name: getattr(claude_agent_sdk, name) for name in MESSAGE_TYPE_NAMES}

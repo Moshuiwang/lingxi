@@ -230,7 +230,6 @@ def run(
     ``connect`` 仅供测试注入（默认 ``lingxi.adapters.postgres.connect``，与业务代码
     同一个连接工厂、同一套受限超时——不给这个只读工具开一条不受超时约束的旁路）。
     """
-
     import os
 
     parser = argparse.ArgumentParser(prog="python -m lingxi.apps.trace")

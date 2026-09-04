@@ -156,7 +156,6 @@ def _validate_endpoint(url: str) -> None:
     3. 配置了 ``LINGXI_QUERY_MCP_ENDPOINT`` 时核对**同源**（scheme + host + port
        三项全等）。这一项可选，理由见该常量的注释。
     """
-
     from urllib.parse import urlsplit
 
     try:
@@ -185,7 +184,6 @@ def _validate_endpoint(url: str) -> None:
 
 def _origin(parts: Any) -> tuple[str, str, int | None]:
     """``(scheme, host, port)``——主机名大小写不敏感，端口按 scheme 归一。"""
-
     port = parts.port
     if port is None and parts.scheme == "https":
         port = 443
@@ -205,7 +203,6 @@ def load_user_mcp_servers(*, root: str, user_id: str) -> Mapping[str, Any]:
     :class:`UserMcpConfigError` 抛出，调用方据此走既有的失败关闭终态，不得吞掉
     异常后回落到别的配置来源（模块文档顶部的红线）。
     """
-
     if not isinstance(root, str) or not root.strip():
         raise UserMcpConfigError("root_unconfigured")
     name = _validated_user_id(user_id)
@@ -336,7 +333,6 @@ def _validate_server_shape(value: Any) -> None:
     偏离（多一个键、少一个键、类型不是 http、URL 不是 https、Authorization
     形状不对）都判 ``config_shape_invalid``——不尝试兼容、不部分接受。
     """
-
     if not isinstance(value, dict):
         raise UserMcpConfigError("config_shape_invalid")
     if set(value) != _ALLOWED_SERVER_KEYS:

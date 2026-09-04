@@ -91,7 +91,8 @@ class PostgresAdminRegistryLookup:
 class PostgresAdminQueries:
     """``AdminQueries`` 端口的真实实现：只读 ``app_user``/``inbound_event``/
     ``local_permission_override``（#319 S-P-1b 卡 B：``/admin user`` 新增
-    「当前生效本地覆盖」段，是 ``/admin revoke_permission`` 的 UX 前置）。"""
+    「当前生效本地覆盖」段，是 ``/admin revoke_permission`` 的 UX 前置）。
+    """
 
     def __init__(self, dsn: str, *, timeouts: PostgresTimeouts = DEFAULT_POSTGRES_TIMEOUTS) -> None:
         self._dsn = dsn
@@ -183,7 +184,6 @@ class PostgresAdminQueries:
         映射损坏或身份无法唯一匹配时全部 fail-closed 为“暂时读不到”，而不是把
         不确定状态渲染成“没有权限”。异常不带人员字段进入日志，也不向调用方冒泡。
         """
-
         if not isinstance(feishu_user_id, str) or not feishu_user_id.strip():
             return GalaxySourceSummary(granted=False, reason="roster_snapshot_unavailable")
         try:
@@ -306,7 +306,6 @@ class PostgresAdminQueries:
         一条手工命令新建两个索引会给每一次入队与每一次终态写入都加上维护
         成本，不划算。此处不新建索引是有意选择，不是遗漏。
         """
-
         with (
             connect(self._dsn, timeouts=self._timeouts) as connection,
             connection.cursor() as cursor,
@@ -377,7 +376,6 @@ class PostgresAdminQueries:
         （管理命令、未开通用户、重复投递事件都不入队），不是错误，调用方据此
         在回显里省掉整段而不是显示一堆空值。
         """
-
         with (
             connect(self._dsn, timeouts=self._timeouts) as connection,
             connection.cursor() as cursor,
@@ -431,7 +429,6 @@ class PostgresAdminQueries:
         注意这里的比较是**逐字相等**，不是索引那条 ``lower(btrim(email))`` 口径：
         本方法只按管理员输入的原文查，不做归一化（既有行为，本次未改）。
         """
-
         if "@" not in identifier:
             return identifier
         with (
@@ -456,7 +453,6 @@ class PostgresAdminQueries:
         模块文档"与 company_function_metric_map_file.py 的关键差异：现读，不
         缓存"）——管理命令面低频，现读成本可忽略，换来编辑别名表立即生效。
         """
-
         from lingxi.adapters.admin_metric_alias_map_file import load_admin_metric_alias_map
 
         aliases = load_admin_metric_alias_map()
@@ -468,8 +464,8 @@ class PostgresAdminQueries:
         display_name`` 是建档时从飞书通讯录读到的官方姓名，不是花名册/银河
         导入的姓名列（数据库设计「姓名列只能用于内部诊断」约束的是后者，本方法
         不涉及）。查无此用户，或姓名邮箱均为空，返回通用占位——绝不把入参
-        ``open_id`` 原样拼进返回值（合同"管理员可见文案零 ou_"）。"""
-
+        ``open_id`` 原样拼进返回值（合同"管理员可见文案零 ou_"）。
+        """
         with (
             connect(self._dsn, timeouts=self._timeouts) as connection,
             connection.cursor() as cursor,
@@ -492,8 +488,8 @@ class PostgresAdminQueries:
         查 ``galaxy_country.name_cn``（``boss_company_id`` 连接，与
         ``core/permission/galaxy_scope.py`` 同一连接键取舍）。没有有效批次，或
         查无中文名，原样返回 ``company_id``——公司编号是业务代码，不是需要隐藏
-        的内部系统标识，允许兜底展示。"""
-
+        的内部系统标识，允许兜底展示。
+        """
         from lingxi.adapters.galaxy_import import PostgresGalaxyImportStore
 
         batch_id = PostgresGalaxyImportStore(self._dsn, timeouts=self._timeouts).current_batch_id()
@@ -517,8 +513,8 @@ class PostgresAdminQueries:
         别名。与 :meth:`resolve_metric_name`（输入侧，中文别名 → 真实 ID）同一
         份文件、方向相反——每次调用现读，不缓存，同一姿态（该文件模块文档）。
         多个别名映射到同一个真实 ID 时任取一个（配置写入方职责，非本方法关注
-        的正确性问题）；查无别名原样返回 ``metric_id``。"""
-
+        的正确性问题）；查无别名原样返回 ``metric_id``。
+        """
         from lingxi.adapters.admin_metric_alias_map_file import load_admin_metric_alias_map
 
         aliases = load_admin_metric_alias_map()
@@ -542,7 +538,6 @@ class PostgresAdminQueries:
         返回映射里原样是该编号本身，与 :meth:`company_label` 的兜底语义
         完全一致——调用方用同一个 ``dict.get(id, id)`` 姿势消费即可。
         """
-
         if not company_ids:
             return {}
         from lingxi.adapters.galaxy_import import PostgresGalaxyImportStore
@@ -578,7 +573,6 @@ class PostgresAdminQueries:
         :meth:`metric_label` 结果逐项相同（含"多个别名映射到同一个真实 ID 时
         任取一个"的既有 tie-break：按别名表迭代顺序，先出现的别名生效）。
         """
-
         if not metric_ids:
             return {}
         from lingxi.adapters.admin_metric_alias_map_file import load_admin_metric_alias_map
@@ -607,7 +601,6 @@ class PostgresAdminQueries:
         公司+指标理论上可能同时有一条生效授权与一条生效抑制，见迁移 ``0072``
         的唯一索引按 ``direction`` 再分）均返回 ``None``——不猜测该收回哪一条。
         """
-
         with (
             connect(self._dsn, timeouts=self._timeouts) as connection,
             connection.cursor() as cursor,
@@ -669,7 +662,6 @@ def seed_admin_registry_entry(
     ``feishu_delegated_subject`` 登记表，见 Issue #137 同一识别机制），本函数本身
     不关心它从哪里来，也不做任何格式假设之外的校验。
     """
-
     if not feishu_open_id or not feishu_open_id.strip():
         raise ValueError("feishu_open_id 不能为空")
     if not label or not label.strip():

@@ -163,7 +163,6 @@ def build_mcp_config(*, server_name: str, endpoint: str, token: str) -> str:
     键排序固定（``sort_keys=True``）且末尾带换行：幂等比较靠的是「内容逐字节相同」，
     键序漂移会让每次开通都重写一次文件。
     """
-
     document = {
         "mcpServers": {
             server_name: {
@@ -182,7 +181,6 @@ def _errno_name(error: OSError) -> str:
     只取 ``errno`` 的符号名（``ENOENT``/``EACCES``/``ELOOP``…）。``str(error)`` 带路径，
     ``strerror`` 在某些平台上还会带更多上下文，两者都不进日志。
     """
-
     return errno_module.errorcode.get(error.errno or 0) or "unknown"
 
 
@@ -238,7 +236,6 @@ class LocalUserEnvironment:
 
     def home_of(self, user_id: str) -> Path:
         """该用户的家目录路径。**不创建**，只算路径并校验标识形态。"""
-
         return self._root / self._validated(user_id)
 
     def ensure(self, *, user_id: str, mcp_token: str) -> EnvironmentResult:
@@ -247,7 +244,6 @@ class LocalUserEnvironment:
         返回 ``created=True`` 表示这次调用真的写了配置（新建或内容变化），``False`` 表示
         本来就是这一份（此时仍然收了一次权限）。
         """
-
         name = self._validated(user_id)
         if not isinstance(mcp_token, str) or not mcp_token:
             raise UserEnvironmentError("empty_mcp_token")
@@ -291,7 +287,6 @@ class LocalUserEnvironment:
         根目录还不存在时返回 ``0``（还没有任何用户环境，不是错误）。其余失败一律抛出：
         扫不动就意味着我们管不了这个目录，而这个进程接下来正要往里写明文令牌。
         """
-
         try:
             root_fd = self._open_root(create=False)
         except FileNotFoundError:
@@ -356,7 +351,6 @@ class LocalUserEnvironment:
         + ``lstat`` 拒绝符号链接（**JumpServer 用户同机有 shell，把家目录换成软链是可达
         攻击**）；``fchmod`` 把已存在目录的权限收回定值。
         """
-
         if create:
             try:
                 os.mkdir(name, mode=mode, dir_fd=parent_fd)
@@ -403,7 +397,6 @@ class LocalUserEnvironment:
         两条都抛 :class:`UserEnvironmentError`（错误码带 ``errno`` 符号名，让运维能直接
         分辨 ``EACCES`` 与 ``ENOTDIR``），并各留一条不带路径的 ``WARNING``。
         """
-
         try:
             with os.scandir(home_fd) as entries:
                 names = [
@@ -438,7 +431,6 @@ class LocalUserEnvironment:
         令牌若含孤立代理项，``UnicodeEncodeError`` 的 ``object`` 属性是**整份 JSON**——
         也就是完整令牌；它会随 ``repr(exception)`` 进日志与错误上报。
         """
-
         try:
             return content.encode("utf-8")
         except UnicodeEncodeError:
@@ -473,7 +465,6 @@ class LocalUserEnvironment:
         改动，这里不该跟着一起失守——但也**不为它编一条测不到的用例**：它的变异不会变红，
         如实登记在这里。
         """
-
         try:
             os.chmod(
                 MCP_CONFIG_FILENAME,
@@ -492,7 +483,6 @@ class LocalUserEnvironment:
         的窗口。``os.replace`` 在同一文件系统上是原子的，读取方要么看到旧的一份完整配置、
         要么看到新的，不会读到半截 JSON。
         """
-
         temporary = f"{TEMPORARY_PREFIX}{os.getpid()}.{secrets.token_hex(8)}{TEMPORARY_SUFFIX}"
         try:
             fd = os.open(
@@ -531,7 +521,6 @@ class LocalUserEnvironment:
         ``WARNING``；并且在**没有在途异常**时抛出——有在途异常时不抛，是为了不把真正的
         失败原因盖掉（两者都已经在日志里）。
         """
-
         try:
             os.unlink(temporary, dir_fd=home_fd)
             return

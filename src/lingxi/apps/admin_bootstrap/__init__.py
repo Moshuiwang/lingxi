@@ -79,7 +79,6 @@ def run(
     ``registered_delegated_subject_open_id`` 与 ``seed_admin_registry_entry``——与
     业务代码同一个函数、同一套受限超时，不给这个受控命令开一条旁路。
     """
-
     args = parse_arguments(argv if argv is not None else sys.argv[1:])
     source: Mapping[str, str] = os.environ if env is None else env
     out = sys.stdout if stdout is None else stdout

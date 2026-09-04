@@ -47,7 +47,6 @@ def registered_delegated_subject_open_id(
     登记表里没有行、或值为空白时返回 ``None``。调用方据此判断"还没有专用主体"，
     **不得**把 ``None`` 当成"任何人都不是专用主体"以外的含义。
     """
-
     with connect(dsn, timeouts=timeouts) as connection, connection.cursor() as cursor:
         cursor.execute(
             "SELECT subject_open_id FROM feishu_delegated_subject WHERE purpose = %s",

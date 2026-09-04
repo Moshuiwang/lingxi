@@ -156,7 +156,6 @@ class HostFileAuthorizationStateStore:
 
     def claim(self, state: str, *, now: datetime | None = None) -> PendingAuthorization | None:
         """校验并立即消费 state；任何不通过都不触发外部换码。"""
-
         if not isinstance(state, str) or _STATE_PATTERN.fullmatch(state) is None:
             return None
         moment = _aware_utc(now or datetime.now(UTC), "当前时间")
@@ -321,7 +320,6 @@ class FeishuReauthorizationEntry:
         回调时还会**再判定一次**（见 :meth:`handle_callback`），这里的预检只
         为提前失败，不是唯一防线。
         """
-
         subject = expected_subject_open_id
         if self._mode == MODE_BOOTSTRAP:
             if subject is None:
@@ -363,7 +361,6 @@ class FeishuReauthorizationEntry:
         now: datetime | None = None,
     ) -> ReauthorizationResult:
         """处理授权回调；所有失败结果都不携带外部原始值。"""
-
         if not isinstance(state, str) or _STATE_PATTERN.fullmatch(state) is None:
             return self._failure("invalid_state", "授权入口已失效，请重新发起授权。")
         has_code = isinstance(code, str) and bool(code)

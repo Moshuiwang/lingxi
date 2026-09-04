@@ -119,7 +119,6 @@ class FeishuSheetsDeliveryError(RuntimeError):
 
 def _require_https(base_url: str) -> str:
     """飞书出站必须 HTTPS：误配 ``http://`` 会把 Bearer token 明文上路。"""
-
     if not isinstance(base_url, str) or not base_url.strip():
         raise ValueError("base_url 必须由配置注入，不得写死在代码里")
     text = base_url.strip()
@@ -159,7 +158,6 @@ def _require_user_open_id(open_id: str) -> str:
     ``feishu_docx_delivery._require_user_open_id``：把群/租户标识误传成用户
     open_id，要在**发出去之前**失败，而不是把「可管理」权限授予一个错误的收件人。
     """
-
     text = (open_id or "").strip()
     if not text.startswith(USER_OPEN_ID_PREFIX) or len(text) <= len(USER_OPEN_ID_PREFIX):
         raise ValueError(
@@ -176,7 +174,6 @@ def _safe_feishu_code(value: object) -> str:
     只在 ``value`` 是货真价实的 ``int``（排除 ``bool``）时插值，否则退化成固定
     标签，防止响应内容注入进异常消息/审计行。
     """
-
     if isinstance(value, int) and not isinstance(value, bool):
         return f"feishu_code_{value}"
     return "feishu_code_invalid"
@@ -199,7 +196,6 @@ def urllib_transport(
     """默认传输层：只发 HTTPS，不重试有副作用的请求（同
     ``feishu_docx_delivery.urllib_transport`` 的姿态）。
     """
-
     payload = json.dumps(body, ensure_ascii=False).encode() if body is not None else None
     headers = {"Content-Type": "application/json; charset=utf-8"} if body is not None else {}
     if token:
@@ -282,7 +278,6 @@ class LarkSheetsDelivery:
         本模块 ``MissingCodeTest`` 一组用例会从抛出
         ``FeishuSheetsDeliveryError`` 变红成静默返回空 dict。
         """
-
         if not isinstance(response, Mapping):
             raise FeishuSheetsDeliveryError("invalid_response_shape", definite=False)
         code = response.get("code")
@@ -301,7 +296,6 @@ class LarkSheetsDelivery:
         docx 那样额外调用一次接口才能拿到链接（见模块文档「与文档交付的差异点」
         第 1 条）。
         """
-
         text = (title or "").strip()
         if not text:
             raise ValueError("表格标题不能为空")
@@ -327,7 +321,6 @@ class LarkSheetsDelivery:
         （见模块文档「与文档交付的差异点」第 3 条：只有写值步的幂等性才需要
         特别说明，查询本身不产生任何副作用）。
         """
-
         token = _require_spreadsheet_token(spreadsheet_token)
         data = self._data(self._call("GET", f"{_SPREADSHEETS_V3_PATH}/{token}/sheets/query"))
         sheets = data.get("sheets")
@@ -369,7 +362,6 @@ class LarkSheetsDelivery:
         第二道纵深防线：不假设上游一定守约，收到不规则矩阵直接 ``ValueError``
         失败关闭，不猜测该怎么补。
         """
-
         token = _require_spreadsheet_token(spreadsheet_token)
         sid = _require_sheet_id(sheet_id)
         if rows is None or not isinstance(rows, (list, tuple)):
@@ -415,7 +407,6 @@ class LarkSheetsDelivery:
         差异是 ``type=sheet``（docx 是 ``type=docx``），端点、字段名完全一致，
         S-W0-3 探针实测：对个人 openid 原样接受、无降级。
         """
-
         token = _require_spreadsheet_token(spreadsheet_token)
         member_id = _require_user_open_id(open_id)
         self._data(
@@ -441,7 +432,6 @@ class LarkSheetsDelivery:
         ——同一接口族、同一口径，只是 ``type`` 参数值不同。返回的每一项只保留
         ``member_type``/``member_id``/``perm`` 三个字段，不透传其它字段。
         """
-
         token = _require_spreadsheet_token(spreadsheet_token)
         data = self._data(
             self._call(
@@ -472,7 +462,6 @@ def _column_letter(column_count: int) -> str:
     ``core/execution/document_delivery.py``）当前取 40，远小于 26×26，这里的
     两位字母上限已经足够覆盖，但实现本身不假设这个上限、支持任意正整数。
     """
-
     if not isinstance(column_count, int) or column_count < 1:
         raise ValueError("column_count 必须是正整数")
     letters = ""

@@ -80,7 +80,6 @@ def new_token() -> str:
     用 ``secrets`` 而不是 ``random``：后者是可预测的伪随机数发生器，用它签发凭据等于
     让任何知道种子的人算出别人的令牌。
     """
-
     return secrets.token_urlsafe(TOKEN_ENTROPY_BYTES)
 
 
@@ -97,7 +96,6 @@ def load_master_key(value: object) -> bytes:
     **不回显收到的值**，长度也只在越界时以数字形式出现：主密钥是全系统最敏感的一个值，
     它一旦进了异常消息，就会被日志、CI 输出和工单一路复制出去。
     """
-
     if not isinstance(value, str) or not value.strip():
         raise ValueError(
             f"MCP 令牌主密钥必须由配置注入（环境变量 {MASTER_KEY_ENV}），不得为空（不回显收到的值）"
@@ -121,7 +119,6 @@ class McpTokenCipher:
 
     def __repr__(self) -> str:
         """密钥不进对象的字符串形态（模块文档「明文的生命周期」）。"""
-
         return "McpTokenCipher(master_key=<已隐去>)"
 
     def encrypt(self, plaintext: str) -> str:
@@ -131,7 +128,6 @@ class McpTokenCipher:
         直接暴露"两份明文的前缀相同"。这一条由 ``tests/test_mcp_token_cipher.py`` 的
         ``IvRandomnessTest`` 钉着——同一明文连加两次必须得到不同的密文。
         """
-
         from cryptography.hazmat.primitives import padding
         from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 
@@ -152,7 +148,6 @@ class McpTokenCipher:
         放在解密之前：``cryptography`` 对畸形长度抛的是库内部异常，而我们要的是一个
         **可分类**的错误码，否则运维分不清"这行数据坏了"和"我们的实现坏了"。
         """
-
         from cryptography.hazmat.primitives import padding
         from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 
@@ -192,7 +187,6 @@ def looks_like_cipher(value: object) -> bool:
     :mod:`lingxi.core.permission.publish_row` 用同一套判据（那里只用标准库重写，
     因为 ``core`` 不 import ``adapters``）。两处形状判据必须一致，改动时一起改。
     """
-
     if not isinstance(value, str) or not value or value.strip() != value:
         return False
     try:

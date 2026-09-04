@@ -22,7 +22,6 @@ def build_hook_matchers(
     ``PermissionRequest`` 实测从不触发，继续注册是为了在 SDK 或 CLI 升级后能第一
     时间发现这一结论失效，不构成审计依据。
     """
-
     from claude_agent_sdk import HookMatcher
 
     matcher = HookMatcher(

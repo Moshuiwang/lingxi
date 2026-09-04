@@ -63,7 +63,6 @@ class ImportResult:
 
 def _issue_payload(issues: Sequence[Issue]) -> list[dict[str, Any]]:
     """把校验结论转成可入库的结构信息；`detail` 本身已按脱敏纪律不含人员数据。"""
-
     return [
         {
             "table": issue.table,
@@ -94,7 +93,6 @@ class PostgresGalaxyImportStore:
         会让下游继续使用可能已失效的权限与超期人员副本（合同九十天上限；
         Codex 复查发现）。没有新鲜批次时如实返回 None，由调用方安全失败。
         """
-
         with (
             connect(self._dsn, timeouts=self._timeouts) as connection,
             connection.cursor() as cursor,
@@ -123,7 +121,6 @@ class PostgresGalaxyImportStore:
         self, cursor: Any, source_table: str, rows: Sequence[Mapping[str, Any]]
     ) -> int:
         """写入一张表的全部行，返回写入行数。子类可覆盖以注入故障（测试用）。"""
-
         if not rows:
             return 0
         target = TARGET_TABLES[source_table]
@@ -150,7 +147,6 @@ class PostgresGalaxyImportStore:
         confirm_unchanged: bool = False,
     ) -> ImportResult:
         """执行「校验 → 检查已有数据 → 写入 → 回读确认」。"""
-
         report = validate_export(tables)
         if not report.ok:
             return ImportResult(

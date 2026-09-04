@@ -66,7 +66,6 @@ class FeishuTenantTokenError(RuntimeError):
 
 def _require_https(base_url: str) -> str:
     """飞书出站必须 HTTPS：误配 ``http://`` 会把 App Secret 明文上路。"""
-
     if not isinstance(base_url, str) or not base_url.strip():
         raise ValueError("base_url 必须由配置注入，不得写死在代码里")
     text = base_url.strip()
@@ -91,7 +90,6 @@ def urllib_transport(method: str, url: str, *, body: Mapping[str, Any] | None = 
     """默认传输层：只发 HTTPS，不重试有副作用的请求（换令牌本身就是一次性调用，
     重试会在飞书那一侧产生第二次计次；调用方按分类失败关闭，下一轮自然会再试）。
     """
-
     payload = json.dumps(body, ensure_ascii=False).encode() if body is not None else None
     headers = {"Content-Type": "application/json; charset=utf-8"} if body is not None else {}
     request = Request(url, data=payload, headers=headers, method=method)
@@ -111,7 +109,8 @@ def urllib_transport(method: str, url: str, *, body: Mapping[str, Any] | None = 
 
 class FeishuTenantTokenClient:
     """应用身份令牌的换取调用。上层只得到 :class:`DerivedAccessToken`，不接触飞书
-    响应字典。"""
+    响应字典。
+    """
 
     def __init__(
         self,
@@ -138,7 +137,6 @@ class FeishuTenantTokenClient:
         "寿命未知就把判断推给缓存层"的姿态——没有别的东西需要抢救，直接拒绝更简单、
         更早暴露问题。
         """
-
         response = self._transport(
             "POST",
             f"{self._base_url}{_TENANT_TOKEN_PATH}",

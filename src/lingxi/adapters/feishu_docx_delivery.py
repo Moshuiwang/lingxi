@@ -351,7 +351,6 @@ class FeishuDocxDeliveryError(RuntimeError):
 
 def _require_https(base_url: str) -> str:
     """飞书出站必须 HTTPS：误配 ``http://`` 会把 Bearer token 明文上路。"""
-
     if not isinstance(base_url, str) or not base_url.strip():
         raise ValueError("base_url 必须由配置注入，不得写死在代码里")
     text = base_url.strip()
@@ -372,7 +371,6 @@ def _require_tenant_domain(value: str) -> str:
     """校验用于拼文档链接的裸域名（不是 API base_url，见模块文档「文档 URL 的
     构造」一节）：不含协议、路径或空白，避免把一段可注入的值悄悄拼进对外链接。
     """
-
     if not isinstance(value, str) or not value.strip():
         raise ValueError("tenant_domain 必须由配置注入，不得写死在代码里")
     text = value.strip()
@@ -396,8 +394,8 @@ def _require_user_open_id(open_id: str) -> str:
     """校验用户 ``open_id`` 形状；不合法就快速失败，且不回显取到的值——理由同
     :func:`lingxi.adapters.feishu_user_message.validate_user_open_id`（把群/
     租户标识误传成用户 open_id，要在**发出去之前**失败，而不是把「可管理」权限
-    授予一个错误的收件人）。"""
-
+    授予一个错误的收件人）。
+    """
     text = (open_id or "").strip()
     if not text.startswith(USER_OPEN_ID_PREFIX) or len(text) <= len(USER_OPEN_ID_PREFIX):
         raise ValueError(
@@ -414,7 +412,6 @@ def _safe_feishu_code(value: object) -> str:
     ``value`` 是货真价实的 ``int``（排除 ``bool``，它是 ``int`` 子类）时插值，
     否则退化成固定标签，防止响应内容注入进异常消息/审计行。
     """
-
     if isinstance(value, int) and not isinstance(value, bool):
         return f"feishu_code_{value}"
     return "feishu_code_invalid"
@@ -430,7 +427,6 @@ def _build_markdown_content(title: str, markdown: str) -> str:
     （见 :meth:`LarkDocxDelivery.create_document_with_markdown`），这里不做
     任何静默转义。
     """
-
     return f"{_TITLE_OPEN_TAG}{title}{_TITLE_CLOSE_TAG}\n\n{markdown}"
 
 
@@ -455,7 +451,6 @@ def _degraded_reason(data: Mapping[str, Any]) -> str | None:
     丢弃且既不产生 ``warnings``、``result`` 也仍是 ``success``——那一类丢弃在
     响应里没有任何痕迹，本函数看不见（模块文档「坑二」末段如实登记）。
     """
-
     result = data.get("result")
     if isinstance(result, str) and result.strip().lower() == _RESULT_FAILED:
         raise FeishuDocxDeliveryError(DOCS_AI_RESULT_FAILED, definite=True)
@@ -497,7 +492,6 @@ def urllib_transport(
     不证明请求没有生效**，因此响应体里那个业务码在这里不具备判别力，不读。
     4xx 与 2xx 仍然照常解析：飞书的业务错误码走这两类状态码返回。
     """
-
     payload = json.dumps(body, ensure_ascii=False).encode() if body is not None else None
     headers = {"Content-Type": "application/json; charset=utf-8"} if body is not None else {}
     if token:
@@ -574,8 +568,8 @@ class LarkDocxDelivery:
         """飞书业务错误码非 0 → 抛出 :class:`FeishuDocxDeliveryError`
         （``definite=True``）；这是本模块唯一判定"飞书明确拒绝"的位置，**刻意
         不做静默降级**——一旦这里被改成"记日志后继续"，所有写操作都会在飞书拒绝
-        的情况下被上层误判为成功。"""
-
+        的情况下被上层误判为成功。
+        """
         if not isinstance(response, Mapping):
             raise FeishuDocxDeliveryError("invalid_response_shape", definite=False)
         code = response.get("code")
@@ -590,7 +584,6 @@ class LarkDocxDelivery:
         ``POST /docx/v1/documents``，S0 探针实测的请求体只有 ``title`` 一个字段
         （不传 ``folder_token`` 时飞书把文档建在应用的默认位置）。
         """
-
         text = (title or "").strip()
         if not text:
             raise ValueError("文档标题不能为空")
@@ -613,7 +606,6 @@ class LarkDocxDelivery:
         请求的 ``index`` 固定为 0（本模块只服务"整篇正文一次写完"这个场景，不
         提供中途插入）。
         """
-
         doc_id = _require_document_id(document_id)
         texts = list(paragraphs) if paragraphs is not None else []
         if not texts:
@@ -647,7 +639,6 @@ class LarkDocxDelivery:
         ——开关关闭时走段落路径**不是降级**（那是这套部署本来就要求的排版），
         用降级机制去表达它会让调用方把一次正常交付告知成"格式已简化"。
         """
-
         return self._markdown_convert_enabled
 
     def create_document_with_markdown(self, title: str, markdown: str) -> CreatedDocument:
@@ -687,7 +678,6 @@ class LarkDocxDelivery:
         判定（``result`` ＋ ``warnings`` 一起看，拿不准倒向多说一句），调用方
         必须接住并如实告知用户——丢掉它等于静默降级。
         """
-
         text = (title or "").strip()
         if not text:
             raise ValueError("文档标题不能为空")
@@ -729,7 +719,6 @@ class LarkDocxDelivery:
         ``POST /drive/v1/permissions/{document_id}/members?type=docx``，S0 探针
         实测：对个人 openid 原样接受、无降级。
         """
-
         doc_id = _require_document_id(document_id)
         member_id = _require_user_open_id(open_id)
         self._data(
@@ -763,7 +752,6 @@ class LarkDocxDelivery:
         ``_member_signature`` 取值口径），不透传飞书响应里可能携带的其它字段
         （例如真实响应额外带的 ``perm_type``）。
         """
-
         doc_id = _require_document_id(document_id)
         data = self._data(
             self._call(
@@ -801,7 +789,6 @@ class LarkDocxDelivery:
         协作者列表放在 ``data.items``，这里假定同一接口族同一口径，一并抛
         ``LookupError`` 归类为结果不明（成功响应缺可回读结构 ≠ 确定为空）。
         """
-
         doc_id = _require_document_id(document_id)
         data = self._data(
             self._call("GET", f"{_DOCX_DOCUMENTS_PATH}/{doc_id}/blocks/{doc_id}/children")
@@ -816,7 +803,6 @@ class LarkDocxDelivery:
 
         纯本地拼接，不发起任何请求。
         """
-
         doc_id = _require_document_id(document_id)
         return f"https://{self._tenant_domain}/docx/{doc_id}"
 
