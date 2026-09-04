@@ -15,8 +15,8 @@ from .audit import TurnAudit
 from .tool_policy import ToolPolicy
 
 # 需要注册的 hook 事件。``PostToolUseFailure`` 是工具抛错的唯一来源；
-# ``PermissionDenied`` / ``PermissionRequest`` 实测从不触发（Issue #23），
-# 保留注册只为持续验证这一结论，不作为审计依据。
+# ``PermissionDenied`` / ``PermissionRequest`` 实测从不触发，保留注册只为持续
+# 验证这一结论，不作为审计依据。
 HOOK_EVENTS: tuple[str, ...] = (
     "PreToolUse",
     "PostToolUse",
@@ -30,53 +30,26 @@ OBSERVATION_ONLY_EVENTS: tuple[str, ...] = (
 )
 
 # 认得的事件名全集。收到不在这里、却带着 tool_name 的事件时留痕，不当作无事发生。
-#
-# **这条留痕的覆盖面比字面看起来窄。** 适配器只按 HOOK_EVENTS 与
-# OBSERVATION_ONLY_EVENTS 里的名字注册；SDK 真把 `PreToolUse` 改名的话，我们注册
-# 的那个名字根本不会再被调用，本分支永远进不去。它只在「SDK 用一个我们认不出的
-# 事件名回调我们已注册的 matcher」时生效。**不得据此声称"事件改名会自动被发现"**
-# ——事件名是否仍然有效只有真实 SDK 的冒烟检查与 L4a 能回答，见 V-执行-11。
+# 这条留痕的覆盖面比字面看起来窄——适配器只按 HOOK_EVENTS 与
+# OBSERVATION_ONLY_EVENTS 里的名字注册，SDK 真把事件改名的话，我们注册的名字
+# 根本不会再被调用，这条分支永远进不去，只在"SDK 用一个我们认不出的事件名
+# 回调我们已注册的 matcher"时生效，不能据此声称"事件改名会自动被发现"。
 KNOWN_EVENTS: frozenset[str] = frozenset(HOOK_EVENTS) | frozenset(OBSERVATION_ONLY_EVENTS)
 
-# CLI 对超大工具输出的通用截断形态（Issue #323，2026-08-26 内测实证
-# task `tsk_01M0YA8C1P1PFTZVWF3PY92P4Q`）：把结果存成本地临时文件，提示模型
-# "exceeds maximum allowed tokens...Output has been saved to .../tmp/...
-# Use offset and limit parameters to read specific portions of the file"。
-# worker 白名单里没有 Read/Bash，模型照着这条提示走只会连续撞两种必然被拒的
-# 工具——实测同一问句因此多花约四成时长（19 次调用/4 次被拒/488s）。
-#
-# 正则只锁「exceeds maximum allowed tokens」与「offset and limit parameters」
-# 这两段——它们是该提示模板里最不像随版本措辞漂移的部分（中间的字节数、文件路径
-# 每次都不同，两头的固定短语是模板骨架）。用 DOTALL + 非贪婪跨段匹配，能扛住
-# 中间内容变化；两段都要求命中，是为了不误伤"截断"以外、只是恰好提到其中一个
-# 短语的正常业务结果（例如指标名称、说明文字里偶然出现"tokens"）。
-# 大小写不敏感只是防御性的，未在真实样本里见过大小写变体。
-#
-# **中段距离上限 2000 字符**（独立审核 P3-5）：两段固定短语之间实测只隔着字节数
-# 与一个 ``/tmp`` 文件路径，远小于这个上限；加上限不是为了贴合真实样本长度，
-# 而是防御性地给 `.*?` 的搜索范围封顶——`_tool_result_text` 现在会在拿不到标准
-# 文本字段时兜底整段 JSON dump（见该函数文档），被扫描的文本可能远比"一段错误
-# 提示"大得多，不加距离上限时两个固定短语一旦分别出现在一份很大的正常业务结果
-# 里相距很远的位置，仍然可能被巧合命中；加了上限后，这类跨越业务数据两端偶然
-# 撞在一起的极端假阳性被排除，真实截断提示（两段紧邻）不受影响。
-#
-# **这条边界与 `_MESSAGE_BUFFER_OVERFLOW_PATTERN`（见
-# ``lingxi.adapters.claude_agent_session``）不是同一个问题**：那个匹配的是
-# SDK 读流缓冲上限压平成的裸异常（会话级、整条消息读不出来）；这个匹配的是
-# 单次 MCP 工具调用**正常返回**、但被 CLI 自己截断改写过的回执内容
-# （PostToolUse 能正常收到，只是文本在骗模型去读文件）。
+# CLI 对超大工具输出的通用截断形态：把结果存成本地临时文件，提示模型改用
+# offset/limit 读那个文件——worker 白名单里没有 Read/Bash，模型照着走只会
+# 连续撞必然被拒的工具。正则只锁两段固定短语，DOTALL + 非贪婪跨段匹配并加
+# 距离上限防止被正常业务结果巧合命中；与消息缓冲上限异常是两个不同问题：
+# 那个是会话级读流异常，这个是单次调用正常返回但被 CLI 自己截断改写。
 _MCP_OVERSIZE_RESULT_PATTERN = re.compile(
     r"exceeds maximum allowed tokens.{0,2000}?offset and limit parameters",
     re.IGNORECASE | re.DOTALL,
 )
 
-# 替换后模型看到的完整文本。三条硬要求（对应 #323 的可观测完成标准）：
-# 不含 /tmp 路径、不含"读文件""offset/limit"这类分页引导、明确给出可执行的
-# 下一步（缩小范围重新查询）。措辞与运行时提示词 v5 现行口径核对一致——
-# 提示词原文「不要尝试读取那个文件（会被拒绝），直接改用更粗的聚合粒度、更短的
-# 时间段或更少的维度重新查询」（ssh biai-stage 只读核对，2026-08-27）；
-# 这里是结构性兜底，提示词未来裁剪掉这条时改写仍然生效，因此各自独立措辞，
-# 不做字符串复用。
+# 替换后模型看到的完整文本。三条硬要求：不含 /tmp 路径、不含"读文件"
+# "offset/limit"这类分页引导、明确给出可执行的下一步（缩小范围重新查询）。
+# 这里是结构性兜底，与运行时提示词各自独立措辞，不做字符串复用——提示词未来
+# 裁剪掉相关条款时，这里的改写仍然生效。
 MCP_OVERSIZE_RESULT_REWRITE = (
     "本次查询返回的数据量超过单次可处理的上限，原始结果不可用。"
     "请缩小查询范围后重新调用查询工具——例如缩短时间范围、减少指标或公司数量、"
@@ -89,14 +62,11 @@ def _iter_tool_result_text_fragments(value: Any) -> list[str]:
 
     真实 MCP 回执常见形状不止字符串/``{"text": ...}``/纯内容块数组三种——典型
     还有 ``{"content": [{"type": "text", "text": ...}], "isError": ...}``
-    （Agent SDK 的 ``CallToolResult`` 外层信封，`isError` 与其它非文本字段一起
-    被忽略）。此前 Mapping 分支只读顶层 ``"text"``，这一形状因为没有顶层
-    ``text`` 键、只有嵌套在 ``content`` 里的文本块，永远拿不到文本，改写因此
-    对这一最典型的真实回执形状**静默不生效**（Issue #328 opus 审查 P1-2）。
-    这里改为递归下钻：``Mapping`` 既读自己的 ``"text"`` 也读 ``"content"``
-    的内容（`content` 本身可能是字符串或块数组），``list``/``tuple`` 逐项递归。
+    （Agent SDK 的 ``CallToolResult`` 外层信封）。``Mapping`` 既读自己的
+    ``"text"`` 也读 ``"content"`` 的内容（``content`` 本身可能是字符串或块
+    数组），``list``/``tuple`` 逐项递归——只读顶层 ``"text"`` 会让这一最典型的
+    真实回执形状永远拿不到文本，改写因此静默不生效。
     """
-
     if isinstance(value, str):
         return [value]
     if isinstance(value, Mapping):
@@ -117,13 +87,13 @@ def _iter_tool_result_text_fragments(value: Any) -> list[str]:
 
 
 def _tool_result_text(tool_response: Any) -> str:
-    """把 :func:`_iter_tool_result_text_fragments` 拼成一段文本；递归没能捞出
-    任何文本片段时（既没有标准 ``content``/``text`` 字段，也不是数组/字符串），
-    兜底整体 JSON dump 一遍再交给正则——不追求精确字段路径，只求不因为一个没
-    预料到的形状而漏判一条本该被改写的截断提示。dump 失败（例如出现不可序列
-    化对象）时退回空串，等价于"不识别"，不是误判为截断。
-    """
+    """把 :func:`_iter_tool_result_text_fragments` 拼成一段文本。
 
+    递归没能捞出任何文本片段时（既没有标准 ``content``/``text`` 字段，也不是
+    数组/字符串），兜底整体 JSON dump 一遍再交给正则——不追求精确字段路径，
+    只求不因为一个没预料到的形状而漏判一条本该被改写的截断提示。dump 失败
+    时退回空串，等价于"不识别"，不是误判为截断。
+    """
     fragments = _iter_tool_result_text_fragments(tool_response)
     if fragments:
         return "\n".join(fragments)
@@ -142,33 +112,14 @@ def _is_oversize_tool_result(tool_response: Any) -> bool:
     回执分类成功/失败，这里只要够用来判断"是不是那条截断提示"。文本提取本身见
     :func:`_tool_result_text`。
     """
-
     return bool(_MCP_OVERSIZE_RESULT_PATTERN.search(_tool_result_text(tool_response)))
 
 
-# 包装拒绝熔断阈值（Issue #352；产品负责人 2026-08-27/28 裁定留痕）：2026-08-27
-# 生产事故里，qwen3.7-plus 在一次「查询+成文」组合任务中连续 20 次用
-# ``Bash: claude mcp call …`` 包装调用问数 MCP（外加 1 次 ``Agent`` 工具），全部
-# 撞白名单拒绝、零原生调用，烧尽 20 轮上限才失败——用户体验与成本都很差，且
-# 已确认导回文案（#349）逐字送达也劝不动模型。产品负责人裁定方案 1「包装拒绝
-# 熔断」：同一回合内非 MCP 工具被拒累计达到该阈值即终止回合，不再烧尽单次处理
-# 轮数上限。默认值 5 是 Issue #352 登记的产品负责人已批值；调整它必须回到该
-# Issue 或后续 Issue 重新裁定，不在这里静默改。
-#
-# **触发口径收窄（Issue #352 独立审查 P2-1，产品负责人 2026-08-28 裁定）**：
-# 熔断触发条件从"单看拒绝次数"改为合取——拒绝次数达阈值 **且** 本回合零次放行的
-# 原生 MCP 调用。这是事故签名原文"零原生调用"的直接收窄，不是新发明的口径。
-# 取证依据（stage 全史 95 个真实任务实测复核）：成功任务的 `guard_denied_count`
-# 最高为 4、达到或超过阈值 5 的任务为零——阈值单独看已经没有太多裕度（4 距 5
-# 只差 1）；但这 95 个成功任务无一例外都有至少一次放行的原生调用（模型最终
-# 还是摸到了正确工具，只是路上包装式试探了几次）。加上合取项之后：正常任务
-# 哪怕撞到 4 次包装拒绝的边缘情形，只要有过一次放行调用就不会被误熔断——
-# 经验误伤面归零；事故签名本身（连续多次包装拒绝、零原生调用）完整保留在
-# 触发范围内；最坏情况（模型全程零放行、拒绝次数远超阈值）合取项恒真，等价于
-# 收窄前的现状，不会比没有这条合取项更差。这是"宁可漏保、不可误伤"的取舍：
-# 放宽触发口径换来的是绝不会打断一个正在正常工作的回合，代价是极少数"模型
-# 全程只包装调用、一次原生调用都没有但还没攒够阈值次拒绝"的场景要多等几次
-# 拒绝才谈得上熔断——这类场景本来就在阈值本身的等待窗口内，不是新引入的风险。
+# 包装拒绝熔断阈值：同一回合内非 MCP 工具被拒累计达到该阈值即终止回合，不再
+# 烧尽单次处理轮数上限——防的是模型连续用内置工具包装调用问数 MCP、全部撞
+# 白名单拒绝、零原生调用的情形。默认值 5，调整需产品重新决策。触发条件是
+# 合取，不是单看拒绝次数：拒绝次数达阈值 **且** 本回合零次放行的原生 MCP
+# 调用，这样正常任务不会被误熔断，事故特征仍完整保留在触发范围内。
 WRAPPER_DENIAL_FUSE_THRESHOLD = 5
 
 
@@ -189,106 +140,89 @@ class ToolGateway:
         raw_pre_tool_use: Callable[[str | None, Any], None] | None = None,
         wrapper_denial_fuse_threshold: int = WRAPPER_DENIAL_FUSE_THRESHOLD,
     ) -> None:
+        """装配判定所需的端口与本回合各项计数的初始状态。"""
         self._policy = policy
         self._audit = audit
         self._mark_external_side_effect = mark_external_side_effect
-        # 内测轮内容级采集的唯一原始入参出口（Issue #251/#304 批次 3，可选、默认
-        # None）：`self._audit` 记的是**经字段白名单裁剪过**的入参（见
-        # `AuditRedactor.redact`），采集要的是裁剪之前的原始值——因此不能从
-        # `self._audit` 反推，必须在这里另开一个独立分支，在传给审计之前把原始
-        # `tool_input` 递给调用方注入的收集器。默认 `None` 时这个分支整体不存在，
-        # 不产生任何额外调用、不额外持有一份原始入参——这是"默认关闭"在这一层的
-        # 具体形状：不是多一个 if 分支跳过写库，而是这份收集器压根没被构造出来
-        # （构造方见 apps/worker/turn.py）。失败必须被这里兜住、不得影响工具判定
-        # 本身（同 `_mark_side_effect` 的既有姿态）。
+        # 内测轮内容级采集的唯一原始入参出口（可选、默认 None）：``self._audit``
+        # 记的是经字段白名单裁剪过的入参，采集要的是裁剪之前的原始值，因此不能
+        # 从 ``self._audit`` 反推，必须在这里另开一个独立分支。默认 None 时这个
+        # 分支整体不存在，不产生任何额外调用——这是"默认关闭"在这一层的具体
+        # 形状：不是多一个 if 分支跳过写库，而是收集器压根没被构造出来。
         self._raw_pre_tool_use = raw_pre_tool_use
-        # 语义化进度的工具调用开始通知（Issue #321 方向 C）：默认 ``None``，由
-        # ``set_tool_call_listener`` 按回合装配（见 ``apps/worker/turn.py`` 的
-        # ``run_turn``）。不做成构造参数——``ToolGateway`` 在
-        # ``WorkerTurnExecutor.__init__`` 里只建一次，而这个监听器要跟着每一次
-        # ``run_turn()`` 调用传入的回调走（回调闭包了那一次任务的进度状态），
-        # 因此需要一个可以在构造之后重新挂载的入口，与固定在构造期的
-        # ``raw_pre_tool_use``（内容级采集，语义上跟着整个执行器实例、不是单次
-        # 回合）用途不同。
+        # 语义化进度的工具调用开始通知：默认 None，由 set_tool_call_listener
+        # 按回合装配。不做成构造参数——ToolGateway 只建一次，而这个监听器要跟
+        # 着每一次 run_turn() 调用传入的回调走（回调闭包了那一次任务的进度
+        # 状态），因此需要一个可以在构造之后重新挂载的入口。
         self._on_tool_call: Callable[[str], None] | None = None
-        # 包装拒绝熔断（Issue #352）：同一回合内累计的「非 MCP 工具被拒」次数。
-        # 与 `TurnAudit` 的回合级状态同一姿态——按调用方约定，必须在每次尝试
-        # 开头调 `reset_wrapper_denial_fuse()`（见 `apps/worker/turn.py` 的
-        # `run_turn`），否则第二个回合会带着第一个回合的计数继续累加。
+        # 包装拒绝熔断：同一回合内累计的「非 MCP 工具被拒」次数。与 TurnAudit
+        # 的回合级状态同一姿态——按调用方约定，必须在每次尝试开头调
+        # reset_wrapper_denial_fuse()，否则第二个回合会带着第一个回合的计数
+        # 继续累加。
         self._wrapper_denial_fuse_threshold = wrapper_denial_fuse_threshold
         self._wrapper_denial_count = 0
-        # 熔断只通知一次：达到阈值之后同一回合内继续出现的拒绝（中断请求已发出
-        # 但 SDK 还没来得及停下来这段真实存在的窗口，见 `claude_agent_session.
-        # run_single_turn` 的中断竞态）不得重复触发回调、重复留痕。
+        # 熔断只通知一次：达到阈值之后同一回合内继续出现的拒绝（中断请求已发
+        # 出但 SDK 还没来得及停下来这段真实存在的窗口）不得重复触发回调、重复
+        # 留痕。
         self._wrapper_denial_fuse_tripped = False
         self._on_wrapper_fuse_tripped: Callable[[int], None] | None = None
-        # 熔断触发条件的合取项（Issue #352 P2-1 裁定，见 WRAPPER_DENIAL_FUSE_
-        # THRESHOLD 上方注释）：本回合累计的「放行的 mcp__ 前缀工具调用」次数。
-        # 与 `_wrapper_denial_count` 同一姿态——回合级窗口状态，必须跟着
-        # `reset_wrapper_denial_fuse()` 一起清零，不得跨回合/跨尝试累计。
+        # 熔断触发条件的合取项：本回合累计的「放行的 mcp__ 前缀工具调用」次数。
+        # 与 _wrapper_denial_count 同一姿态——回合级窗口状态，必须跟着
+        # reset_wrapper_denial_fuse() 一起清零，不得跨回合/跨尝试累计。
         self._granted_mcp_count = 0
 
     @property
     def audit(self) -> TurnAudit:
+        """本网关绑定的审计出口。"""
         return self._audit
 
     @property
     def wrapper_denial_count(self) -> int:
-        """本回合累计的「非 MCP 工具被拒」次数（Issue #352），供调用方观测/断言。"""
-
+        """本回合累计的「非 MCP 工具被拒」次数，供调用方观测/断言。"""
         return self._wrapper_denial_count
 
     @property
     def granted_mcp_count(self) -> int:
-        """本回合累计的「放行的 mcp__ 前缀工具调用」次数（Issue #352 P2-1 裁定），
-        供调用方观测/断言；也是熔断触发条件的合取项——见 ``_on_pre_tool_use``
-        尾部的判定与 ``WRAPPER_DENIAL_FUSE_THRESHOLD`` 上方注释里的取证依据。
-        """
+        """本回合累计的「放行的 mcp__ 前缀工具调用」次数，供调用方观测/断言。
 
+        也是熔断触发条件的合取项——见 ``_update_wrapper_denial_fuse`` 与
+        ``WRAPPER_DENIAL_FUSE_THRESHOLD`` 上方注释里的取证依据。
+        """
         return self._granted_mcp_count
 
     def reset_wrapper_denial_fuse(self) -> None:
-        """开始新的一个回合前清零包装拒绝熔断计数（Issue #352）。
+        """开始新的一个回合前清零包装拒绝熔断计数。
 
         与 ``TurnAudit.start_turn()`` 同一时机、同一姿态：这是"同一回合内"的
-        窗口计数，跨回合不累计。调用方必须在每次尝试开头（与
-        ``self._audit.start_turn()`` 同一时机）显式调用。``_granted_mcp_count``
-        （P2-1 裁定新增的合取项计数）与 ``_wrapper_denial_count`` 同一时机一起
-        清零——否则 resume-fallback 的第二次尝试会带着第一次尝试里放行过的
-        原生调用痕迹，让本该正常触发的熔断被错误地拦下来。
+        窗口计数，跨回合不累计。调用方必须在每次尝试开头显式调用；
+        ``_granted_mcp_count``（合取项计数）与 ``_wrapper_denial_count`` 同一
+        时机一起清零，否则 resume-fallback 的第二次尝试会带着第一次尝试里
+        放行过的原生调用痕迹，让本该正常触发的熔断被错误地拦下来。
         """
-
         self._wrapper_denial_count = 0
         self._wrapper_denial_fuse_tripped = False
         self._granted_mcp_count = 0
 
     def set_wrapper_fuse_listener(self, callback: Callable[[int], None] | None) -> None:
-        """登记（或清除）包装拒绝熔断触发时的回调（Issue #352）。
+        """登记（或清除）包装拒绝熔断触发时的回调。
 
         回调只在阈值**第一次**被达到的那一次调用（由 ``_wrapper_denial_fuse_
         tripped`` 哨兵防重入），入参是触发时的累计拒绝次数。这里只负责"发现
         熔断条件已满足"；真正让回合停下来（向 Agent SDK 会话发出 interrupt）
-        是调用方（``apps/worker/turn.py``）的职责——本类是纯逻辑层，不知道、
-        也不需要知道 SDK 会话的存在（见文件头）。回调异常与 ``set_tool_call_
-        listener`` 同一姿态：不得影响工具判定本身。
+        是调用方的职责——本类是纯逻辑层，不知道、也不需要知道 SDK 会话的存在。
+        回调异常不得影响工具判定本身。
         """
-
         self._on_wrapper_fuse_tripped = callback
 
     def set_tool_call_listener(self, callback: Callable[[str], None] | None) -> None:
-        """登记（或清除）本回合的工具调用开始通知（Issue #321 方向 C）。
+        """登记（或清除）本回合的工具调用开始通知。
 
-        回调收到的是 :class:`~lingxi.core.execution.tool_policy.PolicyVerdict` 的
-        ``tool_name``——判定之后的规范化值（合法工具名原样、畸形输入已经被
-        ``ToolPolicy._display_name`` 投影成 ``"<空>"``/``"<类型名>"`` 这类占位符，
-        见 ``tool_policy.py``），不是 hook 事件里未经校验的原始 ``tool_name``。
-        既被允许也被拒绝的调用都会通知——这只是"用户可见的语义化进度"要看的
-        「模型发起过一次调用」信号，不代表调用真的执行了；调用是否真的执行、
-        是否成功由 ``PostToolUse``/``PostToolUseFailure`` 记账，两者互不影响、
-        互不覆盖。回调异常必须被 ``_on_pre_tool_use`` 兜住，不能影响工具判定
-        本身（与 ``raw_pre_tool_use`` 同一姿态）。
+        回调收到的是判定之后规范化的 ``tool_name``（合法工具名原样，畸形输入
+        已投影成占位符），不是 hook 事件里未经校验的原始 ``tool_name``。既被
+        允许也被拒绝的调用都会通知——这只是"模型发起过一次调用"信号，不代表
+        调用真的执行了；调用是否真的执行由 ``PostToolUse``/``PostToolUseFailure``
+        记账，两者互不影响。回调异常必须被兜住，不能影响工具判定本身。
         """
-
         self._on_tool_call = callback
 
     async def on_hook_event(
@@ -298,7 +232,6 @@ class ToolGateway:
         _context: Any = None,
     ) -> dict[str, Any]:
         """Agent SDK 的 hook 回调签名。返回空字典表示不干预。"""
-
         event = hook_input.get("hook_event_name")
         tool_name = hook_input.get("tool_name")
         tool_input = hook_input.get("tool_input")
@@ -312,9 +245,8 @@ class ToolGateway:
             self._audit.record_executed(tool_name=tool_name, tool_use_id=call_id)
             # 范围刻意只限只读问数 MCP：改写权限本身就是"能替换模型看到的工具
             # 结果"，只在本 Story 唯一放行的只读面上开这个口子。非 MCP 工具即使
-            # 输出恰好命中同一段截断特征，也不改写——`updatedMCPToolOutput` 本来
-            # 就只对 MCP 生效（SDK 类型声明），这里的前缀判断是双重把关，不依赖
-            # SDK 那一侧的字段隔离单独兜底。
+            # 输出恰好命中同一段截断特征，也不改写——``updatedMCPToolOutput``
+            # 本来就只对 MCP 生效（SDK 类型声明），这里的前缀判断是双重把关。
             if tool_name.startswith("mcp__") and _is_oversize_tool_result(
                 hook_input.get("tool_response")
             ):
@@ -352,31 +284,24 @@ class ToolGateway:
 
     @staticmethod
     def _is_side_effecting_tool(tool_name: str) -> bool:
-        # 本 Story 的唯一放行能力是只读 MCP；其它真正执行到的工具都按可能有副作用
-        # 处理。未经过 PreToolUse 的旁路仍由报告的 ungated_calls 拦截收口。
-        #
-        # `mcp__delivery__deliver_document`（Issue #341 S-ES-2）**不是**这条经验
-        # 规则的例外（opus 审查 P2-1，撤销此前把它显式列为例外的修复）。这个工具
-        # 调用一次确实会在进程内登记/覆盖本轮的文档交付请求，但它**没有任何跨进程
-        # 副作用**：不发外部请求、不落任何持久化数据，只是回合级内存状态。真正落库
-        # 的一步在 `adapters/postgres_conversation/_queue_outbox.py::
-        # write_terminal_event`——那一步由 `task_document_delivery_request.task_id`
-        # 的 UNIQUE 约束（迁移 0074）与"终态写入同一个事务"两条防线保证幂等：同一个
-        # `task_id` 重放多次，至多插入一行。把这个工具错误地标成"有副作用"，代价是
-        # 崩溃恢复路径（`adapters/postgres_conversation/_queue_lifecycle.py::
-        # reclaim_stale`）会因为 `side_effect_state='possible'` 判定 `safe_retry=
-        # False`，把本可以安全重排回 `queued` 的任务转判 `side_effect_uncertain`
-        # 失败终态——一个只是想要一份文档的用户，因为这个工具调用被错误归类，反而
-        # 从"重试一次就能拿到答案"变成"当场收到失败通知"，而它本该是全部 mcp__
-        # 工具里最经得起重放的那一个。
+        """判定一个已执行的工具是否可能产生外部副作用。
+
+        唯一放行能力是只读 MCP；其它真正执行到的工具都按可能有副作用处理。
+        ``mcp__delivery__deliver_document`` 不是例外——它只登记/覆盖回合级
+        内存状态，没有任何跨进程副作用，真正落库那一步由 UNIQUE 约束与同
+        事务写入保证幂等；错误标成"有副作用"会让崩溃恢复把它误判为不安全
+        重排。
+        """
         return not tool_name.startswith("mcp__")
 
-    def _on_pre_tool_use(
-        self, tool_name: Any, tool_input: Any, call_id: str | None
-    ) -> dict[str, Any]:
-        verdict = self._policy.decide(
-            tool_name, tool_input if isinstance(tool_input, Mapping) else None
-        )
+    def _notify_pre_tool_observers(
+        self, verdict_tool_name: str, tool_input: Any, call_id: str | None
+    ) -> None:
+        """把这次调用同时递给内容采集与进度通知两个可选观察者。
+
+        两者互相独立、失败互不影响，也都不得影响工具判定本身：观察者的可用性
+        与本次判定结果无关。
+        """
         if self._raw_pre_tool_use is not None:
             try:
                 self._raw_pre_tool_use(call_id, tool_input)
@@ -384,50 +309,53 @@ class ToolGateway:
                 pass
         if self._on_tool_call is not None:
             try:
-                self._on_tool_call(verdict.tool_name)
+                self._on_tool_call(verdict_tool_name)
             except Exception:  # 进度通知失败不得影响工具判定本身
                 pass
-        # 先把响应算出来，再记账：记账处理的是模型可控的入参，一旦它抛异常，
-        # 异常会沿 hook 回调向上抛，把这次拒绝一起带走。审计可以失败，拒绝不能。
-        response: dict[str, Any] = {}
-        if verdict.denied:
-            response = {
-                "hookSpecificOutput": {
-                    "hookEventName": "PreToolUse",
-                    "permissionDecision": "deny",
-                    "permissionDecisionReason": verdict.model_reason,
-                }
+
+    @staticmethod
+    def _build_pre_tool_response(denied: bool, model_reason: str | None) -> dict[str, Any]:
+        """按判定结果构造 hook 回调应答；放行时返回空字典表示不干预。"""
+        if not denied:
+            return {}
+        return {
+            "hookSpecificOutput": {
+                "hookEventName": "PreToolUse",
+                "permissionDecision": "deny",
+                "permissionDecisionReason": model_reason,
             }
+        }
+
+    def _record_pre_tool_decision(
+        self, *, tool_name: str, tool_input: Any, call_id: str | None, verdict: Any
+    ) -> None:
+        """记账这次判定；记账失败不得降级为放行，只记一次审计缺口。
+
+        必须在应答已经算好之后才调用——记账处理的是模型可控的入参，一旦它
+        抛异常，异常会沿 hook 回调向上抛，把这次拒绝一起带走；审计可以失败，
+        拒绝不能。
+        """
         try:
             self._audit.record_decision(
-                tool_name=verdict.tool_name,
+                tool_name=tool_name,
                 tool_input=tool_input,
                 tool_use_id=call_id,
                 verdict=verdict,
             )
-        except Exception:  # 见上：审计失败不得降级为放行
-            self._audit.record_audit_fault(tool_name=verdict.tool_name, tool_use_id=call_id)
-        # 包装拒绝熔断（Issue #352）：计数口径是「非 MCP 工具被拒」——真实事故里
-        # 模型用 `Bash: claude mcp call …` 之类的内置工具包装调用问数 MCP，一律
-        # 落在 `verdict.tool_name` 不以 `mcp__` 开头这一支（与 `_is_side_effecting_
-        # tool` 判非 MCP 同一条件，但语义不同，不复用那个方法名）。刻意不区分
-        # `NOT_IN_WHITELIST` 与 `NOT_IN_WHITELIST_QUERY_REDIRECT` 两种拒绝原因码：
-        # 产品负责人的裁定原文是"非 MCP 工具被拒累计"，没有按原因码再收窄；被拒的
-        # `mcp__` 工具（例如模型请求了一个真实存在但未获批准的 MCP 工具名）不计入
-        # ——那是"选错了具体工具"，不是这次事故里的"用内置工具包装绕过白名单"。
-        # 未达阈值时的全部行为不受这段代码影响——不改变现状。放行的调用不计入
-        # 拒绝计数本身，但从 P2-1 裁定起会计入下面这段独立的合取项计数，见下。
-        #
-        # 合取项判定（Issue #352 P2-1 裁定，取证依据见 WRAPPER_DENIAL_FUSE_
-        # THRESHOLD 上方注释）：`self._granted_mcp_count == 0` 是在**这一次拒绝
-        # 发生的瞬间**读取的，不是回合结束后回溯重算。这个"瞬时读取"的写法本身
-        # 就带出了产品负责人要的边界语义——如果放行发生在第 N 次（N>=阈值）拒绝
-        # 之后，熔断已经在第 N 次拒绝那一刻用 `granted_mcp_count == 0` 触发过了
-        # （`_wrapper_denial_fuse_tripped` 哨兵已置位），后续的放行调用不会、也
-        # 不应该撤销已经发生的触发；如果放行发生在阈值达成之前，等到第 N 次拒绝
-        # 时 `granted_mcp_count` 已经 >= 1，合取项判定为假，不触发。即"连续打转
-        # 即熔断，不回溯撤销"。
-        if verdict.denied and not verdict.tool_name.startswith("mcp__"):
+        except Exception:  # 见 docstring：审计失败不得降级为放行
+            self._audit.record_audit_fault(tool_name=tool_name, tool_use_id=call_id)
+
+    def _update_wrapper_denial_fuse(self, *, denied: bool, tool_name: str) -> None:
+        """更新包装拒绝熔断的两支互斥计数，达到阈值时触发一次熔断回调。
+
+        计数口径是「非 MCP 工具被拒」，一律落在 ``tool_name`` 不以 ``mcp__``
+        开头这一支，刻意不按拒绝原因码再收窄；放行的 MCP 调用计入独立的合取
+        项计数，两支各自独立。合取项判定在这一次拒绝发生的瞬间读取，不是
+        回合结束后回溯重算：阈值达成之后的后续放行不会撤销已经发生的触发，
+        阈值达成之前的放行则让判定为假、不触发——即"连续打转即熔断，不回溯
+        撤销"。
+        """
+        if denied and not tool_name.startswith("mcp__"):
             self._wrapper_denial_count += 1
             if (
                 not self._wrapper_denial_fuse_tripped
@@ -440,9 +368,22 @@ class ToolGateway:
                         self._on_wrapper_fuse_tripped(self._wrapper_denial_count)
                     except Exception:  # 熔断通知失败不得影响工具判定本身
                         pass
-        elif not verdict.denied and verdict.tool_name.startswith("mcp__"):
-            # 熔断合取项计数：本回合放行过至少一次原生 MCP 调用，说明模型没有
-            # 陷入"只会包装绕过、完全摸不到正确工具"的事故模式（见上方合取项
-            # 判定注释），不再计入拒绝分支，两支互斥、各自独立计数。
+        elif not denied and tool_name.startswith("mcp__"):
+            # 本回合放行过至少一次原生 MCP 调用，说明模型没有陷入"只会包装
+            # 绕过、完全摸不到正确工具"的事故模式，不再计入拒绝分支。
             self._granted_mcp_count += 1
+
+    def _on_pre_tool_use(
+        self, tool_name: Any, tool_input: Any, call_id: str | None
+    ) -> dict[str, Any]:
+        """PreToolUse 事件的完整处理：判定 → 通知观察者 → 应答 → 记账 → 更新熔断。"""
+        verdict = self._policy.decide(
+            tool_name, tool_input if isinstance(tool_input, Mapping) else None
+        )
+        self._notify_pre_tool_observers(verdict.tool_name, tool_input, call_id)
+        response = self._build_pre_tool_response(verdict.denied, verdict.model_reason)
+        self._record_pre_tool_decision(
+            tool_name=verdict.tool_name, tool_input=tool_input, call_id=call_id, verdict=verdict
+        )
+        self._update_wrapper_denial_fuse(denied=verdict.denied, tool_name=verdict.tool_name)
         return response

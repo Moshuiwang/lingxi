@@ -113,7 +113,6 @@
 4	docstring_over	src/lingxi/core/daily_report.py
 4	docstring_over	src/lingxi/core/execution/audit.py
 8	docstring_over	src/lingxi/core/execution/card_stream.py
-2	docstring_over	src/lingxi/core/execution/hooks.py
 4	docstring_over	src/lingxi/core/execution/input_safety.py
 5	docstring_over	src/lingxi/core/identity/access_token_supply.py
 4	docstring_over	src/lingxi/core/identity/credentials.py
@@ -211,7 +210,6 @@
 5	hash_block_over	src/lingxi/core/daily_report.py
 4	hash_block_over	src/lingxi/core/execution/audit.py
 10	hash_block_over	src/lingxi/core/execution/card_stream.py
-8	hash_block_over	src/lingxi/core/execution/hooks.py
 5	hash_block_over	src/lingxi/core/execution/input_safety.py
 1	hash_block_over	src/lingxi/core/identity/first_contact.py
 1	hash_block_over	src/lingxi/core/identity/innertest_roster_gate.py
@@ -345,7 +343,6 @@
 39	provenance	src/lingxi/core/daily_report.py
 12	provenance	src/lingxi/core/execution/audit.py
 61	provenance	src/lingxi/core/execution/card_stream.py
-28	provenance	src/lingxi/core/execution/hooks.py
 23	provenance	src/lingxi/core/execution/input_safety.py
 15	provenance	src/lingxi/core/identity/access_token_supply.py
 6	provenance	src/lingxi/core/identity/credentials.py
