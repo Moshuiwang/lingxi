@@ -1,6 +1,4 @@
-"""Gateway 投递消费（Issue #239 从 ``postgres_conversation.PostgresTaskQueue`` 按
-读写边界拆分而来）。原班注释见类体内的小节说明。
-"""
+"""Gateway 投递消费。"""
 
 from __future__ import annotations
 
@@ -18,30 +16,22 @@ from ._dataclasses import (
 
 
 class _GatewayDeliveryMixin:
-    # -----------------------------------------------------------------
-    # Gateway 投递消费（Issue #152）
-    #
     # 这一组方法服务的是「读 outbox、驱动 CardKit/文本、记消费进度」这一条 Gateway
-    # 侧的独立读写路径，与上面 Worker 侧写 outbox 的那组方法各自独立提交、不共用
-    # 事务——两者本来就是不同进程。持久化的进度字段（``delivery_consumed_sequence``/
-    # ``card_id``/``card_seq``/``delivery_message_id``/``fallback_text``/
-    # ``dispatch_reserved_kind``）见迁移 0060 头部注释。
-    # -----------------------------------------------------------------
+    # 侧的独立读写路径，与 Worker 侧写 outbox 的那组方法各自独立提交、不共用事务
+    # ——两者本来就是不同进程。持久化的进度字段见迁移 0060 头部注释。
 
     def list_pending_delivery_tasks(self, *, limit: int = 20) -> list[PendingDeliveryTask]:
-        """列出本轮需要处理的任务：还有未消费的 outbox 事件，或已经拿到
-        ``delivery_message_id`` 但尚未确认送达（``confirm_delivery`` 上一次失败或
-        还没调用）。**不含**``dispatch_reserved_kind`` 非空的任务——那些是崩溃恢复后
-        outcome 不明的任务，必须被上层单独识别为 ``uncertain``，不能混进正常消费。
+        """列出本轮需要处理的任务。
 
-        只读查询，不加锁：外发前预留位（``reserve_dispatch``）才是真正的并发互斥点，
-        这里允许多个候选同时被读到，抢占失败的一方在预留时自然让路。
+        还有未消费的 outbox 事件，或已经拿到 ``delivery_message_id`` 但尚未
+        确认送达。**不含** ``dispatch_reserved_kind`` 非空的任务——那些是崩溃
+        恢复后 outcome 不明的任务，必须被上层单独识别为 ``uncertain``。只读
+        查询，不加锁：外发前预留位（``reserve_dispatch``）才是真正的并发
+        互斥点，这里允许多个候选同时被读到，抢占失败的一方在预留时自然让路。
         """
-
-        # S-H1-6（#359 根因取证方案第 2 条）：gateway 投递循环每 poll_interval 都
-        # 会跑这条发现查询，空转时也不例外——走 `_run_polling_operation`（默认
-        # 逐字节等价于原来的 `connect(...)`，只有装配方显式打开复用时才改为持有
-        # 常驻连接；打开时复用连接首次失败会重建重试一次，见该方法文档，P2-1）。
+        # gateway 投递循环每 poll_interval 都会跑这条发现查询，空转时也不例外
+        # ——走 `_run_polling_operation`（默认逐字节等价于原来的 `connect(...)`，
+        # 只有装配方显式打开复用时才改为持有常驻连接；见该方法文档）。
 
         def _list_pending(connection: Any) -> list[PendingDeliveryTask]:
             with connection.cursor() as cursor:
@@ -88,16 +78,13 @@ class _GatewayDeliveryMixin:
     def list_stale_queued_tasks(
         self, *, older_than: timedelta, limit: int = 50
     ) -> list[StaleQueuedTask]:
-        """列出已入队超过 ``older_than``、仍然 ``queued``（还没有任何 worker 领取）
-        的任务（Issue #465，S-3：排队可感知）。
+        """列出已入队超过 ``older_than``、仍然 ``queued``（还没有 worker 领取）的任务。
 
         只读查询，不加锁、不写任何标记——是否已经通知过完全由调用方
-        （``apps/gateway/delivery.DeliveryConsumer``）在进程内维护，与该消费者
-        既有的 ``_last_alerted_at``/``_fallback_next_attempt_at`` 同一姿态：
-        重启清零是已知的可接受降级（这是一条尽力而为的体验提示，不是需要跨
-        重启持久化的业务结论；`worker.queued_timeout` 那条更长阈值的诚实失败
-        终态仍然走 outbox，不受这条提示影响）。``status = 'queued'`` 复用既有
-        ``task_queue_idx`` 部分索引的过滤前提，积压量通常很小。
+        （``apps/gateway/delivery.DeliveryConsumer``）在进程内维护，重启清零是
+        已知的可接受降级（尽力而为的体验提示，不是需要跨重启持久化的业务
+        结论）。``status = 'queued'`` 复用既有 ``task_queue_idx`` 部分索引的
+        过滤前提，积压量通常很小。
         """
 
         def _list_stale(connection: Any) -> list[StaleQueuedTask]:
@@ -125,19 +112,15 @@ class _GatewayDeliveryMixin:
     def list_uncertain_delivery_tasks(self, *, limit: int = 50) -> list[UncertainDeliveryTask]:
         """列出外发前预留位卡住的任务，供告警。见 ``reserve_dispatch`` 的说明。
 
-        ``status IN ('running', 'awaiting_delivery')``（独立审核 P2-4）：
+        ``status IN ('running', 'awaiting_delivery')`` 过滤：
         ``expire_undelivered_terminals`` 的二十四小时强制收敛不读、也不清
-        ``dispatch_reserved_kind``——它只管把业务结论收敛为 ``failed``，预留位
-        字段本身是 Gateway 消费循环私有的运行时簿记。没有这条过滤，一个卡在
-        预留位里、后来被到期路径收敛为 ``failed`` 的任务会在 ``dispatch_reserved_kind``
-        永远不被清空的情况下被这里永远查出来，按默认 1 秒轮询造成不会停止的
-        告警——即使任务本身早已经不再需要任何人处理。任务到期收敛之后这个字段
-        本身也不再有意义（不会再被任何投递路径读取或写入）。
+        ``dispatch_reserved_kind``（预留位字段是 Gateway 消费循环私有的运行时
+        簿记）。没有这条过滤，一个卡在预留位里、后来被到期路径收敛为
+        ``failed`` 的任务会永远被这里查出来，造成不会停止的告警——即使任务
+        本身早已不再需要任何人处理。
         """
-
-        # S-H1-6（#359 根因取证方案第 2 条）：同 `list_pending_delivery_tasks`——
-        # 每 poll_interval 都会跑，同样走 `_run_polling_operation`（复用连接首次
-        # 失败会重建重试一次，见该方法文档，P2-1）。
+        # 同 `list_pending_delivery_tasks`：每 poll_interval 都会跑，同样走
+        # `_run_polling_operation`（复用连接首次失败会重建重试一次，见该方法文档）。
 
         def _list_uncertain(connection: Any) -> list[UncertainDeliveryTask]:
             with connection.cursor() as cursor:
@@ -162,7 +145,6 @@ class _GatewayDeliveryMixin:
         self, *, task_id: str, after_sequence: int
     ) -> list[DeliveryEventRecord]:
         """按序号升序读回一个任务尚未消费的 outbox 事件。"""
-
         with (
             connect(self._dsn, timeouts=self._timeouts) as connection,
             connection.cursor() as cursor,
@@ -188,21 +170,14 @@ class _GatewayDeliveryMixin:
             ]
 
     def reserve_dispatch(self, *, task_id: str, kind: str) -> bool:
-        """在一次结果不可事后消歧的外发调用（建卡、终态卡片更新+关闭、文本兜底
-        发送）之前提交预留位。三者共同点是：一旦崩溃重启，消费循环单靠"重放同一次
-        调用"本身无法安全判断上一次是否已经外发成功——建卡与文本发送没有飞书原生
-        幂等键；终态卡片更新+关闭虽然有整卡级 ``sequence`` 天然拒绝重复帧，但拒绝
-        本身只保证不出现第二次可见卡片帧，不保证调用方的错误处理不会把这次拒绝
-        误判成"卡片链路整体失败"进而降级到文本兜底、造成跨通道的重复投递（迁移
-        0060 头部注释）。
+        """在一次结果不可事后消歧的外发调用之前提交预留位。
 
-        返回 ``False`` 表示没能预留到——任务已经不在可处理状态，或已经被预留
-        （正常情况下同一时刻只有一个消费者处理同一任务，命中说明上一轮处理到一半
-        就中断了；调用方此时不应该继续外发，而应把这个任务视为 ``uncertain``）。
-        预留成功即**独立提交**：这条写入必须在真正发起外部调用之前落盘可见，
-        否则"进程崩溃后能不能从数据库看出上一次是否已经外发"这件事无从谈起。
+        三者是建卡、终态卡片更新+关闭、文本兜底发送，共同点：一旦崩溃重启，
+        消费循环单靠"重放同一次调用"无法安全判断上一次是否已经外发成功。
+        返回 ``False`` 表示没能预留到——任务已不在可处理状态、或已被预留
+        （命中说明上一轮处理到一半中断了，调用方应把任务视为 ``uncertain``）。
+        预留成功即独立提交：必须在真正发起外部调用之前落盘可见。
         """
-
         if kind not in ("card_create", "card_finish", "text_send"):
             raise ValueError("dispatch_reserved_kind 只能是 card_create、card_finish 或 text_send")
         with (
@@ -225,9 +200,8 @@ class _GatewayDeliveryMixin:
         明确失败与进程崩溃的区别决定下一轮的行为：明确失败允许下一轮重试同一次
         外发（游标不会被推进过这个事件）；进程崩溃则让预留位原样留在数据库里，
         由 ``list_pending_delivery_tasks`` 的过滤条件与 ``list_uncertain_delivery_tasks``
-        把它路由到人工核对，不自动重发（Issue #151 审核 P3-6、状态合同第 6 条）。
+        把它路由到人工核对，不自动重发（状态合同第 6 条）。
         """
-
         with (
             connect(self._dsn, timeouts=self._timeouts) as connection,
             connection.cursor() as cursor,
@@ -247,15 +221,15 @@ class _GatewayDeliveryMixin:
         card_sequence: int | None = None,
         fallback_text: bool = False,
     ) -> None:
-        """把一次已经明确知道结果的外发进度写回。总是清空预留位——调用这个方法本身
-        就意味着调用方已经拿到了确定的结果（成功，或同步捕获的失败）。
+        """把一次已经明确知道结果的外发进度写回，总是清空预留位。
 
-        ``card_id``/``message_id``/``card_sequence`` 用 ``COALESCE`` 只增不减：
+        调用这个方法本身就意味着调用方已经拿到了确定的结果（成功，或同步
+        捕获的失败）。``card_id``/``message_id``/``card_sequence`` 用
+        ``COALESCE`` 只增不减：
         一旦写入就不会被后续调用误置回 ``NULL``；``consumed_sequence`` 用
         ``GREATEST`` 防止乱序调用把游标往回拨；``fallback_text`` 一旦置真就不会
         被置回假（`V-卡片-03`：首次失败后永久走文本通道）。
         """
-
         with (
             connect(self._dsn, timeouts=self._timeouts) as connection,
             connection.cursor() as cursor,

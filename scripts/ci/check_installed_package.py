@@ -144,6 +144,9 @@ REQUIRED_MODULES = (
     "lingxi.core.permission.publish_row",
     "lingxi.core.permission.publish",
     "lingxi.adapters.postgres_permission_publish",
+    # 权限决定/发布意图写入路径，从上一条按体量棘轮纯移动拆出（#592 可读性批）；
+    # postgres_permission_publish.py 顶层 import 它，随它同一条发布理由。
+    "lingxi.adapters.postgres_permission_publish_decision",
     "lingxi.adapters.feishu_permission_bitable",
     # MCP 令牌签发与就绪状态机（Issue #156 / S-C-02）：五路分流状态机在 core，
     # 加解密、令牌与就绪记录读写、问数 MCP 探针在 adapters。与上面四个同一姿态——
@@ -231,6 +234,10 @@ REQUIRED_MODULES = (
     "lingxi.core.permission.local_override",
     "lingxi.core.permission.position_override",
     "lingxi.adapters.postgres_local_permission",
+    # 存量差集导入/职位范围预授权的落库细节，从 `postgres_local_permission.py`
+    # 按体量棘轮纯移动拆出（#592 可读性批）；`postgres_local_permission.py`
+    # 顶层 import 它，随它同一条发布理由，见下面 scheduler/gateway 闭包同名注释。
+    "lingxi.adapters.postgres_local_permission_import",
     "lingxi.core.permission.merge_sources",
     # 存量用户首聊差集导入的纯逻辑（rc25 S-1，Issue #540）：开通编排、每日/定向重算
     # 与本地覆盖适配器都消费它（见下面 scheduler/gateway 闭包）；开通链的两步编排
@@ -335,6 +342,7 @@ REQUIRED_MODULES = (
     "lingxi.core.admin.card_callback_ports",
     "lingxi.core.admin.card_callback_management",
     "lingxi.adapters.postgres_pending_action",
+    "lingxi.adapters.postgres_pending_action_execution",
     "lingxi.adapters.postgres_management_card_context",
     "lingxi.adapters.feishu_admin_card",
     # 回调应答之后那批网络往返的后台执行器（#493 块 B）：确认成功后的出带外换卡、
@@ -676,6 +684,9 @@ PROCESS_RUNTIME_IMPORTS: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {
             "lingxi.adapters.postgres_galaxy_snapshot",
             "lingxi.adapters.galaxy_import",
             "lingxi.adapters.postgres_permission_publish",
+            # 权限决定/发布意图写入路径，随 postgres_permission_publish 同一条
+            # 发布理由（#592 可读性批体量棘轮纯移动拆出）。
+            "lingxi.adapters.postgres_permission_publish_decision",
             "lingxi.adapters.mcp_token_cipher",
             "lingxi.adapters.postgres_mcp_token",
             "lingxi.adapters.role_function_map_file",
@@ -696,6 +707,7 @@ PROCESS_RUNTIME_IMPORTS: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {
             # 闭包里了）。
             "lingxi.core.permission.local_override",
             "lingxi.adapters.postgres_local_permission",
+            "lingxi.adapters.postgres_local_permission_import",
             "lingxi.core.permission.merge_sources",
             # 存量差集导入纯逻辑（rc25 S-1）：`onboarding_runner`/`permission_refresh`/
             # `postgres_local_permission` 模块级 import；开通链两步编排随 runner 进闭包。
@@ -1134,6 +1146,7 @@ PROCESS_RUNTIME_IMPORTS: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {
             "lingxi.core.admin.card_callback_ports",
             "lingxi.core.admin.card_callback_management",
             "lingxi.adapters.postgres_pending_action",
+            "lingxi.adapters.postgres_pending_action_execution",
             "lingxi.adapters.postgres_management_card_context",
             "lingxi.adapters.feishu_admin_card",
             "lingxi.adapters.admin_post_callback",
@@ -1154,14 +1167,15 @@ PROCESS_RUNTIME_IMPORTS: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {
             # 一起进入 gateway 的运行时闭包。
             "lingxi.core.admin.card_layout",
             "lingxi.core.admin.display_names",
-            # 本地权限授权/抑制全链路（#319 S-P-1b）：
-            # adapters.postgres_pending_action 模块级 import 了
-            # adapters.postgres_local_permission 的 _insert_locked/
-            # DuplicateActiveOverride（confirm() 同一事务内落库本地权限覆盖行，
-            # 见该模块文档「为什么拆分」），以及 core.permission.local_override
-            # 的 LocalPermissionOverrideEntry/OverrideDirection（纯类型，供
-            # confirm() 解析 payload 后构造要写入的条目）。
+            # 本地权限授权/抑制全链路：adapters.postgres_pending_action_execution
+            # （待确认操作里"自己不开连接"的纯执行辅助方法，见该模块文档）模块级
+            # import 了 adapters.postgres_local_permission 的 _insert_locked/
+            # DuplicateActiveOverrideError（confirm() 同一事务内落库本地权限覆盖
+            # 行），以及 core.permission.local_override 的
+            # LocalPermissionOverrideEntry/OverrideDirection（纯类型，供 confirm()
+            # 解析 payload 后构造要写入的条目）。
             "lingxi.adapters.postgres_local_permission",
+            "lingxi.adapters.postgres_local_permission_import",
             "lingxi.core.permission.local_override",
             "lingxi.core.permission.position_override",
             # 管理员写动作确认执行成功后的定向单用户权限重算+发布（Issue #438）：
@@ -1199,6 +1213,9 @@ PROCESS_RUNTIME_IMPORTS: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {
             "lingxi.core.permission.mcp_readiness",
             "lingxi.core.permission.role_function",
             "lingxi.adapters.postgres_permission_publish",
+            # 权限决定/发布意图写入路径，随 postgres_permission_publish 同一条
+            # 发布理由（#592 可读性批体量棘轮纯移动拆出）。
+            "lingxi.adapters.postgres_permission_publish_decision",
             "lingxi.adapters.role_function_map_file",
             "lingxi.core.alerting",
             "lingxi.core.identity",

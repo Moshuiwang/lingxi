@@ -1,14 +1,15 @@
-"""任务队列领取与收口（Issue #239 从 ``postgres_conversation.PostgresTaskQueue``
-按读写边界拆分而来）：worker 侧的 ``claim``/``finish``/心跳续期，以及 scheduler 侧
-的心跳超时回收（``reclaim_stale``）与 queued 超时/灰度版本不可用收口
+"""任务队列领取与收口。
+
+worker 侧的 ``claim``/``finish``/心跳续期，以及 scheduler 侧的心跳超时
+回收（``reclaim_stale``）与 queued 超时/灰度版本不可用收口
 （``_fail_queued`` 及其两个入口）。
 
-``_write_system_terminal`` 虽然要写投递 outbox 事件，但它只被本文件内的
-``reclaim_stale``/``_fail_queued`` 调用（系统代为收口从未被真实 worker 执行完的
-任务），因此仍归在这条"任务队列领取与收口"边界里；它通过 ``self`` 调用
-``_queue_outbox.py`` 里的 ``_find_by_idempotency_key``/``_insert_new_event`` ——
-拆分只搬动方法的物理位置，两个 mixin 组合进同一个 ``PostgresTaskQueue`` 后仍是
-同一个实例上的方法查找，调用顺序和行为与拆分前逐位相同。
+``_write_system_terminal`` 只被本文件内的 ``reclaim_stale``/``_fail_queued``
+调用（系统代为收口从未被真实 worker 执行完的任务），因此仍归在这条边界里；
+它通过 ``self`` 调用 ``_queue_outbox.py`` 里的
+``_find_by_idempotency_key``/``_insert_new_event``——拆分只搬动方法的物理
+位置，两个 mixin 组合进同一个 ``PostgresTaskQueue`` 后仍是同一个实例上的
+方法查找，调用顺序和行为与拆分前逐位相同。
 """
 
 from __future__ import annotations
@@ -22,25 +23,71 @@ from lingxi.core.delivery.ports import DeliveryEventType, TerminalKind
 
 from ._dataclasses import ClaimedTask, TaskContext, TerminalTask
 
-# 三条"系统代为收口"路径共用的哨兵 worker_id（Issue #178）：``reclaim_stale``
-# 的心跳超时终态分支、``reclaim_queued``、``fail_unavailable_versions`` 收口的
-# 任务从未被一个仍然存活的 worker 正常执行完，没有真实持有者可以填进
-# ``task_delivery_event.worker_id``。该列只是 ``TEXT NOT NULL``，没有指向任何
-# "worker" 表的外键（迁移 0059），写一个固定、可在诊断查询里一眼认出的哨兵值
-# 即可，不影响 Gateway 消费循环（它不按 worker_id 过滤）。
+# 三条"系统代为收口"路径共用的哨兵 worker_id：这些任务从未被一个仍然存活
+# 的 worker 正常执行完，没有真实持有者可以填进
+# ``task_delivery_event.worker_id``。该列只是 ``TEXT NOT NULL``，没有外键
+# 约束，写一个固定、可在诊断查询里一眼认出的哨兵值即可，不影响 Gateway
+# 消费循环（它不按 worker_id 过滤）。
 _SYSTEM_DELIVERY_WORKER_ID = "system"
 
-# error_kind → 用户可见文案键：全部复用 config/content.toml 已经登记、已过产品
-# 审校的既有文案（Issue #178 明确要求"走 config/content 既有文案机制"，不发明
-# 新文案）。`worker.queued_timeout`/`worker.version_unavailable` 在本次修复前
-# 从未被任何生产代码引用过——它们是 #151 outbox 改造时被遗留的"文案已经写好、
-# 但没有任何路径真正投递"的孤儿键，本次修复是它们第一次被真正渲染发出。
+# error_kind → 用户可见文案键：全部复用 config/content.toml 已经登记、已过
+# 产品审校的既有文案，不发明新文案。这里列出的四个键在被本文件引用之前
+# 从未被任何生产代码渲染过，是此前 outbox 改造遗留的孤儿键。
 _SYSTEM_TERMINAL_CONTENT_KEYS: dict[str, str] = {
     "queued_timeout": "worker.queued_timeout",
     "worker_version_unavailable": "worker.version_unavailable",
     "retry_exhausted": "worker.running_timeout",
     "side_effect_uncertain": "worker.side_effect_uncertain",
 }
+
+_FINISH_TASK_SQL = """
+UPDATE task
+   SET status = %s,
+       ended_at = now(),
+       error_kind = COALESCE(%s, error_kind),
+       side_effect_state = COALESCE(%s, side_effect_state)
+ WHERE id = %s AND worker_id = %s AND status = 'running'
+"""
+
+_RELEASE_CONVERSATION_SQL = """
+WITH target AS (
+    SELECT id, user_id, agent_session_id AS previous_session_id
+      FROM conversation
+     WHERE id = %s AND running_task_id = %s
+     FOR UPDATE
+)
+UPDATE conversation AS c
+   SET running_task_id = NULL,
+       last_task_ended_at = now(),
+       agent_session_id = COALESCE(%s, target.previous_session_id)
+  FROM target
+ WHERE c.id = target.id
+RETURNING target.user_id, target.previous_session_id
+"""
+
+_RECLAIM_STALE_CANDIDATES_SQL = """
+SELECT id, conversation_id, attempts, side_effect_state
+  FROM task
+ WHERE status = 'running'
+   AND heartbeat_at < now() - %s::interval
+ ORDER BY heartbeat_at, id
+ FOR UPDATE SKIP LOCKED
+"""
+
+
+def _row_to_claimed_task(row: Any) -> ClaimedTask:
+    return ClaimedTask(
+        task_id=row[0],
+        conversation_id=row[1],
+        user_id=row[2],
+        prompt=row[3],
+        resumed_session=row[4],
+        target_worker_version=row[5],
+        attempts=row[6],
+        reply_to_message_id=row[7],
+        stop_requested=row[8],
+        side_effect_state=row[9],
+    )
 
 
 class _TaskLifecycleMixin:
@@ -49,23 +96,20 @@ class _TaskLifecycleMixin:
     ) -> list[ClaimedTask]:
         """领取任务。
 
-        两条关键约束都在这一句 SQL 里：
-
-        - ``FOR UPDATE SKIP LOCKED``：两个 worker 并发领取时每个任务恰好被一个领到，
-          既不重复也不互相阻塞（`V-队列-04`）。
-        - ``target_worker_version = %s``：声明版本的 worker 只领得到匹配的任务，
-          不匹配的保持 ``queued`` 不被误改状态（`V-灰度-02`）。去掉这个条件，
-          canary 任务就会被 stable worker 领走。
-
-        **本方法不写 ``target_worker_version``。** 它在入队时已固化，重试与回收都不得
-        改写（`V-灰度-01`）；迁移 013 的触发器兜底，这里写它会直接抛异常。
+        两条约束都在这句 SQL 里：``FOR UPDATE SKIP LOCKED`` 保证并发领取
+        不重复不阻塞；``target_worker_version = %s`` 保证声明版本的 worker
+        只领得到匹配任务，去掉它 canary 任务会被 stable worker 领走。
+        **本方法不写 ``target_worker_version``**——入队时已固化，重试与回收
+        都不得改写，迁移 013 的触发器会让误写直接抛异常。
         """
+        # 这是 worker 主循环每个 poll_interval 都会执行一次的发现查询——即使
+        # 空转也照样命中，因此走 `_run_polling_operation`（默认逐字节等价于
+        # 原来的 `connect(...)`，只有装配方显式打开复用时才改为持有常驻
+        # 连接；打开时复用连接首次失败会重建重试一次，见该方法文档）。
 
-        # S-H1-6（#359 根因取证方案第 2 条）：这是 worker 主循环每个 poll_interval
-        # 都会执行一次的发现查询——即使空转也照样命中，因此走
-        # `_run_polling_operation`（默认逐字节等价于原来的 `connect(...)`，只有
-        # 装配方显式打开复用时才改为持有常驻连接；打开时复用连接首次失败会重建
-        # 重试一次，见该方法文档，P2-1）。
+        # SQL 就地内联、不提到模块常量：两条真库结构性用例直接用
+        # `inspect.getsource(...claim)` 扫这个方法自身的源码文本找 SET
+        # 子句/`FOR UPDATE SKIP LOCKED`，挪到别处会让判据落空、断言失明。
 
         def _claim(connection: Any) -> list[ClaimedTask]:
             with connection.cursor() as cursor:
@@ -91,21 +135,7 @@ class _TaskLifecycleMixin:
                     """,
                     (worker_id, target_worker_version, limit),
                 )
-                return [
-                    ClaimedTask(
-                        task_id=row[0],
-                        conversation_id=row[1],
-                        user_id=row[2],
-                        prompt=row[3],
-                        resumed_session=row[4],
-                        target_worker_version=row[5],
-                        attempts=row[6],
-                        reply_to_message_id=row[7],
-                        stop_requested=row[8],
-                        side_effect_state=row[9],
-                    )
-                    for row in cursor.fetchall()
-                ]
+                return [_row_to_claimed_task(row) for row in cursor.fetchall()]
 
         return self._run_polling_operation(_claim)
 
@@ -122,18 +152,13 @@ class _TaskLifecycleMixin:
     ) -> bool:
         """结束任务并释放话题。只有**这一代**的执行者能收口。
 
-        两层条件，缺一不可：
-
-        - 任务更新带 ``worker_id = %s AND status = 'running'``。只判「是不是这个任务
-          占的话题」是不够的——任务被心跳超时回收、重排、由另一个 worker 重新领取
-          之后，``task_id`` 并没有变，僵尸 worker 照样匹配得上。独立复查在真库上实测
-          出这条：僵尸 w1 的收口会把话题释放掉，而 w2 仍在执行该任务，于是下一条
-          消息可以再次抢占并与 w2 并行——同话题串行被打破。
-        - 释放带 ``running_task_id = %s``：**只有持有者能释放**，防止清掉别人的占用。
-
-        ``last_task_ended_at`` 在这里落，它是两小时规则的唯一依据。
+        两层条件缺一不可：任务更新带 ``worker_id = %s AND status = 'running'``
+        ——仅凭 task_id 不够，僵尸 worker 心跳超时后被重排、由另一个 worker
+        领取，task_id 不变但持有者已经换人，若只判任务归属会把仍在执行的
+        新持有者的话题提前释放，打破同话题串行；话题释放带
+        ``running_task_id = %s`` 保证只有持有者能释放。``last_task_ended_at``
+        在这里落，是两小时规则的唯一依据。
         """
-
         if status not in {"succeeded", "failed", "stopped"}:
             raise ValueError("任务只能以 succeeded、failed 或 stopped 收口")
         if side_effect_state not in {None, "none", "possible"}:
@@ -142,51 +167,44 @@ class _TaskLifecycleMixin:
             with connection.transaction():
                 cursor = connection.cursor()
                 cursor.execute(
-                    """
-                    UPDATE task
-                       SET status = %s,
-                           ended_at = now(),
-                           error_kind = COALESCE(%s, error_kind),
-                           side_effect_state = COALESCE(%s, side_effect_state)
-                     WHERE id = %s AND worker_id = %s AND status = 'running'
-                    """,
+                    _FINISH_TASK_SQL,
                     (status, error_kind, side_effect_state, task_id, worker_id),
                 )
                 if cursor.rowcount != 1:
                     # 不是这一代执行者（或任务早已结束）：什么都不改，也不释放话题。
                     return False
-                cursor.execute(
-                    """
-                    WITH target AS (
-                        SELECT id, user_id, agent_session_id AS previous_session_id
-                          FROM conversation
-                         WHERE id = %s AND running_task_id = %s
-                         FOR UPDATE
-                    )
-                    UPDATE conversation AS c
-                       SET running_task_id = NULL,
-                           last_task_ended_at = now(),
-                           agent_session_id = COALESCE(%s, target.previous_session_id)
-                      FROM target
-                     WHERE c.id = target.id
-                    RETURNING target.user_id, target.previous_session_id
-                    """,
-                    (conversation_id, task_id, agent_session_id),
-                )
-                row = cursor.fetchone()
-                if row is None:
-                    return False
-                self._queue_overwritten_session(
+                return self._release_conversation_after_finish(
                     cursor,
-                    user_id=row[0],
-                    previous_session_id=row[1],
-                    new_session_id=agent_session_id,
+                    conversation_id=conversation_id,
+                    task_id=task_id,
+                    agent_session_id=agent_session_id,
                 )
-                return True
+
+    def _release_conversation_after_finish(
+        self,
+        cursor: Any,
+        *,
+        conversation_id: str,
+        task_id: str,
+        agent_session_id: str | None,
+    ) -> bool:
+        cursor.execute(
+            _RELEASE_CONVERSATION_SQL,
+            (conversation_id, task_id, agent_session_id),
+        )
+        row = cursor.fetchone()
+        if row is None:
+            return False
+        self._queue_overwritten_session(
+            cursor,
+            user_id=row[0],
+            previous_session_id=row[1],
+            new_session_id=agent_session_id,
+        )
+        return True
 
     def heartbeat(self, *, task_id: str, worker_id: str) -> bool:
         """只有当前 worker 这一代能续心跳；僵尸 worker 的续期会返回 False。"""
-
         with (
             connect(self._dsn, timeouts=self._timeouts) as connection,
             connection.cursor() as cursor,
@@ -217,7 +235,6 @@ class _TaskLifecycleMixin:
 
     def mark_side_effect(self, *, task_id: str, worker_id: str) -> bool:
         """在调用外部工具、卡片或文本发送前先落保守状态。"""
-
         with (
             connect(self._dsn, timeouts=self._timeouts) as connection,
             connection.cursor() as cursor,
@@ -277,9 +294,12 @@ class _TaskLifecycleMixin:
         """回收心跳超时任务；可安全重试的第一轮回到 queued，其余进入失败终态。
 
         同样**不碰 ``target_worker_version``**：任务被回收重排后，用户仍然进入他当初
-        被分到的那个版本（`V-灰度-01` 的回收路径）。
+        被分到的那个版本（`V-灰度-01` 的回收路径）。安全重试的 ``UPDATE`` 就地内联、
+        不提到模块常量：``tests/test_gateway_postgres.py::WorkerVersionTests``
+        用 ``inspect.getsource(...reclaim_stale)`` 直接扫本方法自身的源码文本
+        确认 SET 子句没有写 ``target_worker_version``，挪到别处会让这条判据
+        落空。
         """
-
         if isinstance(max_auto_retries, bool) or max_auto_retries < 0:
             raise ValueError("max_auto_retries 必须是非负整数")
 
@@ -288,17 +308,7 @@ class _TaskLifecycleMixin:
         with connect(self._dsn, timeouts=self._timeouts) as connection:
             with connection.transaction():
                 cursor = connection.cursor()
-                cursor.execute(
-                    """
-                    SELECT id, conversation_id, attempts, side_effect_state
-                      FROM task
-                     WHERE status = 'running'
-                       AND heartbeat_at < now() - %s::interval
-                     ORDER BY heartbeat_at, id
-                     FOR UPDATE SKIP LOCKED
-                    """,
-                    (older_than,),
-                )
+                cursor.execute(_RECLAIM_STALE_CANDIDATES_SQL, (older_than,))
                 for task_id, conversation_id, attempts, side_effect_state in cursor.fetchall():
                     safe_retry = side_effect_state == "none" and attempts <= max_auto_retries
                     if safe_retry:
@@ -312,34 +322,41 @@ class _TaskLifecycleMixin:
                         )
                         requeued.append(task_id)
                         continue
-                    error_kind = (
-                        "side_effect_uncertain"
-                        if side_effect_state != "none"
-                        else "retry_exhausted"
-                    )
-                    # Issue #178（红线）：这个任务从未被一个仍然存活的 worker 正常
-                    # 收口——旧实现在这里直接把 task 记 failed 并释放话题，跳过了
-                    # outbox，用户永远收不到终态。改为写出与真实 worker 完全同型的
-                    # 投递事件序列并转入 awaiting_delivery，见
-                    # `_write_system_terminal` 的说明。
-                    if not self._write_system_terminal(
+                    terminal_task = self._reclaim_stale_terminal(
                         cursor,
                         task_id=task_id,
-                        error_kind=error_kind,
-                        from_status="running",
-                    ):
-                        continue  # pragma: no cover - 见该方法文档的竞态防御说明
-                    terminal.append(
-                        TerminalTask(
-                            task_id=task_id,
-                            conversation_id=conversation_id,
-                            status="awaiting_delivery",
-                            error_kind=error_kind,
-                        )
+                        conversation_id=conversation_id,
+                        side_effect_state=side_effect_state,
                     )
+                    if terminal_task is not None:
+                        terminal.append(terminal_task)
         if _with_outcomes:
             return requeued, terminal
         return requeued
+
+    def _reclaim_stale_terminal(
+        self,
+        cursor: Any,
+        *,
+        task_id: str,
+        conversation_id: str,
+        side_effect_state: str | None,
+    ) -> TerminalTask | None:
+        """不可安全重试的心跳超时任务：代为收口为失败终态。"""
+        error_kind = "side_effect_uncertain" if side_effect_state != "none" else "retry_exhausted"
+        # 这类任务从未被一个仍然存活的 worker 正常收口，不能只改 task.status
+        # 就直接释放话题——必须写出与真实 worker 完全同型的投递事件序列并
+        # 转入 awaiting_delivery，见 `_write_system_terminal` 的说明。
+        if not self._write_system_terminal(
+            cursor, task_id=task_id, error_kind=error_kind, from_status="running"
+        ):
+            return None  # pragma: no cover - 见该方法文档的竞态防御说明
+        return TerminalTask(
+            task_id=task_id,
+            conversation_id=conversation_id,
+            status="awaiting_delivery",
+            error_kind=error_kind,
+        )
 
     def reclaim_stale_with_outcomes(
         self, *, older_than: timedelta, max_auto_retries: int = 1
@@ -355,7 +372,6 @@ class _TaskLifecycleMixin:
 
     def reclaim_queued(self, *, max_wait: timedelta) -> list[TerminalTask]:
         """无 worker 领取的 queued 任务在等待上限后失败并释放话题。"""
-
         return self._fail_queued(
             older_than=max_wait,
             error_kind="queued_timeout",
@@ -366,7 +382,6 @@ class _TaskLifecycleMixin:
         self, *, available_versions: Sequence[str], unavailable_for: timedelta
     ) -> list[TerminalTask]:
         """目标版本连续不可用时收口，绝不把任务改投到另一个版本。"""
-
         versions = tuple(dict.fromkeys(available_versions))
         return self._fail_queued(
             older_than=unavailable_for,
@@ -415,9 +430,9 @@ class _TaskLifecycleMixin:
                 cursor.execute(sql, params)
                 rows = cursor.fetchall()
                 for task_id, conversation_id in rows:
-                    # Issue #178（红线）：见 `reclaim_stale` 同一处注释——这个任务
-                    # 从未被任何 worker 领取过，同样必须写出唯一、可投递的用户
-                    # 终态，不能只改 task.status 就直接释放话题。
+                    # 这个任务从未被任何 worker 领取过，同样必须写出唯一、可投递
+                    # 的用户终态，不能只改 task.status 就直接释放话题，见
+                    # `reclaim_stale` 同一处注释。
                     if not self._write_system_terminal(
                         cursor,
                         task_id=task_id,
@@ -443,64 +458,21 @@ class _TaskLifecycleMixin:
         error_kind: str,
         from_status: str,
     ) -> bool:
-        """系统代为收口一个从未被真实 worker 正常执行完的任务时，写出与真实
-        worker 完全同型的投递事件序列并转入 ``awaiting_delivery``（Issue #178：
-        ``reclaim_stale`` 的心跳超时终态分支、``reclaim_queued``、
-        ``fail_unavailable_versions`` 此前只改 ``task.status`` 就直接把话题
-        释放掉，跳过了 outbox——数据库里任务已经"结束"，但没有任何可投递的
-        终态，用户永远停在处理态收不到结果）。
+        """系统代为收口一个从未被真实 worker 执行完的任务。
 
-        **调用方必须已经用 ``SELECT ... FOR UPDATE [SKIP LOCKED]`` 锁定了这一
-        行**（``reclaim_stale``/``_fail_queued`` 的既有查询本来就这样做）：这里
-        只按 ``status = from_status`` 再确认一次并原子转移，不重复获取锁。
-
-        **不释放 ``conversation.running_task_id``**：话题继续占用，直到 Gateway
-        消费 outbox 并调用 ``confirm_delivery``，或二十四小时到期兜底
-        （``expire_undelivered_terminals``）——与真实 worker 通过
-        ``write_terminal_event`` 收口的既有语义完全一致（#151/#152 状态合同），
-        也是"Gateway 不可用时由既有 24 小时到期路径兜底为 delivery_expired"
-        这句话能够成立的唯一原因：这条路径复用的是同一张 outbox 表和同一组
-        到期/确认机制，不是另起一套。
-
-        **必须先写一条 ``started`` 事件，再写 ``terminal``，不能只写终态**：
-        Gateway 消费循环（``apps/gateway/delivery.py`` 的 ``_handle_terminal``）
-        只在 ``stream.card_id is not None`` 或 ``stream.fallback_needed`` 为真
-        时才会建卡或走文本兜底；一个从未出现过 ``started`` 事件的任务两者都是
-        假，终态事件会被无声消费（游标推进）而不产生任何外发，任务只能在
-        ``awaiting_delivery`` 里静默沉底、靠 24 小时到期兜底才勉强收口——这正是
-        本次要修复的"用户永远收不到终态"换一个更晚的时间点重演。写一条与真实
-        worker 完全同形的 ``started``（不带正文，只是一个让 Gateway 建卡/判定
-        兜底的信号）事件，复用的是已经过 #152 完整测试的既有消费路径，不需要
-        改 Gateway 或卡片协议的任何一行代码。
-
-        幂等：``started``/``terminal`` 各自用固定的 idempotency_key（与真实
-        worker 写终态时用的 ``f"{task_id}:terminal"`` 同一形状），重复调用
-        （同一批任务被 housekeeping 轮询两次、或写到一半崩溃后整个事务回滚重来）
-        不会产生第二条事件——理论上不该发生第二次调用还命中已存在的终态
-        （命中即说明状态已经离开 ``from_status``，行锁下不会被再次选中），但
-        仍然按既有 `append_delivery_event`/`write_terminal_event` 同一原则做
-        防御性检查，返回 ``False`` 表示"这一行已经被处理过，调用方不应该把它
-        算作这一轮新产生的终态"。
+        写出与真实 worker 完全同型的投递事件序列（先 ``started`` 后
+        ``terminal``）并转入 ``awaiting_delivery``，复用既有 outbox 消费/
+        到期路径；不释放 ``conversation.running_task_id``，由 Gateway 确认
+        或二十四小时到期兜底释放。调用方必须已用 ``FOR UPDATE [SKIP LOCKED]``
+        锁定该行；``started``/``terminal`` 各自按固定 idempotency_key 幂等，
+        重复调用不会产生第二条事件，命中已存在终态时返回 ``False``。
         """
-
         content_key = _SYSTEM_TERMINAL_CONTENT_KEYS.get(error_kind)
         if content_key is None:
             raise ValueError(f"没有为 error_kind={error_kind!r} 登记用户可见文案键")
         content = self._content_catalog.text(content_key).text
 
-        started_key = f"{task_id}:system:started"
-        if self._find_by_idempotency_key(cursor, started_key) is None:
-            self._insert_new_event(
-                cursor,
-                task_id=task_id,
-                worker_id=_SYSTEM_DELIVERY_WORKER_ID,
-                event_type=DeliveryEventType.STARTED.value,
-                idempotency_key=started_key,
-                terminal_kind=None,
-                error_kind=None,
-                elapsed_seconds=None,
-                content=None,
-            )
+        self._ensure_system_started_event(cursor, task_id=task_id)
 
         terminal_key = f"{task_id}:terminal"
         if self._find_by_idempotency_key(cursor, terminal_key) is not None:
@@ -530,3 +502,25 @@ class _TaskLifecycleMixin:
             # 的既有处理方式一致）。
             raise RuntimeError(f"任务 {task_id} 在系统代为收口时状态发生了竞态")
         return True
+
+    def _ensure_system_started_event(self, cursor: Any, *, task_id: str) -> None:
+        """幂等写入系统代为收口的 ``started`` 哨兵事件。
+
+        Gateway 消费循环只在见过 ``started`` 事件后才会建卡或判定文本兜底；
+        没有它，终态事件会被无声消费（游标推进）而不产生任何外发，任务只能
+        在 ``awaiting_delivery`` 里静默沉底、靠二十四小时到期兜底才勉强收口
+        ——写一条不带正文的 ``started`` 事件即可复用既有消费路径。
+        """
+        started_key = f"{task_id}:system:started"
+        if self._find_by_idempotency_key(cursor, started_key) is None:
+            self._insert_new_event(
+                cursor,
+                task_id=task_id,
+                worker_id=_SYSTEM_DELIVERY_WORKER_ID,
+                event_type=DeliveryEventType.STARTED.value,
+                idempotency_key=started_key,
+                terminal_kind=None,
+                error_kind=None,
+                elapsed_seconds=None,
+                content=None,
+            )
