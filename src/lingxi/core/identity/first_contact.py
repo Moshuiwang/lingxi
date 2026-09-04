@@ -78,7 +78,9 @@ class EmploymentStatus:
 
     @property
     def employed(self) -> bool:
-        return self.is_activated and not (self.is_exited or self.is_frozen or self.is_resigned or self.is_unjoin)
+        return self.is_activated and not (
+            self.is_exited or self.is_frozen or self.is_resigned or self.is_unjoin
+        )
 
     @classmethod
     def from_feishu(cls, payload: Any) -> EmploymentStatus | None:
@@ -195,7 +197,9 @@ def decide_first_contact(
     """
 
     incoming = open_id.strip() if isinstance(open_id, str) else ""
-    delegated = delegated_subject_open_id.strip() if isinstance(delegated_subject_open_id, str) else ""
+    delegated = (
+        delegated_subject_open_id.strip() if isinstance(delegated_subject_open_id, str) else ""
+    )
 
     # 1. 专用授权账号本身永远不建档，且这条判断必须先于任何其他分支——
     #    组织资料不可用、定位不到都不能让它落回普通员工路径（断言 V-身份-02）。
@@ -207,23 +211,49 @@ def decide_first_contact(
         return _decision(FirstContactOutcome.DIRECTORY_UNAVAILABLE)
 
     if location.outcome is LocationOutcome.NOT_FOUND:
-        return _decision(FirstContactOutcome.NOT_AUTHORIZED, failure_reason=FailureReason.NOT_LOCATED)
+        return _decision(
+            FirstContactOutcome.NOT_AUTHORIZED, failure_reason=FailureReason.NOT_LOCATED
+        )
     if location.outcome is LocationOutcome.AMBIGUOUS or location.member is None:
-        return _decision(FirstContactOutcome.NOT_AUTHORIZED, failure_reason=FailureReason.AMBIGUOUS_IDENTITY)
+        return _decision(
+            FirstContactOutcome.NOT_AUTHORIZED, failure_reason=FailureReason.AMBIGUOUS_IDENTITY
+        )
 
     member = location.member
 
     # 3. 在职状态不可判定或明确非在职都按无可用权限结束。两者都不建档、不建待办。
     if employment is None:
-        return _decision(FirstContactOutcome.NOT_AUTHORIZED, failure_reason=FailureReason.EMPLOYMENT_UNKNOWN)
+        return _decision(
+            FirstContactOutcome.NOT_AUTHORIZED, failure_reason=FailureReason.EMPLOYMENT_UNKNOWN
+        )
     if not employment.employed:
-        return _decision(FirstContactOutcome.NOT_AUTHORIZED, failure_reason=FailureReason.NOT_EMPLOYED)
+        return _decision(
+            FirstContactOutcome.NOT_AUTHORIZED, failure_reason=FailureReason.NOT_EMPLOYED
+        )
 
     # 4. 必要资料缺失时不写半条记录（断言 V-开通-06），统一走无可用权限出口。
     #    部门仍是必要资料；把它当可选字段放行会建出 department 为空的半份档案。
-    department = member.department_names[0].strip() if member.department_names and member.department_names[0] else ""
-    if any(_blank(value) for value in (member.open_id, member.user_id, member.union_id, member.display_name, member.tenant_key)) or not department:
-        return _decision(FirstContactOutcome.NOT_AUTHORIZED, failure_reason=FailureReason.INCOMPLETE_PROFILE)
+    department = (
+        member.department_names[0].strip()
+        if member.department_names and member.department_names[0]
+        else ""
+    )
+    if (
+        any(
+            _blank(value)
+            for value in (
+                member.open_id,
+                member.user_id,
+                member.union_id,
+                member.display_name,
+                member.tenant_key,
+            )
+        )
+        or not department
+    ):
+        return _decision(
+            FirstContactOutcome.NOT_AUTHORIZED, failure_reason=FailureReason.INCOMPLETE_PROFILE
+        )
 
     draft = IdentityRecordDraft(
         feishu_open_id=member.open_id.strip(),

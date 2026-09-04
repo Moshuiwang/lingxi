@@ -163,7 +163,10 @@ class _GatewayDeliveryMixin:
     ) -> list[DeliveryEventRecord]:
         """按序号升序读回一个任务尚未消费的 outbox 事件。"""
 
-        with connect(self._dsn, timeouts=self._timeouts) as connection, connection.cursor() as cursor:
+        with (
+            connect(self._dsn, timeouts=self._timeouts) as connection,
+            connection.cursor() as cursor,
+        ):
             cursor.execute(
                 """
                 SELECT sequence, event_type, terminal_kind, content, elapsed_seconds
@@ -202,7 +205,10 @@ class _GatewayDeliveryMixin:
 
         if kind not in ("card_create", "card_finish", "text_send"):
             raise ValueError("dispatch_reserved_kind 只能是 card_create、card_finish 或 text_send")
-        with connect(self._dsn, timeouts=self._timeouts) as connection, connection.cursor() as cursor:
+        with (
+            connect(self._dsn, timeouts=self._timeouts) as connection,
+            connection.cursor() as cursor,
+        ):
             cursor.execute(
                 """
                 UPDATE task SET dispatch_reserved_kind = %s
@@ -222,7 +228,10 @@ class _GatewayDeliveryMixin:
         把它路由到人工核对，不自动重发（Issue #151 审核 P3-6、状态合同第 6 条）。
         """
 
-        with connect(self._dsn, timeouts=self._timeouts) as connection, connection.cursor() as cursor:
+        with (
+            connect(self._dsn, timeouts=self._timeouts) as connection,
+            connection.cursor() as cursor,
+        ):
             cursor.execute(
                 "UPDATE task SET dispatch_reserved_kind = NULL WHERE id = %s",
                 (task_id,),
@@ -247,7 +256,10 @@ class _GatewayDeliveryMixin:
         被置回假（`V-卡片-03`：首次失败后永久走文本通道）。
         """
 
-        with connect(self._dsn, timeouts=self._timeouts) as connection, connection.cursor() as cursor:
+        with (
+            connect(self._dsn, timeouts=self._timeouts) as connection,
+            connection.cursor() as cursor,
+        ):
             cursor.execute(
                 """
                 UPDATE task

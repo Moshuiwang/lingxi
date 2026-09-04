@@ -215,7 +215,10 @@ class ReadinessSchedule:
         )
         _require_seconds("总预算", self.budget_seconds, MIN_BUDGET_SECONDS, MAX_BUDGET_SECONDS)
         _require_seconds(
-            "单次探针超时", self.probe_timeout_seconds, MIN_PROBE_TIMEOUT_SECONDS, MAX_INTERVAL_SECONDS
+            "单次探针超时",
+            self.probe_timeout_seconds,
+            MIN_PROBE_TIMEOUT_SECONDS,
+            MAX_INTERVAL_SECONDS,
         )
         if self.interval_seconds > self.budget_seconds:
             raise ValueError("轮询间隔不得大于总预算：那样只会发出一次探针，配置在说谎")
@@ -386,7 +389,11 @@ class ReadinessAttempt:
         if self.attempt_no < 1:
             raise ValueError("尝试次序从 1 开始")
         for label, moment in (("开始", self.started_at), ("结束", self.finished_at)):
-            if not isinstance(moment, datetime) or moment.tzinfo is None or moment.utcoffset() is None:
+            if (
+                not isinstance(moment, datetime)
+                or moment.tzinfo is None
+                or moment.utcoffset() is None
+            ):
                 raise ValueError(f"就绪判定的{label}时间必须是带时区的时间")
         if self.finished_at < self.started_at:
             raise ValueError("就绪判定的结束时间不得早于开始时间")
@@ -836,7 +843,6 @@ class McpReadinessConfirmation(_ReadinessProbeRunner):
         remaining = (due - self._now()).total_seconds()
         if remaining > 0:
             self._sleep(remaining)
-
 
     def _finish(
         self,

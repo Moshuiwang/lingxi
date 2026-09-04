@@ -281,8 +281,7 @@ class SeedConflictDetectionTests(AdminRegistryPostgresTestCase):
 
         with self.assertRaises(Exception):
             self.execute(
-                "UPDATE admin_registry SET ops_admin_granted = FALSE"
-                " WHERE feishu_open_id = %s",
+                "UPDATE admin_registry SET ops_admin_granted = FALSE WHERE feishu_open_id = %s",
                 ("ou_role_drift",),
             )
 
@@ -438,9 +437,9 @@ class MergedRoleGrantCheckConstraintTests(AdminRegistryPostgresTestCase):
             " VALUES ('adm_revoked_no_roles', 'ou_revoked_no_roles', 'x', 'revoked', now())"
         )
 
-        count = self.query(
-            "SELECT count(*) FROM admin_registry WHERE id = 'adm_revoked_no_roles'"
-        )[0][0]
+        count = self.query("SELECT count(*) FROM admin_registry WHERE id = 'adm_revoked_no_roles'")[
+            0
+        ][0]
         self.assertEqual(count, 1)
 
 
@@ -451,9 +450,7 @@ class RealTimeLookupTests(AdminRegistryPostgresTestCase):
         self.assertIsNone(lookup.active_entry(open_id="ou_never_seen_anywhere"))
 
     def test_seeded_identity_reads_back_with_all_roles(self) -> None:
-        seed_admin_registry_entry(
-            self._dsn, feishu_open_id="ou_seeded", label="delegated_subject"
-        )
+        seed_admin_registry_entry(self._dsn, feishu_open_id="ou_seeded", label="delegated_subject")
         lookup = PostgresAdminRegistryLookup(self._dsn)
 
         entry = lookup.active_entry(open_id="ou_seeded")
@@ -596,7 +593,10 @@ class AdminQueriesTests(AdminRegistryPostgresTestCase):
     def test_recent_events_scoped_by_identifier_and_window(self) -> None:
         now = datetime.now(UTC)
         self.add_event(
-            event_id="evt_in_window", open_id="ou_a", received_at=now - timedelta(hours=1), trace_id="trc_in"
+            event_id="evt_in_window",
+            open_id="ou_a",
+            received_at=now - timedelta(hours=1),
+            trace_id="trc_in",
         )
         self.add_event(
             event_id="evt_out_of_window",
@@ -605,7 +605,10 @@ class AdminQueriesTests(AdminRegistryPostgresTestCase):
             trace_id="trc_out",
         )
         self.add_event(
-            event_id="evt_other_user", open_id="ou_b", received_at=now - timedelta(hours=1), trace_id="trc_other"
+            event_id="evt_other_user",
+            open_id="ou_b",
+            received_at=now - timedelta(hours=1),
+            trace_id="trc_other",
         )
         queries = PostgresAdminQueries(self._dsn)
 
@@ -616,10 +619,16 @@ class AdminQueriesTests(AdminRegistryPostgresTestCase):
     def test_recent_events_without_identifier_covers_all_users(self) -> None:
         now = datetime.now(UTC)
         self.add_event(
-            event_id="evt_1", open_id="ou_a", received_at=now - timedelta(minutes=5), trace_id="trc_1"
+            event_id="evt_1",
+            open_id="ou_a",
+            received_at=now - timedelta(minutes=5),
+            trace_id="trc_1",
         )
         self.add_event(
-            event_id="evt_2", open_id="ou_b", received_at=now - timedelta(minutes=10), trace_id="trc_2"
+            event_id="evt_2",
+            open_id="ou_b",
+            received_at=now - timedelta(minutes=10),
+            trace_id="trc_2",
         )
         queries = PostgresAdminQueries(self._dsn)
 
@@ -818,7 +827,9 @@ class TraceLookupTests(AdminRegistryPostgresTestCase):
         """文档投递失败与问数任务收口是两条独立状态机；trace 查询不能用 task 的
         成功状态遮住用户未拿到文档的事实。"""
 
-        self.add_user(user_id="usr_doc_failed", open_id="ou_doc_failed", provisioning_state="active")
+        self.add_user(
+            user_id="usr_doc_failed", open_id="ou_doc_failed", provisioning_state="active"
+        )
         self.add_event(
             event_id="evt_doc_failed",
             open_id="ou_doc_failed",
@@ -916,9 +927,7 @@ class ResolveIdentifierTests(AdminRegistryPostgresTestCase):
         self.add_user(open_id="ou_target", email="someone@example.com")
         queries = PostgresAdminQueries(self._dsn)
 
-        self.assertEqual(
-            queries.resolve_identifier(identifier="someone@example.com"), "ou_target"
-        )
+        self.assertEqual(queries.resolve_identifier(identifier="someone@example.com"), "ou_target")
 
     def test_zero_hits_falls_back_to_the_original_input(self) -> None:
         queries = PostgresAdminQueries(self._dsn)
@@ -1095,9 +1104,7 @@ class DisplayNamesTests(AdminRegistryPostgresTestCase):
         self.add_user(open_id="ou_target", display_name="张三", email="zhangsan@example.com")
         queries = PostgresAdminQueries(self._dsn)
 
-        self.assertEqual(
-            queries.user_label(open_id="ou_target"), "张三（zhangsan@example.com）"
-        )
+        self.assertEqual(queries.user_label(open_id="ou_target"), "张三（zhangsan@example.com）")
 
     def test_user_label_falls_back_to_display_name_only(self) -> None:
         self.add_user(open_id="ou_target", display_name="张三", email=None)

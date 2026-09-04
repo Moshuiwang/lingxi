@@ -229,11 +229,11 @@ def parse_baseline(text: str) -> dict[str, int]:
             )
         size_text, identifier_text = parts
         if not ASSERTION_ID.match(identifier_text):
-            raise BaselineError(
-                f"基线文件第 {line_number} 行的断言编号不合法：{identifier_text!r}"
-            )
+            raise BaselineError(f"基线文件第 {line_number} 行的断言编号不合法：{identifier_text!r}")
         if identifier_text in entries:
-            raise BaselineError(f"基线文件第 {line_number} 行重复登记同一断言编号：{identifier_text}")
+            raise BaselineError(
+                f"基线文件第 {line_number} 行重复登记同一断言编号：{identifier_text}"
+            )
         entries[identifier_text] = int(size_text)
     return entries
 
@@ -427,7 +427,10 @@ def run_refresh() -> int:
     if lowered:
         print(
             "已调低："
-            + "、".join(f"{identifier}（{baseline[identifier]}→{new_baseline[identifier]}）" for identifier in lowered)
+            + "、".join(
+                f"{identifier}（{baseline[identifier]}→{new_baseline[identifier]}）"
+                for identifier in lowered
+            )
         )
     if removed:
         print("已移除（已缩到阈值以下或已删除/改名）：" + "、".join(removed))

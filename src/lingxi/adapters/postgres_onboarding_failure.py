@@ -27,9 +27,7 @@ class PostgresFailureReasonRecorder:
     若同一个 ``trace_id`` 被处理第二次（例如进程重启后重跑），先落的那一行保持
     不变，不覆盖、不报错（见迁移 ``0077`` 文件头部「幂等」一节）。"""
 
-    def __init__(
-        self, dsn: str, *, timeouts: PostgresTimeouts = DEFAULT_POSTGRES_TIMEOUTS
-    ) -> None:
+    def __init__(self, dsn: str, *, timeouts: PostgresTimeouts = DEFAULT_POSTGRES_TIMEOUTS) -> None:
         self._dsn = dsn
         self._timeouts = timeouts
 
@@ -43,7 +41,10 @@ class PostgresFailureReasonRecorder:
             # 打到数据库才发现字面量拼错——这是唯一两个已知调用方各自的固定
             # 字面量，不接受任意字符串（见迁移文件头部「数据来源」一节）。
             raise ValueError(f"未知的 event_type：{event_type!r}")
-        with connect(self._dsn, timeouts=self._timeouts) as connection, connection.cursor() as cursor:
+        with (
+            connect(self._dsn, timeouts=self._timeouts) as connection,
+            connection.cursor() as cursor,
+        ):
             cursor.execute(
                 """
                 INSERT INTO onboarding_failure (trace_id, failure_reason, event_type)

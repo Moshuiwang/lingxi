@@ -306,6 +306,7 @@ SERVER_SIMPLIFIED_BODY = "server_simplified_body"
 #: 降级交付的请求变成整次失败，而没有任何东西会红。
 PRE_FLIGHT_DEGRADE_REASONS = frozenset({BODY_TOO_LONG, TITLE_NOT_EMBEDDABLE})
 
+
 @dataclass(frozen=True)
 class CreatedDocument:
     """:meth:`LarkDocxDelivery.create_document_with_markdown` 的返回值：这次
@@ -355,7 +356,12 @@ def _require_https(base_url: str) -> str:
         raise ValueError("base_url 必须由配置注入，不得写死在代码里")
     text = base_url.strip()
     parsed = urlparse(text)
-    if parsed.scheme != "https" or not parsed.netloc or parsed.username is not None or parsed.password is not None:
+    if (
+        parsed.scheme != "https"
+        or not parsed.netloc
+        or parsed.username is not None
+        or parsed.password is not None
+    ):
         raise ValueError("飞书 base_url 必须使用不含凭据的 HTTPS 地址")
     if parsed.fragment:
         raise ValueError("飞书 base_url 不得包含 URL fragment")
@@ -371,7 +377,9 @@ def _require_tenant_domain(value: str) -> str:
         raise ValueError("tenant_domain 必须由配置注入，不得写死在代码里")
     text = value.strip()
     if "://" in text or "/" in text or any(character.isspace() for character in text):
-        raise ValueError("tenant_domain 必须是裸域名（不含协议、路径或空白），例如 example.feishu.cn")
+        raise ValueError(
+            "tenant_domain 必须是裸域名（不含协议、路径或空白），例如 example.feishu.cn"
+        )
     return text
 
 
@@ -392,7 +400,9 @@ def _require_user_open_id(open_id: str) -> str:
 
     text = (open_id or "").strip()
     if not text.startswith(USER_OPEN_ID_PREFIX) or len(text) <= len(USER_OPEN_ID_PREFIX):
-        raise ValueError(f"open_id 必须是飞书用户 open_id（以 {USER_OPEN_ID_PREFIX} 开头），不回显收到的值")
+        raise ValueError(
+            f"open_id 必须是飞书用户 open_id（以 {USER_OPEN_ID_PREFIX} 开头），不回显收到的值"
+        )
     if any(character.isspace() for character in text):
         raise ValueError("open_id 不得包含空白字符，不回显收到的值")
     return text
@@ -461,11 +471,18 @@ def _degraded_reason(data: Mapping[str, Any]) -> str | None:
 
 class Transport(Protocol):
     def __call__(
-        self, method: str, url: str, *, body: Mapping[str, Any] | None = ..., token: str | None = ...
+        self,
+        method: str,
+        url: str,
+        *,
+        body: Mapping[str, Any] | None = ...,
+        token: str | None = ...,
     ) -> Any: ...
 
 
-def urllib_transport(method: str, url: str, *, body: Mapping[str, Any] | None = None, token: str | None = None) -> Any:
+def urllib_transport(
+    method: str, url: str, *, body: Mapping[str, Any] | None = None, token: str | None = None
+) -> Any:
     """默认传输层：只发 HTTPS，**不重试**任何请求（同
     :func:`lingxi.adapters.feishu_tenant_token.urllib_transport` 的姿态：飞书
     调用失败按已知分类抛出，交由调用方决定要不要重试）。
@@ -487,7 +504,9 @@ def urllib_transport(method: str, url: str, *, body: Mapping[str, Any] | None = 
         headers["Authorization"] = f"Bearer {token}"
     request = Request(url, data=payload, headers=headers, method=method)
     try:
-        with urlopen(request, timeout=REQUEST_TIMEOUT_SECONDS) as response:  # 地址来自受控配置且已校验 https
+        with urlopen(
+            request, timeout=REQUEST_TIMEOUT_SECONDS
+        ) as response:  # 地址来自受控配置且已校验 https
             return json.loads(response.read())
     except HTTPError as error:
         if error.code >= 500:
@@ -603,7 +622,10 @@ class LarkDocxDelivery:
             if not isinstance(text, str) or not text.strip():
                 raise ValueError(f"第 {index + 1} 段正文不能为空")
         children = [
-            {"block_type": _TEXT_PARAGRAPH_BLOCK_TYPE, "text": {"elements": [{"text_run": {"content": text}}]}}
+            {
+                "block_type": _TEXT_PARAGRAPH_BLOCK_TYPE,
+                "text": {"elements": [{"text_run": {"content": text}}]},
+            }
             for text in texts
         ]
         self._data(
@@ -715,7 +737,11 @@ class LarkDocxDelivery:
                 "POST",
                 f"/drive/v1/permissions/{doc_id}/members",
                 params={"type": DOCX_PERMISSION_TYPE},
-                body={"member_type": OPENID_MEMBER_TYPE, "member_id": member_id, "perm": FULL_ACCESS_PERM},
+                body={
+                    "member_type": OPENID_MEMBER_TYPE,
+                    "member_id": member_id,
+                    "perm": FULL_ACCESS_PERM,
+                },
             )
         )
         logger.info("飞书 docx 已授予可管理 document_id_len=%s", len(doc_id))
@@ -740,7 +766,11 @@ class LarkDocxDelivery:
 
         doc_id = _require_document_id(document_id)
         data = self._data(
-            self._call("GET", f"/drive/v1/permissions/{doc_id}/members", params={"type": DOCX_PERMISSION_TYPE})
+            self._call(
+                "GET",
+                f"/drive/v1/permissions/{doc_id}/members",
+                params={"type": DOCX_PERMISSION_TYPE},
+            )
         )
         members = data.get("items")
         if not isinstance(members, list):

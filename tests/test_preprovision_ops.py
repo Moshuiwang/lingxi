@@ -102,7 +102,9 @@ class RosterParsingTest(unittest.TestCase):
 
     def test_a_well_formed_roster_normalizes_the_email(self) -> None:
         rows = TOOL.load_roster(
-            self._write("email,position,company_scope\n  Zhang.San@Example.com , A国家总经理 , 1011 \n")
+            self._write(
+                "email,position,company_scope\n  Zhang.San@Example.com , A国家总经理 , 1011 \n"
+            )
         )
         self.assertEqual(
             [(row.email, row.position_name, row.company_scope) for row in rows],
@@ -111,7 +113,7 @@ class RosterParsingTest(unittest.TestCase):
 
     def test_a_wrong_header_is_rejected_outright(self) -> None:
         with self.assertRaises(TOOL.RosterError):
-            TOOL.load_roster(self._write("email,permissions\na@b.com,\"{}\"\n"))
+            TOOL.load_roster(self._write('email,permissions\na@b.com,"{}"\n'))
 
     def test_a_blank_field_is_rejected_outright(self) -> None:
         with self.assertRaises(TOOL.RosterError):
@@ -133,7 +135,9 @@ class RosterParsingTest(unittest.TestCase):
         """职位写错**当场拒**——这正是选「职位＋公司范围」而不是「邮箱＋指标 JSON」的意义：
         名单上没有一列会静默生效的自由文本。"""
 
-        rows = (TOOL.RosterRow(email="a@b.com", position_name="A国家运维总监", company_scope="1011"),)
+        rows = (
+            TOOL.RosterRow(email="a@b.com", position_name="A国家运维总监", company_scope="1011"),
+        )
         with self.assertRaises(TOOL.RosterError):
             TOOL.plan_preprovision(
                 rows, role_function_map=ROLE_MAP, company_function_metric_map=COMPANY_MAP
@@ -192,7 +196,9 @@ class PerPersonFailureIsolationTest(unittest.TestCase):
             (
                 TOOL.RosterRow(email="a@b.com", position_name="A国家总经理", company_scope="1011"),
                 TOOL.RosterRow(email="c@d.com", position_name="A国家总经理", company_scope="1011"),
-                TOOL.RosterRow(email="e@f.com", position_name="A国家财务总监", company_scope="1012"),
+                TOOL.RosterRow(
+                    email="e@f.com", position_name="A国家财务总监", company_scope="1012"
+                ),
             ),
             role_function_map=ROLE_MAP,
             company_function_metric_map=COMPANY_MAP,
@@ -210,10 +216,15 @@ class PerPersonFailureIsolationTest(unittest.TestCase):
             return _Result()
 
         report = TOOL.run_preprovision(
-            items, start_system=start_system, initiated_by_open_id="ou_admin", trace_id_factory=lambda: "trace"
+            items,
+            start_system=start_system,
+            initiated_by_open_id="ou_admin",
+            trace_id_factory=lambda: "trace",
         )
 
-        self.assertEqual(seen, ["a@b.com", "c@d.com", "e@f.com"], "第二个人失败后必须继续跑第三个人")
+        self.assertEqual(
+            seen, ["a@b.com", "c@d.com", "e@f.com"], "第二个人失败后必须继续跑第三个人"
+        )
         self.assertEqual((report.provisioned, report.failed), (2, 1))
         self.assertEqual(
             [item.outcome for item in report.outcomes],
@@ -231,7 +242,10 @@ class PerPersonFailureIsolationTest(unittest.TestCase):
             raise ValueError("zhang.san@example.com 定位失败")
 
         report = TOOL.run_preprovision(
-            items, start_system=start_system, initiated_by_open_id="ou_admin", trace_id_factory=lambda: "trace"
+            items,
+            start_system=start_system,
+            initiated_by_open_id="ou_admin",
+            trace_id_factory=lambda: "trace",
         )
         rendered = io.StringIO()
         with redirect_stdout(rendered):
@@ -287,9 +301,7 @@ class PerPersonFailureIsolationTest(unittest.TestCase):
             (report.provisioned, report.skipped, report.failed, report.grant_not_applied),
             (0, 0, 0, 1),
         )
-        self.assertEqual(
-            report.outcomes[0].outcome, TOOL.OUTCOME_ALREADY_ACTIVE_GRANT_NOT_APPLIED
-        )
+        self.assertEqual(report.outcomes[0].outcome, TOOL.OUTCOME_ALREADY_ACTIVE_GRANT_NOT_APPLIED)
         rendered = io.StringIO()
         with redirect_stdout(rendered):
             TOOL.print_report(report)
@@ -360,11 +372,7 @@ class CommandLineWritePolarityTest(unittest.TestCase):
             code = TOOL.main(argv)
         return code, out.getvalue(), err.getvalue()
 
-    ROSTER = (
-        "email,position,company_scope\n"
-        "a@b.com,A国家总经理,1011\n"
-        "c@d.com,A国家财务总监,1012\n"
-    )
+    ROSTER = "email,position,company_scope\na@b.com,A国家总经理,1011\nc@d.com,A国家财务总监,1012\n"
 
     def test_an_abbreviated_flag_is_rejected_with_zero_side_effects(self) -> None:
         """rc25 修复包 F5：argparse 前缀缩写关闭（``allow_abbrev=False``）。``--a``
@@ -607,9 +615,7 @@ class PreprovisionGrantSeamTests(unittest.TestCase):
             PostgresLocalPermissionOverrideStore,
         )
 
-        signature = inspect.signature(
-            PostgresLocalPermissionOverrideStore.import_position_grant
-        )
+        signature = inspect.signature(PostgresLocalPermissionOverrideStore.import_position_grant)
         # 这五个关键字逐字抄自真实调用点 core/identity/preprovision.py::import_preprovision_grant。
         signature.bind(
             object(),

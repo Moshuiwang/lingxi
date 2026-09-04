@@ -117,8 +117,7 @@ def prepare(
     else:
         if manifest.is_symlink() or not manifest.is_file():
             raise IMPACT.CountEvidenceError(
-                "权限事实发生变化但缺少 biai-stage 只读聚合清单；"
-                "CI 不读取业务凭据或调用公司系统"
+                "权限事实发生变化但缺少 biai-stage 只读聚合清单；CI 不读取业务凭据或调用公司系统"
             )
         evidence = _read_json(manifest)
         validated = IMPACT._validate_count_manifest(
@@ -130,12 +129,9 @@ def prepare(
         )
         if validated["source"]["kind"] != IMPACT.STAGE_COUNT_CLAIM_SOURCE:
             raise IMPACT.CountEvidenceError(
-                "非空权限影响面只能使用 biai-stage 只读聚合声明；"
-                "不能用静态 0 或其他自报来源替代"
+                "非空权限影响面只能使用 biai-stage 只读聚合声明；不能用静态 0 或其他自报来源替代"
             )
-        registration = IMPACT.load_optional_provenance(
-            trusted_provenance, repository=repository
-        )
+        registration = IMPACT.load_optional_provenance(trusted_provenance, repository=repository)
         if registration is None:
             # Issue #520 F3：缺 registration 不再终止；把降级原因写进门禁日志，
             # 让审查者与产品负责人看到这次的数量是未验证声明。

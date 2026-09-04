@@ -43,7 +43,10 @@ class OAuthBridgeMessage:
     @classmethod
     def parse(cls, raw: str) -> OAuthBridgeMessage:
         value = json.loads(raw)
-        if not isinstance(value, dict) or value.get("type") not in {"oauth_code", "oauth_cancelled"}:
+        if not isinstance(value, dict) or value.get("type") not in {
+            "oauth_code",
+            "oauth_cancelled",
+        }:
             raise ValueError("未识别的 OAuth 桥接消息")
         state = value.get("state")
         if not isinstance(state, str) or _STATE_PATTERN.fullmatch(state) is None:
@@ -123,7 +126,11 @@ class OAuthBridgeClient:
 
         while not self._stop.is_set():
             try:
-                with connect(self._url, additional_headers={"Authorization": f"Bearer {self._token}"}, open_timeout=10) as socket:
+                with connect(
+                    self._url,
+                    additional_headers={"Authorization": f"Bearer {self._token}"},
+                    open_timeout=10,
+                ) as socket:
                     self._socket = socket
                     for raw in socket:
                         if self._stop.is_set():

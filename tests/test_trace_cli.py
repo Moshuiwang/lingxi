@@ -126,7 +126,15 @@ class TraceLookupRealDatabaseTests(unittest.TestCase):
                      (id, feishu_open_id, feishu_user_id, feishu_union_id, display_name,
                       department, tenant_key, provisioning_state, permission_version)
                    VALUES (%s, %s, %s, %s, %s, %s, %s, 'mcp_syncing', 1)""",
-                ("usr_trace_1", "ou_trace_1", "fs_trace_1", "on_trace_1", "化名甲", "测试部门", "tenant-fake"),
+                (
+                    "usr_trace_1",
+                    "ou_trace_1",
+                    "fs_trace_1",
+                    "on_trace_1",
+                    "化名甲",
+                    "测试部门",
+                    "tenant-fake",
+                ),
             )
             cursor.execute(
                 """INSERT INTO inbound_event

@@ -72,7 +72,9 @@ def _token_supply(token: str = FAKE_TOKEN):
     return lambda: token
 
 
-def _client(transport, *, tenant_access_token=None, markdown_convert_enabled: bool = False) -> LarkDocxDelivery:
+def _client(
+    transport, *, tenant_access_token=None, markdown_convert_enabled: bool = False
+) -> LarkDocxDelivery:
     return LarkDocxDelivery(
         base_url=BASE_URL,
         tenant_access_token=tenant_access_token or _token_supply(),
@@ -93,18 +95,32 @@ class ClientConstructionTest(unittest.TestCase):
 
     def test_a_non_callable_token_supply_is_rejected(self) -> None:
         with self.assertRaises(ValueError):
-            LarkDocxDelivery(base_url=BASE_URL, tenant_access_token=FAKE_TOKEN, tenant_domain=TENANT_DOMAIN)  # type: ignore[arg-type]
+            LarkDocxDelivery(
+                base_url=BASE_URL, tenant_access_token=FAKE_TOKEN, tenant_domain=TENANT_DOMAIN
+            )  # type: ignore[arg-type]
 
     def test_tenant_domain_must_be_a_bare_domain(self) -> None:
-        for bad_domain in ("", "   ", "https://gv3qfk4q2rp.feishu.cn", "gv3qfk4q2rp.feishu.cn/docx", "has space.feishu.cn"):
+        for bad_domain in (
+            "",
+            "   ",
+            "https://gv3qfk4q2rp.feishu.cn",
+            "gv3qfk4q2rp.feishu.cn/docx",
+            "has space.feishu.cn",
+        ):
             with self.subTest(bad_domain=bad_domain):
                 with self.assertRaises(ValueError):
-                    LarkDocxDelivery(base_url=BASE_URL, tenant_access_token=_token_supply(), tenant_domain=bad_domain)
+                    LarkDocxDelivery(
+                        base_url=BASE_URL,
+                        tenant_access_token=_token_supply(),
+                        tenant_domain=bad_domain,
+                    )
 
 
 class CreateDocumentTest(unittest.TestCase):
     def test_a_successful_create_returns_the_document_id_and_matches_the_probed_shape(self) -> None:
-        transport = RecordingTransport([{"code": 0, "data": {"document": {"document_id": DOCUMENT_ID, "revision_id": 1}}}])
+        transport = RecordingTransport(
+            [{"code": 0, "data": {"document": {"document_id": DOCUMENT_ID, "revision_id": 1}}}]
+        )
         client = _client(transport)
 
         document_id = client.create_document("本月销售分析")
@@ -137,7 +153,9 @@ class CreateDocumentTest(unittest.TestCase):
         self.assertTrue(raised.exception.definite)
         self.assertNotIn("本月销售分析", str(raised.exception))
 
-    def test_a_success_response_missing_document_id_is_a_lookup_error_not_a_silent_success(self) -> None:
+    def test_a_success_response_missing_document_id_is_a_lookup_error_not_a_silent_success(
+        self,
+    ) -> None:
         """结果不明：飞书说成功（``code=0``）但拿不到可回读标识——这不是
         ``FeishuDocxDeliveryError``（那是"明确拒绝"），必须是 ``LookupError``。
 
@@ -170,13 +188,21 @@ class WriteParagraphsTest(unittest.TestCase):
         self.assertEqual(len(transport.calls), 1)
         method, url, body, token = transport.calls[0]
         self.assertEqual(method, "POST")
-        self.assertEqual(url, f"{BASE_URL}/docx/v1/documents/{DOCUMENT_ID}/blocks/{DOCUMENT_ID}/children")
+        self.assertEqual(
+            url, f"{BASE_URL}/docx/v1/documents/{DOCUMENT_ID}/blocks/{DOCUMENT_ID}/children"
+        )
         self.assertEqual(
             body,
             {
                 "children": [
-                    {"block_type": 2, "text": {"elements": [{"text_run": {"content": "第一段正文"}}]}},
-                    {"block_type": 2, "text": {"elements": [{"text_run": {"content": "第二段正文"}}]}},
+                    {
+                        "block_type": 2,
+                        "text": {"elements": [{"text_run": {"content": "第一段正文"}}]},
+                    },
+                    {
+                        "block_type": 2,
+                        "text": {"elements": [{"text_run": {"content": "第二段正文"}}]},
+                    },
                 ],
                 "index": 0,
             },
@@ -250,7 +276,9 @@ class GrantFullAccessTest(unittest.TestCase):
         method, url, body, token = transport.calls[0]
         self.assertEqual(method, "POST")
         self.assertEqual(url, f"{BASE_URL}/drive/v1/permissions/{DOCUMENT_ID}/members?type=docx")
-        self.assertEqual(body, {"member_type": "openid", "member_id": OPEN_ID, "perm": "full_access"})
+        self.assertEqual(
+            body, {"member_type": "openid", "member_id": OPEN_ID, "perm": "full_access"}
+        )
         self.assertEqual(token, FAKE_TOKEN)
 
     def test_the_granted_perm_is_exactly_full_access_not_edit(self) -> None:
@@ -316,7 +344,12 @@ class ReadMembersTest(unittest.TestCase):
                                 "perm": "full_access",
                                 "perm_type": "container",
                             },
-                            {"member_type": "app", "member_id": "cli_fake_app", "perm": "full_access", "perm_type": "container"},
+                            {
+                                "member_type": "app",
+                                "member_id": "cli_fake_app",
+                                "perm": "full_access",
+                                "perm_type": "container",
+                            },
                         ]
                     },
                 }
@@ -338,7 +371,9 @@ class ReadMembersTest(unittest.TestCase):
         self.assertEqual(target["perm"], "full_access")
         self.assertNotIn("perm_type", target)
 
-    def test_a_legacy_members_shaped_response_is_still_accepted_as_a_degraded_fallback(self) -> None:
+    def test_a_legacy_members_shaped_response_is_still_accepted_as_a_degraded_fallback(
+        self,
+    ) -> None:
         """降级读：``items`` 缺失但 ``members`` 存在时仍要能读出协作者——不是当前
         真实形状（见上一条用例），只是不排除历史响应或未来回归会回到这个形状，
         兼容读不应该让调用方多做一次判断。"""
@@ -402,7 +437,9 @@ class ReadBodyChildrenTest(unittest.TestCase):
         self.assertEqual(len(transport.calls), 1)
         method, url, body, token = transport.calls[0]
         self.assertEqual(method, "GET")
-        self.assertEqual(url, f"{BASE_URL}/docx/v1/documents/{DOCUMENT_ID}/blocks/{DOCUMENT_ID}/children")
+        self.assertEqual(
+            url, f"{BASE_URL}/docx/v1/documents/{DOCUMENT_ID}/blocks/{DOCUMENT_ID}/children"
+        )
         self.assertIsNone(body)
         self.assertEqual(token, FAKE_TOKEN)
         self.assertEqual(len(children), 1)
@@ -474,10 +511,16 @@ class CreateDocumentWithMarkdownTest(unittest.TestCase):
     """
 
     def _response(self, **data: object) -> dict[str, object]:
-        document = {"document_id": DOCUMENT_ID, "revision_id": 3, "url": f"https://{TENANT_DOMAIN}/docx/{DOCUMENT_ID}"}
+        document = {
+            "document_id": DOCUMENT_ID,
+            "revision_id": 3,
+            "url": f"https://{TENANT_DOMAIN}/docx/{DOCUMENT_ID}",
+        }
         return {"code": 0, "msg": "", "data": {"document": document, **data}}
 
-    def test_the_comprehensive_sample_is_delivered_in_exactly_one_call_with_the_probed_shape(self) -> None:
+    def test_the_comprehensive_sample_is_delivered_in_exactly_one_call_with_the_probed_shape(
+        self,
+    ) -> None:
         """综合样本一次建档成功：**一次**调用、请求形态与探针实测逐字一致、
         正文一个字符没被改写。
 
@@ -488,18 +531,24 @@ class CreateDocumentWithMarkdownTest(unittest.TestCase):
         transport = RecordingTransport([self._response()])
         client = _client(transport, markdown_convert_enabled=True)
 
-        created = client.create_document_with_markdown("2026 年 8 月经营简报", COMPREHENSIVE_MARKDOWN)
+        created = client.create_document_with_markdown(
+            "2026 年 8 月经营简报", COMPREHENSIVE_MARKDOWN
+        )
 
         self.assertEqual(created.document_id, DOCUMENT_ID)
         self.assertIsNone(created.degraded_reason)
         self.assertFalse(created.degraded)
-        self.assertEqual(len(transport.calls), 1, "一次建档必须只发一次调用，不得再有 convert/写块调用")
+        self.assertEqual(
+            len(transport.calls), 1, "一次建档必须只发一次调用，不得再有 convert/写块调用"
+        )
         method, url, body, token = transport.calls[0]
         self.assertEqual(method, "POST")
         self.assertEqual(url, f"{BASE_URL}/docs_ai/v1/documents")
         self.assertEqual(token, FAKE_TOKEN)
         assert body is not None
-        self.assertEqual(set(body), {"format", "content"}, "探针实测不传 parent_token：落点与老路径本来就一致")
+        self.assertEqual(
+            set(body), {"format", "content"}, "探针实测不传 parent_token：落点与老路径本来就一致"
+        )
         self.assertEqual(body["format"], "markdown")
         content = body["content"]
         assert isinstance(content, str)
@@ -516,7 +565,9 @@ class CreateDocumentWithMarkdownTest(unittest.TestCase):
         """探针二实测：干净成功时 ``data`` 只有 ``document`` 一个键——"``result``
         键不存在"就是零告警，不能被当成"拿不准所以报降级"。"""
 
-        transport = RecordingTransport([{"code": 0, "data": {"document": {"document_id": DOCUMENT_ID}}}])
+        transport = RecordingTransport(
+            [{"code": 0, "data": {"document": {"document_id": DOCUMENT_ID}}}]
+        )
         client = _client(transport, markdown_convert_enabled=True)
 
         created = client.create_document_with_markdown("标题", "正文")
@@ -566,7 +617,8 @@ class CreateDocumentWithMarkdownTest(unittest.TestCase):
         client = _client(transport, markdown_convert_enabled=True)
 
         self.assertEqual(
-            client.create_document_with_markdown("标题", "正文").degraded_reason, SERVER_SIMPLIFIED_BODY
+            client.create_document_with_markdown("标题", "正文").degraded_reason,
+            SERVER_SIMPLIFIED_BODY,
         )
 
     def test_result_failed_is_a_definite_failure_and_reports_no_document(self) -> None:
@@ -687,7 +739,13 @@ class GatewayTimeoutTest(unittest.TestCase):
     @staticmethod
     def _raise_http_error(status: int, payload: bytes):
         def boom(*_args, **_kwargs):
-            raise HTTPError(f"{BASE_URL}/docs_ai/v1/documents", status, "Gateway Timeout", {}, io.BytesIO(payload))
+            raise HTTPError(
+                f"{BASE_URL}/docs_ai/v1/documents",
+                status,
+                "Gateway Timeout",
+                {},
+                io.BytesIO(payload),
+            )
 
         return boom
 
@@ -700,12 +758,17 @@ class GatewayTimeoutTest(unittest.TestCase):
 
     def test_a_gateway_timeout_is_result_unknown_and_the_body_code_is_not_trusted(self) -> None:
         self._with_urlopen(
-            self._raise_http_error(504, b'{"code": 2200, "msg": "Gateway timeout. Please try again later."}')
+            self._raise_http_error(
+                504, b'{"code": 2200, "msg": "Gateway timeout. Please try again later."}'
+            )
         )
 
         with self.assertRaises(FeishuDocxDeliveryError) as raised:
             urllib_transport(
-                "POST", f"{BASE_URL}/docs_ai/v1/documents", body={"format": "markdown"}, token=FAKE_TOKEN
+                "POST",
+                f"{BASE_URL}/docs_ai/v1/documents",
+                body={"format": "markdown"},
+                token=FAKE_TOKEN,
             )
 
         self.assertEqual(raised.exception.code, "http_504")
@@ -729,9 +792,13 @@ class GatewayTimeoutTest(unittest.TestCase):
     def test_a_client_error_still_parses_the_business_code(self) -> None:
         """4xx 仍然照常解析：飞书的业务错误码走 2xx/4xx 返回，那是确定性拒绝。"""
 
-        self._with_urlopen(self._raise_http_error(400, b'{"code": 1770001, "msg": "invalid param"}'))
+        self._with_urlopen(
+            self._raise_http_error(400, b'{"code": 1770001, "msg": "invalid param"}')
+        )
 
-        response = urllib_transport("POST", f"{BASE_URL}/docs_ai/v1/documents", body={}, token=FAKE_TOKEN)
+        response = urllib_transport(
+            "POST", f"{BASE_URL}/docs_ai/v1/documents", body={}, token=FAKE_TOKEN
+        )
 
         self.assertEqual(response, {"code": 1770001, "msg": "invalid param"})
 
@@ -779,7 +846,9 @@ class TokenSupplyTest(unittest.TestCase):
         for _, url, _, _ in transport.calls:
             self.assertNotIn(FAKE_TOKEN, url)
 
-    def test_a_missing_token_from_the_supply_is_rejected_without_calling_the_transport(self) -> None:
+    def test_a_missing_token_from_the_supply_is_rejected_without_calling_the_transport(
+        self,
+    ) -> None:
         transport = RecordingTransport([])
         client = _client(transport, tenant_access_token=lambda: "")
 
@@ -805,7 +874,9 @@ class DefaultTransportTest(unittest.TestCase):
         module.urlopen = boom
         try:
             with self.assertRaises(FeishuDocxDeliveryError) as raised:
-                urllib_transport("POST", f"{BASE_URL}/docx/v1/documents", body={"title": "x"}, token=FAKE_TOKEN)
+                urllib_transport(
+                    "POST", f"{BASE_URL}/docx/v1/documents", body={"title": "x"}, token=FAKE_TOKEN
+                )
             self.assertEqual(raised.exception.code, "transport_error")
             self.assertFalse(raised.exception.definite)
         finally:

@@ -881,7 +881,9 @@ class CardStream:
                     query_step, _DEFAULT_QUERYING_DONE_TEXT_KEY
                 )
             else:
-                text_key = _QUERY_STEP_ACTION_TEXT_KEYS.get(query_step, "worker.action.querying_metrics")
+                text_key = _QUERY_STEP_ACTION_TEXT_KEYS.get(
+                    query_step, "worker.action.querying_metrics"
+                )
             action_text = self._catalog.text(text_key, count=query_count).text
         elif action == PROGRESS_ACTION_COMPOSING:
             # 完成时措辞改走 _ACTION_DONE_TEXT_KEYS（B-4，Trace #469 修复包

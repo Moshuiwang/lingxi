@@ -118,12 +118,17 @@ class StalledProvisioningPostgresTestCase(unittest.TestCase):
 
         decision = self.publish_store.record_decision(
             require_enabled_account=True,
-            user_id=user_id, row=row or _row(), reason=reason, decided_at=datetime.now(UTC)
+            user_id=user_id,
+            row=row or _row(),
+            reason=reason,
+            decided_at=datetime.now(UTC),
         )
         claimed = self.publish_store.claim_next()
         assert claimed is not None
         self.publish_store.complete(
-            _publish_attempt(claimed.outbox_id, version=claimed.permission_version, user_id=user_id),
+            _publish_attempt(
+                claimed.outbox_id, version=claimed.permission_version, user_id=user_id
+            ),
             status=STATUS_PUBLISHED,
         )
         return int(decision.permission_version)
@@ -150,9 +155,7 @@ class StalledProvisioningPostgresTestCase(unittest.TestCase):
         `OnboardingReconciler` 的候选集合。"""
 
         with connect(self._dsn) as connection, connection.cursor() as cursor:
-            cursor.execute(
-                "SELECT feishu_open_id FROM app_user WHERE id = %s", (user_id,)
-            )
+            cursor.execute("SELECT feishu_open_id FROM app_user WHERE id = %s", (user_id,))
             open_id = cursor.fetchone()[0]
             cursor.execute(
                 """INSERT INTO inbound_event
@@ -429,9 +432,7 @@ class ComplementaryCandidateSetsTest(StalledProvisioningPostgresTestCase):
         }
 
         self.assertEqual(stalled, {USER_A})
-        self.assertEqual(
-            late_readiness, {USER_B}, "夹具必须让 USER_B 真的出现在对方的候选集合里"
-        )
+        self.assertEqual(late_readiness, {USER_B}, "夹具必须让 USER_B 真的出现在对方的候选集合里")
         self.assertEqual(stalled & late_readiness, set())
 
 

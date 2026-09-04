@@ -318,9 +318,7 @@ def run_refresh(content_path: Path, lock_path: Path) -> int:
             return 1
         if version in retired:
             _print_refresh_failure(
-                [
-                    f"拒绝刷新：版本 {version!r} 是已经登记过的旧标识，不能复用；请改用一个新标识。"
-                ]
+                [f"拒绝刷新：版本 {version!r} 是已经登记过的旧标识，不能复用；请改用一个新标识。"]
             )
             return 1
         if lock["version"] not in retired:

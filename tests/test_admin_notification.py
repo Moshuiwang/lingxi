@@ -191,7 +191,9 @@ class LocalPermissionRenderingTests(unittest.TestCase):
         self.assertIn("授权", notice)
 
     def test_group_notice_has_no_scope_suffix_for_suspend(self) -> None:
-        pending = _pending(action_type=PendingActionType.SUSPEND_USER, status=PendingActionStatus.EXECUTED)
+        pending = _pending(
+            action_type=PendingActionType.SUSPEND_USER, status=PendingActionStatus.EXECUTED
+        )
         notice = render_group_notice(pending, target_label="张三（zhang@example.com）")
 
         self.assertNotIn("公司", notice)
@@ -434,9 +436,7 @@ class AdminSurfaceTerminologySweepTests(unittest.TestCase):
         import ast
 
         admin_package = pathlib.Path(notification_module.__file__).parent
-        scanned = sorted(admin_package.glob("*.py")) + [
-            admin_package.parent / "daily_report.py"
-        ]
+        scanned = sorted(admin_package.glob("*.py")) + [admin_package.parent / "daily_report.py"]
         offenders: list[str] = []
         for path in scanned:
             source = path.read_text(encoding="utf-8")

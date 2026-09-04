@@ -123,7 +123,10 @@ class ConfirmCardDispatcherTests(unittest.TestCase):
         transport = _FakeTransport(card_id="cardkit_abc")
         tracker = _FakeTracker()
         dispatcher = ConfirmCardDispatcher(
-            transport=transport, tracker=tracker, audit=_FakeAudit(), display_names=FakeDisplayNames()
+            transport=transport,
+            tracker=tracker,
+            audit=_FakeAudit(),
+            display_names=FakeDisplayNames(),
         )
         pending = _pending()
 
@@ -141,7 +144,10 @@ class ConfirmCardDispatcherTests(unittest.TestCase):
         transport = _FakeTransport(raises=AdminCardDeliveryRejected("拒绝", code="9999"))
         tracker = _FakeTracker()
         dispatcher = ConfirmCardDispatcher(
-            transport=transport, tracker=tracker, audit=_FakeAudit(), display_names=FakeDisplayNames()
+            transport=transport,
+            tracker=tracker,
+            audit=_FakeAudit(),
+            display_names=FakeDisplayNames(),
         )
         pending = _pending()
 
@@ -162,7 +168,10 @@ class ConfirmCardDispatcherTests(unittest.TestCase):
         transport = _FakeTransport(raises=RuntimeError("网络超时"))
         tracker = _FakeTracker()
         dispatcher = ConfirmCardDispatcher(
-            transport=transport, tracker=tracker, audit=_FakeAudit(), display_names=FakeDisplayNames()
+            transport=transport,
+            tracker=tracker,
+            audit=_FakeAudit(),
+            display_names=FakeDisplayNames(),
         )
         pending = _pending()
 
@@ -177,7 +186,10 @@ class ConfirmCardDispatcherTests(unittest.TestCase):
         transport = _FakeTransport()
         tracker = _FakeTracker()
         dispatcher = ConfirmCardDispatcher(
-            transport=transport, tracker=tracker, audit=_FakeAudit(), display_names=FakeDisplayNames()
+            transport=transport,
+            tracker=tracker,
+            audit=_FakeAudit(),
+            display_names=FakeDisplayNames(),
         )
         pending = _pending()
 
@@ -204,9 +216,7 @@ class ConfirmCardDispatcherTests(unittest.TestCase):
         )
         pending = _pending()
 
-        dispatcher.send(
-            pending=pending, chat_id="oc_1", thread_id=None, reply_to_message_id="om_1"
-        )
+        dispatcher.send(pending=pending, chat_id="oc_1", thread_id=None, reply_to_message_id="om_1")
 
         self.assertEqual(display_names.user_label_calls, [pending.target_open_id])
         card = transport.create_calls[0]["card"]
@@ -231,9 +241,7 @@ class SendFailureAuditTests(unittest.TestCase):
         )
         pending = _pending()
 
-        dispatcher.send(
-            pending=pending, chat_id="oc_1", thread_id=None, reply_to_message_id="om_1"
-        )
+        dispatcher.send(pending=pending, chat_id="oc_1", thread_id=None, reply_to_message_id="om_1")
 
         self.assertEqual(len(audit.calls), 1)
         action, fields = audit.calls[0]
@@ -255,9 +263,7 @@ class SendFailureAuditTests(unittest.TestCase):
         )
         pending = _pending()
 
-        dispatcher.send(
-            pending=pending, chat_id="oc_1", thread_id=None, reply_to_message_id="om_1"
-        )
+        dispatcher.send(pending=pending, chat_id="oc_1", thread_id=None, reply_to_message_id="om_1")
 
         self.assertEqual(len(audit.calls), 1)
         action, fields = audit.calls[0]
@@ -280,9 +286,7 @@ class SendFailureAuditTests(unittest.TestCase):
         )
         pending = _pending()
 
-        dispatcher.send(
-            pending=pending, chat_id="oc_1", thread_id=None, reply_to_message_id="om_1"
-        )
+        dispatcher.send(pending=pending, chat_id="oc_1", thread_id=None, reply_to_message_id="om_1")
 
         _, fields = audit.calls[0]
         self.assertEqual(set(fields), {"pending_action_id", "error"})
@@ -299,9 +303,7 @@ class SendFailureAuditTests(unittest.TestCase):
         )
         pending = _pending()
 
-        dispatcher.send(
-            pending=pending, chat_id="oc_1", thread_id=None, reply_to_message_id="om_1"
-        )
+        dispatcher.send(pending=pending, chat_id="oc_1", thread_id=None, reply_to_message_id="om_1")
 
         self.assertEqual(audit.calls, [])
 
@@ -351,7 +353,10 @@ class ManagementCardDispatcherTests(unittest.TestCase):
         transport = _FakeManagementTransport()
         audit = _FakeAudit()
         dispatcher = ManagementCardDispatcher(
-            transport=transport, catalog=_FakeCatalog(), audit=audit, display_names=FakeDisplayNames()
+            transport=transport,
+            catalog=_FakeCatalog(),
+            audit=audit,
+            display_names=FakeDisplayNames(),
         )
 
         result = dispatcher.send(
@@ -375,7 +380,10 @@ class ManagementCardDispatcherTests(unittest.TestCase):
         )
         audit = _FakeAudit()
         dispatcher = ManagementCardDispatcher(
-            transport=transport, catalog=_FakeCatalog(), audit=audit, display_names=FakeDisplayNames()
+            transport=transport,
+            catalog=_FakeCatalog(),
+            audit=audit,
+            display_names=FakeDisplayNames(),
         )
 
         result = dispatcher.send(
@@ -397,7 +405,10 @@ class ManagementCardDispatcherTests(unittest.TestCase):
         transport = _FakeManagementTransport(raises=RuntimeError("网络超时"))
         audit = _FakeAudit()
         dispatcher = ManagementCardDispatcher(
-            transport=transport, catalog=_FakeCatalog(), audit=audit, display_names=FakeDisplayNames()
+            transport=transport,
+            catalog=_FakeCatalog(),
+            audit=audit,
+            display_names=FakeDisplayNames(),
         )
 
         result = dispatcher.send(
@@ -515,7 +526,10 @@ class ManagementCardDispatcherContextRegistrationTests(unittest.TestCase):
 
         transport = _FakeManagementTransport()
         dispatcher = ManagementCardDispatcher(
-            transport=transport, catalog=_FakeCatalog(), audit=_FakeAudit(), display_names=FakeDisplayNames()
+            transport=transport,
+            catalog=_FakeCatalog(),
+            audit=_FakeAudit(),
+            display_names=FakeDisplayNames(),
         )
 
         result = dispatcher.send(

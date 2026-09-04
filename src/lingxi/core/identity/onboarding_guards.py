@@ -180,7 +180,5 @@ def reject_zero_galaxy_without_local_grant(
         audit.record("onboarding.local_override_skipped", user=user_id, reason=reason)
     if merged.permissions:
         return None
-    audit.record(
-        "onboarding.no_local_grant_after_zero_galaxy", user=user_id, trace_id=trace_id
-    )
+    audit.record("onboarding.no_local_grant_after_zero_galaxy", user=user_id, trace_id=trace_id)
     return _not_authorized(aggregate.reason)

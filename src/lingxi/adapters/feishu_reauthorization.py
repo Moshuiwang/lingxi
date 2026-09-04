@@ -228,7 +228,9 @@ class HostFileAuthorizationStateStore:
     def _write(self, payload: dict[str, Any]) -> None:
         record = {**payload, "mac": self._mac(payload)}
         self._path.parent.mkdir(parents=True, exist_ok=True)
-        descriptor, temp_name = tempfile.mkstemp(dir=str(self._path.parent), prefix=self._path.name + ".")
+        descriptor, temp_name = tempfile.mkstemp(
+            dir=str(self._path.parent), prefix=self._path.name + "."
+        )
         try:
             os.fchmod(descriptor, 0o600)
             with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
@@ -291,7 +293,11 @@ class FeishuReauthorizationEntry:
         self._scope = _required_text(scope, "授权范围")
         if "offline_access" not in self._scope.split():
             raise ValueError("授权范围必须包含 offline_access，才能安全保存可轮换凭据")
-        if not isinstance(state_ttl_seconds, int) or isinstance(state_ttl_seconds, bool) or state_ttl_seconds <= 0:
+        if (
+            not isinstance(state_ttl_seconds, int)
+            or isinstance(state_ttl_seconds, bool)
+            or state_ttl_seconds <= 0
+        ):
             raise ValueError("重授权 state 有效期必须是正整数秒")
         self._state_ttl_seconds = state_ttl_seconds
         self._state_store = state_store
@@ -332,15 +338,19 @@ class FeishuReauthorizationEntry:
             now=now,
         )
         separator = "&" if "?" in self._authorization_endpoint else "?"
-        authorization_url = self._authorization_endpoint + separator + urlencode(
-            {
-                "client_id": self._app_id,
-                "response_type": "code",
-                "redirect_uri": self._redirect_uri,
-                "state": state,
-                "scope": self._scope,
-                "prompt": "consent",
-            }
+        authorization_url = (
+            self._authorization_endpoint
+            + separator
+            + urlencode(
+                {
+                    "client_id": self._app_id,
+                    "response_type": "code",
+                    "redirect_uri": self._redirect_uri,
+                    "state": state,
+                    "scope": self._scope,
+                    "prompt": "consent",
+                }
+            )
         )
         return ReauthorizationStart(authorization_url, state, expires_at)
 
@@ -473,7 +483,9 @@ class FeishuReauthorizationEntry:
                 False,
             )
         logger.info("正式重授权完成，凭据已交给正式 vault")
-        return ReauthorizationResult(True, "completed", "专用授权已更新，可以继续组织目录同步。", False)
+        return ReauthorizationResult(
+            True, "completed", "专用授权已更新，可以继续组织目录同步。", False
+        )
 
     @staticmethod
     def _failure(code: str, message: str) -> ReauthorizationResult:
@@ -495,7 +507,12 @@ def _aware_utc(value: datetime, label: str) -> datetime:
 def _https_url(value: object, label: str) -> str:
     text = _required_text(value, label)
     parsed = urlparse(text)
-    if parsed.scheme != "https" or not parsed.netloc or parsed.username is not None or parsed.password is not None:
+    if (
+        parsed.scheme != "https"
+        or not parsed.netloc
+        or parsed.username is not None
+        or parsed.password is not None
+    ):
         raise ValueError(f"{label}必须使用不含凭据的 HTTPS 地址")
     if parsed.fragment:
         raise ValueError(f"{label}不得包含 URL fragment")

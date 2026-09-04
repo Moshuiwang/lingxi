@@ -156,7 +156,10 @@ class PostgresMcpTokenStore:
         """
 
         candidate_cipher = self._cipher.encrypt(candidate)
-        with connect(self._dsn, timeouts=self._timeouts) as connection, connection.cursor() as cursor:
+        with (
+            connect(self._dsn, timeouts=self._timeouts) as connection,
+            connection.cursor() as cursor,
+        ):
             cursor.execute(
                 """INSERT INTO mcp_access_token (user_id, token_cipher)
                         VALUES (%s, %s)
@@ -182,7 +185,10 @@ class PostgresMcpTokenStore:
     def token_cipher(self, user_id: str) -> str | None:
         """只取密文，**不解密**。构造发布行时用它——那条链路不需要明文。"""
 
-        with connect(self._dsn, timeouts=self._timeouts) as connection, connection.cursor() as cursor:
+        with (
+            connect(self._dsn, timeouts=self._timeouts) as connection,
+            connection.cursor() as cursor,
+        ):
             cursor.execute(
                 "SELECT token_cipher FROM mcp_access_token WHERE user_id = %s", (user_id,)
             )
@@ -217,7 +223,10 @@ class PostgresMcpTokenStore:
         存在的令牌都足以满足调用方的需要。
         """
 
-        with connect(self._dsn, timeouts=self._timeouts) as connection, connection.cursor() as cursor:
+        with (
+            connect(self._dsn, timeouts=self._timeouts) as connection,
+            connection.cursor() as cursor,
+        ):
             cursor.execute("SELECT user_id FROM mcp_access_token ORDER BY issued_at DESC LIMIT 1")
             row = cursor.fetchone()
         return None if row is None else str(row[0])
@@ -282,7 +291,10 @@ class PostgresMcpTokenStore:
     def load_checks(self, user_id: str, permission_version: int) -> tuple[StoredCheck, ...]:
         """回读某个用户某一版权限的全部判定，按次序。给运维排查与用例断言用。"""
 
-        with connect(self._dsn, timeouts=self._timeouts) as connection, connection.cursor() as cursor:
+        with (
+            connect(self._dsn, timeouts=self._timeouts) as connection,
+            connection.cursor() as cursor,
+        ):
             cursor.execute(
                 """SELECT id, user_id, permission_version, attempt_no, result, error_code,
                           metric_count, started_at, finished_at
@@ -320,7 +332,10 @@ class PostgresMcpTokenStore:
             raise ValueError("到期判定时间必须带时区")
         if isinstance(limit, bool) or not isinstance(limit, int) or limit < 1:
             raise ValueError("limit 必须是正整数")
-        with connect(self._dsn, timeouts=self._timeouts) as connection, connection.cursor() as cursor:
+        with (
+            connect(self._dsn, timeouts=self._timeouts) as connection,
+            connection.cursor() as cursor,
+        ):
             cursor.execute(
                 """DELETE FROM mcp_sync_check
                     WHERE id IN (

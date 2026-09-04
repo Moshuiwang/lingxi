@@ -352,7 +352,11 @@ class StalledProvisioningDuty:
         clock: Callable[[], float] | None = None,
         stop: threading.Event | None = None,
     ) -> None:
-        if isinstance(lease_seconds, bool) or not isinstance(lease_seconds, int) or lease_seconds < 1:
+        if (
+            isinstance(lease_seconds, bool)
+            or not isinstance(lease_seconds, int)
+            or lease_seconds < 1
+        ):
             raise ValueError("停摆租约必须是正整数秒")
         if isinstance(limit, bool) or not isinstance(limit, int) or limit < 1:
             raise ValueError("单轮候选上限必须是正整数")
@@ -543,9 +547,7 @@ class StalledProvisioningDuty:
             # 是新的 user_id，不会撞上这条陈旧记录；同一 user_id 罕见地再次停摆时
             # 多等一段退避窗口不构成正确性问题）。
             tally.advance_refused += 1
-            self._audit.record(
-                "stalled_provisioning.advance_refused", user=item.user_id
-            )
+            self._audit.record("stalled_provisioning.advance_refused", user=item.user_id)
             return
         tally.aborted += 1
         self._audit.record(
@@ -648,9 +650,7 @@ def _build_stalled_provisioning_duty(
         lease_seconds=DEFAULT_STALLED_LEASE_SECONDS,
         stop=stop,
     )
-    logger.info(
-        "开通中途停摆收口职责已装配 租约=%ss", DEFAULT_STALLED_LEASE_SECONDS
-    )
+    logger.info("开通中途停摆收口职责已装配 租约=%ss", DEFAULT_STALLED_LEASE_SECONDS)
     return duty
 
 

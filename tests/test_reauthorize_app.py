@@ -172,7 +172,11 @@ def _lingxi_imports(module_name: str) -> set[str]:
     imported: set[str] = set()
     for node in ast.walk(tree):
         if isinstance(node, ast.Import):
-            imported.update(alias.name for alias in node.names if alias.name == "lingxi" or alias.name.startswith("lingxi."))
+            imported.update(
+                alias.name
+                for alias in node.names
+                if alias.name == "lingxi" or alias.name.startswith("lingxi.")
+            )
         elif isinstance(node, ast.ImportFrom):
             if node.level:
                 relative = "." * node.level + (node.module or "")
@@ -263,8 +267,9 @@ class ReauthorizeAppTest(unittest.TestCase):
             state_path = str(Path(directory) / "reauth-state.json")
             entry = FakeReauthorizationEntry()
             FakeBridge.instances.clear()
-            with patch("lingxi.apps.reauthorize._build_entry", return_value=entry), patch(
-                "lingxi.apps.reauthorize.OAuthBridgeClient", FakeBridge
+            with (
+                patch("lingxi.apps.reauthorize._build_entry", return_value=entry),
+                patch("lingxi.apps.reauthorize.OAuthBridgeClient", FakeBridge),
             ):
                 output, errors = io.StringIO(), io.StringIO()
                 result = main(
@@ -302,8 +307,9 @@ class ReauthorizeAppTest(unittest.TestCase):
             builder = RecordingEntryBuilder()
             audit = AuditStream()
             FakeBridge.instances.clear()
-            with patch("lingxi.apps.reauthorize._build_entry", builder), patch(
-                "lingxi.apps.reauthorize.OAuthBridgeClient", FakeBridge
+            with (
+                patch("lingxi.apps.reauthorize._build_entry", builder),
+                patch("lingxi.apps.reauthorize.OAuthBridgeClient", FakeBridge),
             ):
                 result = main(
                     [],
@@ -350,8 +356,9 @@ class BootstrapEntryTest(unittest.TestCase):
         audit: AuditStream,
         env: dict[str, str] | None = None,
     ) -> int:
-        with patch("lingxi.apps.reauthorize._build_entry", builder), patch(
-            "lingxi.apps.reauthorize.OAuthBridgeClient", FakeBridge
+        with (
+            patch("lingxi.apps.reauthorize._build_entry", builder),
+            patch("lingxi.apps.reauthorize.OAuthBridgeClient", FakeBridge),
         ):
             return main(
                 argv,
@@ -416,7 +423,9 @@ class BootstrapEntryTest(unittest.TestCase):
         self.assertEqual(audit.actions, ["requested", "completed"])
         self.assertEqual({record["mode"] for record in audit.records}, {"bootstrap"})
 
-    def test_existing_registration_is_reported_and_audited_without_touching_the_bridge(self) -> None:
+    def test_existing_registration_is_reported_and_audited_without_touching_the_bridge(
+        self,
+    ) -> None:
         builder = RecordingEntryBuilder(
             FakeReauthorizationEntry(begin_error=SubjectAlreadyRegisteredError("已有主体"))
         )
@@ -469,7 +478,9 @@ class BootstrapEntryTest(unittest.TestCase):
     def test_failed_bootstrap_outcome_is_audited_with_its_failure_code(self) -> None:
         builder = RecordingEntryBuilder(
             FakeReauthorizationEntry(
-                result=ReauthorizationResult(False, "subject_exists", "已存在专用授权主体登记。", True)
+                result=ReauthorizationResult(
+                    False, "subject_exists", "已存在专用授权主体登记。", True
+                )
             )
         )
         audit = AuditStream()
@@ -511,8 +522,9 @@ class BootstrapEntryTest(unittest.TestCase):
         """不注入出口时审计仍然要落到受控终端，而不是被日志级别静默丢弃。"""
 
         builder = RecordingEntryBuilder()
-        with patch("lingxi.apps.reauthorize._build_entry", builder), patch(
-            "lingxi.apps.reauthorize.OAuthBridgeClient", FakeBridge
+        with (
+            patch("lingxi.apps.reauthorize._build_entry", builder),
+            patch("lingxi.apps.reauthorize.OAuthBridgeClient", FakeBridge),
         ):
             result = main(
                 ["--bootstrap-subject", BOOTSTRAP_SUBJECT, "--confirm-bootstrap"],
@@ -522,7 +534,9 @@ class BootstrapEntryTest(unittest.TestCase):
             )
 
         self.assertEqual(result, 0)
-        written = [line for line in self.errors.getvalue().splitlines() if line.startswith("event=")]
+        written = [
+            line for line in self.errors.getvalue().splitlines() if line.startswith("event=")
+        ]
         self.assertEqual(len(written), 2)
         self.assertIn("mode=bootstrap", written[0])
         self.assertIn("action=completed", written[1])

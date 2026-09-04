@@ -68,6 +68,7 @@ class DrainTimeoutError(Exception):
     drain_timeout，并让失败文案谎称"已完成业务执行"）。
     """
 
+
 # 依赖到的 SDK 类型名。集中列出，便于真实 SDK 冒烟一次性核对它们是否还在。
 MESSAGE_TYPE_NAMES: tuple[str, ...] = (
     "AssistantMessage",

@@ -116,9 +116,7 @@ class FakeQueries:
         self.resolve_metric_calls.append(metric_token)
         return self._metric_aliases.get(metric_token, metric_token)
 
-    def resolve_override_id(
-        self, *, open_id: str, company_id: str, metric_name: str
-    ) -> str | None:
+    def resolve_override_id(self, *, open_id: str, company_id: str, metric_name: str) -> str | None:
         key = (open_id, company_id, metric_name)
         self.resolve_override_calls.append(key)
         return self._overrides_by_key.get(key)
@@ -163,7 +161,9 @@ class _FakePrepareDecision:
 
 
 class _FakePrepareOutcome:
-    def __init__(self, *, decision: _FakePrepareDecision, pending: PendingAction | None = None) -> None:
+    def __init__(
+        self, *, decision: _FakePrepareDecision, pending: PendingAction | None = None
+    ) -> None:
         self.decision = decision
         self.pending = pending
 
@@ -390,7 +390,7 @@ class DefaultDenyTests(unittest.TestCase):
 
 class RealTimeJudgmentTests(unittest.TestCase):
     def test_every_call_triggers_a_fresh_registry_read(self) -> None:
-        """"实时判定、不缓存"的行为证据：同一 open_id 连续两次调用各自触发一次
+        """ "实时判定、不缓存"的行为证据：同一 open_id 连续两次调用各自触发一次
         独立的 ``active_entry`` 读取，第二次读取可以返回与第一次不同的结果
         （模拟角色收回后新请求立即拒绝）。"""
 
@@ -448,9 +448,7 @@ class QueryUserCommandTests(unittest.TestCase):
         display_names = FakeDisplayNames(user_labels={"ou_target": "张三（zhangsan@example.com）"})
         router, _, _, audit = _router(queries=queries, display_names=display_names)
 
-        outcome = router.route(
-            open_id=ADMIN_OPEN_ID, text="/admin user ou_target", trace_id="t1"
-        )
+        outcome = router.route(open_id=ADMIN_OPEN_ID, text="/admin user ou_target", trace_id="t1")
 
         self.assertTrue(outcome.handled)
         # Trace #469 S-1：不再回显 open_id，改经 AdminDisplayNames 展示姓名+邮箱；
@@ -465,9 +463,7 @@ class QueryUserCommandTests(unittest.TestCase):
     def test_not_found_user_reported_without_crashing(self) -> None:
         router, _, queries, audit = _router()
 
-        outcome = router.route(
-            open_id=ADMIN_OPEN_ID, text="/admin user ou_missing", trace_id="t1"
-        )
+        outcome = router.route(open_id=ADMIN_OPEN_ID, text="/admin user ou_missing", trace_id="t1")
 
         self.assertTrue(outcome.handled)
         # Trace #469 S-1：查无记录时，长得像内部 open_id 的输入退化为通用占位
@@ -479,9 +475,7 @@ class QueryUserCommandTests(unittest.TestCase):
     def test_query_failure_yields_internal_error_reply_not_crash(self) -> None:
         router, _, _, audit = _router(queries=FakeQueries(raise_on_user=True))
 
-        outcome = router.route(
-            open_id=ADMIN_OPEN_ID, text="/admin user ou_target", trace_id="t1"
-        )
+        outcome = router.route(open_id=ADMIN_OPEN_ID, text="/admin user ou_target", trace_id="t1")
 
         self.assertTrue(outcome.handled)
         self.assertTrue(outcome.reply_text)
@@ -504,9 +498,7 @@ class QueryUserCommandTests(unittest.TestCase):
         )
         router, _, _, _ = _router(queries=queries)
 
-        outcome = router.route(
-            open_id=ADMIN_OPEN_ID, text="/admin user ou_target", trace_id="t1"
-        )
+        outcome = router.route(open_id=ADMIN_OPEN_ID, text="/admin user ou_target", trace_id="t1")
 
         self.assertTrue(outcome.handled)
         self.assertIn("无本地覆盖", outcome.reply_text)
@@ -545,9 +537,7 @@ class QueryUserCommandTests(unittest.TestCase):
         )
         router, _, _, _ = _router(queries=queries)
 
-        outcome = router.route(
-            open_id=ADMIN_OPEN_ID, text="/admin user ou_target", trace_id="t1"
-        )
+        outcome = router.route(open_id=ADMIN_OPEN_ID, text="/admin user ou_target", trace_id="t1")
 
         self.assertTrue(outcome.handled)
         self.assertNotIn("lpo_01JGFJJZ008XSHEADGG8V74SPC", outcome.reply_text)
@@ -588,9 +578,7 @@ class QueryUserCommandTests(unittest.TestCase):
         )
         router, _, _, _ = _router(queries=queries)
 
-        outcome = router.route(
-            open_id=ADMIN_OPEN_ID, text="/admin user ou_target", trace_id="t1"
-        )
+        outcome = router.route(open_id=ADMIN_OPEN_ID, text="/admin user ou_target", trace_id="t1")
 
         self.assertTrue(outcome.handled)
         self.assertEqual(outcome.reply_text.count("覆盖 3 项权限"), 1)
@@ -628,9 +616,7 @@ class QueryUserCommandTests(unittest.TestCase):
         )
         router, _, _, _ = _router(queries=queries)
 
-        outcome = router.route(
-            open_id=ADMIN_OPEN_ID, text="/admin user ou_target", trace_id="t1"
-        )
+        outcome = router.route(open_id=ADMIN_OPEN_ID, text="/admin user ou_target", trace_id="t1")
 
         self.assertTrue(outcome.handled)
         self.assertNotIn("暂不生效", outcome.reply_text)
@@ -653,9 +639,7 @@ class QueryUserCommandTests(unittest.TestCase):
         )
         router, _, _, _ = _router(queries=queries)
 
-        outcome = router.route(
-            open_id=ADMIN_OPEN_ID, text="/admin user ou_target", trace_id="t1"
-        )
+        outcome = router.route(open_id=ADMIN_OPEN_ID, text="/admin user ou_target", trace_id="t1")
 
         self.assertNotIn("暂不生效", outcome.reply_text)
 
@@ -1049,9 +1033,7 @@ class QueryTraceCommandTests(unittest.TestCase):
             open_id=ADMIN_OPEN_ID, text=f"/admin trace {trace_id}", trace_id="t1"
         )
 
-        self.assertIn(
-            "some_future_value_not_yet_registered（未登记显示名）", outcome.reply_text
-        )
+        self.assertIn("some_future_value_not_yet_registered（未登记显示名）", outcome.reply_text)
 
     def _trace_view(self, trace_id: str, **overrides: object) -> AdminTraceView:
         values: dict[str, object] = {
@@ -1133,7 +1115,9 @@ class QueryTraceCommandTests(unittest.TestCase):
         终态下本来就是 ``NULL``（迁移 ``0080`` 的精确语义），不得凭空补一行
         「失败原因」。"""
 
-        reply = self._trace_reply(task_status="succeeded", task_ended_at="2026-08-31T01:02:03+00:00")
+        reply = self._trace_reply(
+            task_status="succeeded", task_ended_at="2026-08-31T01:02:03+00:00"
+        )
 
         self.assertIn("任务结果: 成功", reply)
         self.assertNotIn("任务失败原因", reply)
@@ -1238,7 +1222,9 @@ class QueryAuditCommandTests(unittest.TestCase):
 
         self.assertTrue(outcome.handled)
         self.assertIn("trc_abc", outcome.reply_text)
-        self.assertEqual(queries.event_calls, [{"identifier": None, "window_hours": 24, "limit": 20}])
+        self.assertEqual(
+            queries.event_calls, [{"identifier": None, "window_hours": 24, "limit": 20}]
+        )
         self.assertEqual(audit.actions(), ["admin.command.query_audit"])
 
     def test_no_events_reported_clearly(self) -> None:
@@ -1296,13 +1282,9 @@ class AuditFailureFailsClosedTests(unittest.TestCase):
         self.assertFalse(outcome.handled)
 
     def test_default_deny_branch_does_not_propagate_the_audit_exception(self) -> None:
-        router, _, _, _ = _router(
-            registry=FakeRegistry({}), audit=FakeAudit(raise_error=True)
-        )
+        router, _, _, _ = _router(registry=FakeRegistry({}), audit=FakeAudit(raise_error=True))
 
-        outcome = router.route(
-            open_id="ou_never_registered", text="/admin help", trace_id="t1"
-        )
+        outcome = router.route(open_id="ou_never_registered", text="/admin help", trace_id="t1")
 
         self.assertFalse(outcome.handled)
 
@@ -1327,9 +1309,7 @@ class AuditFailureFailsClosedTests(unittest.TestCase):
             queries=FakeQueries(raise_on_user=True), audit=FakeAudit(raise_error=True)
         )
 
-        outcome = router.route(
-            open_id=ADMIN_OPEN_ID, text="/admin user ou_target", trace_id="t1"
-        )
+        outcome = router.route(open_id=ADMIN_OPEN_ID, text="/admin user ou_target", trace_id="t1")
 
         self.assertFalse(outcome.handled)
 
@@ -1418,9 +1398,7 @@ class SuspendResumeDispatchTests(unittest.TestCase):
             outcome=_FakePrepareOutcome(decision=_FakePrepareDecision(ok=True))
         )
         confirm_cards = FakeConfirmCards()
-        router, _, _, audit = _router(
-            pending_actions=pending_actions, confirm_cards=confirm_cards
-        )
+        router, _, _, audit = _router(pending_actions=pending_actions, confirm_cards=confirm_cards)
 
         outcome = router.route(
             open_id=ADMIN_OPEN_ID,
@@ -1479,9 +1457,7 @@ class SuspendResumeDispatchTests(unittest.TestCase):
             )
         )
         confirm_cards = FakeConfirmCards()
-        router, _, _, audit = _router(
-            pending_actions=pending_actions, confirm_cards=confirm_cards
-        )
+        router, _, _, audit = _router(pending_actions=pending_actions, confirm_cards=confirm_cards)
 
         outcome = router.route(
             open_id=ADMIN_OPEN_ID,
@@ -1499,21 +1475,15 @@ class SuspendResumeDispatchTests(unittest.TestCase):
         self.assertEqual(
             pending_actions.prepare_calls[0]["action_type"], PendingActionType.SUSPEND_USER
         )
-        self.assertEqual(
-            pending_actions.prepare_calls[0]["initiated_by_open_id"], ADMIN_OPEN_ID
-        )
+        self.assertEqual(pending_actions.prepare_calls[0]["initiated_by_open_id"], ADMIN_OPEN_ID)
 
     def test_card_send_failure_is_reported_and_operation_does_not_proceed(self) -> None:
         pending = _prepared_pending()
         pending_actions = FakePendingActions(
-            outcome=_FakePrepareOutcome(
-                decision=_FakePrepareDecision(ok=True), pending=pending
-            )
+            outcome=_FakePrepareOutcome(decision=_FakePrepareDecision(ok=True), pending=pending)
         )
         confirm_cards = FakeConfirmCards(delivered=False)
-        router, _, _, audit = _router(
-            pending_actions=pending_actions, confirm_cards=confirm_cards
-        )
+        router, _, _, audit = _router(pending_actions=pending_actions, confirm_cards=confirm_cards)
 
         outcome = router.route(
             open_id=ADMIN_OPEN_ID,
@@ -1533,14 +1503,10 @@ class SuspendResumeDispatchTests(unittest.TestCase):
     ) -> None:
         pending = _prepared_pending(action_type=PendingActionType.SUSPEND_USER)
         pending_actions = FakePendingActions(
-            outcome=_FakePrepareOutcome(
-                decision=_FakePrepareDecision(ok=True), pending=pending
-            )
+            outcome=_FakePrepareOutcome(decision=_FakePrepareDecision(ok=True), pending=pending)
         )
         confirm_cards = FakeConfirmCards(delivered=True)
-        router, _, _, audit = _router(
-            pending_actions=pending_actions, confirm_cards=confirm_cards
-        )
+        router, _, _, audit = _router(pending_actions=pending_actions, confirm_cards=confirm_cards)
 
         outcome = router.route(
             open_id=ADMIN_OPEN_ID,
@@ -1569,9 +1535,7 @@ class SuspendResumeDispatchTests(unittest.TestCase):
             outcome=_FakePrepareOutcome(decision=_FakePrepareDecision(ok=True), pending=pending)
         )
         confirm_cards = FakeConfirmCards(delivered=True)
-        router, _, _, audit = _router(
-            pending_actions=pending_actions, confirm_cards=confirm_cards
-        )
+        router, _, _, audit = _router(pending_actions=pending_actions, confirm_cards=confirm_cards)
 
         outcome = router.route(
             open_id=ADMIN_OPEN_ID,
@@ -1742,9 +1706,7 @@ class RevokePermissionDispatchTests(unittest.TestCase):
             outcome=_FakePrepareOutcome(decision=_FakePrepareDecision(ok=True), pending=pending)
         )
         confirm_cards = FakeConfirmCards(delivered=True)
-        router, _, _, audit = _router(
-            pending_actions=pending_actions, confirm_cards=confirm_cards
-        )
+        router, _, _, audit = _router(pending_actions=pending_actions, confirm_cards=confirm_cards)
 
         outcome = router.route(
             open_id=ADMIN_OPEN_ID,
@@ -1780,9 +1742,7 @@ class RevokePermissionDispatchTests(unittest.TestCase):
             )
         )
         confirm_cards = FakeConfirmCards()
-        router, _, _, audit = _router(
-            pending_actions=pending_actions, confirm_cards=confirm_cards
-        )
+        router, _, _, audit = _router(pending_actions=pending_actions, confirm_cards=confirm_cards)
 
         outcome = router.route(
             open_id=ADMIN_OPEN_ID,
@@ -1903,9 +1863,7 @@ class RevokePermissionShapeTwoDispatchTests(unittest.TestCase):
 
         self.assertTrue(outcome.handled)
         self.assertEqual(len(pending_actions.prepare_calls), 1)
-        self.assertEqual(
-            pending_actions.prepare_calls[0]["target_open_id"], _VALID_OVERRIDE_ID
-        )
+        self.assertEqual(pending_actions.prepare_calls[0]["target_open_id"], _VALID_OVERRIDE_ID)
 
     def test_unmatched_lookup_replies_without_touching_prepare(self) -> None:
         """否定断言：零命中/多命中歧义（``resolve_override_id`` 返回 ``None``）
@@ -2093,9 +2051,7 @@ class SegmentedUnknownReplyTests(unittest.TestCase):
     def test_unparseable_identifier_reply_names_the_identifier_segment(self) -> None:
         router, _, _, audit = _router()
 
-        outcome = router.route(
-            open_id=ADMIN_OPEN_ID, text="/admin user ou_a;b", trace_id="t1"
-        )
+        outcome = router.route(open_id=ADMIN_OPEN_ID, text="/admin user ou_a;b", trace_id="t1")
 
         self.assertIn("用户标识", outcome.reply_text)
         self.assertEqual(audit.records[0][1]["reject_reason"], "bad_identifier")
@@ -2103,9 +2059,7 @@ class SegmentedUnknownReplyTests(unittest.TestCase):
     def test_unknown_subcommand_reply_names_the_command_name_segment(self) -> None:
         router, _, _, audit = _router()
 
-        outcome = router.route(
-            open_id=ADMIN_OPEN_ID, text="/admin delete_user ou_1", trace_id="t1"
-        )
+        outcome = router.route(open_id=ADMIN_OPEN_ID, text="/admin delete_user ou_1", trace_id="t1")
 
         self.assertIn("命令名", outcome.reply_text)
         self.assertEqual(audit.records[0][1]["reject_reason"], "unknown_subcommand")
@@ -2133,9 +2087,7 @@ class SegmentedUnknownReplyTests(unittest.TestCase):
         router, _, _, _ = _router()
         payload = "ou_a;;;;<at></at>"
 
-        outcome = router.route(
-            open_id=ADMIN_OPEN_ID, text=f"/admin user {payload}", trace_id="t1"
-        )
+        outcome = router.route(open_id=ADMIN_OPEN_ID, text=f"/admin user {payload}", trace_id="t1")
 
         self.assertNotIn(payload, outcome.reply_text)
         self.assertNotIn(";;;;", outcome.reply_text)
@@ -2231,9 +2183,7 @@ class UnknownCommandForensicsTests(unittest.TestCase):
 
         outcome = router.route(open_id=ADMIN_OPEN_ID, text="今天数据怎么样", trace_id="t1")
 
-        self.assertEqual(
-            outcome.reply_text, "未识别的管理命令，请发送 /admin help 查看可用命令。"
-        )
+        self.assertEqual(outcome.reply_text, "未识别的管理命令，请发送 /admin help 查看可用命令。")
         self.assertNotIn("实际收到", outcome.reply_text)
 
     def test_unknown_reply_is_governed_by_the_versioned_content_catalog(self) -> None:
@@ -2242,9 +2192,7 @@ class UnknownCommandForensicsTests(unittest.TestCase):
         router, _, _, _ = _router()
         catalog_version = default_content_catalog().version
 
-        detailed = router.route(
-            open_id=ADMIN_OPEN_ID, text="/admin delete_user x", trace_id="t1"
-        )
+        detailed = router.route(open_id=ADMIN_OPEN_ID, text="/admin delete_user x", trace_id="t1")
         generic = router.route(open_id=ADMIN_OPEN_ID, text="闲聊", trace_id="t2")
 
         self.assertEqual(detailed.content_key, "admin.unknown_command_detail")

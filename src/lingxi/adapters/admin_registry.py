@@ -64,14 +64,15 @@ def admin_registry_entry_from_row(row: tuple) -> AdminRegistryEntry:
 class PostgresAdminRegistryLookup:
     """``AdminRegistryLookup`` 端口的真实实现。"""
 
-    def __init__(
-        self, dsn: str, *, timeouts: PostgresTimeouts = DEFAULT_POSTGRES_TIMEOUTS
-    ) -> None:
+    def __init__(self, dsn: str, *, timeouts: PostgresTimeouts = DEFAULT_POSTGRES_TIMEOUTS) -> None:
         self._dsn = dsn
         self._timeouts = timeouts
 
     def active_entry(self, *, open_id: str) -> AdminRegistryEntry | None:
-        with connect(self._dsn, timeouts=self._timeouts) as connection, connection.cursor() as cursor:
+        with (
+            connect(self._dsn, timeouts=self._timeouts) as connection,
+            connection.cursor() as cursor,
+        ):
             cursor.execute(
                 """
                 SELECT feishu_open_id, label, permission_admin_granted,
@@ -92,9 +93,7 @@ class PostgresAdminQueries:
     ``local_permission_override``（#319 S-P-1b 卡 B：``/admin user`` 新增
     「当前生效本地覆盖」段，是 ``/admin revoke_permission`` 的 UX 前置）。"""
 
-    def __init__(
-        self, dsn: str, *, timeouts: PostgresTimeouts = DEFAULT_POSTGRES_TIMEOUTS
-    ) -> None:
+    def __init__(self, dsn: str, *, timeouts: PostgresTimeouts = DEFAULT_POSTGRES_TIMEOUTS) -> None:
         self._dsn = dsn
         self._timeouts = timeouts
         # 复用已有的读路径（``effective_entries``），不在本类里重新拼一遍同样的
@@ -125,7 +124,10 @@ class PostgresAdminQueries:
         # 重复。复议条件：下一次拆分批一并评估抽取两边共用的只读 helper，并同步
         # 修订 `docs/技术设计/代码框架.md` §二对应的例外条目（届时如果真的抽取，
         # trace 那条例外要么撤销，要么改写为"仅其余 3 条内联 SELECT"）。
-        with connect(self._dsn, timeouts=self._timeouts) as connection, connection.cursor() as cursor:
+        with (
+            connect(self._dsn, timeouts=self._timeouts) as connection,
+            connection.cursor() as cursor,
+        ):
             cursor.execute(
                 """
                 SELECT id, feishu_user_id, provisioning_state, account_state,
@@ -223,7 +225,10 @@ class PostgresAdminQueries:
     def recent_events(
         self, *, identifier: str | None, window_hours: int, limit: int
     ) -> Sequence[AdminEventView]:
-        with connect(self._dsn, timeouts=self._timeouts) as connection, connection.cursor() as cursor:
+        with (
+            connect(self._dsn, timeouts=self._timeouts) as connection,
+            connection.cursor() as cursor,
+        ):
             if identifier:
                 cursor.execute(
                     """
@@ -302,7 +307,10 @@ class PostgresAdminQueries:
         成本，不划算。此处不新建索引是有意选择，不是遗漏。
         """
 
-        with connect(self._dsn, timeouts=self._timeouts) as connection, connection.cursor() as cursor:
+        with (
+            connect(self._dsn, timeouts=self._timeouts) as connection,
+            connection.cursor() as cursor,
+        ):
             cursor.execute(
                 """
                 SELECT received_at, event_type, handled_as, user_open_id,
@@ -349,16 +357,19 @@ class PostgresAdminQueries:
 
     def _trace_task(
         self, *, trace_id: str
-    ) -> tuple[
-        str,
-        str | None,
-        str | None,
-        str | None,
-        object,
-        str | None,
-        str | None,
-        str | None,
-    ] | None:
+    ) -> (
+        tuple[
+            str,
+            str | None,
+            str | None,
+            str | None,
+            object,
+            str | None,
+            str | None,
+            str | None,
+        ]
+        | None
+    ):
         """按追溯号取这条入站事件派生的**最近一个**任务与文档投递收口结果（Issue
         #495/#499）。
 
@@ -367,7 +378,10 @@ class PostgresAdminQueries:
         在回显里省掉整段而不是显示一堆空值。
         """
 
-        with connect(self._dsn, timeouts=self._timeouts) as connection, connection.cursor() as cursor:
+        with (
+            connect(self._dsn, timeouts=self._timeouts) as connection,
+            connection.cursor() as cursor,
+        ):
             cursor.execute(
                 """
                 SELECT task.status, task.error_kind, task.failure_code,
@@ -420,7 +434,10 @@ class PostgresAdminQueries:
 
         if "@" not in identifier:
             return identifier
-        with connect(self._dsn, timeouts=self._timeouts) as connection, connection.cursor() as cursor:
+        with (
+            connect(self._dsn, timeouts=self._timeouts) as connection,
+            connection.cursor() as cursor,
+        ):
             cursor.execute(
                 "SELECT feishu_open_id FROM app_user"
                 " WHERE email = %s AND feishu_open_id IS NOT NULL",
@@ -453,7 +470,10 @@ class PostgresAdminQueries:
         不涉及）。查无此用户，或姓名邮箱均为空，返回通用占位——绝不把入参
         ``open_id`` 原样拼进返回值（合同"管理员可见文案零 ou_"）。"""
 
-        with connect(self._dsn, timeouts=self._timeouts) as connection, connection.cursor() as cursor:
+        with (
+            connect(self._dsn, timeouts=self._timeouts) as connection,
+            connection.cursor() as cursor,
+        ):
             cursor.execute(
                 "SELECT display_name, email FROM app_user WHERE feishu_open_id = %s",
                 (open_id,),
@@ -479,7 +499,10 @@ class PostgresAdminQueries:
         batch_id = PostgresGalaxyImportStore(self._dsn, timeouts=self._timeouts).current_batch_id()
         if batch_id is None:
             return company_id
-        with connect(self._dsn, timeouts=self._timeouts) as connection, connection.cursor() as cursor:
+        with (
+            connect(self._dsn, timeouts=self._timeouts) as connection,
+            connection.cursor() as cursor,
+        ):
             cursor.execute(
                 "SELECT name_cn FROM galaxy_country WHERE batch_id = %s AND boss_company_id = %s LIMIT 1",
                 (batch_id, company_id),
@@ -527,7 +550,10 @@ class PostgresAdminQueries:
         batch_id = PostgresGalaxyImportStore(self._dsn, timeouts=self._timeouts).current_batch_id()
         if batch_id is None:
             return {company_id: company_id for company_id in company_ids}
-        with connect(self._dsn, timeouts=self._timeouts) as connection, connection.cursor() as cursor:
+        with (
+            connect(self._dsn, timeouts=self._timeouts) as connection,
+            connection.cursor() as cursor,
+        ):
             cursor.execute(
                 "SELECT boss_company_id, name_cn FROM galaxy_country"
                 " WHERE batch_id = %s AND boss_company_id = ANY(%s)",
@@ -561,13 +587,9 @@ class PostgresAdminQueries:
         alias_by_metric_id: dict[str, str] = {}
         for alias, real_id in aliases.items():
             alias_by_metric_id.setdefault(real_id, alias)
-        return {
-            metric_id: alias_by_metric_id.get(metric_id, metric_id) for metric_id in metric_ids
-        }
+        return {metric_id: alias_by_metric_id.get(metric_id, metric_id) for metric_id in metric_ids}
 
-    def resolve_override_id(
-        self, *, open_id: str, company_id: str, metric_name: str
-    ) -> str | None:
+    def resolve_override_id(self, *, open_id: str, company_id: str, metric_name: str) -> str | None:
         """按「open_id + 公司 + 指标」反查当前生效的本地覆盖行 override_id（#439 A
         档，revoke 新参数形状）；见 ``core/admin/router.AdminQueries.
         resolve_override_id`` 的完整契约文档。
@@ -586,7 +608,10 @@ class PostgresAdminQueries:
         的唯一索引按 ``direction`` 再分）均返回 ``None``——不猜测该收回哪一条。
         """
 
-        with connect(self._dsn, timeouts=self._timeouts) as connection, connection.cursor() as cursor:
+        with (
+            connect(self._dsn, timeouts=self._timeouts) as connection,
+            connection.cursor() as cursor,
+        ):
             cursor.execute(
                 "SELECT id FROM app_user WHERE feishu_open_id = %s",
                 (open_id,),

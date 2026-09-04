@@ -224,9 +224,7 @@ class LocalUserEnvironment:
             ("落盘凭据", credential_file_mode, CREDENTIAL_FILE_MODE),
         ):
             if value != expected:
-                raise ValueError(
-                    f"{label}权限必须恰为 {expected:#o}：它是安全不变量，不是可调参数"
-                )
+                raise ValueError(f"{label}权限必须恰为 {expected:#o}：它是安全不变量，不是可调参数")
         self._root = Path(str(root))
         self._endpoint = mcp_endpoint
         self._server_name = mcp_server_name.strip()
@@ -302,11 +300,7 @@ class LocalUserEnvironment:
         try:
             try:
                 with os.scandir(root_fd) as entries:
-                    names = [
-                        entry.name
-                        for entry in entries
-                        if entry.is_dir(follow_symlinks=False)
-                    ]
+                    names = [entry.name for entry in entries if entry.is_dir(follow_symlinks=False)]
             except OSError as error:
                 logger.warning("用户环境根目录无法扫描 errno=%s", _errno_name(error))
                 raise UserEnvironmentError(f"sweep_failed_{_errno_name(error)}") from None
@@ -349,9 +343,7 @@ class LocalUserEnvironment:
         except OSError as error:
             raise UserEnvironmentError(f"root_parent_{_errno_name(error)}") from None
         try:
-            return self._open_child_dir(
-                parent_fd, name, self._root_dir_mode, "root", create=create
-            )
+            return self._open_child_dir(parent_fd, name, self._root_dir_mode, "root", create=create)
         finally:
             os.close(parent_fd)
 
@@ -387,9 +379,7 @@ class LocalUserEnvironment:
         if not stat.S_ISDIR(info.st_mode):
             raise UserEnvironmentError(f"{label}_not_a_directory")
         try:
-            fd = os.open(
-                name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=parent_fd
-            )
+            fd = os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=parent_fd)
         except OSError as error:
             raise UserEnvironmentError(f"{label}_open_{_errno_name(error)}") from None
         try:
@@ -423,9 +413,7 @@ class LocalUserEnvironment:
                     and entry.name.endswith(TEMPORARY_SUFFIX)
                 ]
         except OSError as error:
-            logger.warning(
-                "用户环境目录无法扫描，本次不写入配置 errno=%s", _errno_name(error)
-            )
+            logger.warning("用户环境目录无法扫描，本次不写入配置 errno=%s", _errno_name(error))
             raise UserEnvironmentError(f"sweep_failed_{_errno_name(error)}") from None
         cleaned = 0
         for name in names:
@@ -434,9 +422,7 @@ class LocalUserEnvironment:
             except FileNotFoundError:
                 continue
             except OSError as error:
-                logger.warning(
-                    "用户环境残留的写入临时文件删除失败 errno=%s", _errno_name(error)
-                )
+                logger.warning("用户环境残留的写入临时文件删除失败 errno=%s", _errno_name(error))
                 raise UserEnvironmentError(f"sweep_failed_{_errno_name(error)}") from None
             cleaned += 1
             logger.warning("清理了用户环境里遗留的写入临时文件（可能带有令牌）")
@@ -507,9 +493,7 @@ class LocalUserEnvironment:
         要么看到新的，不会读到半截 JSON。
         """
 
-        temporary = (
-            f"{TEMPORARY_PREFIX}{os.getpid()}.{secrets.token_hex(8)}{TEMPORARY_SUFFIX}"
-        )
+        temporary = f"{TEMPORARY_PREFIX}{os.getpid()}.{secrets.token_hex(8)}{TEMPORARY_SUFFIX}"
         try:
             fd = os.open(
                 temporary,
@@ -531,12 +515,8 @@ class LocalUserEnvironment:
                 try:
                     os.close(fd)
                 except OSError as error:
-                    logger.warning(
-                        "用户环境临时文件关闭失败 errno=%s", _errno_name(error)
-                    )
-            os.replace(
-                temporary, MCP_CONFIG_FILENAME, src_dir_fd=home_fd, dst_dir_fd=home_fd
-            )
+                    logger.warning("用户环境临时文件关闭失败 errno=%s", _errno_name(error))
+            os.replace(temporary, MCP_CONFIG_FILENAME, src_dir_fd=home_fd, dst_dir_fd=home_fd)
             handed_over = True
         except OSError as error:
             raise UserEnvironmentError(f"config_write_{_errno_name(error)}") from None
@@ -559,8 +539,6 @@ class LocalUserEnvironment:
             return
         except OSError as error:
             code = _errno_name(error)
-        logger.warning(
-            "用户环境写入临时文件删除失败，可能残留明文令牌 errno=%s", code
-        )
+        logger.warning("用户环境写入临时文件删除失败，可能残留明文令牌 errno=%s", code)
         if sys.exc_info()[0] is None:
             raise UserEnvironmentError(f"config_cleanup_{code}")

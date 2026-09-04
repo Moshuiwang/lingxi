@@ -93,12 +93,19 @@ FROZEN = EmploymentStatus(
 )
 
 ROSTER_ROWS: tuple[Mapping[str, Any], ...] = (
-    {"personnel_id": "fu_1", "employee_no": "0012", "email": "Xiaoming@Example.com", "name": "王小明"},
+    {
+        "personnel_id": "fu_1",
+        "employee_no": "0012",
+        "email": "Xiaoming@Example.com",
+        "name": "王小明",
+    },
 )
 GALAXY_USER_ROWS = ({"user_id": "g_1", "user_name": "0012", "email": "xiaoming@example.com"},)
 ROLE_ROWS = ({"user_id": "g_1", "role_id": "r_1", "role_name": "销售分析师"},)
 DATACOUNTRY_ROWS = ({"user_id": "g_1", "datacountry_id": "c_1"},)
-COUNTRY_ROWS = ({"country_key": "c_1", "name": "Kenya", "name_cn": "肯尼亚", "boss_company_id": "88"},)
+COUNTRY_ROWS = (
+    {"country_key": "c_1", "name": "Kenya", "name_cn": "肯尼亚", "boss_company_id": "88"},
+)
 ROLE_FUNCTION_MAP = {"销售分析师": "销售分析"}
 #: 「公司+职能→指标名」翻译映射（Issue #227 / #346）默认夹具：**恒等**翻译（职能
 #: 标签"销售分析"逐字符翻译成同名指标名），让本文件绝大多数既有断言（此前编码的是
@@ -118,7 +125,9 @@ METRIC_TRANSLATION_MAP: Mapping[str, Mapping[str, Sequence[str]]] = {
 
 
 class FakeLookup:
-    def __init__(self, availability: DirectoryAvailability, members: tuple[SnapshotMember, ...]) -> None:
+    def __init__(
+        self, availability: DirectoryAvailability, members: tuple[SnapshotMember, ...]
+    ) -> None:
         self.availability = availability
         self.members = members
 
@@ -157,7 +166,9 @@ class FakeDirectory:
 
 
 class FakeEmployment:
-    def __init__(self, status: EmploymentStatus | None = EMPLOYED, error: Exception | None = None) -> None:
+    def __init__(
+        self, status: EmploymentStatus | None = EMPLOYED, error: Exception | None = None
+    ) -> None:
         self._status = status
         self._error = error
         self.calls: list[tuple[str, str]] = []
@@ -234,7 +245,9 @@ class FakeEmailBindings:
         self.calls.append(email)
         if self._error is not None:
             raise self._error
-        return tuple(EmailBinding(user_id, open_id) for user_id, open_id in self.bound.get(email, ()))
+        return tuple(
+            EmailBinding(user_id, open_id) for user_id, open_id in self.bound.get(email, ())
+        )
 
 
 class FakeUsers:
@@ -247,7 +260,9 @@ class FakeUsers:
         abort_result: bool = True,
         has_inbound_event: bool = False,
     ) -> None:
-        self.status = UserProvisioningStatus("enabled", "matching", 0) if status is _UNSET else status
+        self.status = (
+            UserProvisioningStatus("enabled", "matching", 0) if status is _UNSET else status
+        )
         #: 「首聊时补一句」挂起口（Issue #541）的调用记录与它的两个真实守卫。
         self.notice_calls: list[str] = []
         #: 真的挂起成功的那几次（守卫拒绝的不进这里）。
@@ -364,7 +379,13 @@ class FakeStockTokens:
 
 
 class FakeLegacyImportReport:
-    def __init__(self, imported: int, already_present: int = 0, group_id: str | None = None, group_created: bool = False) -> None:
+    def __init__(
+        self,
+        imported: int,
+        already_present: int = 0,
+        group_id: str | None = None,
+        group_created: bool = False,
+    ) -> None:
         self.imported = imported
         self.already_present = already_present
         self.group_id = group_id
@@ -383,14 +404,19 @@ class FakeLegacyImporter:
         self.calls: list[dict[str, Any]] = []
 
     def import_plan(self, *, user_id: str, target_open_id: str, plan: Any, now: Any) -> Any:
-        self.calls.append({"user_id": user_id, "target_open_id": target_open_id, "plan": plan, "now": now})
+        self.calls.append(
+            {"user_id": user_id, "target_open_id": target_open_id, "plan": plan, "now": now}
+        )
         if self._error is not None:
             raise self._error
         total = len(plan.pairs) + len(plan.all_scope_metrics)
         imported = max(total - self._already_present, 0)
         group_id = "lpg_fake" if plan.all_scope_metrics else None
         return FakeLegacyImportReport(
-            imported, self._already_present, group_id, group_created=bool(plan.all_scope_metrics) and imported > 0
+            imported,
+            self._already_present,
+            group_id,
+            group_created=bool(plan.all_scope_metrics) and imported > 0,
         )
 
 
@@ -473,7 +499,9 @@ class FakeNotifier:
         self._error = error
         self._fail_times = fail_times
 
-    def send(self, *, open_id: str, key: str, values: Mapping[str, object], dedupe_key: str) -> None:
+    def send(
+        self, *, open_id: str, key: str, values: Mapping[str, object], dedupe_key: str
+    ) -> None:
         self.attempts += 1
         if self._error is not None and (
             self._fail_times is None or self.attempts <= self._fail_times
@@ -652,7 +680,11 @@ def build_runner(**overrides: Any) -> tuple[AutoOnboardingRunner, dict[str, Any]
         "position_grants": None,
     }
     parts.update({key: value for key, value in overrides.items() if key in parts})
-    if parts["stock_tokens"] is not None and parts["legacy_importer"] is None and "legacy_importer" not in overrides:
+    if (
+        parts["stock_tokens"] is not None
+        and parts["legacy_importer"] is None
+        and "legacy_importer" not in overrides
+    ):
         parts["legacy_importer"] = FakeLegacyImporter()
     executor = overrides.get("executor") or InlineExecutor()
     parts["executor"] = executor
@@ -748,7 +780,9 @@ class HappyPathTests(unittest.TestCase):
         self.assertEqual(values, {"company_name": "88", "function_name": "销售分析"})
         self.assertEqual(dedupe, "onboarding:evt_1")
         # 状态推进次序固定，`active` 只在就绪之后。
-        self.assertEqual(parts["users"].advanced, [STATE_PROVISIONING, STATE_MCP_SYNCING, STATE_ACTIVE])
+        self.assertEqual(
+            parts["users"].advanced, [STATE_PROVISIONING, STATE_MCP_SYNCING, STATE_ACTIVE]
+        )
         self.assertEqual(parts["environment"].calls, [USER_ID])
         self.assertEqual(parts["decisions"].reasons, ["first_onboarding"])
         self.assertEqual(parts["ledger"].marked, ["evt_1"])
@@ -870,7 +904,13 @@ class AdminRoleGalaxySnapshot(FakeGalaxySnapshot):
     独立成因中的另一个（真全指标通配，`merge_sources` 模块文档「通配角 v2」）。"""
 
     def role_rows(self, galaxy_user_id: str) -> tuple[Mapping[str, Any], ...]:
-        return ({"user_id": galaxy_user_id, "role_id": "r_admin", "role_name": ADMIN_FULL_ACCESS_FUNCTION},)
+        return (
+            {
+                "user_id": galaxy_user_id,
+                "role_id": "r_admin",
+                "role_name": ADMIN_FULL_ACCESS_FUNCTION,
+            },
+        )
 
 
 class LocalOverrideMergeTests(unittest.TestCase):
@@ -903,9 +943,15 @@ class LocalOverrideMergeTests(unittest.TestCase):
         自己加的那条；只有被抑制到空的公司键消失，另一家公司不受影响。"""
 
         overrides = FakeLocalOverrides(
-            {USER_ID: (_override_entry(direction=OverrideDirection.SUPPRESS, metric_name="销售分析"),)}
+            {
+                USER_ID: (
+                    _override_entry(direction=OverrideDirection.SUPPRESS, metric_name="销售分析"),
+                )
+            }
         )
-        parts, _ = run_once(galaxy=FakeGalaxy(TwoCompanyGalaxySnapshot()), local_overrides=overrides)
+        parts, _ = run_once(
+            galaxy=FakeGalaxy(TwoCompanyGalaxySnapshot()), local_overrides=overrides
+        )
 
         self.assertEqual(parts["decisions"].rows[0].permissions, '{"99":["销售分析"]}')
 
@@ -930,7 +976,11 @@ class LocalOverrideMergeTests(unittest.TestCase):
         不可分辨的 ``INTERNAL_ERROR``。"""
 
         overrides = FakeLocalOverrides(
-            {USER_ID: (_override_entry(direction=OverrideDirection.SUPPRESS, metric_name="销售分析"),)}
+            {
+                USER_ID: (
+                    _override_entry(direction=OverrideDirection.SUPPRESS, metric_name="销售分析"),
+                )
+            }
         )
         parts, result = run_once(local_overrides=overrides)
 
@@ -1019,7 +1069,9 @@ class LocalOverrideMergeTests(unittest.TestCase):
             "真全指标通配下本地源整体不生效",
         )
         skipped = [
-            fields for name, fields in parts["audit"].records if name == "onboarding.local_override_skipped"
+            fields
+            for name, fields in parts["audit"].records
+            if name == "onboarding.local_override_skipped"
         ]
         reasons = {fields["reason"] for fields in skipped}
         self.assertEqual(
@@ -1092,7 +1144,9 @@ class ZeroGalaxyLocalGrantTests(unittest.TestCase):
 
         parts, _ = run_once(role_function_map={})
 
-        self.assertEqual(parts["audit"].facts("onboarding.result")["failure_reason"], "no_supported_function")
+        self.assertEqual(
+            parts["audit"].facts("onboarding.result")["failure_reason"], "no_supported_function"
+        )
         self.assertEqual(parts["environment"].calls, [])
         self.assertEqual(parts["decisions"].rows, [])
         self.assertEqual(parts["users"].advanced, [])
@@ -1168,7 +1222,9 @@ class PublishTranslationTests(unittest.TestCase):
         )
         self.assertEqual(expected, {"88": ("日活万人",)})
         self.assertEqual(parts["decisions"].rows[0].permissions, '{"88":["日活万人"]}')
-        self.assertNotIn("销售分析", parts["decisions"].rows[0].permissions, "不得残留未翻译的职能标签")
+        self.assertNotIn(
+            "销售分析", parts["decisions"].rows[0].permissions, "不得残留未翻译的职能标签"
+        )
 
     def test_an_uncovered_combination_fails_closed_with_zero_external_writes(self) -> None:
         """否定用例（本卡核心）：存在未翻译（未覆盖）的「公司 + 职能」组合时，
@@ -1483,12 +1539,18 @@ class StockTokenAdoptionTests(unittest.TestCase):
 
     def test_adoptable_secret_is_adopted_instead_of_issuing_a_new_one(self) -> None:
         secret = "stock-plaintext-secret"
-        stock = FakeStockTokens(StockTokenLookup(state=ADOPTABLE, secret=secret, status="approved", permissions="{}"))
+        stock = FakeStockTokens(
+            StockTokenLookup(state=ADOPTABLE, secret=secret, status="approved", permissions="{}")
+        )
         parts, _ = run_once(stock_tokens=stock)
         self.assertEqual(parts["tokens"].calls, [], "有可用存量密文时不该再签新")
         self.assertEqual(parts["tokens"].adopt_calls, [(USER_ID, secret)])
-        self.assertEqual(parts["environment"].tokens, [secret], "落进用户环境的必须是采纳的那份明文")
-        self.assertEqual(parts["audit"].facts("onboarding.stock_token_adopted")["status_approved"], True)
+        self.assertEqual(
+            parts["environment"].tokens, [secret], "落进用户环境的必须是采纳的那份明文"
+        )
+        self.assertEqual(
+            parts["audit"].facts("onboarding.stock_token_adopted")["status_approved"], True
+        )
 
     def test_adopting_an_existing_row_is_audited_distinctly_from_a_fresh_adoption(self) -> None:
         """幂等：库里已经有这个用户的令牌行时，审计动作名必须与"首次采纳"可分辨。"""
@@ -1523,16 +1585,24 @@ class StockTokenAdoptionTests(unittest.TestCase):
         """权限面由银河同步权威决定，不由本步裁量——非 approved 只审计标注，仍然采纳。"""
 
         secret = "stock-plaintext-secret"
-        stock = FakeStockTokens(StockTokenLookup(state=ADOPTABLE, secret=secret, status="pending", permissions="{}"))
+        stock = FakeStockTokens(
+            StockTokenLookup(state=ADOPTABLE, secret=secret, status="pending", permissions="{}")
+        )
         parts, _ = run_once(stock_tokens=stock)
         self.assertEqual(parts["tokens"].adopt_calls, [(USER_ID, secret)], "非 approved 不阻止采纳")
-        self.assertEqual(parts["audit"].facts("onboarding.stock_token_adopted")["status_approved"], False)
+        self.assertEqual(
+            parts["audit"].facts("onboarding.stock_token_adopted")["status_approved"], False
+        )
 
     def test_blank_status_counts_as_approved(self) -> None:
         secret = "stock-plaintext-secret"
-        stock = FakeStockTokens(StockTokenLookup(state=ADOPTABLE, secret=secret, status="", permissions="{}"))
+        stock = FakeStockTokens(
+            StockTokenLookup(state=ADOPTABLE, secret=secret, status="", permissions="{}")
+        )
         parts, _ = run_once(stock_tokens=stock)
-        self.assertEqual(parts["audit"].facts("onboarding.stock_token_adopted")["status_approved"], True)
+        self.assertEqual(
+            parts["audit"].facts("onboarding.stock_token_adopted")["status_approved"], True
+        )
 
     def test_source_lookup_failure_is_an_internal_fault_not_a_business_rejection(self) -> None:
         stock = FakeStockTokens(RuntimeError("源端不可用"))
@@ -1567,7 +1637,9 @@ class LegacyPermissionImportTests(unittest.TestCase):
 
     def _adoptable(self, permissions: str) -> FakeStockTokens:
         return FakeStockTokens(
-            StockTokenLookup(state=ADOPTABLE, secret="stock-secret", status="approved", permissions=permissions)
+            StockTokenLookup(
+                state=ADOPTABLE, secret="stock-secret", status="approved", permissions=permissions
+            )
         )
 
     def test_specific_row_imports_only_the_difference(self) -> None:
@@ -1590,22 +1662,32 @@ class LegacyPermissionImportTests(unittest.TestCase):
         self.assertEqual(facts["imported"], 2)
         self.assertEqual(facts["unmapped_companies_kept"], 1)
         self.assertEqual(facts["group_created"], False)
-        self.assertEqual((facts["group_skipped_revoked"], facts["revoked_skipped"]), (False, 0), "撤销跳过标志进审计")
+        self.assertEqual(
+            (facts["group_skipped_revoked"], facts["revoked_skipped"]),
+            (False, 0),
+            "撤销跳过标志进审计",
+        )
 
     def test_full_wildcard_row_becomes_one_all_scope_group(self) -> None:
         importer = FakeLegacyImporter()
-        parts, result = run_once(stock_tokens=self._adoptable('{"*":["*"]}'), legacy_importer=importer)
+        parts, result = run_once(
+            stock_tokens=self._adoptable('{"*":["*"]}'), legacy_importer=importer
+        )
 
         self.assertEqual(parts["audit"].facts("onboarding.result")["state"], "completed")
         plan = importer.calls[0]["plan"]
         self.assertEqual(plan.shape, "full_wildcard")
         self.assertEqual(plan.all_scope_metrics, ("销售分析",), "指标数 = 映射并集")
         self.assertEqual(plan.pairs, ())
-        self.assertEqual(parts["audit"].facts("onboarding.legacy_permission_import")["group_created"], True)
+        self.assertEqual(
+            parts["audit"].facts("onboarding.legacy_permission_import")["group_created"], True
+        )
 
     def test_an_identical_row_imports_nothing_and_is_audited_as_skipped(self) -> None:
         importer = FakeLegacyImporter()
-        parts, _ = run_once(stock_tokens=self._adoptable('{"88":["销售分析"]}'), legacy_importer=importer)
+        parts, _ = run_once(
+            stock_tokens=self._adoptable('{"88":["销售分析"]}'), legacy_importer=importer
+        )
 
         self.assertEqual(importer.calls, [], "差集为空时不调用导入口")
         facts = parts["audit"].facts("onboarding.legacy_permission_import_skipped")
@@ -1622,7 +1704,8 @@ class LegacyPermissionImportTests(unittest.TestCase):
             report = FakeLegacyImporter.import_plan(importer, **kwargs)
             # 模拟落库后本地覆盖表可读回这些行。
             overrides._entries[USER_ID] = tuple(
-                _override_entry(company_id=company, metric_name=metric) for company, metric in kwargs["plan"].pairs
+                _override_entry(company_id=company, metric_name=metric)
+                for company, metric in kwargs["plan"].pairs
             )
             return report
 
@@ -1659,7 +1742,10 @@ class LegacyPermissionImportTests(unittest.TestCase):
         importer = FakeLegacyImporter()
         parts, _ = run_once(stock_tokens=self._adoptable("   "), legacy_importer=importer)
         self.assertEqual(importer.calls, [])
-        self.assertEqual(parts["audit"].facts("onboarding.legacy_permission_import_skipped")["reasons"], ["nothing_to_import"])
+        self.assertEqual(
+            parts["audit"].facts("onboarding.legacy_permission_import_skipped")["reasons"],
+            ["nothing_to_import"],
+        )
         self.assertEqual(parts["audit"].facts("onboarding.result")["state"], "completed")
 
     def test_unparseable_permissions_text_fails_closed(self) -> None:
@@ -1677,7 +1763,9 @@ class LegacyPermissionImportTests(unittest.TestCase):
         """变异锚点②。"""
 
         importer = FakeLegacyImporter(RuntimeError("落库失败"))
-        parts, _ = run_once(stock_tokens=self._adoptable('{"88":["旧表指标"]}'), legacy_importer=importer)
+        parts, _ = run_once(
+            stock_tokens=self._adoptable('{"88":["旧表指标"]}'), legacy_importer=importer
+        )
 
         facts = parts["audit"].facts("onboarding.result")
         self.assertEqual(facts["state"], "internal_error")
@@ -1706,7 +1794,10 @@ class LegacyPermissionImportTests(unittest.TestCase):
 
     def test_issue_path_never_calls_the_importer(self) -> None:
         importer = FakeLegacyImporter()
-        for lookup in (StockTokenLookup(state=NO_ROW), StockTokenLookup(state=NO_CIPHER, status="pending")):
+        for lookup in (
+            StockTokenLookup(state=NO_ROW),
+            StockTokenLookup(state=NO_CIPHER, status="pending"),
+        ):
             with self.subTest(state=lookup.state):
                 parts, _ = run_once(stock_tokens=FakeStockTokens(lookup), legacy_importer=importer)
                 self.assertEqual(importer.calls, [])
@@ -1716,7 +1807,8 @@ class LegacyPermissionImportTests(unittest.TestCase):
     def test_the_raw_permissions_text_never_reaches_the_audit_trail(self) -> None:
         importer = FakeLegacyImporter()
         parts, _ = run_once(
-            stock_tokens=self._adoptable('{"88":["销售分析","独一无二的旧表指标"]}'), legacy_importer=importer
+            stock_tokens=self._adoptable('{"88":["销售分析","独一无二的旧表指标"]}'),
+            legacy_importer=importer,
         )
         rendered = repr(parts["audit"].records)
         self.assertNotIn("独一无二的旧表指标", rendered)
@@ -1729,7 +1821,10 @@ class LegacyPermissionImportTests(unittest.TestCase):
             stock_tokens=self._adoptable('{"88":["旧表指标"]}'),
             legacy_importer=importer,
         )
-        self.assertEqual(parts["audit"].facts("onboarding.result")["failure_reason"], "permission_translation_uncovered")
+        self.assertEqual(
+            parts["audit"].facts("onboarding.result")["failure_reason"],
+            "permission_translation_uncovered",
+        )
         self.assertEqual(importer.calls, [])
         self.assertEqual(parts["tokens"].adopt_calls, [])
         self.assertEqual(parts["environment"].calls, [])
@@ -1775,9 +1870,7 @@ class OnboardingFailedAlertCallbackTests(unittest.TestCase):
             directory=FakeDirectory(members=()),
             onboarding_failed=lambda reason, trace_id: calls.append((reason, trace_id)),
         )
-        self.assertEqual(
-            parts["audit"].facts("onboarding.result")["state"], "not_authorized"
-        )
+        self.assertEqual(parts["audit"].facts("onboarding.result")["state"], "not_authorized")
         self.assertEqual(calls, [], "确定性业务失败（无可用权限）不应该触发管理员告警")
 
     def test_the_callback_never_receives_open_id_or_profile_values(self) -> None:
@@ -1906,9 +1999,7 @@ class FailureReasonRecordingTests(unittest.TestCase):
 
         recorder = RecordingFailureReasons()
         parts, _ = run_once(directory=FakeDirectory(members=()), failure_reasons=recorder)
-        self.assertEqual(
-            parts["audit"].facts("onboarding.result")["state"], "not_authorized"
-        )
+        self.assertEqual(parts["audit"].facts("onboarding.result")["state"], "not_authorized")
         self.assertEqual(len(recorder.calls), 1)
         self.assertEqual(recorder.calls[0]["event_type"], "onboarding.result")
 
@@ -1991,7 +2082,8 @@ class RecheckBeforeContinuingTests(unittest.TestCase):
     def test_a_suspended_account_stops_before_the_environment_and_the_publish(self) -> None:
         users = FakeUsers(UserProvisioningStatus("suspended", "matching", 0))
         parts, _ = run_once(
-            users=users, provisioning=FakeProvisioning(ProvisioningResult.already_provisioned(USER_ID))
+            users=users,
+            provisioning=FakeProvisioning(ProvisioningResult.already_provisioned(USER_ID)),
         )
         self.assertEqual(parts["notifier"].terminal()[1], KEY_SUSPENDED)
         self.assertEqual(parts["environment"].calls, [])
@@ -2039,7 +2131,8 @@ class RecheckBeforeContinuingTests(unittest.TestCase):
 
         users = FakeUsers(UserProvisioningStatus("enabled", "active", 3))
         parts, _ = run_once(
-            users=users, provisioning=FakeProvisioning(ProvisioningResult.already_provisioned(USER_ID))
+            users=users,
+            provisioning=FakeProvisioning(ProvisioningResult.already_provisioned(USER_ID)),
         )
         self.assertEqual(parts["environment"].calls, [], "已 active 的人不得重复创建环境")
         self.assertEqual(parts["decisions"].rows, [], "已 active 的人不得重复发布权限")
@@ -2105,20 +2198,14 @@ class NotificationAndLedgerTests(unittest.TestCase):
             "释放必须带上认领代次，否则会撤销别人的认领（ABA）",
         )
         self.assertEqual(parts["ledger"].marked, [], "放回之后不得同时记账")
-        self.assertIn(
-            "onboarding.claim_released_after_notify_failed", parts["audit"].actions()
-        )
+        self.assertIn("onboarding.claim_released_after_notify_failed", parts["audit"].actions())
 
     def test_the_claim_is_put_back_at_most_once_per_event(self) -> None:
         """放回有上限：一次飞书长时间不可用不得把执行器永久占满。"""
 
         runner, parts = build_runner(notifier=FakeNotifier(error=RuntimeError()))
-        runner.start(
-            event_id="evt_1", open_id=OPEN_ID, trace_id="t1", claim_token=CLAIM_TOKEN
-        )
-        runner.start(
-            event_id="evt_1", open_id=OPEN_ID, trace_id="t1", claim_token=CLAIM_TOKEN
-        )
+        runner.start(event_id="evt_1", open_id=OPEN_ID, trace_id="t1", claim_token=CLAIM_TOKEN)
+        runner.start(event_id="evt_1", open_id=OPEN_ID, trace_id="t1", claim_token=CLAIM_TOKEN)
 
         self.assertEqual(parts["ledger"].released, [("evt_1", CLAIM_TOKEN)])
         self.assertEqual(parts["ledger"].marked, ["evt_1"], "第二次记账收口")
@@ -2254,15 +2341,11 @@ class ShutdownTests(unittest.TestCase):
                 stops["value"] = True
                 return super().ensure(user_id=user_id, mcp_token=mcp_token)
 
-        parts, _ = run_once(
-            environment=StoppingEnvironment(), should_stop=lambda: stops["value"]
-        )
+        parts, _ = run_once(environment=StoppingEnvironment(), should_stop=lambda: stops["value"])
 
         self.assertEqual(parts["notifier"].sent, [], "停机中止不得给用户任何结论")
         self.assertEqual(parts["ledger"].marked, [], "停机中止不得记账")
-        self.assertEqual(
-            parts["ledger"].released, [("evt_1", CLAIM_TOKEN)], "认领必须放回去"
-        )
+        self.assertEqual(parts["ledger"].released, [("evt_1", CLAIM_TOKEN)], "认领必须放回去")
         self.assertIn("onboarding.aborted_while_stopping", parts["audit"].actions())
         self.assertEqual(parts["decisions"].rows, [], "停机之后不再排新的发布意图")
 
@@ -2422,9 +2505,7 @@ class StalledAbortTests(unittest.TestCase):
             ) -> bool:
                 raise RuntimeError("boom")
 
-        parts, _ = run_once(
-            users=ExplodingAbort(), decisions=FakeDecisions(statuses=("failed",))
-        )
+        parts, _ = run_once(users=ExplodingAbort(), decisions=FakeDecisions(statuses=("failed",)))
         self.assertIn("onboarding.stalled_abort_failed", parts["audit"].actions())
         self.assertEqual(parts["ledger"].marked, ["evt_1"])
         self.assertEqual(parts["notifier"].terminal()[1], KEY_INTERNAL_ERROR)
@@ -2617,7 +2698,9 @@ class EmailAlreadyBoundTests(unittest.TestCase):
 
     def test_another_user_holding_the_same_email_stops_the_chain_as_internal_error(self) -> None:
         alerts: list[tuple[str, str]] = []
-        parts, _ = self._conflicting(onboarding_failed=lambda reason, trace: alerts.append((reason, trace)))
+        parts, _ = self._conflicting(
+            onboarding_failed=lambda reason, trace: alerts.append((reason, trace))
+        )
 
         result = parts["audit"].facts("onboarding.result")
         self.assertEqual(result["state"], OnboardingState.INTERNAL_ERROR.value)
@@ -2774,7 +2857,9 @@ class SystemTriggerTests(unittest.TestCase):
         preprovisioned, _ = run_system_once()
         first_chat, _ = run_once()
 
-        self.assertEqual(preprovisioned["audit"].facts("onboarding.result")["origin"], "preprovision")
+        self.assertEqual(
+            preprovisioned["audit"].facts("onboarding.result")["origin"], "preprovision"
+        )
         self.assertEqual(first_chat["audit"].facts("onboarding.result")["origin"], "first_chat")
         # 合成事件标识只进审计与去重键，不落任何表。
         self.assertEqual(
@@ -2831,7 +2916,9 @@ class SystemTriggerTests(unittest.TestCase):
         runner, _ = build_runner()
         with self.assertRaises(ValueError):
             runner.start_system(
-                email=ROSTER_ROWS[0]["email"], trace_id="t", origin="whatever",
+                email=ROSTER_ROWS[0]["email"],
+                trace_id="t",
+                origin="whatever",
                 initiated_by_open_id=INITIATED_BY,
             )
 
@@ -2841,7 +2928,9 @@ class SystemTriggerTests(unittest.TestCase):
         runner, _ = build_runner()
         with self.assertRaises(ValueError):
             runner.start_system(
-                email=ROSTER_ROWS[0]["email"], trace_id="t", initiated_by_open_id="  ",
+                email=ROSTER_ROWS[0]["email"],
+                trace_id="t",
+                initiated_by_open_id="  ",
             )
 
     # ---- 预授权随链落库（次序是硬的） --------------------------------
@@ -2948,7 +3037,9 @@ class SystemTriggerTests(unittest.TestCase):
         # 管理员照常收到告警：预开通失败没有用户可见出口，管理群是唯一的活人通道。
         self.assertEqual(alerts, [("email_already_bound", "trace_1")])
 
-    def test_a_conflict_on_the_system_path_leaves_no_token_environment_or_publish_intent(self) -> None:
+    def test_a_conflict_on_the_system_path_leaves_no_token_environment_or_publish_intent(
+        self,
+    ) -> None:
         stock = FakeStockTokens(
             StockTokenLookup(state=ADOPTABLE, secret="stolen-token", permissions="{}")
         )
@@ -2965,7 +3056,9 @@ class SystemTriggerTests(unittest.TestCase):
 
     # ---- 分水岭之后的当场收口（接缝修复①） ---------------------------
 
-    def test_a_failure_after_the_watershed_is_collapsed_although_nothing_was_delivered(self) -> None:
+    def test_a_failure_after_the_watershed_is_collapsed_although_nothing_was_delivered(
+        self,
+    ) -> None:
         """接缝修复①。「当场收口」原本以通知**确认送达**为前提（外部审查 P2-1）；
         预开通静默不发通知，照搬那条判据 ⇒ ``delivered`` 恒为假 ⇒ 收口永不触发 ⇒
         这个人永久停在 ``provisioning``/``mcp_syncing``，与 Issue #282 修复前的形状
@@ -3091,13 +3184,17 @@ class ConstructionTests(unittest.TestCase):
 
         with self.assertRaises(TypeError):
             AutoOnboardingRunner(
-                submit=None, sleep=lambda seconds: None, **self._parts()  # type: ignore[arg-type]
+                submit=None,
+                sleep=lambda seconds: None,
+                **self._parts(),  # type: ignore[arg-type]
             )
 
     def test_a_missing_sleep_is_refused_at_construction(self) -> None:
         with self.assertRaises(TypeError):
             AutoOnboardingRunner(
-                submit=lambda task: True, sleep=None, **self._parts()  # type: ignore[arg-type]
+                submit=lambda task: True,
+                sleep=None,
+                **self._parts(),  # type: ignore[arg-type]
             )
 
     def test_a_non_callable_onboarding_failed_is_refused_at_construction(self) -> None:
@@ -3121,7 +3218,9 @@ class ConstructionTests(unittest.TestCase):
         del parts["email_bindings"]
         with self.assertRaises(TypeError):
             AutoOnboardingRunner(
-                submit=lambda task: True, sleep=lambda seconds: None, **parts  # type: ignore[arg-type]
+                submit=lambda task: True,
+                sleep=lambda seconds: None,
+                **parts,  # type: ignore[arg-type]
             )
 
     def test_a_missing_innertest_roster_gate_is_refused_at_construction(self) -> None:
@@ -3131,7 +3230,9 @@ class ConstructionTests(unittest.TestCase):
         parts["innertest_roster_gate"] = None
         with self.assertRaises(TypeError):
             AutoOnboardingRunner(
-                submit=lambda task: True, sleep=lambda seconds: None, **parts  # type: ignore[arg-type]
+                submit=lambda task: True,
+                sleep=lambda seconds: None,
+                **parts,  # type: ignore[arg-type]
             )
 
 

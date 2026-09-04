@@ -247,9 +247,7 @@ class SendTest(unittest.TestCase):
 
         opener = module._no_redirect_opener()
         handlers = [
-            handler
-            for handler in opener.handlers
-            if type(handler).__name__ == "_NoRedirect"
+            handler for handler in opener.handlers if type(handler).__name__ == "_NoRedirect"
         ]
         self.assertEqual(len(handlers), 1)
         self.assertIsNone(

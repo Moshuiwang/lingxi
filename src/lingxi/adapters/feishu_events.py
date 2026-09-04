@@ -142,7 +142,9 @@ def _mentioned_open_ids(message: Mapping[str, Any] | None) -> tuple[str, ...]:
     return tuple(open_ids)
 
 
-def parse_message_event(payload: Mapping[str, Any], *, trace_id: str | None = None) -> InboundMessage:
+def parse_message_event(
+    payload: Mapping[str, Any], *, trace_id: str | None = None
+) -> InboundMessage:
     """把一条 ``im.message.receive_v1`` 事件体解析成 ``InboundMessage``。
 
     ``trace_id`` 只为测试可重复而开放；正常调用不传，由本函数生成一个 ULID

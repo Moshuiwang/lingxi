@@ -50,9 +50,10 @@ class RenderEmptyTests(unittest.TestCase):
     def test_no_entries_renders_empty_text(self) -> None:
         result = render_user_memory_prompt((), type_label=_label)
 
-        self.assertEqual(result, RenderedUserMemoryPrompt(
-            text="", truncated=False, total_entries=0, kept_entries=0
-        ))
+        self.assertEqual(
+            result,
+            RenderedUserMemoryPrompt(text="", truncated=False, total_entries=0, kept_entries=0),
+        )
 
 
 class RenderContentTests(unittest.TestCase):
@@ -83,8 +84,7 @@ class RenderContentTests(unittest.TestCase):
 
     def test_all_three_memory_types_use_their_own_label(self) -> None:
         entries = tuple(
-            _entry(memory_id=f"mem_{t}", memory_type=t, memory_key=t)
-            for t in MEMORY_TYPES
+            _entry(memory_id=f"mem_{t}", memory_type=t, memory_key=t) for t in MEMORY_TYPES
         )
 
         result = render_user_memory_prompt(entries, type_label=_label)
@@ -95,9 +95,7 @@ class RenderContentTests(unittest.TestCase):
 
 class TruncationTests(unittest.TestCase):
     def test_stays_under_the_limit_drops_nothing(self) -> None:
-        entries = tuple(
-            _entry(memory_id=f"mem_{i}", memory_key=f"key{i}") for i in range(3)
-        )
+        entries = tuple(_entry(memory_id=f"mem_{i}", memory_key=f"key{i}") for i in range(3))
 
         result = render_user_memory_prompt(entries, type_label=_label, max_chars=100_000)
 

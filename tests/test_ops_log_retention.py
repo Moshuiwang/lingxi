@@ -193,18 +193,14 @@ class MonitoringSampleRetentionTest(unittest.TestCase):
             self.assertTrue(old.exists())
 
             # 收紧到 5 天就该被清掉。
-            self._run_resource_sample(
-                output_dir, workspace, LINGXI_MONITORING_RETENTION_DAYS="5"
-            )
+            self._run_resource_sample(output_dir, workspace, LINGXI_MONITORING_RETENTION_DAYS="5")
             self.assertFalse(old.exists())
 
             # 0 表示关掉这条清理（不是"全删"）。
             revived = output_dir / "resource-20260102.log"
             revived.write_text("{}\n", encoding="utf-8")
             os.utime(revived, (now - 400 * 86400, now - 400 * 86400))
-            self._run_resource_sample(
-                output_dir, workspace, LINGXI_MONITORING_RETENTION_DAYS="0"
-            )
+            self._run_resource_sample(output_dir, workspace, LINGXI_MONITORING_RETENTION_DAYS="0")
             self.assertTrue(revived.exists(), "0 是关掉清理，不是无条件删除")
 
 

@@ -186,7 +186,6 @@ class LegacyPermissionImporter(Protocol):
     ) -> LegacyImportReport: ...
 
 
-
 class ReadinessConfirmer(Protocol):
     """阻塞式 MCP 就绪确认（``core/permission/mcp_readiness.McpReadinessConfirmation``）。"""
 

@@ -131,7 +131,13 @@ def import_legacy_permissions(
             type(error).__name__,
             "".join(traceback.format_tb(error.__traceback__)),
         )
-        _fail(audit, user_id, f"legacy_permission_import_failed_{type(error).__name__}", trace_id, error)
+        _fail(
+            audit,
+            user_id,
+            f"legacy_permission_import_failed_{type(error).__name__}",
+            trace_id,
+            error,
+        )
     audit.record(
         "onboarding.legacy_permission_import",
         user=user_id,

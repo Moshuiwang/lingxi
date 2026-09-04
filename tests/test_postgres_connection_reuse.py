@@ -161,9 +161,7 @@ class ConnectionReuseTests(unittest.TestCase):
             default_pid = _backend_pid(default_connection)
         with connect(DSN, timeouts=other) as other_connection:
             self.assertNotEqual(_backend_pid(other_connection), default_pid)
-            self.assertEqual(
-                other_connection.execute("SHOW statement_timeout").fetchone()[0], "4s"
-            )
+            self.assertEqual(other_connection.execute("SHOW statement_timeout").fetchone()[0], "4s")
         self.assertEqual(idle_connection_count(), 2)
 
     def test_close_idle_connections_really_closes_them(self) -> None:
@@ -176,7 +174,6 @@ class ConnectionReuseTests(unittest.TestCase):
                 "SELECT count(*) FROM pg_stat_activity WHERE pid = %s", (pid,)
             ).fetchone()[0]
         self.assertEqual(alive, 0)
-
 
     def test_close_is_idempotent_and_the_object_enters_the_idle_stack_once(self) -> None:
         """审核 P1-1：重复 close() 不得把同一对象压栈两次（否则两位借用者共用一条连接）。"""
@@ -275,7 +272,9 @@ class ConnectionReuseTests(unittest.TestCase):
             self.assertIsNone(connection.prepare_threshold)
             for _ in range(7):
                 connection.execute("SELECT 42").fetchone()
-            prepared = connection.execute("SELECT count(*) FROM pg_prepared_statements").fetchone()[0]
+            prepared = connection.execute("SELECT count(*) FROM pg_prepared_statements").fetchone()[
+                0
+            ]
             self.assertEqual(prepared, 0)
         with connect(DSN, dedicated=True) as dedicated:
             self.assertEqual(dedicated.info.get_parameters().get("keepalives_idle"), "30")
@@ -306,9 +305,7 @@ class DedicatedCallSiteWiringTests(unittest.TestCase):
             return _Connection()
 
         queue = _TaskQueueBase("postgresql://test/db", reuse_polling_connection=True)
-        with mock.patch(
-            "lingxi.adapters.postgres_conversation._queue_base.connect", fake_connect
-        ):
+        with mock.patch("lingxi.adapters.postgres_conversation._queue_base.connect", fake_connect):
             queue._run_polling_operation(lambda connection: None)
         self.assertEqual(len(calls), 1)
         self.assertIs(calls[0].get("dedicated"), True)
@@ -329,9 +326,7 @@ class DedicatedCallSiteWiringTests(unittest.TestCase):
             calls.append(kwargs)
             return _Connection()
 
-        with mock.patch(
-            "lingxi.adapters.postgres_conversation._listener.connect", fake_connect
-        ):
+        with mock.patch("lingxi.adapters.postgres_conversation._listener.connect", fake_connect):
             with PostgresTaskQueueListener("postgresql://test/db"):
                 pass
         self.assertEqual(len(calls), 1)

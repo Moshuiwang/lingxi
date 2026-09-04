@@ -119,7 +119,11 @@ class BitableStockTokenSource:
         self._table_id = _require_identifier(table_id, "存量令牌源表 table_id")
         if not callable(access_token):
             raise ValueError("access_token 必须是返回已就绪短期令牌的可调用对象")
-        if isinstance(page_size, bool) or not isinstance(page_size, int) or not 1 <= page_size <= MAX_PAGE_SIZE:
+        if (
+            isinstance(page_size, bool)
+            or not isinstance(page_size, int)
+            or not 1 <= page_size <= MAX_PAGE_SIZE
+        ):
             raise ValueError(f"page_size 必须是 1 到 {MAX_PAGE_SIZE} 之间的整数")
         if isinstance(max_pages, bool) or not isinstance(max_pages, int) or max_pages < 1:
             raise ValueError("max_pages 必须是正整数")

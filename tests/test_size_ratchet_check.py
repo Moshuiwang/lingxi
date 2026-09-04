@@ -267,7 +267,9 @@ class RunRefreshClassificationTest(unittest.TestCase):
 
     def test_refresh_lowers_a_shrunk_entry(self) -> None:
         self._write_module("big.py", 1600)
-        self.baseline_path.write_text(CHECK.render_baseline({"src/lingxi/big.py": 2000}), encoding="utf-8")
+        self.baseline_path.write_text(
+            CHECK.render_baseline({"src/lingxi/big.py": 2000}), encoding="utf-8"
+        )
         exit_code = CHECK.run_refresh()
         self.assertEqual(exit_code, 0)
         self.assertEqual(CHECK.load_baseline(self.baseline_path), {"src/lingxi/big.py": 1600})

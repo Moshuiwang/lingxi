@@ -314,7 +314,8 @@ class SectionIndependentFailureTests(unittest.TestCase):
         self.assertIn("成功(卡片) 5", text)
         self.assertIn("daily_report.section_read_failed", parts["audit"].actions())
         failed_sections = [
-            fields["section"] for fields in parts["audit"].fields_for("daily_report.section_read_failed")
+            fields["section"]
+            for fields in parts["audit"].fields_for("daily_report.section_read_failed")
         ]
         self.assertEqual(failed_sections, ["active_users"])
 
@@ -352,7 +353,9 @@ class SectionIndependentFailureTests(unittest.TestCase):
         时，正文渲染这两段的真实聚合，不再是固定的不可判定文案。"""
 
         duty, _ = build_duty(
-            source=FakeSource(guard_denied_stats=(10, 0, 4), token_usage_stats_value=(10, 0, 1000, 200, 0, 0))
+            source=FakeSource(
+                guard_denied_stats=(10, 0, 4), token_usage_stats_value=(10, 0, 1000, 200, 0, 0)
+            )
         )
         text = duty.run_once()
         assert text is not None
@@ -374,7 +377,8 @@ class SectionIndependentFailureTests(unittest.TestCase):
         self.assertIn("token 用量：input=0，output=0", text)
         self.assertIn("活跃用户：", text)
         failed_sections = [
-            fields["section"] for fields in parts["audit"].fields_for("daily_report.section_read_failed")
+            fields["section"]
+            for fields in parts["audit"].fields_for("daily_report.section_read_failed")
         ]
         self.assertEqual(failed_sections, ["denied_count"])
 
@@ -383,7 +387,9 @@ class SectionIndependentFailureTests(unittest.TestCase):
         之前的历史任务）——与"查询失败"是不同的不可判定原因。"""
 
         duty, _ = build_duty(
-            source=FakeSource(guard_denied_stats=(0, 6, 0), token_usage_stats_value=(0, 6, 0, 0, 0, 0))
+            source=FakeSource(
+                guard_denied_stats=(0, 6, 0), token_usage_stats_value=(0, 6, 0, 0, 0, 0)
+            )
         )
         text = duty.run_once()
         assert text is not None
@@ -449,14 +455,20 @@ class SendFailureReasonClassificationTests(unittest.TestCase):
     def _reason(self, *, error: Exception) -> str:
         duty, parts = build_duty(sender=FakeSender(failures=1, error=error))
         duty.run_once()
-        records = [fields for action, fields in parts["audit"].records if action == "daily_report.send_failed"]
+        records = [
+            fields
+            for action, fields in parts["audit"].records
+            if action == "daily_report.send_failed"
+        ]
         self.assertEqual(len(records), 1)
         return records[0]["reason"]
 
     def test_a_value_error_is_classified_as_uuid_budget(self) -> None:
         """`delivery_uuid()` 唯一会抛的异常类型——A1 修复的那类 bug。"""
 
-        self.assertEqual(self._reason(error=ValueError("投递去重 ID 超过飞书的 50 字符上限")), "uuid_budget")
+        self.assertEqual(
+            self._reason(error=ValueError("投递去重 ID 超过飞书的 50 字符上限")), "uuid_budget"
+        )
 
     def test_a_feishu_group_message_error_is_classified_as_transport(self) -> None:
         from lingxi.adapters.feishu_group_message import FeishuGroupMessageError
@@ -473,9 +485,15 @@ class SendFailureReasonClassificationTests(unittest.TestCase):
         出现在审计字段里的任何一处。"""
 
         secret_looking_message = "投递到 oc_admin_group_secret 失败：正文片段泄露样例"
-        duty, parts = build_duty(sender=FakeSender(failures=1, error=RuntimeError(secret_looking_message)))
+        duty, parts = build_duty(
+            sender=FakeSender(failures=1, error=RuntimeError(secret_looking_message))
+        )
         duty.run_once()
-        records = [fields for action, fields in parts["audit"].records if action == "daily_report.send_failed"]
+        records = [
+            fields
+            for action, fields in parts["audit"].records
+            if action == "daily_report.send_failed"
+        ]
         self.assertNotIn(secret_looking_message, repr(records))
 
 
@@ -560,7 +578,9 @@ class PersistedWatermarkTests(unittest.TestCase):
             duty, _ = build_duty(watermark=watermark, sender=sender, clock=clock)
             results.append(duty.run_once())
 
-        self.assertEqual(sum(1 for result in results if result is not None), 1, "四次模拟重启只应有一次真正发送")
+        self.assertEqual(
+            sum(1 for result in results if result is not None), 1, "四次模拟重启只应有一次真正发送"
+        )
         self.assertEqual(len(sender.payloads), 1)
 
     def test_a_successful_send_marks_the_persisted_watermark(self) -> None:
@@ -575,7 +595,9 @@ class PersistedWatermarkTests(unittest.TestCase):
         duty, _ = build_duty(watermark=watermark, sender=FakeSender(failures=1), clock=FixedClock())
         duty.run_once()
         self.assertEqual(watermark.mark_sent_calls, [])
-        self.assertFalse(watermark.already_sent(report_date=date(2026, 8, 24), chat_id=FAKE_CHAT_ID))
+        self.assertFalse(
+            watermark.already_sent(report_date=date(2026, 8, 24), chat_id=FAKE_CHAT_ID)
+        )
 
     def test_the_in_memory_fast_path_avoids_a_second_watermark_lookup_the_same_day(self) -> None:
         """判重水位查询是每一轮的"第一道最快的一关"之后才会碰的第二关：同一
@@ -638,7 +660,9 @@ class WatermarkCallFailureAuditTests(unittest.TestCase):
         self.assertFalse(sent_fields["watermark_persisted"])
 
         self.assertIn("daily_report.watermark_persist_failed", parts["audit"].actions())
-        persist_failed_fields = parts["audit"].fields_for("daily_report.watermark_persist_failed")[0]
+        persist_failed_fields = parts["audit"].fields_for("daily_report.watermark_persist_failed")[
+            0
+        ]
         self.assertEqual(persist_failed_fields["error"], "RuntimeError")
 
         # 内存态照常置位：本进程存活期间不会重发同一窗口的通报。
@@ -785,8 +809,13 @@ class LocalOverrideActivityWiringTests(unittest.TestCase):
 
     @staticmethod
     def _stub(
-        *, granted: int = 0, suppressed: int = 0, revoked: int = 0, active_grant: int = 0,
-        active_suppress: int = 0, affected: int = 0,
+        *,
+        granted: int = 0,
+        suppressed: int = 0,
+        revoked: int = 0,
+        active_grant: int = 0,
+        active_suppress: int = 0,
+        affected: int = 0,
     ):
         def _fetch(*, window_start, window_end):
             return (granted, suppressed, revoked, active_grant, active_suppress, affected)

@@ -516,10 +516,16 @@ class ManagementCardContextStore:
                 # 起不再参与 CAS，只作为状态代数继续维护，与生产表保持同一形状。
                 card_sequence=context.card_sequence + (1 if changed else 0),
                 state_version=context.state_version + (1 if changed else 0),
-                snapshot_fingerprint=(snapshot_fingerprint if snapshot_fingerprint is not None else context.snapshot_fingerprint),
+                snapshot_fingerprint=(
+                    snapshot_fingerprint
+                    if snapshot_fingerprint is not None
+                    else context.snapshot_fingerprint
+                ),
                 context_deadline_at=context.context_deadline_at,
                 state=state if state is not None else context.state,
-                dispatch_status=dispatch_status if dispatch_status is not None else context.dispatch_status,
+                dispatch_status=dispatch_status
+                if dispatch_status is not None
+                else context.dispatch_status,
                 last_trace_id=last_trace_id if last_trace_id is not None else context.last_trace_id,
                 daily_correction_reported_at=(
                     context.daily_correction_reported_at
@@ -542,9 +548,7 @@ class ManagementCardContextStore:
             return ()
         with self._lock:
             return tuple(
-                context
-                for context, _expires_at in self._entries.values()
-                if context.needs_refresh
+                context for context, _expires_at in self._entries.values() if context.needs_refresh
             )[:limit]
 
     def mark_visual_refreshed(

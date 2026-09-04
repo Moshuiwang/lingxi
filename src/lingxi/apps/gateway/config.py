@@ -274,6 +274,7 @@ def _tenant_domain(env: Mapping[str, str]) -> str | None:
     except ValueError as error:
         raise GatewayConfigError(f"{ENV_PREFIX}TENANT_DOMAIN 不合法：{error}") from None
 
+
 def _markdown_convert_enabled(env: Mapping[str, str]) -> bool:
     """markdown 官方转换开关（Issue #408 正式方案接线；Issue #467／rc22 S-4
     翻转默认值）：未配置或为空——``True``（代码默认开启：docx 转换已通过
@@ -348,18 +349,14 @@ def _bot_open_id(env: Mapping[str, str]) -> str | None:
 def load_config(env: Mapping[str, str]) -> GatewayConfig:
     """从环境变量构造配置。缺失或不合法时抛 :class:`GatewayConfigError`。"""
 
-    missing = [
-        name for name in ("APP_ID", "APP_SECRET", "POSTGRES_DSN") if not _text(env, name)
-    ]
+    missing = [name for name in ("APP_ID", "APP_SECRET", "POSTGRES_DSN") if not _text(env, name)]
     if missing:
         raise GatewayConfigError(
             "缺少必填环境变量：" + "、".join(f"{ENV_PREFIX}{name}" for name in missing)
         )
 
     try:
-        postgres_timeouts = PostgresTimeouts.from_env(
-            env, prefix=f"{ENV_PREFIX}POSTGRES_"
-        )
+        postgres_timeouts = PostgresTimeouts.from_env(env, prefix=f"{ENV_PREFIX}POSTGRES_")
     except PostgresTimeoutConfigError as error:
         raise GatewayConfigError(str(error)) from None
 
@@ -400,7 +397,6 @@ def load_config(env: Mapping[str, str]) -> GatewayConfig:
         innertest_roster_open_ids=_innertest_roster_open_ids(env),
         tenant_domain=_tenant_domain(env),
         markdown_convert_enabled=_markdown_convert_enabled(env),
-
         bot_open_id=_bot_open_id(env),
         metric_map_path=_metric_map_path(env),
     )

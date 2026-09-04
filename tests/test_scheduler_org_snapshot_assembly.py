@@ -55,9 +55,7 @@ class RecordingAudit:
         return [action for action, _ in self.records]
 
 
-def build(
-    *, user_token: Any = None, app_token: Any = None
-) -> tuple[Any, RecordingAudit]:
+def build(*, user_token: Any = None, app_token: Any = None) -> tuple[Any, RecordingAudit]:
     audit = RecordingAudit()
     duty = _build_org_snapshot_sync_duty(
         SchedulerConfig.from_env(BASE_ENV),
@@ -99,7 +97,7 @@ class PrerequisiteTests(unittest.TestCase):
 
 
 class RuntimeVsUnwiredDistinctionTest(unittest.TestCase):
-    """"未接线"（装配期，只报一条 ``duty_not_registered``）与"配了但拿不到"
+    """ "未接线"（装配期，只报一条 ``duty_not_registered``）与"配了但拿不到"
     （运行期，职责照常注册，失败发生在 ``run_once`` 内部）必须可分辨。"""
 
     def test_a_wired_but_failing_token_supply_still_registers_the_duty(self) -> None:
@@ -436,7 +434,9 @@ class HardeningWiringTests(unittest.TestCase):
             ["org_snapshot_sync.watermark_check_failed", "org_snapshot_sync.read_failed"],
         )
         fields = audit.records[-1][1]
-        self.assertEqual(fields.get("code"), "stopping", "审计必须如实记下中止原因，不是笼统的异常类型名")
+        self.assertEqual(
+            fields.get("code"), "stopping", "审计必须如实记下中止原因，不是笼统的异常类型名"
+        )
 
     def test_the_onboarding_employment_reader_client_is_never_wrapped_in_round_budget(self) -> None:
         """**名不副实的旧版本**只证明了「两次组织快照装配各自拿到独立的 client

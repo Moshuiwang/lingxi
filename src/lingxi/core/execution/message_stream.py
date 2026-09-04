@@ -138,7 +138,9 @@ class TurnStreamRecorder:
             subtype = event.get("subtype")
             self._result_subtype = subtype[:64] if isinstance(subtype, str) else None
             terminal_reason = event.get("terminal_reason")
-            self._terminal_reason = terminal_reason[:64] if isinstance(terminal_reason, str) else None
+            self._terminal_reason = (
+                terminal_reason[:64] if isinstance(terminal_reason, str) else None
+            )
             self._agent_turns = _non_negative_int(event.get("num_turns"))
             self._usage_summary = _usage_summary(
                 event.get("usage"),

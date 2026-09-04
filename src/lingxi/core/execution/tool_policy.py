@@ -152,7 +152,9 @@ class ToolPolicy:
         allowed_skills: object = (),
     ) -> None:
         self._allowed_tools = self._freeze_names(allowed_tools, field="allowed_tools")
-        self._allowed_skills = self._freeze_names(allowed_skills, field="allowed_skills", allow_empty=True)
+        self._allowed_skills = self._freeze_names(
+            allowed_skills, field="allowed_skills", allow_empty=True
+        )
         unsupported = sorted(
             name
             for name in self._allowed_tools
@@ -174,7 +176,9 @@ class ToolPolicy:
     def allowed_skills(self) -> frozenset[str]:
         return self._allowed_skills
 
-    def decide(self, tool_name: object, tool_input: Mapping[str, Any] | None = None) -> PolicyVerdict:
+    def decide(
+        self, tool_name: object, tool_input: Mapping[str, Any] | None = None
+    ) -> PolicyVerdict:
         """判定一次工具调用。任何无法确认为白名单内的输入都返回拒绝。"""
 
         if not isinstance(tool_name, str) or not _VALID_TOOL_NAME.fullmatch(tool_name):

@@ -114,7 +114,9 @@ class WriteAndReadBackTests(ContentCapturePostgresTestCase):
         self.assertEqual(row["tool_calls"], record.tool_calls_payload())
         self.assertEqual(row["tool_calls_redaction_count"], 0)
 
-    def test_multiple_rows_for_the_same_task_are_ordered_newest_first_and_respect_limit(self) -> None:
+    def test_multiple_rows_for_the_same_task_are_ordered_newest_first_and_respect_limit(
+        self,
+    ) -> None:
         self.seed_task(task_id="t1")
         self.writer.write(self.sample_record(task_id="t1", worker_id="worker-a"))
         self.writer.write(self.sample_record(task_id="t1", worker_id="worker-b"))

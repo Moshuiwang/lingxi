@@ -91,7 +91,9 @@ def role_ids_for_user(user_id: str, user_role_rows: Iterable[Mapping[str, Any]])
     if not key:
         return ()
     return _unique(
-        _required_text(row.get("role_id")) for row in user_role_rows if _required_text(row.get("user_id")) == key
+        _required_text(row.get("role_id"))
+        for row in user_role_rows
+        if _required_text(row.get("user_id")) == key
     )
 
 
@@ -112,13 +114,17 @@ def menu_entries_for_roles(
     return tuple(entries.values())
 
 
-def menu_ids_for_roles(role_ids: Iterable[str], role_menu_rows: Iterable[Mapping[str, Any]]) -> tuple[str, ...]:
+def menu_ids_for_roles(
+    role_ids: Iterable[str], role_menu_rows: Iterable[Mapping[str, Any]]
+) -> tuple[str, ...]:
     """菜单权限的唯一判定键集合。"""
 
     return tuple(entry.menu_id for entry in menu_entries_for_roles(role_ids, role_menu_rows))
 
 
-def role_names_for_user(user_id: str, user_role_rows: Iterable[Mapping[str, Any]]) -> tuple[str, ...]:
+def role_names_for_user(
+    user_id: str, user_role_rows: Iterable[Mapping[str, Any]]
+) -> tuple[str, ...]:
     """该账号持有的角色名（自由文本）。
 
     角色名只用于职能标签映射（见 `role_function`），不用于连接，也不能反推公司范围。
@@ -128,11 +134,15 @@ def role_names_for_user(user_id: str, user_role_rows: Iterable[Mapping[str, Any]
     if not key:
         return ()
     return _unique(
-        _required_text(row.get("role_name")) for row in user_role_rows if _required_text(row.get("user_id")) == key
+        _required_text(row.get("role_name"))
+        for row in user_role_rows
+        if _required_text(row.get("user_id")) == key
     )
 
 
-def country_keys_for_user(user_id: str, datacountry_rows: Iterable[Mapping[str, Any]]) -> tuple[str, ...]:
+def country_keys_for_user(
+    user_id: str, datacountry_rows: Iterable[Mapping[str, Any]]
+) -> tuple[str, ...]:
     """按 `user_id` 取该账号被授权的国家键（源列 `USER_ID` / `DATACOUNTRY_ID`）。"""
 
     key = _required_text(user_id)
@@ -187,10 +197,9 @@ def resolve_company_scope(
     all_countries = SENTINEL_COUNTRY_KEY in explicit and sentinel_valid
 
     if all_countries:
-        resolved = (
-            tuple(scope for key, scope in by_country_key.items() if key != SENTINEL_COUNTRY_KEY)
-            + tuple(unkeyed)
-        )
+        resolved = tuple(
+            scope for key, scope in by_country_key.items() if key != SENTINEL_COUNTRY_KEY
+        ) + tuple(unkeyed)
     else:
         # 哨兵不是国家：显式路径永不把 key=0 的行当作可用范围返回——
         # 哨兵损坏时它会顶着「全非」的名字混进结果（终轮 Codex 的失败开放面）。

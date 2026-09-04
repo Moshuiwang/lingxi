@@ -61,9 +61,13 @@ def expand_position_scope(
 
     if scope == ALL_COMPANIES_SCOPE or scope.casefold() in {"all", "全部"}:
         if available_companies is None:
-            companies = tuple(sorted(key for key in company_function_metric_map if key != ALL_COMPANIES_SCOPE))
+            companies = tuple(
+                sorted(key for key in company_function_metric_map if key != ALL_COMPANIES_SCOPE)
+            )
         else:
-            companies = tuple(dict.fromkeys(str(value) for value in available_companies if str(value).strip()))
+            companies = tuple(
+                dict.fromkeys(str(value) for value in available_companies if str(value).strip())
+            )
     else:
         if available_companies is not None:
             allowed_companies = {

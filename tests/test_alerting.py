@@ -207,9 +207,7 @@ class SendFailureTests(unittest.TestCase):
             manager.send_failure(channel="card", final=False, at=START + timedelta(minutes=7)),
             (),
         )
-        third = manager.send_failure(
-            channel="card", final=False, at=START + timedelta(minutes=8)
-        )
+        third = manager.send_failure(channel="card", final=False, at=START + timedelta(minutes=8))
 
         self.assertEqual(len(third), 1)
         self.assertEqual(third[0].count, 3)

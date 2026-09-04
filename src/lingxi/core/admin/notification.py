@@ -167,7 +167,9 @@ def _position_company_count(payload: Mapping[str, Any]) -> int:
     raw_companies = payload.get("companies")
     values: list[str] = []
     if isinstance(raw_companies, (list, tuple, set)):
-        values.extend(value.strip() for value in raw_companies if isinstance(value, str) and value.strip())
+        values.extend(
+            value.strip() for value in raw_companies if isinstance(value, str) and value.strip()
+        )
     if not values:
         pairs = payload.get("pairs")
         if isinstance(pairs, (list, tuple)):
@@ -221,10 +223,7 @@ def _permission_scope_block(
             else (company_label if company_label is not None else scope)
         )
         reason = payload.get("reason", "")
-        return (
-            f"职位：{role}\n公司范围：{scope_display}\n"
-            f"原因：{reason}\n"
-        )
+        return f"职位：{role}\n公司范围：{scope_display}\n原因：{reason}\n"
     company_display = company_label if company_label is not None else payload.get("company_id", "")
     metric_display = metric_label if metric_label is not None else payload.get("metric_name", "")
     reason = payload.get("reason", "")
@@ -271,6 +270,7 @@ def _permission_scope_suffix(
     direction = payload.get("direction")
     direction_infix = f"{_DIRECTION_LABEL.get(direction, direction)} · " if direction else ""
     return f"（{direction_infix}公司 {company_display} · 指标 {metric_display} · 原因 {reason}）"
+
 
 #: 卡片按钮点击回传的 ``decision`` 取值，与
 #: ``adapters/feishu_events.parse_card_action_event``/``core/admin/card_callback``
@@ -467,7 +467,9 @@ def render_terminal_card(
     ``metric_label`` 同一份 Trace #469 S-1 人性化裁定，缺省时退回原始 ID）。"""
 
     action_label = _ACTION_LABEL[pending.action_type]
-    scope_block = _permission_scope_block(pending, company_label=company_label, metric_label=metric_label)
+    scope_block = _permission_scope_block(
+        pending, company_label=company_label, metric_label=metric_label
+    )
     body = f"目标：{target_label}\n{scope_block}结果：{outcome_text}"
     return RenderedConfirmCard(title=f"{action_label}用户 · 已结束", body=body, buttons=())
 
@@ -577,7 +579,7 @@ def render_group_notice(
     """
 
     action_label = _ACTION_LABEL[pending.action_type]
-    scope_suffix = _permission_scope_suffix(pending, company_label=company_label, metric_label=metric_label)
-    return (
-        f"管理操作：{action_label} {target_label}{scope_suffix} · {_group_outcome_text(pending)}"
+    scope_suffix = _permission_scope_suffix(
+        pending, company_label=company_label, metric_label=metric_label
     )
+    return f"管理操作：{action_label} {target_label}{scope_suffix} · {_group_outcome_text(pending)}"

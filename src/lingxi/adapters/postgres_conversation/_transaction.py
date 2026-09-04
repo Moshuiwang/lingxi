@@ -295,7 +295,9 @@ class _Transaction:
             (new_id("asc"), user_id, agent_session_id, reason),
         )
 
-    def clear_delivered_content_for_user(self, *, user_id: str, reason: str = "user_cleared") -> int:
+    def clear_delivered_content_for_user(
+        self, *, user_id: str, reason: str = "user_cleared"
+    ) -> int:
         """停用感知、权限变化感知触发：清除该用户名下全部会话已送达的投递正文，
         并使该用户全部会话的当前 Agent 会话失效、排队物理清理其 JSONL（Issue #153）。
 

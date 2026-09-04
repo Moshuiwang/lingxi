@@ -374,7 +374,12 @@ class LarkAdminManagementCardTransport:
             .card_id(card_id)
             .request_body(
                 UpdateCardRequestBody.builder()
-                .card(Card.builder().type("card_json").data(json.dumps(card, ensure_ascii=False)).build())
+                .card(
+                    Card.builder()
+                    .type("card_json")
+                    .data(json.dumps(card, ensure_ascii=False))
+                    .build()
+                )
                 .sequence(sequence)
                 .build()
             )

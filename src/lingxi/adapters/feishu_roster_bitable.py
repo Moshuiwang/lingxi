@@ -312,7 +312,9 @@ class RosterReadOutcome:
             "reported_total": self.integrity.reported_total,
             "total_matches_rows": self.integrity.total_matches_rows,
             "absent_columns": list(self.integrity.absent_columns),
-            "blank_column_rows": {item.column: item.rows for item in self.integrity.blank_column_rows},
+            "blank_column_rows": {
+                item.column: item.rows for item in self.integrity.blank_column_rows
+            },
             "rows_without_personnel_id": self.integrity.rows_without_personnel_id,
             "duplicate_keys": {item.field: item.keys for item in self.integrity.duplicates},
             "duplicate_rows": {item.field: item.rows for item in self.integrity.duplicates},
@@ -335,8 +337,7 @@ class RosterRecordPage(NamedTuple):
 class RosterPageSource(Protocol):
     """按页返回花名册记录的只读传输（可注入面）。"""
 
-    def fetch_page(self, page_token: str | None = None) -> RosterRecordPage:
-        ...
+    def fetch_page(self, page_token: str | None = None) -> RosterRecordPage: ...
 
 
 def _require_https(base_url: object) -> str:
@@ -463,6 +464,7 @@ class BitableRosterPages:
         if isinstance(total, bool) or not isinstance(total, int) or total < 0:
             total = None
         return RosterRecordPage(tuple(items), next_page_token, total)
+
 
 def _integrity(
     *,

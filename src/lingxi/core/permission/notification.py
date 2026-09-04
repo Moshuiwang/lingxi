@@ -406,9 +406,7 @@ class PermissionNoticeDispatcher:
                 if self._backoff:
                     self._sleep(self._backoff[min(attempt_no - 2, len(self._backoff) - 1)])
             try:
-                self._sender.send_text(
-                    open_id=open_id, text=notice.text, dedupe_key=dedupe_key
-                )
+                self._sender.send_text(open_id=open_id, text=notice.text, dedupe_key=dedupe_key)
             except Exception as error:  # 通知失败不得阻塞权限生效
                 last_error = _error_code(error)
                 logger.warning(

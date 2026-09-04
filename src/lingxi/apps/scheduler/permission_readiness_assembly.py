@@ -100,9 +100,7 @@ def _build_readiness_follow_up(
             metrics_reader=content_text_metrics_reader,
         )
         if probe.timeout_seconds != schedule.probe_timeout_seconds:  # pragma: no cover - 装配自证
-            raise RuntimeError(
-                "探针传输超时必须与就绪节奏的单次超时一致，否则收口上界是假的"
-            )
+            raise RuntimeError("探针传输超时必须与就绪节奏的单次超时一致，否则收口上界是假的")
     else:
         # **恰一条**审计：只关掉探针，撤权通知照常。
         audit.record(

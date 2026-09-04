@@ -260,7 +260,9 @@ class UnknownDecisionTests(unittest.TestCase):
         self.assertNotIn("card", outcome, "不存在的动作不能带任何卡片")
         self.assertEqual(pending_actions.confirm_calls, [])
         self.assertEqual(pending_actions.cancel_calls, [])
-        self.assertIn("admin.card_callback.unknown_decision", [action for action, _ in audit.records])
+        self.assertIn(
+            "admin.card_callback.unknown_decision", [action for action, _ in audit.records]
+        )
 
 
 class ConfirmExecutionTests(unittest.TestCase):
@@ -291,7 +293,9 @@ class ConfirmExecutionTests(unittest.TestCase):
             trace_id="trc_2",
         )
 
-        self.assertEqual(outcome["toast"]["type"], "success", "executed 状态的 toast 必须是 success")
+        self.assertEqual(
+            outcome["toast"]["type"], "success", "executed 状态的 toast 必须是 success"
+        )
         # Trace #469 S-1 TOP-3 接线修复：toast 直接用这次点击产生的
         # ``decision.message``（这里由 ``_FakeDecision.message`` 注入），不再
         # 由 ``_outcome_text(pending)`` 重新按持久状态派生一句不同的文案——
@@ -322,7 +326,9 @@ class DisplayNamesWiringTests(unittest.TestCase):
     def _executed_outcome(self, pending: PendingAction) -> _FakeOutcome:
         return _FakeOutcome(
             decision=_FakeDecision(
-                kind=ConfirmResultKind.EXECUTE, ok=True, message="已确认执行。",
+                kind=ConfirmResultKind.EXECUTE,
+                ok=True,
+                message="已确认执行。",
                 terminal_status=PendingActionStatus.EXECUTED,
             ),
             pending=pending,
@@ -487,7 +493,9 @@ class ForgedPendingActionIdTests(unittest.TestCase):
         pending_actions.set_confirm_result(
             _FakeOutcome(
                 decision=_FakeDecision(
-                    kind=ConfirmResultKind.NOT_FOUND, ok=False, message="未找到该待确认操作。",
+                    kind=ConfirmResultKind.NOT_FOUND,
+                    ok=False,
+                    message="未找到该待确认操作。",
                     terminal_status=None,
                 ),
                 pending=None,
@@ -575,7 +583,8 @@ class TransientFailureTests(unittest.TestCase):
         self.assertEqual(cards.update_calls, [])
         self.assertEqual(group.sent, [])
         transient_records = [
-            fields for action, fields in audit.records
+            fields
+            for action, fields in audit.records
             if action == "admin.card_callback.transient_failure"
         ]
         self.assertEqual(len(transient_records), 1)
@@ -628,7 +637,9 @@ class BestEffortSideEffectFailureTests(unittest.TestCase):
         pending_actions.set_confirm_result(
             _FakeOutcome(
                 decision=_FakeDecision(
-                    kind=ConfirmResultKind.EXECUTE, ok=True, message="已确认执行。",
+                    kind=ConfirmResultKind.EXECUTE,
+                    ok=True,
+                    message="已确认执行。",
                     terminal_status=PendingActionStatus.EXECUTED,
                 ),
                 pending=pending,
@@ -665,7 +676,9 @@ class BestEffortSideEffectFailureTests(unittest.TestCase):
         pending_actions.set_confirm_result(
             _FakeOutcome(
                 decision=_FakeDecision(
-                    kind=ConfirmResultKind.EXECUTE, ok=True, message="已确认执行。",
+                    kind=ConfirmResultKind.EXECUTE,
+                    ok=True,
+                    message="已确认执行。",
                     terminal_status=PendingActionStatus.EXECUTED,
                 ),
                 pending=pending,
@@ -697,7 +710,9 @@ class BestEffortSideEffectFailureTests(unittest.TestCase):
         pending_actions.set_confirm_result(
             _FakeOutcome(
                 decision=_FakeDecision(
-                    kind=ConfirmResultKind.EXECUTE, ok=True, message="已确认执行。",
+                    kind=ConfirmResultKind.EXECUTE,
+                    ok=True,
+                    message="已确认执行。",
                     terminal_status=PendingActionStatus.EXECUTED,
                 ),
                 pending=pending,
@@ -727,7 +742,9 @@ class CancelPathTests(unittest.TestCase):
         pending_actions.set_cancel_result(
             _FakeOutcome(
                 decision=_FakeDecision(
-                    kind="cancel", ok=True, message="已取消，未做任何变更。",
+                    kind="cancel",
+                    ok=True,
+                    message="已取消，未做任何变更。",
                     terminal_status=PendingActionStatus.CANCELLED,
                 ),
                 pending=pending,
@@ -844,7 +861,9 @@ class ManagementFormSubmitTests(unittest.TestCase):
 
         self.assertEqual(response["toast"]["type"], "error")
         self.assertEqual(router.route_calls, [])
-        self.assertIn("admin.card_callback.management_unknown_action", [a for a, _ in audit.records])
+        self.assertIn(
+            "admin.card_callback.management_unknown_action", [a for a, _ in audit.records]
+        )
 
     def test_blank_reason_is_rejected_without_calling_the_router(self) -> None:
         router = _FakeManagementRouter()
@@ -1104,7 +1123,8 @@ class ManagementFormSubmitWhitespaceValidationTests(unittest.TestCase):
         self.assertEqual(response["toast"]["type"], "success")
         self.assertEqual(len(router.route_calls), 1)
         self.assertEqual(
-            router.route_calls[0]["text"], "/admin grant_position ou_target A运营 1011 特批 授权说明"
+            router.route_calls[0]["text"],
+            "/admin grant_position ou_target A运营 1011 特批 授权说明",
         )
 
 
@@ -1292,7 +1312,9 @@ class RecomputeTriggerWiringTests(unittest.TestCase):
     def _confirm_result(self, pending: PendingAction) -> _FakeOutcome:
         return _FakeOutcome(
             decision=_FakeDecision(
-                kind=ConfirmResultKind.EXECUTE, ok=True, message="已确认执行。",
+                kind=ConfirmResultKind.EXECUTE,
+                ok=True,
+                message="已确认执行。",
                 terminal_status=PendingActionStatus.EXECUTED,
             ),
             pending=pending,
@@ -1327,7 +1349,9 @@ class RecomputeTriggerWiringTests(unittest.TestCase):
         pending_actions.set_cancel_result(
             _FakeOutcome(
                 decision=_FakeDecision(
-                    kind="cancel", ok=True, message="已取消，未做任何变更。",
+                    kind="cancel",
+                    ok=True,
+                    message="已取消，未做任何变更。",
                     terminal_status=PendingActionStatus.CANCELLED,
                 ),
                 pending=pending,
@@ -1353,7 +1377,9 @@ class RecomputeTriggerWiringTests(unittest.TestCase):
         pending_actions.set_confirm_result(
             _FakeOutcome(
                 decision=_FakeDecision(
-                    kind=ConfirmResultKind.ALREADY_TERMINAL, ok=False, message="已确认执行。",
+                    kind=ConfirmResultKind.ALREADY_TERMINAL,
+                    ok=False,
+                    message="已确认执行。",
                     terminal_status=None,
                 ),
                 pending=pending,

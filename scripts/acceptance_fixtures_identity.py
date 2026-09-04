@@ -68,7 +68,9 @@ def _roster_row(
     }
 
 
-def _galaxy_row(user_id: str, *, user_name: str = "", email: str = "", nick_name: str = "验收夹具测试人员") -> dict[str, str]:
+def _galaxy_row(
+    user_id: str, *, user_name: str = "", email: str = "", nick_name: str = "验收夹具测试人员"
+) -> dict[str, str]:
     return {"user_id": user_id, "user_name": user_name, "email": email, "nick_name": nick_name}
 
 
@@ -106,8 +108,12 @@ MULTIPLE_HIT = NegativeIdentityFixture(
     name="多条：同一人员 ID 花名册存在多行",
     feishu_user_id=_PERSON_ID_PREFIX + "MULTI",
     roster_rows=(
-        _roster_row(_PERSON_ID_PREFIX + "MULTI", employee_no="80101", email="dup1@example-corp.invalid"),
-        _roster_row(_PERSON_ID_PREFIX + "MULTI", employee_no="80101", email="dup1@example-corp.invalid"),
+        _roster_row(
+            _PERSON_ID_PREFIX + "MULTI", employee_no="80101", email="dup1@example-corp.invalid"
+        ),
+        _roster_row(
+            _PERSON_ID_PREFIX + "MULTI", employee_no="80101", email="dup1@example-corp.invalid"
+        ),
     ),
     galaxy_rows=(_galaxy_row("U-DUP", user_name="80101", email="dup1@example-corp.invalid"),),
     expected_state="not_found",
@@ -164,7 +170,9 @@ UNSUPPORTED_FUNCTION = NegativeIdentityFixture(
             email="no-function@example-corp.invalid",
         ),
     ),
-    galaxy_rows=(_galaxy_row("U-NO-FUNCTION", user_name="80103", email="no-function@example-corp.invalid"),),
+    galaxy_rows=(
+        _galaxy_row("U-NO-FUNCTION", user_name="80103", email="no-function@example-corp.invalid"),
+    ),
     expected_state="matched",
     expected_reason="unique_employee_no_match",
     contract_note=(

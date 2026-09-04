@@ -60,6 +60,7 @@ _UTC = UTC
 NOTICE_BACKOFF_STEP_SECONDS = 300
 NOTICE_BACKOFF_CEILING_SECONDS = 3600
 
+
 @dataclass(frozen=True)
 class LateOnboardingCandidate:
     """一个「首次开通已经超时、仍卡在 ``mcp_syncing``」的恢复候选（V-开通-18）。
@@ -103,9 +104,7 @@ class PostgresLateReadinessStore:
     """V-开通-18 恢复路径的读写口：构造时不连接数据库，每次调用自带连接
     （adapters 既有惯例）。"""
 
-    def __init__(
-        self, dsn: str, *, timeouts: PostgresTimeouts = DEFAULT_POSTGRES_TIMEOUTS
-    ) -> None:
+    def __init__(self, dsn: str, *, timeouts: PostgresTimeouts = DEFAULT_POSTGRES_TIMEOUTS) -> None:
         self._dsn = dsn
         self._timeouts = timeouts
 
@@ -153,7 +152,10 @@ class PostgresLateReadinessStore:
             or recovery_interval_seconds < 1
         ):
             raise ValueError("复检节奏必须是正整数秒")
-        with connect(self._dsn, timeouts=self._timeouts) as connection, connection.cursor() as cursor:
+        with (
+            connect(self._dsn, timeouts=self._timeouts) as connection,
+            connection.cursor() as cursor,
+        ):
             cursor.execute(
                 """
                 SELECT u.id, u.permission_version, o.payload ->> 'permissions',
@@ -376,7 +378,10 @@ class PostgresLateReadinessStore:
     def mark_notice_delivered(self, notice_id: str) -> None:
         """把一条通知记成已送达（终态）。"""
 
-        with connect(self._dsn, timeouts=self._timeouts) as connection, connection.cursor() as cursor:
+        with (
+            connect(self._dsn, timeouts=self._timeouts) as connection,
+            connection.cursor() as cursor,
+        ):
             cursor.execute(
                 "UPDATE onboarding_completion_notice "
                 "SET status = 'delivered', delivered_at = now() WHERE id = %s",
@@ -399,15 +404,16 @@ class PostgresLateReadinessStore:
         认领时算好了，这里只留痕，不重复退避。
         """
 
-        with connect(self._dsn, timeouts=self._timeouts) as connection, connection.cursor() as cursor:
+        with (
+            connect(self._dsn, timeouts=self._timeouts) as connection,
+            connection.cursor() as cursor,
+        ):
             cursor.execute(
                 "UPDATE onboarding_completion_notice SET last_error = %s WHERE id = %s",
                 (str(error)[:500], notice_id),
             )
 
-    def purge_expired_notices(
-        self, *, now: datetime | None = None, limit: int = 500
-    ) -> int:
+    def purge_expired_notices(self, *, now: datetime | None = None, limit: int = 500) -> int:
         """删除已经送达（``delivered``）且过了九十天上限的通知，返回删除条数。
         **``pending`` 的行永远不在这条语句的候选范围内**——删掉一条还在等待送达的
         通知，等于让一个已经写成 ``active`` 的用户真的永远收不到那句话，这正是
@@ -420,7 +426,10 @@ class PostgresLateReadinessStore:
             raise ValueError("到期判定时间必须带时区")
         if isinstance(limit, bool) or not isinstance(limit, int) or limit < 1:
             raise ValueError("limit 必须是正整数")
-        with connect(self._dsn, timeouts=self._timeouts) as connection, connection.cursor() as cursor:
+        with (
+            connect(self._dsn, timeouts=self._timeouts) as connection,
+            connection.cursor() as cursor,
+        ):
             cursor.execute(
                 """DELETE FROM onboarding_completion_notice
                     WHERE id IN (

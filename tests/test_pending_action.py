@@ -238,8 +238,12 @@ class SuspendResumeMappingsUnchangedTests(unittest.TestCase):
     证据（#319 S-P-1b 设计卡；卡 B 沿用同一纪律扩展 revoke 项）。"""
 
     def test_valid_source_states_unchanged_for_suspend_and_resume(self) -> None:
-        self.assertEqual(VALID_SOURCE_STATES[PendingActionType.SUSPEND_USER], frozenset({"enabled"}))
-        self.assertEqual(VALID_SOURCE_STATES[PendingActionType.RESUME_USER], frozenset({"suspended"}))
+        self.assertEqual(
+            VALID_SOURCE_STATES[PendingActionType.SUSPEND_USER], frozenset({"enabled"})
+        )
+        self.assertEqual(
+            VALID_SOURCE_STATES[PendingActionType.RESUME_USER], frozenset({"suspended"})
+        )
 
     def test_required_role_unchanged_for_suspend_and_resume(self) -> None:
         self.assertEqual(REQUIRED_ROLE[PendingActionType.SUSPEND_USER], AdminRole.PERMISSION_ADMIN)
@@ -261,7 +265,9 @@ class SuspendResumeMappingsUnchangedTests(unittest.TestCase):
         """卡 B 只新增 revoke 项，不改卡 A 已登记的 grant/suppress 取值——逐值
         断言，抓"改了不该改的既有取值"这类变异。"""
 
-        self.assertEqual(VALID_SOURCE_STATES[PendingActionType.LOCAL_PERMISSION_GRANT], frozenset({"absent"}))
+        self.assertEqual(
+            VALID_SOURCE_STATES[PendingActionType.LOCAL_PERMISSION_GRANT], frozenset({"absent"})
+        )
         self.assertEqual(
             VALID_SOURCE_STATES[PendingActionType.LOCAL_PERMISSION_SUPPRESS], frozenset({"absent"})
         )
@@ -289,7 +295,9 @@ class SuspendResumeMappingsUnchangedTests(unittest.TestCase):
 
 class DecideConfirmHappyPathTests(unittest.TestCase):
     def test_suspend_executes_when_every_check_passes(self) -> None:
-        pending = _pending(action_type=PendingActionType.SUSPEND_USER, target_state_snapshot="enabled")
+        pending = _pending(
+            action_type=PendingActionType.SUSPEND_USER, target_state_snapshot="enabled"
+        )
         decision = decide_confirm(
             pending=pending,
             clicker_open_id=INITIATOR,
@@ -375,7 +383,9 @@ class DecideConfirmAlreadyTerminalTests(unittest.TestCase):
     """否定断言：重复点击/重复回调/重试 → 只执行一次，幂等返回既有结果。"""
 
     def test_executed_action_is_not_re_executed(self) -> None:
-        pending = _pending(status=PendingActionStatus.EXECUTED, decided_at=NOW - timedelta(minutes=1))
+        pending = _pending(
+            status=PendingActionStatus.EXECUTED, decided_at=NOW - timedelta(minutes=1)
+        )
         decision = decide_confirm(
             pending=pending,
             clicker_open_id=INITIATOR,
@@ -479,12 +489,10 @@ class DecideConfirmExpiryTests(unittest.TestCase):
         self.assertIs(decision.terminal_status, PendingActionStatus.EXPIRED)
 
     def test_cancel_by_non_initiator_after_expiry_writes_nothing(self) -> None:
-        """"取消"侧同一条顺序：非发起人点一张已过期的卡不得把它翻成终态。"""
+        """ "取消"侧同一条顺序：非发起人点一张已过期的卡不得把它翻成终态。"""
 
         pending = _pending(confirm_deadline_at=NOW - timedelta(seconds=1))
-        decision = decide_cancel(
-            pending=pending, clicker_open_id=OTHER_OPEN_ID, now=NOW
-        )
+        decision = decide_cancel(pending=pending, clicker_open_id=OTHER_OPEN_ID, now=NOW)
         self.assertIs(decision.kind, CancelResultKind.NOT_INITIATOR)
         self.assertIsNone(decision.terminal_status)
         self.assertIsNone(decision.reason)
@@ -506,9 +514,7 @@ class DecideConfirmNotInitiatorTests(unittest.TestCase):
         self.assertFalse(decision.ok)
         self.assertIs(decision.kind, ConfirmResultKind.NOT_INITIATOR)
         self.assertEqual(decision.code, "not_authorized")
-        self.assertIsNone(
-            decision.terminal_status, "非本人点击不得改变 pending_action 的任何字段"
-        )
+        self.assertIsNone(decision.terminal_status, "非本人点击不得改变 pending_action 的任何字段")
         self.assertIsNone(decision.new_account_state)
 
     def test_wrong_clicker_is_rejected_even_with_full_admin_roles(self) -> None:
@@ -619,7 +625,9 @@ class ConfirmResultKindDistinctionTests(unittest.TestCase):
 
     def test_role_revoked_and_not_initiator_are_distinct_enum_members(self) -> None:
         self.assertIsNot(ConfirmResultKind.ROLE_REVOKED, ConfirmResultKind.NOT_INITIATOR)
-        self.assertNotEqual(ConfirmResultKind.ROLE_REVOKED.value, ConfirmResultKind.NOT_INITIATOR.value)
+        self.assertNotEqual(
+            ConfirmResultKind.ROLE_REVOKED.value, ConfirmResultKind.NOT_INITIATOR.value
+        )
 
     def test_both_still_report_the_same_wire_error_code(self) -> None:
         role_revoked = decide_confirm(
@@ -659,7 +667,9 @@ class DecideCancelTests(unittest.TestCase):
                 self.assertIs(decision.kind, CancelResultKind.NOT_FOUND)
 
     def test_cancel_is_idempotent_on_already_terminal_action(self) -> None:
-        pending = _pending(status=PendingActionStatus.EXECUTED, decided_at=NOW - timedelta(minutes=1))
+        pending = _pending(
+            status=PendingActionStatus.EXECUTED, decided_at=NOW - timedelta(minutes=1)
+        )
         decision = decide_cancel(pending=pending, clicker_open_id=INITIATOR, now=NOW)
         self.assertIs(decision.kind, CancelResultKind.ALREADY_TERMINAL)
         self.assertIsNone(decision.terminal_status)
@@ -717,9 +727,7 @@ class LocalPermissionTerminologyTests(unittest.TestCase):
 
         for action_type in self._LOCAL_PERMISSION_TYPES:
             with self.subTest(action_type=action_type):
-                self.assertEqual(
-                    _ACTION_TYPE_DISPLAY_NAME[action_type], _ACTION_LABEL[action_type]
-                )
+                self.assertEqual(_ACTION_TYPE_DISPLAY_NAME[action_type], _ACTION_LABEL[action_type])
 
     def test_no_display_name_uses_a_retired_permission_verb(self) -> None:
         for action_type, name in _ACTION_TYPE_DISPLAY_NAME.items():
@@ -786,7 +794,9 @@ class FormatInFlightConflictMessageTests(unittest.TestCase):
         ——挡"漏映射悄悄退化成同一句话"这类变异。"""
 
         names = {
-            action_type: format_in_flight_conflict_message(blocking=_pending(action_type=action_type))
+            action_type: format_in_flight_conflict_message(
+                blocking=_pending(action_type=action_type)
+            )
             for action_type in PendingActionType
         }
         self.assertEqual(len(set(names.values())), len(PendingActionType))
@@ -828,9 +838,7 @@ class FormatInFlightConflictMessageTests(unittest.TestCase):
 
         message = format_in_flight_conflict_message(blocking=pending)
 
-        self.assertIn(
-            "2026-08-24 20:00", message, "已经是北京时间的输入展示时不该再偏移"
-        )
+        self.assertIn("2026-08-24 20:00", message, "已经是北京时间的输入展示时不该再偏移")
         self.assertIn("2026-08-24 20:10", message)
         self.assertNotIn(
             "2026-08-25 04:00",

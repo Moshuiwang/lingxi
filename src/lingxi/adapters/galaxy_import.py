@@ -65,7 +65,12 @@ def _issue_payload(issues: Sequence[Issue]) -> list[dict[str, Any]]:
     """把校验结论转成可入库的结构信息；`detail` 本身已按脱敏纪律不含人员数据。"""
 
     return [
-        {"table": issue.table, "rule": issue.rule, "detail": issue.detail, "rows": list(issue.row_numbers)}
+        {
+            "table": issue.table,
+            "rule": issue.rule,
+            "detail": issue.detail,
+            "rows": list(issue.row_numbers),
+        }
         for issue in issues
     ]
 
@@ -90,7 +95,10 @@ class PostgresGalaxyImportStore:
         Codex 复查发现）。没有新鲜批次时如实返回 None，由调用方安全失败。
         """
 
-        with connect(self._dsn, timeouts=self._timeouts) as connection, connection.cursor() as cursor:
+        with (
+            connect(self._dsn, timeouts=self._timeouts) as connection,
+            connection.cursor() as cursor,
+        ):
             cursor.execute(
                 "SELECT id FROM galaxy_import_batch WHERE status = 'complete' AND expires_at > now() "
                 "ORDER BY completed_at DESC, started_at DESC LIMIT 1"
@@ -111,7 +119,9 @@ class PostgresGalaxyImportStore:
 
     # ---- 写入 -------------------------------------------------------------
 
-    def _insert_rows(self, cursor: Any, source_table: str, rows: Sequence[Mapping[str, Any]]) -> int:
+    def _insert_rows(
+        self, cursor: Any, source_table: str, rows: Sequence[Mapping[str, Any]]
+    ) -> int:
         """写入一张表的全部行，返回写入行数。子类可覆盖以注入故障（测试用）。"""
 
         if not rows:
@@ -193,7 +203,9 @@ class PostgresGalaxyImportStore:
                 )
 
                 for source_table in SOURCE_TABLES:
-                    rows = [{"batch_id": new_batch_id, **dict(row)} for row in report.rows[source_table]]
+                    rows = [
+                        {"batch_id": new_batch_id, **dict(row)} for row in report.rows[source_table]
+                    ]
                     self._insert_rows(cursor, source_table, rows)
 
                 # 回读确认：以库里数回来的行数为准，不相信写入调用的返回值。
@@ -205,7 +217,10 @@ class PostgresGalaxyImportStore:
                 if mismatched:
                     raise GalaxyImportVerificationError(
                         "回读确认失败，已整批回滚："
-                        + "；".join(f"{name} 期望 {row_counts[name]} 行、实际 {readback[name]} 行" for name in mismatched)
+                        + "；".join(
+                            f"{name} 期望 {row_counts[name]} 行、实际 {readback[name]} 行"
+                            for name in mismatched
+                        )
                     )
 
                 # 旧的完成批次让位给新批次，保证「当前有效批次」唯一。

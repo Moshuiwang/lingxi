@@ -84,7 +84,9 @@ class PermissionRecomputeTriggerPostgresTestCase(unittest.TestCase):
     def setUp(self) -> None:
         reset_production_rows(self._dsn)
         self.audit = _RecordingAudit()
-        self.pending_actions = PostgresPendingActionStore(self._dsn, audit=self.audit, metric_map_path=None)
+        self.pending_actions = PostgresPendingActionStore(
+            self._dsn, audit=self.audit, metric_map_path=None
+        )
         self.publish_store = PostgresPermissionPublishStore(self._dsn)
         seed_admin_registry_entry(self._dsn, feishu_open_id=ADMIN_OPEN_ID, label="test-admin")
         self.handler = AdminCardCallbackHandler(
@@ -96,7 +98,9 @@ class PermissionRecomputeTriggerPostgresTestCase(unittest.TestCase):
             # PostgresAdminQueries 结构性实现 AdminDisplayNames（Trace #469
             # S-1），与真实 apps/gateway/__init__.py 装配同一姿态。
             display_names=PostgresAdminQueries(self._dsn),
-            recompute_trigger=PermissionRecomputeAdapter(self._dsn, audit=self.audit, metric_map_path=None),
+            recompute_trigger=PermissionRecomputeAdapter(
+                self._dsn, audit=self.audit, metric_map_path=None
+            ),
         )
 
     def query(self, sql: str, parameters: tuple = ()) -> list[tuple]:
@@ -115,7 +119,14 @@ class PermissionRecomputeTriggerPostgresTestCase(unittest.TestCase):
                  (id, feishu_open_id, feishu_user_id, feishu_union_id, display_name,
                   department, tenant_key, provisioning_state, account_state, email)
                VALUES (%s, %s, %s, %s, '化名用户', '测试部门', 'tk_test', 'active', %s, %s)""",
-            (user_id, TARGET_OPEN_ID, f"fs_{TARGET_OPEN_ID}", f"un_{TARGET_OPEN_ID}", account_state, TARGET_EMAIL),
+            (
+                user_id,
+                TARGET_OPEN_ID,
+                f"fs_{TARGET_OPEN_ID}",
+                f"un_{TARGET_OPEN_ID}",
+                account_state,
+                TARGET_EMAIL,
+            ),
         )
         return user_id
 
@@ -173,9 +184,9 @@ class PermissionRecomputeTriggerPostgresTestCase(unittest.TestCase):
         return int(version), dict(payload)
 
     def publish_row_count(self, user_id: str) -> int:
-        return self.query(
-            "SELECT count(*) FROM publish_outbox WHERE user_id = %s", (user_id,)
-        )[0][0]
+        return self.query("SELECT count(*) FROM publish_outbox WHERE user_id = %s", (user_id,))[0][
+            0
+        ]
 
 
 class SuspendTriggersInstantRevokeTests(PermissionRecomputeTriggerPostgresTestCase):
@@ -210,9 +221,9 @@ class SuspendTriggersInstantRevokeTests(PermissionRecomputeTriggerPostgresTestCa
         )
 
         # 账号状态：既有行为不变（本卡不改动这一层）。
-        account_state = self.query(
-            "SELECT account_state FROM app_user WHERE id = %s", (user_id,)
-        )[0][0]
+        account_state = self.query("SELECT account_state FROM app_user WHERE id = %s", (user_id,))[
+            0
+        ][0]
         self.assertEqual(account_state, "suspended")
 
         # 发布行：新的一版已经写入，permissions 清空为 {}——定向重算真的发生了，
@@ -277,9 +288,7 @@ class ResumeDegradesToDailyBatchWhenGalaxyDataIsMissingTests(
         fields = self.audit.fields_for("permission_targeted_recompute.skipped")
         self.assertEqual(fields["mode"], "recompute")
         self.assertEqual(fields["reason"], "missing_roster_snapshot")
-        self.assertNotIn(
-            "admin.card_callback.recompute_trigger_failed", self.audit.actions()
-        )
+        self.assertNotIn("admin.card_callback.recompute_trigger_failed", self.audit.actions())
 
 
 class LocalPermissionGrantResolvesTheOwningUserIdTests(PermissionRecomputeTriggerPostgresTestCase):
@@ -362,9 +371,5 @@ class LocalPermissionGrantResolvesTheOwningUserIdTests(PermissionRecomputeTrigge
         self.assertNotEqual(fields["user"], override_id)
         self.assertNotEqual(fields["user"], pending_id)
 
-        self.assertNotIn(
-            "permission_targeted_recompute.target_unresolved", self.audit.actions()
-        )
-        self.assertNotIn(
-            "admin.card_callback.recompute_trigger_failed", self.audit.actions()
-        )
+        self.assertNotIn("permission_targeted_recompute.target_unresolved", self.audit.actions())
+        self.assertNotIn("admin.card_callback.recompute_trigger_failed", self.audit.actions())

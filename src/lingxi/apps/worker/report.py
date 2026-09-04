@@ -32,7 +32,9 @@ from lingxi.core.execution.document_delivery import DocumentRequest, SheetReques
 from lingxi.core.execution.input_safety import constrain_output
 from lingxi.core.execution.message_stream import TurnStreamRecorder
 
-_GUARD_FAILURE_CODES = frozenset({"max_turns_exceeded", "turn_timeout", "cancelled", "drain_timeout"})
+_GUARD_FAILURE_CODES = frozenset(
+    {"max_turns_exceeded", "turn_timeout", "cancelled", "drain_timeout"}
+)
 # 独立、可查询的安全拒发终态；命名与 #141/#149 产品决定一致，"最终命名可由实现
 # 保持同义"——这里就是那个约定名字，运营/审计据此过滤，不猜测某个字符串巧合。
 REDACTED_WITHHELD_RESULT = "redacted_withheld"
@@ -119,8 +121,8 @@ def build_report(
     failure_code = effective_failure.get("code") if effective_failure else None
     guard_triggered = failure_code in _GUARD_FAILURE_CODES
     termination_reason = failure_code or ("completed" if summary.terminal_ok else "turn_not_closed")
-    termination_state = "guarded" if guard_triggered else (
-        "completed" if effective_failure is None else "failed"
+    termination_state = (
+        "guarded" if guard_triggered else ("completed" if effective_failure is None else "failed")
     )
     # 用户是否拿到了结果，必须同时满足"工具调用确认成功"与"最终正文没有因为
     # 安全策略被整段拒发"——只看前者正是 #141 描述的"内部记 obtained，用户拿到
@@ -128,9 +130,7 @@ def build_report(
     effective_user_result = (
         REDACTED_WITHHELD_RESULT if output_safety.withheld else summary.user_result.value
     )
-    result_delivery = (
-        "confirmed" if effective_user_result == "obtained" else "not_confirmed"
-    )
+    result_delivery = "confirmed" if effective_user_result == "obtained" else "not_confirmed"
     usage = stream.usage_summary
     resources = {
         "agent_turns": stream.agent_turns,
@@ -170,8 +170,12 @@ def build_report(
             "terminal_result_count": summary.terminal_result_count,
             "sdk_result_message_count": stream.result_message_count,
             "sdk_result_is_error": stream.result_is_error,
-            "sdk_result_subtype": redact_free_text(stream.result_subtype) if stream.result_subtype else None,
-            "sdk_terminal_reason": redact_free_text(stream.terminal_reason) if stream.terminal_reason else None,
+            "sdk_result_subtype": redact_free_text(stream.result_subtype)
+            if stream.result_subtype
+            else None,
+            "sdk_terminal_reason": redact_free_text(stream.terminal_reason)
+            if stream.terminal_reason
+            else None,
             "termination_state": termination_state,
             "termination_reason": termination_reason,
             "guard_triggered": guard_triggered,

@@ -46,8 +46,18 @@ def _valid_tables() -> dict[str, list[dict[str, str]]]:
             {"role_id": "R-乙", "menu_id": "M2", "role_name": "A销售", "menu_name": "报表"},
         ],
         "sys_user_datacountry": [
-            {"USER_ID": "U1", "DATACOUNTRY_ID": "101", "USER_NAME": "化名甲", "DATACOUNTRY_NAME": "甲国"},
-            {"USER_ID": "U2", "DATACOUNTRY_ID": "0", "USER_NAME": "化名乙", "DATACOUNTRY_NAME": "全非"},
+            {
+                "USER_ID": "U1",
+                "DATACOUNTRY_ID": "101",
+                "USER_NAME": "化名甲",
+                "DATACOUNTRY_NAME": "甲国",
+            },
+            {
+                "USER_ID": "U2",
+                "DATACOUNTRY_ID": "0",
+                "USER_NAME": "化名乙",
+                "DATACOUNTRY_NAME": "全非",
+            },
         ],
         "sys_country": [
             {
@@ -116,7 +126,8 @@ class GalaxyExportRequiredHeaderTest(unittest.TestCase):
             with self.subTest(table=table, column=column):
                 tables = _valid_tables()
                 tables[table] = [
-                    {key: value for key, value in row.items() if key != column} for row in tables[table]
+                    {key: value for key, value in row.items() if key != column}
+                    for row in tables[table]
                 ]
                 report = validate_export(tables)
                 self.assertFalse(report.ok)
@@ -161,10 +172,22 @@ class GalaxyExportColumnNormalizationTest(unittest.TestCase):
     def test_uppercase_and_padded_source_headers_are_accepted(self) -> None:
         tables = _valid_tables()
         tables["user"] = [
-            {" USER_ID ": "U1", "Dept_Id": "D1", "USER_NAME": "10001", "Nick_Name": "化名甲",
-             "EMAIL": "jiaming.jia@example.invalid", "CREATE_TIME": "2019-01-02 03:04:05"},
-            {" USER_ID ": "U2", "Dept_Id": "D2", "USER_NAME": "10002", "Nick_Name": "化名乙",
-             "EMAIL": "yiming.yi@example.invalid", "CREATE_TIME": "2020-02-03 04:05:06"},
+            {
+                " USER_ID ": "U1",
+                "Dept_Id": "D1",
+                "USER_NAME": "10001",
+                "Nick_Name": "化名甲",
+                "EMAIL": "jiaming.jia@example.invalid",
+                "CREATE_TIME": "2019-01-02 03:04:05",
+            },
+            {
+                " USER_ID ": "U2",
+                "Dept_Id": "D2",
+                "USER_NAME": "10002",
+                "Nick_Name": "化名乙",
+                "EMAIL": "yiming.yi@example.invalid",
+                "CREATE_TIME": "2020-02-03 04:05:06",
+            },
         ]
 
         report = validate_export(tables)
@@ -227,7 +250,9 @@ class GalaxyExportRejectionTest(unittest.TestCase):
 
     def test_empty_key_value_is_rejected(self) -> None:
         tables = _valid_tables()
-        tables["user_role"].append({"user_id": "", "role_id": "R-甲", "user_name": "化名甲", "role_name": "A运营"})
+        tables["user_role"].append(
+            {"user_id": "", "role_id": "R-甲", "user_name": "化名甲", "role_name": "A运营"}
+        )
 
         report = validate_export(tables)
 
@@ -275,7 +300,9 @@ class GalaxyExportRejectionTest(unittest.TestCase):
 
     def test_role_row_of_unknown_account_is_rejected(self) -> None:
         tables = _valid_tables()
-        tables["user_role"].append({"user_id": "U-未知", "role_id": "R-甲", "user_name": "化名丁", "role_name": "A运营"})
+        tables["user_role"].append(
+            {"user_id": "U-未知", "role_id": "R-甲", "user_name": "化名丁", "role_name": "A运营"}
+        )
 
         report = validate_export(tables)
 
@@ -285,7 +312,12 @@ class GalaxyExportRejectionTest(unittest.TestCase):
     def test_country_authorization_that_cannot_be_joined_is_rejected(self) -> None:
         tables = _valid_tables()
         tables["sys_user_datacountry"].append(
-            {"USER_ID": "U1", "DATACOUNTRY_ID": "999", "USER_NAME": "化名甲", "DATACOUNTRY_NAME": "未知国"}
+            {
+                "USER_ID": "U1",
+                "DATACOUNTRY_ID": "999",
+                "USER_NAME": "化名甲",
+                "DATACOUNTRY_NAME": "未知国",
+            }
         )
 
         report = validate_export(tables)
@@ -315,7 +347,9 @@ class GalaxyExportRejectionTest(unittest.TestCase):
 
     def test_role_without_any_menu_is_only_a_warning(self) -> None:
         tables = _valid_tables()
-        tables["user_role"].append({"user_id": "U1", "role_id": "R-空", "user_name": "化名甲", "role_name": "临时角色"})
+        tables["user_role"].append(
+            {"user_id": "U1", "role_id": "R-空", "user_name": "化名甲", "role_name": "临时角色"}
+        )
 
         report = validate_export(tables)
 
@@ -359,7 +393,10 @@ class GalaxyExportIssueRedactionTest(unittest.TestCase):
         )
 
         report = validate_export(tables)
-        text = "\n".join(f"{issue.table}|{issue.rule}|{issue.detail}" for issue in report.errors + report.warnings)
+        text = "\n".join(
+            f"{issue.table}|{issue.rule}|{issue.detail}"
+            for issue in report.errors + report.warnings
+        )
 
         self.assertFalse(report.ok)
         for secret in ("化名丁", "化名丙", "bingming.bing@example.invalid", "U-未知", "10003"):
@@ -368,7 +405,9 @@ class GalaxyExportIssueRedactionTest(unittest.TestCase):
 
     def test_issue_carries_row_numbers_for_locating_without_values(self) -> None:
         tables = _valid_tables()
-        tables["role_menu"].append({"role_id": "R-甲", "menu_id": "", "role_name": "A运营", "menu_name": "报表"})
+        tables["role_menu"].append(
+            {"role_id": "R-甲", "menu_id": "", "role_name": "A运营", "menu_name": "报表"}
+        )
 
         report = validate_export(tables)
         empty_key = [issue for issue in report.errors if issue.rule == "empty_key"]

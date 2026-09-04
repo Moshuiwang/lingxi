@@ -173,7 +173,9 @@ PINNED_PER_FILE_IGNORES: dict[str, frozenset[str]] = {
     "src/lingxi/core/alerting.py": frozenset(["D"]),
     "src/lingxi/core/conversation/commands.py": frozenset(["D"]),
     "src/lingxi/core/conversation/onboarding_recovery.py": frozenset(["D"]),
-    "src/lingxi/core/conversation/pipeline.py": frozenset(["D", "PLR0913", "N818", "I001", "UP035"]),
+    "src/lingxi/core/conversation/pipeline.py": frozenset(
+        ["D", "PLR0913", "N818", "I001", "UP035"]
+    ),
     "src/lingxi/core/conversation/ports.py": frozenset(["D"]),
     "src/lingxi/core/conversation/session_window.py": frozenset(["D"]),
     "src/lingxi/core/daily_report.py": frozenset(["D"]),
@@ -194,7 +196,9 @@ PINNED_PER_FILE_IGNORES: dict[str, frozenset[str]] = {
     "src/lingxi/core/identity/onboarding.py": frozenset(["D"]),
     "src/lingxi/core/identity/onboarding_guards.py": frozenset(["D"]),
     "src/lingxi/core/identity/onboarding_ports.py": frozenset(["D"]),
-    "src/lingxi/core/identity/onboarding_runner.py": frozenset(["D", "PLR0913", "F401", "I001", "UP035"]),
+    "src/lingxi/core/identity/onboarding_runner.py": frozenset(
+        ["D", "PLR0913", "F401", "I001", "UP035"]
+    ),
     "src/lingxi/core/identity/onboarding_support.py": frozenset(["D"]),
     "src/lingxi/core/identity/onboarding_terminal.py": frozenset(["D", "N818"]),
     "src/lingxi/core/identity/org_snapshot.py": frozenset(["D"]),

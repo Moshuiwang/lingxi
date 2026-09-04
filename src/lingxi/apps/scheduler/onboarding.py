@@ -218,9 +218,7 @@ class HardDeadlineProbe:
             except BaseException as error:  # 原样带回主线程再抛
                 failure.append(error)
 
-        worker = threading.Thread(
-            target=call, name="lingxi-gateway-mcp-probe", daemon=True
-        )
+        worker = threading.Thread(target=call, name="lingxi-gateway-mcp-probe", daemon=True)
         worker.start()
         worker.join(timeout=self._timeout_seconds)
         if worker.is_alive():
@@ -267,9 +265,7 @@ class OnboardingExecutor:
             raise ValueError("停机轮询间隔必须是正数秒")
         self._workers = workers
         self._backlog = backlog if backlog is not None else workers * 2
-        self._queue: queue.Queue[Callable[[], None] | None] = queue.Queue(
-            maxsize=self._backlog
-        )
+        self._queue: queue.Queue[Callable[[], None] | None] = queue.Queue(maxsize=self._backlog)
         self._stop_poll_seconds = float(stop_poll_seconds)
         self._inflight = 0
         self._inflight_lock = threading.Lock()
@@ -481,8 +477,6 @@ class CatalogNotifier:
     ) -> None:
         content = self._catalog.text(key, **values)
         self._sender.send_text(open_id=open_id, text=content.text, dedupe_key=dedupe_key)
-
-
 
 
 # ----------------------------------------------------------------------

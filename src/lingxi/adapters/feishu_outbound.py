@@ -39,11 +39,7 @@ def build_client(*, app_id: str, app_secret: str, timeout_seconds: float) -> Any
     import lark_oapi as lark
 
     return (
-        lark.Client.builder()
-        .app_id(app_id)
-        .app_secret(app_secret)
-        .timeout(timeout_seconds)
-        .build()
+        lark.Client.builder().app_id(app_id).app_secret(app_secret).timeout(timeout_seconds).build()
     )
 
 
@@ -107,10 +103,7 @@ class LarkReplies:
             .build()
         )
         request = (
-            ReplyMessageRequest.builder()
-            .message_id(reply_to_message_id)
-            .request_body(body)
-            .build()
+            ReplyMessageRequest.builder().message_id(reply_to_message_id).request_body(body).build()
         )
         response = self._client.im.v1.message.reply(request)
         if not response.success():

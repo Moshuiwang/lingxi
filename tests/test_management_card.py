@@ -24,7 +24,9 @@ from lingxi.core.admin.views import (
 
 
 class FakeCatalog:
-    def __init__(self, *, companies: list[str] | None = None, metrics: list[str] | None = None) -> None:
+    def __init__(
+        self, *, companies: list[str] | None = None, metrics: list[str] | None = None
+    ) -> None:
         self._companies = companies if companies is not None else ["1011", "1012"]
         self._metrics = metrics if metrics is not None else ["sub_new_count", "exchange_rate"]
 
@@ -162,7 +164,10 @@ def _visible_text(card: dict) -> str:
 class TopLevelShapeTests(unittest.TestCase):
     def test_schema_and_body_shape_matches_the_confirm_card_convention(self) -> None:
         card = render_management_card(
-            _status(), display_identifier="ou_target", catalog=FakeCatalog(), display_names=FakeDisplayNames()
+            _status(),
+            display_identifier="ou_target",
+            catalog=FakeCatalog(),
+            display_names=FakeDisplayNames(),
         )
         self.assertEqual(card["schema"], "2.0")
         self.assertIn("elements", card["body"])
@@ -173,14 +178,20 @@ class TopLevelShapeTests(unittest.TestCase):
         实现缺陷（本模块开发过程中发现并修复），这里钉住不再发生。"""
 
         card = render_management_card(
-            _status(), display_identifier="ou_target", catalog=FakeCatalog(), display_names=FakeDisplayNames()
+            _status(),
+            display_identifier="ou_target",
+            catalog=FakeCatalog(),
+            display_names=FakeDisplayNames(),
         )
         for element in _elements(card):
             self.assertIsInstance(element, dict)
 
     def test_display_identifier_is_echoed_verbatim(self) -> None:
         card = render_management_card(
-            _status(), display_identifier="someone@example.com", catalog=FakeCatalog(), display_names=FakeDisplayNames()
+            _status(),
+            display_identifier="someone@example.com",
+            catalog=FakeCatalog(),
+            display_names=FakeDisplayNames(),
         )
         markdown_texts = "\n".join(
             e["content"] for e in _elements(card) if e.get("tag") == "markdown"
@@ -191,7 +202,10 @@ class TopLevelShapeTests(unittest.TestCase):
 class GalaxySourceSectionTests(unittest.TestCase):
     def test_none_galaxy_source_renders_unavailable(self) -> None:
         card = render_management_card(
-            _status(galaxy_source=None), display_identifier="ou_target", catalog=FakeCatalog(), display_names=FakeDisplayNames()
+            _status(galaxy_source=None),
+            display_identifier="ou_target",
+            catalog=FakeCatalog(),
+            display_names=FakeDisplayNames(),
         )
         markdown_texts = "\n".join(
             e["content"] for e in _elements(card) if e.get("tag") == "markdown"
@@ -204,7 +218,10 @@ class GalaxySourceSectionTests(unittest.TestCase):
             granted=True, reason="granted", companies=("1011",), functions=("运营",)
         )
         card = render_management_card(
-            _status(galaxy_source=summary), display_identifier="ou_target", catalog=FakeCatalog(), display_names=FakeDisplayNames()
+            _status(galaxy_source=summary),
+            display_identifier="ou_target",
+            catalog=FakeCatalog(),
+            display_names=FakeDisplayNames(),
         )
         markdown_texts = "\n".join(
             e["content"] for e in _elements(card) if e.get("tag") == "markdown"
@@ -217,7 +234,10 @@ class GalaxySourceSectionTests(unittest.TestCase):
             granted=True, reason="granted", functions=("后台管理员",), all_companies=True
         )
         card = render_management_card(
-            _status(galaxy_source=summary), display_identifier="ou_target", catalog=FakeCatalog(), display_names=FakeDisplayNames()
+            _status(galaxy_source=summary),
+            display_identifier="ou_target",
+            catalog=FakeCatalog(),
+            display_names=FakeDisplayNames(),
         )
         markdown_texts = "\n".join(
             e["content"] for e in _elements(card) if e.get("tag") == "markdown"
@@ -228,7 +248,10 @@ class GalaxySourceSectionTests(unittest.TestCase):
 class LocalOverrideSectionTests(unittest.TestCase):
     def test_no_overrides_shows_the_empty_line(self) -> None:
         card = render_management_card(
-            _status(local_overrides=()), display_identifier="ou_target", catalog=FakeCatalog(), display_names=FakeDisplayNames()
+            _status(local_overrides=()),
+            display_identifier="ou_target",
+            catalog=FakeCatalog(),
+            display_names=FakeDisplayNames(),
         )
         markdown_texts = "\n".join(
             e["content"] for e in _elements(card) if e.get("tag") == "markdown"
@@ -253,7 +276,9 @@ class LocalOverrideSectionTests(unittest.TestCase):
         elements = _elements(card)
         buttons = _find_buttons(elements)
         revoke_buttons = [
-            b for b in buttons if b["behaviors"][0]["value"].get("admin_action") == ADMIN_ACTION_REVOKE
+            b
+            for b in buttons
+            if b["behaviors"][0]["value"].get("admin_action") == ADMIN_ACTION_REVOKE
         ]
         self.assertEqual(len(revoke_buttons), 1)
         value = revoke_buttons[0]["behaviors"][0]["value"]
@@ -356,7 +381,9 @@ class LegacyAllScopeGroupSectionTests(unittest.TestCase):
             catalog=FakeCatalog(),
             display_names=FakeDisplayNames(),
         )
-        markdown_texts = "\n".join(e["content"] for e in _elements(card) if e.get("tag") == "markdown")
+        markdown_texts = "\n".join(
+            e["content"] for e in _elements(card) if e.get("tag") == "markdown"
+        )
         self.assertIn(ALL_SCOPE_EXPLICIT_POSITION_NAME, markdown_texts)
 
     def test_the_group_renders_as_one_item_with_a_group_revoke_button(self) -> None:
@@ -369,7 +396,9 @@ class LegacyAllScopeGroupSectionTests(unittest.TestCase):
         )
         elements = _elements(card)
         revoke_buttons = [
-            b for b in _find_buttons(elements) if b["behaviors"][0]["value"].get("admin_action") == ADMIN_ACTION_REVOKE
+            b
+            for b in _find_buttons(elements)
+            if b["behaviors"][0]["value"].get("admin_action") == ADMIN_ACTION_REVOKE
         ]
         self.assertEqual(len(revoke_buttons), 1, "一组只渲染一项")
         value = revoke_buttons[0]["behaviors"][0]["value"]
@@ -392,7 +421,10 @@ class RetiredLegacyFormSectionTests(unittest.TestCase):
 
     def test_legacy_branch_renders_no_write_form_at_all(self) -> None:
         card = render_management_card(
-            _status(), display_identifier="ou_target", catalog=FakeCatalog(), display_names=FakeDisplayNames()
+            _status(),
+            display_identifier="ou_target",
+            catalog=FakeCatalog(),
+            display_names=FakeDisplayNames(),
         )
 
         self.assertEqual(_find_forms(card), [], "旧分支不得再渲染任何写入表单")
@@ -401,7 +433,10 @@ class RetiredLegacyFormSectionTests(unittest.TestCase):
         """连按钮也不留：一个按不动的按钮比没有按钮更糟。"""
 
         card = render_management_card(
-            _status(), display_identifier="ou_target", catalog=FakeCatalog(), display_names=FakeDisplayNames()
+            _status(),
+            display_identifier="ou_target",
+            catalog=FakeCatalog(),
+            display_names=FakeDisplayNames(),
         )
         submit_actions = {
             button["behaviors"][0]["value"].get("admin_action")
@@ -413,7 +448,10 @@ class RetiredLegacyFormSectionTests(unittest.TestCase):
 
     def test_legacy_branch_says_why_there_is_no_form(self) -> None:
         card = render_management_card(
-            _status(), display_identifier="ou_target", catalog=FakeCatalog(), display_names=FakeDisplayNames()
+            _status(),
+            display_identifier="ou_target",
+            catalog=FakeCatalog(),
+            display_names=FakeDisplayNames(),
         )
         markdown_texts = "\n".join(
             e["content"] for e in _elements(card) if e.get("tag") == "markdown"

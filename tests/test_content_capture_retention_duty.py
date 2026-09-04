@@ -138,9 +138,7 @@ class AssemblyTest(unittest.TestCase):
 
     def test_the_duty_is_assembled_into_the_scheduler_process(self) -> None:
         loop = build_loop(self._config())
-        matching = [
-            duty for duty in loop.duties if isinstance(duty, ContentCaptureRetentionDuty)
-        ]
+        matching = [duty for duty in loop.duties if isinstance(duty, ContentCaptureRetentionDuty)]
 
         self.assertEqual(len(matching), 1, "内测采集到期删除必须恰好注册一条")
         self.assertIn("内测采集到期删除", [duty.name for duty in loop.duties])
@@ -156,9 +154,7 @@ class AssemblyTest(unittest.TestCase):
         )
 
         loop = build_loop(self._config())
-        (duty,) = [
-            item for item in loop.duties if isinstance(item, ContentCaptureRetentionDuty)
-        ]
+        (duty,) = [item for item in loop.duties if isinstance(item, ContentCaptureRetentionDuty)]
 
         self.assertIsInstance(duty._captures, PostgresContentCaptureRetention)
 
@@ -169,8 +165,7 @@ class AssemblyTest(unittest.TestCase):
         import ast
 
         source = (
-            Path(__file__).parents[1]
-            / "src/lingxi/adapters/postgres_content_capture_retention.py"
+            Path(__file__).parents[1] / "src/lingxi/adapters/postgres_content_capture_retention.py"
         ).read_text(encoding="utf-8")
         imported = {
             node.module

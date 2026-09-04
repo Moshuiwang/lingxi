@@ -40,22 +40,30 @@ MAPPING = {
 class ClassifyTests(unittest.TestCase):
     def test_specific_shapes(self) -> None:
         self.assertEqual(classify_legacy_permissions({}), SHAPE_SPECIFIC)
-        self.assertEqual(classify_legacy_permissions({"88": ("m1",), "40": ("m2",)}), SHAPE_SPECIFIC)
+        self.assertEqual(
+            classify_legacy_permissions({"88": ("m1",), "40": ("m2",)}), SHAPE_SPECIFIC
+        )
 
     def test_full_wildcard_is_exactly_star_star(self) -> None:
         self.assertEqual(classify_legacy_permissions({"*": ("*",)}), SHAPE_FULL_WILDCARD)
         self.assertEqual(classify_legacy_permissions({"*": ("*", "*")}), SHAPE_FULL_WILDCARD)
         # 附带具体公司键仍是「全部」形状：具体键按差集另落无组行。
-        self.assertEqual(classify_legacy_permissions({"*": ("*",), "40": ("m1",)}), SHAPE_FULL_WILDCARD)
+        self.assertEqual(
+            classify_legacy_permissions({"*": ("*",), "40": ("m1",)}), SHAPE_FULL_WILDCARD
+        )
 
     def test_explicit_all_scope_list(self) -> None:
         self.assertEqual(classify_legacy_permissions({"*": ("m1", "m2")}), SHAPE_ALL_SCOPE_EXPLICIT)
         self.assertEqual(classify_legacy_permissions({"*": ()}), SHAPE_ALL_SCOPE_EXPLICIT)
 
     def test_other_star_shapes_are_unsupported(self) -> None:
-        self.assertEqual(classify_legacy_permissions({"*": ("*", "m1")}), SHAPE_UNSUPPORTED_WILDCARD)
+        self.assertEqual(
+            classify_legacy_permissions({"*": ("*", "m1")}), SHAPE_UNSUPPORTED_WILDCARD
+        )
         self.assertEqual(classify_legacy_permissions({"88": ("*",)}), SHAPE_UNSUPPORTED_WILDCARD)
-        self.assertEqual(classify_legacy_permissions({"*": ("m1",), "88": ("*",)}), SHAPE_UNSUPPORTED_WILDCARD)
+        self.assertEqual(
+            classify_legacy_permissions({"*": ("m1",), "88": ("*",)}), SHAPE_UNSUPPORTED_WILDCARD
+        )
 
     def test_blank_key_or_metric_is_unparseable(self) -> None:
         with self.assertRaises(ValueError):
@@ -117,7 +125,9 @@ class CompanyDiffTests(unittest.TestCase):
     """脚本沿用的保守口径：银河出现 ``"*"`` 整份恒空；其余按公司键求差。"""
 
     def test_subtracts_per_company_and_drops_empty_keys(self) -> None:
-        diff = compute_company_diff({"88": ("m1", "m2"), "99": ("m1",)}, {"88": ("m1",), "99": ("m1",)})
+        diff = compute_company_diff(
+            {"88": ("m1", "m2"), "99": ("m1",)}, {"88": ("m1",), "99": ("m1",)}
+        )
         self.assertEqual(diff, {"88": ("m2",)})
 
     def test_any_galaxy_wildcard_yields_empty_diff(self) -> None:
@@ -159,7 +169,10 @@ class PlanTests(unittest.TestCase):
 
     def test_full_wildcard_expands_to_every_mapped_metric_under_star(self) -> None:
         plan = plan_legacy_import(
-            legacy={"*": ("*",)}, galaxy_current={"88": ("m1",)}, full_access_wildcard=False, mapping=MAPPING
+            legacy={"*": ("*",)},
+            galaxy_current={"88": ("m1",)},
+            full_access_wildcard=False,
+            mapping=MAPPING,
         )
         self.assertEqual(plan.shape, SHAPE_FULL_WILDCARD)
         self.assertEqual(plan.all_scope_metrics, ("m1", "m2", "m3"))
@@ -178,14 +191,19 @@ class PlanTests(unittest.TestCase):
 
     def test_explicit_all_scope_list_becomes_the_group_as_listed(self) -> None:
         plan = plan_legacy_import(
-            legacy={"*": ("m2", "m1")}, galaxy_current={"88": ("m1",)}, full_access_wildcard=False, mapping=MAPPING
+            legacy={"*": ("m2", "m1")},
+            galaxy_current={"88": ("m1",)},
+            full_access_wildcard=False,
+            mapping=MAPPING,
         )
         self.assertEqual(plan.shape, SHAPE_ALL_SCOPE_EXPLICIT)
         self.assertEqual(plan.all_scope_metrics, ("m1", "m2"), "公司 * 保留、指标按表中列出的")
         self.assertEqual(plan.all_scope_position_name, ALL_SCOPE_EXPLICIT_POSITION_NAME)
 
     def test_full_wildcard_group_carries_the_auto_expanding_label(self) -> None:
-        plan = plan_legacy_import(legacy={"*": ("*",)}, galaxy_current={}, full_access_wildcard=False, mapping=MAPPING)
+        plan = plan_legacy_import(
+            legacy={"*": ("*",)}, galaxy_current={}, full_access_wildcard=False, mapping=MAPPING
+        )
         self.assertEqual(plan.all_scope_position_name, ALL_SCOPE_POSITION_NAME)
 
     def test_limited_galaxy_wildcard_subtracts_the_star_list_from_group_and_pairs(self) -> None:
@@ -231,14 +249,20 @@ class PlanTests(unittest.TestCase):
 
     def test_nothing_to_import_when_galaxy_already_covers_the_legacy_row(self) -> None:
         plan = plan_legacy_import(
-            legacy={"88": ("m1",)}, galaxy_current={"88": ("m1", "m2")}, full_access_wildcard=False, mapping=MAPPING
+            legacy={"88": ("m1",)},
+            galaxy_current={"88": ("m1", "m2")},
+            full_access_wildcard=False,
+            mapping=MAPPING,
         )
         self.assertTrue(plan.nothing_to_import)
         self.assertEqual(plan.skipped_reasons, (REASON_NOTHING_TO_IMPORT,))
 
     def test_zero_galaxy_imports_the_whole_legacy_row(self) -> None:
         plan = plan_legacy_import(
-            legacy={"88": ("m2", "m1")}, galaxy_current={}, full_access_wildcard=True, mapping=MAPPING
+            legacy={"88": ("m2", "m1")},
+            galaxy_current={},
+            full_access_wildcard=True,
+            mapping=MAPPING,
         )
         self.assertEqual(plan.pairs, (("88", "m1"), ("88", "m2")))
 
@@ -287,7 +311,13 @@ class MissingAllScopeMetricsTests(unittest.TestCase):
         """独立审核 P1：``{"*":[显式列表]}`` 的组语义是「就这几个指标」，映射里多出来的
         指标不得自动补进去——否则显式列表用户次日就静默拿到映射全部指标。"""
 
-        entries = (_entry(metric_name="m1", position_name=ALL_SCOPE_EXPLICIT_POSITION_NAME, group_id="lpg_explicit"),)
+        entries = (
+            _entry(
+                metric_name="m1",
+                position_name=ALL_SCOPE_EXPLICIT_POSITION_NAME,
+                group_id="lpg_explicit",
+            ),
+        )
         self.assertEqual(missing_all_scope_metrics(entries, MAPPING), {})
 
     def test_no_entries_means_no_groups(self) -> None:

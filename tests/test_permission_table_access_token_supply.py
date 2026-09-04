@@ -262,7 +262,9 @@ class AuditDeduplicationTest(unittest.TestCase):
 
 class NoAuditSinkTest(unittest.TestCase):
     def test_without_an_audit_sink_the_failure_still_propagates(self) -> None:
-        fetch = _ScriptedFetch(outcomes=[PermissionTableAccessTokenUnavailable("fetch_unavailable")])
+        fetch = _ScriptedFetch(
+            outcomes=[PermissionTableAccessTokenUnavailable("fetch_unavailable")]
+        )
         provider = PermissionTableAccessTokenProvider(fetch=fetch)
 
         with self.assertRaises(PermissionTableAccessTokenUnavailable):

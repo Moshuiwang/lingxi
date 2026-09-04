@@ -158,7 +158,9 @@ class AuthorizationGrant:
     def __post_init__(self) -> None:
         if not isinstance(self.refresh_token, SecretToken):
             raise TypeError("refresh_token 必须包在 SecretToken 里，避免明文进入日志")
-        if not isinstance(self.refresh_token_expires_in, int) or isinstance(self.refresh_token_expires_in, bool):
+        if not isinstance(self.refresh_token_expires_in, int) or isinstance(
+            self.refresh_token_expires_in, bool
+        ):
             raise ValueError("飞书未返回有效的续期凭据有效期")
         if self.refresh_token_expires_in <= 0:
             raise ValueError("飞书未返回有效的续期凭据有效期")
@@ -219,7 +221,9 @@ def rotation_deadline(issued_at: datetime, refresh_token_expires_in: int) -> dat
     _require_aware(issued_at, "issued_at")
     if not isinstance(refresh_token_expires_in, int) or refresh_token_expires_in <= 0:
         raise ValueError("飞书未返回有效的续期凭据有效期")
-    seconds = max(0, min(refresh_token_expires_in - 1, int(refresh_token_expires_in * ROTATION_TRIGGER_RATIO)))
+    seconds = max(
+        0, min(refresh_token_expires_in - 1, int(refresh_token_expires_in * ROTATION_TRIGGER_RATIO))
+    )
     return issued_at + timedelta(seconds=seconds)
 
 
@@ -232,7 +236,9 @@ def expiry_moment(issued_at: datetime, refresh_token_expires_in: int) -> datetim
     return issued_at + timedelta(seconds=refresh_token_expires_in)
 
 
-def credential_state(*, refresh_at: datetime, expires_at: datetime, now: datetime) -> CredentialState:
+def credential_state(
+    *, refresh_at: datetime, expires_at: datetime, now: datetime
+) -> CredentialState:
     """按两个已存时刻判定当前状态。失效优先于到期轮换，避免重放死凭据。"""
 
     _require_aware(refresh_at, "refresh_at")

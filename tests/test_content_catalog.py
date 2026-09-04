@@ -97,8 +97,7 @@ for loaded_name in sorted(sys.modules):
     )
     if completed.returncode != 0:
         raise AssertionError(
-            "正式渲染入口导入失败：\n"
-            + (completed.stderr or completed.stdout).strip()
+            "正式渲染入口导入失败：\n" + (completed.stderr or completed.stdout).strip()
         )
     return tuple(line for line in completed.stdout.splitlines() if line)
 
@@ -113,7 +112,12 @@ def _code_string_literals(path: Path):
             yield node.value
         if isinstance(node, (ast.Module, ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)):
             body = list(node.body)
-            if body and isinstance(body[0], ast.Expr) and isinstance(body[0].value, ast.Constant) and isinstance(body[0].value.value, str):
+            if (
+                body
+                and isinstance(body[0], ast.Expr)
+                and isinstance(body[0].value, ast.Constant)
+                and isinstance(body[0].value.value, str)
+            ):
                 body = body[1:]
             for child in body:
                 yield from visit(child)
@@ -242,9 +246,7 @@ class ContentDirectoryTests(unittest.TestCase):
         for key in REQUIRED_TEXT_KEYS:
             template = document["texts"][key]
             variables = {
-                field
-                for _literal, field, _spec, _conv in Formatter().parse(template)
-                if field
+                field for _literal, field, _spec, _conv in Formatter().parse(template) if field
             }
             if "reference" not in variables:
                 continue
@@ -379,7 +381,14 @@ class ContentDirectoryTests(unittest.TestCase):
         changed = ContentCatalog.from_mapping(document)
         report = compare_roster(
             [ArchivedIdentity("usr_1", "person_1", "张三", "E1", "a@example.com")],
-            [{"personnel_id": "person_1", "name": "张三改名", "employee_no": "E1", "email": "a@example.com"}],
+            [
+                {
+                    "personnel_id": "person_1",
+                    "name": "张三改名",
+                    "employee_no": "E1",
+                    "email": "a@example.com",
+                }
+            ],
         )
 
         rendered = render_daily_report(report, report_date=date(2026, 8, 8), catalog=changed)
@@ -406,8 +415,7 @@ class ContentDirectoryTests(unittest.TestCase):
         self.assertEqual(
             imported,
             (),
-            "正式渲染入口的传递导入闭包不得包含 Bot-Test 资产模块："
-            + ", ".join(imported),
+            "正式渲染入口的传递导入闭包不得包含 Bot-Test 资产模块：" + ", ".join(imported),
         )
 
     def test_the_six_naming_keys_render_bi_plus_and_never_the_internal_codename(self) -> None:

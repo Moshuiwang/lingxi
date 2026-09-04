@@ -84,7 +84,8 @@ class RetentionReport:
         if not self.tables:
             return "保留清理：本轮无目标表"
         parts = [
-            f"{result.table} 删除 {result.deleted} 行" + ("（锁等待超时，本轮让路）" if result.blocked else "")
+            f"{result.table} 删除 {result.deleted} 行"
+            + ("（锁等待超时，本轮让路）" if result.blocked else "")
             for result in self.tables
         ]
         return "保留清理：" + "；".join(parts)
@@ -119,7 +120,10 @@ class PostgresRetentionCleaner:
         删了父行没删子行的半删状态（断言 V-保留-17）。
         """
 
-        with connect(self._dsn, timeouts=self._timeouts) as connection, connection.cursor() as cursor:
+        with (
+            connect(self._dsn, timeouts=self._timeouts) as connection,
+            connection.cursor() as cursor,
+        ):
             cursor.execute(
                 "SELECT target_table, deleted_rows, oldest_expires_at, newest_expires_at, blocked "
                 f"FROM {CLEANUP_FUNCTION}(now(), %s)",

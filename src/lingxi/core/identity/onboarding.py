@@ -65,7 +65,10 @@ class InMemoryOnboardingStore:
 
     def upsert_identity(self, profile: IdentityProfile) -> AppUser:
         existing = self._users_by_open_id.get(profile.open_id)
-        user = AppUser(id=existing.id if existing else f"usr_test_{len(self._users_by_open_id) + 1:02d}", profile=profile)
+        user = AppUser(
+            id=existing.id if existing else f"usr_test_{len(self._users_by_open_id) + 1:02d}",
+            profile=profile,
+        )
         self._users_by_open_id[profile.open_id] = user
         return user
 
@@ -139,7 +142,9 @@ class OnboardingService:
             return OnboardingResponse(ResponseKind.AUTHORIZATION_CANCELLED)
         return OnboardingResponse(ResponseKind.IDENTITY_CONFIRMED)
 
-    def authorization_succeeded(self, event_id: str, profile: IdentityProfile) -> OnboardingResponse:
+    def authorization_succeeded(
+        self, event_id: str, profile: IdentityProfile
+    ) -> OnboardingResponse:
         """授权完成后再一次性写入完整身份资料，重复回调只更新同一用户。"""
 
         recorded_user_id = self._store.get_authorization_event_user_id(event_id)
@@ -153,8 +158,14 @@ class OnboardingService:
 
     @classmethod
     def _is_start_confirmation(cls, text: str) -> bool:
-        compact = "".join(character for character in text.strip() if character not in " ，。！？、.!?\t\n")
-        compact = compact.translate(str.maketrans({"開": "开", "始": "始", "確": "确", "認": "认", "想": "想", "使": "使", "用": "用"}))
+        compact = "".join(
+            character for character in text.strip() if character not in " ，。！？、.!?\t\n"
+        )
+        compact = compact.translate(
+            str.maketrans(
+                {"開": "开", "始": "始", "確": "确", "認": "认", "想": "想", "使": "使", "用": "用"}
+            )
+        )
         return compact in cls._START_CONFIRMATIONS
 
     @staticmethod

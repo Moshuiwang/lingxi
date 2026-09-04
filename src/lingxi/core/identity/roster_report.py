@@ -134,9 +134,7 @@ def _entry_line(
     if not entry.changed_fields:
         # 花名册查无此人 / 同一人员 ID 多行：没有「变化字段」可言，但身份仍要给全，
         # 否则管理员拿到一串 ULID 无从下手。
-        return catalog.text(
-            "roster.entry_plain", user_id=entry.app_user_id, identity=identity
-        ).text
+        return catalog.text("roster.entry_plain", user_id=entry.app_user_id, identity=identity).text
     # 按 ARCHIVED_FIELDS 的固定次序渲染，不依赖 changed_fields 的构造顺序。
     labels = "、".join(
         _field_label(field, catalog) for field in ARCHIVED_FIELDS if field in entry.changed_fields
@@ -145,9 +143,7 @@ def _entry_line(
         "roster.entry", user_id=entry.app_user_id, identity=identity, fields=labels
     ).text
     if entry.handover:
-        return catalog.text(
-            "roster.entry_handover", entry=line, handover_mark=HANDOVER_MARK
-        ).text
+        return catalog.text("roster.entry_handover", entry=line, handover_mark=HANDOVER_MARK).text
     return line
 
 
@@ -228,11 +224,7 @@ def render_daily_report_content(
     catalog = catalog or default_content_catalog()
     index: Mapping[str, ArchivedIdentity] = identities or {}
     title = catalog.text("roster.report_title").text
-    lines = [
-        catalog.text(
-            "roster.header", title=title, report_date=report_date.isoformat()
-        ).text
-    ]
+    lines = [catalog.text("roster.header", title=title, report_date=report_date.isoformat()).text]
 
     if snapshot is not None and not snapshot.available:
         # 没比对就不能说「本次发现 N 条」——那句话在这一天是假的。
@@ -258,9 +250,7 @@ def render_daily_report_content(
         ).text
         lines.append("")
         lines.append(
-            catalog.text(
-                "roster.section_heading_with_note", heading=heading, note=note
-            ).text
+            catalog.text("roster.section_heading_with_note", heading=heading, note=note).text
             if note
             else heading
         )

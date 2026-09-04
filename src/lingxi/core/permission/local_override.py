@@ -127,8 +127,7 @@ class ResolvedLocalOverrides:
         overlap = self.grants & self.suppressions
         if overlap:
             raise ValueError(
-                "本地覆盖的授权集合与抑制集合不得有交集：suppress 必须赢，"
-                "这些键不应同时出现在两侧"
+                "本地覆盖的授权集合与抑制集合不得有交集：suppress 必须赢，这些键不应同时出现在两侧"
             )
 
 
@@ -173,9 +172,7 @@ def resolve_local_overrides(
 
     # suppress 赢：净授权集合里剔除同时被抑制的键（模块文档「语义定稿」）。
     grants -= suppressions
-    return ResolvedLocalOverrides(
-        grants=frozenset(grants), suppressions=frozenset(suppressions)
-    )
+    return ResolvedLocalOverrides(grants=frozenset(grants), suppressions=frozenset(suppressions))
 
 
 def to_company_metric_map(pairs: frozenset[tuple[str, str]]) -> dict[str, tuple[str, ...]]:

@@ -83,7 +83,9 @@ def _normalize_bitable_rows(rows: Iterable[Mapping[str, Any]]) -> list[dict[str,
     return normalized
 
 
-def _match_stats(rows: list[dict[str, Any]], field: str, index: Mapping[str, list[dict[str, Any]]]) -> dict[str, int]:
+def _match_stats(
+    rows: list[dict[str, Any]], field: str, index: Mapping[str, list[dict[str, Any]]]
+) -> dict[str, int]:
     matched = [row for row in rows if row.get(field) and row[field] in index]
     return {
         "matched_rows": len(matched),
@@ -111,13 +113,19 @@ def analyze_association(
         if not user_candidates or not open_candidates:
             continue
         both_keys.append(row)
-        user_members = {(candidate.get("tenant_key"), candidate.get("user_id")) for candidate in user_candidates}
-        open_members = {(candidate.get("tenant_key"), candidate.get("user_id")) for candidate in open_candidates}
+        user_members = {
+            (candidate.get("tenant_key"), candidate.get("user_id")) for candidate in user_candidates
+        }
+        open_members = {
+            (candidate.get("tenant_key"), candidate.get("user_id")) for candidate in open_candidates
+        }
         if user_members & open_members:
             same_member.append(row)
 
     name_matches = [row for row in bitable if row["name"] and row["name"] in by_name]
-    personnel_to_open = [row for row in bitable if row["personnel_id"] and row["personnel_id"] in by_open_id]
+    personnel_to_open = [
+        row for row in bitable if row["personnel_id"] and row["personnel_id"] in by_open_id
+    ]
     open_to_user = [row for row in bitable if row["open_id"] and row["open_id"] in by_user_id]
 
     return {
@@ -125,12 +133,20 @@ def analyze_association(
             "member_rows": len(snapshot),
             "distinct_user_id": len(by_user_id),
             "distinct_open_id": len(by_open_id),
-            "distinct_union_id": len({row["union_id"] or row["union_user_id"] for row in snapshot if row["union_id"] or row["union_user_id"]}),
+            "distinct_union_id": len(
+                {
+                    row["union_id"] or row["union_user_id"]
+                    for row in snapshot
+                    if row["union_id"] or row["union_user_id"]
+                }
+            ),
         },
         "bitable": {
             "record_rows": len(bitable),
             "nonempty_personnel_id": sum(bool(row["personnel_id"]) for row in bitable),
-            "distinct_personnel_id": len({row["personnel_id"] for row in bitable if row["personnel_id"]}),
+            "distinct_personnel_id": len(
+                {row["personnel_id"] for row in bitable if row["personnel_id"]}
+            ),
             "nonempty_open_id": sum(bool(row["open_id"]) for row in bitable),
             "distinct_open_id": len({row["open_id"] for row in bitable if row["open_id"]}),
             "nonempty_work_no": sum(bool(row["work_no"]) for row in bitable),
@@ -145,8 +161,12 @@ def analyze_association(
             },
             "name_only": {
                 "matched_rows": len(name_matches),
-                "unique_snapshot_name_matches": sum(len(by_name[row["name"]]) == 1 for row in name_matches),
-                "ambiguous_snapshot_name_matches": sum(len(by_name[row["name"]]) > 1 for row in name_matches),
+                "unique_snapshot_name_matches": sum(
+                    len(by_name[row["name"]]) == 1 for row in name_matches
+                ),
+                "ambiguous_snapshot_name_matches": sum(
+                    len(by_name[row["name"]]) > 1 for row in name_matches
+                ),
             },
             "work_no": {"matched_against_snapshot_identity_fields": 0},
             "cross_checks": {

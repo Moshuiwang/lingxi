@@ -143,8 +143,7 @@ def find_violations(path: Path, source_root: Path = SOURCE_ROOT) -> list[str]:
                 # （同一姿态见 check_runtime_dependencies.py 的 `_split_imports`）。
                 if module_target == "lingxi" or module_target.startswith("lingxi."):
                     targets += [
-                        (f"{module_target}.{alias.name}", node.lineno)
-                        for alias in node.names
+                        (f"{module_target}.{alias.name}", node.lineno) for alias in node.names
                     ]
 
         for target, lineno in targets:
@@ -157,7 +156,9 @@ def find_violations(path: Path, source_root: Path = SOURCE_ROOT) -> list[str]:
                 continue  # 其余 lingxi.* 路径（core、config 等）允许
             if top in stdlib:
                 continue
-            violations.append(f"{location}：`core/` import 了外部第三方模块 `{target}`（core/ 不得 import 任何外部 SDK）")
+            violations.append(
+                f"{location}：`core/` import 了外部第三方模块 `{target}`（core/ 不得 import 任何外部 SDK）"
+            )
 
     return violations
 
@@ -215,13 +216,12 @@ def find_transitive_violations(source_root: Path = SOURCE_ROOT) -> list[str]:
             direct = installed_pkg._source_imports(module, all_files)
         except SyntaxError as error:
             raise LayeringCheckError(f"{_display_path(path)} 解析失败：{error}") from error
-        ancestors = {
-            name
-            for name in installed_pkg._ancestor_packages(module, all_files)
-        }
+        ancestors = {name for name in installed_pkg._ancestor_packages(module, all_files)}
         edges[module] = direct | ancestors
 
-    core_modules = sorted(m for m in all_files if m == "lingxi.core" or m.startswith("lingxi.core."))
+    core_modules = sorted(
+        m for m in all_files if m == "lingxi.core" or m.startswith("lingxi.core.")
+    )
     violations: list[str] = []
     for start in core_modules:
         # 逐起点 BFS；记录到每个已访问节点的最短路径，命中 adapters/apps 时

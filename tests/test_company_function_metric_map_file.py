@@ -200,7 +200,9 @@ class ExternalPathOverrideTest(unittest.TestCase):
             self.assertEqual(mapping, {"9999": {"运营": ("外置专用指标",)}})
             # 反证：外置内容与包内默认（44 个公司键，含 "后台管理员"）截然不同，
             # 证明确实没有悄悄回落到包内默认再叠加。
-            default_mapping = load_company_function_metric_map(default_company_function_metric_map_path())
+            default_mapping = load_company_function_metric_map(
+                default_company_function_metric_map_path()
+            )
             self.assertNotEqual(mapping, default_mapping)
 
     def test_no_path_argument_falls_back_to_the_packaged_default(self) -> None:

@@ -137,7 +137,13 @@ class DailyReportPostgresTestCase(unittest.TestCase):
             VALUES (%s, %s, %s, 'terminal', 'success', 'worker-1', %s,
                     {created_at_sql}, {received_sql}, %s)
             """,
-            (f"tde-{task_id}-{sequence}", task_id, sequence, f"{task_id}:terminal:{sequence}", platform_message_kind),
+            (
+                f"tde-{task_id}-{sequence}",
+                task_id,
+                sequence,
+                f"{task_id}:terminal:{sequence}",
+                platform_message_kind,
+            ),
         )
 
 
@@ -149,7 +155,9 @@ class ActiveUserTaskCountsTests(DailyReportPostgresTestCase):
 
         window_start = datetime.now(UTC) - timedelta(hours=1)
         window_end = datetime.now(UTC) + timedelta(hours=1)
-        counts = self.source.active_user_task_counts(window_start=window_start, window_end=window_end)
+        counts = self.source.active_user_task_counts(
+            window_start=window_start, window_end=window_end
+        )
 
         self.assertEqual(sorted(counts), [1, 2])
         # 返回类型只可能是整数元组——`user_id` 字面上没有出现在返回值里，
@@ -175,7 +183,9 @@ class ActiveUserTaskCountsTests(DailyReportPostgresTestCase):
 
         window_start = datetime.now(UTC) - timedelta(hours=1)
         window_end = datetime.now(UTC) + timedelta(hours=1)
-        counts = self.source.active_user_task_counts(window_start=window_start, window_end=window_end)
+        counts = self.source.active_user_task_counts(
+            window_start=window_start, window_end=window_end
+        )
         self.assertEqual(counts, ())
 
 
@@ -203,11 +213,15 @@ class TaskDurationsTests(DailyReportPostgresTestCase):
             ended_at_sql="now()",
         )
         self.seed_task(task_id="t-still-running", started_at_sql="now()", ended_at_sql=None)
-        self.seed_task(task_id="t-never-started", started_at_sql=None, ended_at_sql=None, status="queued")
+        self.seed_task(
+            task_id="t-never-started", started_at_sql=None, ended_at_sql=None, status="queued"
+        )
 
         window_start = datetime.now(UTC) - timedelta(hours=1)
         window_end = datetime.now(UTC) + timedelta(hours=1)
-        durations = self.source.task_durations_seconds(window_start=window_start, window_end=window_end)
+        durations = self.source.task_durations_seconds(
+            window_start=window_start, window_end=window_end
+        )
 
         self.assertEqual(len(durations), 1)
         self.assertAlmostEqual(durations[0], 300.0, delta=2.0)
@@ -216,9 +230,13 @@ class TaskDurationsTests(DailyReportPostgresTestCase):
 class DeliveryOutcomesTests(DailyReportPostgresTestCase):
     def test_delivered_card_delivered_text_and_pending_are_distinguished(self) -> None:
         self.seed_task(task_id="t-card")
-        self.seed_delivery_event(task_id="t-card", platform_message_kind="card", platform_received=True)
+        self.seed_delivery_event(
+            task_id="t-card", platform_message_kind="card", platform_received=True
+        )
         self.seed_task(task_id="t-text")
-        self.seed_delivery_event(task_id="t-text", platform_message_kind="text", platform_received=True)
+        self.seed_delivery_event(
+            task_id="t-text", platform_message_kind="text", platform_received=True
+        )
         self.seed_task(task_id="t-pending")
         self.seed_delivery_event(task_id="t-pending", platform_received=False)
 
@@ -233,7 +251,9 @@ class DeliveryOutcomesTests(DailyReportPostgresTestCase):
     def test_an_undelivered_row_past_its_twenty_four_hour_expiry_is_expired(self) -> None:
         self.seed_task(task_id="t-expired", created_at_sql="now() - interval '25 hours'")
         self.seed_delivery_event(
-            task_id="t-expired", created_at_sql="now() - interval '25 hours'", platform_received=False
+            task_id="t-expired",
+            created_at_sql="now() - interval '25 hours'",
+            platform_received=False,
         )
 
         # 窗口覆盖那一轮插入的时刻，不覆盖真实「现在」——`expires_at` 由触发器固定为

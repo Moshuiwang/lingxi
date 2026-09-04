@@ -100,9 +100,7 @@ class RecordingAudit:
         return [action for action, _ in self.records]
 
     def rendered(self) -> str:
-        return " ".join(
-            f"{action} {sorted(fields.items())}" for action, fields in self.records
-        )
+        return " ".join(f"{action} {sorted(fields.items())}" for action, fields in self.records)
 
 
 # --------------------------------------------------------------------------
@@ -136,7 +134,9 @@ class HolderTest(unittest.TestCase):
         holder.store(derived(lifetime=7200), now=DAY)
         expires_at = DAY + timedelta(seconds=7200)
 
-        self.assertIsNotNone(holder.fresh(now=expires_at - DEFAULT_ACCESS_TOKEN_SAFETY_MARGIN - timedelta(seconds=1)))
+        self.assertIsNotNone(
+            holder.fresh(now=expires_at - DEFAULT_ACCESS_TOKEN_SAFETY_MARGIN - timedelta(seconds=1))
+        )
         self.assertIsNone(holder.fresh(now=expires_at - DEFAULT_ACCESS_TOKEN_SAFETY_MARGIN))
         self.assertIsNone(holder.fresh(now=expires_at + timedelta(seconds=1)))
 
@@ -185,7 +185,9 @@ class HolderTest(unittest.TestCase):
         self.assertNotIn(FAKE_ACCESS_TOKEN, repr(holder))
         self.assertNotIn(FAKE_ACCESS_TOKEN, str(holder))
         self.assertTrue(holder.has_token)
-        self.assertNotIn(FAKE_ACCESS_TOKEN, str(holder.__dict__ if hasattr(holder, "__dict__") else {}))
+        self.assertNotIn(
+            FAKE_ACCESS_TOKEN, str(holder.__dict__ if hasattr(holder, "__dict__") else {})
+        )
 
     def test_a_bare_string_token_is_refused(self) -> None:
         """明文令牌不得以裸字符串流转：普通字符串会被 repr、日志与 dataclass 原样吐出。"""
@@ -342,9 +344,7 @@ class ProviderAuditDateMonotonicTest(unittest.TestCase):
         # day_two 同一分类此后再来一次，必须仍然只算一条（没有因为中途被倒退清空
         # 而重新放行）。
         provider._record("refresh_error", day_two)
-        self.assertEqual(
-            len(provider._audited_reasons), 2, "不应该出现同一天同一分类被重复计入"
-        )
+        self.assertEqual(len(provider._audited_reasons), 2, "不应该出现同一天同一分类被重复计入")
 
     def test_out_of_order_calls_do_not_duplicate_audits_across_midnight(self) -> None:
         """端到端形状：交替喂入乱序的日期，最终审计出口不应该看到同一天同一分类
@@ -411,9 +411,9 @@ class NoSecondCeilingCopyTest(unittest.TestCase):
     def test_the_rotation_duty_keeps_no_daily_ledger(self) -> None:
         # #237 拆分后 `CredentialRotationLoop`（唯一可能重新长出账本副本的地方）搬进了
         # credential_rotation 子模块，不再是包的 __init__.py（那里现在只剩重导出）。
-        source = (
-            SOURCE_ROOT / "apps" / "scheduler" / "credential_rotation.py"
-        ).read_text(encoding="utf-8")
+        source = (SOURCE_ROOT / "apps" / "scheduler" / "credential_rotation.py").read_text(
+            encoding="utf-8"
+        )
 
         for banned in ("DailyRefreshBudget", "_budget", "daily_refresh_budget_exhausted"):
             self.assertNotIn(banned, source, f"{banned} 是账本副本残留")
@@ -468,7 +468,9 @@ class SupplyFailureReasonTest(unittest.TestCase):
 class _CountingRefresh:
     """记账用的假"受控续期"：按脚本要么写入持有者、要么抛错。"""
 
-    def __init__(self, holder: DerivedAccessTokenHolder, clock: MovableClock, *, outcomes=None) -> None:
+    def __init__(
+        self, holder: DerivedAccessTokenHolder, clock: MovableClock, *, outcomes=None
+    ) -> None:
         self._holder = holder
         self._clock = clock
         self._outcomes = list(outcomes or [])
@@ -488,9 +490,7 @@ def build_provider(*, outcomes=None, now: datetime = DAY):
     clock = MovableClock(now)
     audit = RecordingAudit()
     refresh = _CountingRefresh(holder, clock, outcomes=outcomes)
-    provider = RosterAccessTokenProvider(
-        holder=holder, refresh=refresh, audit=audit, clock=clock
-    )
+    provider = RosterAccessTokenProvider(holder=holder, refresh=refresh, audit=audit, clock=clock)
     return provider, holder, clock, audit, refresh
 
 
@@ -945,7 +945,9 @@ class OnDemandRefreshTest(unittest.TestCase):
         self.assertEqual(fixture.vault.saved[0]["refresh_consumed_at"], claimed_moment)
         self.assertEqual(fixture.vault.consumed_at, claimed_moment)
 
-    def test_a_second_refresh_within_the_minimum_interval_is_refused_by_the_credential_itself(self) -> None:
+    def test_a_second_refresh_within_the_minimum_interval_is_refused_by_the_credential_itself(
+        self,
+    ) -> None:
         """同一天、间隔未到的第二次：由凭据文件里的最小间隔判据拒绝（Issue #276）。
 
         两次 ``refresh_for_supply()`` 之间只过了 ``ScriptedVault.CLAIM_TAKES``（5 秒），
@@ -1170,9 +1172,7 @@ class OnDemandRefreshTest(unittest.TestCase):
         变异验红锚点：把 ``SUPERSEDED`` 重新折成 ``SAVED``，本用例必须变红。
         """
 
-        loop, vault, holder, events, _clock, _authorization = build_supply_loop(
-            superseded=True
-        )
+        loop, vault, holder, events, _clock, _authorization = build_supply_loop(superseded=True)
 
         with self.assertLogs("lingxi.apps.scheduler", level="WARNING") as captured:
             with self.assertRaises(AccessTokenUnavailable) as raised:
@@ -1281,9 +1281,7 @@ class OnDemandRefreshTest(unittest.TestCase):
 
         call = fixture.vault.claim_calls[0]
         self.assertEqual(sorted(call), ["for_supply", "moment"], "除了模式没有别的入参")
-        self.assertEqual(
-            fixture.vault.consumed_at.astimezone(UTC).date(), date(2026, 8, 18)
-        )
+        self.assertEqual(fixture.vault.consumed_at.astimezone(UTC).date(), date(2026, 8, 18))
 
     def test_the_two_moments_of_one_refresh_are_kept_apart(self) -> None:
         """一次续期跨越一个 HTTP 往返，因此有两个时刻，各有各的用途：
@@ -1471,9 +1469,7 @@ class ScheduledRotationFeedsTheHolderTest(unittest.TestCase):
         ``SAVED`` 的变异会存活（N3 首轮）。
         """
 
-        loop, vault, holder, events, _clock, _authorization = build_supply_loop(
-            superseded=True
-        )
+        loop, vault, holder, events, _clock, _authorization = build_supply_loop(superseded=True)
 
         with self.assertLogs("lingxi.apps.scheduler", level="WARNING") as captured:
             report = loop.run_once()
@@ -1578,13 +1574,15 @@ class RefreshTokenHasExactlyOneConsumerTest(unittest.TestCase):
         directory = (SOURCE_ROOT / "adapters" / "feishu_directory.py").read_text(encoding="utf-8")
         # #237 拆分后 `CredentialRotationLoop`（两个消费入口都在其中）搬进了这个子模块，
         # 不再是包的 __init__.py。
-        scheduler = (
-            SOURCE_ROOT / "apps" / "scheduler" / "credential_rotation.py"
-        ).read_text(encoding="utf-8")
+        scheduler = (SOURCE_ROOT / "apps" / "scheduler" / "credential_rotation.py").read_text(
+            encoding="utf-8"
+        )
 
         self.assertTrue(scan_consumption_sites(directory).grant_type_sites)
         scheduler_sites = scan_consumption_sites(scheduler)
-        self.assertGreaterEqual(len(scheduler_sites.refresh_call_sites), 2, "到期轮换与按需续期各一处")
+        self.assertGreaterEqual(
+            len(scheduler_sites.refresh_call_sites), 2, "到期轮换与按需续期各一处"
+        )
         self.assertGreaterEqual(len(scheduler_sites.claim_sites), 2)
 
     def test_the_scanner_flags_a_synthetic_second_consumer(self) -> None:
@@ -1600,7 +1598,9 @@ class RefreshTokenHasExactlyOneConsumerTest(unittest.TestCase):
                 self.assertTrue(getattr(scan_consumption_sites(source), attribute))
 
         # 反向：不含任何消费痕迹的源码不得被误报。
-        clean = scan_consumption_sites('body = {"grant_type": "authorization_code"}\nx.refresh_at()')
+        clean = scan_consumption_sites(
+            'body = {"grant_type": "authorization_code"}\nx.refresh_at()'
+        )
         self.assertEqual(clean.grant_type_sites, [])
         self.assertEqual(clean.refresh_call_sites, [])
         self.assertEqual(clean.claim_sites, [])
@@ -1778,7 +1778,9 @@ class AssembledSupplyTest(unittest.TestCase):
         )
         # 只看花名册那一条：同一个 `build_loop` 还会为每日权限重算与权限发布各留一条
         # 自己的未注册审计（本夹具没配 MCP 主密钥与发布表），那是它们各自的用例的事。
-        roster_records = [record for record in audit.records if record[0].startswith("roster_audit.")]
+        roster_records = [
+            record for record in audit.records if record[0].startswith("roster_audit.")
+        ]
         self.assertEqual(roster_records, [], "前置齐备时不该有『未注册』审计")
 
     def test_assembly_never_touches_the_credential(self) -> None:

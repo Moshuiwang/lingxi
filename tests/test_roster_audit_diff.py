@@ -23,7 +23,9 @@ from lingxi.core.identity.roster_audit import (
     compare_roster,
 )
 
-MODULE_PATH = pathlib.Path(__file__).parents[1] / "src" / "lingxi" / "core" / "identity" / "roster_audit.py"
+MODULE_PATH = (
+    pathlib.Path(__file__).parents[1] / "src" / "lingxi" / "core" / "identity" / "roster_audit.py"
+)
 
 # 比对用的固定资料。这些值在日报、审计与日志里都**不得出现**，
 # 后续几个测试文件按同一份取值做模式扫描。
@@ -116,7 +118,9 @@ class ThreeStateTest(unittest.TestCase):
         报进管理群等于把非用户的资料也纳入了每日通知面。
         """
 
-        outsider = roster_row(personnel_id="ou_person_9999", name="局外人", email="outsider@example.com")
+        outsider = roster_row(
+            personnel_id="ou_person_9999", name="局外人", email="outsider@example.com"
+        )
         report = compare_roster([archived()], [roster_row(), outsider])
 
         self.assertTrue(report.is_empty)
@@ -196,7 +200,10 @@ class DuplicateRosterRowTest(unittest.TestCase):
         matching = roster_row()
         differing = roster_row(name="另一个张三", email="other@example.com")
 
-        for label, rows in (("匹配行在前", [matching, differing]), ("差异行在前", [differing, matching])):
+        for label, rows in (
+            ("匹配行在前", [matching, differing]),
+            ("差异行在前", [differing, matching]),
+        ):
             with self.subTest(case=label):
                 report = compare_roster([archived()], rows)
 
@@ -232,7 +239,11 @@ class AsymmetricBlankTest(unittest.TestCase):
     def test_losing_a_value_that_was_archived_is_always_reported(self) -> None:
         """存档有值、花名册变空**必须报**：丢值往往是转交前兆。"""
 
-        for field, roster_key in (("display_name", "name"), ("employee_no", "employee_no"), ("email", "email")):
+        for field, roster_key in (
+            ("display_name", "name"),
+            ("employee_no", "employee_no"),
+            ("email", "email"),
+        ):
             with self.subTest(cleared_field=field):
                 report = compare_roster([archived()], [roster_row(**{roster_key: ""})])
 
@@ -302,7 +313,9 @@ class OutputCarriesNoValuesTest(unittest.TestCase):
             archived(app_user_id=f"usr_01{letter * 24}", personnel_id=f"ou_person_{index}")
             for index, letter in enumerate("ABCDE")
         ]
-        rows = [roster_row(personnel_id=f"ou_person_{index}", name=f"改名{index}") for index in range(5)]
+        rows = [
+            roster_row(personnel_id=f"ou_person_{index}", name=f"改名{index}") for index in range(5)
+        ]
 
         first = compare_roster(baseline, rows)
         second = compare_roster(list(reversed(baseline)), list(reversed(rows)))
@@ -338,7 +351,9 @@ class ExcludedFieldsTest(unittest.TestCase):
         from lingxi.core.identity.roster_audit import ROSTER_KEYS
 
         self.assertEqual(ROSTER_FIELD_NAMES, ("人员ID", "邮箱", "人员姓名", "工号"))
-        self.assertEqual(RosterRow._fields, ("personnel_id", "email", "name", "employee_no", "record_id"))
+        self.assertEqual(
+            RosterRow._fields, ("personnel_id", "email", "name", "employee_no", "record_id")
+        )
         self.assertEqual(set(ROSTER_KEYS), {"display_name", "employee_no", "email"})
         self.assertEqual(set(ROSTER_KEYS.values()), {"name", "employee_no", "email"})
 
@@ -347,7 +362,13 @@ class ExcludedFieldsTest(unittest.TestCase):
 
         from lingxi.adapters.feishu_roster_bitable import RosterRow
 
-        row = RosterRow(personnel_id=PERSON, email=EMAIL, name="改过的名字", employee_no=EMPLOYEE_NO, record_id="rec1")
+        row = RosterRow(
+            personnel_id=PERSON,
+            email=EMAIL,
+            name="改过的名字",
+            employee_no=EMPLOYEE_NO,
+            record_id="rec1",
+        )
         report = compare_roster([archived()], [row])
 
         self.assertEqual(report.entries[0].changed_fields, ("display_name",))

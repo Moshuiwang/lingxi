@@ -37,9 +37,7 @@ MAX_MEMORY_ENTRIES_PER_USER = 50
 #: 出半条记忆，格式不完整）。
 DEFAULT_MAX_PROMPT_CHARS = 6000
 
-_PROMPT_HEADER = (
-    "## 已登记的用户记忆（用户可通过 /memory 查看、删除或清空；不代表当前查询结果）"
-)
+_PROMPT_HEADER = "## 已登记的用户记忆（用户可通过 /memory 查看、删除或清空；不代表当前查询结果）"
 
 
 @dataclass(frozen=True)

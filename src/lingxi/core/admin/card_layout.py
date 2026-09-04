@@ -50,9 +50,7 @@ def button_row(buttons: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
     return {
         "tag": "column_set",
         "flex_mode": flex_mode,
-        "columns": [
-            {"tag": "column", "width": "auto", "elements": [button]} for button in buttons
-        ],
+        "columns": [{"tag": "column", "width": "auto", "elements": [button]} for button in buttons],
     }
 
 

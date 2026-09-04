@@ -85,7 +85,9 @@ def _text(value: Any) -> str:
     return str(value).strip()
 
 
-def _rows(cursor: Any, statement: str, batch_id: str, columns: Sequence[str]) -> tuple[dict[str, Any], ...]:
+def _rows(
+    cursor: Any, statement: str, batch_id: str, columns: Sequence[str]
+) -> tuple[dict[str, Any], ...]:
     cursor.execute(statement, (batch_id,))
     return tuple(dict(zip(columns, row)) for row in cursor.fetchall())
 
@@ -197,16 +199,23 @@ class PostgresGalaxySnapshotReader:
             logger.warning("没有当前有效的银河批次，本次读取不可用")
             return None
 
-        with connect(self._dsn, timeouts=self._timeouts) as connection, connection.cursor() as cursor:
+        with (
+            connect(self._dsn, timeouts=self._timeouts) as connection,
+            connection.cursor() as cursor,
+        ):
             user_rows = _rows(cursor, _select("user", USER_COLUMNS), batch_id, USER_COLUMNS)
-            role_rows = _rows(cursor, _select("user_role", USER_ROLE_COLUMNS), batch_id, USER_ROLE_COLUMNS)
+            role_rows = _rows(
+                cursor, _select("user_role", USER_ROLE_COLUMNS), batch_id, USER_ROLE_COLUMNS
+            )
             datacountry_rows = _rows(
                 cursor,
                 _select("sys_user_datacountry", USER_DATACOUNTRY_COLUMNS),
                 batch_id,
                 USER_DATACOUNTRY_COLUMNS,
             )
-            country_rows = _rows(cursor, _select("sys_country", COUNTRY_COLUMNS), batch_id, COUNTRY_COLUMNS)
+            country_rows = _rows(
+                cursor, _select("sys_country", COUNTRY_COLUMNS), batch_id, COUNTRY_COLUMNS
+            )
 
         confirmed = self.current_batch_id()
         if confirmed != batch_id:
@@ -262,7 +271,10 @@ class PostgresCompanyNames:
         batch_id = PostgresGalaxyImportStore(self._dsn, timeouts=self._timeouts).current_batch_id()
         if batch_id is None:
             return None
-        with connect(self._dsn, timeouts=self._timeouts) as connection, connection.cursor() as cursor:
+        with (
+            connect(self._dsn, timeouts=self._timeouts) as connection,
+            connection.cursor() as cursor,
+        ):
             cursor.execute(
                 "SELECT name_cn FROM galaxy_country WHERE batch_id = %s AND boss_company_id = %s LIMIT 1",
                 (batch_id, company_id),
@@ -293,7 +305,10 @@ class PostgresCompanyNames:
         batch_id = PostgresGalaxyImportStore(self._dsn, timeouts=self._timeouts).current_batch_id()
         if batch_id is None:
             return {company_id: None for company_id in company_ids}
-        with connect(self._dsn, timeouts=self._timeouts) as connection, connection.cursor() as cursor:
+        with (
+            connect(self._dsn, timeouts=self._timeouts) as connection,
+            connection.cursor() as cursor,
+        ):
             cursor.execute(
                 "SELECT boss_company_id, name_cn FROM galaxy_country"
                 " WHERE batch_id = %s AND boss_company_id = ANY(%s)",

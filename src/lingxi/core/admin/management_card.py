@@ -161,7 +161,11 @@ def _select_static(
 
 
 def _input(*, name: str, placeholder: str, required: bool = False) -> dict[str, Any]:
-    element: dict[str, Any] = {"tag": "input", "name": name, "placeholder": _plain_text(placeholder)}
+    element: dict[str, Any] = {
+        "tag": "input",
+        "name": name,
+        "placeholder": _plain_text(placeholder),
+    }
     if required:
         element["required"] = True
     return element
@@ -230,9 +234,7 @@ def _galaxy_source_markdown(
     if summary.all_companies:
         company_label = "全部公司"
     else:
-        company_label = (
-            "、".join(company_label_for(cid) for cid in summary.companies) or "(无)"
-        )
+        company_label = "、".join(company_label_for(cid) for cid in summary.companies) or "(无)"
     function_label = "、".join(summary.functions) or "(无)"
     return f"**银河权限**（银河来源）：公司范围 {company_label} · 职能 {function_label}（职能标签，非最终指标名）"
 
@@ -553,7 +555,10 @@ def render_management_card(
                             style="primary",
                             form_submit=True,
                             name=GRANT_SUBMIT_BUTTON_NAME,
-                            value={"admin_action": ADMIN_ACTION_GRANT, "identifier": display_identifier},
+                            value={
+                                "admin_action": ADMIN_ACTION_GRANT,
+                                "identifier": display_identifier,
+                            },
                         )
                     ]
                 ),

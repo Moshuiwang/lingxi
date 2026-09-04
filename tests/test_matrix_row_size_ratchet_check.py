@@ -16,7 +16,9 @@ SCRIPT = Path(__file__).parents[1] / "scripts" / "ci" / "check_matrix_row_size_r
 
 
 def _load_script():
-    spec = importlib.util.spec_from_file_location("matrix_row_size_ratchet_check_under_test", SCRIPT)
+    spec = importlib.util.spec_from_file_location(
+        "matrix_row_size_ratchet_check_under_test", SCRIPT
+    )
     module = importlib.util.module_from_spec(spec)
     assert spec.loader is not None
     spec.loader.exec_module(module)
@@ -79,9 +81,7 @@ class AssertionRowParsingTest(unittest.TestCase):
         text = matrix_document("| V-开通-01 | 一句判定 | L2（真库） | 已认领 |\n")
         current = CHECK.measure_rows(text)
         self.assertIn("V-开通-01", current)
-        expected_bytes = len(
-            "| V-开通-01 | 一句判定 | L2（真库） | 已认领 |".encode()
-        )
+        expected_bytes = len("| V-开通-01 | 一句判定 | L2（真库） | 已认领 |".encode())
         self.assertEqual(current["V-开通-01"], expected_bytes)
 
     def test_row_under_a_different_table_header_is_ignored(self) -> None:
@@ -94,20 +94,20 @@ class AssertionRowParsingTest(unittest.TestCase):
             "|---|---|---|\n"
             "| 首次对话 | V-开通-01…03 | — |\n"
         )
-        text = matrix_document("| V-开通-01 | 一句判定 | L2（真库） | 已认领 |\n", extra_table=extra)
+        text = matrix_document(
+            "| V-开通-01 | 一句判定 | L2（真库） | 已认领 |\n", extra_table=extra
+        )
         current = CHECK.measure_rows(text)
         self.assertEqual(set(current), {"V-开通-01"})
 
     def test_row_inside_fenced_code_block_is_ignored(self) -> None:
-        text = matrix_document(
-            "```\n"
-            "| V-开通-99 | 示例，不是真实登记 | L2 | 已认领 |\n"
-            "```\n"
-        )
+        text = matrix_document("```\n| V-开通-99 | 示例，不是真实登记 | L2 | 已认领 |\n```\n")
         current = CHECK.measure_rows(text)
         self.assertEqual(current, {})
 
-    def test_row_missing_from_matrix_header_table_is_ignored_even_if_it_looks_like_one(self) -> None:
+    def test_row_missing_from_matrix_header_table_is_ignored_even_if_it_looks_like_one(
+        self,
+    ) -> None:
         """编号格开头是 V- 但所在表没有 MATRIX_HEADER 表头：本检查不认，
         这类问题由 check_acceptance_matrix.py 负责判红，本检查不重复也不漏。"""
 
@@ -129,7 +129,10 @@ class AssertionRowParsingTest(unittest.TestCase):
         current = CHECK.measure_rows(matrix_document(short_row + long_row))
         self.assertEqual(
             current["V-开通-01"],
-            max(len(short_row.rstrip("\n").encode("utf-8")), len(long_row.rstrip("\n").encode("utf-8"))),
+            max(
+                len(short_row.rstrip("\n").encode("utf-8")),
+                len(long_row.rstrip("\n").encode("utf-8")),
+            ),
         )
 
 
@@ -336,7 +339,9 @@ class RunRefreshClassificationTest(unittest.TestCase):
         row = self._row("V-开通-01", "长", 300)  # 仍超 800B 阈值，但比下面登记的旧上限小
         text = matrix_document(row)
         actual_bytes = CHECK.measure_rows(text)["V-开通-01"]
-        self.assertGreater(actual_bytes, CHECK.THRESHOLD_BYTES)  # 夹具自检：这条用例测「调低」不是「移除」
+        self.assertGreater(
+            actual_bytes, CHECK.THRESHOLD_BYTES
+        )  # 夹具自检：这条用例测「调低」不是「移除」
         self.matrix_path.write_text(text, encoding="utf-8")
         self.baseline_path.write_text(
             CHECK.render_baseline({"V-开通-01": actual_bytes + 500}), encoding="utf-8"
@@ -358,7 +363,9 @@ class RunRefreshClassificationTest(unittest.TestCase):
     def test_refresh_refuses_when_an_unregistered_row_newly_crosses_threshold(self) -> None:
         registered_row = self._row("V-开通-01", "短", 3)
         new_giant_row = self._row("V-开通-02", "巨", 400)  # 远超 800B，未登记
-        self.matrix_path.write_text(matrix_document(registered_row + new_giant_row), encoding="utf-8")
+        self.matrix_path.write_text(
+            matrix_document(registered_row + new_giant_row), encoding="utf-8"
+        )
         self.baseline_path.write_text(CHECK.render_baseline({"V-开通-01": 2000}), encoding="utf-8")
 
         exit_code = CHECK.run_refresh()

@@ -312,7 +312,9 @@ class FakeAgentSDK:
                     },
                     call_id,
                 )
-                yield StubUserMessage([StubToolResultBlock(call_id, step.get("result"), step.get("is_error"))])
+                yield StubUserMessage(
+                    [StubToolResultBlock(call_id, step.get("result"), step.get("is_error"))]
+                )
                 continue
 
             response = await self._fire(
@@ -330,7 +332,11 @@ class FakeAgentSDK:
             if hook_output.get("permissionDecision") == "deny":
                 # 真实 CLI 会把拒绝理由当成失败回执发回模型；照抄这个形状。
                 yield StubUserMessage(
-                    [StubToolResultBlock(call_id, hook_output.get("permissionDecisionReason"), True)]
+                    [
+                        StubToolResultBlock(
+                            call_id, hook_output.get("permissionDecisionReason"), True
+                        )
+                    ]
                 )
                 continue
 
@@ -394,7 +400,9 @@ class FakeAgentSDK:
             self.child_turns += 1
         target = step.get("writes")
         if target:
-            pathlib.Path(target).write_text(step.get("input", {}).get("content", ""), encoding="utf-8")
+            pathlib.Path(target).write_text(
+                step.get("input", {}).get("content", ""), encoding="utf-8"
+            )
 
     async def _fire(self, options, event, payload, call_id):
         hooks = getattr(options, "hooks", None) or {}
@@ -472,7 +480,9 @@ class WorkerWiringTest(unittest.TestCase):
         _, fake, executor = run_turn(self, [{"kind": "text", "text": "已完成。"}])
 
         self.assertEqual(executor.policy.allowed_tools, frozenset({READ_ONLY_TOOL}))
-        self.assertEqual(fake.options[0].allowed_tools, [READ_ONLY_TOOL], "纵深防御层也只列这一个工具")
+        self.assertEqual(
+            fake.options[0].allowed_tools, [READ_ONLY_TOOL], "纵深防御层也只列这一个工具"
+        )
         self.assertEqual(fake.options[0].max_turns, 20, "默认轮数必须通过 SDK 选项生效")
         self.assertEqual(
             fake.options[0].disallowed_tools,
@@ -485,7 +495,12 @@ class WorkerWiringTest(unittest.TestCase):
         report, _, _ = run_turn(
             self,
             [
-                {"kind": "tool", "tool": READ_ONLY_TOOL, "input": {"metric": "dau"}, "result": ok_result()},
+                {
+                    "kind": "tool",
+                    "tool": READ_ONLY_TOOL,
+                    "input": {"metric": "dau"},
+                    "result": ok_result(),
+                },
                 {"kind": "text", "text": "近 7 天日活是 1024。"},
             ],
         )
@@ -495,7 +510,9 @@ class WorkerWiringTest(unittest.TestCase):
         self.assertTrue(calls[0]["allowed"], "PreToolUse 的判定没有汇入审计")
         self.assertTrue(calls[0]["executed"], "PostToolUse 没有汇入审计")
         self.assertEqual(calls[0]["result_kind"], "ok", "消息流里的工具回执没有汇入审计")
-        self.assertEqual(report["turn"]["final_text"], "近 7 天日活是 1024。", "最终正文没有汇入审计")
+        self.assertEqual(
+            report["turn"]["final_text"], "近 7 天日活是 1024。", "最终正文没有汇入审计"
+        )
         self.assertEqual(report["turn"]["terminal_result_count"], 1)
         self.assertEqual(report["turn"]["user_result"], "obtained")
         self.assertTrue(report["turn"]["closed"])
@@ -506,13 +523,20 @@ class WorkerWiringTest(unittest.TestCase):
         report, _, _ = run_turn(
             self,
             [
-                {"kind": "tool", "tool": READ_ONLY_TOOL, "input": {"metric": "dau"}, "result": ok_result()},
+                {
+                    "kind": "tool",
+                    "tool": READ_ONLY_TOOL,
+                    "input": {"metric": "dau"},
+                    "result": ok_result(),
+                },
                 {"kind": "text", "text": "近 7 天日活是 1024。"},
             ],
             turns=2,
         )
 
-        self.assertEqual(report["turn"]["terminal_result_count"], 1, "上一回合的终止结果被带进了本回合")
+        self.assertEqual(
+            report["turn"]["terminal_result_count"], 1, "上一回合的终止结果被带进了本回合"
+        )
         self.assertEqual(len(report["audit"]["calls"]), 1, "上一回合的工具调用被带进了本回合")
         self.assertTrue(report["turn"]["closed"])
 
@@ -764,7 +788,9 @@ class SessionResumeFallbackTest(unittest.TestCase):
 
         self.assertEqual(report["failure"]["code"], "session_failed")
         self.assertFalse(report["turn"]["closed"])
-        self.assertEqual(len(sdk.options), 2, "必须恰好重试一次，不能因为再次撞见同样特征而继续重试")
+        self.assertEqual(
+            len(sdk.options), 2, "必须恰好重试一次，不能因为再次撞见同样特征而继续重试"
+        )
         events = self._events(captured)
         resume_miss_events = [e for e in events if e["event"] == "worker.session_resume_miss"]
         self.assertEqual(len(resume_miss_events), 1, "降级审计事件只应出现一次")
@@ -803,7 +829,12 @@ class ReadOnlyBoundaryTest(unittest.TestCase):
 
     def _script(self):
         return [
-            {"kind": "tool", "tool": READ_ONLY_TOOL, "input": {"metric": "dau"}, "result": ok_result()},
+            {
+                "kind": "tool",
+                "tool": READ_ONLY_TOOL,
+                "input": {"metric": "dau"},
+                "result": ok_result(),
+            },
             {
                 "kind": "tool",
                 "tool": "Write",
@@ -814,10 +845,14 @@ class ReadOnlyBoundaryTest(unittest.TestCase):
         ]
 
     def test_v_zhixing_19_whitelisted_tool_runs_and_the_write_probe_never_executes(self) -> None:
-        report, fake, _ = run_turn(self, self._script(), LINGXI_WORKER_WORKSPACE=self._workspace.name)
+        report, fake, _ = run_turn(
+            self, self._script(), LINGXI_WORKER_WORKSPACE=self._workspace.name
+        )
 
         self.assertEqual(fake.executed, [READ_ONLY_TOOL], "只有白名单工具应当真的被执行")
-        self.assertFalse(os.path.exists(self.probe), "越界工具在执行前没有被拦住，探针文件被写了出来")
+        self.assertFalse(
+            os.path.exists(self.probe), "越界工具在执行前没有被拦住，探针文件被写了出来"
+        )
         self.assertEqual(report["audit"]["executed_tool_names"], [READ_ONLY_TOOL])
 
     def test_v_zhixing_19_denial_is_queryable_in_the_audit_summary(self) -> None:
@@ -901,7 +936,12 @@ class MixedTurnThroughTheEntryTest(unittest.TestCase):
         report, _, _ = run_turn(
             self,
             [
-                {"kind": "tool", "tool": READ_ONLY_TOOL, "input": {"metric": "dau"}, "result": ok_result()},
+                {
+                    "kind": "tool",
+                    "tool": READ_ONLY_TOOL,
+                    "input": {"metric": "dau"},
+                    "result": ok_result(),
+                },
                 {
                     "kind": "tool",
                     "tool": READ_ONLY_TOOL,
@@ -919,8 +959,18 @@ class MixedTurnThroughTheEntryTest(unittest.TestCase):
         report, _, _ = run_turn(
             self,
             [
-                {"kind": "tool", "tool": READ_ONLY_TOOL, "input": {"metric": "dau"}, "result": ok_result()},
-                {"kind": "tool", "tool": READ_ONLY_TOOL, "input": {"metric": "arpu"}, "no_result": True},
+                {
+                    "kind": "tool",
+                    "tool": READ_ONLY_TOOL,
+                    "input": {"metric": "dau"},
+                    "result": ok_result(),
+                },
+                {
+                    "kind": "tool",
+                    "tool": READ_ONLY_TOOL,
+                    "input": {"metric": "arpu"},
+                    "no_result": True,
+                },
                 {"kind": "text", "text": "只查到其中一部分。"},
             ],
         )
@@ -1009,7 +1059,12 @@ class OutputSafetyCanaryTest(unittest.TestCase):
 
     def _script(self):
         return [
-            {"kind": "tool", "tool": READ_ONLY_TOOL, "input": {"metric": "dau"}, "result": ok_result()},
+            {
+                "kind": "tool",
+                "tool": READ_ONLY_TOOL,
+                "input": {"metric": "dau"},
+                "result": ok_result(),
+            },
             {"kind": "text", "text": "业务答案：DAU 为一千零二十四。"},
         ]
 
@@ -1047,7 +1102,12 @@ class OutputSafetyCanaryTest(unittest.TestCase):
         report, _, _ = run_turn(
             self,
             [
-                {"kind": "tool", "tool": READ_ONLY_TOOL, "input": {"metric": "dau"}, "result": ok_result()},
+                {
+                    "kind": "tool",
+                    "tool": READ_ONLY_TOOL,
+                    "input": {"metric": "dau"},
+                    "result": ok_result(),
+                },
                 {"kind": "text", "text": "system prompt"},
             ],
             LINGXI_WORKER_SYSTEM_PROMPT=self.SYNTHETIC_PROMPT,
@@ -1112,7 +1172,14 @@ class OutputSafetyCanaryTest(unittest.TestCase):
     def test_masked_canary_with_an_empty_model_output_still_masks_not_withholds(self) -> None:
         report, _, _ = run_turn(
             self,
-            [{"kind": "tool", "tool": READ_ONLY_TOOL, "input": {"metric": "dau"}, "result": ok_result()}],
+            [
+                {
+                    "kind": "tool",
+                    "tool": READ_ONLY_TOOL,
+                    "input": {"metric": "dau"},
+                    "result": ok_result(),
+                }
+            ],
             LINGXI_WORKER_SYSTEM_PROMPT=self.SYNTHETIC_PROMPT,
             LINGXI_WORKER_OUTPUT_SAFETY_CANARY="masked",
         )
@@ -1480,7 +1547,12 @@ class WorkerConfigTest(unittest.TestCase):
         report, _, _ = run_turn(
             self,
             [
-                {"kind": "tool", "tool": READ_ONLY_TOOL, "input": {"metric": "dau"}, "result": "指标不存在"},
+                {
+                    "kind": "tool",
+                    "tool": READ_ONLY_TOOL,
+                    "input": {"metric": "dau"},
+                    "result": "指标不存在",
+                },
                 {"kind": "text", "text": "查不到。"},
             ],
             LINGXI_WORKER_FAILURE_MARKERS=json.dumps(["指标不存在"], ensure_ascii=False),
@@ -1727,7 +1799,11 @@ class WorkerResourceGuardTest(unittest.TestCase):
     def test_v_hulan_01_max_turns_is_passed_to_sdk_and_has_distinct_guard_state(self) -> None:
         report, fake, _ = self._run_with_sdk(
             [{"kind": "text", "text": "尚未完成。"}],
-            sdk_kwargs={"result_subtype": "error_max_turns", "result_is_error": True, "result_num_turns": 2},
+            sdk_kwargs={
+                "result_subtype": "error_max_turns",
+                "result_is_error": True,
+                "result_num_turns": 2,
+            },
             env_overrides={"LINGXI_WORKER_MAX_TURNS": "2"},
         )
 
@@ -1779,10 +1855,19 @@ class WorkerResourceGuardTest(unittest.TestCase):
     def test_v_hulan_03_guarded_turn_with_confirmed_result_is_marked_early(self) -> None:
         report, _, _ = self._run_with_sdk(
             [
-                {"kind": "tool", "tool": READ_ONLY_TOOL, "input": {"metric": "dau"}, "result": ok_result()},
+                {
+                    "kind": "tool",
+                    "tool": READ_ONLY_TOOL,
+                    "input": {"metric": "dau"},
+                    "result": ok_result(),
+                },
                 {"kind": "text", "text": "近 7 天日活是 1024。"},
             ],
-            sdk_kwargs={"result_subtype": "error_max_turns", "result_is_error": True, "result_num_turns": 2},
+            sdk_kwargs={
+                "result_subtype": "error_max_turns",
+                "result_is_error": True,
+                "result_num_turns": 2,
+            },
         )
 
         self.assertFalse(report["turn"]["closed"])
@@ -1800,7 +1885,12 @@ class WorkerResourceGuardTest(unittest.TestCase):
         ticks = iter((100.0, 100.0, 101.2, 101.25))
         report, _, _ = self._run_with_sdk(
             [
-                {"kind": "tool", "tool": READ_ONLY_TOOL, "input": {"metric": "dau"}, "result": ok_result()},
+                {
+                    "kind": "tool",
+                    "tool": READ_ONLY_TOOL,
+                    "input": {"metric": "dau"},
+                    "result": ok_result(),
+                },
                 {"kind": "tool", "tool": "Write", "input": {"file_path": "probe"}},
                 {"kind": "text", "text": "已完成。"},
             ],
@@ -1816,7 +1906,9 @@ class WorkerResourceGuardTest(unittest.TestCase):
         self.assertEqual(resources["executed_tool_call_count"], 1)
         self.assertAlmostEqual(resources["business_duration_seconds"], 1.2, places=9)
         self.assertAlmostEqual(resources["drain_duration_seconds"], 0.05, places=9)
-        self.assertEqual(resources["business_execution_budget_seconds"], DEFAULT_TURN_TIMEOUT_SECONDS)
+        self.assertEqual(
+            resources["business_execution_budget_seconds"], DEFAULT_TURN_TIMEOUT_SECONDS
+        )
 
     def test_v_hulan_04_missing_num_turns_is_unknown_not_zero(self) -> None:
         """ResultMessage 没有 num_turns 时必须保留未知，不能用 0 填洞。"""
@@ -1873,7 +1965,14 @@ class WorkerResourceGuardTest(unittest.TestCase):
         )
 
         usage = report["resources"]["usage"]
-        self.assertEqual(usage, {"status": "known", "source": "mock", "fields": {"input_tokens": 12, "output_tokens": 7}})
+        self.assertEqual(
+            usage,
+            {
+                "status": "known",
+                "source": "mock",
+                "fields": {"input_tokens": 12, "output_tokens": 7},
+            },
+        )
         self.assertNotIn(FAKE_CREDENTIAL, json.dumps(report, ensure_ascii=False))
         self.assertNotIn("模型正文不得进入 usage", json.dumps(report, ensure_ascii=False))
 
@@ -1986,7 +2085,12 @@ class ReviewHardeningTest(unittest.TestCase):
         """把此前"只上报不断言"的字段钉住：正常回合恰好一条非错误终止消息、
         回执计数与调用数一致。"""
         script = [
-            {"kind": "tool", "tool": READ_ONLY_TOOL, "input": {"metric": "dau"}, "result": ok_result()},
+            {
+                "kind": "tool",
+                "tool": READ_ONLY_TOOL,
+                "input": {"metric": "dau"},
+                "result": ok_result(),
+            },
             {"kind": "text", "text": "日活 1024。"},
         ]
         code, payload, _ = self._run_cli(FakeAgentSDK(script))
@@ -2003,12 +2107,16 @@ class ReviewHardeningTest(unittest.TestCase):
 
         probe = "Bearer LINGXI_FAKE_SECRET_a1b2c3d4e5f6g7h8"
         stdout, stderr = io.StringIO(), io.StringIO()
-        code = main(env=worker_env(LINGXI_WORKER_READONLY_TOOLS=probe), stdout=stdout, stderr=stderr)
+        code = main(
+            env=worker_env(LINGXI_WORKER_READONLY_TOOLS=probe), stdout=stdout, stderr=stderr
+        )
 
         self.assertEqual(code, 3)
         self.assertNotIn(probe, stdout.getvalue())
         self.assertNotIn(probe, stderr.getvalue())
-        self.assertNotIn("LINGXI_FAKE_SECRET_a1b2c3d4e5f6g7h8", stdout.getvalue() + stderr.getvalue())
+        self.assertNotIn(
+            "LINGXI_FAKE_SECRET_a1b2c3d4e5f6g7h8", stdout.getvalue() + stderr.getvalue()
+        )
 
     def test_a_hung_transport_times_out_as_an_explicit_failure(self) -> None:
         """Codex 复查：SDK 传输挂住不发终止消息时必须墙钟超时并出失败报告，
@@ -2032,7 +2140,9 @@ class ReviewHardeningTest(unittest.TestCase):
         from lingxi.apps.worker.cli import main
 
         stdout, stderr = io.StringIO(), io.StringIO()
-        code = main(env=worker_env(LINGXI_WORKER_TURN_TIMEOUT_SECONDS="0.05"), stdout=stdout, stderr=stderr)
+        code = main(
+            env=worker_env(LINGXI_WORKER_TURN_TIMEOUT_SECONDS="0.05"), stdout=stdout, stderr=stderr
+        )
 
         self.assertEqual(code, 4)
         payload = json.loads(stdout.getvalue())
@@ -2097,7 +2207,11 @@ class ReviewHardeningTest(unittest.TestCase):
         for value in ("inf", "Infinity", "1e999", "nan"):
             with self.subTest(value=value):
                 stdout, stderr = io.StringIO(), io.StringIO()
-                code = main(env=worker_env(LINGXI_WORKER_TURN_TIMEOUT_SECONDS=value), stdout=stdout, stderr=stderr)
+                code = main(
+                    env=worker_env(LINGXI_WORKER_TURN_TIMEOUT_SECONDS=value),
+                    stdout=stdout,
+                    stderr=stderr,
+                )
                 self.assertEqual(code, 3)
 
     def test_an_interruption_still_produces_a_report(self) -> None:
@@ -2300,7 +2414,12 @@ class WorkerCliTest(unittest.TestCase):
         from lingxi.apps.worker.cli import main
 
         script = [
-            {"kind": "tool", "tool": READ_ONLY_TOOL, "input": {"metric": "dau"}, "result": ok_result()},
+            {
+                "kind": "tool",
+                "tool": READ_ONLY_TOOL,
+                "input": {"metric": "dau"},
+                "result": ok_result(),
+            },
             {"kind": "text", "text": "日活 1024。"},
         ]
         FakeAgentSDK(script).install(self)
@@ -2487,10 +2606,17 @@ class ContentCaptureEndToEndWiringTest(unittest.TestCase):
         report = asyncio.run(executor.run_turn(config.question))
         return report, executor, config
 
-    def test_a_real_turn_produces_a_capture_record_matching_the_real_tool_call_and_answer(self) -> None:
+    def test_a_real_turn_produces_a_capture_record_matching_the_real_tool_call_and_answer(
+        self,
+    ) -> None:
         report, executor, config = self._run_turn_with_capture(
             [
-                {"kind": "tool", "tool": READ_ONLY_TOOL, "input": {"metric": "dau"}, "result": ok_result()},
+                {
+                    "kind": "tool",
+                    "tool": READ_ONLY_TOOL,
+                    "input": {"metric": "dau"},
+                    "result": ok_result(),
+                },
                 {"kind": "text", "text": "近 7 天日活是 1024。"},
             ],
             capture=True,
@@ -2513,13 +2639,20 @@ class ContentCaptureEndToEndWiringTest(unittest.TestCase):
         self.assertEqual(call.result_summary["result_kind"], "ok")
         self.assertIn("1024", call.result_summary["content"])
 
-    def test_capture_disabled_by_default_produces_no_record_even_with_a_real_tool_call(self) -> None:
+    def test_capture_disabled_by_default_produces_no_record_even_with_a_real_tool_call(
+        self,
+    ) -> None:
         """``capture_raw_content`` 不传即 False——默认关闭在真实装配路径下同样
         成立，不只是 core 层单测里的孤立断言。"""
 
         _report, executor, config = self._run_turn_with_capture(
             [
-                {"kind": "tool", "tool": READ_ONLY_TOOL, "input": {"metric": "dau"}, "result": ok_result()},
+                {
+                    "kind": "tool",
+                    "tool": READ_ONLY_TOOL,
+                    "input": {"metric": "dau"},
+                    "result": ok_result(),
+                },
                 {"kind": "text", "text": "近 7 天日活是 1024。"},
             ],
             capture=False,
@@ -2551,9 +2684,7 @@ class ToolCallProgressWiringTest(unittest.TestCase):
         config = load_config(worker_env())
         executor = WorkerTurnExecutor(config)
         received: list[str] = []
-        report = asyncio.run(
-            executor.run_turn(config.question, on_tool_call=received.append)
-        )
+        report = asyncio.run(executor.run_turn(config.question, on_tool_call=received.append))
         return report, received
 
     def test_listener_is_notified_for_both_an_allowed_and_a_denied_real_tool_call(
@@ -2561,7 +2692,12 @@ class ToolCallProgressWiringTest(unittest.TestCase):
     ) -> None:
         _report, received = self._run_turn_with_listener(
             [
-                {"kind": "tool", "tool": READ_ONLY_TOOL, "input": {"metric": "dau"}, "result": ok_result()},
+                {
+                    "kind": "tool",
+                    "tool": READ_ONLY_TOOL,
+                    "input": {"metric": "dau"},
+                    "result": ok_result(),
+                },
                 {"kind": "tool", "tool": "Write", "input": {"file_path": "/tmp/x", "content": "x"}},
                 {"kind": "text", "text": "日活是 1024；另一部分我无法查询。"},
             ]
@@ -2578,7 +2714,12 @@ class ToolCallProgressWiringTest(unittest.TestCase):
 
         FakeAgentSDK(
             [
-                {"kind": "tool", "tool": READ_ONLY_TOOL, "input": {"metric": "dau"}, "result": ok_result()},
+                {
+                    "kind": "tool",
+                    "tool": READ_ONLY_TOOL,
+                    "input": {"metric": "dau"},
+                    "result": ok_result(),
+                },
                 {"kind": "text", "text": "日活是 1024。"},
             ]
         ).install(self)
@@ -2621,7 +2762,12 @@ class WrapperDenialFuseWiringTest(unittest.TestCase):
         ``worker.max_turns`` 文案（本文件不复测那条映射本身，只钉住 code）。"""
 
         script = [self._wrapper_style_denied_step(i) for i in range(5)] + [
-            {"kind": "tool", "tool": READ_ONLY_TOOL, "input": {"metric": "dau"}, "result": ok_result()},
+            {
+                "kind": "tool",
+                "tool": READ_ONLY_TOOL,
+                "input": {"metric": "dau"},
+                "result": ok_result(),
+            },
         ]
         report, _fake, _executor = run_turn(self, script)
 
@@ -2639,7 +2785,12 @@ class WrapperDenialFuseWiringTest(unittest.TestCase):
         不触发护栏。"""
 
         script = [self._wrapper_style_denied_step(i) for i in range(4)] + [
-            {"kind": "tool", "tool": READ_ONLY_TOOL, "input": {"metric": "dau"}, "result": ok_result()},
+            {
+                "kind": "tool",
+                "tool": READ_ONLY_TOOL,
+                "input": {"metric": "dau"},
+                "result": ok_result(),
+            },
             {"kind": "text", "text": "日活是 1024；其余部分我无法查询。"},
         ]
         report, _fake, _executor = run_turn(self, script)
@@ -2789,7 +2940,14 @@ class WrapperDenialFuseWiringTest(unittest.TestCase):
         """
 
         script = (
-            [{"kind": "tool", "tool": READ_ONLY_TOOL, "input": {"metric": "dau"}, "result": ok_result()}]
+            [
+                {
+                    "kind": "tool",
+                    "tool": READ_ONLY_TOOL,
+                    "input": {"metric": "dau"},
+                    "result": ok_result(),
+                }
+            ]
             + [self._wrapper_style_denied_step(i) for i in range(5)]
             + [{"kind": "text", "text": "日活是 1024；其余部分我无法查询。"}]
         )
@@ -2818,7 +2976,12 @@ class WrapperDenialFuseWiringTest(unittest.TestCase):
         from lingxi.apps.worker.turn import WorkerTurnExecutor
 
         granted_script = [
-            {"kind": "tool", "tool": READ_ONLY_TOOL, "input": {"metric": "dau"}, "result": ok_result()},
+            {
+                "kind": "tool",
+                "tool": READ_ONLY_TOOL,
+                "input": {"metric": "dau"},
+                "result": ok_result(),
+            },
             {"kind": "text", "text": "日活是 1024。"},
         ]
         fake = FakeAgentSDK(granted_script).install(self)

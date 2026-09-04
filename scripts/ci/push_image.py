@@ -58,9 +58,9 @@ PERMISSION = "permission"
 OTHER = "other"
 
 # 远端已有同名 tag 时的两种情形。
-TAG_IDENTICAL = "identical"   # 同源，重跑或补推 → 跳过该服务，继续推其余
-TAG_CONFLICT = "conflict"     # 异源 → 拒绝，不可变 tag 不得被覆盖
-TAG_UNKNOWN = "unknown"       # 读不到来源标签 → 拒绝，无法判定时不放行
+TAG_IDENTICAL = "identical"  # 同源，重跑或补推 → 跳过该服务，继续推其余
+TAG_CONFLICT = "conflict"  # 异源 → 拒绝，不可变 tag 不得被覆盖
+TAG_UNKNOWN = "unknown"  # 读不到来源标签 → 拒绝，无法判定时不放行
 
 
 @dataclass(frozen=True)
@@ -112,12 +112,16 @@ def remote_tag_exists(reference: str, runner=run_command) -> bool:
 def image_source_identity(reference: str, runner=run_command) -> tuple[str, str] | None:
     """读一个**本地**镜像的来源身份（源提交 sha, 源码树哈希）。读不到返回 None。"""
 
-    result = runner([
-        "docker", "inspect", "--format",
-        "{{index .Config.Labels \"%s\"}} {{index .Config.Labels \"%s\"}}"
-        % (REVISION_LABEL, SOURCE_TREE_LABEL),
-        reference,
-    ])
+    result = runner(
+        [
+            "docker",
+            "inspect",
+            "--format",
+            '{{index .Config.Labels "%s"}} {{index .Config.Labels "%s"}}'
+            % (REVISION_LABEL, SOURCE_TREE_LABEL),
+            reference,
+        ]
+    )
     if result.returncode != 0:
         return None
     parts = result.stdout.split()
@@ -164,10 +168,15 @@ def write_line(path: pathlib.Path | None, text: str) -> None:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("reference", help="完整镜像引用，例如 ghcr.io/moshuiwang/lingxi-scheduler:20260806-abc123def456")
+    parser.add_argument(
+        "reference",
+        help="完整镜像引用，例如 ghcr.io/moshuiwang/lingxi-scheduler:20260806-abc123def456",
+    )
     parser.add_argument("--artifact-dir", type=pathlib.Path, help="降级时把镜像 tar 存到这里")
     parser.add_argument("--summary-file", type=pathlib.Path, help="GitHub Step Summary 文件")
-    parser.add_argument("--output-file", type=pathlib.Path, help="GitHub Actions 的 GITHUB_OUTPUT 文件")
+    parser.add_argument(
+        "--output-file", type=pathlib.Path, help="GitHub Actions 的 GITHUB_OUTPUT 文件"
+    )
     args = parser.parse_args()
 
     reference = args.reference
@@ -198,7 +207,10 @@ def main() -> int:
         # 不会再用到本地那个 tag，所以覆盖本地 tag 没有副作用。
         pull = run_command(["docker", "pull", "--quiet", reference])
         if pull.returncode != 0:
-            print(f"远端已有 {reference} 但拉不下来，无法判定来源，拒绝推送：{pull.stderr.strip()}", file=sys.stderr)
+            print(
+                f"远端已有 {reference} 但拉不下来，无法判定来源，拒绝推送：{pull.stderr.strip()}",
+                file=sys.stderr,
+            )
             return 1
         remote_identity = image_source_identity(reference)
         verdict = classify_existing_tag(local_identity, remote_identity)
@@ -216,7 +228,8 @@ def main() -> int:
             return 0
 
         reason = (
-            "读不到远端的来源标签" if verdict is TAG_UNKNOWN
+            "读不到远端的来源标签"
+            if verdict is TAG_UNKNOWN
             else f"远端来源 {remote_identity[0] if remote_identity else '?'} 与本地 {local_identity[0]} 不同"
         )
         print(
@@ -229,8 +242,7 @@ def main() -> int:
         write_line(args.output_file, "pushed=false")
         write_line(
             args.summary_file,
-            f"### 拒绝推送：不可变 tag 会被覆盖\n\n"
-            f"- 引用：`{reference}`\n- 判定：{reason}\n",
+            f"### 拒绝推送：不可变 tag 会被覆盖\n\n- 引用：`{reference}`\n- 判定：{reason}\n",
         )
         return 1
 

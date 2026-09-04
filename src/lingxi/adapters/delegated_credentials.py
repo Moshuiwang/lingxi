@@ -258,7 +258,10 @@ class HostFileDelegatedCredentialVault:
                     logger.warning("轮换结果已过期（期间发生新授权），放弃写回")
                     return False
 
-            with connect(self._dsn, timeouts=self._timeouts) as connection, connection.cursor() as cursor:
+            with (
+                connect(self._dsn, timeouts=self._timeouts) as connection,
+                connection.cursor() as cursor,
+            ):
                 if require_absent_registration:
                     # 首次建立的 CAS：只有登记表仍为空这一插入才会命中，返回零行
                     # 说明期间已经有主体登记，本次一律放弃——不覆盖、不更新。
@@ -301,7 +304,9 @@ class HostFileDelegatedCredentialVault:
                     "refresh_token": grant.refresh_token.reveal(),
                     "scope": grant.scope,
                     "issued_at": moment.isoformat(),
-                    "refresh_at": rotation_deadline(moment, grant.refresh_token_expires_in).isoformat(),
+                    "refresh_at": rotation_deadline(
+                        moment, grant.refresh_token_expires_in
+                    ).isoformat(),
                     "expires_at": expiry_moment(moment, grant.refresh_token_expires_in).isoformat(),
                     "consumed_at": None,
                     # 只记"哪一刻消费了一次续期"，不记任何令牌值。
@@ -312,7 +317,9 @@ class HostFileDelegatedCredentialVault:
                     "refresh_consumed_count": refresh_consumed_count,
                 }
                 self._write_encrypted(payload)
-        logger.info("专用授权凭据已加密写入宿主机文件 subject=%s", redact_identifier(subject_open_id))
+        logger.info(
+            "专用授权凭据已加密写入宿主机文件 subject=%s", redact_identifier(subject_open_id)
+        )
         return True
 
     def revoke(self, *, reason: str, generation: str | None = None) -> bool:
@@ -338,7 +345,9 @@ class HostFileDelegatedCredentialVault:
             logger.warning("专用授权凭据已撤销 reason=%s", reason)
         return existed
 
-    def revoke_stale_consumed(self, *, max_age_seconds: int = 600, now: datetime | None = None) -> bool:
+    def revoke_stale_consumed(
+        self, *, max_age_seconds: int = 600, now: datetime | None = None
+    ) -> bool:
         """收殓「已消费但一直没写回新凭据」的文件。
 
         这种文件意味着进程在续期后、落盘前死掉：旧令牌已被飞书作废，留着密文
@@ -488,7 +497,9 @@ class HostFileDelegatedCredentialVault:
             )
             # 当日消费计数的基线：跨了 UTC 日界（或从未消费过）就是 0，否则沿用落盘的
             # 那个值——旧凭据文件没有这个字段时按 0 处理（向后兼容）。
-            count_today = _parse_supply_count(payload.get("refresh_consumed_count")) if same_utc_day else 0
+            count_today = (
+                _parse_supply_count(payload.get("refresh_consumed_count")) if same_utc_day else 0
+            )
 
             if for_supply:
                 if last_consumed_at is not None and moment - last_consumed_at < min_interval:
@@ -534,7 +545,10 @@ class HostFileDelegatedCredentialVault:
         登记表里，双向触发器只护着 B，继续用 A 的凭据等于在防线外运行
         （终轮 Codex）。清除旧文件并要求重新授权是唯一安全的恢复。"""
 
-        with connect(self._dsn, timeouts=self._timeouts) as connection, connection.cursor() as cursor:
+        with (
+            connect(self._dsn, timeouts=self._timeouts) as connection,
+            connection.cursor() as cursor,
+        ):
             cursor.execute(
                 "SELECT subject_open_id FROM feishu_delegated_subject WHERE purpose = %s",
                 (DELEGATED_PURPOSE,),
@@ -571,7 +585,9 @@ class HostFileDelegatedCredentialVault:
     def _write_encrypted(self, payload: dict[str, Any]) -> None:
         blob = self._cipher.encrypt(json.dumps(payload, ensure_ascii=False).encode())
         self._path.parent.mkdir(parents=True, exist_ok=True)
-        descriptor, temp_name = tempfile.mkstemp(dir=str(self._path.parent), prefix=self._path.name + ".")
+        descriptor, temp_name = tempfile.mkstemp(
+            dir=str(self._path.parent), prefix=self._path.name + "."
+        )
         try:
             os.fchmod(descriptor, 0o600)
             with os.fdopen(descriptor, "wb") as handle:
@@ -586,12 +602,20 @@ class HostFileDelegatedCredentialVault:
         subject = payload.get("subject_open_id")
         refresh_at = _parse_moment(payload.get("refresh_at"))
         expires_at = _parse_moment(payload.get("expires_at"))
-        if not isinstance(token, str) or not token or not isinstance(subject, str) or refresh_at is None or expires_at is None:
+        if (
+            not isinstance(token, str)
+            or not token
+            or not isinstance(subject, str)
+            or refresh_at is None
+            or expires_at is None
+        ):
             return None
         remaining = max(int((expires_at - datetime.now(UTC)).total_seconds()), 1)
         return StoredCredential(
             subject_open_id=subject,
-            grant=AuthorizationGrant(SecretToken(token), remaining, str(payload.get("scope") or "")),
+            grant=AuthorizationGrant(
+                SecretToken(token), remaining, str(payload.get("scope") or "")
+            ),
             refresh_at=refresh_at,
             expires_at=expires_at,
             generation=str(payload.get("generation") or ""),

@@ -202,7 +202,9 @@ class InputBoundaryTests(unittest.TestCase):
                 self.assertTrue(result.blocked, f"{label} 应当命中 system_prompt_marker")
                 self.assertEqual(result.reasons, ("system_prompt_marker",))
 
-    def test_v_149_normalization_does_not_change_the_original_text_shown_around_the_hit(self) -> None:
+    def test_v_149_normalization_does_not_change_the_original_text_shown_around_the_hit(
+        self,
+    ) -> None:
         """折叠只用于检测，替换仍然发生在原文上——命中范围之外的原始字符（包括
         全角字符本身）必须原样保留，不能被悄悄转成半角。"""
 
@@ -391,9 +393,7 @@ class InputBoundaryTests(unittest.TestCase):
         模糊拦截，误报控制用例需要覆盖 external_texts 这条路径）。"""
 
         metric_description = (
-            "日活用户数：统计当日登录过的去重用户数。"
-            "口径与埋点保持一致。"
-            "不含内部测试账号。"
+            "日活用户数：统计当日登录过的去重用户数。口径与埋点保持一致。不含内部测试账号。"
         )
         answer = "日活用户数：统计当日登录过的去重用户数。近 7 天日活是 1024，环比上升 3%。"
 
@@ -461,7 +461,9 @@ class InputBoundaryTests(unittest.TestCase):
         self.assertEqual(result.text, WITHHELD_MESSAGE)
         self.assertNotIn(INJECTION, result.text)
 
-    def test_v_149_system_prompt_fragment_leak_with_only_punctuation_residue_is_withheld(self) -> None:
+    def test_v_149_system_prompt_fragment_leak_with_only_punctuation_residue_is_withheld(
+        self,
+    ) -> None:
         """同一缺陷的系统提示复现：模型只复述了系统提示里的一句，命中区间之外
         只剩下一个句号，没有任何真实业务结论——必须整段拒发，而不是放行一个
         只剩标点的"命中"结果。"""
@@ -606,7 +608,9 @@ class WorkerReportProjectionTests(unittest.TestCase):
         self.assertNotIn(FAKE_CREDENTIAL, serialized)
         self.assertNotIn(SYSTEM_PROMPT, serialized)
 
-    def test_report_marks_redacted_withheld_and_honest_user_result_when_nothing_survives(self) -> None:
+    def test_report_marks_redacted_withheld_and_honest_user_result_when_nothing_survives(
+        self,
+    ) -> None:
         """#141 合同第 2 条：整段命中时报告必须暴露独立可查询的 withheld 终态，
         且不得再把 user_result 记成 obtained——即使**工具调用本身是成功的**
         （这正是 #141 真实验收发现的形状：内部记 obtained，用户拿到的是兜底）。"""
@@ -629,7 +633,9 @@ class WorkerReportProjectionTests(unittest.TestCase):
             {
                 "kind": "tool_result",
                 "tool_use_id": "toolu-1",
-                "content": json.dumps({"metrics": [{"metric": "dau", "value": 1024}]}, ensure_ascii=False),
+                "content": json.dumps(
+                    {"metrics": [{"metric": "dau", "value": 1024}]}, ensure_ascii=False
+                ),
                 "is_error": False,
             }
         )
@@ -894,7 +900,11 @@ class StreamingOutputGuardTests(unittest.TestCase):
         guard = StreamingOutputGuard()
         released = [
             guard.feed(chunk)
-            for chunk in ("近 7 天日活趋势平稳，", "环比上升约 3 个百分点，", "样本覆盖全部活跃用户。")
+            for chunk in (
+                "近 7 天日活趋势平稳，",
+                "环比上升约 3 个百分点，",
+                "样本覆盖全部活跃用户。",
+            )
         ]
         final = guard.finish()
 

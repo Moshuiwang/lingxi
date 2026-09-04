@@ -333,9 +333,7 @@ class DocumentDeliveryConsumer:
                 # 永远看不到"有请求耗尽重试预算被清出队列"这件事。不带具体 task_id
                 # （这是一次批量转态，不是单行结果），退化为不带 trace_id 的信号
                 # （见 `delivery_alert_callback` 对空/非法 task_id 的既有容错）。
-                logger.error(
-                    "gateway.document_delivery.attempts_exhausted count=%s", exhausted
-                )
+                logger.error("gateway.document_delivery.attempts_exhausted count=%s", exhausted)
                 self._alert("document_delivery_attempts_exhausted", "")
 
         try:
@@ -347,9 +345,7 @@ class DocumentDeliveryConsumer:
             if reclaim_failed > 0:
                 # 同上：回收时直接判定 failed 的那部分（重试预算已耗尽）此前同样
                 # 只落日志、不上报。
-                logger.error(
-                    "gateway.document_delivery.reclaim_failed count=%s", reclaim_failed
-                )
+                logger.error("gateway.document_delivery.reclaim_failed count=%s", reclaim_failed)
                 self._alert("document_delivery_reclaim_failed", "")
 
         # P2-2（opus 审查）：补发"文档已就绪"通知排在认领新行**之前**——已经
@@ -380,7 +376,9 @@ class DocumentDeliveryConsumer:
 
         for claim in claims:
             logger.info(
-                "gateway.document_delivery.claimed task_id=%s attempts=%s", claim.task_id, claim.attempts
+                "gateway.document_delivery.claimed task_id=%s attempts=%s",
+                claim.task_id,
+                claim.attempts,
             )
             try:
                 self._process_claim(claim)
@@ -592,7 +590,9 @@ class DocumentDeliveryConsumer:
             sheet_id = self._sheets.get_default_sheet_id(spreadsheet_token)
             # 写值天然幂等（PUT 覆盖式接口），检查点恢复路径无条件重放——不需要
             # docx 那样先读一遍判断"是否已经写过"（见模块文档「表格分支」）。
-            self._sheets.write_values(spreadsheet_token, sheet_id, [list(row) for row in claim.paragraphs])
+            self._sheets.write_values(
+                spreadsheet_token, sheet_id, [list(row) for row in claim.paragraphs]
+            )
             self._sheets.grant_full_access(spreadsheet_token, claim.requester_open_id)
             members = self._sheets.read_members(spreadsheet_token)
         except DocumentDeliveryOwnershipLost:
@@ -698,7 +698,9 @@ class DocumentDeliveryConsumer:
             return
         except Exception as error:  # 记录失败不能让异常逃出本方法
             logger.error(
-                "文档投递终态写入失败（failed）task_id=%s error=%s", claim.task_id, type(error).__name__
+                "文档投递终态写入失败（failed）task_id=%s error=%s",
+                claim.task_id,
+                type(error).__name__,
             )
         logger.error(
             "gateway.document_delivery.failed task_id=%s attempts=%s last_error=%s",
@@ -724,7 +726,9 @@ class DocumentDeliveryConsumer:
             if claim.delivery_type == DELIVERY_TYPE_SHEET
             else ("delivery.document_failed", "document-failed", {})
         )
-        self._send_terminal_notice(claim, key=key, dedupe_prefix=dedupe_prefix, template_variables=variables)
+        self._send_terminal_notice(
+            claim, key=key, dedupe_prefix=dedupe_prefix, template_variables=variables
+        )
 
     def _uncertain(self, claim: DocumentDeliveryClaim, *, last_error: str) -> None:
         from lingxi.adapters.postgres_document_delivery import DocumentDeliveryOwnershipLost
@@ -740,7 +744,9 @@ class DocumentDeliveryConsumer:
             return
         except Exception as error:  # 记录失败不能让异常逃出本方法
             logger.error(
-                "文档投递终态写入失败（uncertain）task_id=%s error=%s", claim.task_id, type(error).__name__
+                "文档投递终态写入失败（uncertain）task_id=%s error=%s",
+                claim.task_id,
+                type(error).__name__,
             )
         logger.warning(
             "gateway.document_delivery.uncertain task_id=%s attempts=%s last_error=%s",
@@ -761,7 +767,9 @@ class DocumentDeliveryConsumer:
             if claim.delivery_type == DELIVERY_TYPE_SHEET
             else ("delivery.document_uncertain", "document-uncertain", {})
         )
-        self._send_terminal_notice(claim, key=key, dedupe_prefix=dedupe_prefix, template_variables=variables)
+        self._send_terminal_notice(
+            claim, key=key, dedupe_prefix=dedupe_prefix, template_variables=variables
+        )
 
     def _send_ready_notice(
         self,
@@ -998,7 +1006,9 @@ def assemble_document_delivery_consumer(
     )
     return DocumentDeliveryConsumer(
         store=store
-        or PostgresDocumentDeliveryStore(str(config.postgres_dsn), timeouts=config.postgres_timeouts),
+        or PostgresDocumentDeliveryStore(
+            str(config.postgres_dsn), timeouts=config.postgres_timeouts
+        ),
         docx=docx,
         sheets=sheets,
         notifier=notifier,

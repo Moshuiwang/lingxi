@@ -107,11 +107,7 @@ def build_client(*, app_id: str, app_secret: str, timeout_seconds: float) -> Any
     import lark_oapi as lark
 
     return (
-        lark.Client.builder()
-        .app_id(app_id)
-        .app_secret(app_secret)
-        .timeout(timeout_seconds)
-        .build()
+        lark.Client.builder().app_id(app_id).app_secret(app_secret).timeout(timeout_seconds).build()
     )
 
 

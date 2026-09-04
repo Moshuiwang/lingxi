@@ -62,9 +62,7 @@ class StalledProvisioningCandidate:
 class PostgresStalledProvisioningStore:
     """候选查询的只读口。构造时不连接数据库，每次调用自带连接（adapters 既有惯例）。"""
 
-    def __init__(
-        self, dsn: str, *, timeouts: PostgresTimeouts = DEFAULT_POSTGRES_TIMEOUTS
-    ) -> None:
+    def __init__(self, dsn: str, *, timeouts: PostgresTimeouts = DEFAULT_POSTGRES_TIMEOUTS) -> None:
         self._dsn = dsn
         self._timeouts = timeouts
 
@@ -131,11 +129,18 @@ class PostgresStalledProvisioningStore:
         入站事件（本来就没有），只能查到本职责落的那一行失败原因。
         """
 
-        if isinstance(lease_seconds, bool) or not isinstance(lease_seconds, int) or lease_seconds < 1:
+        if (
+            isinstance(lease_seconds, bool)
+            or not isinstance(lease_seconds, int)
+            or lease_seconds < 1
+        ):
             raise ValueError("租约必须是正整数秒")
         if isinstance(limit, bool) or not isinstance(limit, int) or limit < 1:
             raise ValueError("limit 必须是正整数")
-        with connect(self._dsn, timeouts=self._timeouts) as connection, connection.cursor() as cursor:
+        with (
+            connect(self._dsn, timeouts=self._timeouts) as connection,
+            connection.cursor() as cursor,
+        ):
             cursor.execute(
                 """
                 SELECT u.id, u.feishu_open_id,

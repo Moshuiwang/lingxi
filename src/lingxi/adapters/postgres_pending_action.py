@@ -151,7 +151,9 @@ TARGET_HAS_PENDING_ACTION_CODE = "target_has_pending_action"
 #: format_in_flight_conflict_message`` 按查到的在途行动态生成，带摘要与自助指引
 #: （Trace #445 #437 拦截文案改进：修复"提示不说、旧卡可能淹没在历史消息
 #: 里"这条真实运维事故，见该函数文档）。
-TARGET_HAS_PENDING_ACTION_MESSAGE = "该用户当前已有一条待确认操作在途，请先处理（确认或取消）后再重新发起。"
+TARGET_HAS_PENDING_ACTION_MESSAGE = (
+    "该用户当前已有一条待确认操作在途，请先处理（确认或取消）后再重新发起。"
+)
 
 #: 收回的自我目标防呆拒绝码/文案（#319 S-P-1b 卡 B）：取值与 ``core/admin/
 #: router._SELF_TARGET_FORBIDDEN_CODE``/拒绝文案相同字符串——两个模块结构上
@@ -286,7 +288,10 @@ class PostgresPendingActionStore:
         self._metric_map_path = metric_map_path
 
     def get(self, *, pending_action_id: str) -> PendingAction | None:
-        with connect(self._dsn, timeouts=self._timeouts) as connection, connection.cursor() as cursor:
+        with (
+            connect(self._dsn, timeouts=self._timeouts) as connection,
+            connection.cursor() as cursor,
+        ):
             cursor.execute(
                 f"SELECT {_SELECT_COLUMNS} FROM pending_action WHERE id = %s", (pending_action_id,)
             )
@@ -351,9 +356,7 @@ class PostgresPendingActionStore:
         # 0081 基线曾把职位展开授权的 permission_group_id 写成 pending_action
         # 的 pac_ id。新授权使用专用 lpg_ 前缀，但存量不迁移，所以旧组卡仍须按组
         # 撤销，而不能被误当成历史 NULL 组的单行撤销。
-        is_group_revoke_action = is_revoke_action and target_open_id.startswith(
-            ("lpg_", "pac_")
-        )
+        is_group_revoke_action = is_revoke_action and target_open_id.startswith(("lpg_", "pac_"))
         position_expansion = None
         if position_name is not None or company_scope is not None:
             if action_type is not PendingActionType.LOCAL_PERMISSION_GRANT:
@@ -472,7 +475,9 @@ class PostgresPendingActionStore:
                                             "direction": first[2],
                                             "position_name": first[5],
                                             "company_scope": first[6],
-                                            "companies": list(dict.fromkeys(row[3] for row in group_rows)),
+                                            "companies": list(
+                                                dict.fromkeys(row[3] for row in group_rows)
+                                            ),
                                             "pairs": [[row[3], row[4]] for row in group_rows],
                                             "reason": reason,
                                         },
@@ -695,7 +700,10 @@ class PostgresPendingActionStore:
         调用也不会把已经因为其它路径前进过的 sequence 倒退回 2。
         """
 
-        with connect(self._dsn, timeouts=self._timeouts) as connection, connection.cursor() as cursor:
+        with (
+            connect(self._dsn, timeouts=self._timeouts) as connection,
+            connection.cursor() as cursor,
+        ):
             cursor.execute(
                 "UPDATE pending_action SET card_delivered = TRUE, card_id = %s,"
                 " card_sequence = GREATEST(card_sequence, 2)"
@@ -713,7 +721,10 @@ class PostgresPendingActionStore:
         """
 
         moment = now or datetime.now(UTC)
-        with connect(self._dsn, timeouts=self._timeouts) as connection, connection.cursor() as cursor:
+        with (
+            connect(self._dsn, timeouts=self._timeouts) as connection,
+            connection.cursor() as cursor,
+        ):
             cursor.execute(
                 "UPDATE pending_action SET status = 'failed', reason = 'card_send_failed',"
                 " decided_at = %s WHERE id = %s AND status = 'pending'",
@@ -729,7 +740,10 @@ class PostgresPendingActionStore:
         不同的、严格递增的返回值，不需要额外加锁或包一层显式事务。
         """
 
-        with connect(self._dsn, timeouts=self._timeouts) as connection, connection.cursor() as cursor:
+        with (
+            connect(self._dsn, timeouts=self._timeouts) as connection,
+            connection.cursor() as cursor,
+        ):
             cursor.execute(
                 "UPDATE pending_action SET card_sequence = card_sequence + 1"
                 " WHERE id = %s RETURNING card_sequence",
@@ -874,14 +888,18 @@ class PostgresPendingActionStore:
                             # 之间被删除（target_user_id 为 None），那种情况下必须
                             # 仍然判定为漂移，不能假装"无变化"。
                             current_account_state = (
-                                pending.target_state_snapshot if target_user_id is not None else None
+                                pending.target_state_snapshot
+                                if target_user_id is not None
+                                else None
                             )
                         elif pending.action_type is PendingActionType.LOCAL_PERMISSION_REVOKE:
                             # 同一手法（模块文档「本地权限收回如何复用同一套机制」）：
                             # 真正的漂移检测不经过这里的字符串比较，而是让下面 EXECUTE
                             # 分支的条件 UPDATE（_revoke_locked）的 rowcount 说话。
                             current_account_state = (
-                                pending.target_state_snapshot if target_user_id is not None else None
+                                pending.target_state_snapshot
+                                if target_user_id is not None
+                                else None
                             )
 
                     # 两把行锁（待确认操作、目标账号）与 admin_registry 的 FOR SHARE
@@ -981,11 +999,18 @@ class PostgresPendingActionStore:
                                     with connection.transaction():
                                         pairs = payload_data.get("pairs")
                                         if not pairs:
-                                            pairs = ((payload_data["company_id"], payload_data["metric_name"]),)
+                                            pairs = (
+                                                (
+                                                    payload_data["company_id"],
+                                                    payload_data["metric_name"],
+                                                ),
+                                            )
                                         for pair_company_id, pair_metric_name in pairs:
                                             entry = LocalPermissionOverrideEntry(
                                                 user_id=target_user_id,
-                                                direction=_DIRECTION_BY_ACTION_TYPE[pending.action_type],
+                                                direction=_DIRECTION_BY_ACTION_TYPE[
+                                                    pending.action_type
+                                                ],
                                                 company_id=pair_company_id,
                                                 metric_name=pair_metric_name,
                                                 reason=payload_data["reason"],
@@ -994,9 +1019,13 @@ class PostgresPendingActionStore:
                                                 created_at=moment,
                                                 position_name=payload_data.get("position_name"),
                                                 company_scope=payload_data.get("company_scope"),
-                                                permission_group_id=payload_data.get("permission_group_id"),
+                                                permission_group_id=payload_data.get(
+                                                    "permission_group_id"
+                                                ),
                                             )
-                                            _insert_locked(cursor, override_id=new_id("lpo"), entry=entry)
+                                            _insert_locked(
+                                                cursor, override_id=new_id("lpo"), entry=entry
+                                            )
                                 except DuplicateActiveOverride:
                                     decision = ConfirmDecision(
                                         kind=ConfirmResultKind.TARGET_DRIFTED,
@@ -1019,7 +1048,9 @@ class PostgresPendingActionStore:
                                         permission_group_id=payload_data["permission_group_id"],
                                         revoked_pending_action_id=pending.id,
                                         moment=moment,
-                                        expected_override_ids=tuple(payload_data.get("override_ids", ())),
+                                        expected_override_ids=tuple(
+                                            payload_data.get("override_ids", ())
+                                        ),
                                     )
                                 else:
                                     revoked = _revoke_locked(
@@ -1083,7 +1114,7 @@ class PostgresPendingActionStore:
     def cancel(
         self, *, pending_action_id: str, clicker_open_id: str, now: datetime | None = None
     ) -> CancelOutcome:
-        """"取消"按钮的事务：核对链更短（见 ``decide_cancel``），同样在同一事务内
+        """ "取消"按钮的事务：核对链更短（见 ``decide_cancel``），同样在同一事务内
         先写审计、失败即整体回滚。"审计与时钟"两条注意事项与 :meth:`~.confirm`
         文档同一姿态（结构化日志出口的"同一事务"只在失败方向成立；时钟在拿到行锁
         之后才取，外部审查交叉裁定，codex P1-3）。

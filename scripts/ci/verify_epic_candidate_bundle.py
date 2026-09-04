@@ -94,7 +94,10 @@ def check_manifest_shape(document: dict[str, object]) -> list[str]:
         if not isinstance(value, int) or isinstance(value, bool) or value <= 0:
             failures.append(f"manifest.{label} 不是正整数：{value!r}")
 
-    if not isinstance(document.get("repository"), str) or document.get("repository", "").count("/") != 1:
+    if (
+        not isinstance(document.get("repository"), str)
+        or document.get("repository", "").count("/") != 1
+    ):
         failures.append(f"manifest.repository 不是 owner/name 形状：{document.get('repository')!r}")
 
     images = document.get("images")
@@ -103,9 +106,13 @@ def check_manifest_shape(document: dict[str, object]) -> list[str]:
         return failures
 
     if len(images) != len(REQUIRED_SERVICES):
-        failures.append(f"manifest.images 有 {len(images)} 个条目，要求恰好 {len(REQUIRED_SERVICES)} 个")
+        failures.append(
+            f"manifest.images 有 {len(images)} 个条目，要求恰好 {len(REQUIRED_SERVICES)} 个"
+        )
 
-    services = tuple(sorted(str(item.get("service", "")) for item in images if isinstance(item, dict)))
+    services = tuple(
+        sorted(str(item.get("service", "")) for item in images if isinstance(item, dict))
+    )
     if services != REQUIRED_SERVICES:
         failures.append(f"manifest.images 的服务集合是 {services}，必须恰好是 {REQUIRED_SERVICES}")
 
@@ -113,7 +120,14 @@ def check_manifest_shape(document: dict[str, object]) -> list[str]:
         if not isinstance(item, dict):
             failures.append(f"manifest.images 里有非对象条目：{item!r}")
             continue
-        for field in ("service", "reference", "tar", "tar_sha256", "tar_size_bytes", "image_digest"):
+        for field in (
+            "service",
+            "reference",
+            "tar",
+            "tar_sha256",
+            "tar_size_bytes",
+            "image_digest",
+        ):
             if field not in item:
                 failures.append(f"镜像条目缺少字段 {field}：{item}")
         digest = item.get("image_digest")
@@ -258,15 +272,21 @@ def import_and_check_digest(
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("bundle_dir", type=pathlib.Path, help="包含 manifest.json 与四个 tar 的目录")
+    parser = argparse.ArgumentParser(
+        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
+    )
+    parser.add_argument(
+        "bundle_dir", type=pathlib.Path, help="包含 manifest.json 与四个 tar 的目录"
+    )
     parser.add_argument("--expect-repository")
     parser.add_argument("--expect-pr-number", type=int)
     parser.add_argument("--expect-head-sha")
     parser.add_argument("--expect-tree-sha")
     parser.add_argument("--expect-run-id", type=int)
     parser.add_argument(
-        "--import", dest="do_import", action="store_true",
+        "--import",
+        dest="do_import",
+        action="store_true",
         help="额外执行 docker load 并核对导入后的镜像 digest（需要本机 docker）",
     )
     args = parser.parse_args()

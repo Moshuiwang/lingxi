@@ -351,7 +351,9 @@ class TargetedPermissionRecompute:
         if match.state != MATCHED or not match.galaxy_user_id:
             # 匹配失败＝"认不出这个人"，与每日批同一姿态：不做任何撤权/发布写入，
             # 保留发布表现状，交给下一轮每日批（那时花名册/银河数据可能已经更新）。
-            return self._skip(user_id, mode="recompute", reason=SKIP_MATCH_FAILED, match_reason=match.reason)
+            return self._skip(
+                user_id, mode="recompute", reason=SKIP_MATCH_FAILED, match_reason=match.reason
+            )
 
         if not identity.email or not identity.display_name:
             return self._skip(user_id, mode="recompute", reason=SKIP_ARCHIVED_IDENTITY_INCOMPLETE)
@@ -373,7 +375,9 @@ class TargetedPermissionRecompute:
                     mapping=self._metric_translation_map,
                 )
             except UncoveredPermissionCombination:
-                return self._skip(user_id, mode="recompute", reason=SKIP_METRIC_TRANSLATION_UNCOVERED)
+                return self._skip(
+                    user_id, mode="recompute", reason=SKIP_METRIC_TRANSLATION_UNCOVERED
+                )
             cause = None
         else:
             # 零银河权限：银河对合并的贡献恒为空字典，不调用翻译（与
@@ -411,7 +415,10 @@ class TargetedPermissionRecompute:
         if not merged.permissions:
             if not self._publish_history.has_publish_footprint(user_id):
                 return self._skip(
-                    user_id, mode="recompute", reason=SKIP_NO_PUBLISHED_ROW, cause=cause or "fully_suppressed"
+                    user_id,
+                    mode="recompute",
+                    reason=SKIP_NO_PUBLISHED_ROW,
+                    cause=cause or "fully_suppressed",
                 )
             return self._settle_revocation(user_id, identity, cause=cause or "fully_suppressed")
 
@@ -480,7 +487,9 @@ class TargetedPermissionRecompute:
         self, user_id: str, identity: ArchivedIdentity, *, cause: str
     ) -> TargetedRecomputeOutcome:
         now = self._clock()
-        row = build_revocation_row(email=identity.email, display_name=identity.display_name, decided_at=now)
+        row = build_revocation_row(
+            email=identity.email, display_name=identity.display_name, decided_at=now
+        )
         decision = self._decisions.record_decision(
             user_id=user_id,
             row=row,

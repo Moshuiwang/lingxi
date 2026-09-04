@@ -254,7 +254,9 @@ def decide_snapshot_update(
         )
 
     return SnapshotDecision(
-        action=SnapshotAction.KEEP_PREVIOUS if previous is not None else SnapshotAction.NO_SNAPSHOT_YET,
+        action=SnapshotAction.KEEP_PREVIOUS
+        if previous is not None
+        else SnapshotAction.NO_SNAPSHOT_YET,
         status=status,
         alert=_classify(outcome, status),
         failure_code=failure_code,
@@ -503,18 +505,24 @@ class DailyRosterSource:
             # 刚写进去的就是本轮读到的那一份，不必再回读一次库：多读一次既慢，
             # 又给并发替换多开一个可以读到别人那一份的窗口。
             rows = tuple(getattr(outcome, "rows", ()))
-            return RosterRound(rows, self._status(decision, captured_at=moment, row_count=len(rows), now=moment))
+            return RosterRound(
+                rows, self._status(decision, captured_at=moment, row_count=len(rows), now=moment)
+            )
 
         stored = self._load_snapshot()
         if stored is None:
             # 库里一份都没有：`decision.action` 已经是 `NO_SNAPSHOT_YET`，这里也可能是
             # 「刚刚被并发删掉」。两种情况对日报是同一件事：没有基线，不能比对。
-            return RosterRound((), self._status(decision, captured_at=None, row_count=0, now=moment))
+            return RosterRound(
+                (), self._status(decision, captured_at=None, row_count=0, now=moment)
+            )
 
         facts = stored.facts
         return RosterRound(
             tuple(stored.rows),
-            self._status(decision, captured_at=facts.captured_at, row_count=facts.row_count, now=moment),
+            self._status(
+                decision, captured_at=facts.captured_at, row_count=facts.row_count, now=moment
+            ),
         )
 
     def _status(

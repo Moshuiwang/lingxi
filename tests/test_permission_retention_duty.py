@@ -153,7 +153,9 @@ def build_duty(
 class SweepTest(unittest.TestCase):
     def test_every_round_sweeps_all_three_tables_exactly_once(self) -> None:
         duty, parts = build_duty(
-            outbox=FakeOutbox(redacted=3), checks=FakeChecks(purged=7), notices=FakeNotices(purged=2)
+            outbox=FakeOutbox(redacted=3),
+            checks=FakeChecks(purged=7),
+            notices=FakeNotices(purged=2),
         )
 
         report = duty.run_once()
@@ -174,7 +176,9 @@ class SweepTest(unittest.TestCase):
         """
 
         duty, parts = build_duty(
-            outbox=FakeOutbox(redacted=500), checks=FakeChecks(purged=500), notices=FakeNotices(purged=500)
+            outbox=FakeOutbox(redacted=500),
+            checks=FakeChecks(purged=500),
+            notices=FakeNotices(purged=500),
         )
 
         duty.run_once()
@@ -248,14 +252,21 @@ class FailClosedTest(unittest.TestCase):
     """
 
     def test_a_failing_payload_sweep_is_audited_and_raised(self) -> None:
-        duty, parts = build_duty(outbox=FakeOutbox(error=RuntimeError("锁等待超时")), checks=FakeChecks())
+        duty, parts = build_duty(
+            outbox=FakeOutbox(error=RuntimeError("锁等待超时")), checks=FakeChecks()
+        )
 
         with self.assertRaises(RuntimeError):
             duty.run_once()
 
         self.assertEqual(
             parts["audit"].entries,
-            [("permission_retention.sweep_failed", {"table": "publish_outbox", "error": "RuntimeError"})],
+            [
+                (
+                    "permission_retention.sweep_failed",
+                    {"table": "publish_outbox", "error": "RuntimeError"},
+                )
+            ],
         )
         self.assertEqual(parts["checks"].calls, 0, "上一面没做完就不往下走")
         self.assertNotIn("permission_retention.completed", parts["audit"].actions)
@@ -268,7 +279,12 @@ class FailClosedTest(unittest.TestCase):
 
         self.assertEqual(
             parts["audit"].entries,
-            [("permission_retention.sweep_failed", {"table": "mcp_sync_check", "error": "RuntimeError"})],
+            [
+                (
+                    "permission_retention.sweep_failed",
+                    {"table": "mcp_sync_check", "error": "RuntimeError"},
+                )
+            ],
         )
         self.assertNotIn("permission_retention.completed", parts["audit"].actions)
 
@@ -380,13 +396,19 @@ class RetentionSweepPostgresTest(unittest.TestCase):
                          (id, feishu_open_id, feishu_user_id, feishu_union_id, display_name,
                           department, tenant_key, email)
                        VALUES (%s, %s, %s, %s, %s, %s, %s, %s)""",
-                    (user_id, f"ou_{user_id}", f"fs_{user_id}", f"on_{user_id}", name,
-                     "测试部门", "tenant-fake", email),
+                    (
+                        user_id,
+                        f"ou_{user_id}",
+                        f"fs_{user_id}",
+                        f"on_{user_id}",
+                        name,
+                        "测试部门",
+                        "tenant-fake",
+                        email,
+                    ),
                 )
         self.outbox = PostgresPermissionPublishStore(self._dsn)
-        self.checks = PostgresMcpTokenStore(
-            self._dsn, cipher=McpTokenCipher(SPEC_MASTER_KEY)
-        )
+        self.checks = PostgresMcpTokenStore(self._dsn, cipher=McpTokenCipher(SPEC_MASTER_KEY))
         self.notices = PostgresLateReadinessStore(self._dsn)
         self.audit = RecordingAudit()
         self.duty = PermissionRetentionSweepDuty(
@@ -414,8 +436,13 @@ class RetentionSweepPostgresTest(unittest.TestCase):
                       last_error, external_record_id, created_at, content_expires_at)
                    VALUES (%s, %s, %s, 'permission_refresh', %s::jsonb, 'failed', 5,
                            'http_500', 'rec_1', now() - %s::interval, now())""",
-                (outbox_id, user_id, version, json.dumps(payload, ensure_ascii=False),
-                 timedelta(days=age_days)),
+                (
+                    outbox_id,
+                    user_id,
+                    version,
+                    json.dumps(payload, ensure_ascii=False),
+                    timedelta(days=age_days),
+                ),
             )
         return outbox_id
 
@@ -502,7 +529,9 @@ class RetentionSweepPostgresTest(unittest.TestCase):
             self.assertEqual(int(cursor.fetchone()[0]), 1, "到期的是内容，不是行本身")
             cursor.execute("SELECT count(*) FROM app_user")
             self.assertEqual(int(cursor.fetchone()[0]), 2, "用户表一行都不碰")
-            cursor.execute("SELECT token_cipher FROM mcp_access_token WHERE user_id = %s", (USER_A,))
+            cursor.execute(
+                "SELECT token_cipher FROM mcp_access_token WHERE user_id = %s", (USER_A,)
+            )
             self.assertEqual(str(cursor.fetchone()[0]), issued.token_cipher, "令牌密文一个字不动")
 
         stored = self.outbox.load(expired)
@@ -578,8 +607,7 @@ class ProductionCallerSourceTest(unittest.TestCase):
                 callers = sorted(
                     path.relative_to(source_root).as_posix()
                     for path in source_root.rglob("*.py")
-                    if path.name != defining_module
-                    and _reads_attribute(path, method)
+                    if path.name != defining_module and _reads_attribute(path, method)
                 )
                 self.assertTrue(
                     callers,
@@ -622,9 +650,7 @@ class AssemblyTest(unittest.TestCase):
 
     def test_the_duty_is_assembled_into_the_scheduler_process(self) -> None:
         loop = build_loop(self._config())
-        matching = [
-            duty for duty in loop.duties if isinstance(duty, PermissionRetentionSweepDuty)
-        ]
+        matching = [duty for duty in loop.duties if isinstance(duty, PermissionRetentionSweepDuty)]
 
         self.assertEqual(len(matching), 1, "权限链到期清理必须恰好注册一条")
         self.assertIn("权限链到期清理", [duty.name for duty in loop.duties])
@@ -640,9 +666,7 @@ class AssemblyTest(unittest.TestCase):
         from lingxi.adapters.postgres_permission_publish import PostgresPermissionPublishStore
 
         loop = build_loop(self._config(mcp_token_encrypt_key=SPEC_MASTER_KEY))
-        (duty,) = [
-            item for item in loop.duties if isinstance(item, PermissionRetentionSweepDuty)
-        ]
+        (duty,) = [item for item in loop.duties if isinstance(item, PermissionRetentionSweepDuty)]
 
         self.assertIsInstance(duty._outbox, PostgresPermissionPublishStore)
         self.assertIsInstance(duty._checks, PostgresMcpTokenStore)
@@ -654,9 +678,7 @@ class AssemblyTest(unittest.TestCase):
 
         audit = RecordingAudit()
         loop = build_loop(self._config(), audit=audit)
-        (duty,) = [
-            item for item in loop.duties if isinstance(item, PermissionRetentionSweepDuty)
-        ]
+        (duty,) = [item for item in loop.duties if isinstance(item, PermissionRetentionSweepDuty)]
 
         self.assertFalse(duty.checks_wired)
         self.assertIsNotNone(duty._outbox, "带个人数据的那一面无条件装配")

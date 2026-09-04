@@ -37,7 +37,15 @@ class GalaxyCsvExportTest(unittest.TestCase):
     def test_five_sheets_map_to_five_csv_files(self) -> None:
         self.assertEqual(
             sorted(EXPORT_FILE_NAMES.values()),
-            sorted(["user.csv", "user_role.csv", "role_menu.csv", "sys_user_datacountry.csv", "sys_country.csv"]),
+            sorted(
+                [
+                    "user.csv",
+                    "user_role.csv",
+                    "role_menu.csv",
+                    "sys_user_datacountry.csv",
+                    "sys_country.csv",
+                ]
+            ),
         )
 
     def test_directory_is_read_into_five_tables(self) -> None:
@@ -67,7 +75,10 @@ class GalaxyCsvExportTest(unittest.TestCase):
             first = load_export_directory(Path(raw_a)).digest
             same = load_export_directory(Path(raw_b)).digest
 
-            _write_export(Path(raw_b), {"user_role.csv": "user_id,role_id,user_name,role_name\nU1,R-乙,化名甲,A销售\n"})
+            _write_export(
+                Path(raw_b),
+                {"user_role.csv": "user_id,role_id,user_name,role_name\nU1,R-乙,化名甲,A销售\n"},
+            )
             changed = load_export_directory(Path(raw_b)).digest
 
         self.assertEqual(first, same)
@@ -98,7 +109,9 @@ class GalaxyCsvExportTest(unittest.TestCase):
     def test_short_row_is_padded_with_empty_strings_not_none(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
             directory = Path(raw)
-            _write_export(directory, {"role_menu.csv": "role_id,menu_id,role_name,menu_name\nR-甲,M1\n"})
+            _write_export(
+                directory, {"role_menu.csv": "role_id,menu_id,role_name,menu_name\nR-甲,M1\n"}
+            )
 
             rows = read_csv_table(directory / "role_menu.csv")
 

@@ -210,7 +210,10 @@ class PostgresDocumentDeliveryStore:
         :meth:`fail_exhausted_pending` 转终态 ``failed``，不会被这里认领到。
         """
 
-        with connect(self._dsn, timeouts=self._timeouts) as connection, connection.cursor() as cursor:
+        with (
+            connect(self._dsn, timeouts=self._timeouts) as connection,
+            connection.cursor() as cursor,
+        ):
             cursor.execute(
                 """
                 UPDATE task_document_delivery_request
@@ -248,7 +251,10 @@ class PostgresDocumentDeliveryStore:
         提交在持有权已经转移之后继续覆盖/绕过后续判断。
         """
 
-        with connect(self._dsn, timeouts=self._timeouts) as connection, connection.cursor() as cursor:
+        with (
+            connect(self._dsn, timeouts=self._timeouts) as connection,
+            connection.cursor() as cursor,
+        ):
             cursor.execute(
                 """
                 UPDATE task_document_delivery_request
@@ -280,7 +286,10 @@ class PostgresDocumentDeliveryStore:
         因此不存在"上次降级、这次没降级"需要清位的场景。
         """
 
-        with connect(self._dsn, timeouts=self._timeouts) as connection, connection.cursor() as cursor:
+        with (
+            connect(self._dsn, timeouts=self._timeouts) as connection,
+            connection.cursor() as cursor,
+        ):
             cursor.execute(
                 """
                 UPDATE task_document_delivery_request
@@ -298,7 +307,10 @@ class PostgresDocumentDeliveryStore:
         P1-2：命中 0 行时抛出 :class:`DocumentDeliveryOwnershipLost`。
         """
 
-        with connect(self._dsn, timeouts=self._timeouts) as connection, connection.cursor() as cursor:
+        with (
+            connect(self._dsn, timeouts=self._timeouts) as connection,
+            connection.cursor() as cursor,
+        ):
             cursor.execute(
                 """
                 UPDATE task_document_delivery_request
@@ -325,7 +337,10 @@ class PostgresDocumentDeliveryStore:
         ``dedupe_key`` 去重，不在这里）。
         """
 
-        with connect(self._dsn, timeouts=self._timeouts) as connection, connection.cursor() as cursor:
+        with (
+            connect(self._dsn, timeouts=self._timeouts) as connection,
+            connection.cursor() as cursor,
+        ):
             cursor.execute(
                 """
                 SELECT id, task_id, requester_open_id, document_id, delivery_type, resource_url,
@@ -342,7 +357,7 @@ class PostgresDocumentDeliveryStore:
             return [UnnotifiedSuccess(*row) for row in cursor.fetchall()]
 
     def mark_notified(self, *, request_id: str) -> None:
-        """"文档已就绪"通知确认送达：置位 ``notified_at``（P2-2）。
+        """ "文档已就绪"通知确认送达：置位 ``notified_at``（P2-2）。
 
         ``WHERE ... AND notified_at IS NULL`` 是幂等闸——已经置过位的行再次调用
         是无害的 no-op（0 行），不覆盖第一次确认的时间戳。命中 0 行不视为
@@ -352,7 +367,10 @@ class PostgresDocumentDeliveryStore:
         调用方做任何补救，静默返回即可。
         """
 
-        with connect(self._dsn, timeouts=self._timeouts) as connection, connection.cursor() as cursor:
+        with (
+            connect(self._dsn, timeouts=self._timeouts) as connection,
+            connection.cursor() as cursor,
+        ):
             cursor.execute(
                 """
                 UPDATE task_document_delivery_request
@@ -371,7 +389,10 @@ class PostgresDocumentDeliveryStore:
         P1-2：命中 0 行时抛出 :class:`DocumentDeliveryOwnershipLost`。
         """
 
-        with connect(self._dsn, timeouts=self._timeouts) as connection, connection.cursor() as cursor:
+        with (
+            connect(self._dsn, timeouts=self._timeouts) as connection,
+            connection.cursor() as cursor,
+        ):
             cursor.execute(
                 """
                 UPDATE task_document_delivery_request
@@ -389,7 +410,10 @@ class PostgresDocumentDeliveryStore:
         P1-2：命中 0 行时抛出 :class:`DocumentDeliveryOwnershipLost`。
         """
 
-        with connect(self._dsn, timeouts=self._timeouts) as connection, connection.cursor() as cursor:
+        with (
+            connect(self._dsn, timeouts=self._timeouts) as connection,
+            connection.cursor() as cursor,
+        ):
             cursor.execute(
                 """
                 UPDATE task_document_delivery_request
@@ -465,7 +489,10 @@ class PostgresDocumentDeliveryStore:
         清出消费循环，而不是无限期占着索引却永远认领不到。
         """
 
-        with connect(self._dsn, timeouts=self._timeouts) as connection, connection.cursor() as cursor:
+        with (
+            connect(self._dsn, timeouts=self._timeouts) as connection,
+            connection.cursor() as cursor,
+        ):
             cursor.execute(
                 """
                 UPDATE task_document_delivery_request
@@ -476,9 +503,7 @@ class PostgresDocumentDeliveryStore:
             )
             return cursor.rowcount
 
-    def fail_expired_pending(
-        self, *, older_than: timedelta = PENDING_DEAD_LETTER_AFTER
-    ) -> int:
+    def fail_expired_pending(self, *, older_than: timedelta = PENDING_DEAD_LETTER_AFTER) -> int:
         """R-2 死信面（opus 审查，Issue #341）：把停在 ``pending`` 超过
         ``older_than`` 仍未被任何消费循环认领的行直接转终态 ``failed``
         （``last_error = 'pending_expired_unconsumed'``）。
@@ -502,7 +527,10 @@ class PostgresDocumentDeliveryStore:
         同时把同一行既转 ``processing`` 又转 ``failed``。
         """
 
-        with connect(self._dsn, timeouts=self._timeouts) as connection, connection.cursor() as cursor:
+        with (
+            connect(self._dsn, timeouts=self._timeouts) as connection,
+            connection.cursor() as cursor,
+        ):
             cursor.execute(
                 """
                 UPDATE task_document_delivery_request
@@ -539,7 +567,10 @@ class PostgresDocumentDeliveryStore:
 
         if isinstance(limit, bool) or not isinstance(limit, int) or limit < 1:
             raise ValueError("limit 必须是正整数")
-        with connect(self._dsn, timeouts=self._timeouts) as connection, connection.cursor() as cursor:
+        with (
+            connect(self._dsn, timeouts=self._timeouts) as connection,
+            connection.cursor() as cursor,
+        ):
             cursor.execute(
                 """
                 UPDATE task_document_delivery_request

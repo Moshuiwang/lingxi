@@ -162,7 +162,17 @@ def verify_batch(batch: SnapshotBatch) -> IntegrityReport:
     for item in batch.members:
         if item.tenant_key not in declared_tenants:
             problems.append(IntegrityProblem.MEMBER_TENANT_UNKNOWN)
-        if any(_blank(value) for value in (item.open_id, item.user_id, item.union_id, item.display_name, item.tenant_key, item.member_key)):
+        if any(
+            _blank(value)
+            for value in (
+                item.open_id,
+                item.user_id,
+                item.union_id,
+                item.display_name,
+                item.tenant_key,
+                item.member_key,
+            )
+        ):
             problems.append(IntegrityProblem.IDENTITY_FIELD_MISSING)
             continue
         if item.open_id in seen_open_ids:
@@ -198,7 +208,11 @@ def require_complete_batch(batch: SnapshotBatch) -> IntegrityReport:
 def snapshot_expires_at(started_at: datetime) -> datetime:
     """一轮快照的到期时刻：来源时间 + 2160 小时，调用方不得自定义或后移。"""
 
-    if not isinstance(started_at, datetime) or started_at.tzinfo is None or started_at.utcoffset() is None:
+    if (
+        not isinstance(started_at, datetime)
+        or started_at.tzinfo is None
+        or started_at.utcoffset() is None
+    ):
         raise ValueError("started_at 必须是带时区的 UTC 时间")
     return started_at + timedelta(hours=SNAPSHOT_RETENTION_HOURS)
 
@@ -216,10 +230,16 @@ def directory_availability(expires_at: datetime | None, now: datetime) -> Direct
 
     if expires_at is None:
         return DirectoryAvailability.UNAVAILABLE
-    return DirectoryAvailability.STALE if snapshot_is_expired(expires_at, now) else DirectoryAvailability.AVAILABLE
+    return (
+        DirectoryAvailability.STALE
+        if snapshot_is_expired(expires_at, now)
+        else DirectoryAvailability.AVAILABLE
+    )
 
 
-def index_members_by_open_id(members: Sequence[SnapshotMember]) -> dict[str, tuple[SnapshotMember, ...]]:
+def index_members_by_open_id(
+    members: Sequence[SnapshotMember],
+) -> dict[str, tuple[SnapshotMember, ...]]:
     """按完整 ``open_id`` 建索引。**不做前缀、不做大小写归一、不做姓名回退。**"""
 
     index: dict[str, list[SnapshotMember]] = {}

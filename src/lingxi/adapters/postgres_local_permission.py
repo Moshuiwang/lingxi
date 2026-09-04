@@ -211,9 +211,7 @@ def _row_to_stored(row: tuple) -> StoredLocalPermissionOverride:
 class PostgresLocalPermissionOverrideStore:
     """``local_permission_override`` 表的唯一真实实现。"""
 
-    def __init__(
-        self, dsn: str, *, timeouts: PostgresTimeouts = DEFAULT_POSTGRES_TIMEOUTS
-    ) -> None:
+    def __init__(self, dsn: str, *, timeouts: PostgresTimeouts = DEFAULT_POSTGRES_TIMEOUTS) -> None:
         self._dsn = dsn
         self._timeouts = timeouts
 
@@ -225,7 +223,10 @@ class PostgresLocalPermissionOverrideStore:
         :func:`resolve_local_overrides` 对输入次序不敏感（集合运算）。
         """
 
-        with connect(self._dsn, timeouts=self._timeouts) as connection, connection.cursor() as cursor:
+        with (
+            connect(self._dsn, timeouts=self._timeouts) as connection,
+            connection.cursor() as cursor,
+        ):
             cursor.execute(
                 f"SELECT {_SELECT_COLUMNS} FROM local_permission_override"
                 " WHERE user_id = %s AND entry_status = 'active'"
@@ -248,7 +249,10 @@ class PostgresLocalPermissionOverrideStore:
         判定留给 ``core/daily_report.py::build_local_override_activity``。
         """
 
-        with connect(self._dsn, timeouts=self._timeouts) as connection, connection.cursor() as cursor:
+        with (
+            connect(self._dsn, timeouts=self._timeouts) as connection,
+            connection.cursor() as cursor,
+        ):
             cursor.execute(
                 _DAILY_ACTIVITY_STATS_SQL,
                 {"window_start": window_start, "window_end": window_end},
@@ -323,7 +327,10 @@ class PostgresLocalPermissionOverrideStore:
         )
 
         override_id = new_id("lpo")
-        with connect(self._dsn, timeouts=self._timeouts) as connection, connection.cursor() as cursor:
+        with (
+            connect(self._dsn, timeouts=self._timeouts) as connection,
+            connection.cursor() as cursor,
+        ):
             _insert_locked(cursor, override_id=override_id, entry=entry)
         return StoredLocalPermissionOverride(id=override_id, entry=entry)
 
@@ -350,9 +357,15 @@ class PostgresLocalPermissionOverrideStore:
         """
 
         moment = now or datetime.now(UTC)
-        with connect(self._dsn, timeouts=self._timeouts) as connection, connection.cursor() as cursor:
+        with (
+            connect(self._dsn, timeouts=self._timeouts) as connection,
+            connection.cursor() as cursor,
+        ):
             return _revoke_locked(
-                cursor, override_id=override_id, revoked_pending_action_id=revoked_pending_action_id, moment=moment
+                cursor,
+                override_id=override_id,
+                revoked_pending_action_id=revoked_pending_action_id,
+                moment=moment,
             )
 
     def revoke_group(
@@ -374,7 +387,10 @@ class PostgresLocalPermissionOverrideStore:
         if not permission_group_id or not expected_override_ids:
             return False
         moment = now or datetime.now(UTC)
-        with connect(self._dsn, timeouts=self._timeouts) as connection, connection.cursor() as cursor:
+        with (
+            connect(self._dsn, timeouts=self._timeouts) as connection,
+            connection.cursor() as cursor,
+        ):
             return _revoke_group_locked(
                 cursor,
                 permission_group_id=permission_group_id,
@@ -382,7 +398,6 @@ class PostgresLocalPermissionOverrideStore:
                 moment=moment,
                 expected_override_ids=expected_override_ids,
             )
-
 
     def import_plan(
         self, *, user_id: str, target_open_id: str, plan: LegacyImportPlan, now: datetime
@@ -429,7 +444,10 @@ class PostgresLocalPermissionOverrideStore:
         group_metrics = tuple(plan.all_scope_metrics)
         if not pairs and not group_metrics:
             return LegacyImportReport(imported=0, already_present=0)
-        with connect(self._dsn, timeouts=self._timeouts) as connection, connection.cursor() as cursor:
+        with (
+            connect(self._dsn, timeouts=self._timeouts) as connection,
+            connection.cursor() as cursor,
+        ):
             # 用户级行锁（独立审核 P3-4）：同一用户两条并发开通链不会各建半个「全部」组。
             cursor.execute("SELECT id FROM app_user WHERE id = %s FOR UPDATE", (user_id,))
             cursor.execute(
@@ -462,12 +480,16 @@ class PostgresLocalPermissionOverrideStore:
             missing_group = [
                 metric
                 for metric in group_metrics
-                if (ALL_COMPANIES_KEY, metric) not in existing and (ALL_COMPANIES_KEY, metric) not in revoked
+                if (ALL_COMPANIES_KEY, metric) not in existing
+                and (ALL_COMPANIES_KEY, metric) not in revoked
             ]
-            revoked_skipped = sum(1 for pair in pairs if pair not in existing and pair in revoked) + sum(
+            revoked_skipped = sum(
+                1 for pair in pairs if pair not in existing and pair in revoked
+            ) + sum(
                 1
                 for metric in group_metrics
-                if (ALL_COMPANIES_KEY, metric) not in existing and (ALL_COMPANIES_KEY, metric) in revoked
+                if (ALL_COMPANIES_KEY, metric) not in existing
+                and (ALL_COMPANIES_KEY, metric) in revoked
             )
             group_skipped_revoked = False
             if group_metrics and existing_group is None and revoked_group:
@@ -489,7 +511,9 @@ class PostgresLocalPermissionOverrideStore:
                     revoked_skipped=revoked_skipped,
                 )
 
-            group_id = existing_group if existing_group else (new_id("lpg") if missing_group else None)
+            group_id = (
+                existing_group if existing_group else (new_id("lpg") if missing_group else None)
+            )
             pending_id = _insert_synthetic_pending_action(
                 cursor,
                 target_open_id=target_open_id,
@@ -580,8 +604,13 @@ class PostgresLocalPermissionOverrideStore:
         wanted = tuple(dict.fromkeys(metric for metric in metrics if metric))
         if not group_id or not wanted:
             return 0
-        with connect(self._dsn, timeouts=self._timeouts) as connection, connection.cursor() as cursor:
-            cursor.execute("SELECT feishu_open_id FROM app_user WHERE id = %s FOR UPDATE", (user_id,))
+        with (
+            connect(self._dsn, timeouts=self._timeouts) as connection,
+            connection.cursor() as cursor,
+        ):
+            cursor.execute(
+                "SELECT feishu_open_id FROM app_user WHERE id = %s FOR UPDATE", (user_id,)
+            )
             row = cursor.fetchone()
             if row is None or not row[0]:
                 return 0
@@ -630,7 +659,6 @@ class PostgresLocalPermissionOverrideStore:
                 cursor.execute("DELETE FROM pending_action WHERE id = %s", (pending_id,))
             return added
 
-
     def import_position_grant(
         self,
         *,
@@ -665,7 +693,10 @@ class PostgresLocalPermissionOverrideStore:
 
         if not grant.pairs:
             return LegacyImportReport(imported=0, already_present=0)
-        with connect(self._dsn, timeouts=self._timeouts) as connection, connection.cursor() as cursor:
+        with (
+            connect(self._dsn, timeouts=self._timeouts) as connection,
+            connection.cursor() as cursor,
+        ):
             return _apply_position_grant_locked(
                 cursor,
                 user_id=user_id,

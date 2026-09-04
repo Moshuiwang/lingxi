@@ -250,16 +250,17 @@ def run_refresh() -> int:
         return 0
 
     lowered = sorted(
-        path
-        for path in new_baseline
-        if path in baseline and new_baseline[path] < baseline[path]
+        path for path in new_baseline if path in baseline and new_baseline[path] < baseline[path]
     )
     removed = sorted(path for path in baseline if path not in new_baseline)
 
     BASELINE_PATH.write_text(render_baseline(new_baseline), encoding="utf-8")
 
     if lowered:
-        print("已调低：" + "、".join(f"{path}（{baseline[path]}→{new_baseline[path]}）" for path in lowered))
+        print(
+            "已调低："
+            + "、".join(f"{path}（{baseline[path]}→{new_baseline[path]}）" for path in lowered)
+        )
     if removed:
         print("已移除（已缩到阈值以下或已删除）：" + "、".join(removed))
     print(f"文件体量棘轮基线已刷新：{len(new_baseline)} 条登记")

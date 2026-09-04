@@ -1429,9 +1429,7 @@ def check_module_manifests(
     process = (
         PROCESS_RUNTIME_IMPORTS if process_runtime_imports is None else process_runtime_imports
     )
-    actual_exemptions = dict(
-        MODULE_MANIFEST_EXEMPTIONS if exemptions is None else exemptions
-    )
+    actual_exemptions = dict(MODULE_MANIFEST_EXEMPTIONS if exemptions is None else exemptions)
     failures: list[str] = []
 
     if not files:
@@ -1446,9 +1444,7 @@ def check_module_manifests(
     if set(frozen_exemption_reasons) != frozen_exemption_names:
         failures.append("模块豁免冻结键集与冻结理由全文不一致，冻结清单本身需要修复。")
     for name in sorted(actual_exemption_names - frozen_exemption_names):
-        failures.append(
-            f"豁免 `{name}`：不是已批准的模块豁免；不能用错误豁免掩盖制品清单漏项。"
-        )
+        failures.append(f"豁免 `{name}`：不是已批准的模块豁免；不能用错误豁免掩盖制品清单漏项。")
     for name in sorted(frozen_exemption_names - actual_exemption_names):
         failures.append(f"豁免 `{name}`：已批准但未登记，必须保留可审查理由。")
     for name, reason in sorted(actual_exemptions.items()):
@@ -1505,7 +1501,9 @@ def check_module_manifests(
         try:
             expected = process_source_closure(extra, files)
         except (OSError, SyntaxError) as error:
-            failures.append(f"进程 `{extra}`：无法解析源码 import 闭包（{type(error).__name__}: {error}）。")
+            failures.append(
+                f"进程 `{extra}`：无法解析源码 import 闭包（{type(error).__name__}: {error}）。"
+            )
             expected = set()
 
         for name in sorted(expected - listed_set):
@@ -1520,13 +1518,9 @@ def check_module_manifests(
             )
 
         if expected and extra in PROCESS_ENTRY_EXEMPTIONS:
-            failures.append(
-                f"进程 `{extra}`：存在实际 lingxi import 闭包，却登记为入口豁免。"
-            )
+            failures.append(f"进程 `{extra}`：存在实际 lingxi import 闭包，却登记为入口豁免。")
         if not expected and extra not in PROCESS_ENTRY_EXEMPTIONS:
-            failures.append(
-                f"进程 `{extra}`：没有模块但缺少显式 PROCESS_ENTRY_EXEMPTIONS 理由。"
-            )
+            failures.append(f"进程 `{extra}`：没有模块但缺少显式 PROCESS_ENTRY_EXEMPTIONS 理由。")
 
         for name in sorted(listed_set):
             # 2026-08-23 #146 清退：此前 `bot-test` 进程组本身合法依赖自己的豁免
@@ -1552,7 +1546,9 @@ def _print_module_manifest_summary() -> None:
     print(f"  - 正式制品清单（{len(REQUIRED_MODULES)}）：{', '.join(REQUIRED_MODULES)}")
     for extra in sorted(PROCESS_RUNTIME_IMPORTS):
         lingxi_modules, _third_party_modules = PROCESS_RUNTIME_IMPORTS[extra]
-        print(f"  - 进程 `{extra}` 清单（{len(lingxi_modules)}）：{', '.join(lingxi_modules) or '（无）'}")
+        print(
+            f"  - 进程 `{extra}` 清单（{len(lingxi_modules)}）：{', '.join(lingxi_modules) or '（无）'}"
+        )
     print(
         f"  - 制品显式豁免（{len(MODULE_MANIFEST_EXEMPTIONS)}）："
         + ", ".join(
@@ -1562,8 +1558,7 @@ def _print_module_manifest_summary() -> None:
     print(
         "  - 进程入口显式豁免："
         + ", ".join(
-            f"{name}（{reason}）"
-            for name, reason in sorted(PROCESS_ENTRY_EXEMPTIONS.items())
+            f"{name}（{reason}）" for name, reason in sorted(PROCESS_ENTRY_EXEMPTIONS.items())
         )
     )
 
@@ -1599,7 +1594,9 @@ def check_ci_matrix(declared: set[str], workflow_text: str | None) -> list[str]:
         return [f"{CI_WORKFLOW}：读不到 CI 配置，无法核对 extras 矩阵"]
     matrix = ci_matrix_extras(workflow_text)
     if matrix is None:
-        return ["ci.yml：找不到 `extra: [...]` 矩阵行，extras 矩阵无法核对（改了写法就同步本脚本的正则）"]
+        return [
+            "ci.yml：找不到 `extra: [...]` 矩阵行，extras 矩阵无法核对（改了写法就同步本脚本的正则）"
+        ]
 
     failures: list[str] = []
     for name in sorted(declared - matrix - MATRIX_EXEMPT_EXTRAS):
@@ -1669,7 +1666,9 @@ def _check_process(name: str) -> list[str]:
         try:
             location = _installed_module_location(module_name)
         except Exception as error:  # noqa: BLE001 - 任何导入失败都是制品问题
-            failures.append(f"{name} 进程入口 {module_name}：导入失败（{type(error).__name__}: {error}）")
+            failures.append(
+                f"{name} 进程入口 {module_name}：导入失败（{type(error).__name__}: {error}）"
+            )
             continue
         if not any(marker in location.parts for marker in _INSTALL_MARKERS):
             failures.append(

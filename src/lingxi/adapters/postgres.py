@@ -168,7 +168,9 @@ def _read_timeout(environment: Mapping[str, str], name: str, default: int) -> in
     try:
         value = int(raw.strip())
     except (TypeError, ValueError):
-        raise PostgresTimeoutConfigError(f"{name} 必须是 1 到 {MAX_TIMEOUT_SECONDS} 的整数秒") from None
+        raise PostgresTimeoutConfigError(
+            f"{name} 必须是 1 到 {MAX_TIMEOUT_SECONDS} 的整数秒"
+        ) from None
     return _validate_timeout(name, value)
 
 

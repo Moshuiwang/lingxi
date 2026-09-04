@@ -258,9 +258,7 @@ def _check_free_space(
     try:
         stats = probe(str(path))
     except OSError as error:
-        raise HealthcheckError(
-            f"临时目录不可用：{type(error).__name__}"
-        ) from error
+        raise HealthcheckError(f"临时目录不可用：{type(error).__name__}") from error
     total = stats.f_blocks * stats.f_frsize
     free = stats.f_bavail * stats.f_frsize
     if total <= 0:

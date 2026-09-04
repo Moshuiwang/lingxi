@@ -94,7 +94,12 @@ class _ExternalMapFixture(unittest.TestCase):
 
     def packaged_metrics(self) -> set[str]:
         mapping = load_company_function_metric_map(None)
-        return {metric for functions in mapping.values() for values in functions.values() for metric in values}
+        return {
+            metric
+            for functions in mapping.values()
+            for values in functions.values()
+            for metric in values
+        }
 
 
 class SharedEnvSourceTests(_ExternalMapFixture):
@@ -144,8 +149,14 @@ class SharedEnvSourceTests(_ExternalMapFixture):
         for raw in ("", "   "):
             with self.subTest(raw=raw):
                 self.assertIsNone(parse_metric_map_path(raw))
-                self.assertIsNone(load_config({**GATEWAY_ENV, METRIC_MAP_PATH_ENV: raw}).metric_map_path)
-                self.assertIsNone(SchedulerConfig.from_env({**SCHEDULER_ENV, METRIC_MAP_PATH_ENV: raw}).metric_map_path)
+                self.assertIsNone(
+                    load_config({**GATEWAY_ENV, METRIC_MAP_PATH_ENV: raw}).metric_map_path
+                )
+                self.assertIsNone(
+                    SchedulerConfig.from_env(
+                        {**SCHEDULER_ENV, METRIC_MAP_PATH_ENV: raw}
+                    ).metric_map_path
+                )
 
     def test_a_misconfigured_value_fails_closed_at_startup_on_both_sides(self) -> None:
         """错配不是未配：带空白的路径两侧都启动即失败，且不回显取到的值。"""
@@ -164,7 +175,9 @@ class SharedEnvSourceTests(_ExternalMapFixture):
     def test_the_gateway_prefixed_name_is_not_read(self) -> None:
         """这不是 gateway 私有配置：带 LINGXI_GATEWAY_ 前缀的同名变量不该被读取。"""
 
-        config = load_config({**GATEWAY_ENV, f"{ENV_PREFIX}COMPANY_FUNCTION_METRIC_MAP_PATH": str(self.external)})
+        config = load_config(
+            {**GATEWAY_ENV, f"{ENV_PREFIX}COMPANY_FUNCTION_METRIC_MAP_PATH": str(self.external)}
+        )
         self.assertIsNone(config.metric_map_path)
 
 
@@ -182,7 +195,9 @@ class ManagementCardCatalogTests(_ExternalMapFixture):
         )
         self.assertEqual(catalog.companies(), (COMPANY,))
 
-    def test_a_configured_but_missing_file_degrades_to_empty_not_to_the_packaged_default(self) -> None:
+    def test_a_configured_but_missing_file_degrades_to_empty_not_to_the_packaged_default(
+        self,
+    ) -> None:
         catalog = TomlCompanyMetricCatalog(metric_map_path=self.missing)
 
         self.assertEqual(catalog.companies(), ())
@@ -359,7 +374,9 @@ class PositionGrantPayloadTests(_ExternalMapFixture):
         self.assertTrue(outcome.decision.ok, outcome.decision.message)
         self.assertIn(DELETED_METRIC, json.dumps(self._payload(), ensure_ascii=False))
 
-    def test_a_configured_but_missing_file_refuses_the_action_without_touching_the_database(self) -> None:
+    def test_a_configured_but_missing_file_refuses_the_action_without_touching_the_database(
+        self,
+    ) -> None:
         store = PostgresPendingActionStore(
             "postgresql://unused-by-the-fake-connection",
             audit=self.audit,
@@ -502,9 +519,11 @@ class GatewayAssemblyWiringTests(_ExternalMapFixture):
         saved = sys.modules.get("lark_oapi")
         sys.modules["lark_oapi"] = module
         self.addCleanup(
-            lambda: sys.modules.__setitem__("lark_oapi", saved)
-            if saved is not None
-            else sys.modules.pop("lark_oapi", None)
+            lambda: (
+                sys.modules.__setitem__("lark_oapi", saved)
+                if saved is not None
+                else sys.modules.pop("lark_oapi", None)
+            )
         )
 
     def _assemble(self, env_value: str | None) -> dict[str, object]:
@@ -527,18 +546,22 @@ class GatewayAssemblyWiringTests(_ExternalMapFixture):
 
             return factory
 
-        with mock.patch.object(
-            admin_card_module,
-            "TomlCompanyMetricCatalog",
-            _recording("catalog", admin_card_module.TomlCompanyMetricCatalog),
-        ), mock.patch.object(
-            pending_action_module,
-            "PostgresPendingActionStore",
-            _recording("pending_action", pending_action_module.PostgresPendingActionStore),
-        ), mock.patch.object(
-            recompute_module,
-            "PermissionRecomputeAdapter",
-            _recording("recompute", recompute_module.PermissionRecomputeAdapter),
+        with (
+            mock.patch.object(
+                admin_card_module,
+                "TomlCompanyMetricCatalog",
+                _recording("catalog", admin_card_module.TomlCompanyMetricCatalog),
+            ),
+            mock.patch.object(
+                pending_action_module,
+                "PostgresPendingActionStore",
+                _recording("pending_action", pending_action_module.PostgresPendingActionStore),
+            ),
+            mock.patch.object(
+                recompute_module,
+                "PermissionRecomputeAdapter",
+                _recording("recompute", recompute_module.PermissionRecomputeAdapter),
+            ),
         ):
             build_supervisor(config, transport=object())
 

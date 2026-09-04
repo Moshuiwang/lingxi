@@ -127,12 +127,17 @@ class LateReadinessRecoveryPostgresTestCase(unittest.TestCase):
 
         decision = self.publish_store.record_decision(
             require_enabled_account=True,
-            user_id=user_id, row=row or _row(), reason=reason, decided_at=NOW
+            user_id=user_id,
+            row=row or _row(),
+            reason=reason,
+            decided_at=NOW,
         )
         claimed = self.publish_store.claim_next()
         assert claimed is not None
         self.publish_store.complete(
-            _publish_attempt(claimed.outbox_id, version=claimed.permission_version, user_id=user_id),
+            _publish_attempt(
+                claimed.outbox_id, version=claimed.permission_version, user_id=user_id
+            ),
             status=STATUS_PUBLISHED,
         )
         return int(decision.permission_version)
@@ -229,7 +234,9 @@ class CandidateQueryTest(LateReadinessRecoveryPostgresTestCase):
 
         self.assertEqual(len(candidates), 1)
         self.assertFalse(hasattr(candidates[0], "already_ready"))
-        self.assertEqual(candidates[0].next_attempt_no, 3, "两条历史判定 + 1，不因为曾经 ready 而特殊处理")
+        self.assertEqual(
+            candidates[0].next_attempt_no, 3, "两条历史判定 + 1，不因为曾经 ready 而特殊处理"
+        )
 
     def test_a_suspended_account_is_not_a_candidate(self) -> None:
         version = self._publish()
@@ -241,7 +248,10 @@ class CandidateQueryTest(LateReadinessRecoveryPostgresTestCase):
     def test_an_intent_owned_by_another_orchestrator_is_not_a_candidate(self) -> None:
         self.publish_store.record_decision(
             require_enabled_account=True,
-            user_id=USER_A, row=_row(), reason="daily_permission_refresh", decided_at=NOW
+            user_id=USER_A,
+            row=_row(),
+            reason="daily_permission_refresh",
+            decided_at=NOW,
         )
         self.publish_store.claim_next()
         self._stuck()
@@ -374,9 +384,7 @@ class ActivationTest(LateReadinessRecoveryPostgresTestCase):
         )
 
         self.assertFalse(activated)
-        self.assertEqual(
-            self._provisioning_state(), "mcp_syncing", "CAS 失败绝不能推进状态"
-        )
+        self.assertEqual(self._provisioning_state(), "mcp_syncing", "CAS 失败绝不能推进状态")
         self.assertEqual(self._notice_count(), 0, "CAS 失败绝不能排出任何通知")
 
     def test_a_suspended_account_is_refused_and_creates_no_notice(self) -> None:
@@ -480,7 +488,9 @@ class NoticeOutboxTest(LateReadinessRecoveryPostgresTestCase):
     """通知 outbox 的 claim / complete / purge（F1 的持久重试半边）。"""
 
     def _activate(self, *, user_id: str = USER_A, version: int | None = None) -> int:
-        v = version or self._publish(user_id=user_id, row=_row(EMAIL_A if user_id == USER_A else EMAIL_B))
+        v = version or self._publish(
+            user_id=user_id, row=_row(EMAIL_A if user_id == USER_A else EMAIL_B)
+        )
         self._stuck(user_id)
         ok = self.store.activate_after_late_readiness(
             user_id=user_id,
@@ -589,7 +599,9 @@ class NoticeOutboxTest(LateReadinessRecoveryPostgresTestCase):
         purged = self.store.purge_expired_notices(now=far_future)
 
         self.assertEqual(purged, 1, "只删已送达且过期的那一条")
-        self.assertEqual(self._notice_count(USER_A), 1, "pending 的那一条绝不会被删——它还在等待送达")
+        self.assertEqual(
+            self._notice_count(USER_A), 1, "pending 的那一条绝不会被删——它还在等待送达"
+        )
         self.assertEqual(self._notice_count(USER_B), 0)
 
     def test_purge_requires_a_timezone_aware_moment(self) -> None:

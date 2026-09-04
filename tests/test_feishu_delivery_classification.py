@@ -224,7 +224,9 @@ class _FakeClient:
         reply: Any = None,
     ) -> None:
         self.create = create if isinstance(create, _Endpoint) else _Endpoint(create or _created())
-        self.content = content if isinstance(content, _Endpoint) else _Endpoint(content or _accepted())
+        self.content = (
+            content if isinstance(content, _Endpoint) else _Endpoint(content or _accepted())
+        )
         self.settings = (
             settings if isinstance(settings, _Endpoint) else _Endpoint(settings or _accepted())
         )
@@ -610,8 +612,14 @@ class UnexpectedExceptionTests(_ClassificationTestCase):
                     chat_id="oc-1", thread_id=None, reply_to_message_id="om-in-1", card=_card()
                 ),
             ),
-            ("update", lambda transports: transports[0].update(card_id="c", sequence=1, card=_card())),
-            ("close", lambda transports: transports[0].close(card_id="c", sequence=1, card=_card())),
+            (
+                "update",
+                lambda transports: transports[0].update(card_id="c", sequence=1, card=_card()),
+            ),
+            (
+                "close",
+                lambda transports: transports[0].close(card_id="c", sequence=1, card=_card()),
+            ),
             (
                 "send_text",
                 lambda transports: transports[1].send_text(
@@ -621,7 +629,9 @@ class UnexpectedExceptionTests(_ClassificationTestCase):
         ):
             with self.subTest(endpoint=endpoint):
                 failure = _UnknownSDKError("SDK 内部未知失败")
-                client = _FakeClient(create=failure, content=failure, settings=failure, reply=failure)
+                client = _FakeClient(
+                    create=failure, content=failure, settings=failure, reply=failure
+                )
                 transports = self._transports(client)
                 self.assert_result_unknown(lambda: invoke(transports), _UnknownSDKError)
 

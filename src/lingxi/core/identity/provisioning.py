@@ -275,9 +275,7 @@ class ProvisioningRequest:
         for field in ROSTER_ARCHIVE_FIELDS:
             if getattr(self.identity, field) is not None and getattr(self, field) is None:
                 raise ValueError(f"建档请求的花名册字段 {field} 只在草稿上有值，会被静默丢弃")
-        return dataclasses.replace(
-            self.identity, employee_no=self.employee_no, email=self.email
-        )
+        return dataclasses.replace(self.identity, employee_no=self.employee_no, email=self.email)
 
 
 @dataclass(frozen=True)
@@ -326,9 +324,7 @@ class ProvisioningResult:
     def rejected(
         cls, rejection: ProvisioningRejection, *, missing_fields: tuple[str, ...] = ()
     ) -> ProvisioningResult:
-        return cls(
-            ProvisioningOutcome.REJECTED, None, rejection, missing_fields
-        )
+        return cls(ProvisioningOutcome.REJECTED, None, rejection, missing_fields)
 
 
 class IdentityProvisioning(Protocol):

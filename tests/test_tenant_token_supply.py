@@ -145,7 +145,9 @@ class FailClosedTest(unittest.TestCase):
             supply()
 
     def test_never_returns_an_empty_or_placeholder_string(self) -> None:
-        supply, _fetch, _clock = build_supply(outcomes=[PermissionTableAccessTokenUnavailable("fetch_unavailable")])
+        supply, _fetch, _clock = build_supply(
+            outcomes=[PermissionTableAccessTokenUnavailable("fetch_unavailable")]
+        )
 
         with self.assertRaises(PermissionTableAccessTokenUnavailable):
             token = supply()

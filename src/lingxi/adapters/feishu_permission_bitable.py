@@ -122,7 +122,11 @@ class BitablePermissionTable:
         self._table_id = _require_identifier(table_id, "权限发布表 table_id")
         if not callable(access_token):
             raise ValueError("access_token 必须是返回已就绪短期令牌的可调用对象")
-        if isinstance(page_size, bool) or not isinstance(page_size, int) or not 1 <= page_size <= MAX_PAGE_SIZE:
+        if (
+            isinstance(page_size, bool)
+            or not isinstance(page_size, int)
+            or not 1 <= page_size <= MAX_PAGE_SIZE
+        ):
             raise ValueError(f"page_size 必须是 1 到 {MAX_PAGE_SIZE} 之间的整数")
         if isinstance(max_pages, bool) or not isinstance(max_pages, int) or max_pages < 1:
             raise ValueError("max_pages 必须是正整数")
@@ -250,7 +254,9 @@ class BitablePermissionTable:
         return tuple(matched)
 
     def create_row(self, fields: Mapping[str, str]) -> str:
-        data = self._call("POST", f"{self._base_url}{self._records_path}", body={"fields": dict(fields)})
+        data = self._call(
+            "POST", f"{self._base_url}{self._records_path}", body={"fields": dict(fields)}
+        )
         record_id, _ = self._record(data)
         logger.info("权限发布行已新建 record=%s", record_id)
         return record_id

@@ -87,14 +87,19 @@ class PostgresManagementCardContextStore:
         dispatch_status: str = "idle",
         last_trace_id: str | None = None,
     ) -> None:
-        if not all((message_id, identifier, card_id, chat_id, initiated_by_open_id, snapshot_fingerprint)):
+        if not all(
+            (message_id, identifier, card_id, chat_id, initiated_by_open_id, snapshot_fingerprint)
+        ):
             raise ValueError("管理卡持久上下文缺少必填字段")
         deadline = bounded_management_card_deadline(
             now=datetime.now(UTC),
             requested=context_deadline_at,
             ttl_seconds=self._ttl_seconds,
         )
-        with connect(self._dsn, timeouts=self._timeouts) as connection, connection.cursor() as cursor:
+        with (
+            connect(self._dsn, timeouts=self._timeouts) as connection,
+            connection.cursor() as cursor,
+        ):
             cursor.execute(
                 f"""
                 INSERT INTO management_card_context
@@ -153,10 +158,12 @@ class PostgresManagementCardContextStore:
 
         if not message_id:
             return None
-        with connect(self._dsn, timeouts=self._timeouts) as connection, connection.cursor() as cursor:
+        with (
+            connect(self._dsn, timeouts=self._timeouts) as connection,
+            connection.cursor() as cursor,
+        ):
             cursor.execute(
-                f"SELECT {_SELECT_COLUMNS} FROM management_card_context"
-                " WHERE message_id = %s",
+                f"SELECT {_SELECT_COLUMNS} FROM management_card_context WHERE message_id = %s",
                 (message_id,),
             )
             row = cursor.fetchone()
@@ -193,7 +200,10 @@ class PostgresManagementCardContextStore:
         if expected_card_sequence is not None:
             conditions.append("card_sequence = %(expected_card_sequence)s")
             parameters["expected_card_sequence"] = expected_card_sequence
-        with connect(self._dsn, timeouts=self._timeouts) as connection, connection.cursor() as cursor:
+        with (
+            connect(self._dsn, timeouts=self._timeouts) as connection,
+            connection.cursor() as cursor,
+        ):
             cursor.execute(
                 "UPDATE management_card_context"
                 " SET card_sequence = card_sequence + 1, updated_at = now()"
@@ -257,13 +267,15 @@ class PostgresManagementCardContextStore:
         if not assignments:
             return self.lookup_context(message_id=message_id)
         values.append(message_id)
-        with connect(self._dsn, timeouts=self._timeouts) as connection, connection.cursor() as cursor:
+        with (
+            connect(self._dsn, timeouts=self._timeouts) as connection,
+            connection.cursor() as cursor,
+        ):
             cursor.execute(
                 "UPDATE management_card_context SET "
                 + ", ".join(assignments)
                 + ", updated_at = now() WHERE message_id = %s"
-                " RETURNING "
-                + _SELECT_COLUMNS,
+                " RETURNING " + _SELECT_COLUMNS,
                 tuple(values),
             )
             row = cursor.fetchone()
@@ -274,7 +286,10 @@ class PostgresManagementCardContextStore:
 
         if limit < 1:
             return ()
-        with connect(self._dsn, timeouts=self._timeouts) as connection, connection.cursor() as cursor:
+        with (
+            connect(self._dsn, timeouts=self._timeouts) as connection,
+            connection.cursor() as cursor,
+        ):
             cursor.execute(
                 f"SELECT {_SELECT_COLUMNS} FROM management_card_context"
                 " WHERE needs_refresh = TRUE ORDER BY updated_at, message_id LIMIT %s",
@@ -318,7 +333,10 @@ class PostgresManagementCardContextStore:
             conditions.append("card_sequence = %(expected_card_sequence)s")
             parameters["expected_card_sequence"] = expected_card_sequence
 
-        with connect(self._dsn, timeouts=self._timeouts) as connection, connection.cursor() as cursor:
+        with (
+            connect(self._dsn, timeouts=self._timeouts) as connection,
+            connection.cursor() as cursor,
+        ):
             cursor.execute(
                 "UPDATE management_card_context"
                 " SET visual_sequence = GREATEST(visual_sequence, %(sequence)s),"
@@ -339,7 +357,10 @@ class PostgresManagementCardContextStore:
 
         if not message_id:
             return None
-        with connect(self._dsn, timeouts=self._timeouts) as connection, connection.cursor() as cursor:
+        with (
+            connect(self._dsn, timeouts=self._timeouts) as connection,
+            connection.cursor() as cursor,
+        ):
             cursor.execute(
                 """
                 SELECT o.status
@@ -374,7 +395,10 @@ class PostgresManagementCardContextStore:
         该管理员操作之前的旧发布误认成这次操作已完成。
         """
 
-        with connect(self._dsn, timeouts=self._timeouts) as connection, connection.cursor() as cursor:
+        with (
+            connect(self._dsn, timeouts=self._timeouts) as connection,
+            connection.cursor() as cursor,
+        ):
             cursor.execute(
                 """
                 WITH latest_published AS (
@@ -440,14 +464,13 @@ class PostgresManagementCardContextStore:
                 """
             )
             rows = cursor.fetchall()
-        return tuple(
-            str(row[0])
-            for row in rows
-            if row[1] == "incomplete" and bool(row[2])
-        )
+        return tuple(str(row[0]) for row in rows if row[1] == "incomplete" and bool(row[2]))
 
     def unreported_daily_correction_ids(self) -> tuple[str, ...]:
-        with connect(self._dsn, timeouts=self._timeouts) as connection, connection.cursor() as cursor:
+        with (
+            connect(self._dsn, timeouts=self._timeouts) as connection,
+            connection.cursor() as cursor,
+        ):
             cursor.execute(
                 """SELECT message_id FROM management_card_context
                     WHERE state = 'effective'
@@ -462,7 +485,10 @@ class PostgresManagementCardContextStore:
         if not message_ids:
             return
         placeholders = ", ".join("%s" for _ in message_ids)
-        with connect(self._dsn, timeouts=self._timeouts) as connection, connection.cursor() as cursor:
+        with (
+            connect(self._dsn, timeouts=self._timeouts) as connection,
+            connection.cursor() as cursor,
+        ):
             cursor.execute(
                 "UPDATE management_card_context SET daily_correction_reported_at = now(), "
                 "daily_correction_pending = FALSE "

@@ -20,7 +20,9 @@ SCRIPT = REPOSITORY_ROOT / "scripts" / "ci" / "check_installed_package.py"
 
 
 def _load_checker():
-    spec = importlib.util.spec_from_file_location("check_installed_package_manifest_under_test", SCRIPT)
+    spec = importlib.util.spec_from_file_location(
+        "check_installed_package_manifest_under_test", SCRIPT
+    )
     module = importlib.util.module_from_spec(spec)
     assert spec.loader is not None
     spec.loader.exec_module(module)
@@ -137,7 +139,7 @@ class ModuleManifestReconciliationTest(unittest.TestCase):
             source = source.replace('    "lingxi.adapters.galaxy_import",\n', "", 1)
             return source.replace(
                 "MODULE_MANIFEST_EXEMPTIONS: dict[str, str] = {\n",
-                'MODULE_MANIFEST_EXEMPTIONS: dict[str, str] = {\n'
+                "MODULE_MANIFEST_EXEMPTIONS: dict[str, str] = {\n"
                 '    "lingxi.adapters.galaxy_import": "临时随意豁免理由",\n',
                 1,
             )
@@ -155,7 +157,9 @@ class ModuleManifestReconciliationTest(unittest.TestCase):
         def edit(source: str) -> str:
             old = '"lingxi.adapters.feishu_bitable_association": "Bot-Test 历史测试资产，不纳入正式用户路径清单"'
             self.assertIn(old, source)
-            return source.replace(old, '"lingxi.adapters.feishu_bitable_association": "被改写的豁免理由"', 1)
+            return source.replace(
+                old, '"lingxi.adapters.feishu_bitable_association": "被改写的豁免理由"', 1
+            )
 
         result = _run_source_only_with_edit(edit)
         output = result.stdout + result.stderr
@@ -240,9 +244,7 @@ class ModuleManifestReconciliationTest(unittest.TestCase):
             "父包 __init__ 新增的依赖必须出现在依赖它的进程闭包里",
         )
         self.assertTrue(failures)
-        self.assertTrue(
-            any("lingxi.core.synthetic_parent_dependency" in line for line in failures)
-        )
+        self.assertTrue(any("lingxi.core.synthetic_parent_dependency" in line for line in failures))
         self.assertTrue(any("import 闭包" in line for line in failures))
 
 

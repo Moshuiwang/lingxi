@@ -114,11 +114,18 @@ class CredentialStateTest(unittest.TestCase):
         cases = (
             (self.now + timedelta(hours=1), self.now + timedelta(days=7), CredentialState.ACTIVE),
             (self.now - timedelta(seconds=1), self.now + timedelta(days=7), CredentialState.DUE),
-            (self.now - timedelta(days=8), self.now - timedelta(seconds=1), CredentialState.EXPIRED),
+            (
+                self.now - timedelta(days=8),
+                self.now - timedelta(seconds=1),
+                CredentialState.EXPIRED,
+            ),
         )
         for refresh_at, expires_at, expected in cases:
             with self.subTest(expected=expected):
-                self.assertIs(credential_state(refresh_at=refresh_at, expires_at=expires_at, now=self.now), expected)
+                self.assertIs(
+                    credential_state(refresh_at=refresh_at, expires_at=expires_at, now=self.now),
+                    expected,
+                )
 
     def test_expired_wins_over_due_so_a_dead_credential_is_never_replayed(self) -> None:
         state = credential_state(
@@ -145,7 +152,10 @@ class RefreshOutcomeTest(unittest.TestCase):
         # refresh_token 一次性有效：新增一个未处理的结果分支绝不能默认成「保留」。
         for outcome in RefreshOutcome:
             with self.subTest(outcome=outcome):
-                self.assertIn(decide_after_refresh(outcome), (CredentialAction.ROTATE, CredentialAction.REVOKE))
+                self.assertIn(
+                    decide_after_refresh(outcome),
+                    (CredentialAction.ROTATE, CredentialAction.REVOKE),
+                )
 
 
 @unittest.skipUnless(
@@ -231,7 +241,6 @@ class VaultSaveArgumentGuardTest(unittest.TestCase):
         self.assertIn("续期消费时刻必须是带时区的时间", str(raised.exception))
         self.assertFalse(path.exists(), "被拒的保存不得写入密文")
         self.assertFalse(path.with_name(path.name + ".lock").exists(), "守卫应在取文件锁之前就拒绝")
-
 
     def test_no_parameter_can_relax_the_due_check_without_the_rate_ceilings(self) -> None:
         """收口轮 P2-a、Issue #276 延伸：``for_supply`` 把三件事**捆死**，没有任何参数
@@ -324,7 +333,7 @@ class UndecryptableCredentialFileTest(unittest.TestCase):
         self.assertEqual(path.read_bytes(), ciphertext, "密文必须字节不变")
 
     def test_the_right_key_still_reads_the_same_file_afterwards(self) -> None:
-        """"留着"的意义在于可恢复：密钥换回来，同一份文件照常可用。"""
+        """ "留着"的意义在于可恢复：密钥换回来，同一份文件照常可用。"""
 
         from cryptography.fernet import Fernet
 

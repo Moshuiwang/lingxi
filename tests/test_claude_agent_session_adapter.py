@@ -193,7 +193,9 @@ class AgentOptionsShapeTest(_StubSDK):
         from lingxi.core.execution.hooks import HOOK_EVENTS, OBSERVATION_ONLY_EVENTS
 
         gateway = self.gateway()
-        options = build_agent_options(gateway, allowed_tools=("mcp__q__list",), stderr_sink=lambda line: None)
+        options = build_agent_options(
+            gateway, allowed_tools=("mcp__q__list",), stderr_sink=lambda line: None
+        )
 
         self.assertEqual(set(options.hooks), set(HOOK_EVENTS) | set(OBSERVATION_ONLY_EVENTS))
         self.assertEqual(options.hooks["PreToolUse"][0].hooks, [gateway.on_hook_event])
@@ -269,7 +271,9 @@ class AgentOptionsShapeTest(_StubSDK):
     def test_optional_fields_are_only_passed_when_configured(self) -> None:
         from lingxi.adapters.claude_agent_session import build_agent_options
 
-        bare = build_agent_options(self.gateway(), allowed_tools=("mcp__q__list",), stderr_sink=lambda line: None)
+        bare = build_agent_options(
+            self.gateway(), allowed_tools=("mcp__q__list",), stderr_sink=lambda line: None
+        )
         self.assertIsNone(bare.cwd)
         self.assertIsNone(bare.model)
         self.assertIsNone(bare.mcp_servers)
@@ -347,14 +351,20 @@ class MessageNormalisationTest(_StubSDK):
     def test_assistant_text_blocks_become_one_final_text_event(self) -> None:
         from lingxi.adapters.claude_agent_session import normalize_message
 
-        events = normalize_message(StubAssistantMessage([StubTextBlock("日活 "), StubTextBlock("1024。")]))
+        events = normalize_message(
+            StubAssistantMessage([StubTextBlock("日活 "), StubTextBlock("1024。")])
+        )
 
         self.assertEqual(events, ({"kind": "assistant_message", "text": "日活 1024。"},))
 
-    def test_an_assistant_message_without_any_text_block_does_not_clear_the_final_text(self) -> None:
+    def test_an_assistant_message_without_any_text_block_does_not_clear_the_final_text(
+        self,
+    ) -> None:
         from lingxi.adapters.claude_agent_session import normalize_message
 
-        events = normalize_message(StubAssistantMessage([StubToolUseBlock("toolu_1", "mcp__q__list", {})]))
+        events = normalize_message(
+            StubAssistantMessage([StubToolUseBlock("toolu_1", "mcp__q__list", {})])
+        )
 
         self.assertEqual(events, ())
 
@@ -376,7 +386,14 @@ class MessageNormalisationTest(_StubSDK):
 
         self.assertEqual(
             events,
-            ({"kind": "tool_result", "tool_use_id": "toolu_1", "content": '{"data": []}', "is_error": False},),
+            (
+                {
+                    "kind": "tool_result",
+                    "tool_use_id": "toolu_1",
+                    "content": '{"data": []}',
+                    "is_error": False,
+                },
+            ),
         )
 
     def test_result_message_is_normalised_without_being_counted_as_a_tool_call(self) -> None:
@@ -436,10 +453,14 @@ class SingleTurnSessionTest(_StubSDK):
             StubAssistantMessage([StubTextBlock("日活 1024。")]),
             StubResultMessage(),
         ]
-        options = build_agent_options(self.gateway(), allowed_tools=("mcp__q__list",), stderr_sink=lambda line: None)
+        options = build_agent_options(
+            self.gateway(), allowed_tools=("mcp__q__list",), stderr_sink=lambda line: None
+        )
         seen: list = []
 
-        asyncio.run(run_single_turn(options=options, prompt="问题", sink=seen.append, timeout_seconds=30))
+        asyncio.run(
+            run_single_turn(options=options, prompt="问题", sink=seen.append, timeout_seconds=30)
+        )
 
         self.assertEqual(self.calls["clients"], [options])
         self.assertEqual(self.calls["prompts"], ["问题"])
@@ -453,7 +474,9 @@ class SingleTurnSessionTest(_StubSDK):
             StubAssistantMessage([StubTextBlock("续接结果")]),
             StubResultMessage(session_id="session-new"),
         ]
-        options = build_agent_options(self.gateway(), allowed_tools=("mcp__q__list",), stderr_sink=lambda line: None)
+        options = build_agent_options(
+            self.gateway(), allowed_tools=("mcp__q__list",), stderr_sink=lambda line: None
+        )
         seen: list = []
 
         asyncio.run(
@@ -475,7 +498,9 @@ class SingleTurnSessionTest(_StubSDK):
         from lingxi.adapters.claude_agent_session import build_agent_options, run_single_turn
 
         self.messages = [StubAssistantMessage([StubTextBlock("日活 1024。")]), StubResultMessage()]
-        options = build_agent_options(self.gateway(), allowed_tools=("mcp__q__list",), stderr_sink=lambda line: None)
+        options = build_agent_options(
+            self.gateway(), allowed_tools=("mcp__q__list",), stderr_sink=lambda line: None
+        )
         ticks = iter((100.0, 101.2, 101.25))
         durations: list[float] = []
 
@@ -512,7 +537,9 @@ class SingleTurnSessionTest(_StubSDK):
                 return await super().__aexit__(*exc_info)
 
         module.ClaudeSDKClient = HangingDrainClient
-        options = build_agent_options(self.gateway(), allowed_tools=("mcp__q__list",), stderr_sink=lambda line: None)
+        options = build_agent_options(
+            self.gateway(), allowed_tools=("mcp__q__list",), stderr_sink=lambda line: None
+        )
 
         with self.assertRaises(DrainTimeoutError):
             asyncio.run(
@@ -541,7 +568,9 @@ class SingleTurnSessionTest(_StubSDK):
                 return _gen()
 
         module.ClaudeSDKClient = HangingBusinessClient
-        options = build_agent_options(self.gateway(), allowed_tools=("mcp__q__list",), stderr_sink=lambda line: None)
+        options = build_agent_options(
+            self.gateway(), allowed_tools=("mcp__q__list",), stderr_sink=lambda line: None
+        )
 
         with self.assertRaises(TimeoutError):
             asyncio.run(
@@ -583,7 +612,9 @@ class SingleTurnSessionTest(_StubSDK):
                 return await super().__aexit__(*exc_info)  # pragma: no cover
 
         module.ClaudeSDKClient = DoubleHangClient
-        options = build_agent_options(self.gateway(), allowed_tools=("mcp__q__list",), stderr_sink=lambda line: None)
+        options = build_agent_options(
+            self.gateway(), allowed_tools=("mcp__q__list",), stderr_sink=lambda line: None
+        )
 
         with self.assertRaises(TimeoutError) as ctx:
             asyncio.run(
@@ -615,7 +646,9 @@ class SingleTurnSessionTest(_StubSDK):
                 raise RuntimeError("连接失败")
 
         module.ClaudeSDKClient = FailingEnterClient
-        options = build_agent_options(self.gateway(), allowed_tools=("mcp__q__list",), stderr_sink=lambda line: None)
+        options = build_agent_options(
+            self.gateway(), allowed_tools=("mcp__q__list",), stderr_sink=lambda line: None
+        )
 
         with self.assertRaises(RuntimeError):
             asyncio.run(
@@ -731,10 +764,10 @@ class McpStatusProbeTest(_StubSDK):
         from lingxi.adapters.claude_agent_session import build_agent_options, run_single_turn
 
         self.messages = [StubResultMessage()]
-        self.mcp_status = {
-            "mcpServers": [{"name": "query", "status": "failed", "error": "boom"}]
-        }
-        options = build_agent_options(self.gateway(), allowed_tools=("mcp__q__list",), stderr_sink=lambda line: None)
+        self.mcp_status = {"mcpServers": [{"name": "query", "status": "failed", "error": "boom"}]}
+        options = build_agent_options(
+            self.gateway(), allowed_tools=("mcp__q__list",), stderr_sink=lambda line: None
+        )
         seen_status: list = []
 
         asyncio.run(
@@ -759,7 +792,9 @@ class McpStatusProbeTest(_StubSDK):
         from lingxi.adapters.claude_agent_session import build_agent_options, run_single_turn
 
         self.messages = [StubResultMessage()]
-        options = build_agent_options(self.gateway(), allowed_tools=("mcp__q__list",), stderr_sink=lambda line: None)
+        options = build_agent_options(
+            self.gateway(), allowed_tools=("mcp__q__list",), stderr_sink=lambda line: None
+        )
 
         asyncio.run(
             run_single_turn(

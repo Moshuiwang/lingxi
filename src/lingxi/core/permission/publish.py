@@ -445,14 +445,17 @@ class PublishAttempt:
         }
 
 
-def _failure(claim: ClaimedPublish, error: PermissionTableError, *, action: str,
-             external_record_id: str | None) -> PublishAttempt:
+def _failure(
+    claim: ClaimedPublish,
+    error: PermissionTableError,
+    *,
+    action: str,
+    external_record_id: str | None,
+) -> PublishAttempt:
     """把一次外部调用失败结算成尝试结果，保留明确失败 / 结果不明的分界。"""
 
     kind = PublishFailureKind.DEFINITE if error.definite else PublishFailureKind.INDETERMINATE
-    outcome = (
-        PublishOutcome.REJECTED if error.definite else PublishOutcome.UNCERTAIN
-    )
+    outcome = PublishOutcome.REJECTED if error.definite else PublishOutcome.UNCERTAIN
     return PublishAttempt(
         outcome=outcome,
         outbox_id=claim.outbox_id,
@@ -466,9 +469,7 @@ def _failure(claim: ClaimedPublish, error: PermissionTableError, *, action: str,
     )
 
 
-def publish_claim(
-    claim: ClaimedPublish, *, transport: PermissionTableTransport
-) -> PublishAttempt:
+def publish_claim(claim: ClaimedPublish, *, transport: PermissionTableTransport) -> PublishAttempt:
     """执行一条发布意图：查找 → 新建或更新 → **逐字段读回核对**。
 
     判定次序是刻意的：

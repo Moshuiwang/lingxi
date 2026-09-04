@@ -453,9 +453,7 @@ class ReclaimSessionTranscriptsTests(unittest.TestCase):
             root = Path(tmp)
             fresh = [self._write(root, f"n{index}", 100, age_seconds=1.0) for index in range(5)]
 
-            outcome = reclaim_session_transcripts(
-                root, budget_bytes=200, min_age_seconds=300.0
-            )
+            outcome = reclaim_session_transcripts(root, budget_bytes=200, min_age_seconds=300.0)
 
             self.assertEqual(outcome.files_deleted, 0)
             self.assertEqual(outcome.files_protected, 5)

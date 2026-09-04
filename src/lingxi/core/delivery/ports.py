@@ -111,7 +111,9 @@ _TERMINAL_TO_OUTCOME: dict[TerminalKind, ResolvedOutcome] = {
     TerminalKind.SUCCESS: ResolvedOutcome(status="succeeded", error_kind=None),
     TerminalKind.FAILED: ResolvedOutcome(status="failed", error_kind="session_failed"),
     TerminalKind.STOPPED: ResolvedOutcome(status="stopped", error_kind="stopped"),
-    TerminalKind.REDACTED_WITHHELD: ResolvedOutcome(status="failed", error_kind="redacted_withheld"),
+    TerminalKind.REDACTED_WITHHELD: ResolvedOutcome(
+        status="failed", error_kind="redacted_withheld"
+    ),
     TerminalKind.TIMEOUT: ResolvedOutcome(status="failed", error_kind="running_timeout"),
 }
 

@@ -159,6 +159,7 @@ from lingxi.core.daily_report import (
 
 logger = logging.getLogger(__name__)
 
+
 #: 安全的发送失败原因分类（opus 批量审查 P3 修复）。此前 `daily_report.send_failed`
 #: 只记异常**类名**（`type(error).__name__`），运维要靠类名自己猜"这是我们自己的
 #: uuid 预算算错了，还是飞书/网络那一侧的问题"——两类问题的处置完全不同（前者是
@@ -425,9 +426,7 @@ class DailyReportDuty:
                     type(error).__name__,
                 )
 
-        thread = threading.Thread(
-            target=worker, name="lingxi-daily-report-aggregate", daemon=True
-        )
+        thread = threading.Thread(target=worker, name="lingxi-daily-report-aggregate", daemon=True)
         self._pending_thread = thread
         thread.start()
         thread.join(timeout=self._aggregation_join_timeout_seconds)
@@ -494,7 +493,9 @@ class DailyReportDuty:
         )
         token_usage_raw, token_usage_fetch_reason = self._fetch(
             "resource_usage",
-            lambda: self._source.token_usage_stats(window_start=window_start, window_end=window_end),
+            lambda: self._source.token_usage_stats(
+                window_start=window_start, window_end=window_end
+            ),
         )
         # 「未覆盖新指标」日检（Issue #320 并入项）。与其余六段不同，本段**允许
         # 完全不接线**（`self._metric_coverage is None`）——那种情况下连尝试都不
@@ -552,7 +553,9 @@ class DailyReportDuty:
             failure_top_determined = True
 
         if failure_top_determined:
-            throttled_lines, updated_streaks = apply_repeat_throttle(self._reason_streaks, today_top)
+            throttled_lines, updated_streaks = apply_repeat_throttle(
+                self._reason_streaks, today_top
+            )
         else:
             # 本轮取不到失败分类：节流状态原样冻结，不因一次瞬时故障被清零或
             # 提前推进（见 `core.daily_report.apply_repeat_throttle` 的文档）。
@@ -754,7 +757,9 @@ class DailyReportDuty:
         self._audit.record(
             "daily_report.sent",
             report_date=today.isoformat(),
-            active_users=active_users.value.active_user_count if active_users.is_determined else None,
+            active_users=active_users.value.active_user_count
+            if active_users.is_determined
+            else None,
             undetermined_sections=[
                 name for name, section in determinable_sections if not section.is_determined
             ],
@@ -874,7 +879,9 @@ def _build_local_override_activity_check(
         config.postgres_dsn, timeouts=config.postgres_timeouts
     )
 
-    def _check(*, window_start: datetime, window_end: datetime) -> tuple[int, int, int, int, int, int]:
+    def _check(
+        *, window_start: datetime, window_end: datetime
+    ) -> tuple[int, int, int, int, int, int]:
         return store.daily_activity_stats(window_start=window_start, window_end=window_end)
 
     return _check
@@ -943,7 +950,12 @@ def _build_metric_coverage_check(
     def _check() -> tuple[Sequence[str], Sequence[str]]:
         mapping = load_company_function_metric_map(config.metric_map_path)
         mapped_metric_ids = sorted(
-            {metric_id for functions in mapping.values() for metrics in functions.values() for metric_id in metrics}
+            {
+                metric_id
+                for functions in mapping.values()
+                for metrics in functions.values()
+                for metric_id in metrics
+            }
         )
         user_id = tokens.any_token_holder()
         if user_id is None:

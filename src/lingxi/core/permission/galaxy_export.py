@@ -61,7 +61,9 @@ class TableSpec:
     primary_key: tuple[str, ...]
 
 
-def _column(canonical: str, *sources: str, required: bool = False, non_empty: bool = False) -> ColumnSpec:
+def _column(
+    canonical: str, *sources: str, required: bool = False, non_empty: bool = False
+) -> ColumnSpec:
     return ColumnSpec(canonical, sources or (canonical,), required=required, non_empty=non_empty)
 
 
@@ -197,7 +199,11 @@ def _normalize_table(
     for column in spec.columns:
         if column.required and column.canonical not in present:
             errors.append(
-                Issue(spec.name, "missing_column", f"缺少必需列：{column.canonical}（可接受的源列名：{'/'.join(column.sources)}）")
+                Issue(
+                    spec.name,
+                    "missing_column",
+                    f"缺少必需列：{column.canonical}（可接受的源列名：{'/'.join(column.sources)}）",
+                )
             )
 
     if ignored:
@@ -295,7 +301,7 @@ def _deduplicate(
 
 
 def _check_references(
-    tables: Mapping[str, Sequence[Mapping[str, str | None]]]
+    tables: Mapping[str, Sequence[Mapping[str, str | None]]],
 ) -> tuple[list[Issue], list[Issue]]:
     errors: list[Issue] = []
     warnings: list[Issue] = []
@@ -306,9 +312,7 @@ def _check_references(
 
     for source_table in ("user_role", "sys_user_datacountry"):
         dangling = [
-            row[SOURCE_ROW_KEY]
-            for row in tables[source_table]
-            if row["user_id"] not in known_users
+            row[SOURCE_ROW_KEY] for row in tables[source_table] if row["user_id"] not in known_users
         ]
         if dangling:
             errors.append(
@@ -337,7 +341,11 @@ def _check_references(
         )
 
     roles_without_menu = sorted(
-        {row["role_id"] for row in tables["user_role"] if row["role_id"] not in menu_roles and row["role_id"]}
+        {
+            row["role_id"]
+            for row in tables["user_role"]
+            if row["role_id"] not in menu_roles and row["role_id"]
+        }
     )
     if roles_without_menu:
         warnings.append(
@@ -367,9 +375,7 @@ def _check_references(
         )
 
     countries_without_key = [
-        row[SOURCE_ROW_KEY]
-        for row in tables["sys_country"]
-        if not row["country_key"]
+        row[SOURCE_ROW_KEY] for row in tables["sys_country"] if not row["country_key"]
     ]
     if countries_without_key:
         warnings.append(
@@ -398,7 +404,13 @@ def validate_export(raw_tables: Mapping[str, Sequence[Mapping[str, Any]]]) -> Va
         errors.append(Issue(name, "missing_table", "导出缺少该表"))
     unknown = [name for name in raw_tables if name not in TABLE_SPECS]
     if unknown:
-        warnings.append(Issue("-", "ignored_table", f"导出含 {len(unknown)} 张未落库的表：{'、'.join(sorted(unknown))}"))
+        warnings.append(
+            Issue(
+                "-",
+                "ignored_table",
+                f"导出含 {len(unknown)} 张未落库的表：{'、'.join(sorted(unknown))}",
+            )
+        )
     if missing:
         return ValidationReport(False, tuple(errors), tuple(warnings), {}, {})
 

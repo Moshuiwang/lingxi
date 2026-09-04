@@ -342,7 +342,11 @@ logger = logging.getLogger(__name__)
 
 def main(argv: list[str] | None = None) -> int:
     # 日志只到 stdout / stderr，不写文件、不自行轮转（断言 V-部署-04）。
-    logging.basicConfig(level=logging.INFO, stream=sys.stdout, format="%(asctime)s %(levelname)s %(name)s %(message)s")
+    logging.basicConfig(
+        level=logging.INFO,
+        stream=sys.stdout,
+        format="%(asctime)s %(levelname)s %(name)s %(message)s",
+    )
     try:
         config = SchedulerConfig.from_env()
     except ValueError as error:

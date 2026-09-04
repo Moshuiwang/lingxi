@@ -509,7 +509,11 @@ class QueryMcpProbe:
             raise ValueError("token_provider 必须是按 user_id 返回明文令牌的可调用对象")
         if not isinstance(tool_name, str) or not tool_name.strip():
             raise ValueError("探针工具名不得为空")
-        if isinstance(timeout_seconds, bool) or not isinstance(timeout_seconds, int) or timeout_seconds < 1:
+        if (
+            isinstance(timeout_seconds, bool)
+            or not isinstance(timeout_seconds, int)
+            or timeout_seconds < 1
+        ):
             raise ValueError("探针传输超时必须是正整数秒")
         self._token_provider = token_provider
         self._transport: Callable[..., McpHttpResponse] = transport or urllib_mcp_transport

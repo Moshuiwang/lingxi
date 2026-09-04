@@ -330,17 +330,13 @@ class DeliveryConsumer:
             self._note_loop_failure(error, stage="queue_delay_hint")
             loop_healthy = False
         try:
-            uncertain_tasks = self._queue.list_uncertain_delivery_tasks(
-                limit=self._uncertain_limit
-            )
+            uncertain_tasks = self._queue.list_uncertain_delivery_tasks(limit=self._uncertain_limit)
         except Exception as error:  # 见方法文档：只降级这一段，不带走本轮
             self._note_loop_failure(error, stage="list_uncertain")
             uncertain_tasks = []
             loop_healthy = False
         for uncertain in uncertain_tasks:
-            self._alert_deduped(
-                "dispatch_uncertain:" + uncertain.reserved_kind, uncertain.task_id
-            )
+            self._alert_deduped("dispatch_uncertain:" + uncertain.reserved_kind, uncertain.task_id)
         if len(uncertain_tasks) >= self._uncertain_limit:
             # 独立审核 P2-4：`list_uncertain_delivery_tasks` 的 `LIMIT` 会让超过
             # 这个数量的 uncertain 任务静默无告警。这里没有条件做到精确判断"是否
@@ -608,9 +604,7 @@ class DeliveryConsumer:
             # 一张卡在"正在处理"的卡片。这里没有像终态/建卡那样引入预留位来完全
             # 消除这个窗口（会给每个 progress 帧都加两次额外的数据库往返，成本/
             # 收益需要单独评估），只先保证它不再是"零告警的静默永久降级"。
-            self._alert_deduped(
-                "progress_persist_failed:" + type(error).__name__, task.task_id
-            )
+            self._alert_deduped("progress_persist_failed:" + type(error).__name__, task.task_id)
             raise
 
     def _handle_terminal(self, task: Any, stream: CardStream, event: Any) -> bool:

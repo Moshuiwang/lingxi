@@ -130,9 +130,7 @@ class PostgresGatewayStore:
         """
 
         if claim_token is None:
-            logger.warning(
-                "释放开通认领缺少认领代次，本次不动账本 event=%s", event_id
-            )
+            logger.warning("释放开通认领缺少认领代次，本次不动账本 event=%s", event_id)
             return
         with connect(self._dsn, timeouts=self._timeouts) as connection:
             with connection.transaction():

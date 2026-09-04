@@ -64,7 +64,9 @@ class LongConnectionError(Exception):
     """建连失败。``failure`` 是分类的唯一输入。"""
 
     def __init__(self, failure: HandshakeFailure) -> None:
-        super().__init__(f"{failure.source.value}: status={failure.status_code} detail={failure.detail}")
+        super().__init__(
+            f"{failure.source.value}: status={failure.status_code} detail={failure.detail}"
+        )
         self.failure = failure
 
 
@@ -122,7 +124,7 @@ class BackoffPolicy:
 
 
 class TerminationReason(str, Enum):
-    STOPPED = "stopped"          # 收到停机信号，正常退出
+    STOPPED = "stopped"  # 收到停机信号，正常退出
     TERMINAL_ERROR = "terminal"  # 终止型错误，不再重连
 
 
@@ -342,8 +344,7 @@ class _RawEventSink:
         self._submit(pending)
         if not pending.done.wait(self._ack_timeout_seconds):
             raise TimeoutError(
-                f"事件处理未在 {self._ack_timeout_seconds} 秒内完成落库，"
-                "向飞书返回失败以便平台重投"
+                f"事件处理未在 {self._ack_timeout_seconds} 秒内完成落库，向飞书返回失败以便平台重投"
             )
         if pending.error is not None:
             raise pending.error

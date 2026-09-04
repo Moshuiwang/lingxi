@@ -367,7 +367,9 @@ class OrgSnapshotSyncDuty:
             try:
                 already_done = self._store.has_complete_run_on(today)
             except Exception as error:  # 只记异常类型
-                self._audit.record("org_snapshot_sync.watermark_check_failed", error=type(error).__name__)
+                self._audit.record(
+                    "org_snapshot_sync.watermark_check_failed", error=type(error).__name__
+                )
                 logger.warning(
                     "组织快照当日持久化水位检查失败，按未知处理、继续尝试本轮 error=%s",
                     type(error).__name__,
@@ -379,7 +381,9 @@ class OrgSnapshotSyncDuty:
                     # 失败推进了退避，但之前若有残留的退避状态（例如昨天读取失败
                     # 到今天才被别的实例补上）已经没有意义，一并清零。
                     self._reset_backoff()
-                    self._audit.record("org_snapshot_sync.already_completed_today", source="persisted_watermark")
+                    self._audit.record(
+                        "org_snapshot_sync.already_completed_today", source="persisted_watermark"
+                    )
                     return None
 
         if self._next_attempt_at is not None and now < self._next_attempt_at:
@@ -460,7 +464,9 @@ class OrgSnapshotSyncDuty:
             return None
 
         try:
-            run_id = self._store.commit_batch(batch, source_app_id=self._source_app_id, started_at=now)
+            run_id = self._store.commit_batch(
+                batch, source_app_id=self._source_app_id, started_at=now
+            )
         except SnapshotIntegrityError as error:
             # 也推进退避（与读取失败共用同一条，见模块顶部常量注释）：走到这一步
             # 说明两条身份路径都已经读完一整轮（数百次分页请求）才在交叉校验上失败，
@@ -607,9 +613,7 @@ class OrgSnapshotSyncDuty:
                     type(error).__name__,
                 )
 
-        thread = threading.Thread(
-            target=worker, name="lingxi-org-snapshot-round", daemon=True
-        )
+        thread = threading.Thread(target=worker, name="lingxi-org-snapshot-round", daemon=True)
         self._pending_thread = thread
         self._pending_thread_started_at = now
         self._round_thread_stuck_alerted = False
@@ -684,15 +688,13 @@ def _build_org_snapshot_sync_duty(
     if user_access_token is None:
         audit.record("org_snapshot_sync.duty_not_registered", reason="user_access_token_unwired")
         logger.warning(
-            "调用方未提供组织快照用户身份读取令牌供给，组织快照同步职责不注册；"
-            "其余定时职责照常运行"
+            "调用方未提供组织快照用户身份读取令牌供给，组织快照同步职责不注册；其余定时职责照常运行"
         )
         return None
     if app_access_token is None:
         audit.record("org_snapshot_sync.duty_not_registered", reason="app_access_token_unwired")
         logger.warning(
-            "调用方未提供组织快照应用身份读取令牌供给，组织快照同步职责不注册；"
-            "其余定时职责照常运行"
+            "调用方未提供组织快照应用身份读取令牌供给，组织快照同步职责不注册；其余定时职责照常运行"
         )
         return None
 

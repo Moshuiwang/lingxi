@@ -141,7 +141,9 @@ class FakeAuthorization:
 
 class SchedulerConfigTest(unittest.TestCase):
     def test_every_setting_comes_from_an_environment_variable(self) -> None:
-        config = SchedulerConfig.from_env({**COMPLETE_ENV, "LINGXI_SCHEDULER_INTERVAL_SECONDS": "30"})
+        config = SchedulerConfig.from_env(
+            {**COMPLETE_ENV, "LINGXI_SCHEDULER_INTERVAL_SECONDS": "30"}
+        )
 
         self.assertEqual(config.postgres_dsn, COMPLETE_ENV["LINGXI_POSTGRES_DSN"])
         self.assertEqual(config.credential_path, COMPLETE_ENV["LINGXI_DELEGATED_CREDENTIAL_PATH"])
@@ -164,7 +166,11 @@ class SchedulerConfigTest(unittest.TestCase):
     def test_the_config_repr_never_echoes_the_secret_values(self) -> None:
         config = SchedulerConfig.from_env(COMPLETE_ENV)
 
-        for secret in ("secret_fake", COMPLETE_ENV["LINGXI_DELEGATED_CREDENTIAL_KEY"], COMPLETE_ENV["LINGXI_POSTGRES_DSN"]):
+        for secret in (
+            "secret_fake",
+            COMPLETE_ENV["LINGXI_DELEGATED_CREDENTIAL_KEY"],
+            COMPLETE_ENV["LINGXI_POSTGRES_DSN"],
+        ):
             with self.subTest(secret=secret[:8]):
                 self.assertNotIn(secret, repr(config))
 
@@ -186,7 +192,9 @@ class SchedulerConfigTest(unittest.TestCase):
         for value in ("0", "-5", "abc"):
             with self.subTest(value=value):
                 with self.assertRaises(ValueError):
-                    SchedulerConfig.from_env({**COMPLETE_ENV, "LINGXI_SCHEDULER_INTERVAL_SECONDS": value})
+                    SchedulerConfig.from_env(
+                        {**COMPLETE_ENV, "LINGXI_SCHEDULER_INTERVAL_SECONDS": value}
+                    )
 
     def test_there_is_no_target_tenant_setting(self) -> None:
         """硬约束 1：租户是查出来的结果，不是配置项。"""
@@ -197,7 +205,9 @@ class RotationLoopTest(unittest.TestCase):
     def test_a_successful_refresh_rotates_the_stored_credential(self) -> None:
         vault = FakeVault([credential()])
         replacement = AuthorizationGrant(SecretToken("fake-next-token"), 604800, "offline_access")
-        loop = CredentialRotationLoop(vault=vault, authorization=FakeAuthorization(replacement), interval_seconds=1)
+        loop = CredentialRotationLoop(
+            vault=vault, authorization=FakeAuthorization(replacement), interval_seconds=1
+        )
 
         report = loop.run_once()
 
@@ -227,7 +237,9 @@ class RotationLoopTest(unittest.TestCase):
                 return super().claim_due()
 
         vault = StoppingVault()
-        loop = CredentialRotationLoop(vault=vault, authorization=FakeAuthorization(replacement_grant()), interval_seconds=0.01)
+        loop = CredentialRotationLoop(
+            vault=vault, authorization=FakeAuthorization(replacement_grant()), interval_seconds=0.01
+        )
         loop_holder.append(loop)
 
         report = loop.run_once()
@@ -239,7 +251,9 @@ class RotationLoopTest(unittest.TestCase):
         """崩溃窗口收殓：每轮先清「已消费未落库」的行，防止旧令牌在租期后被重放
         （Codex 复查发现）。"""
         vault = FakeVault([None])
-        loop = CredentialRotationLoop(vault=vault, authorization=FakeAuthorization(replacement_grant()), interval_seconds=0.01)
+        loop = CredentialRotationLoop(
+            vault=vault, authorization=FakeAuthorization(replacement_grant()), interval_seconds=0.01
+        )
 
         loop.run_once()
 
@@ -248,7 +262,9 @@ class RotationLoopTest(unittest.TestCase):
     def test_a_transient_save_failure_is_retried_and_the_credential_survives(self) -> None:
         """写库瞬时失败要重试：一次数据库抖动不该报废一条一次性凭据（独立复查发现）。"""
         vault = FakeVault([credential()], save_failures=1)
-        loop = CredentialRotationLoop(vault=vault, authorization=FakeAuthorization(replacement_grant()), interval_seconds=0.01)
+        loop = CredentialRotationLoop(
+            vault=vault, authorization=FakeAuthorization(replacement_grant()), interval_seconds=0.01
+        )
 
         report = loop.run_once()
 
@@ -260,7 +276,9 @@ class RotationLoopTest(unittest.TestCase):
         """续期成功但新凭据始终写不进库：旧的已被飞书作废，必须撤销并以
         可区分的日志请求人工重新授权，不得抛异常带着新凭据一起消失。"""
         vault = FakeVault([credential()], save_failures=99)
-        loop = CredentialRotationLoop(vault=vault, authorization=FakeAuthorization(replacement_grant()), interval_seconds=0.01)
+        loop = CredentialRotationLoop(
+            vault=vault, authorization=FakeAuthorization(replacement_grant()), interval_seconds=0.01
+        )
 
         with self.assertLogs("lingxi.apps.scheduler", level="ERROR") as captured:
             report = loop.run_once()
@@ -285,7 +303,9 @@ class RotationLoopTest(unittest.TestCase):
                 return None
 
         vault = ExplodingVault()
-        loop = CredentialRotationLoop(vault=vault, authorization=FakeAuthorization(replacement_grant()), interval_seconds=0.01)
+        loop = CredentialRotationLoop(
+            vault=vault, authorization=FakeAuthorization(replacement_grant()), interval_seconds=0.01
+        )
 
         def stop_after_second_round() -> None:
             deadline = time.monotonic() + 5
@@ -318,10 +338,16 @@ class RotationLoopTest(unittest.TestCase):
         self.assertEqual(len(vault.revoked), 1)
 
     def test_an_indeterminate_transport_result_also_revokes(self) -> None:
-        for error in (FeishuDirectoryError("transport_error"), TimeoutError("boom"), RuntimeError("boom")):
+        for error in (
+            FeishuDirectoryError("transport_error"),
+            TimeoutError("boom"),
+            RuntimeError("boom"),
+        ):
             with self.subTest(error=type(error).__name__):
                 vault = FakeVault([credential()])
-                loop = CredentialRotationLoop(vault=vault, authorization=FakeAuthorization(error), interval_seconds=1)
+                loop = CredentialRotationLoop(
+                    vault=vault, authorization=FakeAuthorization(error), interval_seconds=1
+                )
 
                 loop.run_once()
 
@@ -330,7 +356,9 @@ class RotationLoopTest(unittest.TestCase):
 
     def test_nothing_due_is_a_no_op(self) -> None:
         vault = FakeVault([None])
-        loop = CredentialRotationLoop(vault=vault, authorization=FakeAuthorization(None), interval_seconds=1)
+        loop = CredentialRotationLoop(
+            vault=vault, authorization=FakeAuthorization(None), interval_seconds=1
+        )
 
         report = loop.run_once()
 
@@ -338,7 +366,9 @@ class RotationLoopTest(unittest.TestCase):
 
     def test_a_stopping_loop_claims_nothing_further(self) -> None:
         vault = FakeVault([credential(), credential()])
-        loop = CredentialRotationLoop(vault=vault, authorization=FakeAuthorization(None), interval_seconds=1)
+        loop = CredentialRotationLoop(
+            vault=vault, authorization=FakeAuthorization(None), interval_seconds=1
+        )
 
         loop.request_stop()
         report = loop.run_once()
@@ -384,10 +414,16 @@ class SchedulerLoopTest(unittest.TestCase):
                 with self.assertLogs("lingxi.apps.scheduler", level="ERROR") as captured:
                     reports = loop.run_once()
 
-                self.assertEqual([duty.calls for duty in duties], [1, 1], "两个职责本轮都必须被调用")
+                self.assertEqual(
+                    [duty.calls for duty in duties], [1, 1], "两个职责本轮都必须被调用"
+                )
                 self.assertEqual(reports[exploding_index], None)
-                self.assertEqual(reports[1 - exploding_index], f"{duties[1 - exploding_index].name}-ok")
-                self.assertTrue(any(duties[exploding_index].name in line for line in captured.output))
+                self.assertEqual(
+                    reports[1 - exploding_index], f"{duties[1 - exploding_index].name}-ok"
+                )
+                self.assertTrue(
+                    any(duties[exploding_index].name in line for line in captured.output)
+                )
 
     def test_repeated_failures_never_stop_the_process(self) -> None:
         """V-保留-15（验收 F-03）：连续失败不退出；日志只记异常类型，不记正文。"""
@@ -399,7 +435,9 @@ class SchedulerLoopTest(unittest.TestCase):
                 loop.run_once()
 
         self.assertEqual(exploding.calls, 5)
-        self.assertTrue(all("模拟失败" not in line for line in captured.output), "异常正文不得进日志")
+        self.assertTrue(
+            all("模拟失败" not in line for line in captured.output), "异常正文不得进日志"
+        )
         self.assertTrue(any("RuntimeError" in line for line in captured.output))
 
     def test_a_stopping_loop_lets_no_duty_claim_new_work(self) -> None:
@@ -471,7 +509,9 @@ class SchedulerLoopTest(unittest.TestCase):
     def test_a_stopping_idle_sweep_duty_does_not_call_the_queue(self) -> None:
         stop = threading.Event()
         queue = self.RecordingQueue(cleared=5)
-        duty = IdleConversationSweepDuty(queue=queue, idle_after=IDLE_CONVERSATION_SWEEP_AFTER, stop=stop)
+        duty = IdleConversationSweepDuty(
+            queue=queue, idle_after=IDLE_CONVERSATION_SWEEP_AFTER, stop=stop
+        )
 
         stop.set()
         report = duty.run_once()
@@ -490,7 +530,7 @@ class SchedulerLoopTest(unittest.TestCase):
 )
 class BuildLoopTest(unittest.TestCase):
     def test_the_assembled_process_carries_all_scheduled_duties(self) -> None:
-        """"谁会调用它"的落点：清理与空闲会话扫描职责由**已存在**的
+        """ "谁会调用它"的落点：清理与空闲会话扫描职责由**已存在**的
         `lingxi-scheduler` 进程装配。
 
         `build_loop` 是 `main()` 唯一的装配入口（本模块 `main` 内），因此这条断言
@@ -597,7 +637,11 @@ class SigtermTest(unittest.TestCase):
     )
 
     def test_sigterm_stops_claiming_finishes_the_in_flight_rotation_and_exits_cleanly(self) -> None:
-        environment = {**os.environ, "PYTHONPATH": str(REPOSITORY_ROOT / "src"), "PYTHONUNBUFFERED": "1"}
+        environment = {
+            **os.environ,
+            "PYTHONPATH": str(REPOSITORY_ROOT / "src"),
+            "PYTHONUNBUFFERED": "1",
+        }
         process = subprocess.Popen(
             [sys.executable, "-c", self.SCRIPT],
             cwd=REPOSITORY_ROOT,

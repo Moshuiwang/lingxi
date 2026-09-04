@@ -288,10 +288,14 @@ class _OutboxMixin:
                 # `_insert_document_delivery_request`（因缺少 title/内容字段被
                 # 拒绝为 ValueError），命中下面的 `except` 分支记一条响亮审计，
                 # 不再静默失踪。
-                delivery_request = document_request if document_request is not None else sheet_request
+                delivery_request = (
+                    document_request if document_request is not None else sheet_request
+                )
                 delivery_type = (
-                    "docx" if document_request is not None else "sheet"
-                ) if delivery_request is not None else None
+                    ("docx" if document_request is not None else "sheet")
+                    if delivery_request is not None
+                    else None
+                )
                 if delivery_request is not None and not appended.duplicate:
                     # 只在这次真正插入了新终态事件（不是幂等重试命中已有行）时才
                     # 插入文档/表格投递请求——``duplicate=True`` 分支在上面已经
@@ -664,7 +668,9 @@ class _OutboxMixin:
                     conversation_id=conversation_id
                 )
 
-    def clear_delivered_content_for_user(self, *, user_id: str, reason: str = "user_cleared") -> int:
+    def clear_delivered_content_for_user(
+        self, *, user_id: str, reason: str = "user_cleared"
+    ) -> int:
         """停用感知、权限变化感知触发：清除该用户名下全部会话已送达的投递正文，
         并使该用户全部会话的当前 Agent 会话失效、排队物理清理其 JSONL（Issue #153）。
 

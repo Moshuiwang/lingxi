@@ -124,7 +124,12 @@ def _require_https(base_url: str) -> str:
         raise ValueError("base_url 必须由配置注入，不得写死在代码里")
     text = base_url.strip()
     parsed = urlparse(text)
-    if parsed.scheme != "https" or not parsed.netloc or parsed.username is not None or parsed.password is not None:
+    if (
+        parsed.scheme != "https"
+        or not parsed.netloc
+        or parsed.username is not None
+        or parsed.password is not None
+    ):
         raise ValueError("飞书 base_url 必须使用不含凭据的 HTTPS 地址")
     if parsed.fragment:
         raise ValueError("飞书 base_url 不得包含 URL fragment")
@@ -157,7 +162,9 @@ def _require_user_open_id(open_id: str) -> str:
 
     text = (open_id or "").strip()
     if not text.startswith(USER_OPEN_ID_PREFIX) or len(text) <= len(USER_OPEN_ID_PREFIX):
-        raise ValueError(f"open_id 必须是飞书用户 open_id（以 {USER_OPEN_ID_PREFIX} 开头），不回显收到的值")
+        raise ValueError(
+            f"open_id 必须是飞书用户 open_id（以 {USER_OPEN_ID_PREFIX} 开头），不回显收到的值"
+        )
     if any(character.isspace() for character in text):
         raise ValueError("open_id 不得包含空白字符，不回显收到的值")
     return text
@@ -177,11 +184,18 @@ def _safe_feishu_code(value: object) -> str:
 
 class Transport(Protocol):
     def __call__(
-        self, method: str, url: str, *, body: Mapping[str, Any] | None = ..., token: str | None = ...
+        self,
+        method: str,
+        url: str,
+        *,
+        body: Mapping[str, Any] | None = ...,
+        token: str | None = ...,
     ) -> Any: ...
 
 
-def urllib_transport(method: str, url: str, *, body: Mapping[str, Any] | None = None, token: str | None = None) -> Any:
+def urllib_transport(
+    method: str, url: str, *, body: Mapping[str, Any] | None = None, token: str | None = None
+) -> Any:
     """默认传输层：只发 HTTPS，不重试有副作用的请求（同
     ``feishu_docx_delivery.urllib_transport`` 的姿态）。
     """
@@ -192,7 +206,9 @@ def urllib_transport(method: str, url: str, *, body: Mapping[str, Any] | None = 
         headers["Authorization"] = f"Bearer {token}"
     request = Request(url, data=payload, headers=headers, method=method)
     try:
-        with urlopen(request, timeout=REQUEST_TIMEOUT_SECONDS) as response:  # 地址来自受控配置且已校验 https
+        with urlopen(
+            request, timeout=REQUEST_TIMEOUT_SECONDS
+        ) as response:  # 地址来自受控配置且已校验 https
             return json.loads(response.read())
     except HTTPError as error:
         try:
@@ -313,9 +329,7 @@ class LarkSheetsDelivery:
         """
 
         token = _require_spreadsheet_token(spreadsheet_token)
-        data = self._data(
-            self._call("GET", f"{_SPREADSHEETS_V3_PATH}/{token}/sheets/query")
-        )
+        data = self._data(self._call("GET", f"{_SPREADSHEETS_V3_PATH}/{token}/sheets/query"))
         sheets = data.get("sheets")
         if not isinstance(sheets, list) or not sheets:
             raise LookupError("查询 sheet 列表响应缺少非空 sheets 字段：结果不明")
@@ -327,7 +341,9 @@ class LarkSheetsDelivery:
             raise LookupError("查询 sheet 列表响应缺少可回读标识 sheet_id：结果不明")
         return sheet_id
 
-    def write_values(self, spreadsheet_token: str, sheet_id: str, rows: Sequence[Sequence[str]]) -> None:
+    def write_values(
+        self, spreadsheet_token: str, sheet_id: str, rows: Sequence[Sequence[str]]
+    ) -> None:
         """把 ``rows``（行×列的单元格文本）写入表格，从 ``A1`` 起按行列展开。
 
         ``PUT /sheets/v2/spreadsheets/{token}/values``——**注意版本号**：这是
@@ -407,7 +423,11 @@ class LarkSheetsDelivery:
                 "POST",
                 f"/drive/v1/permissions/{token}/members",
                 params={"type": SHEET_PERMISSION_TYPE},
-                body={"member_type": OPENID_MEMBER_TYPE, "member_id": member_id, "perm": FULL_ACCESS_PERM},
+                body={
+                    "member_type": OPENID_MEMBER_TYPE,
+                    "member_id": member_id,
+                    "perm": FULL_ACCESS_PERM,
+                },
             )
         )
         logger.info("飞书电子表格已授予可管理 spreadsheet_token_len=%s", len(token))
@@ -424,7 +444,11 @@ class LarkSheetsDelivery:
 
         token = _require_spreadsheet_token(spreadsheet_token)
         data = self._data(
-            self._call("GET", f"/drive/v1/permissions/{token}/members", params={"type": SHEET_PERMISSION_TYPE})
+            self._call(
+                "GET",
+                f"/drive/v1/permissions/{token}/members",
+                params={"type": SHEET_PERMISSION_TYPE},
+            )
         )
         members = data.get("items")
         if not isinstance(members, list):

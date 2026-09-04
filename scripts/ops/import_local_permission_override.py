@@ -330,7 +330,11 @@ def resolve_galaxy_current(
             mapping=metric_translation_map,
         )
     except UncoveredPermissionCombination as error:
-        reason = REASON_TRANSLATION_UNAVAILABLE if error.mapping_is_empty else REASON_TRANSLATION_UNCOVERED
+        reason = (
+            REASON_TRANSLATION_UNAVAILABLE
+            if error.mapping_is_empty
+            else REASON_TRANSLATION_UNCOVERED
+        )
         return None, reason
     return dict(company_metrics), None
 
@@ -439,7 +443,9 @@ def load_legacy_export(path: Path) -> dict[str, dict[str, tuple[str, ...]]]:
             try:
                 permissions = dict(parse_permissions(row.get("permissions")))
             except ValueError as error:
-                raise ValueError(f"第 {row_number} 行（{email}）permissions 列解析失败：{error}") from error
+                raise ValueError(
+                    f"第 {row_number} 行（{email}）permissions 列解析失败：{error}"
+                ) from error
             if ALL_COMPANIES_KEY in permissions:
                 # rc21 修复包 B（opus 审查发现，P1+P2+P3 之 a）：旧表本身出现
                 # ALL_COMPANIES_KEY（"*"）键，整份导出拒绝导入——不是这一行
@@ -620,7 +626,9 @@ def apply_grant(
         skipped_reasons=(),
         unmapped_companies_kept=0,
     )
-    report = PostgresLocalPermissionOverrideStore(dsn, timeouts=resolved_timeouts).import_legacy_plan(
+    report = PostgresLocalPermissionOverrideStore(
+        dsn, timeouts=resolved_timeouts
+    ).import_legacy_plan(
         user_id=grant.user_id,
         target_open_id=grant.feishu_open_id,
         plan=plan,
@@ -651,24 +659,37 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         description="旧表权限差集导入为管理员本地授权（Issue #441）", allow_abbrev=False
     )
-    parser.add_argument("legacy_export", type=Path, help="旧表只读导出快照（CSV，见脚本文档「输入一」）")
     parser.add_argument(
-        "--initiated-by", required=True, dest="initiated_by_open_id",
+        "legacy_export", type=Path, help="旧表只读导出快照（CSV，见脚本文档「输入一」）"
+    )
+    parser.add_argument(
+        "--initiated-by",
+        required=True,
+        dest="initiated_by_open_id",
         help="本次导入的责任人飞书 open_id，写入每一行的 initiated_by_open_id/decided_by_open_id；"
         "必须是 admin_registry 里一位生效的已登记管理员，否则整次运行拒绝、零写入",
     )
     parser.add_argument("--dsn", default=None, help="PostgreSQL DSN；缺省读 LINGXI_POSTGRES_DSN")
     parser.add_argument(
-        "--apply", action="store_true",
+        "--apply",
+        action="store_true",
         help="真正写入这份差集计划；不传时（默认）只计算并打印计划，不写入任何一行",
     )
     parser.add_argument(
-        "--dry-run", action="store_true",
+        "--dry-run",
+        action="store_true",
         help="兼容别名：与不传 --apply 时的默认行为等价，只计算并打印计划，不写入任何一行"
         "（与 --apply 同时给出时，按更保守的 --dry-run 处理）",
     )
-    parser.add_argument("--role-function-map", type=Path, default=None, help="覆盖随包发布的角色→职能映射文件")
-    parser.add_argument("--metric-translation-map", type=Path, default=None, help="覆盖随包发布的公司+职能→指标名映射文件")
+    parser.add_argument(
+        "--role-function-map", type=Path, default=None, help="覆盖随包发布的角色→职能映射文件"
+    )
+    parser.add_argument(
+        "--metric-translation-map",
+        type=Path,
+        default=None,
+        help="覆盖随包发布的公司+职能→指标名映射文件",
+    )
     arguments = parser.parse_args(argv)
 
     dsn = arguments.dsn or os.environ.get("LINGXI_POSTGRES_DSN")
@@ -725,7 +746,10 @@ def main(argv: list[str] | None = None) -> int:
     try:
         metric_translation_map = load_company_function_metric_map(arguments.metric_translation_map)
     except (OSError, ValueError) as error:
-        print(f"公司+职能→指标名翻译映射配置不可用，未做任何操作：{type(error).__name__}", file=sys.stderr)
+        print(
+            f"公司+职能→指标名翻译映射配置不可用，未做任何操作：{type(error).__name__}",
+            file=sys.stderr,
+        )
         return 2
 
     galaxy = PostgresGalaxySnapshotReader(dsn).load_current()
@@ -736,6 +760,7 @@ def main(argv: list[str] | None = None) -> int:
     # 只读阶段共用一条连接：匹配/差集计算全程不写任何数据，多条并发游标读同一份
     # 数据没有隔离级别顾虑，重复开连接只会白白增加往返。
     with connect(dsn) as connection:
+
         def lookup_user(email: str) -> UserLookup:
             with connection.cursor() as cursor:
                 return _lookup_app_user_by_email(cursor, email)
@@ -760,7 +785,9 @@ def main(argv: list[str] | None = None) -> int:
         print("同时给出 --apply 与 --dry-run：按更保守的 --dry-run 处理，未写入任何一行。")
         return 0
     if not arguments.apply:
-        print("默认只出计划，不写入任何一行；确认无误后加 --apply 真正写入（--dry-run 是该默认行为的兼容别名）。")
+        print(
+            "默认只出计划，不写入任何一行；确认无误后加 --apply 真正写入（--dry-run 是该默认行为的兼容别名）。"
+        )
         return 0
 
     print(f"即将写入 {len(plan.grants)} 行。")

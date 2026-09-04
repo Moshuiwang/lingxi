@@ -42,13 +42,13 @@ def new_ulid(*, now_ms: int | None = None, randomness: bytes | None = None) -> s
     )
 
 
-
 def new_id(prefix: str, *, now_ms: int | None = None) -> str:
     """按接口设计的前缀约定生成内部标识，例如 ``usr_01HXYZ...``。"""
 
     if not prefix or not prefix.isascii() or not prefix.replace("_", "").isalnum():
         raise ValueError("标识前缀必须是 ASCII 字母数字")
     return f"{prefix}_{new_ulid(now_ms=now_ms)}"
+
 
 _CROCKFORD = frozenset("0123456789ABCDEFGHJKMNPQRSTVWXYZ")
 

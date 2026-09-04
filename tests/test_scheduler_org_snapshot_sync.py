@@ -158,7 +158,11 @@ class BaselineProtectionTest(unittest.TestCase):
             raise RuntimeError("transport_error")
 
         duty = OrgSnapshotSyncDuty(
-            read_snapshot=failing_read, store=store, audit=audit, source_app_id="cli_test", clock=lambda: FIXED_NOW
+            read_snapshot=failing_read,
+            store=store,
+            audit=audit,
+            source_app_id="cli_test",
+            clock=lambda: FIXED_NOW,
         )
 
         result = duty.run_once()
@@ -330,7 +334,11 @@ class ReadFailedAuditTest(unittest.TestCase):
             raise FakeFeishuDirectoryError("missing_target_tenant_list")
 
         duty = OrgSnapshotSyncDuty(
-            read_snapshot=failing_read, store=store, audit=audit, source_app_id="cli_test", clock=lambda: FIXED_NOW
+            read_snapshot=failing_read,
+            store=store,
+            audit=audit,
+            source_app_id="cli_test",
+            clock=lambda: FIXED_NOW,
         )
 
         duty.run_once()
@@ -361,7 +369,11 @@ class ReadFailedAuditTest(unittest.TestCase):
             raise FakeFeishuDirectoryError("round_budget_exceeded")
 
         duty = OrgSnapshotSyncDuty(
-            read_snapshot=failing_read, store=store, audit=audit, source_app_id="cli_test", clock=lambda: FIXED_NOW
+            read_snapshot=failing_read,
+            store=store,
+            audit=audit,
+            source_app_id="cli_test",
+            clock=lambda: FIXED_NOW,
         )
 
         result = duty.run_once()
@@ -386,7 +398,11 @@ class ReadFailedAuditTest(unittest.TestCase):
             raise RuntimeError("transport_error")
 
         duty = OrgSnapshotSyncDuty(
-            read_snapshot=failing_read, store=store, audit=audit, source_app_id="cli_test", clock=lambda: FIXED_NOW
+            read_snapshot=failing_read,
+            store=store,
+            audit=audit,
+            source_app_id="cli_test",
+            clock=lambda: FIXED_NOW,
         )
 
         duty.run_once()
@@ -408,7 +424,11 @@ class ReadFailedAuditTest(unittest.TestCase):
             raise TokenSupplyFailure("app_access_token")
 
         duty = OrgSnapshotSyncDuty(
-            read_snapshot=failing_read, store=store, audit=audit, source_app_id="cli_test", clock=lambda: FIXED_NOW
+            read_snapshot=failing_read,
+            store=store,
+            audit=audit,
+            source_app_id="cli_test",
+            clock=lambda: FIXED_NOW,
         )
 
         duty.run_once()
@@ -437,7 +457,11 @@ class ReadFailedAuditTest(unittest.TestCase):
                 raise TokenSupplyFailure("app_access_token") from cause
 
         duty = OrgSnapshotSyncDuty(
-            read_snapshot=failing_read, store=store, audit=audit, source_app_id="cli_test", clock=lambda: FIXED_NOW
+            read_snapshot=failing_read,
+            store=store,
+            audit=audit,
+            source_app_id="cli_test",
+            clock=lambda: FIXED_NOW,
         )
 
         duty.run_once()
@@ -469,7 +493,11 @@ class ReadFailedAuditTest(unittest.TestCase):
                 raise TokenSupplyFailure("app_access_token") from cause
 
         duty = OrgSnapshotSyncDuty(
-            read_snapshot=failing_read, store=store, audit=audit, source_app_id="cli_test", clock=lambda: FIXED_NOW
+            read_snapshot=failing_read,
+            store=store,
+            audit=audit,
+            source_app_id="cli_test",
+            clock=lambda: FIXED_NOW,
         )
 
         with self.assertLogs("lingxi.apps.scheduler.org_snapshot_sync", level="ERROR") as captured:
@@ -477,7 +505,9 @@ class ReadFailedAuditTest(unittest.TestCase):
 
         fields = audit.records[0][1]
         self.assertEqual(fields["supply"], "app_access_token")
-        self.assertNotIn("code", fields, "不安全字符集的 code 必须整个丢弃，不能截断或替换后仍然写入")
+        self.assertNotIn(
+            "code", fields, "不安全字符集的 code 必须整个丢弃，不能截断或替换后仍然写入"
+        )
         for line in captured.output:
             self.assertNotIn(forged, line, "未过滤的 code 不得原样出现在日志行里")
             self.assertNotIn("action=org_snapshot_sync.committed", line)
@@ -499,7 +529,11 @@ class BackoffTest(unittest.TestCase):
             raise RuntimeError("transport_error")
 
         duty = OrgSnapshotSyncDuty(
-            read_snapshot=failing_read, store=store, audit=audit, source_app_id="cli_test", clock=lambda: FIXED_NOW
+            read_snapshot=failing_read,
+            store=store,
+            audit=audit,
+            source_app_id="cli_test",
+            clock=lambda: FIXED_NOW,
         )
 
         duty.run_once()
@@ -567,8 +601,8 @@ class BackoffTest(unittest.TestCase):
         self.assertEqual(len(audit.records), 1, "退避窗口内跳过的一轮不留审计")
 
         # 从失败那一刻起真的过了 300 秒之后，才允许重试。
-        clock["now"] = FIXED_NOW + round_duration + timedelta(
-            seconds=READ_FAILURE_BACKOFF_STEP_SECONDS
+        clock["now"] = (
+            FIXED_NOW + round_duration + timedelta(seconds=READ_FAILURE_BACKOFF_STEP_SECONDS)
         )
         duty.run_once()
         self.assertEqual(call_count["n"], 2, "退避窗口过后必须真的重试")
@@ -584,7 +618,11 @@ class BackoffTest(unittest.TestCase):
             raise RuntimeError("transport_error")
 
         duty = OrgSnapshotSyncDuty(
-            read_snapshot=failing_read, store=store, audit=audit, source_app_id="cli_test", clock=lambda: clock["now"]
+            read_snapshot=failing_read,
+            store=store,
+            audit=audit,
+            source_app_id="cli_test",
+            clock=lambda: clock["now"],
         )
 
         duty.run_once()
@@ -606,7 +644,11 @@ class BackoffTest(unittest.TestCase):
             raise RuntimeError("transport_error")
 
         duty = OrgSnapshotSyncDuty(
-            read_snapshot=failing_read, store=store, audit=audit, source_app_id="cli_test", clock=lambda: clock["now"]
+            read_snapshot=failing_read,
+            store=store,
+            audit=audit,
+            source_app_id="cli_test",
+            clock=lambda: clock["now"],
         )
 
         # 12 次连续失败恰好到达封顶（12 * 300 = 3600）；多跑两次证明封顶之后
@@ -620,11 +662,18 @@ class BackoffTest(unittest.TestCase):
             clock["now"] = clock["now"] + timedelta(seconds=backoff)
 
         expected = [
-            min((index + 1) * READ_FAILURE_BACKOFF_STEP_SECONDS, READ_FAILURE_BACKOFF_CEILING_SECONDS)
+            min(
+                (index + 1) * READ_FAILURE_BACKOFF_STEP_SECONDS,
+                READ_FAILURE_BACKOFF_CEILING_SECONDS,
+            )
             for index in range(attempts)
         ]
         self.assertEqual(observed_backoffs, expected)
-        self.assertEqual(observed_backoffs[-3:], [READ_FAILURE_BACKOFF_CEILING_SECONDS] * 3, "必须真的封顶，不能无限增长")
+        self.assertEqual(
+            observed_backoffs[-3:],
+            [READ_FAILURE_BACKOFF_CEILING_SECONDS] * 3,
+            "必须真的封顶，不能无限增长",
+        )
 
     def test_a_successful_commit_resets_the_backoff_streak(self) -> None:
         store = FakeStore()
@@ -638,7 +687,11 @@ class BackoffTest(unittest.TestCase):
             return _committable_batch()
 
         duty = OrgSnapshotSyncDuty(
-            read_snapshot=flaky_read, store=store, audit=audit, source_app_id="cli_test", clock=lambda: clock["now"]
+            read_snapshot=flaky_read,
+            store=store,
+            audit=audit,
+            source_app_id="cli_test",
+            clock=lambda: clock["now"],
         )
 
         duty.run_once()  # 第 1 次失败，streak=1，退避 300 秒
@@ -657,7 +710,9 @@ class BackoffTest(unittest.TestCase):
         clock["now"] = clock["now"] + timedelta(days=1)
         should_fail["value"] = True
         duty.run_once()
-        self.assertEqual(audit.records[-1][1]["attempt"], 1, "成功一轮之后退避必须清零，不能带着旧的失败计数")
+        self.assertEqual(
+            audit.records[-1][1]["attempt"], 1, "成功一轮之后退避必须清零，不能带着旧的失败计数"
+        )
         self.assertEqual(audit.records[-1][1]["backoff_seconds"], READ_FAILURE_BACKOFF_STEP_SECONDS)
 
     def test_integrity_rejection_shares_the_same_backoff_as_read_failure(self) -> None:
@@ -668,7 +723,11 @@ class BackoffTest(unittest.TestCase):
         audit = RecordingAudit()
         clock = {"now": FIXED_NOW}
         duty = OrgSnapshotSyncDuty(
-            read_snapshot=lambda: EMPTY_BATCH, store=store, audit=audit, source_app_id="cli_test", clock=lambda: clock["now"]
+            read_snapshot=lambda: EMPTY_BATCH,
+            store=store,
+            audit=audit,
+            source_app_id="cli_test",
+            clock=lambda: clock["now"],
         )
 
         duty.run_once()
@@ -698,7 +757,11 @@ class BackoffTest(unittest.TestCase):
         store = FakeStore(raises=RuntimeError("connection_lost"))
         audit = RecordingAudit()
         duty = OrgSnapshotSyncDuty(
-            read_snapshot=counting_read, store=store, audit=audit, source_app_id="cli_test", clock=lambda: FIXED_NOW
+            read_snapshot=counting_read,
+            store=store,
+            audit=audit,
+            source_app_id="cli_test",
+            clock=lambda: FIXED_NOW,
         )
 
         result = duty.run_once()
@@ -721,7 +784,10 @@ class ConstructionTest(unittest.TestCase):
     def test_an_empty_source_app_id_is_refused_at_construction(self) -> None:
         with self.assertRaises(ValueError):
             OrgSnapshotSyncDuty(
-                read_snapshot=lambda: EMPTY_BATCH, store=FakeStore(), audit=RecordingAudit(), source_app_id=""
+                read_snapshot=lambda: EMPTY_BATCH,
+                store=FakeStore(),
+                audit=RecordingAudit(),
+                source_app_id="",
             )
 
 
@@ -737,7 +803,9 @@ class RoundBudgetEscalationTest(unittest.TestCase):
     @staticmethod
     def _advance_past_backoff(clock: dict[str, datetime], attempt: int) -> None:
         clock["now"] = clock["now"] + timedelta(
-            seconds=min(attempt * READ_FAILURE_BACKOFF_STEP_SECONDS, READ_FAILURE_BACKOFF_CEILING_SECONDS)
+            seconds=min(
+                attempt * READ_FAILURE_BACKOFF_STEP_SECONDS, READ_FAILURE_BACKOFF_CEILING_SECONDS
+            )
         )
 
     def test_three_consecutive_rounds_trigger_the_escalation(self) -> None:
@@ -792,7 +860,9 @@ class RoundBudgetEscalationTest(unittest.TestCase):
             clock=lambda: clock["now"],
         )
 
-        with self.assertLogs("lingxi.apps.scheduler.org_snapshot_sync", level="WARNING") as captured:
+        with self.assertLogs(
+            "lingxi.apps.scheduler.org_snapshot_sync", level="WARNING"
+        ) as captured:
             for attempt in range(1, CONSECUTIVE_ROUND_BUDGET_EXCEEDED_ESCALATION_THRESHOLD + 1):
                 duty.run_once()
                 self._advance_past_backoff(clock, attempt)
@@ -822,9 +892,7 @@ class RoundBudgetEscalationTest(unittest.TestCase):
             duty.run_once()
             self._advance_past_backoff(clock, attempt)
 
-        self.assertNotIn(
-            "org_snapshot_sync.round_budget_persistently_exceeded", audit.actions()
-        )
+        self.assertNotIn("org_snapshot_sync.round_budget_persistently_exceeded", audit.actions())
 
     def test_an_interleaved_different_failure_resets_the_streak(self) -> None:
         """连续计数只统计"恰好都是撞预算"的连续轮次；中间夹一次别的失败原因
@@ -898,7 +966,9 @@ class RoundBudgetEscalationTest(unittest.TestCase):
         duty.run_once()  # 撞预算 #2
         clock["now"] = clock["now"] + timedelta(seconds=2 * READ_FAILURE_BACKOFF_STEP_SECONDS)
         duty.run_once()  # 成功提交
-        clock["now"] = clock["now"].replace(day=clock["now"].day + 1)  # 下一 UTC 日，daily gate 放行
+        clock["now"] = clock["now"].replace(
+            day=clock["now"].day + 1
+        )  # 下一 UTC 日，daily gate 放行
         duty.run_once()  # 撞预算 #1'（重新数）
 
         self.assertNotIn(
@@ -1105,7 +1175,9 @@ class StuckThreadAlertTests(unittest.TestCase):
         ) as captured:
             duty.run_once()
         stuck_records = [
-            fields for action, fields in audit.records if action == "org_snapshot_sync.round_thread_stuck"
+            fields
+            for action, fields in audit.records
+            if action == "org_snapshot_sync.round_thread_stuck"
         ]
         self.assertEqual(len(stuck_records), 1)
         self.assertTrue(
@@ -1117,7 +1189,9 @@ class StuckThreadAlertTests(unittest.TestCase):
         clock["now"] = clock["now"] + timedelta(seconds=1)
         duty.run_once()
         stuck_records_again = [
-            fields for action, fields in audit.records if action == "org_snapshot_sync.round_thread_stuck"
+            fields
+            for action, fields in audit.records
+            if action == "org_snapshot_sync.round_thread_stuck"
         ]
         self.assertEqual(len(stuck_records_again), 1, "同一条僵死线程只告警一次")
 
@@ -1186,9 +1260,7 @@ class NoFakeHeartbeatTest(unittest.TestCase):
 
     def test_t7_the_module_source_never_references_the_liveness_module(self) -> None:
         source = inspect.getsource(org_snapshot_sync_module)
-        self.assertNotIn(
-            "apps.liveness", source, "本模块不得依赖进程活性心跳机制所在的模块"
-        )
+        self.assertNotIn("apps.liveness", source, "本模块不得依赖进程活性心跳机制所在的模块")
         self.assertNotIn(
             "touch_liveness",
             source,
@@ -1214,11 +1286,13 @@ class NoFakeHeartbeatTest(unittest.TestCase):
             with self.subTest(module=module.__name__):
                 source = inspect.getsource(module)
                 self.assertNotIn(
-                    "apps.liveness", source,
+                    "apps.liveness",
+                    source,
                     f"{module.__name__} 不得依赖进程活性心跳机制所在的模块",
                 )
                 self.assertNotIn(
-                    "touch_liveness", source,
+                    "touch_liveness",
+                    source,
                     f"{module.__name__} 不得调用 touch_liveness（假心跳变体）",
                 )
 
@@ -1247,9 +1321,7 @@ class BaseExceptionInThreadTests(unittest.TestCase):
             clock=lambda: FIXED_NOW,
         )
 
-        with self.assertLogs(
-            "lingxi.apps.scheduler.org_snapshot_sync", level="ERROR"
-        ) as captured:
+        with self.assertLogs("lingxi.apps.scheduler.org_snapshot_sync", level="ERROR") as captured:
             result = duty.run_once()
 
         self.assertIsNone(result)

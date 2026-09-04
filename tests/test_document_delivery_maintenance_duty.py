@@ -122,8 +122,12 @@ class SweepTest(unittest.TestCase):
         report = duty.run_once()
 
         self.assertEqual(store.redact_calls, 1)
-        self.assertEqual(report, DocumentDeliveryMaintenanceReport(dead_lettered=0, content_redacted=4))
-        self.assertIn("document_delivery_maintenance.dead_letter_sweep_failed", parts["audit"].actions)
+        self.assertEqual(
+            report, DocumentDeliveryMaintenanceReport(dead_lettered=0, content_redacted=4)
+        )
+        self.assertIn(
+            "document_delivery_maintenance.dead_letter_sweep_failed", parts["audit"].actions
+        )
 
     def test_content_redaction_failure_does_not_block_the_dead_letter_sweep(self) -> None:
         store = FakeStore(dead_lettered=6, redact_error=RuntimeError("boom"))
@@ -132,7 +136,9 @@ class SweepTest(unittest.TestCase):
         report = duty.run_once()
 
         self.assertEqual(store.dead_letter_calls, 1)
-        self.assertEqual(report, DocumentDeliveryMaintenanceReport(dead_lettered=6, content_redacted=0))
+        self.assertEqual(
+            report, DocumentDeliveryMaintenanceReport(dead_lettered=6, content_redacted=0)
+        )
         self.assertIn(
             "document_delivery_maintenance.content_redaction_failed", parts["audit"].actions
         )
@@ -142,7 +148,8 @@ class AlertTest(unittest.TestCase):
     def test_a_positive_dead_letter_count_alerts(self) -> None:
         alerts: list[tuple[str, str]] = []
         duty, _ = build_duty(
-            store=FakeStore(dead_lettered=3), alert=lambda kind, task_id: alerts.append((kind, task_id))
+            store=FakeStore(dead_lettered=3),
+            alert=lambda kind, task_id: alerts.append((kind, task_id)),
         )
 
         duty.run_once()
@@ -152,7 +159,8 @@ class AlertTest(unittest.TestCase):
     def test_a_zero_dead_letter_count_never_alerts(self) -> None:
         alerts: list[tuple[str, str]] = []
         duty, _ = build_duty(
-            store=FakeStore(dead_lettered=0), alert=lambda kind, task_id: alerts.append((kind, task_id))
+            store=FakeStore(dead_lettered=0),
+            alert=lambda kind, task_id: alerts.append((kind, task_id)),
         )
 
         duty.run_once()

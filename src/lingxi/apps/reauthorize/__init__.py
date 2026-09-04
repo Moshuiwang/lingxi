@@ -379,7 +379,9 @@ def _run(
         try:
             start = entry.begin(
                 expected_subject_open_id=(
-                    subject if mode == MODE_BOOTSTRAP else source.get("LINGXI_DELEGATED_SUBJECT_OPEN_ID") or None
+                    subject
+                    if mode == MODE_BOOTSTRAP
+                    else source.get("LINGXI_DELEGATED_SUBJECT_OPEN_ID") or None
                 )
             )
         except SubjectAlreadyRegisteredError:
@@ -429,7 +431,10 @@ def _run(
         print(start.authorization_url, file=output)
         print("授权结果将通过 OAuth Bridge 回传；本入口不接收或显示回跳地址。", file=output)
         if not completed.wait(bridge_wait_seconds(source)):
-            print("OAuth Bridge 回调等待超时；本次授权未确认，请重新运行入口发起新的授权。", file=errors)
+            print(
+                "OAuth Bridge 回调等待超时；本次授权未确认，请重新运行入口发起新的授权。",
+                file=errors,
+            )
             if mode == MODE_BOOTSTRAP:
                 _write_audit(
                     handler,

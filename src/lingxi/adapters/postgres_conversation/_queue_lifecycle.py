@@ -187,7 +187,10 @@ class _TaskLifecycleMixin:
     def heartbeat(self, *, task_id: str, worker_id: str) -> bool:
         """只有当前 worker 这一代能续心跳；僵尸 worker 的续期会返回 False。"""
 
-        with connect(self._dsn, timeouts=self._timeouts) as connection, connection.cursor() as cursor:
+        with (
+            connect(self._dsn, timeouts=self._timeouts) as connection,
+            connection.cursor() as cursor,
+        ):
             cursor.execute(
                 """
                 UPDATE task SET heartbeat_at = now()
@@ -198,7 +201,10 @@ class _TaskLifecycleMixin:
             return cursor.rowcount == 1
 
     def stop_requested(self, *, task_id: str, worker_id: str) -> bool:
-        with connect(self._dsn, timeouts=self._timeouts) as connection, connection.cursor() as cursor:
+        with (
+            connect(self._dsn, timeouts=self._timeouts) as connection,
+            connection.cursor() as cursor,
+        ):
             cursor.execute(
                 """
                 SELECT stop_requested FROM task
@@ -212,7 +218,10 @@ class _TaskLifecycleMixin:
     def mark_side_effect(self, *, task_id: str, worker_id: str) -> bool:
         """在调用外部工具、卡片或文本发送前先落保守状态。"""
 
-        with connect(self._dsn, timeouts=self._timeouts) as connection, connection.cursor() as cursor:
+        with (
+            connect(self._dsn, timeouts=self._timeouts) as connection,
+            connection.cursor() as cursor,
+        ):
             cursor.execute(
                 """
                 UPDATE task SET side_effect_state = 'possible'
@@ -223,7 +232,10 @@ class _TaskLifecycleMixin:
             return cursor.rowcount == 1
 
     def task_context(self, *, task_id: str, worker_id: str) -> TaskContext | None:
-        with connect(self._dsn, timeouts=self._timeouts) as connection, connection.cursor() as cursor:
+        with (
+            connect(self._dsn, timeouts=self._timeouts) as connection,
+            connection.cursor() as cursor,
+        ):
             cursor.execute(
                 """
                 SELECT t.id, t.conversation_id, t.user_id, t.prompt,
@@ -300,7 +312,11 @@ class _TaskLifecycleMixin:
                         )
                         requeued.append(task_id)
                         continue
-                    error_kind = "side_effect_uncertain" if side_effect_state != "none" else "retry_exhausted"
+                    error_kind = (
+                        "side_effect_uncertain"
+                        if side_effect_state != "none"
+                        else "retry_exhausted"
+                    )
                     # Issue #178（红线）：这个任务从未被一个仍然存活的 worker 正常
                     # 收口——旧实现在这里直接把 task 记 failed 并释放话题，跳过了
                     # outbox，用户永远收不到终态。改为写出与真实 worker 完全同型的

@@ -63,9 +63,7 @@ class BackgroundPostCallbackExecutor:
         if isinstance(queue_maxsize, bool) or not isinstance(queue_maxsize, int):
             raise ValueError("queue_maxsize 必须是整数")
         if not _MIN_QUEUE_MAXSIZE <= queue_maxsize <= _MAX_QUEUE_MAXSIZE:
-            raise ValueError(
-                f"queue_maxsize 必须在 {_MIN_QUEUE_MAXSIZE}~{_MAX_QUEUE_MAXSIZE} 之间"
-            )
+            raise ValueError(f"queue_maxsize 必须在 {_MIN_QUEUE_MAXSIZE}~{_MAX_QUEUE_MAXSIZE} 之间")
         self._audit = audit
         self._queue: queue.Queue[Callable[[], None]] = queue.Queue(maxsize=queue_maxsize)
         self._worker = threading.Thread(
@@ -93,9 +91,7 @@ class BackgroundPostCallbackExecutor:
                 task()
             except Exception as error:  # 单个任务失败不得带走 worker
                 try:
-                    self._audit.record(
-                        POST_CALLBACK_TASK_FAILED_ACTION, error=type(error).__name__
-                    )
+                    self._audit.record(POST_CALLBACK_TASK_FAILED_ACTION, error=type(error).__name__)
                 except Exception:  # 审计器自身故障同样不得带走 worker
                     pass
             finally:

@@ -71,7 +71,12 @@ def _require_https(base_url: str) -> str:
         raise ValueError("base_url 必须由配置注入，不得写死在代码里")
     text = base_url.strip()
     parsed = urlparse(text)
-    if parsed.scheme != "https" or not parsed.netloc or parsed.username is not None or parsed.password is not None:
+    if (
+        parsed.scheme != "https"
+        or not parsed.netloc
+        or parsed.username is not None
+        or parsed.password is not None
+    ):
         raise ValueError("飞书 base_url 必须使用不含凭据的 HTTPS 地址")
     if parsed.fragment:
         raise ValueError("飞书 base_url 不得包含 URL fragment")

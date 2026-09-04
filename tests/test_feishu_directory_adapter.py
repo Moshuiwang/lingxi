@@ -48,7 +48,13 @@ class RecordingTransport:
         return response
 
 
-def page(items: list[dict[str, object]], *, key: str, has_more: bool = False, page_token: str | None = None) -> dict[str, object]:
+def page(
+    items: list[dict[str, object]],
+    *,
+    key: str,
+    has_more: bool = False,
+    page_token: str | None = None,
+) -> dict[str, object]:
     data: dict[str, object] = {key: items, "has_more": has_more}
     if page_token:
         data["page_token"] = page_token
@@ -56,7 +62,10 @@ def page(items: list[dict[str, object]], *, key: str, has_more: bool = False, pa
 
 
 def multi_page(
-    lists: dict[str, list[dict[str, object]]], *, has_more: bool = False, page_token: str | None = None
+    lists: dict[str, list[dict[str, object]]],
+    *,
+    has_more: bool = False,
+    page_token: str | None = None,
 ) -> dict[str, object]:
     data: dict[str, object] = {**lists, "has_more": has_more}
     if page_token:
@@ -84,7 +93,12 @@ class DirectoryPaginationTest(unittest.TestCase):
     def test_all_pages_are_followed_until_has_more_is_false(self) -> None:
         transport = RecordingTransport(
             [
-                page([{"tenant_key": "tenant_a"}], key="target_tenant_list", has_more=True, page_token="p2"),
+                page(
+                    [{"tenant_key": "tenant_a"}],
+                    key="target_tenant_list",
+                    has_more=True,
+                    page_token="p2",
+                ),
                 page([{"tenant_key": "tenant_b"}], key="target_tenant_list"),
             ]
         )
@@ -101,8 +115,18 @@ class DirectoryPaginationTest(unittest.TestCase):
         会让调用方拿它替换旧快照（Codex 复查发现，语义由「静默截断」改为报错）。"""
         transport = RecordingTransport(
             [
-                page([{"tenant_key": "tenant_a"}], key="target_tenant_list", has_more=True, page_token="same"),
-                page([{"tenant_key": "tenant_b"}], key="target_tenant_list", has_more=True, page_token="same"),
+                page(
+                    [{"tenant_key": "tenant_a"}],
+                    key="target_tenant_list",
+                    has_more=True,
+                    page_token="same",
+                ),
+                page(
+                    [{"tenant_key": "tenant_b"}],
+                    key="target_tenant_list",
+                    has_more=True,
+                    page_token="same",
+                ),
             ]
         )
         client = _client(transport)
@@ -114,14 +138,20 @@ class DirectoryPaginationTest(unittest.TestCase):
     def test_the_real_probe_field_name_is_accepted(self) -> None:
         """真实探针（verify_feishu_association.sh）实测主字段是 target_tenant_list；
         此前的 collaboration_tenant_list 在真实响应里不存在（Codex 复查发现）。"""
-        transport = RecordingTransport([page([{"tenant_key": "tenant_a"}], key="target_tenant_list")])
+        transport = RecordingTransport(
+            [page([{"tenant_key": "tenant_a"}], key="target_tenant_list")]
+        )
         client = _client(transport)
 
-        self.assertEqual(client.list_collaboration_tenants(token="fake-user-token")[0]["tenant_key"], "tenant_a")
+        self.assertEqual(
+            client.list_collaboration_tenants(token="fake-user-token")[0]["tenant_key"], "tenant_a"
+        )
 
     def test_a_non_object_page_item_is_a_shape_error(self) -> None:
         """终轮 Codex：静默丢弃畸形项会让被丢的租户躲过完整性校验。"""
-        transport = RecordingTransport([page([{"tenant_key": "tenant_a"}, "碎片"], key="target_tenant_list")])
+        transport = RecordingTransport(
+            [page([{"tenant_key": "tenant_a"}, "碎片"], key="target_tenant_list")]
+        )
         client = _client(transport)
 
         with self.assertRaises(FeishuDirectoryError) as context:
@@ -132,7 +162,9 @@ class DirectoryPaginationTest(unittest.TestCase):
         """飞书出站必须 HTTPS：误配 http:// 会把 Bearer token 与 App Secret
         明文上路（Codex 复查发现）。"""
         with self.assertRaises(ValueError):
-            FeishuDirectoryClient(base_url="http://open.feishu.invalid", transport=RecordingTransport([]))
+            FeishuDirectoryClient(
+                base_url="http://open.feishu.invalid", transport=RecordingTransport([])
+            )
 
     def test_a_business_error_code_is_mapped_to_a_directory_error(self) -> None:
         transport = RecordingTransport([{"code": 99991663, "msg": "permission denied"}])
@@ -178,7 +210,9 @@ class DirectoryPaginationTest(unittest.TestCase):
         transport = RecordingTransport([page(entities, key="collaboration_entity_list")])
         client = _client(transport)
 
-        departments, members = client.list_visible_organization(token="fake-user-token", tenant_key="tenant_a")
+        departments, members = client.list_visible_organization(
+            token="fake-user-token", tenant_key="tenant_a"
+        )
 
         self.assertEqual([item["open_department_id"] for item in departments], ["od_1"])
         self.assertEqual([item["open_id"] for item in members], ["ou_1"])
@@ -251,7 +285,9 @@ class DirectoryPaginationTest(unittest.TestCase):
             department_identifier({"open_department_id": "od_1", "department_id": "dept_1"}),
             ("od_1", "open_department_id"),
         )
-        self.assertEqual(department_identifier({"department_id": "dept_1"}), ("dept_1", "department_id"))
+        self.assertEqual(
+            department_identifier({"department_id": "dept_1"}), ("dept_1", "department_id")
+        )
         self.assertIsNone(department_identifier({"name": "测试部门"}))
 
     def test_visible_organization_business_error_stays_a_failure(self) -> None:
@@ -302,7 +338,10 @@ class DirectoryPaginationTest(unittest.TestCase):
         import inspect
 
         self.assertNotIn("tenant_key", inspect.signature(FeishuDirectoryClient.__init__).parameters)
-        self.assertIn("tenant_key", inspect.signature(FeishuDirectoryClient.list_visible_organization).parameters)
+        self.assertIn(
+            "tenant_key",
+            inspect.signature(FeishuDirectoryClient.list_visible_organization).parameters,
+        )
 
 
 class EmptyResultIsNotAShapeErrorTest(unittest.TestCase):
@@ -335,7 +374,12 @@ class EmptyResultIsNotAShapeErrorTest(unittest.TestCase):
         锚点：把这条"陌生非空列表键必须抛错"的检查删掉，本用例会从"抛错"变红成
         "静默返回 []"。"""
         transport = RecordingTransport(
-            [{"code": 0, "data": {"associated_tenants": [{"tenant_key": "tenant_a"}], "has_more": False}}]
+            [
+                {
+                    "code": 0,
+                    "data": {"associated_tenants": [{"tenant_key": "tenant_a"}], "has_more": False},
+                }
+            ]
         )
         client = _client(transport)
 
@@ -357,7 +401,9 @@ class EmptyResultIsNotAShapeErrorTest(unittest.TestCase):
             client.list_collaboration_tenants(token="fake-user-token")
         code = raised.exception.code
         self.assertTrue(code.startswith("unexpected_list_key_"))
-        self.assertEqual(len(code) - len("unexpected_list_key_"), 40, "陌生字段名必须截断到 40 字符")
+        self.assertEqual(
+            len(code) - len("unexpected_list_key_"), 40, "陌生字段名必须截断到 40 字符"
+        )
         self.assertNotIn(" ", code)
         self.assertNotIn("=", code)
 
@@ -365,7 +411,9 @@ class EmptyResultIsNotAShapeErrorTest(unittest.TestCase):
         """陌生字段是空列表（不是"有数据但键名不对"）时，仍然按合法空结果放行——
         真正触发 unexpected_list_key 的信号是"有数据但没被候选键接住"，不是任意
         陌生字段的存在。"""
-        transport = RecordingTransport([{"code": 0, "data": {"associated_tenants": [], "has_more": False}}])
+        transport = RecordingTransport(
+            [{"code": 0, "data": {"associated_tenants": [], "has_more": False}}]
+        )
         client = _client(transport)
 
         self.assertEqual(client.list_collaboration_tenants(token="fake-user-token"), [])
@@ -404,7 +452,9 @@ class EmptyResultIsNotAShapeErrorTest(unittest.TestCase):
             client.list_collaboration_tenants(token="fake-user-token")
         self.assertEqual(raised.exception.code, "missing_target_tenant_list")
 
-    def test_has_more_as_a_non_boolean_truthy_value_with_no_candidate_keys_still_raises(self) -> None:
+    def test_has_more_as_a_non_boolean_truthy_value_with_no_candidate_keys_still_raises(
+        self,
+    ) -> None:
         """同上：``has_more`` 是字符串 ``"false"``（真值但不是合法 bool）时同样不
         满足"严格为 False"，第一页没有候选键仍然抛 ``missing_<key>``。"""
         transport = RecordingTransport([{"code": 0, "data": {"has_more": "false"}}])
@@ -422,7 +472,12 @@ class EmptyResultIsNotAShapeErrorTest(unittest.TestCase):
         用例会从"抛错"变红成"返回 ['tenant_a']"。"""
         transport = RecordingTransport(
             [
-                page([{"tenant_key": "tenant_a"}], key="target_tenant_list", has_more=True, page_token="p2"),
+                page(
+                    [{"tenant_key": "tenant_a"}],
+                    key="target_tenant_list",
+                    has_more=True,
+                    page_token="p2",
+                ),
                 {"code": 0, "data": {"has_more": False}},
             ]
         )
@@ -438,7 +493,9 @@ class EmptyResultIsNotAShapeErrorTest(unittest.TestCase):
         transport = RecordingTransport([{"code": 0, "data": {"has_more": False}}])
         client = _client(transport)
 
-        departments, members = client.list_visible_organization(token="fake-user-token", tenant_key="tenant_a")
+        departments, members = client.list_visible_organization(
+            token="fake-user-token", tenant_key="tenant_a"
+        )
         self.assertEqual(departments, [])
         self.assertEqual(members, [])
 
@@ -455,17 +512,29 @@ class HasMoreLeniencyTest(unittest.TestCase):
         完全缺失、但候选键有真实数据时，不再抛错，按"读完了"处理——与本函数改动前
         的既有生产行为一致。变异锚点：把 `has_more is not True` 改回 `raise
         FeishuDirectoryError("has_more_invalid")`，本用例会变红。"""
-        transport = RecordingTransport([{"code": 0, "data": {"target_tenant_list": [{"tenant_key": "tenant_a"}]}}])
+        transport = RecordingTransport(
+            [{"code": 0, "data": {"target_tenant_list": [{"tenant_key": "tenant_a"}]}}]
+        )
         client = _client(transport)
 
         tenants = client.list_collaboration_tenants(token="fake-user-token")
         self.assertEqual([item["tenant_key"] for item in tenants], ["tenant_a"])
 
-    def test_a_non_boolean_truthy_has_more_with_real_data_is_leniently_treated_as_the_last_page(self) -> None:
+    def test_a_non_boolean_truthy_has_more_with_real_data_is_leniently_treated_as_the_last_page(
+        self,
+    ) -> None:
         """同上，``has_more`` 是字符串 ``"true"``（非法类型，真值）时同样按"读完了"
         处理，不继续翻页、不抛错——这是有意接受的已知限制，不是回归。"""
         transport = RecordingTransport(
-            [{"code": 0, "data": {"target_tenant_list": [{"tenant_key": "tenant_a"}], "has_more": "true"}}]
+            [
+                {
+                    "code": 0,
+                    "data": {
+                        "target_tenant_list": [{"tenant_key": "tenant_a"}],
+                        "has_more": "true",
+                    },
+                }
+            ]
         )
         client = _client(transport)
 
@@ -493,7 +562,9 @@ class AppIdentityPathTest(unittest.TestCase):
     def test_list_collaboration_tenants_as_app_follows_pagination(self) -> None:
         transport = RecordingTransport(
             [
-                page([{"tenant_key": "tenant_a"}], key="tenant_list", has_more=True, page_token="p2"),
+                page(
+                    [{"tenant_key": "tenant_a"}], key="tenant_list", has_more=True, page_token="p2"
+                ),
                 page([{"tenant_key": "tenant_b"}], key="tenant_list"),
             ]
         )
@@ -541,7 +612,15 @@ class AppIdentityPathTest(unittest.TestCase):
         键按 ``[]`` 处理，不再报错。"""
 
         transport = RecordingTransport(
-            [{"code": 0, "data": {"share_departments": [{"open_department_id": "od_1"}], "has_more": False}}]
+            [
+                {
+                    "code": 0,
+                    "data": {
+                        "share_departments": [{"open_department_id": "od_1"}],
+                        "has_more": False,
+                    },
+                }
+            ]
         )
         client = _client(transport)
 
@@ -568,7 +647,9 @@ class AppIdentityPathTest(unittest.TestCase):
         self.assertEqual(departments, [])
         self.assertEqual([item["open_user_id"] for item in members], ["ou_1"])
 
-    def test_share_entities_both_keys_missing_first_page_no_more_is_a_legal_empty_result(self) -> None:
+    def test_share_entities_both_keys_missing_first_page_no_more_is_a_legal_empty_result(
+        self,
+    ) -> None:
         """全部候选键都缺失 + 第一页 + ``has_more=False`` + 无陌生列表键 ⇒ 合法
         空结果，不抛（Issue #270 场景 4）。"""
 
@@ -620,7 +701,9 @@ class AppIdentityPathTest(unittest.TestCase):
         client = _client(transport)
 
         with self.assertRaises(FeishuDirectoryError) as raised:
-            client.list_share_entities(token="fake-app-token", tenant_key="tenant_a", department_id="0")
+            client.list_share_entities(
+                token="fake-app-token", tenant_key="tenant_a", department_id="0"
+            )
         self.assertEqual(raised.exception.code, "missing_share_departments")
 
     def test_share_entities_stray_list_key_without_has_more_is_still_rejected(self) -> None:
@@ -634,7 +717,9 @@ class AppIdentityPathTest(unittest.TestCase):
         client = _client(transport)
 
         with self.assertRaises(FeishuDirectoryError) as raised:
-            client.list_share_entities(token="fake-app-token", tenant_key="tenant_a", department_id="0")
+            client.list_share_entities(
+                token="fake-app-token", tenant_key="tenant_a", department_id="0"
+            )
         self.assertEqual(raised.exception.code, "unexpected_list_key_associated_tenants")
 
     def test_share_entities_stray_list_key_is_rejected_and_sanitized(self) -> None:
@@ -656,7 +741,9 @@ class AppIdentityPathTest(unittest.TestCase):
         client = _client(transport)
 
         with self.assertRaises(FeishuDirectoryError) as raised:
-            client.list_share_entities(token="fake-app-token", tenant_key="tenant_a", department_id="0")
+            client.list_share_entities(
+                token="fake-app-token", tenant_key="tenant_a", department_id="0"
+            )
         self.assertTrue(raised.exception.code.startswith("unexpected_list_key_"))
         self.assertNotIn(" ", raised.exception.code)
 
@@ -664,11 +751,15 @@ class AppIdentityPathTest(unittest.TestCase):
         """全部候选键缺失，但 ``has_more=True``：服务端明确说还有数据，没有列表
         放不进"这批是空的"这个解释，仍然抛错（Issue #270 场景 6）。"""
 
-        transport = RecordingTransport([{"code": 0, "data": {"has_more": True, "page_token": "p2"}}])
+        transport = RecordingTransport(
+            [{"code": 0, "data": {"has_more": True, "page_token": "p2"}}]
+        )
         client = _client(transport)
 
         with self.assertRaises(FeishuDirectoryError) as raised:
-            client.list_share_entities(token="fake-app-token", tenant_key="tenant_a", department_id="0")
+            client.list_share_entities(
+                token="fake-app-token", tenant_key="tenant_a", department_id="0"
+            )
         self.assertEqual(raised.exception.code, "missing_share_departments")
 
     def test_share_entities_wrong_typed_candidate_key_still_raises(self) -> None:
@@ -676,21 +767,29 @@ class AppIdentityPathTest(unittest.TestCase):
         另一个候选键完全缺失——"存在但类型不对"不受"至少一个命中"影响
         （Issue #270 场景 7）。"""
 
-        transport = RecordingTransport([{"code": 0, "data": {"share_users": "x", "has_more": False}}])
+        transport = RecordingTransport(
+            [{"code": 0, "data": {"share_users": "x", "has_more": False}}]
+        )
         client = _client(transport)
 
         with self.assertRaises(FeishuDirectoryError) as raised:
-            client.list_share_entities(token="fake-app-token", tenant_key="tenant_a", department_id="0")
+            client.list_share_entities(
+                token="fake-app-token", tenant_key="tenant_a", department_id="0"
+            )
         self.assertEqual(raised.exception.code, "missing_share_users")
 
     def test_share_entities_wrong_typed_candidate_key_null_still_raises(self) -> None:
         """同上，类型为 ``null``（Issue #270 场景 7 的第二种类型）。"""
 
-        transport = RecordingTransport([{"code": 0, "data": {"share_users": None, "has_more": False}}])
+        transport = RecordingTransport(
+            [{"code": 0, "data": {"share_users": None, "has_more": False}}]
+        )
         client = _client(transport)
 
         with self.assertRaises(FeishuDirectoryError) as raised:
-            client.list_share_entities(token="fake-app-token", tenant_key="tenant_a", department_id="0")
+            client.list_share_entities(
+                token="fake-app-token", tenant_key="tenant_a", department_id="0"
+            )
         self.assertEqual(raised.exception.code, "missing_share_users")
 
     def test_share_entities_missing_key_across_pages_does_not_erase_prior_collection(self) -> None:
@@ -750,24 +849,38 @@ class AppIdentityPathTest(unittest.TestCase):
         client = _client(transport)
 
         with self.assertRaises(FeishuDirectoryError) as raised:
-            client.list_share_entities(token="fake-app-token", tenant_key="tenant_a", department_id="0")
+            client.list_share_entities(
+                token="fake-app-token", tenant_key="tenant_a", department_id="0"
+            )
         self.assertEqual(raised.exception.code, "has_more_invalid")
 
     def test_share_entities_rejects_a_missing_has_more(self) -> None:
         transport = RecordingTransport(
-            [{"code": 0, "data": {"share_departments": [], "share_users": [{"open_user_id": "ou_1"}]}}]
+            [
+                {
+                    "code": 0,
+                    "data": {"share_departments": [], "share_users": [{"open_user_id": "ou_1"}]},
+                }
+            ]
         )
         client = _client(transport)
 
         with self.assertRaises(FeishuDirectoryError) as raised:
-            client.list_share_entities(token="fake-app-token", tenant_key="tenant_a", department_id="0")
+            client.list_share_entities(
+                token="fake-app-token", tenant_key="tenant_a", department_id="0"
+            )
         self.assertEqual(raised.exception.code, "has_more_invalid")
 
     def test_share_entities_accepts_a_strict_false_as_the_last_page(self) -> None:
         """正向对照：真正的 bool ``False`` 才是"读完了"，不受 F4 修复影响。"""
 
         transport = RecordingTransport(
-            [multi_page({"share_departments": [], "share_users": [{"open_user_id": "ou_1"}]}, has_more=False)]
+            [
+                multi_page(
+                    {"share_departments": [], "share_users": [{"open_user_id": "ou_1"}]},
+                    has_more=False,
+                )
+            ]
         )
         client = _client(transport)
 
@@ -805,7 +918,9 @@ class AppIdentityPathTest(unittest.TestCase):
         client = _client(transport)
 
         with self.assertRaises(ValueError):
-            client.list_share_entities(token="fake-app-token", tenant_key="tenant_a", department_id="")
+            client.list_share_entities(
+                token="fake-app-token", tenant_key="tenant_a", department_id=""
+            )
         self.assertEqual(transport.calls, [], "非法请求不得发出真实调用")
 
 
@@ -890,7 +1005,9 @@ class AuthorizationClientTest(unittest.TestCase):
         self.assertEqual(raised.exception.code, "scope_incomplete")
         self.assertEqual(len(transport.calls), 1, "没有可轮换授权时不得读取身份或继续写入")
 
-    def test_authorization_code_with_offline_access_but_missing_directory_scope_is_rejected(self) -> None:
+    def test_authorization_code_with_offline_access_but_missing_directory_scope_is_rejected(
+        self,
+    ) -> None:
         """P1-A：只返回 offline_access 的子集授权不能写入正式凭据。"""
 
         required_scope = "auth:user.id:read auth:directory:readonly offline_access"
@@ -943,9 +1060,20 @@ class AuthorizationClientTest(unittest.TestCase):
 
     def test_a_successful_refresh_returns_a_wrapped_secret(self) -> None:
         transport = RecordingTransport(
-            [{"code": 0, "access_token": "fake-access", "expires_in": 7200, "refresh_token": "fake-next", "refresh_token_expires_in": 604800, "scope": "offline_access"}]
+            [
+                {
+                    "code": 0,
+                    "access_token": "fake-access",
+                    "expires_in": 7200,
+                    "refresh_token": "fake-next",
+                    "refresh_token_expires_in": 604800,
+                    "scope": "offline_access",
+                }
+            ]
         )
-        client = FeishuAuthorizationClient(base_url=BASE_URL, app_id="cli_fake", app_secret="secret_fake", transport=transport)
+        client = FeishuAuthorizationClient(
+            base_url=BASE_URL, app_id="cli_fake", app_secret="secret_fake", transport=transport
+        )
 
         grant, derived = client.refresh(AuthorizationGrant(SecretToken(FAKE_TOKEN), 3600))
 
@@ -969,10 +1097,21 @@ class AuthorizationClientTest(unittest.TestCase):
         for lifetime in ({}, {"expires_in": 0}, {"expires_in": "7200"}, {"expires_in": True}):
             with self.subTest(lifetime=lifetime):
                 transport = RecordingTransport(
-                    [{"code": 0, "access_token": "fake-access", "refresh_token": "fake-next", "refresh_token_expires_in": 604800, **lifetime}]
+                    [
+                        {
+                            "code": 0,
+                            "access_token": "fake-access",
+                            "refresh_token": "fake-next",
+                            "refresh_token_expires_in": 604800,
+                            **lifetime,
+                        }
+                    ]
                 )
                 client = FeishuAuthorizationClient(
-                    base_url=BASE_URL, app_id="cli_fake", app_secret="secret_fake", transport=transport
+                    base_url=BASE_URL,
+                    app_id="cli_fake",
+                    app_secret="secret_fake",
+                    transport=transport,
                 )
 
                 grant, derived = client.refresh(AuthorizationGrant(SecretToken(FAKE_TOKEN), 3600))
@@ -985,22 +1124,39 @@ class AuthorizationClientTest(unittest.TestCase):
         incomplete = (
             {"code": 0, "access_token": "fake-access", "refresh_token_expires_in": 604800},
             {"code": 0, "access_token": "fake-access", "refresh_token": "fake-next"},
-            {"code": 0, "access_token": "fake-access", "refresh_token": "fake-next", "refresh_token_expires_in": 0},
+            {
+                "code": 0,
+                "access_token": "fake-access",
+                "refresh_token": "fake-next",
+                "refresh_token_expires_in": 0,
+            },
             {"code": 0, "refresh_token": "fake-next", "refresh_token_expires_in": 604800},
         )
         for response in incomplete:
             with self.subTest(response=sorted(response)):
                 client = FeishuAuthorizationClient(
-                    base_url=BASE_URL, app_id="cli_fake", app_secret="secret_fake", transport=RecordingTransport([response])
+                    base_url=BASE_URL,
+                    app_id="cli_fake",
+                    app_secret="secret_fake",
+                    transport=RecordingTransport([response]),
                 )
                 with self.assertRaises(FeishuDirectoryError):
                     client.refresh(AuthorizationGrant(SecretToken(FAKE_TOKEN), 3600))
 
     def test_credentials_never_appear_in_the_url_or_in_logs(self) -> None:
         transport = RecordingTransport(
-            [{"code": 0, "access_token": "fake-access", "refresh_token": "fake-next", "refresh_token_expires_in": 604800}]
+            [
+                {
+                    "code": 0,
+                    "access_token": "fake-access",
+                    "refresh_token": "fake-next",
+                    "refresh_token_expires_in": 604800,
+                }
+            ]
         )
-        client = FeishuAuthorizationClient(base_url=BASE_URL, app_id="cli_fake", app_secret="secret_fake", transport=transport)
+        client = FeishuAuthorizationClient(
+            base_url=BASE_URL, app_id="cli_fake", app_secret="secret_fake", transport=transport
+        )
 
         with self.assertLogs("lingxi.adapters.feishu_directory", level=logging.INFO) as captured:
             client.refresh(AuthorizationGrant(SecretToken(FAKE_TOKEN), 3600))
@@ -1039,18 +1195,33 @@ class RequestThrottleTest(unittest.TestCase):
         pauses: list[float] = []
         transport = RecordingTransport(
             [
-                page([{"tenant_key": "tenant_a"}], key="target_tenant_list", has_more=True, page_token="p2"),
-                page([{"tenant_key": "tenant_b"}], key="target_tenant_list", has_more=True, page_token="p3"),
+                page(
+                    [{"tenant_key": "tenant_a"}],
+                    key="target_tenant_list",
+                    has_more=True,
+                    page_token="p2",
+                ),
+                page(
+                    [{"tenant_key": "tenant_b"}],
+                    key="target_tenant_list",
+                    has_more=True,
+                    page_token="p3",
+                ),
                 page([{"tenant_key": "tenant_c"}], key="target_tenant_list"),
             ]
         )
         client = FeishuDirectoryClient(
-            base_url=BASE_URL, transport=transport, sleep=pauses.append, request_pause_jitter_seconds=0
+            base_url=BASE_URL,
+            transport=transport,
+            sleep=pauses.append,
+            request_pause_jitter_seconds=0,
         )
 
         tenants = client.list_collaboration_tenants(token="fake-user-token")
 
-        self.assertEqual([item["tenant_key"] for item in tenants], ["tenant_a", "tenant_b", "tenant_c"])
+        self.assertEqual(
+            [item["tenant_key"] for item in tenants], ["tenant_a", "tenant_b", "tenant_c"]
+        )
         self.assertEqual(pauses, [REQUEST_PAUSE_SECONDS] * 3)
 
     def test_pages_multi_throttles_before_every_page(self) -> None:
@@ -1070,7 +1241,10 @@ class RequestThrottleTest(unittest.TestCase):
             ]
         )
         client = FeishuDirectoryClient(
-            base_url=BASE_URL, transport=transport, sleep=pauses.append, request_pause_jitter_seconds=0
+            base_url=BASE_URL,
+            transport=transport,
+            sleep=pauses.append,
+            request_pause_jitter_seconds=0,
         )
 
         client.list_share_entities(token="fake-app-token", tenant_key="tenant_a", department_id="0")
@@ -1081,9 +1255,14 @@ class RequestThrottleTest(unittest.TestCase):
         """``get_member_detail``（在职状态实时读取）单次调用 ⇒ 1 次节流调用。"""
 
         pauses: list[float] = []
-        transport = RecordingTransport([{"code": 0, "data": {"target_user": {"status": {"is_activated": True}}}}])
+        transport = RecordingTransport(
+            [{"code": 0, "data": {"target_user": {"status": {"is_activated": True}}}}]
+        )
         client = FeishuDirectoryClient(
-            base_url=BASE_URL, transport=transport, sleep=pauses.append, request_pause_jitter_seconds=0
+            base_url=BASE_URL,
+            transport=transport,
+            sleep=pauses.append,
+            request_pause_jitter_seconds=0,
         )
 
         client.get_member_detail(token="fake-app-token", tenant_key="tenant_a", member_id="ou_1")
@@ -1096,9 +1275,14 @@ class RequestThrottleTest(unittest.TestCase):
         记得打开——否则节流形同虚设（Issue #271 判据 1）。"""
 
         pauses: list[float] = []
-        transport = RecordingTransport([page([{"tenant_key": "tenant_a"}], key="target_tenant_list")])
+        transport = RecordingTransport(
+            [page([{"tenant_key": "tenant_a"}], key="target_tenant_list")]
+        )
         client = FeishuDirectoryClient(
-            base_url=BASE_URL, transport=transport, sleep=pauses.append, request_pause_jitter_seconds=0
+            base_url=BASE_URL,
+            transport=transport,
+            sleep=pauses.append,
+            request_pause_jitter_seconds=0,
         )
 
         client.list_collaboration_tenants(token="fake-user-token")
@@ -1115,7 +1299,9 @@ class RequestThrottleTest(unittest.TestCase):
         def _forbidden(seconds: float) -> None:
             raise AssertionError(f"节流关闭后不应再调用 sleeper（收到 {seconds}）")
 
-        transport = RecordingTransport([page([{"tenant_key": "tenant_a"}], key="target_tenant_list")])
+        transport = RecordingTransport(
+            [page([{"tenant_key": "tenant_a"}], key="target_tenant_list")]
+        )
         client = FeishuDirectoryClient(
             base_url=BASE_URL, transport=transport, request_pause_seconds=0, sleep=_forbidden
         )
@@ -1132,7 +1318,9 @@ class RequestThrottleTest(unittest.TestCase):
         去推测。"""
 
         with mock.patch("lingxi.adapters.feishu_directory.time.sleep") as real_sleep:
-            transport = RecordingTransport([page([{"tenant_key": "tenant_a"}], key="target_tenant_list")])
+            transport = RecordingTransport(
+                [page([{"tenant_key": "tenant_a"}], key="target_tenant_list")]
+            )
             client = _client(transport)
             client.list_collaboration_tenants(token="fake-user-token")
         real_sleep.assert_not_called()
@@ -1158,7 +1346,9 @@ class RequestPauseJitterTest(unittest.TestCase):
         不带抖动的固定步长——证明抖动是**叠加**在固定步长之上，不是替换它。"""
 
         pauses: list[float] = []
-        transport = RecordingTransport([page([{"tenant_key": "tenant_a"}], key="target_tenant_list")])
+        transport = RecordingTransport(
+            [page([{"tenant_key": "tenant_a"}], key="target_tenant_list")]
+        )
         client = FeishuDirectoryClient(
             base_url=BASE_URL, transport=transport, sleep=pauses.append, random_source=lambda: 0.0
         )
@@ -1172,7 +1362,9 @@ class RequestPauseJitterTest(unittest.TestCase):
         + 完整抖动上限）。"""
 
         pauses: list[float] = []
-        transport = RecordingTransport([page([{"tenant_key": "tenant_a"}], key="target_tenant_list")])
+        transport = RecordingTransport(
+            [page([{"tenant_key": "tenant_a"}], key="target_tenant_list")]
+        )
         client = FeishuDirectoryClient(
             base_url=BASE_URL, transport=transport, sleep=pauses.append, random_source=lambda: 1.0
         )
@@ -1190,7 +1382,9 @@ class RequestPauseJitterTest(unittest.TestCase):
             raise AssertionError("抖动关闭后不应再调用 random_source")
 
         pauses: list[float] = []
-        transport = RecordingTransport([page([{"tenant_key": "tenant_a"}], key="target_tenant_list")])
+        transport = RecordingTransport(
+            [page([{"tenant_key": "tenant_a"}], key="target_tenant_list")]
+        )
         client = FeishuDirectoryClient(
             base_url=BASE_URL,
             transport=transport,
@@ -1227,7 +1421,9 @@ class RequestPauseJitterTest(unittest.TestCase):
 
         def worker() -> None:
             barrier.wait(timeout=5.0)
-            client.get_member_detail(token="fake-app-token", tenant_key="tenant_a", member_id="ou_1")
+            client.get_member_detail(
+                token="fake-app-token", tenant_key="tenant_a", member_id="ou_1"
+            )
 
         threads = [threading.Thread(target=worker) for _ in range(worker_count)]
         for thread in threads:
@@ -1269,14 +1465,20 @@ class RateLimitRetryTest(unittest.TestCase):
             [_rate_limited_response(), page([{"tenant_key": "tenant_a"}], key="target_tenant_list")]
         )
         client = FeishuDirectoryClient(
-            base_url=BASE_URL, transport=transport, sleep=pauses.append, request_pause_jitter_seconds=0
+            base_url=BASE_URL,
+            transport=transport,
+            sleep=pauses.append,
+            request_pause_jitter_seconds=0,
         )
 
         tenants = client.list_collaboration_tenants(token="fake-user-token")
 
         self.assertEqual([item["tenant_key"] for item in tenants], ["tenant_a"])
         self.assertEqual(len(transport.calls), 2)
-        self.assertEqual(pauses, [REQUEST_PAUSE_SECONDS, RATE_LIMIT_RETRY_BACKOFFS_SECONDS[0], REQUEST_PAUSE_SECONDS])
+        self.assertEqual(
+            pauses,
+            [REQUEST_PAUSE_SECONDS, RATE_LIMIT_RETRY_BACKOFFS_SECONDS[0], REQUEST_PAUSE_SECONDS],
+        )
 
     def test_rate_limit_retries_are_bounded_and_eventually_raise(self) -> None:
         """持续撞限 ⇒ 用尽默认的三次退避后仍然抛出，且抛出的还是
@@ -1287,7 +1489,10 @@ class RateLimitRetryTest(unittest.TestCase):
         attempts = len(RATE_LIMIT_RETRY_BACKOFFS_SECONDS) + 1
         transport = RecordingTransport([_rate_limited_response() for _ in range(attempts)])
         client = FeishuDirectoryClient(
-            base_url=BASE_URL, transport=transport, sleep=pauses.append, request_pause_jitter_seconds=0
+            base_url=BASE_URL,
+            transport=transport,
+            sleep=pauses.append,
+            request_pause_jitter_seconds=0,
         )
 
         with self.assertRaises(FeishuDirectoryError) as raised:
@@ -1309,7 +1514,10 @@ class RateLimitRetryTest(unittest.TestCase):
         pauses: list[float] = []
         transport = RecordingTransport([{"code": 99991663, "msg": "permission denied"}])
         client = FeishuDirectoryClient(
-            base_url=BASE_URL, transport=transport, sleep=pauses.append, request_pause_jitter_seconds=0
+            base_url=BASE_URL,
+            transport=transport,
+            sleep=pauses.append,
+            request_pause_jitter_seconds=0,
         )
 
         with self.assertRaises(FeishuDirectoryError) as raised:
@@ -1331,7 +1539,10 @@ class RateLimitRetryTest(unittest.TestCase):
             [{"code": 0, "data": {"target_tenant_list": "not-a-list", "has_more": False}}]
         )
         client = FeishuDirectoryClient(
-            base_url=BASE_URL, transport=transport, sleep=pauses.append, request_pause_jitter_seconds=0
+            base_url=BASE_URL,
+            transport=transport,
+            sleep=pauses.append,
+            request_pause_jitter_seconds=0,
         )
 
         with self.assertRaises(FeishuDirectoryError) as raised:
@@ -1380,7 +1591,9 @@ class _AdvancingTransport:
     """记录调用并在指定的第 N 次调用**返回之后**推进假时钟——用来模拟
     "这一页处理花了很久" 而不需要真的等待。"""
 
-    def __init__(self, responses: list[object], *, clock: _FakeClock, advance_after: dict[int, float]) -> None:
+    def __init__(
+        self, responses: list[object], *, clock: _FakeClock, advance_after: dict[int, float]
+    ) -> None:
         self._responses = list(responses)
         self.calls: list[tuple[str, str, dict[str, object] | None, str | None]] = []
         self._clock = clock
@@ -1415,12 +1628,20 @@ class RoundBudgetTest(unittest.TestCase):
         clock = _FakeClock()
         transport = RecordingTransport(
             [
-                page([{"tenant_key": "tenant_a"}], key="target_tenant_list", has_more=True, page_token="p2"),
+                page(
+                    [{"tenant_key": "tenant_a"}],
+                    key="target_tenant_list",
+                    has_more=True,
+                    page_token="p2",
+                ),
                 page([{"tenant_key": "tenant_b"}], key="target_tenant_list"),
             ]
         )
         client = FeishuDirectoryClient(
-            base_url=BASE_URL, transport=transport, sleep=lambda seconds: None, round_deadline_clock=clock
+            base_url=BASE_URL,
+            transport=transport,
+            sleep=lambda seconds: None,
+            round_deadline_clock=clock,
         )
 
         with client.round_budget(seconds=1200.0):
@@ -1437,14 +1658,22 @@ class RoundBudgetTest(unittest.TestCase):
         clock = _FakeClock()
         transport = _AdvancingTransport(
             [
-                page([{"tenant_key": "tenant_a"}], key="target_tenant_list", has_more=True, page_token="p2"),
+                page(
+                    [{"tenant_key": "tenant_a"}],
+                    key="target_tenant_list",
+                    has_more=True,
+                    page_token="p2",
+                ),
                 page([{"tenant_key": "tenant_b"}], key="target_tenant_list"),
             ],
             clock=clock,
             advance_after={1: 11.0},  # 第一页处理完之后，时间已经超过 10 秒的预算。
         )
         client = FeishuDirectoryClient(
-            base_url=BASE_URL, transport=transport, sleep=lambda seconds: None, round_deadline_clock=clock
+            base_url=BASE_URL,
+            transport=transport,
+            sleep=lambda seconds: None,
+            round_deadline_clock=clock,
         )
 
         with self.assertRaises(FeishuDirectoryError) as raised:
@@ -1470,9 +1699,14 @@ class RoundBudgetTest(unittest.TestCase):
         「限定『从进入这个 with 块起』」）。"""
 
         clock = _FakeClock(start=1000.0)
-        transport = RecordingTransport([page([{"tenant_key": "tenant_a"}], key="target_tenant_list")])
+        transport = RecordingTransport(
+            [page([{"tenant_key": "tenant_a"}], key="target_tenant_list")]
+        )
         client = FeishuDirectoryClient(
-            base_url=BASE_URL, transport=transport, sleep=lambda seconds: None, round_deadline_clock=clock
+            base_url=BASE_URL,
+            transport=transport,
+            sleep=lambda seconds: None,
+            round_deadline_clock=clock,
         )
 
         with client.round_budget(seconds=1.0):
@@ -1492,9 +1726,14 @@ class RoundBudgetTest(unittest.TestCase):
 
         clock = _FakeClock(start=0.0)
         clock.advance(10_000_000.0)  # 远超任何合理预算，模拟"进程已经跑了很久"。
-        transport = RecordingTransport([page([{"tenant_key": "tenant_a"}], key="target_tenant_list")])
+        transport = RecordingTransport(
+            [page([{"tenant_key": "tenant_a"}], key="target_tenant_list")]
+        )
         client = FeishuDirectoryClient(
-            base_url=BASE_URL, transport=transport, sleep=lambda seconds: None, round_deadline_clock=clock
+            base_url=BASE_URL,
+            transport=transport,
+            sleep=lambda seconds: None,
+            round_deadline_clock=clock,
         )
 
         tenants = client.list_collaboration_tenants(token="fake-user-token")

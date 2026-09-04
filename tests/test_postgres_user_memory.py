@@ -296,7 +296,9 @@ class MemoryLimitTests(UserMemoryPostgresTestCase):
 
         self._fill_to_limit()
 
-        updated_id = self.remember(user_id=self.user_a, memory_key="key0", memory_value="更新后的值")
+        updated_id = self.remember(
+            user_id=self.user_a, memory_key="key0", memory_value="更新后的值"
+        )
 
         self.assertIsNotNone(updated_id)
         with connect(self._dsn) as connection:
@@ -308,9 +310,7 @@ class MemoryLimitTests(UserMemoryPostgresTestCase):
     def test_the_limit_is_per_user_not_global(self) -> None:
         self._fill_to_limit()
 
-        other_user_result = self.remember(
-            user_id=self.user_b, memory_key="k", memory_value="v"
-        )
+        other_user_result = self.remember(user_id=self.user_b, memory_key="k", memory_value="v")
 
         self.assertIsNotNone(other_user_result, "B 的上限与 A 无关")
 

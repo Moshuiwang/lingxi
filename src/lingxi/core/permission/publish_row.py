@@ -319,9 +319,7 @@ def content_digest(fields: Mapping[str, Any]) -> str:
     与"完整且相同"撞成同一个摘要，前者在上游就已经被字段集校验拦住）。
     """
 
-    canonical = "\n".join(
-        f"{name}={_digest_text(fields.get(name))}" for name in DIGEST_FIELD_NAMES
-    )
+    canonical = "\n".join(f"{name}={_digest_text(fields.get(name))}" for name in DIGEST_FIELD_NAMES)
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
 
@@ -334,9 +332,7 @@ def permissions_digest(fields: Mapping[str, Any]) -> str:
     只有后者能决定要不要清空用户记忆与已送达正文。改名不该清记忆。
     """
 
-    return hashlib.sha256(
-        _digest_text(fields.get("permissions")).encode("utf-8")
-    ).hexdigest()
+    return hashlib.sha256(_digest_text(fields.get("permissions")).encode("utf-8")).hexdigest()
 
 
 def _digest_text(value: Any) -> str:
@@ -349,6 +345,7 @@ def _digest_text(value: Any) -> str:
     if value is None:
         return ""
     return value if isinstance(value, str) else str(value)
+
 
 # fail-closed 的三个内部原因。用户侧一律是同一个「无可用银河权限」出口
 # （Issue #17 已确认的产品规则），这里的区分只供审计与排障。
@@ -777,9 +774,7 @@ class PublishRow:
         """
 
         return {
-            name: value
-            for name, value in self.fields.items()
-            if name not in _VOLATILE_FIELD_NAMES
+            name: value for name, value in self.fields.items() if name not in _VOLATILE_FIELD_NAMES
         }
 
     @classmethod
@@ -897,9 +892,7 @@ def build_translated_publish_row(
     )
 
 
-def build_revocation_row(
-    *, email: str, display_name: str, decided_at: datetime
-) -> PublishRow:
+def build_revocation_row(*, email: str, display_name: str, decided_at: datetime) -> PublishRow:
     """结算一行**撤权行**：保行、清空 ``permissions``、其余按授权行同一套规则。
 
     产品负责人 2026-08-18 裁定 3（`V-权限-08` 的刷新侧）：权限从有变无时行**保留**、
@@ -997,7 +990,9 @@ def parse_permissions(text: Any) -> dict[str, tuple[str, ...]]:
     return parsed
 
 
-def lookup_metrics(document: Mapping[str, Sequence[str]], company_id: Any = None) -> tuple[str, ...]:
+def lookup_metrics(
+    document: Mapping[str, Sequence[str]], company_id: Any = None
+) -> tuple[str, ...]:
     """按**回退制**取某个公司下的指标列表。**不取并集。**
 
     产品负责人 2026-08-17 的权威设计（留痕见
@@ -1019,9 +1014,7 @@ def lookup_metrics(document: Mapping[str, Sequence[str]], company_id: Any = None
     """
 
     if company_id is None:
-        return tuple(
-            sorted({item for values in document.values() for item in values})
-        )
+        return tuple(sorted({item for values in document.values() for item in values}))
     key = _text(company_id)
     if not key:
         raise ValueError("公司标识不能为空")

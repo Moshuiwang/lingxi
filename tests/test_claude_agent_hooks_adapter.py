@@ -86,7 +86,11 @@ class CallbackSignatureTest(_StubSDK):
     def test_callback_denies_with_positional_arguments(self) -> None:
         gateway = self._gateway()
         result = asyncio.run(
-            gateway.on_hook_event({"hook_event_name": "PreToolUse", "tool_name": "Write", "tool_input": {}}, "toolu_1", None)
+            gateway.on_hook_event(
+                {"hook_event_name": "PreToolUse", "tool_name": "Write", "tool_input": {}},
+                "toolu_1",
+                None,
+            )
         )
 
         self.assertEqual(result["hookSpecificOutput"]["permissionDecision"], "deny")

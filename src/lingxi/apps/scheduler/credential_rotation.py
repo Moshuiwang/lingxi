@@ -172,8 +172,14 @@ class CredentialRotationLoop:
             outcome = RefreshOutcome.ROTATED
         except Exception as error:  # 任何异常都不足以证明"旧凭据还能用"
             replacement = None
-            outcome = RefreshOutcome.FAILED if _is_definite_failure(error) else RefreshOutcome.INDETERMINATE
-            logger.warning("专用授权续期未成功 outcome=%s error=%s", outcome.value, type(error).__name__)
+            outcome = (
+                RefreshOutcome.FAILED
+                if _is_definite_failure(error)
+                else RefreshOutcome.INDETERMINATE
+            )
+            logger.warning(
+                "专用授权续期未成功 outcome=%s error=%s", outcome.value, type(error).__name__
+            )
 
         claim_generation = getattr(claim, "generation", None) or None
         if decide_after_refresh(outcome) is CredentialAction.ROTATE and replacement is not None:
@@ -185,7 +191,9 @@ class CredentialRotationLoop:
                 refresh_consumed_count=refresh_consumed_count,
             )
             if saved is CredentialSaveOutcome.SAVED:
-                logger.info("专用授权凭据已轮换 subject=%s", redact_identifier(claim.subject_open_id))
+                logger.info(
+                    "专用授权凭据已轮换 subject=%s", redact_identifier(claim.subject_open_id)
+                )
                 # **落盘成功之后**才把派生令牌交给进程内持有者：反过来会让"续期成功但
                 # 写盘失败＝凭据丢失"这条路径在日报照常工作的表象下发生。
                 self._remember_derived(derived, consumed_at=consumed_at)
@@ -259,8 +267,14 @@ class CredentialRotationLoop:
         try:
             replacement, derived = self._authorization.refresh(claim.grant)
         except Exception as error:  # 任何异常都不足以证明"旧凭据还能用"
-            outcome = RefreshOutcome.FAILED if _is_definite_failure(error) else RefreshOutcome.INDETERMINATE
-            logger.warning("按需续期未成功 outcome=%s error=%s", outcome.value, type(error).__name__)
+            outcome = (
+                RefreshOutcome.FAILED
+                if _is_definite_failure(error)
+                else RefreshOutcome.INDETERMINATE
+            )
+            logger.warning(
+                "按需续期未成功 outcome=%s error=%s", outcome.value, type(error).__name__
+            )
             self._vault.revoke(reason=f"refresh_{outcome.value}", generation=claim_generation)
             # from None：原始异常留在 __cause__ 里，任何一次 traceback 打印都会把响应
             # 正文（可能含令牌）带进日志。排障信息以净化过的类名走上面那行日志。
@@ -314,7 +328,9 @@ class CredentialRotationLoop:
             return "refresh_min_interval_not_elapsed"
         if isinstance(error, RefreshDailyLimitReached):
             return "refresh_daily_limit_reached"
-        raise AssertionError(f"未覆盖的频率上界异常类型：{type(error).__name__}")  # pragma: no cover
+        raise AssertionError(
+            f"未覆盖的频率上界异常类型：{type(error).__name__}"
+        )  # pragma: no cover
 
     def _remember_derived(self, derived: Any, *, consumed_at: datetime) -> bool:
         """把派生令牌交给进程内持有者。没有持有者或令牌不可用时返回 ``False``。

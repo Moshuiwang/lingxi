@@ -244,7 +244,10 @@ class SignalHandlerOnStopCallbackTests(GatewayProcessTestCase):
             "print('STOPPED', len(marks), flush=True)\n"
         )
         process = subprocess.Popen(
-            [sys.executable, "-c", script], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True
+            [sys.executable, "-c", script],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
         )
         self.addCleanup(self._reap, process)
 

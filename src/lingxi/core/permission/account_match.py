@@ -136,7 +136,9 @@ def match_galaxy_account(
         return _outcome(NOT_FOUND, "required_fields_missing", roster_name=roster_name)
 
     rows = list(galaxy_user_rows)
-    employee_no_hits = [row for row in rows if employee_no and _text(row.get("user_name")) == employee_no]
+    employee_no_hits = [
+        row for row in rows if employee_no and _text(row.get("user_name")) == employee_no
+    ]
     email_hits = [row for row in rows if email and normalize_email(row.get("email")) == email]
 
     if email and len(email_hits) > 1:

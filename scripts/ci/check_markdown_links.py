@@ -149,7 +149,9 @@ def check_file(markdown_file: Path) -> list[str]:
                 if cleaned_link.startswith("#"):
                     # 形如 `(#)` 的占位链接，不指向任何标题，不视为坏锚点。
                     continue
-                errors.append(f"{markdown_file.relative_to(REPOSITORY_ROOT)}:{line_number}: 本地链接缺少路径")
+                errors.append(
+                    f"{markdown_file.relative_to(REPOSITORY_ROOT)}:{line_number}: 本地链接缺少路径"
+                )
                 continue
 
             if target_path:

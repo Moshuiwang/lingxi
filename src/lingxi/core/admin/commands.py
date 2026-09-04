@@ -468,9 +468,7 @@ def describe_admin_tokens(text: object) -> AdminTokenShapes:
     """
 
     if not isinstance(text, str):
-        return AdminTokenShapes(
-            is_admin_prefixed=False, argument_count=0, shapes=(), raw_text=""
-        )
+        return AdminTokenShapes(is_admin_prefixed=False, argument_count=0, shapes=(), raw_text="")
     tokens = text.strip().split()
     is_admin_prefixed = bool(tokens) and tokens[0].casefold() == _COMMAND_PREFIX
     raw_text = ""
@@ -699,7 +697,11 @@ def _parse_position_permission_command(rest: list[str]) -> AdminCommand:
         return _unknown(AdminRejectReason.BAD_IDENTIFIER)
     if not _POSITION_TOKEN_PATTERN.fullmatch(position_name):
         return _unknown(AdminRejectReason.BAD_METRIC_NAME)
-    if not _IDENTIFIER_PATTERN.fullmatch(company_scope) and company_scope not in {"*", "全部", "all"}:
+    if not _IDENTIFIER_PATTERN.fullmatch(company_scope) and company_scope not in {
+        "*",
+        "全部",
+        "all",
+    }:
         return _unknown(AdminRejectReason.BAD_COMPANY_ID)
     reason = " ".join(reason_tokens).strip()
     if not reason or len(reason) > _PERMISSION_REASON_MAX_LENGTH:

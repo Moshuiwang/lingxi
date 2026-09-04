@@ -120,10 +120,7 @@ def classify_detail(paths: list[str]) -> Classification:
     # 配置目录里除上述白名单外的任何文件都可能改变用户体验、权限或事实源；不能
     # 因为它也位于 src/ 而沿用普通代码 fast。这个分支刻意早于 is_fast()。
     if any(
-        path.startswith(CONFIG_PREFIX)
-        and not is_l1(path)
-        and not is_l3(path)
-        and not is_l2(path)
+        path.startswith(CONFIG_PREFIX) and not is_l1(path) and not is_l3(path) and not is_l2(path)
         for path in normalized
     ):
         return Classification("full", "full", docs_changed, l1_changed, False)
@@ -146,6 +143,7 @@ def classify_detail(paths: list[str]) -> Classification:
         return Classification("fast", "fast", docs_changed, l1_changed, False)
 
     return Classification("full", "full", docs_changed, l1_changed, False)
+
 
 # scripts/ci/ 整目录默认提级到完整门禁，但其中已知的纯数据文件不含可执行逻辑、
 # 不改变门禁脚本本身的判定行为，因此显式登记后单独按 fast 处理（Issue #298）。
@@ -191,15 +189,23 @@ def changed_paths(base: str, head: str, *, repository: Path | None = None) -> li
         # -z 让 Git 输出原始文件名并用 NUL 分隔；否则中文等非 ASCII 路径会被
         # core.quotePath 转义，docs/** 会被误判成未知高风险路径。bytes + surrogateescape
         # 还保留了不合法 UTF-8 文件名，使其无法被错误地折叠到安全路径。
-        ["git", "-c", "core.quotePath=false", "diff", "--name-only", "-z", "--no-renames", base, head],
+        [
+            "git",
+            "-c",
+            "core.quotePath=false",
+            "diff",
+            "--name-only",
+            "-z",
+            "--no-renames",
+            base,
+            head,
+        ],
         check=True,
         capture_output=True,
         cwd=repository,
     )
     return [
-        raw.decode("utf-8", errors="surrogateescape")
-        for raw in result.stdout.split(b"\0")
-        if raw
+        raw.decode("utf-8", errors="surrogateescape") for raw in result.stdout.split(b"\0") if raw
     ]
 
 

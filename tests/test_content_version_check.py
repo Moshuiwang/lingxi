@@ -173,7 +173,10 @@ class ContentVersionGateTest(unittest.TestCase):
     def test_hand_edited_lock_digest_is_red(self) -> None:
         """登记文件被手工改过也要红，否则 digest 与逐键摘要可以悄悄分家。"""
         lines = self.lock.read_text(encoding="utf-8").splitlines()
-        replaced = ['digest = "sha256:' + "9" * 64 + '"' if line.startswith("digest = ") else line for line in lines]
+        replaced = [
+            'digest = "sha256:' + "9" * 64 + '"' if line.startswith("digest = ") else line
+            for line in lines
+        ]
         self.assertNotEqual(replaced, lines)
         self.lock.write_text("\n".join(replaced) + "\n", encoding="utf-8")
         code, _, err = self.check()

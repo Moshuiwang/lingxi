@@ -61,9 +61,7 @@ def _scan(path: Path) -> list[str]:
             findings.append(f"{path}:{node.lineno} {receiver}.exception(…)")
         for keyword in node.keywords:
             if keyword.arg == "exc_info":
-                findings.append(
-                    f"{path}:{node.lineno} {receiver}.{node.func.attr}(…, exc_info=…)"
-                )
+                findings.append(f"{path}:{node.lineno} {receiver}.{node.func.attr}(…, exc_info=…)")
     return findings
 
 

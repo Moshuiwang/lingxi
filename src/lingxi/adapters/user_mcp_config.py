@@ -316,7 +316,7 @@ def _parse_mcp_servers(payload: bytes) -> Mapping[str, Any]:
     # 无声拒绝——用户看到的是"什么都查不出来"，而不是一条诚实的配置错误。
     if len(servers) != 1:
         raise UserMcpConfigError("config_shape_invalid")
-    (name, value), = servers.items()
+    ((name, value),) = servers.items()
     if name != QUERY_MCP_SERVER_NAME:
         raise UserMcpConfigError("config_shape_invalid")
     _validate_server_shape(value)

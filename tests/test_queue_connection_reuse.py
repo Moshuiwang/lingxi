@@ -58,7 +58,9 @@ class _FakeConnection:
     后被关闭）。
     """
 
-    def __init__(self, rows: list[tuple] | None = None, *, commit_error: Exception | None = None) -> None:
+    def __init__(
+        self, rows: list[tuple] | None = None, *, commit_error: Exception | None = None
+    ) -> None:
         self.closed = False
         self.commit_calls = 0
         self.rollback_calls = 0
@@ -106,7 +108,9 @@ class ConnectionReuseHelperTests(unittest.TestCase):
         connections: list[_FakeConnection] = []
         seen: list[_FakeConnection] = []
 
-        def fake_connect(dsn: str, *, timeouts: object = None, dedicated: bool = False) -> _FakeConnection:
+        def fake_connect(
+            dsn: str, *, timeouts: object = None, dedicated: bool = False
+        ) -> _FakeConnection:
             connection = _FakeConnection()
             connections.append(connection)
             return connection
@@ -115,9 +119,7 @@ class ConnectionReuseHelperTests(unittest.TestCase):
             seen.append(connection)
 
         base = _TaskQueueBase("postgresql://test/db")
-        with mock.patch(
-            "lingxi.adapters.postgres_conversation._queue_base.connect", fake_connect
-        ):
+        with mock.patch("lingxi.adapters.postgres_conversation._queue_base.connect", fake_connect):
             base._run_polling_operation(operation)
             base._run_polling_operation(operation)
 
@@ -133,7 +135,9 @@ class ConnectionReuseHelperTests(unittest.TestCase):
         connections: list[_FakeConnection] = []
         seen: list[_FakeConnection] = []
 
-        def fake_connect(dsn: str, *, timeouts: object = None, dedicated: bool = False) -> _FakeConnection:
+        def fake_connect(
+            dsn: str, *, timeouts: object = None, dedicated: bool = False
+        ) -> _FakeConnection:
             connection = _FakeConnection()
             connections.append(connection)
             return connection
@@ -142,9 +146,7 @@ class ConnectionReuseHelperTests(unittest.TestCase):
             seen.append(connection)
 
         base = _TaskQueueBase("postgresql://test/db", reuse_polling_connection=True)
-        with mock.patch(
-            "lingxi.adapters.postgres_conversation._queue_base.connect", fake_connect
-        ):
+        with mock.patch("lingxi.adapters.postgres_conversation._queue_base.connect", fake_connect):
             base._run_polling_operation(operation)
             base._run_polling_operation(operation)
             base._run_polling_operation(operation)
@@ -163,15 +165,15 @@ class ConnectionReuseHelperTests(unittest.TestCase):
 
         connections: list[_FakeConnection] = []
 
-        def fake_connect(dsn: str, *, timeouts: object = None, dedicated: bool = False) -> _FakeConnection:
+        def fake_connect(
+            dsn: str, *, timeouts: object = None, dedicated: bool = False
+        ) -> _FakeConnection:
             connection = _FakeConnection()
             connections.append(connection)
             return connection
 
         base = _TaskQueueBase("postgresql://test/db", reuse_polling_connection=True)
-        with mock.patch(
-            "lingxi.adapters.postgres_conversation._queue_base.connect", fake_connect
-        ):
+        with mock.patch("lingxi.adapters.postgres_conversation._queue_base.connect", fake_connect):
             base._run_polling_operation(lambda connection: None)  # 先建立缓存里的第一条连接
             self.assertEqual(len(connections), 1)
             first = connections[0]
@@ -205,15 +207,15 @@ class ConnectionReuseHelperTests(unittest.TestCase):
 
         connections: list[_FakeConnection] = []
 
-        def fake_connect(dsn: str, *, timeouts: object = None, dedicated: bool = False) -> _FakeConnection:
+        def fake_connect(
+            dsn: str, *, timeouts: object = None, dedicated: bool = False
+        ) -> _FakeConnection:
             connection = _FakeConnection()
             connections.append(connection)
             return connection
 
         base = _TaskQueueBase("postgresql://test/db", reuse_polling_connection=True)
-        with mock.patch(
-            "lingxi.adapters.postgres_conversation._queue_base.connect", fake_connect
-        ):
+        with mock.patch("lingxi.adapters.postgres_conversation._queue_base.connect", fake_connect):
             base._run_polling_operation(lambda connection: None)
             self.assertEqual(len(connections), 1)
 
@@ -234,16 +236,16 @@ class ConnectionReuseHelperTests(unittest.TestCase):
 
         calls = {"count": 0}
 
-        def flaky_connect(dsn: str, *, timeouts: object = None, dedicated: bool = False) -> _FakeConnection:
+        def flaky_connect(
+            dsn: str, *, timeouts: object = None, dedicated: bool = False
+        ) -> _FakeConnection:
             calls["count"] += 1
             if calls["count"] == 1:
                 return _FakeConnection()
             raise ConnectionError("数据库不可达")
 
         base = _TaskQueueBase("postgresql://test/db", reuse_polling_connection=True)
-        with mock.patch(
-            "lingxi.adapters.postgres_conversation._queue_base.connect", flaky_connect
-        ):
+        with mock.patch("lingxi.adapters.postgres_conversation._queue_base.connect", flaky_connect):
             base._run_polling_operation(lambda connection: None)
 
             def fails_once(connection: _FakeConnection) -> None:
@@ -252,9 +254,7 @@ class ConnectionReuseHelperTests(unittest.TestCase):
             with self.assertRaises(ConnectionError):
                 base._run_polling_operation(fails_once)
 
-        self.assertIsNone(
-            base._pooled_connection, "重建失败后不能把半成品连接留在缓存里"
-        )
+        self.assertIsNone(base._pooled_connection, "重建失败后不能把半成品连接留在缓存里")
 
     def test_newly_built_connection_failure_does_not_retry(self) -> None:
         """P2-1 边界：新建的连接（缓存为空/已关闭，本次调用现建）首次失败直接
@@ -263,15 +263,15 @@ class ConnectionReuseHelperTests(unittest.TestCase):
 
         connections: list[_FakeConnection] = []
 
-        def fake_connect(dsn: str, *, timeouts: object = None, dedicated: bool = False) -> _FakeConnection:
+        def fake_connect(
+            dsn: str, *, timeouts: object = None, dedicated: bool = False
+        ) -> _FakeConnection:
             connection = _FakeConnection()
             connections.append(connection)
             return connection
 
         base = _TaskQueueBase("postgresql://test/db", reuse_polling_connection=True)
-        with mock.patch(
-            "lingxi.adapters.postgres_conversation._queue_base.connect", fake_connect
-        ):
+        with mock.patch("lingxi.adapters.postgres_conversation._queue_base.connect", fake_connect):
 
             def fails(connection: _FakeConnection) -> None:
                 raise RuntimeError("新连接刚建好就失败")
@@ -299,15 +299,15 @@ class ConnectionReuseHelperTests(unittest.TestCase):
 
         connections: list[_FakeConnection] = []
 
-        def fake_connect(dsn: str, *, timeouts: object = None, dedicated: bool = False) -> _FakeConnection:
+        def fake_connect(
+            dsn: str, *, timeouts: object = None, dedicated: bool = False
+        ) -> _FakeConnection:
             connection = _FakeConnection()
             connections.append(connection)
             return connection
 
         base = _TaskQueueBase("postgresql://test/db", reuse_polling_connection=True)
-        with mock.patch(
-            "lingxi.adapters.postgres_conversation._queue_base.connect", fake_connect
-        ):
+        with mock.patch("lingxi.adapters.postgres_conversation._queue_base.connect", fake_connect):
             base._run_polling_operation(lambda connection: None)  # 建立缓存里的复用连接
             self.assertEqual(len(connections), 1)
             first = connections[0]
@@ -339,20 +339,22 @@ class ConnectionReuseHelperTests(unittest.TestCase):
 
         connections: list[_FakeConnection] = []
 
-        def fake_connect(dsn: str, *, timeouts: object = None, dedicated: bool = False) -> _FakeConnection:
+        def fake_connect(
+            dsn: str, *, timeouts: object = None, dedicated: bool = False
+        ) -> _FakeConnection:
             connection = _FakeConnection()
             connections.append(connection)
             return connection
 
         base = _TaskQueueBase("postgresql://test/db", reuse_polling_connection=True)
-        with mock.patch(
-            "lingxi.adapters.postgres_conversation._queue_base.connect", fake_connect
-        ):
+        with mock.patch("lingxi.adapters.postgres_conversation._queue_base.connect", fake_connect):
             base._run_polling_operation(lambda connection: None)  # 建立缓存里的第一条连接
             self.assertEqual(len(connections), 1)
 
             # 第二条连接（重试用）的 operation 阶段能成功，但 commit() 会抛错。
-            def flaky_connect(dsn: str, *, timeouts: object = None, dedicated: bool = False) -> _FakeConnection:
+            def flaky_connect(
+                dsn: str, *, timeouts: object = None, dedicated: bool = False
+            ) -> _FakeConnection:
                 connection = _FakeConnection(commit_error=RuntimeError("重试后 COMMIT 依然失败"))
                 connections.append(connection)
                 return connection
@@ -372,7 +374,9 @@ class ConnectionReuseHelperTests(unittest.TestCase):
                     base._run_polling_operation(operation)
 
         self.assertEqual(calls["count"], 2, "operation 应该恰好重试一次（首次失败 + 重试成功）")
-        self.assertEqual(len(connections), 2, "重试只应该重建一条新连接，不因 commit() 失败再建第三条")
+        self.assertEqual(
+            len(connections), 2, "重试只应该重建一条新连接，不因 commit() 失败再建第三条"
+        )
         self.assertEqual(connections[1].commit_calls, 1)
         self.assertTrue(connections[1].closed, "重试后 commit() 失败的连接必须被丢弃")
         self.assertIsNone(base._pooled_connection, "commit() 失败后不能把这条连接留在缓存里")
@@ -385,15 +389,15 @@ class QueueHotPathWiringTests(unittest.TestCase):
     def test_claim_reuses_the_same_connection_across_polls(self) -> None:
         connections: list[_FakeConnection] = []
 
-        def fake_connect(dsn: str, *, timeouts: object = None, dedicated: bool = False) -> _FakeConnection:
+        def fake_connect(
+            dsn: str, *, timeouts: object = None, dedicated: bool = False
+        ) -> _FakeConnection:
             connection = _FakeConnection(rows=[])
             connections.append(connection)
             return connection
 
         queue = PostgresTaskQueue("postgresql://test/db", reuse_polling_connection=True)
-        with mock.patch(
-            "lingxi.adapters.postgres_conversation._queue_base.connect", fake_connect
-        ):
+        with mock.patch("lingxi.adapters.postgres_conversation._queue_base.connect", fake_connect):
             queue.claim(worker_id="w1", target_worker_version="stable", limit=1)
             queue.claim(worker_id="w1", target_worker_version="stable", limit=1)
             queue.claim(worker_id="w1", target_worker_version="stable", limit=1)
@@ -405,15 +409,15 @@ class QueueHotPathWiringTests(unittest.TestCase):
     def test_gateway_delivery_discovery_queries_reuse_the_same_connection(self) -> None:
         connections: list[_FakeConnection] = []
 
-        def fake_connect(dsn: str, *, timeouts: object = None, dedicated: bool = False) -> _FakeConnection:
+        def fake_connect(
+            dsn: str, *, timeouts: object = None, dedicated: bool = False
+        ) -> _FakeConnection:
             connection = _FakeConnection(rows=[])
             connections.append(connection)
             return connection
 
         queue = PostgresTaskQueue("postgresql://test/db", reuse_polling_connection=True)
-        with mock.patch(
-            "lingxi.adapters.postgres_conversation._queue_base.connect", fake_connect
-        ):
+        with mock.patch("lingxi.adapters.postgres_conversation._queue_base.connect", fake_connect):
             queue.list_pending_delivery_tasks(limit=20)
             queue.list_uncertain_delivery_tasks(limit=50)
             queue.list_pending_delivery_tasks(limit=20)
@@ -439,7 +443,9 @@ class QueueHotPathWiringTests(unittest.TestCase):
                     raise RuntimeError("模拟服务端悄悄断开这条复用连接")
                 return super().cursor()
 
-        def fake_connect(dsn: str, *, timeouts: object = None, dedicated: bool = False) -> _FakeConnection:
+        def fake_connect(
+            dsn: str, *, timeouts: object = None, dedicated: bool = False
+        ) -> _FakeConnection:
             # 新建的连接一律健康；第一条连接会在第一次 claim() 之后被外部手动
             # 标记为"已断开"，模拟服务端在两次轮询之间悄悄掐断它。
             connection = _DroppingThenFakeConnection(fail=False, rows=[])
@@ -447,9 +453,7 @@ class QueueHotPathWiringTests(unittest.TestCase):
             return connection
 
         queue = PostgresTaskQueue("postgresql://test/db", reuse_polling_connection=True)
-        with mock.patch(
-            "lingxi.adapters.postgres_conversation._queue_base.connect", fake_connect
-        ):
+        with mock.patch("lingxi.adapters.postgres_conversation._queue_base.connect", fake_connect):
             queue.claim(worker_id="w1", target_worker_version="stable", limit=1)
             connections[0]._fail = True  # 模拟服务端在两次轮询之间悄悄掐断
             result = queue.claim(worker_id="w1", target_worker_version="stable", limit=1)

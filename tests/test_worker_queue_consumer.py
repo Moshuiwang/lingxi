@@ -167,7 +167,9 @@ class RecordingCards:
 
 
 class RecordingText:
-    def __init__(self, *, fail: bool = False, error: type[BaseException] = DeliveryRejected) -> None:
+    def __init__(
+        self, *, fail: bool = False, error: type[BaseException] = DeliveryRejected
+    ) -> None:
         self.texts: list[str] = []
         self.calls: list[dict[str, object]] = []
         self.fail = fail
@@ -379,7 +381,10 @@ class CardStreamTests(unittest.TestCase):
         for index, step in enumerate(steps, start=1):
             now[0] = float(index)
             stream.update(
-                elapsed_seconds=1, action=PROGRESS_ACTION_QUERYING, query_count=index, query_step=step
+                elapsed_seconds=1,
+                action=PROGRESS_ACTION_QUERYING,
+                query_count=index,
+                query_step=step,
             )
             with self.subTest(step=step):
                 expected_lines = expected_done[: index - 1] + [expected_current[index - 1]]
@@ -437,13 +442,19 @@ class CardStreamTests(unittest.TestCase):
         stream.start()
         now[0] = 1.0
         stream.update(
-            elapsed_seconds=2, action=PROGRESS_ACTION_QUERYING, query_count=1, query_step="list_metrics"
+            elapsed_seconds=2,
+            action=PROGRESS_ACTION_QUERYING,
+            query_count=1,
+            query_step="list_metrics",
         )
         now[0] = 2.0
         # 同一身份第二次出现，累计过了 20 秒（22-2）——超过旧阈值（12 秒）但
         # 仍在新阈值（24 秒）之内。
         stream.update(
-            elapsed_seconds=22, action=PROGRESS_ACTION_QUERYING, query_count=1, query_step="list_metrics"
+            elapsed_seconds=22,
+            action=PROGRESS_ACTION_QUERYING,
+            query_count=1,
+            query_step="list_metrics",
         )
 
         self.assertEqual(cards.bodies[-1], "正在第 1 次查询可用指标列表 · 22 秒")
@@ -478,12 +489,18 @@ class CardStreamTests(unittest.TestCase):
         stream.start()
         now[0] = 1.0
         stream.update(
-            elapsed_seconds=2, action=PROGRESS_ACTION_QUERYING, query_count=1, query_step="list_metrics"
+            elapsed_seconds=2,
+            action=PROGRESS_ACTION_QUERYING,
+            query_count=1,
+            query_step="list_metrics",
         )
         now[0] = 3.0
         # 同一身份再次出现，累计已经过了 25 秒（27-2），跨过 24 秒阈值。
         stream.update(
-            elapsed_seconds=27, action=PROGRESS_ACTION_QUERYING, query_count=1, query_step="list_metrics"
+            elapsed_seconds=27,
+            action=PROGRESS_ACTION_QUERYING,
+            query_count=1,
+            query_step="list_metrics",
         )
 
         self.assertEqual(
@@ -524,7 +541,9 @@ class CardStreamTests(unittest.TestCase):
         self.assertEqual(first_stalled_body, "正在处理其它步骤（已 25 秒无新进展）")
         self.assertEqual(second_stalled_body, "正在处理其它步骤（已 49 秒无新进展）")
         self.assertNotEqual(
-            first_stalled_body, second_stalled_body, "停滞期间文字必须继续变化，不能停在同一句话不动"
+            first_stalled_body,
+            second_stalled_body,
+            "停滞期间文字必须继续变化，不能停在同一句话不动",
         )
 
     def test_a_fresh_signal_after_a_stall_resumes_normal_wording_and_keeps_history(
@@ -556,11 +575,17 @@ class CardStreamTests(unittest.TestCase):
         stream.start()
         now[0] = 1.0
         stream.update(
-            elapsed_seconds=2, action=PROGRESS_ACTION_QUERYING, query_count=1, query_step="list_metrics"
+            elapsed_seconds=2,
+            action=PROGRESS_ACTION_QUERYING,
+            query_count=1,
+            query_step="list_metrics",
         )
         now[0] = 2.0
         stream.update(
-            elapsed_seconds=27, action=PROGRESS_ACTION_QUERYING, query_count=1, query_step="list_metrics"
+            elapsed_seconds=27,
+            action=PROGRESS_ACTION_QUERYING,
+            query_count=1,
+            query_step="list_metrics",
         )
         self.assertIn("无新进展", cards.bodies[-1])
         now[0] = 3.0
@@ -646,13 +671,19 @@ class CardStreamTests(unittest.TestCase):
         # t=3：发出查询工具调用。
         now[0] = 1.0
         stream.update(
-            elapsed_seconds=3, action=PROGRESS_ACTION_QUERYING, query_count=1, query_step="query_metric"
+            elapsed_seconds=3,
+            action=PROGRESS_ACTION_QUERYING,
+            query_count=1,
+            query_step="query_metric",
         )
         # t=15：期间一次兜底刷新（距上次 12 秒），身份未变——累计 12 秒，
         # 远没跨过 24 秒新阈值。
         now[0] = 2.0
         stream.update(
-            elapsed_seconds=15, action=PROGRESS_ACTION_QUERYING, query_count=1, query_step="query_metric"
+            elapsed_seconds=15,
+            action=PROGRESS_ACTION_QUERYING,
+            query_count=1,
+            query_step="query_metric",
         )
         # t=18：工具结果返回，rc21 新增信号把身份切到 composing——停滞计时
         # 的锚点随之清零。
@@ -669,7 +700,9 @@ class CardStreamTests(unittest.TestCase):
 
         # 6 = start() 建卡的初始占位帧 + 5 次 update()；逐一确认没有一帧被
         # 节流吞掉，也确认全部 6 帧里没有任何一帧出现停滞措辞。
-        self.assertEqual(len(cards.bodies), 6, "建卡 + 五次 update 都必须真正写库，没有一次被节流吞掉")
+        self.assertEqual(
+            len(cards.bodies), 6, "建卡 + 五次 update 都必须真正写库，没有一次被节流吞掉"
+        )
         for body in cards.bodies:
             self.assertNotIn("无新进展", body, f"正常任务全程不应出现停滞措辞，实际：{body!r}")
 
@@ -753,7 +786,9 @@ class CardStreamTests(unittest.TestCase):
             elapsed_seconds=int(CARD_AUTO_CLOSE_HANDOFF_SECONDS + 30),
             action=PROGRESS_ACTION_COMPOSING,
         )
-        self.assertEqual(len(cards.calls), update_calls_after_handoff, "降级后不应再调用卡片 update")
+        self.assertEqual(
+            len(cards.calls), update_calls_after_handoff, "降级后不应再调用卡片 update"
+        )
 
         # 终态改走既有文本兜底通道，不再尝试卡片 finish。
         stream.finish(result="最终答案", elapsed_seconds=600)
@@ -889,8 +924,11 @@ class CardStreamTests(unittest.TestCase):
         cards = RecordingCards(fail="create", error=TimeoutError)
         text = RecordingText()
         stream = CardStream(
-            chat_id="chat-a", thread_id="topic-a", reply_to_message_id="msg-a",
-            transport=cards, fallback=text,
+            chat_id="chat-a",
+            thread_id="topic-a",
+            reply_to_message_id="msg-a",
+            transport=cards,
+            fallback=text,
         )
 
         with self.assertRaises(TimeoutError):
@@ -907,8 +945,11 @@ class CardStreamTests(unittest.TestCase):
         cards = RecordingCards(fail="update", error=TimeoutError)
         text = RecordingText()
         stream = CardStream(
-            chat_id="chat-a", thread_id="topic-a", reply_to_message_id="msg-a",
-            transport=cards, fallback=text,
+            chat_id="chat-a",
+            thread_id="topic-a",
+            reply_to_message_id="msg-a",
+            transport=cards,
+            fallback=text,
         )
         stream.start()
 
@@ -930,8 +971,11 @@ class CardStreamTests(unittest.TestCase):
         cards = RecordingCards(fail="close", error=TimeoutError)
         text = RecordingText()
         stream = CardStream(
-            chat_id="chat-a", thread_id="topic-a", reply_to_message_id="msg-a",
-            transport=cards, fallback=text,
+            chat_id="chat-a",
+            thread_id="topic-a",
+            reply_to_message_id="msg-a",
+            transport=cards,
+            fallback=text,
         )
         stream.start()
         stream.finish(result="已产生的答案", elapsed_seconds=1)  # 不应该抛出
@@ -947,8 +991,11 @@ class CardStreamTests(unittest.TestCase):
         cards = RecordingCards(fail="create")  # 明确失败，走文本通道
         text = RecordingText(fail=True, error=TimeoutError)
         stream = CardStream(
-            chat_id="chat-a", thread_id="topic-a", reply_to_message_id="msg-a",
-            transport=cards, fallback=text,
+            chat_id="chat-a",
+            thread_id="topic-a",
+            reply_to_message_id="msg-a",
+            transport=cards,
+            fallback=text,
         )
         stream.start()
         self.assertTrue(stream.fallback_needed)
@@ -1298,7 +1345,9 @@ class WorkerServiceTests(unittest.TestCase):
             (False, "result_too_large", "failed", "result_too_large", "worker.result_too_large"),
             (False, "mcp_bad_gateway", "failed", "mcp_bad_gateway", "worker.mcp_bad_gateway"),
         ):
-            with self.subTest(expected_terminal_kind=expected_terminal_kind, failure_code=failure_code):
+            with self.subTest(
+                expected_terminal_kind=expected_terminal_kind, failure_code=failure_code
+            ):
                 queue = FakeWorkerQueue(stopped=stopped)
 
                 class Executor:
@@ -1356,7 +1405,9 @@ class WorkerServiceTests(unittest.TestCase):
             terminal["content"], default_content_catalog().text("worker.mcp_bad_gateway").text
         )
         self.assertEqual(len(sink.calls), 1)
-        self.assertEqual(len([event for event in queue.events if event["event_type"] == "terminal"]), 0)
+        self.assertEqual(
+            len([event for event in queue.events if event["event_type"] == "terminal"]), 0
+        )
 
     def test_withheld_output_writes_redacted_withheld_terminal_not_success(self) -> None:
         """#141/#149：整段正文因安全策略被拒发时，即使 closed=True 也不得写成
@@ -1373,7 +1424,11 @@ class WorkerServiceTests(unittest.TestCase):
                         "closed": True,
                         "final_text": "本次结果涉及需要保护的内容，已被安全策略拦截，未能提供结果。",
                         "session_id": "new-session",
-                        "output_safety": {"blocked": True, "withheld": True, "reasons": ("forbidden_value",)},
+                        "output_safety": {
+                            "blocked": True,
+                            "withheld": True,
+                            "reasons": ("forbidden_value",),
+                        },
                         "user_result": "redacted_withheld",
                     },
                     "failure": None,
@@ -1447,7 +1502,7 @@ class WorkerServiceTests(unittest.TestCase):
         queue = FakeWorkerQueue()
         leaked_text = (
             "好的，我将为你查询。【内部能力已隐藏】【内部标识已隐藏】"
-            "{\"metric\": \"日活\", \"value\": 1024}"
+            '{"metric": "日活", "value": 1024}'
         )
 
         class Executor:
@@ -1916,9 +1971,7 @@ class WorkerServiceTests(unittest.TestCase):
                     terminal["content"],
                     default_content_catalog().text("worker.redacted_withheld").text,
                 )
-                self.assertNotIn(
-                    withheld_text, str(terminal["content"]), "被拒发的正文不得交付"
-                )
+                self.assertNotIn(withheld_text, str(terminal["content"]), "被拒发的正文不得交付")
 
     def test_a_genuinely_interrupted_turn_keeps_the_stopped_terminal(self) -> None:
         """Issue #195：纯 stop 的语义不变——执行层确认这一轮真被中断
@@ -1931,7 +1984,10 @@ class WorkerServiceTests(unittest.TestCase):
 
         catalog = default_content_catalog()
         for partial_text, expected_content in (
-            ("已产出的半截结果", catalog.text("worker.stopped_result", result="已产出的半截结果").text),
+            (
+                "已产出的半截结果",
+                catalog.text("worker.stopped_result", result="已产出的半截结果").text,
+            ),
             ("", catalog.text("worker.stopped").text),
         ):
             with self.subTest(partial_text=bool(partial_text)):
@@ -1940,8 +1996,15 @@ class WorkerServiceTests(unittest.TestCase):
                 class Executor:
                     async def run_turn(self, prompt: str, **kwargs: object) -> dict:
                         return {
-                            "turn": {"closed": False, "final_text": partial_text, "session_id": None},
-                            "failure": {"code": "interrupted", "message": "AgentSessionInterrupted"},
+                            "turn": {
+                                "closed": False,
+                                "final_text": partial_text,
+                                "session_id": None,
+                            },
+                            "failure": {
+                                "code": "interrupted",
+                                "message": "AgentSessionInterrupted",
+                            },
                         }
 
                 service = WorkerService(
@@ -2156,7 +2219,11 @@ class WorkerServiceTests(unittest.TestCase):
                         "session_id": "s",
                         "output_safety": {"blocked": False, "withheld": False, "reasons": ()},
                     },
-                    "audit": {"denied_count": 2, "denied": [], "usage": {"status": "known", "fields": {}}},
+                    "audit": {
+                        "denied_count": 2,
+                        "denied": [],
+                        "usage": {"status": "known", "fields": {}},
+                    },
                     "resources": {
                         "usage": {
                             "status": "known",
@@ -2207,7 +2274,9 @@ class WorkerServiceTests(unittest.TestCase):
 
         self.assertEqual(len(queue.terminals), 1)
         terminal = queue.terminals[0]
-        self.assertIsNone(terminal["guard_denied_count"], "负数必须按结构性不可信处理，不能原样落库")
+        self.assertIsNone(
+            terminal["guard_denied_count"], "负数必须按结构性不可信处理，不能原样落库"
+        )
 
     def test_write_terminal_event_gets_none_not_zero_when_the_turn_never_really_ran(self) -> None:
         """早退分支（这里用执行器抛未预期异常模拟）从未真正跑过一次回合，
@@ -2900,8 +2969,7 @@ class WorkerServiceTests(unittest.TestCase):
         self.assertGreaterEqual(
             alert_ticks[0],
             2,
-            "同一节拍下 _tick_alerts() 也必须继续被调用，不能随 _housekeep() "
-            "一起停摆",
+            "同一节拍下 _tick_alerts() 也必须继续被调用，不能随 _housekeep() 一起停摆",
         )
         self.assertEqual(len(queue.terminals), 1)
         self.assertEqual(queue.terminals[0]["terminal_kind"], "success")
@@ -3003,9 +3071,7 @@ class WorkerServiceTests(unittest.TestCase):
             queue=queue,
             executor_factory=lambda config, marker: Executor(),
         )
-        gateway = ToolGateway(
-            policy=ToolPolicy(allowed_tools=("mcp__q__read",)), audit=TurnAudit()
-        )
+        gateway = ToolGateway(policy=ToolPolicy(allowed_tools=("mcp__q__read",)), audit=TurnAudit())
 
         async def scenario() -> None:
             housekeeping = asyncio.ensure_future(service.process_once())
@@ -3551,9 +3617,7 @@ class SemanticProgressTests(unittest.TestCase):
         self.assertIsNone(terminal["error_kind"])
         self.assertEqual(terminal["content"], "结果")
         progress_events = [e for e in queue.events if e["event_type"] == "progress"]
-        self.assertEqual(
-            progress_events, [], "没有任何工具调用/文本事件时不应凭空产生进度更新"
-        )
+        self.assertEqual(progress_events, [], "没有任何工具调用/文本事件时不应凭空产生进度更新")
 
 
 @unittest.skipUnless(POSTGRES_READY, SKIP_DB)
@@ -3729,9 +3793,7 @@ class RealQueueTerminalTests(unittest.TestCase):
         terminal_kind, error_kind, content = self._terminal_event("tsk-c")
         self.assertEqual(terminal_kind, "failed")
         self.assertEqual(error_kind, "worker_version_unavailable")
-        self.assertEqual(
-            content, default_content_catalog().text("worker.version_unavailable").text
-        )
+        self.assertEqual(content, default_content_catalog().text("worker.version_unavailable").text)
         # 没被判定不可用的 canary 版本本身不该凭空出现终态事件。
         self.assertIsNone(self._terminal_event("tsk-s"))
 
@@ -3741,9 +3803,7 @@ class RealQueueTerminalTests(unittest.TestCase):
         self._insert_old_task(
             task_id="tsk-r", conversation_id="cnv-r", status="running", attempts=1
         )
-        self.assertEqual(
-            self.queue.reclaim_stale(older_than=timedelta(seconds=90)), ["tsk-r"]
-        )
+        self.assertEqual(self.queue.reclaim_stale(older_than=timedelta(seconds=90)), ["tsk-r"])
         # 安全重试的第一轮回到 queued，不写终态事件——不是这条路径要收口的对象。
         self.assertIsNone(self._terminal_event("tsk-r"))
         claimed = self.queue.claim(worker_id="worker-2", target_worker_version="stable")
@@ -4013,9 +4073,7 @@ class RealQueueTerminalTests(unittest.TestCase):
             "SELECT content FROM task_delivery_event WHERE event_type='terminal'"
         )
         self.assertIn("/new", terminal)
-        self.assertEqual(
-            self._scalar("SELECT error_kind FROM task"), "context_too_long"
-        )
+        self.assertEqual(self._scalar("SELECT error_kind FROM task"), "context_too_long")
         self.assertEqual(
             self._scalar(
                 "SELECT agent_session_id FROM conversation WHERE id=%s", (conversation_id,)
@@ -4048,9 +4106,7 @@ class RealQueueTerminalTests(unittest.TestCase):
         )
         claimed = self.queue.claim(worker_id="worker-session", target_worker_version="stable")
         self.assertEqual(claimed[0].task_id, outcome.task_id)
-        context = self.queue.task_context(
-            task_id=claimed[0].task_id, worker_id="worker-session"
-        )
+        context = self.queue.task_context(task_id=claimed[0].task_id, worker_id="worker-session")
         assert context is not None
         self.assertEqual(context.reply_to_message_id, "msg-session")
         self.assertTrue(
@@ -4335,7 +4391,9 @@ class SessionCleanupPipelineIntegrationTests(unittest.TestCase):
                        VALUES ('usr-90','ou-90','u-90','un-90','张三','数据部','tk-90','active')"""
                 )
 
-    def _queue_cleanup(self, *, cleanup_id: str, agent_session_id: str, reason: str = "new_command") -> None:
+    def _queue_cleanup(
+        self, *, cleanup_id: str, agent_session_id: str, reason: str = "new_command"
+    ) -> None:
         with connect(DSN) as connection:
             with connection.transaction():
                 connection.execute(
@@ -4349,7 +4407,9 @@ class SessionCleanupPipelineIntegrationTests(unittest.TestCase):
             session_root = Path(tmp)
             jsonl = session_root / "01J00000000000000000000SESS.jsonl"
             jsonl.write_text("{}", encoding="utf-8")
-            self._queue_cleanup(cleanup_id="asc-int-1", agent_session_id="01J00000000000000000000SESS")
+            self._queue_cleanup(
+                cleanup_id="asc-int-1", agent_session_id="01J00000000000000000000SESS"
+            )
 
             service = WorkerService(
                 config=worker_config(),
@@ -4370,7 +4430,9 @@ class SessionCleanupPipelineIntegrationTests(unittest.TestCase):
         标记完成，不能让一条永远匹配不到文件的记录卡住队列。"""
 
         with tempfile.TemporaryDirectory() as tmp:
-            self._queue_cleanup(cleanup_id="asc-int-2", agent_session_id="01J00000000000000000NEVER")
+            self._queue_cleanup(
+                cleanup_id="asc-int-2", agent_session_id="01J00000000000000000NEVER"
+            )
 
             service = WorkerService(
                 config=worker_config(),
@@ -4425,9 +4487,7 @@ class SessionCleanupPipelineIntegrationTests(unittest.TestCase):
             row = connection.execute(
                 "SELECT claimed_at, done_at FROM agent_session_cleanup WHERE id='asc-int-5'"
             ).fetchone()
-        self.assertIsNotNone(
-            row[0], "这一条应该已经被认领——不该半途放弃到连 claimed_at 都不写"
-        )
+        self.assertIsNotNone(row[0], "这一条应该已经被认领——不该半途放弃到连 claimed_at 都不写")
         self.assertIsNone(
             row[1],
             "根目录不存在时不能标记完成：事后把配置改对也补不回一条已经被"
@@ -4442,7 +4502,9 @@ class SessionCleanupPipelineIntegrationTests(unittest.TestCase):
             session_root = Path(tmp)
             jsonl = session_root / "01J00000000000000000PROCE.jsonl"
             jsonl.write_text("{}", encoding="utf-8")
-            self._queue_cleanup(cleanup_id="asc-int-4", agent_session_id="01J00000000000000000PROCE")
+            self._queue_cleanup(
+                cleanup_id="asc-int-4", agent_session_id="01J00000000000000000PROCE"
+            )
 
             service = WorkerService(
                 config=worker_config(),
@@ -4656,7 +4718,9 @@ class ContentCaptureWiringTests(unittest.TestCase):
     touches_the_executor_capture_hook` 就是 V-采集-01/02 的变异验红锚点）。
     """
 
-    def _sample_record(self, *, task_id: str = "tsk-1", worker_id: str = "worker-test") -> ContentCaptureRecord:
+    def _sample_record(
+        self, *, task_id: str = "tsk-1", worker_id: str = "worker-test"
+    ) -> ContentCaptureRecord:
         return ContentCaptureRecord(
             task_id=task_id,
             worker_id=worker_id,
@@ -5167,9 +5231,7 @@ class TerminalFailureSignatureTests(unittest.TestCase):
                 )
                 signatures.append(signature)
 
-        self.assertEqual(
-            len(set(signatures)), 3, f"三种底层异常必须互相可区分，实际={signatures}"
-        )
+        self.assertEqual(len(set(signatures)), 3, f"三种底层异常必须互相可区分，实际={signatures}")
 
     def test_the_signature_is_a_stable_digest_not_a_bare_class_name(self) -> None:
         """签名必须是固定类别加不可逆摘要，而不是裸类名或模块限定名；后者
@@ -5314,7 +5376,11 @@ class TerminalFailureSignatureTests(unittest.TestCase):
                     "closed": True,
                     "final_text": "被拦下的正文",
                     "session_id": "s",
-                    "output_safety": {"blocked": True, "withheld": True, "reasons": ("forbidden_value",)},
+                    "output_safety": {
+                        "blocked": True,
+                        "withheld": True,
+                        "reasons": ("forbidden_value",),
+                    },
                     "user_result": "redacted_withheld",
                 },
                 "failure": None,
@@ -5399,9 +5465,7 @@ class TerminalFailureSignatureTests(unittest.TestCase):
         self.assertEqual(sanitize_failure_signature("A" * 300), UNKNOWN_FAILURE_SIGNATURE)
         self.assertEqual(sanitize_failure_signature("中文异常"), UNKNOWN_FAILURE_SIGNATURE)
         self.assertEqual(sanitize_failure_signature(""), UNKNOWN_FAILURE_SIGNATURE)
-        self.assertEqual(
-            sanitize_failure_signature("mcp.query.http_502"), "mcp.query.http_502"
-        )
+        self.assertEqual(sanitize_failure_signature("mcp.query.http_502"), "mcp.query.http_502")
 
     def test_a_dynamic_type_name_never_reaches_the_terminal_signature(self) -> None:
         """审核复现：SDK 动态造出的 ``ou_secret_user`` 类名不能原样进入
@@ -5424,7 +5488,9 @@ class TerminalFailureSignatureTests(unittest.TestCase):
         self.assertNotIn("lpo_", signature)
         self.assertNotIn("pac_", signature)
         self.assertNotIn("@", signature)
-        self.assertRegex(signature, r"^exception\.(builtin|database|http|sdk|runtime|external)\.[0-9a-f]{40}$")
+        self.assertRegex(
+            signature, r"^exception\.(builtin|database|http|sdk|runtime|external)\.[0-9a-f]{40}$"
+        )
         self.assertEqual(signature, exception_failure_signature(dynamic_type("different text")))
 
         queue, sink = self._run(self._raising_executor(error))
@@ -5455,7 +5521,8 @@ class TerminalFailureSignatureTests(unittest.TestCase):
             "from lingxi.apps.worker.report_extraction import exception_failure_signature; "
             "E = type('RuntimeDatabaseError', (Exception,), "
             "{'__module__': 'psycopg.errors'}); "
-            "print(exception_failure_signature(E('ou_secret_user=ou_x')))")
+            "print(exception_failure_signature(E('ou_secret_user=ou_x')))"
+        )
         env = os.environ.copy()
         env["PYTHONPATH"] = str(Path(__file__).resolve().parents[1] / "src")
         result = subprocess.run(

@@ -85,17 +85,13 @@ def summarize_reactions(items: Iterable[Any]) -> dict[str, Any]:
     for item in items:
         total += 1
         emoji = getattr(getattr(item, "reaction_type", None), "emoji_type", None) or "(未知)"
-        operator_type = (
-            getattr(getattr(item, "operator", None), "operator_type", None) or "(未知)"
-        )
+        operator_type = getattr(getattr(item, "operator", None), "operator_type", None) or "(未知)"
         key = f"{emoji}/{operator_type}"
         by_key[key] = by_key.get(key, 0) + 1
     return {
         "total": total,
         "by_emoji_and_operator_type": dict(sorted(by_key.items())),
-        "app_reactions": sum(
-            count for key, count in by_key.items() if key.endswith("/app")
-        ),
+        "app_reactions": sum(count for key, count in by_key.items() if key.endswith("/app")),
     }
 
 
@@ -106,11 +102,7 @@ def _list_reaction_pages(client: Any, message_id: str) -> Iterable[Any]:
 
     page_token: str | None = None
     for _ in range(_MAX_PAGES):
-        builder = (
-            ListMessageReactionRequest.builder()
-            .message_id(message_id)
-            .page_size(_PAGE_SIZE)
-        )
+        builder = ListMessageReactionRequest.builder().message_id(message_id).page_size(_PAGE_SIZE)
         if page_token:
             builder = builder.page_token(page_token)
         response = client.im.v1.message_reaction.list(builder.build())

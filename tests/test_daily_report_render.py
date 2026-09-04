@@ -51,7 +51,13 @@ DELIVERY_WINDOW_END = datetime(2026, 8, 23, tzinfo=UTC)
 
 # 用于「正文绝不含用户标识/原文」断言的固定敏感值：真实姓名、工号、邮箱、飞书标识、
 # 内部 ULID 各一个，一个都不许出现在渲染结果里。
-FORBIDDEN_VALUES = ("张三", "E1001", "zhangsan@example.com", "ou_person_0001", "usr_01JQZX3M5N7P9R1T3V5W7Y9A0B")
+FORBIDDEN_VALUES = (
+    "张三",
+    "E1001",
+    "zhangsan@example.com",
+    "ou_person_0001",
+    "usr_01JQZX3M5N7P9R1T3V5W7Y9A0B",
+)
 
 
 def _all_determined_inputs(
@@ -72,11 +78,14 @@ def _all_determined_inputs(
         window_end=WINDOW_END,
         active_users=Section.of(active_users or ActiveUserStats(0, ())),
         status_distribution=Section.of(
-            status_distribution or StatusDistribution(success=0, failed=0, timeout=0, stopped=0, in_progress=0)
+            status_distribution
+            or StatusDistribution(success=0, failed=0, timeout=0, stopped=0, in_progress=0)
         ),
         failure_top=Section.of(failure_top),
         guard_triggered=Section.of(guard_triggered),
-        denied_count=Section.of(denied_count or PartialCount(total=0, covered_tasks=0, uncovered_tasks=0)),
+        denied_count=Section.of(
+            denied_count or PartialCount(total=0, covered_tasks=0, uncovered_tasks=0)
+        ),
         latency=Section.of(latency),
         resource_usage=Section.of(
             resource_usage
@@ -90,7 +99,10 @@ def _all_determined_inputs(
             )
         ),
         delivery_outcome=Section.of(
-            delivery_outcome or DeliveryOutcomeStats(delivered_card=0, delivered_fallback_text=0, expired=0, pending=0)
+            delivery_outcome
+            or DeliveryOutcomeStats(
+                delivered_card=0, delivered_fallback_text=0, expired=0, pending=0
+            )
         ),
         delivery_window_start=delivery_window_start,
         delivery_window_end=delivery_window_end,
@@ -279,7 +291,9 @@ class RepeatThrottleTests(unittest.TestCase):
 
     def test_a_first_appearance_has_streak_one_and_is_not_throttled(self) -> None:
         lines, updated = apply_repeat_throttle({}, [FailureReasonCount("session_failed", 3)])
-        self.assertEqual(lines, (ThrottledFailureLine("session_failed", 3, streak_days=1, throttled=False),))
+        self.assertEqual(
+            lines, (ThrottledFailureLine("session_failed", 3, streak_days=1, throttled=False),)
+        )
         self.assertEqual(updated, {"session_failed": 1})
 
     def test_the_seventh_consecutive_day_is_still_not_throttled(self) -> None:
@@ -304,7 +318,9 @@ class RepeatThrottleTests(unittest.TestCase):
 
         _, updated = apply_repeat_throttle({"session_failed": 9}, [])
         self.assertEqual(updated, {})
-        lines, updated_again = apply_repeat_throttle(updated, [FailureReasonCount("session_failed", 1)])
+        lines, updated_again = apply_repeat_throttle(
+            updated, [FailureReasonCount("session_failed", 1)]
+        )
         self.assertEqual(lines[0].streak_days, 1)
         self.assertFalse(lines[0].throttled)
 
@@ -395,7 +411,9 @@ class RenderUndeterminedSegmentTests(unittest.TestCase):
             status_distribution=StatusDistribution(5, 1, 0, 0, 0),
             latency=LatencyStats(3, 100.0, 100.0, 100.0, 100.0),
         )
-        inputs = DailyReportInputs(**{**inputs.__dict__, "active_users": Section.undetermined("模拟数据源故障")})
+        inputs = DailyReportInputs(
+            **{**inputs.__dict__, "active_users": Section.undetermined("模拟数据源故障")}
+        )
         text = self._render(inputs)
         self.assertIn("活跃用户与任务量分布：不可判定（原因：模拟数据源故障）", text)
         # 其余段落照常：状态分布与时延的真实数字原样出现，没有被一起打成不可判定。
@@ -413,9 +431,13 @@ class RenderUndeterminedSegmentTests(unittest.TestCase):
 
     def test_latency_alone_undetermined_does_not_affect_delivery_outcome(self) -> None:
         inputs = _all_determined_inputs(
-            delivery_outcome=DeliveryOutcomeStats(delivered_card=9, delivered_fallback_text=0, expired=0, pending=0)
+            delivery_outcome=DeliveryOutcomeStats(
+                delivered_card=9, delivered_fallback_text=0, expired=0, pending=0
+            )
         )
-        inputs = DailyReportInputs(**{**inputs.__dict__, "latency": Section.undetermined("连接被拒绝")})
+        inputs = DailyReportInputs(
+            **{**inputs.__dict__, "latency": Section.undetermined("连接被拒绝")}
+        )
         text = self._render(inputs)
         self.assertIn("时延分布", text)
         self.assertIn("不可判定（原因：连接被拒绝）", text)
@@ -479,10 +501,18 @@ class RenderUndeterminedSegmentTests(unittest.TestCase):
             ),
         )
         text = self._render(inputs)
-        self.assertIn("工具调用拒绝计数（PreToolUse 拒绝）：7 次（覆盖 8/10 个任务；另有 2 个任务因字段缺失未计入，不计为零）", text)
-        self.assertIn("token 用量：input=500，output=100，cache_creation=0，cache_read=0（覆盖 8/10 个任务；另有 2 个任务因字段缺失未计入，不计为零）", text)
+        self.assertIn(
+            "工具调用拒绝计数（PreToolUse 拒绝）：7 次（覆盖 8/10 个任务；另有 2 个任务因字段缺失未计入，不计为零）",
+            text,
+        )
+        self.assertIn(
+            "token 用量：input=500，output=100，cache_creation=0，cache_read=0（覆盖 8/10 个任务；另有 2 个任务因字段缺失未计入，不计为零）",
+            text,
+        )
 
-    def test_resource_usage_and_denied_count_undetermined_when_window_is_entirely_null(self) -> None:
+    def test_resource_usage_and_denied_count_undetermined_when_window_is_entirely_null(
+        self,
+    ) -> None:
         """窗口内有任务，但这两个字段全部是 NULL（例如全是迁移 0070 之前产生的
         历史任务）——纯函数返回 ``None``，调用方据此构造 `Section.undetermined`，
         正文必须显式说明，不能悄悄渲染成 0。"""
@@ -731,7 +761,9 @@ class MetricCoverageGapBuildTests(unittest.TestCase):
         self.assertIsNone(gap, "映射表覆盖面是 MCP 目录的超集时，无差异不报")
 
     def test_an_empty_mcp_catalog_reports_no_difference(self) -> None:
-        self.assertIsNone(build_metric_coverage_gap(mcp_metric_ids=(), mapped_metric_ids=("exchange_rate",)))
+        self.assertIsNone(
+            build_metric_coverage_gap(mcp_metric_ids=(), mapped_metric_ids=("exchange_rate",))
+        )
 
     def test_the_result_is_sorted_and_deduplicated(self) -> None:
         gap = build_metric_coverage_gap(
@@ -774,9 +806,7 @@ class MetricCoverageGapRenderTests(unittest.TestCase):
         """接线了、真查了、两边一致：无差异不报，正文同样不含「待分配」字样。"""
 
         inputs = _all_determined_inputs()
-        inputs = DailyReportInputs(
-            **{**inputs.__dict__, "metric_coverage_gap": Section.of(None)}
-        )
+        inputs = DailyReportInputs(**{**inputs.__dict__, "metric_coverage_gap": Section.of(None)})
 
         text = render_daily_report(inputs)
 
@@ -788,7 +818,9 @@ class MetricCoverageGapRenderTests(unittest.TestCase):
             **{
                 **inputs.__dict__,
                 "metric_coverage_gap": Section.of(
-                    MetricCoverageGap(uncovered_metric_ids=("brand_new_metric", "another_new_metric"))
+                    MetricCoverageGap(
+                        uncovered_metric_ids=("brand_new_metric", "another_new_metric")
+                    )
                 ),
             }
         )

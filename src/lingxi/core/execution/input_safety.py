@@ -114,9 +114,7 @@ _PROCESS_MARKERS = re.compile(
     + _zw_tolerant("mcp__")
     + rf"(?:[A-Za-z0-9_.-]|[{_ZERO_WIDTH_CHARS}]){{1,{_MCP_TOOL_SUFFIX_MAX}}}"
     + r"|\b(?:"
-    + r"|".join(
-        _zw_tolerant(word) for word in ("pretooluse", "posttooluse", "posttoolfailure")
-    )
+    + r"|".join(_zw_tolerant(word) for word in ("pretooluse", "posttooluse", "posttoolfailure"))
     + r")\b|\b(?:"
     + r"|".join(_zw_tolerant(word) for word in ("tool_use_id", "trace_id"))
     + r")"
@@ -276,7 +274,9 @@ def wrap_external_text(source: str, text: object) -> str:
 def render_external_context(values: ExternalTextItems | None) -> str:
     """渲染一组外部文本；来源顺序固定，内容边界逐段独立。"""
 
-    return "\n\n".join(wrap_external_text(source, text) for source, text in normalize_external_texts(values))
+    return "\n\n".join(
+        wrap_external_text(source, text) for source, text in normalize_external_texts(values)
+    )
 
 
 # Trace #304 批次 5 直修：gateway 管线（`core/conversation/pipeline.py` 第 6 步）
@@ -355,7 +355,9 @@ def constrain_output(
     redacted, reasons, kept_original = _apply_spans(candidate, merged, len(candidate))
 
     if reasons and not _has_meaningful_content(kept_original):
-        _ensure_terminal_text_is_safe(withheld_text, forbidden_values, system_prompt, internal_tool_names)
+        _ensure_terminal_text_is_safe(
+            withheld_text, forbidden_values, system_prompt, internal_tool_names
+        )
         return OutputConstraintResult(
             text=withheld_text,
             blocked=True,
@@ -367,7 +369,9 @@ def constrain_output(
         return OutputConstraintResult(text=redacted, blocked=True, withheld=False, reasons=reasons)
 
     if not candidate.strip():
-        _ensure_terminal_text_is_safe(fallback_text, forbidden_values, system_prompt, internal_tool_names)
+        _ensure_terminal_text_is_safe(
+            fallback_text, forbidden_values, system_prompt, internal_tool_names
+        )
         return OutputConstraintResult(
             text=fallback_text,
             blocked=True,
@@ -505,17 +509,27 @@ class StreamingOutputGuard:
         if self._reasons and not self._has_real_content:
             self._withheld = True
             _ensure_terminal_text_is_safe(
-                self._withheld_text, self._forbidden_values, self._system_prompt, self._internal_tool_names
+                self._withheld_text,
+                self._forbidden_values,
+                self._system_prompt,
+                self._internal_tool_names,
             )
-            return StreamRelease(text=self._withheld_text, withheld=True, reasons=tuple(self._reasons))
+            return StreamRelease(
+                text=self._withheld_text, withheld=True, reasons=tuple(self._reasons)
+            )
 
         if not self._reasons and not tail.strip() and not self._has_real_content:
             # 整轮什么都没释放过、也没有任何安全触发：与一次性 constrain_output
             # 的"空产出"分支同一语义，不是安全拦截。
             _ensure_terminal_text_is_safe(
-                self._fallback_text, self._forbidden_values, self._system_prompt, self._internal_tool_names
+                self._fallback_text,
+                self._forbidden_values,
+                self._system_prompt,
+                self._internal_tool_names,
             )
-            return StreamRelease(text=self._fallback_text, withheld=False, reasons=("empty_output",))
+            return StreamRelease(
+                text=self._fallback_text, withheld=False, reasons=("empty_output",)
+            )
 
         return StreamRelease(text=released, withheld=False, reasons=tuple(reasons_used))
 
@@ -711,7 +725,9 @@ def _ensure_terminal_text_is_safe(
         raise InputSafetyError("输出约束的安全终态不能为空")
     values = _unique_texts((*forbidden_values, system_prompt))
     tool_names = _unique_texts(internal_tool_names)
-    if any(value in terminal_text for value in values) or any(name in terminal_text for name in tool_names):
+    if any(value in terminal_text for value in values) or any(
+        name in terminal_text for name in tool_names
+    ):
         raise InputSafetyError("输出约束的安全终态包含被禁止的原文")
 
 

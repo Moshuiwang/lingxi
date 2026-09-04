@@ -103,9 +103,18 @@ class FindRowsTest(unittest.TestCase):
             [
                 _page(
                     [
-                        {"record_id": "rec_1", "fields": {"record_key": FAKE_EMAIL, "email": FAKE_EMAIL}},
-                        {"record_id": "rec_2", "fields": {"record_key": "EMP-1", "email": FAKE_EMAIL}},
-                        {"record_id": "rec_3", "fields": {"record_key": "other", "email": "other@x.invalid"}},
+                        {
+                            "record_id": "rec_1",
+                            "fields": {"record_key": FAKE_EMAIL, "email": FAKE_EMAIL},
+                        },
+                        {
+                            "record_id": "rec_2",
+                            "fields": {"record_key": "EMP-1", "email": FAKE_EMAIL},
+                        },
+                        {
+                            "record_id": "rec_3",
+                            "fields": {"record_key": "other", "email": "other@x.invalid"},
+                        },
                     ]
                 )
             ]
@@ -127,7 +136,9 @@ class FindRowsTest(unittest.TestCase):
             {"type": "text", "text": "jiaming.jia@"},
             {"type": "text", "text": "example.invalid"},
         ]
-        table, _ = _table([_page([{"record_id": "rec_1", "fields": {"record_key": segmented, "email": ""}}])])
+        table, _ = _table(
+            [_page([{"record_id": "rec_1", "fields": {"record_key": segmented, "email": ""}}])]
+        )
         rows = table.find_rows(record_key=FAKE_EMAIL, email=FAKE_EMAIL)
         self.assertEqual([row.record_id for row in rows], ["rec_1"])
         # 命中之后仍按同一把尺子判定"是不是我们这个键"，因此走的是更新而不是冲突。
@@ -135,7 +146,16 @@ class FindRowsTest(unittest.TestCase):
 
     def test_match_is_case_insensitive(self) -> None:
         table, _ = _table(
-            [_page([{"record_id": "rec_1", "fields": {"record_key": FAKE_EMAIL.upper(), "email": ""}}])]
+            [
+                _page(
+                    [
+                        {
+                            "record_id": "rec_1",
+                            "fields": {"record_key": FAKE_EMAIL.upper(), "email": ""},
+                        }
+                    ]
+                )
+            ]
         )
         self.assertEqual(len(table.find_rows(record_key=FAKE_EMAIL, email=FAKE_EMAIL)), 1)
 
@@ -152,9 +172,19 @@ class FindRowsTest(unittest.TestCase):
     def test_pagination_follows_the_cursor(self) -> None:
         table, transport = _table(
             [
-                _page([{"record_id": "rec_1", "fields": {"record_key": "x", "email": "x"}}],
-                      has_more=True, page_token="p2"),
-                _page([{"record_id": "rec_2", "fields": {"record_key": FAKE_EMAIL, "email": FAKE_EMAIL}}]),
+                _page(
+                    [{"record_id": "rec_1", "fields": {"record_key": "x", "email": "x"}}],
+                    has_more=True,
+                    page_token="p2",
+                ),
+                _page(
+                    [
+                        {
+                            "record_id": "rec_2",
+                            "fields": {"record_key": FAKE_EMAIL, "email": FAKE_EMAIL},
+                        }
+                    ]
+                ),
             ]
         )
         rows = table.find_rows(record_key=FAKE_EMAIL, email=FAKE_EMAIL)
@@ -211,9 +241,7 @@ class WriteTest(unittest.TestCase):
 
     def test_read_returns_raw_fields(self) -> None:
         table, transport = _table([_record("rec_7", {"record_key": FAKE_EMAIL, "permissions": 12})])
-        self.assertEqual(
-            table.read_row("rec_7"), {"record_key": FAKE_EMAIL, "permissions": 12}
-        )
+        self.assertEqual(table.read_row("rec_7"), {"record_key": FAKE_EMAIL, "permissions": 12})
         self.assertEqual(transport.calls[0]["method"], "GET")
 
     def test_create_without_record_id_is_indeterminate(self) -> None:

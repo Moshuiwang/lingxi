@@ -139,7 +139,9 @@ class RetentionPostgresTestCase(unittest.TestCase):
 
     # ---- 造数 -------------------------------------------------------------
 
-    def insert_batch(self, batch_id: str, *, started_at, status: str = "complete", with_children: bool = False) -> None:
+    def insert_batch(
+        self, batch_id: str, *, started_at, status: str = "complete", with_children: bool = False
+    ) -> None:
         """写一个银河导入批次。到期时间由触发器从 `started_at` 推导，不能自己指定。"""
 
         with self._psycopg.connect(self._dsn) as connection, connection.cursor() as cursor:
@@ -147,14 +149,33 @@ class RetentionPostgresTestCase(unittest.TestCase):
                 "INSERT INTO galaxy_import_batch "
                 "(id, source_label, source_digest, status, started_at, completed_at) "
                 "VALUES (%s, %s, %s, %s, %s, %s)",
-                (batch_id, f"合成导出 {batch_id}", f"digest-{batch_id}", status, started_at, started_at),
+                (
+                    batch_id,
+                    f"合成导出 {batch_id}",
+                    f"digest-{batch_id}",
+                    status,
+                    started_at,
+                    started_at,
+                ),
             )
             if not with_children:
                 return
-            cursor.execute("INSERT INTO galaxy_user (batch_id, user_id, email) VALUES (%s, 'U1', %s)", (batch_id, f"{batch_id}@example.invalid"))
-            cursor.execute("INSERT INTO galaxy_user_role (batch_id, user_id, role_id) VALUES (%s, 'U1', 'R1')", (batch_id,))
-            cursor.execute("INSERT INTO galaxy_role_menu (batch_id, role_id, menu_id) VALUES (%s, 'R1', 'M1')", (batch_id,))
-            cursor.execute("INSERT INTO galaxy_country (batch_id, source_id, country_key) VALUES (%s, '7', '101')", (batch_id,))
+            cursor.execute(
+                "INSERT INTO galaxy_user (batch_id, user_id, email) VALUES (%s, 'U1', %s)",
+                (batch_id, f"{batch_id}@example.invalid"),
+            )
+            cursor.execute(
+                "INSERT INTO galaxy_user_role (batch_id, user_id, role_id) VALUES (%s, 'U1', 'R1')",
+                (batch_id,),
+            )
+            cursor.execute(
+                "INSERT INTO galaxy_role_menu (batch_id, role_id, menu_id) VALUES (%s, 'R1', 'M1')",
+                (batch_id,),
+            )
+            cursor.execute(
+                "INSERT INTO galaxy_country (batch_id, source_id, country_key) VALUES (%s, '7', '101')",
+                (batch_id,),
+            )
             cursor.execute(
                 "INSERT INTO galaxy_user_datacountry (batch_id, user_id, datacountry_id) VALUES (%s, 'U1', '101')",
                 (batch_id,),
@@ -264,7 +285,9 @@ class ExpiryCollectionTest(RetentionPostgresTestCase):
         self.cleanup(now)
 
         surviving = {row[0] for row in self.query("SELECT id FROM galaxy_import_batch")}
-        self.assertEqual(surviving, {"gib_before"}, "恰好到期与已过期的都应被删，只差 1 秒未到期的应留下")
+        self.assertEqual(
+            surviving, {"gib_before"}, "恰好到期与已过期的都应被删，只差 1 秒未到期的应留下"
+        )
 
     def test_the_cleanup_condition_and_the_current_batch_filter_are_complementary(self) -> None:
         """V-保留-04（验收 A-09/B-01）：不存在"既是当前批次、又可被清理"的瞬间。
@@ -277,8 +300,16 @@ class ExpiryCollectionTest(RetentionPostgresTestCase):
         from lingxi.adapters.galaxy_import import PostgresGalaxyImportStore
 
         now = self.database_now()
-        self.insert_batch("gib_expired", started_at=now - RETENTION_WINDOW - timedelta(hours=1), with_children=True)
-        self.insert_batch("gib_current", started_at=now - RETENTION_WINDOW + timedelta(hours=1), with_children=True)
+        self.insert_batch(
+            "gib_expired",
+            started_at=now - RETENTION_WINDOW - timedelta(hours=1),
+            with_children=True,
+        )
+        self.insert_batch(
+            "gib_current",
+            started_at=now - RETENTION_WINDOW + timedelta(hours=1),
+            with_children=True,
+        )
         store = PostgresGalaxyImportStore(self._dsn)
 
         self.assertEqual(store.current_batch_id(), "gib_current")
@@ -314,7 +345,9 @@ class ExpiryCollectionTest(RetentionPostgresTestCase):
             elapsed_seconds, matches_ninety_days = cursor.fetchone()
 
         self.assertEqual(elapsed_seconds, 2160 * 3600)
-        self.assertFalse(matches_ninety_days, "跨夏令时切换时 90 日历日与 2160 小时必须落在不同时刻")
+        self.assertFalse(
+            matches_ninety_days, "跨夏令时切换时 90 日历日与 2160 小时必须落在不同时刻"
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -378,7 +411,9 @@ class CascadeBoundaryTest(RetentionPostgresTestCase):
     def test_each_child_table_is_emptied_by_its_own_cascade_edge(self) -> None:
         """V-保留-06（验收 C-01…C-08）：8 张子表**逐表**一条断言，不合并计数。"""
         now = self.database_now()
-        self.insert_batch("gib_old", started_at=now - RETENTION_WINDOW - timedelta(hours=1), with_children=True)
+        self.insert_batch(
+            "gib_old", started_at=now - RETENTION_WINDOW - timedelta(hours=1), with_children=True
+        )
         self.insert_sync_run("run_old", started_at=now - RETENTION_WINDOW - timedelta(hours=1))
         for child, _parent, column in CASCADE_EDGES:
             self.assertEqual(self.count(child), 1, f"造数阶段 {child} 应有 1 行")
@@ -392,7 +427,9 @@ class CascadeBoundaryTest(RetentionPostgresTestCase):
     def test_no_child_row_survives_without_its_parent(self) -> None:
         """V-保留-06（验收 C-09）：不少——不存在没有父行的子行。"""
         now = self.database_now()
-        self.insert_batch("gib_old", started_at=now - RETENTION_WINDOW - timedelta(hours=1), with_children=True)
+        self.insert_batch(
+            "gib_old", started_at=now - RETENTION_WINDOW - timedelta(hours=1), with_children=True
+        )
         self.insert_batch("gib_new", started_at=now, with_children=True)
         self.insert_sync_run("run_old", started_at=now - RETENTION_WINDOW - timedelta(hours=1))
         self.insert_sync_run("run_new", started_at=now)
@@ -410,7 +447,9 @@ class CascadeBoundaryTest(RetentionPostgresTestCase):
     def test_a_batch_that_has_not_expired_keeps_every_child_row(self) -> None:
         """V-保留-06（验收 C-10）：不多——未到期批次的子行内容一字未改。"""
         now = self.database_now()
-        self.insert_batch("gib_old", started_at=now - RETENTION_WINDOW - timedelta(hours=1), with_children=True)
+        self.insert_batch(
+            "gib_old", started_at=now - RETENTION_WINDOW - timedelta(hours=1), with_children=True
+        )
         self.insert_batch("gib_new", started_at=now, with_children=True)
         self.insert_sync_run("run_new", started_at=now)
         before = {
@@ -461,24 +500,36 @@ class ImmutableExpiryTriggerTest(RetentionPostgresTestCase):
             )
         )
         self.assertTrue(
-            self.scalar("SELECT expires_at < now() + interval '91 days' FROM galaxy_import_batch WHERE id = 'gib_liar'")
+            self.scalar(
+                "SELECT expires_at < now() + interval '91 days' FROM galaxy_import_batch WHERE id = 'gib_liar'"
+            )
         )
 
     def test_an_update_cannot_postpone_the_expiry(self) -> None:
         """V-保留-07（验收 D-02）：与 007 既有做法一致——后移被**覆盖**回来。"""
-        self.insert_batch("gib_move", started_at=self.database_now() - timedelta(hours=10), status="staging")
+        self.insert_batch(
+            "gib_move", started_at=self.database_now() - timedelta(hours=10), status="staging"
+        )
         before = self.scalar("SELECT expires_at FROM galaxy_import_batch WHERE id = 'gib_move'")
 
-        self.execute("UPDATE galaxy_import_batch SET expires_at = now() + interval '900 days' WHERE id = 'gib_move'")
+        self.execute(
+            "UPDATE galaxy_import_batch SET expires_at = now() + interval '900 days' WHERE id = 'gib_move'"
+        )
 
-        self.assertEqual(self.scalar("SELECT expires_at FROM galaxy_import_batch WHERE id = 'gib_move'"), before)
+        self.assertEqual(
+            self.scalar("SELECT expires_at FROM galaxy_import_batch WHERE id = 'gib_move'"), before
+        )
 
     def test_an_update_cannot_change_the_source_time(self) -> None:
         """V-保留-07（验收 D-03）：改来源时间等于换一条推导基线，可以无限后移。"""
-        self.insert_batch("gib_anchor", started_at=self.database_now() - timedelta(hours=10), status="staging")
+        self.insert_batch(
+            "gib_anchor", started_at=self.database_now() - timedelta(hours=10), status="staging"
+        )
 
         with self.assertRaises(self._psycopg.errors.RaiseException) as raised:
-            self.execute("UPDATE galaxy_import_batch SET started_at = now() WHERE id = 'gib_anchor'")
+            self.execute(
+                "UPDATE galaxy_import_batch SET started_at = now() WHERE id = 'gib_anchor'"
+            )
 
         self.assertIn("不允许修改银河导入批次的来源时间", str(raised.exception))
 
@@ -529,7 +580,9 @@ class ImmutableExpiryTriggerTest(RetentionPostgresTestCase):
             cursor.execute(UPGRADE_SQL)
 
         self.assertEqual(
-            self.count("galaxy_import_batch", "WHERE expires_at <> started_at + interval '2160 hours'"),
+            self.count(
+                "galaxy_import_batch", "WHERE expires_at <> started_at + interval '2160 hours'"
+            ),
             0,
         )
 
@@ -567,9 +620,11 @@ class CleanupFunctionContractTest(RetentionPostgresTestCase):
             (now - RETENTION_WINDOW - timedelta(hours=1),),
         )
 
-        summary = self.cleanup(now, limit=10 ** 9)
+        summary = self.cleanup(now, limit=10**9)
 
-        self.assertEqual(summary["galaxy_import_batch"][0], 1000, "超大批量必须被夹取到函数自己的上限")
+        self.assertEqual(
+            summary["galaxy_import_batch"][0], 1000, "超大批量必须被夹取到函数自己的上限"
+        )
         self.assertEqual(self.count("galaxy_import_batch"), 200)
 
         for bad_limit in (0, -5):
@@ -612,13 +667,21 @@ class CleanupFunctionContractTest(RetentionPostgresTestCase):
     def test_rows_that_expired_after_the_given_moment_are_kept(self) -> None:
         """V-保留-11（验收 E-05）：实际条件是 `expires_at <= p_now`，不是"凡过期都删"。"""
         now = self.database_now()
-        self.insert_batch("gib_older", started_at=now - RETENTION_WINDOW - timedelta(hours=2), status="superseded")
-        self.insert_batch("gib_newer", started_at=now - RETENTION_WINDOW - timedelta(minutes=30), status="superseded")
+        self.insert_batch(
+            "gib_older", started_at=now - RETENTION_WINDOW - timedelta(hours=2), status="superseded"
+        )
+        self.insert_batch(
+            "gib_newer",
+            started_at=now - RETENTION_WINDOW - timedelta(minutes=30),
+            status="superseded",
+        )
 
         self.cleanup(now - timedelta(hours=1))
 
         surviving = {row[0] for row in self.query("SELECT id FROM galaxy_import_batch")}
-        self.assertEqual(surviving, {"gib_newer"}, "到期时间晚于传入 p_now 的行，即使已经过期也不该在这一次被删")
+        self.assertEqual(
+            surviving, {"gib_newer"}, "到期时间晚于传入 p_now 的行，即使已经过期也不该在这一次被删"
+        )
 
     def test_the_definition_keeps_the_clock_floor(self) -> None:
         """V-保留-11：`LEAST(p_now, clock_timestamp())` 必须留在函数定义里。
@@ -648,8 +711,14 @@ class CleanupFunctionContractTest(RetentionPostgresTestCase):
         权限面的做法，代价是这一轮该表整批让路，下一轮再收（下一条用例固定这点）。
         """
         now = self.database_now()
-        self.insert_batch("gib_locked", started_at=now - RETENTION_WINDOW - timedelta(hours=2), status="superseded")
-        self.insert_batch("gib_other", started_at=now - RETENTION_WINDOW - timedelta(hours=1), status="superseded")
+        self.insert_batch(
+            "gib_locked",
+            started_at=now - RETENTION_WINDOW - timedelta(hours=2),
+            status="superseded",
+        )
+        self.insert_batch(
+            "gib_other", started_at=now - RETENTION_WINDOW - timedelta(hours=1), status="superseded"
+        )
         self.insert_sync_run("run_old", started_at=now - RETENTION_WINDOW - timedelta(hours=1))
 
         holder = self._psycopg.connect(self._dsn)
@@ -663,8 +732,12 @@ class CleanupFunctionContractTest(RetentionPostgresTestCase):
 
         self.assertLess(elapsed, 10, "清理不得被行锁无限阻塞——它与凭据轮换共用一个线程")
         self.assertGreater(elapsed, 1, "应当是等到超时才放弃，而不是根本没尝试")
-        self.assertEqual(summary["galaxy_import_batch"][0], 0, "摘要必须如实报 0，不能报出没发生的删除")
-        self.assertTrue(summary["galaxy_import_batch"][3], "让路必须带标记：与「本来就没有到期行」是两回事")
+        self.assertEqual(
+            summary["galaxy_import_batch"][0], 0, "摘要必须如实报 0，不能报出没发生的删除"
+        )
+        self.assertTrue(
+            summary["galaxy_import_batch"][3], "让路必须带标记：与「本来就没有到期行」是两回事"
+        )
         self.assertFalse(summary["feishu_org_sync_run"][3], "没被占的表不该带让路标记")
         self.assertEqual(self.count("galaxy_import_batch"), 2, "被锁那一批一行都不该删")
         # 逐表捕获的意义：一张表被占，另一张照常清理。
@@ -674,8 +747,14 @@ class CleanupFunctionContractTest(RetentionPostgresTestCase):
     def test_the_blocked_rows_are_collected_on_a_later_round(self) -> None:
         """V-保留-22：让路不是漏掉——锁一放开，下一轮就全部收走。"""
         now = self.database_now()
-        self.insert_batch("gib_locked", started_at=now - RETENTION_WINDOW - timedelta(hours=2), status="superseded")
-        self.insert_batch("gib_other", started_at=now - RETENTION_WINDOW - timedelta(hours=1), status="superseded")
+        self.insert_batch(
+            "gib_locked",
+            started_at=now - RETENTION_WINDOW - timedelta(hours=2),
+            status="superseded",
+        )
+        self.insert_batch(
+            "gib_other", started_at=now - RETENTION_WINDOW - timedelta(hours=1), status="superseded"
+        )
 
         holder = self._psycopg.connect(self._dsn)
         self.addCleanup(holder.close)
@@ -695,7 +774,9 @@ class CleanupFunctionContractTest(RetentionPostgresTestCase):
         （因此持有行锁），第二条并发清理必须在超时后如实报 0，而不是把同一行再报一遍。
         """
         now = self.database_now()
-        self.insert_batch("gib_a", started_at=now - RETENTION_WINDOW - timedelta(hours=2), status="superseded")
+        self.insert_batch(
+            "gib_a", started_at=now - RETENTION_WINDOW - timedelta(hours=2), status="superseded"
+        )
 
         first = self._psycopg.connect(self._dsn)
         self.addCleanup(first.close)
@@ -732,15 +813,22 @@ class CleanupFunctionContractTest(RetentionPostgresTestCase):
         self.execute(
             "INSERT INTO retention_shadow.galaxy_import_batch VALUES ('shadow', now() - interval '3000 hours')"
         )
-        self.insert_batch("gib_real", started_at=now - RETENTION_WINDOW - timedelta(hours=1), status="superseded")
+        self.insert_batch(
+            "gib_real", started_at=now - RETENTION_WINDOW - timedelta(hours=1), status="superseded"
+        )
 
         with self._psycopg.connect(self._dsn) as connection, connection.cursor() as cursor:
             cursor.execute("SET search_path = retention_shadow, public")
-            cursor.execute("SELECT deleted_rows FROM public.lingxi_retention_cleanup(%s, 100) WHERE target_table = 'galaxy_import_batch'", (now,))
+            cursor.execute(
+                "SELECT deleted_rows FROM public.lingxi_retention_cleanup(%s, 100) WHERE target_table = 'galaxy_import_batch'",
+                (now,),
+            )
             deleted = int(cursor.fetchone()[0])
 
         self.assertEqual(deleted, 1)
-        self.assertEqual(self.count("retention_shadow.galaxy_import_batch"), 1, "影子表必须分毫未动")
+        self.assertEqual(
+            self.count("retention_shadow.galaxy_import_batch"), 1, "影子表必须分毫未动"
+        )
         self.assertEqual(self.count("galaxy_import_batch"), 0)
 
         proconfig = self.scalar(
@@ -770,7 +858,9 @@ class CleanupFunctionContractTest(RetentionPostgresTestCase):
         影子 schema 用例覆盖不到它。
         """
         now = self.database_now()
-        self.insert_batch("gib_atk", started_at=now - RETENTION_WINDOW - timedelta(hours=1), status="superseded")
+        self.insert_batch(
+            "gib_atk", started_at=now - RETENTION_WINDOW - timedelta(hours=1), status="superseded"
+        )
 
         with self._psycopg.connect(self._dsn) as connection, connection.cursor() as cursor:
             cursor.execute("SET SESSION AUTHORIZATION lingxi_scheduler")
@@ -840,17 +930,23 @@ class RolePrivilegeTest(RetentionPostgresTestCase):
         self._denied("lingxi_app", "SELECT * FROM public.lingxi_retention_cleanup(now(), 10)")
 
         now = self.database_now()
-        self.insert_batch("gib_old", started_at=now - RETENTION_WINDOW - timedelta(hours=1), status="superseded")
+        self.insert_batch(
+            "gib_old", started_at=now - RETENTION_WINDOW - timedelta(hours=1), status="superseded"
+        )
         with self._psycopg.connect(self._dsn) as connection, connection.cursor() as cursor:
             cursor.execute("SET SESSION AUTHORIZATION lingxi_scheduler")
-            cursor.execute("SELECT target_table, deleted_rows FROM public.lingxi_retention_cleanup(now(), 10)")
+            cursor.execute(
+                "SELECT target_table, deleted_rows FROM public.lingxi_retention_cleanup(now(), 10)"
+            )
             result = dict(cursor.fetchall())
         self.assertEqual(result["galaxy_import_batch"], 1)
 
     def test_the_application_role_cannot_delete_the_parent_tables_directly(self) -> None:
         """V-保留-13（验收 E-09）：有 SELECT、没有 DELETE——回收只有函数一条路。"""
         now = self.database_now()
-        self.insert_batch("gib_old", started_at=now - RETENTION_WINDOW - timedelta(hours=1), status="superseded")
+        self.insert_batch(
+            "gib_old", started_at=now - RETENTION_WINDOW - timedelta(hours=1), status="superseded"
+        )
 
         with self._psycopg.connect(self._dsn) as connection, connection.cursor() as cursor:
             cursor.execute("SET SESSION AUTHORIZATION lingxi_app")
@@ -872,7 +968,9 @@ class RolePrivilegeTest(RetentionPostgresTestCase):
         now = self.database_now()
         self.addCleanup(force_rebuild_schema, self._dsn)
         self.insert_batch("gib_fresh", started_at=now, status="complete")
-        self.insert_batch("gib_old", started_at=now - RETENTION_WINDOW - timedelta(hours=1), status="superseded")
+        self.insert_batch(
+            "gib_old", started_at=now - RETENTION_WINDOW - timedelta(hours=1), status="superseded"
+        )
         # 误授权：这一格正是"触发器防误授权"要挡的场景。
         self.execute("GRANT DELETE ON public.galaxy_import_batch TO lingxi_app")
 
@@ -883,16 +981,22 @@ class RolePrivilegeTest(RetentionPostgresTestCase):
             ("lingxi_app", "gib_fresh", False),
         )
         for role, batch_id, should_succeed in quadrants:
-            with self.subTest(role=role, row=batch_id, expected="成功" if should_succeed else "拒绝"):
+            with self.subTest(
+                role=role, row=batch_id, expected="成功" if should_succeed else "拒绝"
+            ):
                 with self._psycopg.connect(self._dsn) as connection, connection.cursor() as cursor:
                     cursor.execute(f"SET SESSION AUTHORIZATION {role}")
                     if should_succeed:
-                        cursor.execute("DELETE FROM public.galaxy_import_batch WHERE id = %s", (batch_id,))
+                        cursor.execute(
+                            "DELETE FROM public.galaxy_import_batch WHERE id = %s", (batch_id,)
+                        )
                         self.assertEqual(cursor.rowcount, 1)
                         connection.rollback()
                     else:
                         with self.assertRaises(self._psycopg.errors.RaiseException):
-                            cursor.execute("DELETE FROM public.galaxy_import_batch WHERE id = %s", (batch_id,))
+                            cursor.execute(
+                                "DELETE FROM public.galaxy_import_batch WHERE id = %s", (batch_id,)
+                            )
                         connection.rollback()
 
         self.assertEqual(self.count("galaxy_import_batch"), 2, "四象限验完后两行都应还在")
@@ -904,7 +1008,9 @@ class RolePrivilegeTest(RetentionPostgresTestCase):
         而它会把唯一合法的回收路径也堵死。
         """
         now = self.database_now()
-        self.insert_batch("gib_old", started_at=now - RETENTION_WINDOW - timedelta(hours=1), with_children=True)
+        self.insert_batch(
+            "gib_old", started_at=now - RETENTION_WINDOW - timedelta(hours=1), with_children=True
+        )
 
         summary = self.cleanup(now)
 
@@ -919,11 +1025,17 @@ class RolePrivilegeTest(RetentionPostgresTestCase):
         拿得到 TRUNCATE」钉住——否则那道防线可以被一条 TRUNCATE 整体绕开。
         """
         for table in ("galaxy_import_batch", "feishu_org_sync_run"):
-            for role in ("lingxi_app", "lingxi_scheduler", "lingxi_retention_owner", "lingxi_migrate"):
+            for role in (
+                "lingxi_app",
+                "lingxi_scheduler",
+                "lingxi_retention_owner",
+                "lingxi_migrate",
+            ):
                 with self.subTest(table=table, role=role):
                     self.assertFalse(
                         self.scalar(
-                            "SELECT has_table_privilege(%s, %s, 'TRUNCATE')", (role, f"public.{table}")
+                            "SELECT has_table_privilege(%s, %s, 'TRUNCATE')",
+                            (role, f"public.{table}"),
                         )
                     )
 
@@ -958,13 +1070,17 @@ class RolePrivilegeTest(RetentionPostgresTestCase):
         """
         self.addCleanup(force_rebuild_schema, self._dsn)
         self.execute("ALTER ROLE lingxi_retention_owner LOGIN")
-        self.assertTrue(self.scalar("SELECT rolcanlogin FROM pg_roles WHERE rolname = 'lingxi_retention_owner'"))
+        self.assertTrue(
+            self.scalar("SELECT rolcanlogin FROM pg_roles WHERE rolname = 'lingxi_retention_owner'")
+        )
 
         with self._psycopg.connect(self._dsn) as connection, connection.cursor() as cursor:
             cursor.execute(UPGRADE_SQL)
 
         self.assertFalse(
-            self.scalar("SELECT rolcanlogin FROM pg_roles WHERE rolname = 'lingxi_retention_owner'"),
+            self.scalar(
+                "SELECT rolcanlogin FROM pg_roles WHERE rolname = 'lingxi_retention_owner'"
+            ),
             "重新应用迁移必须把属主角色收紧回无登录",
         )
 
@@ -1011,7 +1127,10 @@ class RolePrivilegeTest(RetentionPostgresTestCase):
         probe_role = f"retention_probe_{suffix}"
 
         def admin(sql: str) -> None:
-            with self._psycopg.connect(self._dsn, autocommit=True) as connection, connection.cursor() as cursor:
+            with (
+                self._psycopg.connect(self._dsn, autocommit=True) as connection,
+                connection.cursor() as cursor,
+            ):
                 cursor.execute(sql)
 
         admin(f"CREATE ROLE {probe_role} NOSUPERUSER CREATEROLE LOGIN")
@@ -1024,7 +1143,9 @@ class RolePrivilegeTest(RetentionPostgresTestCase):
             探针库消失；probe 是它的授予方，不先撤就 DROP 不掉。
             """
 
-            admin(f"REVOKE lingxi_retention_owner FROM lingxi_migrate GRANTED BY {probe_role} CASCADE")
+            admin(
+                f"REVOKE lingxi_retention_owner FROM lingxi_migrate GRANTED BY {probe_role} CASCADE"
+            )
             admin(f"REVOKE lingxi_retention_owner FROM {probe_role} CASCADE")
             admin(f"DROP ROLE IF EXISTS {probe_role}")
 
@@ -1036,19 +1157,27 @@ class RolePrivilegeTest(RetentionPostgresTestCase):
         # ——这正是 README 那条「Ops 预建角色须补授 ADMIN OPTION」运维契约的场景。
         # **`SET FALSE` 是关键**：带 SET 的话 `pg_has_role(probe, owner, 'SET')` 为真，
         # 移交还原分支又被整段跳过，这条用例就白写了。
-        admin(f"GRANT lingxi_retention_owner TO {probe_role} WITH ADMIN TRUE, INHERIT FALSE, SET FALSE")
+        admin(
+            f"GRANT lingxi_retention_owner TO {probe_role} WITH ADMIN TRUE, INHERIT FALSE, SET FALSE"
+        )
 
         probe_dsn = self._dsn.rsplit("/", 1)[0] + "/" + probe_db
 
         def as_probe(statements: list[str]) -> None:
-            with self._psycopg.connect(probe_dsn, user=probe_role) as connection, connection.cursor() as cursor:
+            with (
+                self._psycopg.connect(probe_dsn, user=probe_role) as connection,
+                connection.cursor() as cursor,
+            ):
                 for statement in statements:
                     cursor.execute(statement)
 
         def temporary_grant_rows() -> list[tuple]:
             """本次移交临时授出的那条成员关系（授予方＝执行者）。正常应当一条不剩。"""
 
-            with self._psycopg.connect(probe_dsn, autocommit=True) as connection, connection.cursor() as cursor:
+            with (
+                self._psycopg.connect(probe_dsn, autocommit=True) as connection,
+                connection.cursor() as cursor,
+            ):
                 cursor.execute(
                     "SELECT am.admin_option, am.inherit_option, am.set_option "
                     "  FROM pg_auth_members am "
@@ -1062,7 +1191,12 @@ class RolePrivilegeTest(RetentionPostgresTestCase):
                 return cursor.fetchall()
 
         # 冻结的编号链按 glob 取，不写死文件名（守卫会拦硬编码）。
-        as_probe([path.read_text(encoding="utf-8") for path in sorted((REPOSITORY_ROOT / "migrations").glob("*.sql"))])
+        as_probe(
+            [
+                path.read_text(encoding="utf-8")
+                for path in sorted((REPOSITORY_ROOT / "migrations").glob("*.sql"))
+            ]
+        )
         as_probe([UPGRADE_SQL])
 
         self.assertEqual(
@@ -1070,8 +1204,13 @@ class RolePrivilegeTest(RetentionPostgresTestCase):
             [],
             "移交用完必须精确撤销本次那一条授予；留下它就是 INHERIT 残留（验收两次抓到的形态）",
         )
-        with self._psycopg.connect(probe_dsn, autocommit=True) as connection, connection.cursor() as cursor:
-            cursor.execute("SELECT pg_get_userbyid(proowner) FROM pg_proc WHERE proname = 'lingxi_retention_cleanup'")
+        with (
+            self._psycopg.connect(probe_dsn, autocommit=True) as connection,
+            connection.cursor() as cursor,
+        ):
+            cursor.execute(
+                "SELECT pg_get_userbyid(proowner) FROM pg_proc WHERE proname = 'lingxi_retention_cleanup'"
+            )
             self.assertEqual(cursor.fetchone()[0], "lingxi_retention_owner")
 
         # 两轮 downgrade → upgrade：每轮之后都不得留下临时授予。
@@ -1100,12 +1239,16 @@ class RolePrivilegeTest(RetentionPostgresTestCase):
         # pg_write_all_data 是 PostgreSQL 预定义角色，继承它之后清理函数的执行身份
         # 对**保留范围之外**的 app_user 也持有 DELETE：受限清理函数就此变成全库写。
         self.assertFalse(
-            self.scalar("SELECT has_table_privilege('lingxi_retention_owner', 'public.app_user', 'DELETE')")
+            self.scalar(
+                "SELECT has_table_privilege('lingxi_retention_owner', 'public.app_user', 'DELETE')"
+            )
         )
         self.execute("GRANT pg_write_all_data TO lingxi_retention_owner")
         try:
             self.assertTrue(
-                self.scalar("SELECT has_table_privilege('lingxi_retention_owner', 'public.app_user', 'DELETE')"),
+                self.scalar(
+                    "SELECT has_table_privilege('lingxi_retention_owner', 'public.app_user', 'DELETE')"
+                ),
                 "危害实证：属主继承 pg_write_all_data 后对保留范围外的表也有 DELETE",
             )
         finally:
@@ -1116,10 +1259,15 @@ class RolePrivilegeTest(RetentionPostgresTestCase):
                 self.execute(f"GRANT {container} TO lingxi_retention_owner")
                 try:
                     with self.assertRaises(self._psycopg.errors.RaiseException) as raised:
-                        with self._psycopg.connect(self._dsn) as connection, connection.cursor() as cursor:
+                        with (
+                            self._psycopg.connect(self._dsn) as connection,
+                            connection.cursor() as cursor,
+                        ):
                             cursor.execute(UPGRADE_SQL)
                     self.assertIn("继承计划外权限", str(raised.exception))
-                    self.assertIn(container, str(raised.exception), "报错要指名是哪个角色，否则无从排查")
+                    self.assertIn(
+                        container, str(raised.exception), "报错要指名是哪个角色，否则无从排查"
+                    )
                 finally:
                     self.execute(f"REVOKE {container} FROM lingxi_retention_owner")
 
@@ -1148,7 +1296,9 @@ class RolePrivilegeTest(RetentionPostgresTestCase):
         self.execute(f"GRANT {bridge} TO lingxi_app")
 
         # 直接成员行里看不出问题：app 的直接上游只有 bridge，而它已经够得着属主。
-        self.assertTrue(self.scalar("SELECT pg_has_role('lingxi_app', 'lingxi_retention_owner', 'USAGE')"))
+        self.assertTrue(
+            self.scalar("SELECT pg_has_role('lingxi_app', 'lingxi_retention_owner', 'USAGE')")
+        )
         self.assertEqual(
             self.count(
                 "pg_auth_members am",
@@ -1206,12 +1356,17 @@ class RolePrivilegeTest(RetentionPostgresTestCase):
         授权面被放宽了，而没有任何东西报错。
         """
         self.execute("GRANT lingxi_retention_owner TO lingxi_app, lingxi_scheduler")
-        self.assertEqual(self._owner_members() & {"lingxi_app", "lingxi_scheduler"}, {"lingxi_app", "lingxi_scheduler"})
+        self.assertEqual(
+            self._owner_members() & {"lingxi_app", "lingxi_scheduler"},
+            {"lingxi_app", "lingxi_scheduler"},
+        )
 
         with self._psycopg.connect(self._dsn) as connection, connection.cursor() as cursor:
             cursor.execute(UPGRADE_SQL)
 
-        self.assertEqual(self._owner_members(), {"lingxi_migrate"}, "只有迁移角色应当是属主角色的成员")
+        self.assertEqual(
+            self._owner_members(), {"lingxi_migrate"}, "只有迁移角色应当是属主角色的成员"
+        )
         self._denied("lingxi_app", "SET ROLE lingxi_retention_owner")
 
     def _owner_members(self) -> set[str]:
@@ -1249,7 +1404,11 @@ class BlockedRoundLoggingTest(RetentionPostgresTestCase):
         from lingxi.apps.scheduler import RetentionCleanupDuty
 
         now = self.database_now()
-        self.insert_batch("gib_locked", started_at=now - RETENTION_WINDOW - timedelta(hours=1), status="superseded")
+        self.insert_batch(
+            "gib_locked",
+            started_at=now - RETENTION_WINDOW - timedelta(hours=1),
+            status="superseded",
+        )
 
         holder = self._psycopg.connect(self._dsn)
         self.addCleanup(holder.close)
@@ -1284,8 +1443,12 @@ class BlockedRoundLoggingTest(RetentionPostgresTestCase):
         from lingxi.adapters.retention import PostgresRetentionCleaner
 
         now = self.database_now()
-        self.insert_batch("gib_double_locked", started_at=now - RETENTION_WINDOW - timedelta(hours=1))
-        self.insert_sync_run("run_double_locked", started_at=now - RETENTION_WINDOW - timedelta(hours=1))
+        self.insert_batch(
+            "gib_double_locked", started_at=now - RETENTION_WINDOW - timedelta(hours=1)
+        )
+        self.insert_sync_run(
+            "run_double_locked", started_at=now - RETENTION_WINDOW - timedelta(hours=1)
+        )
 
         first_holder = self._psycopg.connect(self._dsn)
         second_holder = self._psycopg.connect(self._dsn)
@@ -1315,10 +1478,18 @@ class SummaryContentTest(RetentionPostgresTestCase):
         from lingxi.adapters.retention import PostgresRetentionCleaner
 
         now = self.database_now()
-        self.insert_batch("gib_old", started_at=now - RETENTION_WINDOW - timedelta(hours=1), with_children=True)
+        self.insert_batch(
+            "gib_old", started_at=now - RETENTION_WINDOW - timedelta(hours=1), with_children=True
+        )
         self.insert_sync_run("run_old", started_at=now - RETENTION_WINDOW - timedelta(hours=1))
         # 先确认这些人员数据值真的在库里——否则"摘要不含它们"是一句空话。
-        personal_values = ("化名甲", "ou_hua_ming", "user_hua_ming", "union_hua_ming", "gib_old@example.invalid")
+        personal_values = (
+            "化名甲",
+            "ou_hua_ming",
+            "user_hua_ming",
+            "union_hua_ming",
+            "gib_old@example.invalid",
+        )
         self.assertEqual(self.count("galaxy_user", "WHERE email = 'gib_old@example.invalid'"), 1)
         self.assertEqual(
             self.count(
@@ -1362,32 +1533,48 @@ class SchedulerDutyTest(RetentionPostgresTestCase):
         from lingxi.apps.scheduler import RetentionCleanupDuty, SchedulerLoop
 
         now = self.database_now()
-        self.insert_batch("gib_old", started_at=now - RETENTION_WINDOW - timedelta(hours=1), with_children=True)
+        self.insert_batch(
+            "gib_old", started_at=now - RETENTION_WINDOW - timedelta(hours=1), with_children=True
+        )
         self.insert_batch("gib_new", started_at=now, with_children=True)
-        loop = SchedulerLoop(duties=(RetentionCleanupDuty(cleaner=PostgresRetentionCleaner(self._dsn)),), interval_seconds=0.01)
+        loop = SchedulerLoop(
+            duties=(RetentionCleanupDuty(cleaner=PostgresRetentionCleaner(self._dsn)),),
+            interval_seconds=0.01,
+        )
 
         loop.run_once()
 
-        self.assertEqual({row[0] for row in self.query("SELECT id FROM galaxy_import_batch")}, {"gib_new"})
+        self.assertEqual(
+            {row[0] for row in self.query("SELECT id FROM galaxy_import_batch")}, {"gib_new"}
+        )
 
     def test_a_failing_cleanup_never_postpones_an_expiry(self) -> None:
         """V-保留-16（验收 F-04）：清理失败只能重试，不能把到期时间往后挪。"""
         from lingxi.apps.scheduler import RetentionCleanupDuty, SchedulerLoop
 
         now = self.database_now()
-        self.insert_batch("gib_old", started_at=now - RETENTION_WINDOW - timedelta(hours=1), status="superseded")
-        before = self.query("SELECT id, started_at, expires_at FROM galaxy_import_batch ORDER BY id")
+        self.insert_batch(
+            "gib_old", started_at=now - RETENTION_WINDOW - timedelta(hours=1), status="superseded"
+        )
+        before = self.query(
+            "SELECT id, started_at, expires_at FROM galaxy_import_batch ORDER BY id"
+        )
 
         class ExplodingCleaner:
             def run_once(self):
                 raise RuntimeError("模拟清理失败")
 
-        loop = SchedulerLoop(duties=(RetentionCleanupDuty(cleaner=ExplodingCleaner()),), interval_seconds=0.01)
+        loop = SchedulerLoop(
+            duties=(RetentionCleanupDuty(cleaner=ExplodingCleaner()),), interval_seconds=0.01
+        )
         with self.assertLogs("lingxi.apps.scheduler", level="ERROR"):
             for _round in range(3):
                 loop.run_once()
 
-        self.assertEqual(self.query("SELECT id, started_at, expires_at FROM galaxy_import_batch ORDER BY id"), before)
+        self.assertEqual(
+            self.query("SELECT id, started_at, expires_at FROM galaxy_import_batch ORDER BY id"),
+            before,
+        )
 
     def test_sigterm_leaves_no_half_deleted_state_and_claims_nothing_after_stopping(self) -> None:
         """V-保留-17（验收 F-05/F-06）：真实子进程 + 真实 SIGTERM + 真库。
@@ -1485,16 +1672,25 @@ class SchedulerDutyTest(RetentionPostgresTestCase):
         state = json.loads(stdout.strip().splitlines()[-1])
 
         self.assertEqual(state["calls_after_stop"], 0, "收到 SIGTERM 后不得再领取新的清理批次")
-        self.assertGreater(state["calls"], 0, "信号到达前必须真的删过行，否则后面的一致性断言是空的")
-        self.assertGreater(remaining_before_assert := self.count("galaxy_import_batch"), 0, "信号必须落在删完之前")
+        self.assertGreater(
+            state["calls"], 0, "信号到达前必须真的删过行，否则后面的一致性断言是空的"
+        )
+        self.assertGreater(
+            remaining_before_assert := self.count("galaxy_import_batch"), 0, "信号必须落在删完之前"
+        )
         remaining = remaining_before_assert
-        self.assertEqual(state["deleted"], total_batches - remaining, "报告的删除数必须与库里实际少掉的行一致")
+        self.assertEqual(
+            state["deleted"], total_batches - remaining, "报告的删除数必须与库里实际少掉的行一致"
+        )
         for child, parent, column in CASCADE_EDGES:
             if parent != "galaxy_import_batch":
                 continue
             with self.subTest(child=child):
                 self.assertEqual(
-                    self.count(child, f"c WHERE NOT EXISTS (SELECT 1 FROM {parent} p WHERE p.id = c.{column})"),
+                    self.count(
+                        child,
+                        f"c WHERE NOT EXISTS (SELECT 1 FROM {parent} p WHERE p.id = c.{column})",
+                    ),
                     0,
                     "不得存在没有父行的子行——那才是半删状态",
                 )
@@ -1526,7 +1722,9 @@ class MigrationRoundTripTest(RetentionPostgresTestCase):
             "trigger_function": self.scalar(
                 "SELECT count(*) FROM pg_proc WHERE proname = 'galaxy_import_batch_fix_expiry'"
             ),
-            "trigger": self.scalar("SELECT count(*) FROM pg_trigger WHERE tgname = 'galaxy_import_batch_expiry'"),
+            "trigger": self.scalar(
+                "SELECT count(*) FROM pg_trigger WHERE tgname = 'galaxy_import_batch_expiry'"
+            ),
         }
 
     def test_upgrade_and_downgrade_round_trip_twice(self) -> None:
@@ -1538,11 +1736,15 @@ class MigrationRoundTripTest(RetentionPostgresTestCase):
             with self.subTest(attempt=attempt, phase="downgrade"):
                 with self._psycopg.connect(self._dsn) as connection, connection.cursor() as cursor:
                     cursor.execute(DOWNGRADE_SQL)
-                self.assertEqual(self._objects(), {"function": 0, "trigger_function": 0, "trigger": 0})
+                self.assertEqual(
+                    self._objects(), {"function": 0, "trigger_function": 0, "trigger": 0}
+                )
             with self.subTest(attempt=attempt, phase="upgrade"):
                 with self._psycopg.connect(self._dsn) as connection, connection.cursor() as cursor:
                     cursor.execute(UPGRADE_SQL)
-                self.assertEqual(self._objects(), {"function": 1, "trigger_function": 1, "trigger": 1})
+                self.assertEqual(
+                    self._objects(), {"function": 1, "trigger_function": 1, "trigger": 1}
+                )
 
     def test_downgrade_keeps_the_data_and_the_cluster_level_roles(self) -> None:
         """V-保留-18（验收 G-02/G-03）：回滚删对象、不删数据、不删集群级角色。"""
@@ -1556,7 +1758,9 @@ class MigrationRoundTripTest(RetentionPostgresTestCase):
         with self._psycopg.connect(self._dsn) as connection, connection.cursor() as cursor:
             cursor.execute(DOWNGRADE_SQL)
 
-        self.assertEqual(self.query("SELECT to_jsonb(t) FROM galaxy_import_batch t ORDER BY 1"), before)
+        self.assertEqual(
+            self.query("SELECT to_jsonb(t) FROM galaxy_import_batch t ORDER BY 1"), before
+        )
         self.assertEqual(self.count("pg_roles", "WHERE rolname LIKE 'lingxi\\_%'"), 4)
 
     def test_downgrade_leaves_no_privilege_granted_by_this_revision(self) -> None:
@@ -1623,11 +1827,42 @@ class MigrationRoundTripTest(RetentionPostgresTestCase):
             source_label="合成导出（测试）",
             source_digest="digest-old-image",
             tables={
-                "user": [{"user_id": "U1", "dept_id": "D1", "user_name": "10001", "nick_name": "化名甲", "email": "a@example.invalid", "create_time": "2019-01-02 03:04:05"}],
-                "user_role": [{"user_id": "U1", "role_id": "R1", "user_name": "化名甲", "role_name": "A运营"}],
-                "role_menu": [{"role_id": "R1", "menu_id": "M1", "role_name": "A运营", "menu_name": "报表"}],
-                "sys_user_datacountry": [{"USER_ID": "U1", "DATACOUNTRY_ID": "101", "USER_NAME": "化名甲", "DATACOUNTRY_NAME": "甲国"}],
-                "sys_country": [{"id": "7", "country_key": "101", "name": "ALPHA", "code": "AL", "name_cn": "甲国", "region_key": "1", "region_name": "甲区", "boss_company_id": "BC"}],
+                "user": [
+                    {
+                        "user_id": "U1",
+                        "dept_id": "D1",
+                        "user_name": "10001",
+                        "nick_name": "化名甲",
+                        "email": "a@example.invalid",
+                        "create_time": "2019-01-02 03:04:05",
+                    }
+                ],
+                "user_role": [
+                    {"user_id": "U1", "role_id": "R1", "user_name": "化名甲", "role_name": "A运营"}
+                ],
+                "role_menu": [
+                    {"role_id": "R1", "menu_id": "M1", "role_name": "A运营", "menu_name": "报表"}
+                ],
+                "sys_user_datacountry": [
+                    {
+                        "USER_ID": "U1",
+                        "DATACOUNTRY_ID": "101",
+                        "USER_NAME": "化名甲",
+                        "DATACOUNTRY_NAME": "甲国",
+                    }
+                ],
+                "sys_country": [
+                    {
+                        "id": "7",
+                        "country_key": "101",
+                        "name": "ALPHA",
+                        "code": "AL",
+                        "name_cn": "甲国",
+                        "region_key": "1",
+                        "region_name": "甲区",
+                        "boss_company_id": "BC",
+                    }
+                ],
             },
         )
 
@@ -1654,32 +1889,75 @@ class ReimportAfterCleanupTest(RetentionPostgresTestCase):
 
         store = PostgresGalaxyImportStore(self._dsn)
         tables = {
-            "user": [{"user_id": "U1", "dept_id": "D1", "user_name": "10001", "nick_name": "化名甲", "email": "a@example.invalid", "create_time": "2019-01-02 03:04:05"}],
-            "user_role": [{"user_id": "U1", "role_id": "R1", "user_name": "化名甲", "role_name": "A运营"}],
-            "role_menu": [{"role_id": "R1", "menu_id": "M1", "role_name": "A运营", "menu_name": "报表"}],
-            "sys_user_datacountry": [{"USER_ID": "U1", "DATACOUNTRY_ID": "101", "USER_NAME": "化名甲", "DATACOUNTRY_NAME": "甲国"}],
-            "sys_country": [{"id": "7", "country_key": "101", "name": "ALPHA", "code": "AL", "name_cn": "甲国", "region_key": "1", "region_name": "甲区", "boss_company_id": "BC"}],
+            "user": [
+                {
+                    "user_id": "U1",
+                    "dept_id": "D1",
+                    "user_name": "10001",
+                    "nick_name": "化名甲",
+                    "email": "a@example.invalid",
+                    "create_time": "2019-01-02 03:04:05",
+                }
+            ],
+            "user_role": [
+                {"user_id": "U1", "role_id": "R1", "user_name": "化名甲", "role_name": "A运营"}
+            ],
+            "role_menu": [
+                {"role_id": "R1", "menu_id": "M1", "role_name": "A运营", "menu_name": "报表"}
+            ],
+            "sys_user_datacountry": [
+                {
+                    "USER_ID": "U1",
+                    "DATACOUNTRY_ID": "101",
+                    "USER_NAME": "化名甲",
+                    "DATACOUNTRY_NAME": "甲国",
+                }
+            ],
+            "sys_country": [
+                {
+                    "id": "7",
+                    "country_key": "101",
+                    "name": "ALPHA",
+                    "code": "AL",
+                    "name_cn": "甲国",
+                    "region_key": "1",
+                    "region_name": "甲区",
+                    "boss_company_id": "BC",
+                }
+            ],
         }
-        first = store.import_export(source_label="合成导出（测试）", source_digest="digest-repeat", tables=tables)
+        first = store.import_export(
+            source_label="合成导出（测试）", source_digest="digest-repeat", tables=tables
+        )
         self.assertEqual(first.outcome, "imported")
 
         # 让它过期：来源时间不能改，所以直接换一条来源时间足够旧的同摘要批次。
         self.execute("TRUNCATE galaxy_import_batch CASCADE")
         now = self.database_now()
-        self.insert_batch("gib_repeat", started_at=now - RETENTION_WINDOW - timedelta(hours=1), with_children=True)
-        self.execute("UPDATE galaxy_import_batch SET source_digest = 'digest-repeat' WHERE id = 'gib_repeat'")
-        first_expiry = self.scalar("SELECT expires_at FROM galaxy_import_batch WHERE id = 'gib_repeat'")
+        self.insert_batch(
+            "gib_repeat", started_at=now - RETENTION_WINDOW - timedelta(hours=1), with_children=True
+        )
+        self.execute(
+            "UPDATE galaxy_import_batch SET source_digest = 'digest-repeat' WHERE id = 'gib_repeat'"
+        )
+        first_expiry = self.scalar(
+            "SELECT expires_at FROM galaxy_import_batch WHERE id = 'gib_repeat'"
+        )
 
         self.cleanup(now)
         self.assertEqual(self.count("galaxy_import_batch"), 0)
 
-        again = store.import_export(source_label="合成导出（测试）", source_digest="digest-repeat", tables=tables)
+        again = store.import_export(
+            source_label="合成导出（测试）", source_digest="digest-repeat", tables=tables
+        )
 
         self.assertEqual(again.outcome, "imported")
         self.assertNotEqual(again.batch_id, "gib_repeat")
         self.assertEqual(store.current_batch_id(), again.batch_id)
         self.assertGreater(
-            self.scalar("SELECT expires_at FROM galaxy_import_batch WHERE id = %s", (again.batch_id,)),
+            self.scalar(
+                "SELECT expires_at FROM galaxy_import_batch WHERE id = %s", (again.batch_id,)
+            ),
             first_expiry,
             "重导得到的是重新起算九十天的新副本",
         )

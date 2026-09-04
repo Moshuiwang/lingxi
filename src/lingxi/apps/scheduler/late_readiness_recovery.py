@@ -564,17 +564,13 @@ class LateReadinessRecoveryDuty:
         成功记过账了）。
         """
 
-        binding = ReadinessBinding(
-            user_id=item.user_id, permission_version=item.permission_version
-        )
+        binding = ReadinessBinding(user_id=item.user_id, permission_version=item.permission_version)
         if self._ticker is None:
             # 探针未接线：本轮不落任何记录，端点配好后从库里的进度原样继续。
             tally.probe_unwired += 1
             return
         try:
-            attempt = self._ticker.probe_after_timeout(
-                binding, attempt_no=item.next_attempt_no
-            )
+            attempt = self._ticker.probe_after_timeout(binding, attempt_no=item.next_attempt_no)
         except Exception as error:  # 占住窗口，再让外层记 failed 并上抛
             self._ticker.record_processing_failure(
                 binding,
@@ -628,18 +624,14 @@ class LateReadinessRecoveryDuty:
             # 别的路径推进过。**不发任何通知**——advance_refused 不是终态，下一轮
             # 候选查询会按当时的真实状态重新判断。
             tally.advance_refused += 1
-            self._audit.record(
-                "late_readiness_recovery.advance_refused", user=item.user_id
-            )
+            self._audit.record("late_readiness_recovery.advance_refused", user=item.user_id)
             return
         tally.activated += 1
         if item.system_triggered:
             # 静默完成（rc25 修复包 F3）：没有任何通知会进 outbox，这条审计是这次
             # 恢复在观测面上唯一的"完成"记录，缺了它运维只能从状态对比里猜。
             tally.activated_silently += 1
-            self._audit.record(
-                "late_readiness_recovery.activated_silently", user=item.user_id
-            )
+            self._audit.record("late_readiness_recovery.activated_silently", user=item.user_id)
         # 用户发起的链：通知已经在同一个事务里排进 outbox（or 已存在同 dedupe_key 的
         # 一条），发送由 _drain_notices 独立完成——这里不再做任何发送尝试。
 
@@ -682,13 +674,9 @@ class LateReadinessRecoveryDuty:
             # 只是暂时的。提前判死会让一个已经 active 的人永远等不到这句话，原路
             # 复活 F1 要堵的洞。真正的"不用再等了"只有 `ON DELETE CASCADE` 一种
             # 事实来源，因此这里与发送失败走同一条路：留在 pending，按既有退避重试。
-            self._notices.mark_notice_failed(
-                notice.notice_id, error="recipient_unavailable"
-            )
+            self._notices.mark_notice_failed(notice.notice_id, error="recipient_unavailable")
             tally.notice_recipient_unavailable += 1
-            self._audit.record(
-                "late_readiness_recovery.recipient_unavailable", user=notice.user_id
-            )
+            self._audit.record("late_readiness_recovery.recipient_unavailable", user=notice.user_id)
             return
         try:
             self._notifier.send(
@@ -830,9 +818,7 @@ def _build_late_readiness_recovery_duty(
         reason=FIRST_ONBOARDING_REASON,
         stop=stop,
     )
-    logger.info(
-        "迟到就绪恢复职责已装配 探针面=%s", "已接线" if ticker is not None else "未接线"
-    )
+    logger.info("迟到就绪恢复职责已装配 探针面=%s", "已接线" if ticker is not None else "未接线")
     return duty
 
 

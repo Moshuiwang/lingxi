@@ -565,8 +565,7 @@ class AdminCardCallbackHandler:
         try:
             parameters = inspect.signature(self._management_actions.route).parameters
             supports_origin = "origin_card_message_id" in parameters or any(
-                parameter.kind is inspect.Parameter.VAR_KEYWORD
-                for parameter in parameters.values()
+                parameter.kind is inspect.Parameter.VAR_KEYWORD for parameter in parameters.values()
             )
         except (TypeError, ValueError):
             supports_origin = False
@@ -616,17 +615,13 @@ class AdminCardCallbackHandler:
                 "admin.card_callback.management_not_initiator",
                 trace_id=trace_id,
             )
-            return _ManagementContextCheck(
-                context=context, status=None, forbidden=True
-            )
+            return _ManagementContextCheck(context=context, status=None, forbidden=True)
         if identifier and identifier != context.identifier:
             self._audit.record(
                 "admin.card_callback.management_identifier_mismatch",
                 trace_id=trace_id,
             )
-            return _ManagementContextCheck(
-                context=context, status=None, forbidden=True
-            )
+            return _ManagementContextCheck(context=context, status=None, forbidden=True)
         if context.state in {"closed", "submitted", "dispatching"}:
             # A closed card must not become a write entry point again if a stale
             # callback is replayed. Likewise, once a form submission has already
@@ -642,9 +637,7 @@ class AdminCardCallbackHandler:
             return _ManagementContextCheck(context=context, status=None, stale=True)
         expired = context.context_deadline_at <= datetime.now(UTC)
         if expired:
-            self._audit.record(
-                "admin.card_callback.management_context_expired", trace_id=trace_id
-            )
+            self._audit.record("admin.card_callback.management_context_expired", trace_id=trace_id)
         status = None
         if self._management_state_lookup is not None:
             try:
@@ -664,13 +657,16 @@ class AdminCardCallbackHandler:
             ):
                 # 变化后尽力把原卡更新到最新状态；无论更新成败都不继续写入旧快照。
                 try:
-                    refreshed_context = store.update_state(
-                        message_id=message_id,
-                        state="closed",
-                        dispatch_status="idle",
-                        snapshot_fingerprint=fingerprint,
-                        last_trace_id=trace_id,
-                    ) or context
+                    refreshed_context = (
+                        store.update_state(
+                            message_id=message_id,
+                            state="closed",
+                            dispatch_status="idle",
+                            snapshot_fingerprint=fingerprint,
+                            last_trace_id=trace_id,
+                        )
+                        or context
+                    )
                 except Exception as error:  # card refresh is best effort
                     self._audit.record(
                         "admin.card_callback.management_context_close_failed",
@@ -928,9 +924,7 @@ class AdminCardCallbackHandler:
         """
 
         if decision not in (DECISION_CONFIRM, DECISION_CANCEL):
-            self._audit.record(
-                "admin.card_callback.unknown_decision", trace_id=trace_id
-            )
+            self._audit.record("admin.card_callback.unknown_decision", trace_id=trace_id)
             return _toast_error("操作不存在或已失效")
 
         try:
@@ -1100,7 +1094,9 @@ class AdminCardCallbackHandler:
             self._push_terminal_card(pending, card)
         return card_payload
 
-    def _render_terminal_card(self, pending: PendingAction) -> tuple[Any | None, dict[str, Any] | None]:
+    def _render_terminal_card(
+        self, pending: PendingAction
+    ) -> tuple[Any | None, dict[str, Any] | None]:
         """只渲染终态卡，不做任何网络调用；返回 ``(card, card_payload)``。
 
         与 :meth:`_push_terminal_card` 拆开，是因为两者的时机不同（#493 块 B）：

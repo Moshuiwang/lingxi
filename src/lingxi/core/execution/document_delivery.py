@@ -226,9 +226,7 @@ def build_document_request(
         system_prompt=system_prompt,
     )
     if output_safety.blocked:
-        raise DocumentDeliveryError(
-            "leak_detected", "标题或正文命中输出安全检查，登记被拒绝"
-        )
+        raise DocumentDeliveryError("leak_detected", "标题或正文命中输出安全检查，登记被拒绝")
 
     return DocumentRequest(title=normalized_title, paragraphs=paragraphs, markdown=markdown)
 
@@ -310,9 +308,7 @@ def build_sheet_request(
     )
 
     normalized_title = title.strip()
-    combined_text = "\n".join(
-        (normalized_title, *(cell for row in padded_rows for cell in row))
-    )
+    combined_text = "\n".join((normalized_title, *(cell for row in padded_rows for cell in row)))
     output_safety = constrain_output(
         combined_text,
         forbidden_values=forbidden_values,
@@ -320,8 +316,6 @@ def build_sheet_request(
         system_prompt=system_prompt,
     )
     if output_safety.blocked:
-        raise DocumentDeliveryError(
-            "leak_detected", "标题或表格内容命中输出安全检查，登记被拒绝"
-        )
+        raise DocumentDeliveryError("leak_detected", "标题或表格内容命中输出安全检查，登记被拒绝")
 
     return SheetRequest(title=normalized_title, rows=padded_rows)

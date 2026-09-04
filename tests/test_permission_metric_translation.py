@@ -84,7 +84,9 @@ class BuildMapValidationTest(unittest.TestCase):
 
     def test_a_non_list_metric_value_is_rejected(self) -> None:
         with self.assertRaises(ValueError):
-            build_company_function_metric_map({"companies": {COMPANY_A: {FUNCTION_OPS: METRIC_DAU}}})
+            build_company_function_metric_map(
+                {"companies": {COMPANY_A: {FUNCTION_OPS: METRIC_DAU}}}
+            )
 
     def test_a_none_metric_entry_is_rejected(self) -> None:
         with self.assertRaises(ValueError):
@@ -231,7 +233,10 @@ class WildcardTest(unittest.TestCase):
             companies=(),
             functions=(FUNCTION_OPS,),
             all_companies=True,
-            mapping={"*": {FUNCTION_OPS: (METRIC_DAU,)}, COMPANY_A: {FUNCTION_OPS: (METRIC_REVENUE,)}},
+            mapping={
+                "*": {FUNCTION_OPS: (METRIC_DAU,)},
+                COMPANY_A: {FUNCTION_OPS: (METRIC_REVENUE,)},
+            },
         )
 
         self.assertEqual(result, {"*": (METRIC_DAU,)})
@@ -373,9 +378,7 @@ class MetricValueHygieneTests(unittest.TestCase):
     def test_company_key_wildcard_is_still_accepted(self) -> None:
         """口径分界：``"*"`` 在**键**位是合法的全公司通配，只有落到值上才是越权。"""
 
-        mapping = build_company_function_metric_map(
-            {"companies": {"*": {"销售": ["日活"]}}}
-        )
+        mapping = build_company_function_metric_map({"companies": {"*": {"销售": ["日活"]}}})
 
         self.assertEqual(mapping["*"]["销售"], ("日活",))
 
@@ -383,9 +386,7 @@ class MetricValueHygieneTests(unittest.TestCase):
         """与 S-2d 同一条口径：**只拒值、不拒公司键**——这个文件本身就是目录，
         没有第二份可以拿来核对公司键在不在里面。"""
 
-        mapping = build_company_function_metric_map(
-            {"companies": {"9999": {"销售": ["日活"]}}}
-        )
+        mapping = build_company_function_metric_map({"companies": {"9999": {"销售": ["日活"]}}})
 
         self.assertEqual(mapping["9999"]["销售"], ("日活",))
 

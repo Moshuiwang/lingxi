@@ -167,7 +167,9 @@ class FakeIntents:
         self._pending = pending
         self._pending_error = pending_error
         self._recipient_error = recipient_error
-        self._recipients = {USER_ONE: OPEN_ID, USER_TWO: OPEN_ID} if recipients is None else recipients
+        self._recipients = (
+            {USER_ONE: OPEN_ID, USER_TWO: OPEN_ID} if recipients is None else recipients
+        )
         self._reclaimed = reclaimed
         self.reclaim_calls = 0
         self.pending_calls: list[int] = []
@@ -311,9 +313,7 @@ def build_duty(
     notices = notices or FakeNotices()
     audit = audit or RecordingAudit()
     readiness = (
-        ReadinessFollowUp(ticker=ticker, checks=checks, notices=notices)
-        if wire_readiness
-        else None
+        ReadinessFollowUp(ticker=ticker, checks=checks, notices=notices) if wire_readiness else None
     )
     duty = PermissionPublishDuty(
         executor=executor,
@@ -469,7 +469,10 @@ class PublishFaceTest(unittest.TestCase):
             with self.subTest(kwargs):
                 with self.assertRaises(ValueError):
                     PermissionPublishDuty(
-                        executor=FakeExecutor(), intents=FakeIntents(), audit=RecordingAudit(), **kwargs
+                        executor=FakeExecutor(),
+                        intents=FakeIntents(),
+                        audit=RecordingAudit(),
+                        **kwargs,
                     )
 
     def test_a_half_wired_readiness_face_is_rejected(self) -> None:
@@ -806,9 +809,7 @@ class UnwiredProbeTest(unittest.TestCase):
         后发布的撤权行就再也进不了窗口，而每轮都在重复取回同一批毫无进展的候选。
         """
 
-        backlog = [
-            FakePending(f"usr_{index:026d}", 2, GRANTED) for index in range(5)
-        ]
+        backlog = [FakePending(f"usr_{index:026d}", 2, GRANTED) for index in range(5)]
         revoked = FakePending(USER_TWO, 3, REVOKED, reason=PERMISSION_REVOKE_REASON)
         duty, parts = build_duty(
             intents=FakeIntents(*backlog, revoked),
@@ -948,9 +949,7 @@ class NonBlockingTest(unittest.TestCase):
         """
 
         stop = threading.Event()
-        executor = FakeExecutor(
-            *(FakeAttempt(published=True) for _ in range(5)), on_call=stop.set
-        )
+        executor = FakeExecutor(*(FakeAttempt(published=True) for _ in range(5)), on_call=stop.set)
         duty, parts = build_duty(executor=executor, stop=stop)
 
         report = duty.run_once()

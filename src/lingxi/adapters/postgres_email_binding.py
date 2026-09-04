@@ -31,9 +31,7 @@ from lingxi.core.identity.onboarding_ports import EmailBinding
 class PostgresEmailBindingSource:
     """``EmailBindingSource`` 的 PostgreSQL 实现。**只读**：本类没有任何写语句。"""
 
-    def __init__(
-        self, dsn: str, *, timeouts: PostgresTimeouts = DEFAULT_POSTGRES_TIMEOUTS
-    ) -> None:
+    def __init__(self, dsn: str, *, timeouts: PostgresTimeouts = DEFAULT_POSTGRES_TIMEOUTS) -> None:
         self._dsn = dsn
         self._timeouts = timeouts
 
@@ -56,7 +54,10 @@ class PostgresEmailBindingSource:
 
         if not email:
             return ()
-        with connect(self._dsn, timeouts=self._timeouts) as connection, connection.cursor() as cursor:
+        with (
+            connect(self._dsn, timeouts=self._timeouts) as connection,
+            connection.cursor() as cursor,
+        ):
             cursor.execute(
                 """
                 SELECT id, feishu_open_id

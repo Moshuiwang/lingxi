@@ -142,9 +142,7 @@ class ShutdownTests(ReconcilerTestCase):
 
             def start(self, *, event_id: str, open_id: str, trace_id: str, claim_token=None):
                 del claim_token
-                self.calls.append(
-                    {"event_id": event_id, "open_id": open_id, "trace_id": trace_id}
-                )
+                self.calls.append({"event_id": event_id, "open_id": open_id, "trace_id": trace_id})
                 stopping[0] = True
                 return OnboardingResult(state=OnboardingState.NOT_AUTHORIZED)
 
@@ -201,9 +199,7 @@ class FailureTests(ReconcilerTestCase):
                 self.setUp()
                 self.state.stale_onboardings.append(orphan())
                 runner = FakeOnboarding(
-                    result=OnboardingResult(
-                        state=OnboardingState.STARTED, failure_reason=reason
-                    )
+                    result=OnboardingResult(state=OnboardingState.STARTED, failure_reason=reason)
                 )
 
                 self.build(onboarding=runner).run_once()
@@ -271,9 +267,7 @@ class CapacityCouplingTests(ReconcilerTestCase):
 
         self.assertEqual(recovered, 3)
         self.assertEqual(len(runner.calls), 3)
-        self.assertEqual(
-            len(self.state.stale_onboardings), 7, "没被认领的那些必须原样留在候选里"
-        )
+        self.assertEqual(len(self.state.stale_onboardings), 7, "没被认领的那些必须原样留在候选里")
 
     def test_zero_capacity_claims_nothing_at_all(self) -> None:
         self.state.stale_onboardings.append(orphan())
@@ -329,17 +323,13 @@ class ClaimGenerationTests(ReconcilerTestCase):
 
         first = store.claim_stale_onboarding(older_than=DEFAULT_STALE_AFTER)
         assert first is not None
-        store.release_onboarding_claim(
-            event_id=first.event_id, claim_token=first.claim_token
-        )
+        store.release_onboarding_claim(event_id=first.event_id, claim_token=first.claim_token)
         second = store.claim_stale_onboarding(older_than=DEFAULT_STALE_AFTER)
         assert second is not None
         self.assertNotEqual(second.claim_token, first.claim_token)
 
         # A 的重试：拿旧代次再释放一次。
-        store.release_onboarding_claim(
-            event_id=first.event_id, claim_token=first.claim_token
-        )
+        store.release_onboarding_claim(event_id=first.event_id, claim_token=first.claim_token)
 
         self.assertIn(
             second.event_id,

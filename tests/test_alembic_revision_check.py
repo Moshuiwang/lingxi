@@ -54,7 +54,9 @@ class AlembicIniTest(unittest.TestCase):
         self.assertEqual(CHECK.check_ini("[alembic]\nsqlalchemy.url =\n"), [])
 
     def test_absent_url_is_accepted(self) -> None:
-        self.assertEqual(CHECK.check_ini("[alembic]\nscript_location = %(here)s/migrations/alembic\n"), [])
+        self.assertEqual(
+            CHECK.check_ini("[alembic]\nscript_location = %(here)s/migrations/alembic\n"), []
+        )
 
     def test_url_hidden_in_another_section_is_still_found(self) -> None:
         """换个小节名不该能绕过：检查按 key 找，不按小节名找。"""
@@ -96,7 +98,9 @@ class RuntimeIsolationTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             source = Path(directory) / "src"
             (source / "lingxi.egg-info").mkdir(parents=True)
-            (source / "lingxi.egg-info" / "requires.txt").write_text("alembic>=1.19\n", encoding="utf-8")
+            (source / "lingxi.egg-info" / "requires.txt").write_text(
+                "alembic>=1.19\n", encoding="utf-8"
+            )
             self.assertEqual(CHECK.check_runtime_isolation(source), [])
 
     def test_clean_source_passes(self) -> None:
@@ -156,7 +160,9 @@ class EmbeddedCopyTest(unittest.TestCase):
     没有容器就整体不跑。
     """
 
-    def _build(self, directory: str, embedded: str, on_disk: str, chain: str = "a.sql") -> list[str]:
+    def _build(
+        self, directory: str, embedded: str, on_disk: str, chain: str = "a.sql"
+    ) -> list[str]:
         root = Path(directory)
         (root / "alembic" / "versions").mkdir(parents=True)
         (root / chain).write_text(on_disk, encoding="utf-8")
@@ -170,7 +176,9 @@ class EmbeddedCopyTest(unittest.TestCase):
 
     def test_identical_bytes_pass(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
-            self.assertEqual(self._build(directory, "CREATE TABLE t ();\n", "CREATE TABLE t ();\n"), [])
+            self.assertEqual(
+                self._build(directory, "CREATE TABLE t ();\n", "CREATE TABLE t ();\n"), []
+            )
 
     def test_one_character_drift_is_reported(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -182,7 +190,9 @@ class EmbeddedCopyTest(unittest.TestCase):
         """只改注释——真库 schema 比对对这种分叉完全沉默。"""
 
         with tempfile.TemporaryDirectory() as directory:
-            failures = self._build(directory, "-- 甲\nCREATE TABLE t ();\n", "-- 乙\nCREATE TABLE t ();\n")
+            failures = self._build(
+                directory, "-- 甲\nCREATE TABLE t ();\n", "-- 乙\nCREATE TABLE t ();\n"
+            )
         self.assertEqual(len(failures), 1)
         self.assertIn("已分叉", failures[0])
 
@@ -272,7 +282,9 @@ class MigrationDsnTest(unittest.TestCase):
                 self.assertNotIn(secret, str(caught.exception))
 
 
-@unittest.skipUnless(_alembic_available(), "跳过：未安装 migrate extra（alembic），env.py 接线未验证")
+@unittest.skipUnless(
+    _alembic_available(), "跳过：未安装 migrate extra（alembic），env.py 接线未验证"
+)
 class MigrationEnvWiringTest(unittest.TestCase):
     """env.py 确实调用了上面那段校验（而不是自己另写一份）。
 

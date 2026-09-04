@@ -63,7 +63,10 @@ class PostgresRosterBaselineReader:
         取的列就是要用的列——多取一列就是多一份可识别数据进内存，而它没有用途。
         """
 
-        with connect(self._dsn, timeouts=self._timeouts) as connection, connection.cursor() as cursor:
+        with (
+            connect(self._dsn, timeouts=self._timeouts) as connection,
+            connection.cursor() as cursor,
+        ):
             cursor.execute(ACTIVE_BASELINE_SQL)
             rows = cursor.fetchall()
 

@@ -96,9 +96,7 @@ class FeishuGroupMessageError(RuntimeError):
         self.definite = definite if definite is not None else code.startswith("feishu_code_")
 
 
-def validate_group_chat_id(
-    value: str, *, variable_name: str = "LINGXI_ADMIN_GROUP_CHAT_ID"
-) -> str:
+def validate_group_chat_id(value: str, *, variable_name: str = "LINGXI_ADMIN_GROUP_CHAT_ID") -> str:
     """校验群 ID 形状；不合法就快速失败，且**不回显取到的值**。
 
     群 ID 本身不是密钥，但它是一个外部标识：错误消息里带上它，就会被日志、CI 输出和

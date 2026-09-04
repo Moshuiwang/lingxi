@@ -183,6 +183,7 @@ def _humanize_error_kind(safe_reason_code: str) -> str:
         return f"{safe_reason_code}（未登记显示名）"
     return label
 
+
 #: 与旧系统「高权限名单加 7 天节流」同一量级的节流阈值（#303 继承的设计教训）。
 #: 连续出现天数超过这个数才折叠，即第 1–7 天正常展开、第 8 天起折叠。
 REPEAT_THROTTLE_DAYS = 7
@@ -667,7 +668,9 @@ def build_metric_coverage_gap(
     """
 
     mapped = set(mapped_metric_ids)
-    gap = sorted(dict.fromkeys(metric_id for metric_id in mcp_metric_ids if metric_id not in mapped))
+    gap = sorted(
+        dict.fromkeys(metric_id for metric_id in mcp_metric_ids if metric_id not in mapped)
+    )
     if not gap:
         return None
     return MetricCoverageGap(uncovered_metric_ids=tuple(gap))
@@ -826,7 +829,9 @@ def _render_denied_count(section: Section[PartialCount]) -> str:
         return f"{label}：{_render_undetermined(section.undetermined_reason)}"
     stats = section.value
     assert stats is not None
-    note = _render_coverage_note(covered_tasks=stats.covered_tasks, uncovered_tasks=stats.uncovered_tasks)
+    note = _render_coverage_note(
+        covered_tasks=stats.covered_tasks, uncovered_tasks=stats.uncovered_tasks
+    )
     return f"{label}：{stats.total} 次{note}"
 
 
@@ -860,7 +865,9 @@ def _render_resource_usage(section: Section[TokenUsageStats]) -> str:
         return f"{label}：{_render_undetermined(section.undetermined_reason)}"
     stats = section.value
     assert stats is not None
-    note = _render_coverage_note(covered_tasks=stats.covered_tasks, uncovered_tasks=stats.uncovered_tasks)
+    note = _render_coverage_note(
+        covered_tasks=stats.covered_tasks, uncovered_tasks=stats.uncovered_tasks
+    )
     body = (
         f"input={stats.input_tokens}，output={stats.output_tokens}，"
         f"cache_creation={stats.cache_creation_input_tokens}，"

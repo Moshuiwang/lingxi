@@ -13,7 +13,9 @@ from lingxi.core.execution.hooks import HOOK_EVENTS, OBSERVATION_ONLY_EVENTS, To
 _HOOK_TIMEOUT_SECONDS = 30
 
 
-def build_hook_matchers(gateway: ToolGateway, *, observe_permission_events: bool = True) -> dict[str, list[Any]]:
+def build_hook_matchers(
+    gateway: ToolGateway, *, observe_permission_events: bool = True
+) -> dict[str, list[Any]]:
     """构造 ``ClaudeAgentOptions.hooks`` 需要的映射。
 
     ``observe_permission_events`` 默认开启：``PermissionDenied`` /
@@ -23,7 +25,9 @@ def build_hook_matchers(gateway: ToolGateway, *, observe_permission_events: bool
 
     from claude_agent_sdk import HookMatcher
 
-    matcher = HookMatcher(matcher=None, hooks=[gateway.on_hook_event], timeout=_HOOK_TIMEOUT_SECONDS)
+    matcher = HookMatcher(
+        matcher=None, hooks=[gateway.on_hook_event], timeout=_HOOK_TIMEOUT_SECONDS
+    )
     events = list(HOOK_EVENTS)
     if observe_permission_events:
         events.extend(OBSERVATION_ONLY_EVENTS)

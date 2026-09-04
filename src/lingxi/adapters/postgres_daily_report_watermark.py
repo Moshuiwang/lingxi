@@ -46,7 +46,10 @@ class PostgresDailyReportWatermark:
         发送过——只回答存在性，不回读 ``sent_at``。"""
 
         _validate_arguments(report_date, chat_id)
-        with connect(self._dsn, timeouts=self._timeouts) as connection, connection.cursor() as cursor:
+        with (
+            connect(self._dsn, timeouts=self._timeouts) as connection,
+            connection.cursor() as cursor,
+        ):
             cursor.execute(
                 "SELECT 1 FROM daily_report_watermark WHERE report_date = %s AND chat_id = %s",
                 (report_date, chat_id),
@@ -59,7 +62,10 @@ class PostgresDailyReportWatermark:
         （见模块文档「标记幂等，且绝不覆盖」）。"""
 
         _validate_arguments(report_date, chat_id)
-        with connect(self._dsn, timeouts=self._timeouts) as connection, connection.cursor() as cursor:
+        with (
+            connect(self._dsn, timeouts=self._timeouts) as connection,
+            connection.cursor() as cursor,
+        ):
             cursor.execute(
                 """INSERT INTO daily_report_watermark (report_date, chat_id)
                         VALUES (%s, %s)

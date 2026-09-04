@@ -150,7 +150,9 @@ class PositionManagementCardTests(unittest.TestCase):
         self.assertTrue(fields["company_scope"]["required"])
         self.assertTrue(fields["reason"]["required"])
         scope = fields["company_scope"]
-        self.assertIn("全部（3 家公司）", [option["text"]["content"] for option in scope["options"]])
+        self.assertIn(
+            "全部（3 家公司）", [option["text"]["content"] for option in scope["options"]]
+        )
 
         buttons = [element for element in elements if element.get("tag") == "button"]
         actions = [button["behaviors"][0]["value"].get("admin_action") for button in buttons]
@@ -211,9 +213,14 @@ class PositionManagementCardTests(unittest.TestCase):
         self.assertEqual(len(transport.updated), 1)
         elements = list(_walk(transport.updated[0]["card"]["body"]["elements"]))
         self.assertTrue([element for element in elements if element.get("tag") == "form"])
-        self.assertIn("已生效", "\n".join(
-            element.get("content", "") for element in elements if element.get("tag") == "markdown"
-        ))
+        self.assertIn(
+            "已生效",
+            "\n".join(
+                element.get("content", "")
+                for element in elements
+                if element.get("tag") == "markdown"
+            ),
+        )
 
     def test_cardkit_failure_does_not_advance_visual_watermark_before_success(self) -> None:
         from lingxi.apps.gateway import _GatewayManagementCardRefresher
@@ -403,13 +410,9 @@ class PositionManagementCardTests(unittest.TestCase):
         assert updated is not None
         self.assertEqual(updated.card_sequence, 3)
         self.assertTrue(updated.needs_refresh)
-        self.assertFalse(
-            store.mark_visual_refreshed(message_id="om_visual_generation", sequence=1)
-        )
+        self.assertFalse(store.mark_visual_refreshed(message_id="om_visual_generation", sequence=1))
         self.assertEqual(len(store.list_needing_refresh()), 1)
-        self.assertTrue(
-            store.mark_visual_refreshed(message_id="om_visual_generation", sequence=3)
-        )
+        self.assertTrue(store.mark_visual_refreshed(message_id="om_visual_generation", sequence=3))
         self.assertEqual(store.list_needing_refresh(), ())
 
     def test_closed_card_has_no_form_or_cancel_action(self) -> None:
@@ -511,9 +514,7 @@ class PositionManagementCardTests(unittest.TestCase):
         self.assertEqual(value.get("permission_group_id"), "lpg_01M1C90YDGMTY567GDTZZJ4C5E")
         self.assertNotIn("override_id", value)
         visible = "\n".join(
-            element.get("content", "")
-            for element in elements
-            if element.get("tag") == "markdown"
+            element.get("content", "") for element in elements if element.get("tag") == "markdown"
         )
         self.assertIn("覆盖 387 项权限", visible)
 
@@ -553,7 +554,9 @@ class TerminalOutcomeTextTests(unittest.TestCase):
 
 
 class ContextSequenceTests(unittest.TestCase):
-    def test_default_context_ttl_is_forty_minutes_and_explicit_deadline_is_hard_capped_at_24h(self) -> None:
+    def test_default_context_ttl_is_forty_minutes_and_explicit_deadline_is_hard_capped_at_24h(
+        self,
+    ) -> None:
         store = ManagementCardContextStore()
         before = datetime.now(UTC)
         store.remember(
@@ -598,16 +601,12 @@ class ContextSequenceTests(unittest.TestCase):
         fixed_now = NOW
         before_24h = fixed_now + timedelta(hours=24) - timedelta(seconds=1)
         self.assertEqual(
-            bounded_management_card_deadline(
-                now=fixed_now, requested=before_24h, ttl_seconds=1800
-            ),
+            bounded_management_card_deadline(now=fixed_now, requested=before_24h, ttl_seconds=1800),
             before_24h,
         )
         exact_24h = fixed_now + timedelta(hours=24)
         self.assertEqual(
-            bounded_management_card_deadline(
-                now=fixed_now, requested=exact_24h, ttl_seconds=1800
-            ),
+            bounded_management_card_deadline(now=fixed_now, requested=exact_24h, ttl_seconds=1800),
             exact_24h,
         )
         self.assertEqual(
@@ -617,7 +616,9 @@ class ContextSequenceTests(unittest.TestCase):
             exact_24h,
         )
 
-    def test_context_sequence_is_monotonic_and_expired_context_is_still_recoverable_for_lazy_close(self) -> None:
+    def test_context_sequence_is_monotonic_and_expired_context_is_still_recoverable_for_lazy_close(
+        self,
+    ) -> None:
         clock = [0.0]
         store = ManagementCardContextStore(ttl_seconds=1.0, clock=lambda: clock[0])
         store.remember(
@@ -759,7 +760,9 @@ class ManagementCardCallbackSecurityTests(unittest.TestCase):
         route = _Route()
         store = self._store(status)
         refresh = _Refresh()
-        handler = self._handler(status=status, route=route, store=store, refresh=refresh, audit=_Audit())
+        handler = self._handler(
+            status=status, route=route, store=store, refresh=refresh, audit=_Audit()
+        )
         response = self._submit(handler)
 
         self.assertEqual(response["toast"]["type"], "success")
@@ -769,11 +772,16 @@ class ManagementCardCallbackSecurityTests(unittest.TestCase):
 
     def test_non_initiator_or_tampered_identifier_cannot_route_write(self) -> None:
         status = _status()
-        for operator, identifier in (("ou_other", "u@example.com"), ("ou_admin", "other@example.com")):
+        for operator, identifier in (
+            ("ou_other", "u@example.com"),
+            ("ou_admin", "other@example.com"),
+        ):
             route = _Route()
             store = self._store(status)
             audit = _Audit()
-            handler = self._handler(status=status, route=route, store=store, refresh=_Refresh(), audit=audit)
+            handler = self._handler(
+                status=status, route=route, store=store, refresh=_Refresh(), audit=audit
+            )
             response = self._submit(handler, operator=operator, identifier=identifier)
             self.assertEqual(response["toast"]["type"], "error")
             self.assertEqual(route.calls, [])
@@ -866,7 +874,9 @@ class ManagementCardCallbackSecurityTests(unittest.TestCase):
         route = _Route()
         store = self._store(original)
         refresh = _Refresh()
-        handler = self._handler(status=changed, route=route, store=store, refresh=refresh, audit=_Audit())
+        handler = self._handler(
+            status=changed, route=route, store=store, refresh=refresh, audit=_Audit()
+        )
         response = self._submit(handler)
 
         self.assertEqual(response["toast"]["type"], "error")
@@ -1027,7 +1037,9 @@ class PositionCommandShiftReproductionTests(unittest.TestCase):
 
         parsed = parse_admin_command(shifted)
 
-        self.assertEqual(parsed.kind, AdminCommandKind.GRANT_POSITION_PERMISSION, "左移后仍然形状合法")
+        self.assertEqual(
+            parsed.kind, AdminCommandKind.GRANT_POSITION_PERMISSION, "左移后仍然形状合法"
+        )
         self.assertEqual(parsed.position_name, "c1", "管理员选的公司范围被当成了职位")
         self.assertEqual(parsed.company_scope, "c2", "公司范围换成了原因里的第一个词")
         self.assertEqual(parsed.reason, "补充授权")
@@ -1041,11 +1053,11 @@ class PositionCommandShiftReproductionTests(unittest.TestCase):
 
         parsed = parse_admin_command(shifted)
 
-        self.assertEqual(parsed.kind, AdminCommandKind.GRANT_POSITION_PERMISSION, "左移后仍然形状合法")
-        self.assertEqual(parsed.position_name, "A运营")
         self.assertEqual(
-            parsed.company_scope, "c2", "授权范围变成了管理员从没选过的公司"
+            parsed.kind, AdminCommandKind.GRANT_POSITION_PERMISSION, "左移后仍然形状合法"
         )
+        self.assertEqual(parsed.position_name, "A运营")
+        self.assertEqual(parsed.company_scope, "c2", "授权范围变成了管理员从没选过的公司")
         self.assertEqual(parsed.reason, "补充授权")
 
 
@@ -1142,9 +1154,7 @@ class SuspendedUserGetsTheTruthNotADailyBatchPromiseTests(unittest.TestCase):
         )
 
         message = skipped_recompute_status_message(
-            TargetedRecomputeOutcome(
-                kind=RecomputeKind.SKIPPED, reason=SKIP_ACCOUNT_NOT_ENABLED
-            )
+            TargetedRecomputeOutcome(kind=RecomputeKind.SKIPPED, reason=SKIP_ACCOUNT_NOT_ENABLED)
         )
         self.assertIsNotNone(message)
         assert message is not None
@@ -1163,9 +1173,7 @@ class SuspendedUserGetsTheTruthNotADailyBatchPromiseTests(unittest.TestCase):
         )
 
         message = skipped_recompute_status_message(
-            TargetedRecomputeOutcome(
-                kind=RecomputeKind.SKIPPED, reason=SKIP_ACCOUNT_NOT_ENABLED
-            )
+            TargetedRecomputeOutcome(kind=RecomputeKind.SKIPPED, reason=SKIP_ACCOUNT_NOT_ENABLED)
         )
         self._assert_is_the_truth(
             _render_incomplete(account_state="suspended", dispatch_status=message)
@@ -1281,9 +1289,7 @@ class SuspendedUserTransientTextTests(unittest.TestCase):
         """反向对照二：只改写「正在下发」这一句——「已生效」「已取消」各有自己的判据，
         不在这里顺手一起改写。"""
 
-        self.assertEqual(
-            self._rendered(account_state="suspended", state="effective"), "已生效"
-        )
+        self.assertEqual(self._rendered(account_state="suspended", state="effective"), "已生效")
         self.assertEqual(self._rendered(account_state="suspended", state="closed"), "已取消")
 
     def test_a_status_view_without_account_state_keeps_the_old_wording(self) -> None:

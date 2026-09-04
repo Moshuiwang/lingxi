@@ -271,9 +271,7 @@ def run(
                     users[event.feishu_event_id] = user
                     if user is not None:
                         publishes[event.feishu_event_id] = _fetch_publish(cursor, user.user_id)
-                        readiness[event.feishu_event_id] = _fetch_readiness(
-                            cursor, user.user_id
-                        )
+                        readiness[event.feishu_event_id] = _fetch_readiness(cursor, user.user_id)
     except Exception as error:  # 查询失败只需要区分"能不能查"
         print(f"查询失败：{type(error).__name__}", file=err)
         return 1

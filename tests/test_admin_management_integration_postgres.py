@@ -69,7 +69,11 @@ class _FakeConfirmCardTransport:
         self.create_calls.append(
             {"chat_id": chat_id, "reply_to_message_id": reply_to_message_id, "card": card}
         )
-        return type("Created", (), {"card_id": f"card_{self._counter}", "message_id": f"msg_{self._counter}"})()
+        return type(
+            "Created",
+            (),
+            {"card_id": f"card_{self._counter}", "message_id": f"msg_{self._counter}"},
+        )()
 
     def update(self, *, card_id, sequence, card):  # pragma: no cover - 本文件不测终态更新
         raise NotImplementedError
@@ -107,7 +111,9 @@ class ManagementCardCallbackIntegrationTestCase(unittest.TestCase):
         )
 
         confirm_audit = _RecordingAudit()
-        self.pending_store = PostgresPendingActionStore(self._dsn, audit=confirm_audit, metric_map_path=None)
+        self.pending_store = PostgresPendingActionStore(
+            self._dsn, audit=confirm_audit, metric_map_path=None
+        )
         # 同一个 PostgresAdminQueries 实例结构性实现 AdminDisplayNames（Trace
         # #469 S-1），与真实 apps/gateway/__init__.py 装配同一姿态——不需要
         # 额外声明或继承，注入到下面三处需要它的构造点。
@@ -512,7 +518,9 @@ class PositionPermissionGroupRealDbTests(ManagementCardCallbackIntegrationTestCa
 class ManagementCorrectionRealDbTests(ManagementCardCallbackIntegrationTestCase):
     """#493 P1：只有真实 daily publish 才能产生每日纠偏群摘要水位。"""
 
-    def _seed_context_and_executed_action(self, message_id: str) -> PostgresManagementCardContextStore:
+    def _seed_context_and_executed_action(
+        self, message_id: str
+    ) -> PostgresManagementCardContextStore:
         now = datetime.now(UTC)
         context_store = PostgresManagementCardContextStore(self._dsn)
         context_store.remember(
@@ -561,7 +569,7 @@ class ManagementCorrectionRealDbTests(ManagementCardCallbackIntegrationTestCase)
                 "record_key": "target@example.com",
                 "email": "target@example.com",
                 "name": "化名用户",
-                "permissions": "{\"1011\":[\"daily_active\"]}",
+                "permissions": '{"1011":["daily_active"]}',
                 "status": "approved",
                 "updated_at": now.isoformat(),
             }
@@ -648,9 +656,7 @@ class ManagementCardStateCasRealDbTests(ManagementCardCallbackIntegrationTestCas
             snapshot_fingerprint="fp",
             context_deadline_at=datetime.now(UTC) + timedelta(hours=1),
         )
-        store.update_state(
-            message_id=message_id, state="effective", dispatch_status="effective"
-        )
+        store.update_state(message_id=message_id, state="effective", dispatch_status="effective")
         return store
 
     def test_concurrent_state_write_rejects_stale_sequence_claim_without_consuming_it(self) -> None:
@@ -857,6 +863,7 @@ class ManagementCardStateCasRealDbTests(ManagementCardCallbackIntegrationTestCas
         assert current is not None
         self.assertFalse(current.needs_refresh)
         self.assertEqual(current.visual_sequence, transport.updates[0]["sequence"])
+
 
 if __name__ == "__main__":  # pragma: no cover
     unittest.main()

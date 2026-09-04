@@ -28,7 +28,9 @@ class SafeRedirectHandler(urllib.request.HTTPRedirectHandler):
     """GitHub artifact 跳到对象存储时不把 GitHub Token 带到另一个主机。"""
 
     def redirect_request(self, request, file_pointer, code, message, headers, new_url):
-        redirected = super().redirect_request(request, file_pointer, code, message, headers, new_url)
+        redirected = super().redirect_request(
+            request, file_pointer, code, message, headers, new_url
+        )
         if redirected is None:
             return None
         old_host = urllib.parse.urlsplit(request.full_url).netloc
@@ -127,11 +129,15 @@ def verified_candidate(
             # 不能只靠分支名（分支名可以复用）。
             if run.get("head_sha") != pr["head"]["sha"]:
                 continue
-            artifacts = reader.json(f"/repos/{encoded_repo}/actions/runs/{run['id']}/artifacts").get(
-                "artifacts", []
-            )
+            artifacts = reader.json(
+                f"/repos/{encoded_repo}/actions/runs/{run['id']}/artifacts"
+            ).get("artifacts", [])
             artifact = next(
-                (item for item in artifacts if item.get("name") == artifact_name and not item.get("expired")),
+                (
+                    item
+                    for item in artifacts
+                    if item.get("name") == artifact_name and not item.get("expired")
+                ),
                 None,
             )
             if artifact is None:

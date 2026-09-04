@@ -331,9 +331,11 @@ class PermissionPublishDuty:
         for label, value in (("发布", publish_limit), ("就绪", readiness_limit)):
             if isinstance(value, bool) or not isinstance(value, int) or value < 1:
                 raise ValueError(f"单轮{label}预算必须是正整数")
-        if isinstance(round_budget_seconds, bool) or not isinstance(
-            round_budget_seconds, (int, float)
-        ) or round_budget_seconds <= 0:
+        if (
+            isinstance(round_budget_seconds, bool)
+            or not isinstance(round_budget_seconds, (int, float))
+            or round_budget_seconds <= 0
+        ):
             raise ValueError("单轮时间预算必须是正数秒")
         if readiness is not None and not isinstance(readiness, ReadinessFollowUp):
             raise TypeError("就绪面必须整体注入 ReadinessFollowUp，不接受半套装配")
@@ -408,9 +410,7 @@ class PermissionPublishDuty:
         if readiness is not None and not interrupted and not self._stop.is_set():
             # 探针没接线时**只取撤权那一类**：授权候选这一轮推进不了，留在查询之外才不会
             # 把窗口占死（:data:`REVOKE_ONLY_REASONS` 的文档写明了饿死是怎么发生的）。
-            reasons = (
-                FOLLOW_UP_REASONS if readiness.ticker.probe_wired else REVOKE_ONLY_REASONS
-            )
+            reasons = FOLLOW_UP_REASONS if readiness.ticker.probe_wired else REVOKE_ONLY_REASONS
             pending = tuple(
                 self._intents.published_awaiting_readiness(
                     reasons=reasons,
@@ -552,17 +552,13 @@ class PermissionPublishDuty:
         那些，代价因此是有界的。
         """
 
-        binding = ReadinessBinding(
-            user_id=item.user_id, permission_version=item.permission_version
-        )
+        binding = ReadinessBinding(user_id=item.user_id, permission_version=item.permission_version)
         # 先查收件人：这一步失败不留任何终态，下一轮重来。
         open_id = self._intents.notice_recipient_open_id(item.user_id)
         progress = ReadinessProgress.from_checks(
             readiness.checks.load_checks(item.user_id, item.permission_version)
         )
-        attempt = readiness.ticker.advance(
-            binding, permissions=item.permissions, progress=progress
-        )
+        attempt = readiness.ticker.advance(binding, permissions=item.permissions, progress=progress)
         if attempt is None:
             # 还没到期、已经收口，或探针未接线：本轮一次外部调用都不发。
             return
@@ -694,9 +690,7 @@ def _build_permission_publish_duty(
 
     from lingxi.adapters.postgres_permission_publish import PostgresPermissionPublishStore
 
-    store = PostgresPermissionPublishStore(
-        config.postgres_dsn, timeouts=config.postgres_timeouts
-    )
+    store = PostgresPermissionPublishStore(config.postgres_dsn, timeouts=config.postgres_timeouts)
     if unwired is None:
         from lingxi.adapters.feishu_permission_bitable import BitablePermissionTable
         from lingxi.core.permission.publish import PermissionPublishExecutor
@@ -735,9 +729,7 @@ def _build_permission_publish_duty(
             facts["variable"] = variable
         # **恰一条**：只说发布面没装配，就绪与通知面照常。
         audit.record("permission_publish.publish_not_wired", **facts)
-        logger.warning(
-            "权限发布面未装配（%s），已发布权限的就绪确认与变化通知照常运行", reason
-        )
+        logger.warning("权限发布面未装配（%s），已发布权限的就绪确认与变化通知照常运行", reason)
 
     return PermissionPublishDuty(
         executor=executor,

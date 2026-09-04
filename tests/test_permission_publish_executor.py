@@ -125,9 +125,10 @@ class FakeTable:
         matched = []
         for row in self.rows:
             fields = row["fields"]
-            if str(fields.get("record_key", "")).casefold() == record_key.casefold() or str(
-                fields.get("email", "")
-            ).casefold() == email.casefold():
+            if (
+                str(fields.get("record_key", "")).casefold() == record_key.casefold()
+                or str(fields.get("email", "")).casefold() == email.casefold()
+            ):
                 matched.append(ExistingPermissionRow(row["record_id"], dict(fields)))
         return tuple(matched)
 
@@ -419,9 +420,7 @@ class PublishClaimTest(unittest.TestCase):
                 }
             ]
         )
-        attempt = publish_claim(
-            _claim(attempts=2, created_record_id="rec_9"), transport=table
-        )
+        attempt = publish_claim(_claim(attempts=2, created_record_id="rec_9"), transport=table)
         self.assertEqual(attempt.outcome, PublishOutcome.MISMATCH)
         self.assertEqual(attempt.mismatch_fields, ("token_cipher",))
         self.assertEqual(table.written, [])
@@ -881,7 +880,9 @@ class NextStatusTest(unittest.TestCase):
             external_record_id="rec_1",
         )
         self.assertEqual(published.next_status(), STATUS_PUBLISHED)
-        self.assertEqual(self._attempt(PublishOutcome.SUPERSEDED, 1).next_status(), STATUS_SUPERSEDED)
+        self.assertEqual(
+            self._attempt(PublishOutcome.SUPERSEDED, 1).next_status(), STATUS_SUPERSEDED
+        )
 
 
 class FakeStore:
@@ -1032,9 +1033,7 @@ class RoundExclusionTest(unittest.TestCase):
     def _executor(self, store) -> PermissionPublishExecutor:
         table = FakeTable()
         table.faults["find_rows"] = PermissionTableError("http_500", definite=True)
-        return PermissionPublishExecutor(
-            store=store, transport=table, audit=RecordingAudit()
-        )
+        return PermissionPublishExecutor(store=store, transport=table, audit=RecordingAudit())
 
     def test_a_failed_intent_is_not_reclaimed_in_the_same_round(self) -> None:
         store = RequeueingStore([_claim(outbox_id="pub_1")])
@@ -1089,7 +1088,7 @@ class RoundExclusionTest(unittest.TestCase):
 
 
 class RequeueingStore:
-    """"失败就回 ``pending``"的 outbox 替身：``complete(status='pending')`` 把那条意图
+    """ "失败就回 ``pending``"的 outbox 替身：``complete(status='pending')`` 把那条意图
     放回队列**最前面**（它的 ``created_at`` 没变，仍然是最老的一条）。
 
     这正是真库 ``claim_next`` 的行为，也是 F2 的成因；没有本轮排除时它会被无限重取。

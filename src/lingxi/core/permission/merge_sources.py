@@ -333,9 +333,7 @@ def merge_permission_sources(
     「空结果」一节。
     """
 
-    galaxy_map: dict[str, tuple[str, ...]] = {
-        key: tuple(values) for key, values in galaxy.items()
-    }
+    galaxy_map: dict[str, tuple[str, ...]] = {key: tuple(values) for key, values in galaxy.items()}
 
     if ALL_COMPANIES_KEY in galaxy_map:
         if full_access_wildcard:
@@ -344,9 +342,7 @@ def merge_permission_sources(
                 skipped.append(REASON_GRANT_REDUNDANT_WILDCARD)
             if local is not None and local.suppressions:
                 skipped.append(REASON_SUPPRESS_INAPPLICABLE_WILDCARD)
-            return MergedPermissionSources(
-                permissions=galaxy_map, skipped_reasons=tuple(skipped)
-            )
+            return MergedPermissionSources(permissions=galaxy_map, skipped_reasons=tuple(skipped))
 
         # 有限指标通配（通配角 v2，Issue #440）：全部本地 grant/suppress 指标名
         # （忽略各自的 company_id——「行来源无关」）直接在 "*" 这一份清单上做
@@ -378,7 +374,9 @@ def merge_permission_sources(
         # 具体键值 ∪ 银河各公司值」并进 "*"，等于把 40 号公司专有的指标发给全部公司）。
         # 某公司减到**空**不可表示（写侧不产出空列表、读侧缺键会回退 "*"），登记进
         # `unrepresentable_companies` 交调用方 fail-closed。
-        star = set(local_grants[ALL_COMPANIES_KEY]) - set(local_suppressions.get(ALL_COMPANIES_KEY, ()))
+        star = set(local_grants[ALL_COMPANIES_KEY]) - set(
+            local_suppressions.get(ALL_COMPANIES_KEY, ())
+        )
         if star:
             collapsed: dict[str, tuple[str, ...]] = {ALL_COMPANIES_KEY: tuple(sorted(star))}
             unrepresentable: list[str] = []
@@ -388,7 +386,9 @@ def merge_permission_sources(
                 | {company for company in local_suppressions if company != ALL_COMPANIES_KEY}
             )
             for company in sorted(companies):
-                values = star | set(galaxy_map.get(company, ())) | set(local_grants.get(company, ()))
+                values = (
+                    star | set(galaxy_map.get(company, ())) | set(local_grants.get(company, ()))
+                )
                 values -= set(local_suppressions.get(company, ()))
                 if not values:
                     unrepresentable.append(company)
@@ -401,7 +401,11 @@ def merge_permission_sources(
             )
         # 组被 "*" 抑制减到空：本地没有「全部」授权了，回到下面的非通配代数
         # （与非通配分支的空结果同一语义：丢键、不写空列表）。
-        local_grants = {company: values for company, values in local_grants.items() if company != ALL_COMPANIES_KEY}
+        local_grants = {
+            company: values
+            for company, values in local_grants.items()
+            if company != ALL_COMPANIES_KEY
+        }
 
     keys = set(galaxy_map) | set(local_grants)
     merged: dict[str, tuple[str, ...]] = {}

@@ -46,7 +46,10 @@ _ALL_OR_NOTHING_MARKER = "-- 定位失败或资料不完整时不得留下半条
 def app_user_migration_lineages() -> tuple[tuple[str, str], ...]:
     sources = tuple(
         (path.name, path.read_text(encoding="utf-8"))
-        for path in [*sorted(MIGRATIONS_DIRECTORY.glob("*.sql")), *sorted(VERSIONS_DIRECTORY.glob("*.py"))]
+        for path in [
+            *sorted(MIGRATIONS_DIRECTORY.glob("*.sql")),
+            *sorted(VERSIONS_DIRECTORY.glob("*.py")),
+        ]
         if _APP_USER_TABLE_MARKER in path.read_text(encoding="utf-8")
     )
     assert len(sources) == 2, "app_user 的迁移血统不再是两条，写侧合同的核对面需要同步修订"
@@ -108,7 +111,9 @@ class ProvisioningRequestTest(unittest.TestCase):
         self.assertIsNone(request.employee_no)
         self.assertIsNone(request.email)
 
-    def test_a_missing_roster_row_is_allowed_because_provisioning_does_not_depend_on_it(self) -> None:
+    def test_a_missing_roster_row_is_allowed_because_provisioning_does_not_depend_on_it(
+        self,
+    ) -> None:
         request = ProvisioningRequest.from_roster_row(draft(), None)
 
         self.assertEqual((request.employee_no, request.email), (None, None))
@@ -136,7 +141,9 @@ class ProvisioningRequestTest(unittest.TestCase):
             "email": "Roster.User@Example-Corp.invalid",
             "name": "张一",
         }
-        galaxy = [{"user_id": "g_1", "user_name": "00080001", "email": "roster.user@example-corp.invalid"}]
+        galaxy = [
+            {"user_id": "g_1", "user_name": "00080001", "email": "roster.user@example-corp.invalid"}
+        ]
 
         match = match_galaxy_account("user_zhang", [row], galaxy)
         archived_from_roster = ProvisioningRequest.from_roster_row(draft(), row)
@@ -248,7 +255,7 @@ class ClassifyWriteFailureTest(unittest.TestCase):
         self.assertIs(
             classify_write_failure(
                 sqlstate=SQLSTATE_RAISE_EXCEPTION,
-                message=f'ERROR:  {DELEGATED_SUBJECT_REJECTION_MARKER}\nCONTEXT: PL/pgSQL',
+                message=f"ERROR:  {DELEGATED_SUBJECT_REJECTION_MARKER}\nCONTEXT: PL/pgSQL",
             ),
             ProvisioningRejection.DELEGATED_SUBJECT,
         )
@@ -442,7 +449,9 @@ def _psycopg_available() -> bool:
     return importlib.util.find_spec("psycopg") is not None
 
 
-PSYCOPG_SKIP_REASON = "跳过：未安装 psycopg，驱动异常到建档结果的映射未验证（本组不需要数据库，只需要驱动）"
+PSYCOPG_SKIP_REASON = (
+    "跳过：未安装 psycopg，驱动异常到建档结果的映射未验证（本组不需要数据库，只需要驱动）"
+)
 
 
 @unittest.skipUnless(_psycopg_available(), PSYCOPG_SKIP_REASON)

@@ -30,8 +30,12 @@ def load(path: Path, name: str):
     return module
 
 
-WRITER = load(ROOT / "scripts/ci/write_epic_candidate_images.py", "epic_candidate_images_writer_under_test")
-VERIFIER = load(ROOT / "scripts/ci/verify_epic_candidate_bundle.py", "epic_candidate_bundle_verifier_under_test")
+WRITER = load(
+    ROOT / "scripts/ci/write_epic_candidate_images.py", "epic_candidate_images_writer_under_test"
+)
+VERIFIER = load(
+    ROOT / "scripts/ci/verify_epic_candidate_bundle.py", "epic_candidate_bundle_verifier_under_test"
+)
 
 HEAD = "a" * 40
 TESTED = "b" * 40
@@ -41,7 +45,9 @@ OTHER_DIGEST = "sha256:" + "2" * 64
 TAR_SHA = "3" * 64
 
 
-def _image(service: str, *, digest: str = DIGEST, tar_sha256: str = TAR_SHA, size: int = 42) -> dict:
+def _image(
+    service: str, *, digest: str = DIGEST, tar_sha256: str = TAR_SHA, size: int = 42
+) -> dict:
     return {
         "service": service,
         "reference": f"lingxi-{service}:build-a",
@@ -108,7 +114,10 @@ class ManifestDocumentValidationTest(unittest.TestCase):
         self.assertEqual(document["schema"], 1)
         self.assertEqual(len(document["images"]), 4)
         # 输出按 service 排序，不依赖调用方传入的顺序。
-        self.assertEqual([item["service"] for item in document["images"]], ["gateway", "migrate", "scheduler", "worker"])
+        self.assertEqual(
+            [item["service"] for item in document["images"]],
+            ["gateway", "migrate", "scheduler", "worker"],
+        )
 
     def test_missing_service_is_rejected(self) -> None:
         images = [image for image in _images() if image["service"] != "worker"]
@@ -158,7 +167,11 @@ class DockerCallSitesTest(unittest.TestCase):
 
     def test_save_image_failure_is_not_swallowed(self) -> None:
         with self.assertRaises(RuntimeError):
-            WRITER.save_image("x:y", Path("/tmp/does-not-matter.tar"), runner=self._runner(1, stderr="no such image"))
+            WRITER.save_image(
+                "x:y",
+                Path("/tmp/does-not-matter.tar"),
+                runner=self._runner(1, stderr="no such image"),
+            )
 
     def test_read_image_digest_returns_id(self) -> None:
         digest = WRITER.read_image_digest("x:y", runner=self._runner(0, stdout=f"{DIGEST}\n"))
@@ -215,7 +228,9 @@ class ManifestShapeCheckTest(unittest.TestCase):
         self.assertTrue(any("gateway" in f or "服务集合" in f for f in failures), failures)
 
     def test_extra_image_count_is_caught(self) -> None:
-        failures = VERIFIER.check_manifest_shape(self._document(images=_images() + [_image("worker")]))
+        failures = VERIFIER.check_manifest_shape(
+            self._document(images=_images() + [_image("worker")])
+        )
         self.assertTrue(any("4" in f for f in failures), failures)
 
     def test_bad_pr_number_type_is_caught(self) -> None:
@@ -231,7 +246,13 @@ class ManifestShapeCheckTest(unittest.TestCase):
 
 class ExpectationCheckTest(unittest.TestCase):
     def test_matching_expectations_pass(self) -> None:
-        document = {"repository": "a/b", "pr_number": 1, "head_sha": HEAD, "tree_sha": TREE, "run_id": 2}
+        document = {
+            "repository": "a/b",
+            "pr_number": 1,
+            "head_sha": HEAD,
+            "tree_sha": TREE,
+            "run_id": 2,
+        }
         failures = VERIFIER.check_expectations(
             document,
             expect_repository="a/b",
@@ -364,9 +385,15 @@ class ImportAndDigestCheckTest(unittest.TestCase):
     def _fake_runner(self, *, load_returncode=0, inspect_stdout=DIGEST, inspect_returncode=0):
         def runner(argv):
             if argv[:2] == ["docker", "load"]:
-                return VERIFIER.CommandResult(load_returncode, "", "" if load_returncode == 0 else "load failed")
+                return VERIFIER.CommandResult(
+                    load_returncode, "", "" if load_returncode == 0 else "load failed"
+                )
             if argv[:2] == ["docker", "inspect"]:
-                return VERIFIER.CommandResult(inspect_returncode, inspect_stdout, "" if inspect_returncode == 0 else "inspect failed")
+                return VERIFIER.CommandResult(
+                    inspect_returncode,
+                    inspect_stdout,
+                    "" if inspect_returncode == 0 else "inspect failed",
+                )
             raise AssertionError(f"unexpected command: {argv}")
 
         return runner

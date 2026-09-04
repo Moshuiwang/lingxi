@@ -182,4 +182,10 @@ def main() -> int:  # pragma: no cover - 由 __main__.py 调用
     return run()
 
 
-__all__: tuple[str, ...] = ("DSN_ENV_VAR", "DELEGATED_SUBJECT_LABEL", "parse_arguments", "run", "main")
+__all__: tuple[str, ...] = (
+    "DSN_ENV_VAR",
+    "DELEGATED_SUBJECT_LABEL",
+    "parse_arguments",
+    "run",
+    "main",
+)

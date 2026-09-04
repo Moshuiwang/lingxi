@@ -143,7 +143,14 @@ class TokenIssuanceTest(McpTokenPostgresTestCase):
 
         columns = self._columns("mcp_access_token")
         self.assertEqual(columns, {"user_id", "token_cipher", "issued_at", "created_at"})
-        for forbidden in ("token", "token_plain", "plaintext", "secret", "token_hash", "fingerprint"):
+        for forbidden in (
+            "token",
+            "token_plain",
+            "plaintext",
+            "secret",
+            "token_hash",
+            "fingerprint",
+        ):
             self.assertNotIn(forbidden, columns)
 
     def test_issue_stores_only_ciphertext(self) -> None:
@@ -630,9 +637,7 @@ class SyncCheckRecordTest(McpTokenPostgresTestCase):
             holder.join(timeout=10)
         # 锁放开之后照常记账。
         self.store.record_attempt(_attempt())
-        self.assertEqual(
-            [item.attempt_no for item in self.store.load_checks(USER_A, VERSION)], [1]
-        )
+        self.assertEqual([item.attempt_no for item in self.store.load_checks(USER_A, VERSION)], [1])
 
     def test_expiry_is_derived_and_cannot_be_moved(self) -> None:
         self.store.record_attempt(_attempt())

@@ -306,9 +306,7 @@ def main(argv: list[str] | None = None) -> int:
         )
     )
     group = parser.add_mutually_exclusive_group(required=True)
-    group.add_argument(
-        "--list", action="store_true", help="列出全部已登记夹具及一句话说明"
-    )
+    group.add_argument("--list", action="store_true", help="列出全部已登记夹具及一句话说明")
     group.add_argument(
         "--check-clear",
         action="store_true",

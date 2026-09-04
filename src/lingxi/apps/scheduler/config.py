@@ -246,7 +246,9 @@ class SchedulerConfig:
             try:
                 interval = int(raw_interval)
             except ValueError as error:
-                raise ValueError("环境变量 LINGXI_SCHEDULER_INTERVAL_SECONDS 必须是正整数秒") from error
+                raise ValueError(
+                    "环境变量 LINGXI_SCHEDULER_INTERVAL_SECONDS 必须是正整数秒"
+                ) from error
             if interval <= 0:
                 raise ValueError("环境变量 LINGXI_SCHEDULER_INTERVAL_SECONDS 必须是正整数秒")
         else:
@@ -300,7 +302,9 @@ class SchedulerConfig:
         query_mcp_endpoint = optional_identifier("LINGXI_QUERY_MCP_ENDPOINT")
         if query_mcp_endpoint is not None and not query_mcp_endpoint.startswith("https://"):
             # 误配 http:// 会让用户自己的 MCP 令牌明文上路。只报变量名，不回显取到的值。
-            raise ValueError("环境变量 LINGXI_QUERY_MCP_ENDPOINT 必须以 https:// 开头（不回显取到的值）")
+            raise ValueError(
+                "环境变量 LINGXI_QUERY_MCP_ENDPOINT 必须以 https:// 开头（不回显取到的值）"
+            )
 
         raw_probe_timeout = (source.get("LINGXI_QUERY_MCP_TIMEOUT_SECONDS") or "").strip()
         if raw_probe_timeout:
@@ -347,9 +351,7 @@ class SchedulerConfig:
                 source.get("LINGXI_INNERTEST_ROSTER_OPEN_IDS")
             )
         except InnerTestRosterConfigError as error:
-            raise ValueError(
-                f"环境变量 LINGXI_INNERTEST_ROSTER_OPEN_IDS 不合法：{error}"
-            ) from None
+            raise ValueError(f"环境变量 LINGXI_INNERTEST_ROSTER_OPEN_IDS 不合法：{error}") from None
 
         raw_org_snapshot_round_budget = (
             source.get("LINGXI_ORG_SNAPSHOT_ROUND_BUDGET_SECONDS") or ""
@@ -418,7 +420,8 @@ class SchedulerConfig:
             credential_path=required("LINGXI_DELEGATED_CREDENTIAL_PATH"),
             feishu_app_id=required("LINGXI_FEISHU_APP_ID"),
             feishu_app_secret=_Secret(required("LINGXI_FEISHU_APP_SECRET")),
-            feishu_base_url=(source.get("LINGXI_FEISHU_BASE_URL") or "").strip() or DEFAULT_FEISHU_BASE_URL,
+            feishu_base_url=(source.get("LINGXI_FEISHU_BASE_URL") or "").strip()
+            or DEFAULT_FEISHU_BASE_URL,
             interval_seconds=interval,
             admin_group_chat_id=admin_group_chat_id,
             alert_policy=alert_policy,

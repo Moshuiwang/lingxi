@@ -172,27 +172,39 @@ class SequenceAndIdempotencyTests(DeliveryOutboxTestCase):
 
     def test_sequence_is_strictly_increasing_across_event_types(self) -> None:
         started = self.queue.append_delivery_event(
-            task_id="tsk-1", worker_id="worker-1", event_type="started",
+            task_id="tsk-1",
+            worker_id="worker-1",
+            event_type="started",
             idempotency_key="tsk-1:a1:started",
         )
         progress1 = self.queue.append_delivery_event(
-            task_id="tsk-1", worker_id="worker-1", event_type="progress",
-            idempotency_key="tsk-1:a1:progress:1", elapsed_seconds=3,
+            task_id="tsk-1",
+            worker_id="worker-1",
+            event_type="progress",
+            idempotency_key="tsk-1:a1:progress:1",
+            elapsed_seconds=3,
         )
         progress2 = self.queue.append_delivery_event(
-            task_id="tsk-1", worker_id="worker-1", event_type="progress",
-            idempotency_key="tsk-1:a1:progress:2", elapsed_seconds=6,
+            task_id="tsk-1",
+            worker_id="worker-1",
+            event_type="progress",
+            idempotency_key="tsk-1:a1:progress:2",
+            elapsed_seconds=6,
         )
         self.assertEqual((started.sequence, progress1.sequence, progress2.sequence), (1, 2, 3))
         self.assertFalse(started.duplicate or progress1.duplicate or progress2.duplicate)
 
     def test_retrying_the_same_idempotency_key_returns_the_same_row_not_a_new_one(self) -> None:
         first = self.queue.append_delivery_event(
-            task_id="tsk-1", worker_id="worker-1", event_type="started",
+            task_id="tsk-1",
+            worker_id="worker-1",
+            event_type="started",
             idempotency_key="tsk-1:a1:started",
         )
         retry = self.queue.append_delivery_event(
-            task_id="tsk-1", worker_id="worker-1", event_type="started",
+            task_id="tsk-1",
+            worker_id="worker-1",
+            event_type="started",
             idempotency_key="tsk-1:a1:started",
         )
         self.assertEqual(first.sequence, retry.sequence)
@@ -202,7 +214,9 @@ class SequenceAndIdempotencyTests(DeliveryOutboxTestCase):
 
     def test_append_rejected_for_non_owning_worker(self) -> None:
         result = self.queue.append_delivery_event(
-            task_id="tsk-1", worker_id="worker-zombie", event_type="started",
+            task_id="tsk-1",
+            worker_id="worker-zombie",
+            event_type="started",
             idempotency_key="tsk-1:zombie:started",
         )
         self.assertIsNone(result)
@@ -211,7 +225,9 @@ class SequenceAndIdempotencyTests(DeliveryOutboxTestCase):
     def test_append_rejected_when_task_not_running(self) -> None:
         self.seed_running_task(task_id="tsk-queued", conversation_id="cnv-queued", status="queued")
         result = self.queue.append_delivery_event(
-            task_id="tsk-queued", worker_id="worker-1", event_type="started",
+            task_id="tsk-queued",
+            worker_id="worker-1",
+            event_type="started",
             idempotency_key="tsk-queued:a1:started",
         )
         self.assertIsNone(result)
@@ -227,8 +243,11 @@ class SequenceAndIdempotencyTests(DeliveryOutboxTestCase):
         def append(n: int) -> None:
             try:
                 appended = self.queue.append_delivery_event(
-                    task_id="tsk-1", worker_id="worker-1", event_type="progress",
-                    idempotency_key=f"tsk-1:a1:progress:{n}", elapsed_seconds=n,
+                    task_id="tsk-1",
+                    worker_id="worker-1",
+                    event_type="progress",
+                    idempotency_key=f"tsk-1:a1:progress:{n}",
+                    elapsed_seconds=n,
                 )
             except BaseException as error:  # noqa: BLE001 - 收集到主线程再判定
                 with lock:
@@ -257,11 +276,17 @@ class TerminalEventTests(DeliveryOutboxTestCase):
 
     def test_write_terminal_event_transitions_status_and_holds_the_topic(self) -> None:
         appended = self.queue.write_terminal_event(
-            task_id="tsk-1", worker_id="worker-1", terminal_kind="success",
-            error_kind=None, content="答案", agent_session_id="sess-new",
+            task_id="tsk-1",
+            worker_id="worker-1",
+            terminal_kind="success",
+            error_kind=None,
+            content="答案",
+            agent_session_id="sess-new",
         )
         self.assertEqual(appended.sequence, 1)
-        self.assertEqual(self.scalar("SELECT status FROM task WHERE id='tsk-1'"), "awaiting_delivery")
+        self.assertEqual(
+            self.scalar("SELECT status FROM task WHERE id='tsk-1'"), "awaiting_delivery"
+        )
         # 话题**不释放**：running_task_id 仍指向这个任务，直到投递解析。
         self.assertEqual(
             self.scalar("SELECT running_task_id FROM conversation WHERE id='cnv-1'"), "tsk-1"
@@ -277,8 +302,11 @@ class TerminalEventTests(DeliveryOutboxTestCase):
         不是应用层假装写入。"""
 
         self.queue.write_terminal_event(
-            task_id="tsk-1", worker_id="worker-1", terminal_kind="success",
-            error_kind=None, content="答案",
+            task_id="tsk-1",
+            worker_id="worker-1",
+            terminal_kind="success",
+            error_kind=None,
+            content="答案",
             token_usage={"input_tokens": 100, "output_tokens": 20},
             guard_denied_count=3,
         )
@@ -294,8 +322,11 @@ class TerminalEventTests(DeliveryOutboxTestCase):
         的 ``_jsonb_or_none`` 文档）。"""
 
         self.queue.write_terminal_event(
-            task_id="tsk-1", worker_id="worker-1", terminal_kind="failed",
-            error_kind="session_failed", content=None,
+            task_id="tsk-1",
+            worker_id="worker-1",
+            terminal_kind="failed",
+            error_kind="session_failed",
+            content=None,
         )
 
         row = self.query(
@@ -326,8 +357,11 @@ class TerminalEventTests(DeliveryOutboxTestCase):
         """
 
         self.queue.write_terminal_event(
-            task_id="tsk-1", worker_id="worker-1", terminal_kind="failed",
-            error_kind="session_failed", content="失败提示",
+            task_id="tsk-1",
+            worker_id="worker-1",
+            terminal_kind="failed",
+            error_kind="session_failed",
+            content="失败提示",
             failure_code="drain_timeout",
             failure_signature="psycopg.errors.OperationalError",
         )
@@ -345,8 +379,11 @@ class TerminalEventTests(DeliveryOutboxTestCase):
         空串会让"没有"和"有一个空的"分不开（迁移 ``0080`` 文件头部）。"""
 
         self.queue.write_terminal_event(
-            task_id="tsk-1", worker_id="worker-1", terminal_kind="success",
-            error_kind=None, content="答案",
+            task_id="tsk-1",
+            worker_id="worker-1",
+            terminal_kind="success",
+            error_kind=None,
+            content="答案",
         )
 
         row = self.query(
@@ -360,22 +397,36 @@ class TerminalEventTests(DeliveryOutboxTestCase):
 
     def test_second_terminal_write_is_rejected_not_a_second_valid_terminal(self) -> None:
         first = self.queue.write_terminal_event(
-            task_id="tsk-1", worker_id="worker-1", terminal_kind="success",
-            error_kind=None, content="答案",
+            task_id="tsk-1",
+            worker_id="worker-1",
+            terminal_kind="success",
+            error_kind=None,
+            content="答案",
         )
         second = self.queue.write_terminal_event(
-            task_id="tsk-1", worker_id="worker-1", terminal_kind="failed",
-            error_kind="session_failed", content="不应该生效的第二条终态",
+            task_id="tsk-1",
+            worker_id="worker-1",
+            terminal_kind="failed",
+            error_kind="session_failed",
+            content="不应该生效的第二条终态",
         )
         self.assertFalse(first.duplicate)
         self.assertTrue(second.duplicate)
-        self.assertEqual(self.scalar("SELECT count(*) FROM task_delivery_event WHERE event_type='terminal'"), 1)
-        self.assertEqual(self.scalar("SELECT terminal_kind FROM task_delivery_event WHERE task_id='tsk-1'"), "success")
+        self.assertEqual(
+            self.scalar("SELECT count(*) FROM task_delivery_event WHERE event_type='terminal'"), 1
+        )
+        self.assertEqual(
+            self.scalar("SELECT terminal_kind FROM task_delivery_event WHERE task_id='tsk-1'"),
+            "success",
+        )
 
     def test_write_terminal_event_rejected_for_non_owning_worker(self) -> None:
         result = self.queue.write_terminal_event(
-            task_id="tsk-1", worker_id="worker-zombie", terminal_kind="success",
-            error_kind=None, content="答案",
+            task_id="tsk-1",
+            worker_id="worker-zombie",
+            terminal_kind="success",
+            error_kind=None,
+            content="答案",
         )
         self.assertIsNone(result)
         self.assertEqual(self.scalar("SELECT status FROM task WHERE id='tsk-1'"), "running")
@@ -388,11 +439,17 @@ class DeliveryResolutionTests(DeliveryOutboxTestCase):
     def test_confirm_delivery_resolves_success_carries_session_and_releases_topic(self) -> None:
         self.seed_running_task(task_id="tsk-1", conversation_id="cnv-1")
         self.queue.write_terminal_event(
-            task_id="tsk-1", worker_id="worker-1", terminal_kind="success",
-            error_kind=None, content="答案", agent_session_id="sess-new",
+            task_id="tsk-1",
+            worker_id="worker-1",
+            terminal_kind="success",
+            error_kind=None,
+            content="答案",
+            agent_session_id="sess-new",
         )
         confirmed = self.queue.confirm_delivery(
-            task_id="tsk-1", platform_message_kind="card", platform_message_id="card-1",
+            task_id="tsk-1",
+            platform_message_kind="card",
+            platform_message_id="card-1",
         )
         self.assertTrue(confirmed)
         self.assertEqual(self.scalar("SELECT status FROM task WHERE id='tsk-1'"), "succeeded")
@@ -402,10 +459,14 @@ class DeliveryResolutionTests(DeliveryOutboxTestCase):
             self.scalar("SELECT agent_session_id FROM conversation WHERE id='cnv-1'"), "sess-new"
         )
         self.assertIsNotNone(
-            self.scalar("SELECT platform_received_at FROM task_delivery_event WHERE task_id='tsk-1'")
+            self.scalar(
+                "SELECT platform_received_at FROM task_delivery_event WHERE task_id='tsk-1'"
+            )
         )
         self.assertEqual(
-            self.scalar("SELECT platform_message_id FROM task_delivery_event WHERE task_id='tsk-1'"),
+            self.scalar(
+                "SELECT platform_message_id FROM task_delivery_event WHERE task_id='tsk-1'"
+            ),
             "card-1",
         )
 
@@ -417,12 +478,18 @@ class DeliveryResolutionTests(DeliveryOutboxTestCase):
         self.seed_running_task(task_id="tsk-1", conversation_id="cnv-1")
         self.execute("UPDATE conversation SET agent_session_id='sess-old' WHERE id='cnv-1'")
         self.queue.write_terminal_event(
-            task_id="tsk-1", worker_id="worker-1", terminal_kind="success",
-            error_kind=None, content="答案", agent_session_id="sess-new",
+            task_id="tsk-1",
+            worker_id="worker-1",
+            terminal_kind="success",
+            error_kind=None,
+            content="答案",
+            agent_session_id="sess-new",
         )
 
         confirmed = self.queue.confirm_delivery(
-            task_id="tsk-1", platform_message_kind="card", platform_message_id="card-1",
+            task_id="tsk-1",
+            platform_message_kind="card",
+            platform_message_id="card-1",
         )
 
         self.assertTrue(confirmed)
@@ -437,26 +504,33 @@ class DeliveryResolutionTests(DeliveryOutboxTestCase):
             "被覆盖的旧 session id 必须被排队做物理清理，否则永久留在磁盘上",
         )
         self.assertIsNone(
-            self.scalar(
-                "SELECT 1 FROM agent_session_cleanup WHERE agent_session_id='sess-new'"
-            ),
+            self.scalar("SELECT 1 FROM agent_session_cleanup WHERE agent_session_id='sess-new'"),
             "刚写入的新 session id 是活跃会话，不该被排队清理",
         )
 
-    def test_confirm_delivery_keeps_business_failure_not_upgraded_by_successful_delivery(self) -> None:
+    def test_confirm_delivery_keeps_business_failure_not_upgraded_by_successful_delivery(
+        self,
+    ) -> None:
         """V-投递-04：飞书接受了失败卡片，业务结果仍然是 failed，不能因为投递
         成功就变成 succeeded。"""
 
         self.seed_running_task(task_id="tsk-1", conversation_id="cnv-1")
         self.queue.write_terminal_event(
-            task_id="tsk-1", worker_id="worker-1", terminal_kind="failed",
-            error_kind="session_failed", content="失败提示",
+            task_id="tsk-1",
+            worker_id="worker-1",
+            terminal_kind="failed",
+            error_kind="session_failed",
+            content="失败提示",
         )
         self.queue.confirm_delivery(
-            task_id="tsk-1", platform_message_kind="text", platform_message_id="msg-1",
+            task_id="tsk-1",
+            platform_message_kind="text",
+            platform_message_id="msg-1",
         )
         self.assertEqual(self.scalar("SELECT status FROM task WHERE id='tsk-1'"), "failed")
-        self.assertEqual(self.scalar("SELECT error_kind FROM task WHERE id='tsk-1'"), "session_failed")
+        self.assertEqual(
+            self.scalar("SELECT error_kind FROM task WHERE id='tsk-1'"), "session_failed"
+        )
 
     def test_confirm_delivery_returns_false_when_task_not_awaiting_delivery(self) -> None:
         self.seed_running_task(task_id="tsk-1", conversation_id="cnv-1")
@@ -470,21 +544,33 @@ class DeliveryResolutionTests(DeliveryOutboxTestCase):
     def test_confirm_delivery_is_not_repeatable(self) -> None:
         self.seed_running_task(task_id="tsk-1", conversation_id="cnv-1")
         self.queue.write_terminal_event(
-            task_id="tsk-1", worker_id="worker-1", terminal_kind="success",
-            error_kind=None, content="答案",
+            task_id="tsk-1",
+            worker_id="worker-1",
+            terminal_kind="success",
+            error_kind=None,
+            content="答案",
         )
         self.assertTrue(
-            self.queue.confirm_delivery(task_id="tsk-1", platform_message_kind="card", platform_message_id="c1")
+            self.queue.confirm_delivery(
+                task_id="tsk-1", platform_message_kind="card", platform_message_id="c1"
+            )
         )
         # 第二次确认：任务已经不在 awaiting_delivery，也不应该覆盖已有送达标记。
         self.assertFalse(
-            self.queue.confirm_delivery(task_id="tsk-1", platform_message_kind="card", platform_message_id="c2")
+            self.queue.confirm_delivery(
+                task_id="tsk-1", platform_message_kind="card", platform_message_id="c2"
+            )
         )
         self.assertEqual(
-            self.scalar("SELECT platform_message_id FROM task_delivery_event WHERE task_id='tsk-1'"), "c1"
+            self.scalar(
+                "SELECT platform_message_id FROM task_delivery_event WHERE task_id='tsk-1'"
+            ),
+            "c1",
         )
 
-    def test_confirm_delivery_rolls_back_entirely_when_the_conversation_write_conflicts(self) -> None:
+    def test_confirm_delivery_rolls_back_entirely_when_the_conversation_write_conflicts(
+        self,
+    ) -> None:
         """内审 P2-4：``conversation.running_task_id`` 与任务不一致（竞态或状态
         损坏）时，事件确认与任务收敛这两步已经在同一事务里执行、尚未提交——修复
         前它们会照常提交，只有 conversation 回写悄悄失败并返回一个和"没有可确认
@@ -493,22 +579,32 @@ class DeliveryResolutionTests(DeliveryOutboxTestCase):
 
         self.seed_running_task(task_id="tsk-1", conversation_id="cnv-1")
         self.queue.write_terminal_event(
-            task_id="tsk-1", worker_id="worker-1", terminal_kind="success",
-            error_kind=None, content="答案正文", agent_session_id="sess-9",
+            task_id="tsk-1",
+            worker_id="worker-1",
+            terminal_kind="success",
+            error_kind=None,
+            content="答案正文",
+            agent_session_id="sess-9",
         )
         # 模拟竞态：conversation 已经不再指向这个任务了（例如被别的路径改动）。
         self.execute("UPDATE conversation SET running_task_id='tsk-other' WHERE id='cnv-1'")
 
         with self.assertRaises(RuntimeError):
             self.queue.confirm_delivery(
-                task_id="tsk-1", platform_message_kind="card", platform_message_id="om-1",
+                task_id="tsk-1",
+                platform_message_kind="card",
+                platform_message_id="om-1",
             )
 
         # 整个确认事务必须整体回滚：task 与 event 都不能推进到"已确认"，
         # 不能出现"业务已提交、会话回写却丢了"的半条状态。
-        self.assertEqual(self.scalar("SELECT status FROM task WHERE id='tsk-1'"), "awaiting_delivery")
+        self.assertEqual(
+            self.scalar("SELECT status FROM task WHERE id='tsk-1'"), "awaiting_delivery"
+        )
         self.assertIsNone(
-            self.scalar("SELECT platform_received_at FROM task_delivery_event WHERE task_id='tsk-1'")
+            self.scalar(
+                "SELECT platform_received_at FROM task_delivery_event WHERE task_id='tsk-1'"
+            )
         )
         self.assertIsNone(self.scalar("SELECT agent_session_id FROM conversation WHERE id='cnv-1'"))
         # 重试（假设调用方在竞态解除后重试）仍然可以正常成功：这不是把任务卡死，
@@ -516,27 +612,35 @@ class DeliveryResolutionTests(DeliveryOutboxTestCase):
         self.execute("UPDATE conversation SET running_task_id='tsk-1' WHERE id='cnv-1'")
         self.assertTrue(
             self.queue.confirm_delivery(
-                task_id="tsk-1", platform_message_kind="card", platform_message_id="om-2",
+                task_id="tsk-1",
+                platform_message_kind="card",
+                platform_message_id="om-2",
             )
         )
         self.assertEqual(
             self.scalar("SELECT agent_session_id FROM conversation WHERE id='cnv-1'"), "sess-9"
         )
 
-    def test_expire_undelivered_terminals_forces_delivery_expired_even_for_business_success(self) -> None:
+    def test_expire_undelivered_terminals_forces_delivery_expired_even_for_business_success(
+        self,
+    ) -> None:
         """V-投递-04/06：二十四小时到期是唯一允许覆盖业务结论的路径——即使原始
         业务结论是 success，到期也必须收敛为 failed/delivery_expired，不得把
         任务写成用户已取得结果。"""
 
         self.seed_running_task(task_id="tsk-1", conversation_id="cnv-1", status="awaiting_delivery")
         self.seed_terminal_event(
-            task_id="tsk-1", terminal_kind="success", content="答案",
+            task_id="tsk-1",
+            terminal_kind="success",
+            content="答案",
             created_at_sql="now() - interval '25 hours'",
         )
         expired = self.queue.expire_undelivered_terminals()
         self.assertEqual([item.task_id for item in expired], ["tsk-1"])
         self.assertEqual(self.scalar("SELECT status FROM task WHERE id='tsk-1'"), "failed")
-        self.assertEqual(self.scalar("SELECT error_kind FROM task WHERE id='tsk-1'"), "delivery_expired")
+        self.assertEqual(
+            self.scalar("SELECT error_kind FROM task WHERE id='tsk-1'"), "delivery_expired"
+        )
         self.assertIsNone(self.scalar("SELECT running_task_id FROM conversation WHERE id='cnv-1'"))
         # 正文清空，但 sequence/terminal_kind 等低敏事实原样保留最长九十天。
         row = self.query(
@@ -549,7 +653,9 @@ class DeliveryResolutionTests(DeliveryOutboxTestCase):
         self.seed_terminal_event(task_id="tsk-1", created_at_sql="now()")
         expired = self.queue.expire_undelivered_terminals()
         self.assertEqual(expired, [])
-        self.assertEqual(self.scalar("SELECT status FROM task WHERE id='tsk-1'"), "awaiting_delivery")
+        self.assertEqual(
+            self.scalar("SELECT status FROM task WHERE id='tsk-1'"), "awaiting_delivery"
+        )
 
     def test_expire_undelivered_terminals_ignores_already_delivered(self) -> None:
         self.seed_running_task(task_id="tsk-1", conversation_id="cnv-1", status="awaiting_delivery")
@@ -563,7 +669,9 @@ class DeliveryResolutionTests(DeliveryOutboxTestCase):
         self.assertEqual(expired, [])
         self.assertEqual(self.scalar("SELECT status FROM task WHERE id='tsk-1'"), "succeeded")
 
-    def test_expire_undelivered_terminals_is_governed_by_the_trigger_owned_expires_at_column(self) -> None:
+    def test_expire_undelivered_terminals_is_governed_by_the_trigger_owned_expires_at_column(
+        self,
+    ) -> None:
         """内审 P2-1：清理判定必须直接读触发器锁定的 ``expires_at`` 列本身，不能
         在应用层按一个可配置窗口重新计算"是否过期"。这里构造一条 ``created_at``
         仍是刚才、但 ``expires_at`` 被直接改到已过期的行——修复前的查询判据是
@@ -588,7 +696,9 @@ class DeliveryResolutionTests(DeliveryOutboxTestCase):
 
         self.assertEqual([item.task_id for item in expired], ["tsk-1"])
         self.assertEqual(self.scalar("SELECT status FROM task WHERE id='tsk-1'"), "failed")
-        self.assertEqual(self.scalar("SELECT error_kind FROM task WHERE id='tsk-1'"), "delivery_expired")
+        self.assertEqual(
+            self.scalar("SELECT error_kind FROM task WHERE id='tsk-1'"), "delivery_expired"
+        )
 
     def test_append_delivery_event_accepts_safely_releasable_answer_with_content(self) -> None:
         """机制级验证（内审 P3-3）：``safely_releasable_answer`` 是 ``terminal``
@@ -599,8 +709,11 @@ class DeliveryResolutionTests(DeliveryOutboxTestCase):
 
         self.seed_running_task(task_id="tsk-1", conversation_id="cnv-1")
         appended = self.queue.append_delivery_event(
-            task_id="tsk-1", worker_id="worker-1", event_type="safely_releasable_answer",
-            idempotency_key="tsk-1:a1:safely_releasable_answer:1", content="流式安全片段",
+            task_id="tsk-1",
+            worker_id="worker-1",
+            event_type="safely_releasable_answer",
+            idempotency_key="tsk-1:a1:safely_releasable_answer:1",
+            content="流式安全片段",
         )
         self.assertFalse(appended.duplicate)
         self.assertEqual(
@@ -635,8 +748,11 @@ class ProgressEventContentTests(DeliveryOutboxTestCase):
 
     def _assert_progress_content_round_trips(self, content: str | None) -> None:
         appended = self.queue.append_delivery_event(
-            task_id="tsk-1", worker_id="worker-1", event_type="progress",
-            idempotency_key="tsk-1:a1:progress:1", content=content,
+            task_id="tsk-1",
+            worker_id="worker-1",
+            event_type="progress",
+            idempotency_key="tsk-1:a1:progress:1",
+            content=content,
         )
         self.assertFalse(appended.duplicate)
         self.assertEqual(
@@ -677,13 +793,20 @@ class SessionRetentionCleanupTests(DeliveryOutboxTestCase):
     """V-投递-05/10：会话边界触发（/new、空闲到点、按用户）统一清除已送达正文，
     送达前的正文不受影响（独立走二十四小时到期路径）。"""
 
-    def _seed_delivered(self, *, task_id: str, conversation_id: str, user_id: str = "usr-1") -> None:
+    def _seed_delivered(
+        self, *, task_id: str, conversation_id: str, user_id: str = "usr-1"
+    ) -> None:
         self.seed_running_task(task_id=task_id, conversation_id=conversation_id, user_id=user_id)
         self.queue.write_terminal_event(
-            task_id=task_id, worker_id="worker-1", terminal_kind="success",
-            error_kind=None, content="已送达的答案",
+            task_id=task_id,
+            worker_id="worker-1",
+            terminal_kind="success",
+            error_kind=None,
+            content="已送达的答案",
         )
-        self.queue.confirm_delivery(task_id=task_id, platform_message_kind="card", platform_message_id="c-" + task_id)
+        self.queue.confirm_delivery(
+            task_id=task_id, platform_message_kind="card", platform_message_id="c-" + task_id
+        )
 
     def test_new_clears_delivered_content_in_the_same_transaction(self) -> None:
         self._seed_delivered(task_id="tsk-1", conversation_id="cnv-1")
@@ -694,7 +817,9 @@ class SessionRetentionCleanupTests(DeliveryOutboxTestCase):
 
         self.assertTrue(cleared)
         self.assertIsNone(self.scalar("SELECT agent_session_id FROM conversation WHERE id='cnv-1'"))
-        self.assertIsNone(self.scalar("SELECT content FROM task_delivery_event WHERE task_id='tsk-1'"))
+        self.assertIsNone(
+            self.scalar("SELECT content FROM task_delivery_event WHERE task_id='tsk-1'")
+        )
 
     def test_new_on_busy_topic_clears_nothing(self) -> None:
         self._seed_delivered(task_id="tsk-1", conversation_id="cnv-1")
@@ -711,9 +836,12 @@ class SessionRetentionCleanupTests(DeliveryOutboxTestCase):
             cleared = transaction.clear_agent_session(conversation_id="cnv-1")
 
         self.assertFalse(cleared)
-        self.assertEqual(self.scalar("SELECT agent_session_id FROM conversation WHERE id='cnv-1'"), "sess-old")
         self.assertEqual(
-            self.scalar("SELECT content FROM task_delivery_event WHERE task_id='tsk-1'"), "已送达的答案"
+            self.scalar("SELECT agent_session_id FROM conversation WHERE id='cnv-1'"), "sess-old"
+        )
+        self.assertEqual(
+            self.scalar("SELECT content FROM task_delivery_event WHERE task_id='tsk-1'"),
+            "已送达的答案",
         )
 
     def test_pending_undelivered_content_is_not_touched_by_conversation_clear(self) -> None:
@@ -722,16 +850,22 @@ class SessionRetentionCleanupTests(DeliveryOutboxTestCase):
         self._seed_delivered(task_id="tsk-1", conversation_id="cnv-1")
         self.seed_running_task(task_id="tsk-2", conversation_id="cnv-1")
         self.queue.write_terminal_event(
-            task_id="tsk-2", worker_id="worker-1", terminal_kind="success",
-            error_kind=None, content="尚未送达的答案",
+            task_id="tsk-2",
+            worker_id="worker-1",
+            terminal_kind="success",
+            error_kind=None,
+            content="尚未送达的答案",
         )
 
         cleared_count = self.queue.clear_delivered_content_for_conversation(conversation_id="cnv-1")
 
         self.assertEqual(cleared_count, 1)
-        self.assertIsNone(self.scalar("SELECT content FROM task_delivery_event WHERE task_id='tsk-1'"))
+        self.assertIsNone(
+            self.scalar("SELECT content FROM task_delivery_event WHERE task_id='tsk-1'")
+        )
         self.assertEqual(
-            self.scalar("SELECT content FROM task_delivery_event WHERE task_id='tsk-2'"), "尚未送达的答案"
+            self.scalar("SELECT content FROM task_delivery_event WHERE task_id='tsk-2'"),
+            "尚未送达的答案",
         )
 
     def test_sweep_idle_conversations_clears_only_idle_and_delivered(self) -> None:
@@ -747,9 +881,12 @@ class SessionRetentionCleanupTests(DeliveryOutboxTestCase):
         cleared = self.queue.sweep_idle_conversations(idle_after=timedelta(hours=2))
 
         self.assertEqual(cleared, 1)
-        self.assertIsNone(self.scalar("SELECT content FROM task_delivery_event WHERE task_id='tsk-idle'"))
+        self.assertIsNone(
+            self.scalar("SELECT content FROM task_delivery_event WHERE task_id='tsk-idle'")
+        )
         self.assertEqual(
-            self.scalar("SELECT content FROM task_delivery_event WHERE task_id='tsk-active'"), "已送达的答案"
+            self.scalar("SELECT content FROM task_delivery_event WHERE task_id='tsk-active'"),
+            "已送达的答案",
         )
         # 幂等：再跑一轮不再有可清的会话。
         self.assertEqual(self.queue.sweep_idle_conversations(idle_after=timedelta(hours=2)), 0)
@@ -770,7 +907,8 @@ class SessionRetentionCleanupTests(DeliveryOutboxTestCase):
 
         self.assertEqual(cleared, 0)
         self.assertEqual(
-            self.scalar("SELECT content FROM task_delivery_event WHERE task_id='tsk-1'"), "已送达的答案"
+            self.scalar("SELECT content FROM task_delivery_event WHERE task_id='tsk-1'"),
+            "已送达的答案",
         )
 
     def test_clear_delivered_content_for_user_covers_all_their_conversations_only(self) -> None:
@@ -781,10 +919,15 @@ class SessionRetentionCleanupTests(DeliveryOutboxTestCase):
         cleared = self.queue.clear_delivered_content_for_user(user_id="usr-1")
 
         self.assertEqual(cleared, 2)
-        self.assertIsNone(self.scalar("SELECT content FROM task_delivery_event WHERE task_id='tsk-a1'"))
-        self.assertIsNone(self.scalar("SELECT content FROM task_delivery_event WHERE task_id='tsk-a2'"))
+        self.assertIsNone(
+            self.scalar("SELECT content FROM task_delivery_event WHERE task_id='tsk-a1'")
+        )
+        self.assertIsNone(
+            self.scalar("SELECT content FROM task_delivery_event WHERE task_id='tsk-a2'")
+        )
         self.assertEqual(
-            self.scalar("SELECT content FROM task_delivery_event WHERE task_id='tsk-b1'"), "已送达的答案"
+            self.scalar("SELECT content FROM task_delivery_event WHERE task_id='tsk-b1'"),
+            "已送达的答案",
         )
 
 
@@ -840,7 +983,9 @@ class LockOrderingDeadlockTests(DeliveryOutboxTestCase):
     这里断言同一构造连续 20 轮都不再出现死锁或锁等待超时。
     """
 
-    def _seed_delivered(self, *, task_id: str, conversation_id: str, user_id: str = "usr-1") -> None:
+    def _seed_delivered(
+        self, *, task_id: str, conversation_id: str, user_id: str = "usr-1"
+    ) -> None:
         """与 ``SessionRetentionCleanupTests._seed_delivered`` 同一内容——不继承
         那个类，是为了不把它已有的用例方法当成本类的一部分再跑一遍（unittest
         按类收集 ``test_*`` 方法，继承会让同一批用例在两个类名下各跑一次）。
@@ -848,8 +993,11 @@ class LockOrderingDeadlockTests(DeliveryOutboxTestCase):
 
         self.seed_running_task(task_id=task_id, conversation_id=conversation_id, user_id=user_id)
         self.queue.write_terminal_event(
-            task_id=task_id, worker_id="worker-1", terminal_kind="success",
-            error_kind=None, content="已送达的答案",
+            task_id=task_id,
+            worker_id="worker-1",
+            terminal_kind="success",
+            error_kind=None,
+            content="已送达的答案",
         )
         self.queue.confirm_delivery(
             task_id=task_id, platform_message_kind="card", platform_message_id="c-" + task_id
@@ -886,9 +1034,9 @@ class LockOrderingDeadlockTests(DeliveryOutboxTestCase):
 
         def run_new_command() -> None:
             try:
-                _PausingTransaction(
-                    conn_b, ready_event=b_ready, go_event=b_go
-                ).clear_agent_session(conversation_id=conversation_id)
+                _PausingTransaction(conn_b, ready_event=b_ready, go_event=b_go).clear_agent_session(
+                    conversation_id=conversation_id
+                )
                 conn_b.commit()
             except BaseException as error:  # noqa: BLE001 - 收集到主线程再断言
                 errors["b"] = error
@@ -1168,14 +1316,20 @@ class WorkerServiceHousekeepingIntegrationTests(DeliveryOutboxTestCase):
         self.seed_terminal_event(task_id="tsk-1", created_at_sql="now() - interval '25 hours'")
 
         config = WorkerConfig(
-            question="", read_only_tools=("mcp__q__read",), trace_id="01J00000000000000000000000",
-            turn_timeout_seconds=1.0, worker_id="worker-1", target_worker_version="stable",
+            question="",
+            read_only_tools=("mcp__q__read",),
+            trace_id="01J00000000000000000000000",
+            turn_timeout_seconds=1.0,
+            worker_id="worker-1",
+            target_worker_version="stable",
         )
         service = WorkerService(config=config, queue=self.queue)
         asyncio.run(service.process_once())
 
         self.assertEqual(self.scalar("SELECT status FROM task WHERE id='tsk-1'"), "failed")
-        self.assertEqual(self.scalar("SELECT error_kind FROM task WHERE id='tsk-1'"), "delivery_expired")
+        self.assertEqual(
+            self.scalar("SELECT error_kind FROM task WHERE id='tsk-1'"), "delivery_expired"
+        )
 
 
 class NegativeConstraintTests(DeliveryOutboxTestCase):
@@ -1259,14 +1413,20 @@ class NegativeConstraintTests(DeliveryOutboxTestCase):
 
     def test_task_id_sequence_and_event_type_are_immutable(self) -> None:
         self._insert(id="tde-1")
-        for column, value in (("task_id", "tsk-other"), ("sequence", 99), ("event_type", "terminal")):
+        for column, value in (
+            ("task_id", "tsk-other"),
+            ("sequence", 99),
+            ("event_type", "terminal"),
+        ):
             with self.subTest(column=column):
                 with self.assertRaises(self._psycopg.errors.RaiseException):
                     self.execute(
                         f"UPDATE task_delivery_event SET {column} = %s WHERE id='tde-1'", (value,)
                     )
 
-    def test_expires_at_is_forced_to_24_hours_from_created_at_regardless_of_caller_input(self) -> None:
+    def test_expires_at_is_forced_to_24_hours_from_created_at_regardless_of_caller_input(
+        self,
+    ) -> None:
         self.execute(
             """
             INSERT INTO task_delivery_event
@@ -1281,6 +1441,8 @@ class NegativeConstraintTests(DeliveryOutboxTestCase):
 
     def test_task_status_check_accepts_awaiting_delivery_and_rejects_unknown_value(self) -> None:
         self.execute("UPDATE task SET status='awaiting_delivery' WHERE id='tsk-1'")
-        self.assertEqual(self.scalar("SELECT status FROM task WHERE id='tsk-1'"), "awaiting_delivery")
+        self.assertEqual(
+            self.scalar("SELECT status FROM task WHERE id='tsk-1'"), "awaiting_delivery"
+        )
         with self.assertRaises(self._psycopg.errors.CheckViolation):
             self.execute("UPDATE task SET status='not_a_real_status' WHERE id='tsk-1'")

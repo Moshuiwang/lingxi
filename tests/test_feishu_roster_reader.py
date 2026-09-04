@@ -90,9 +90,7 @@ class _RecordingTransport:
         self._responses = list(responses)
         self.calls: list[dict[str, Any]] = []
 
-    def __call__(
-        self, method: str, url: str, *, body: Any = None, token: str | None = None
-    ) -> Any:
+    def __call__(self, method: str, url: str, *, body: Any = None, token: str | None = None) -> Any:
         self.calls.append({"method": method, "url": url, "body": body, "token": token})
         index = len(self.calls) - 1
         if index >= len(self._responses):
@@ -122,7 +120,9 @@ def _page(records: list[Any], next_page_token: str | None = None, total: int | N
     return RosterRecordPage(tuple(records), next_page_token, total)
 
 
-def _bitable_response(items: list[Any], *, has_more: bool = False, page_token: str | None = None, total: Any = None):
+def _bitable_response(
+    items: list[Any], *, has_more: bool = False, page_token: str | None = None, total: Any = None
+):
     data: dict[str, Any] = {"items": items, "has_more": has_more}
     if page_token is not None:
         data["page_token"] = page_token
@@ -184,7 +184,10 @@ class RosterPaginationTest(unittest.TestCase):
     def test_partial_rows_are_never_returned_as_data(self) -> None:
         # 半轮的行如果照样返回，快照层就会拿一份"看起来正常、其实骤减"的数据去替换。
         source = _FakePageSource(
-            [_page([_record("fs-u1"), _record("fs-u2")], "page-2"), RosterReadError("transport_error", definite=False)]
+            [
+                _page([_record("fs-u1"), _record("fs-u2")], "page-2"),
+                RosterReadError("transport_error", definite=False),
+            ]
         )
 
         outcome = read_roster_snapshot(source)
@@ -234,7 +237,10 @@ class RosterFailureClassificationTest(unittest.TestCase):
         self.assertEqual(outcome.failure.kind, RosterFailureKind.INDETERMINATE)
 
     def test_every_failure_status_is_failed_regardless_of_kind(self) -> None:
-        for error in (RosterReadError("feishu_code_1254005"), RosterReadError("invalid_response_shape", definite=False)):
+        for error in (
+            RosterReadError("feishu_code_1254005"),
+            RosterReadError("invalid_response_shape", definite=False),
+        ):
             with self.subTest(code=error.code):
                 self.assertEqual(self._outcome_for(error).status, RosterReadStatus.FAILED)
 
@@ -254,10 +260,14 @@ class RosterFailureClassificationTest(unittest.TestCase):
         self.assertEqual(outcome.failure.code, "invalid_page_item")
         self.assertEqual(outcome.rows, ())
 
-    def test_a_record_with_non_mapping_fields_fails_the_round_instead_of_becoming_a_blank_row(self) -> None:
+    def test_a_record_with_non_mapping_fields_fails_the_round_instead_of_becoming_a_blank_row(
+        self,
+    ) -> None:
         # PR #208 二级审查 P2-1：`fields` 不是对象时此前静默归一成一条全空的行。
         # 持久快照落地后那条空行会被写进快照，在比对时表现为"这个人资料被清空了"。
-        source = _FakePageSource([_page([_record(), {"record_id": "rec-2", "fields": ["不是对象"]}], None)])
+        source = _FakePageSource(
+            [_page([_record(), {"record_id": "rec-2", "fields": ["不是对象"]}], None)]
+        )
 
         outcome = read_roster_snapshot(source)
 
@@ -304,7 +314,10 @@ class RosterIntegrityTest(unittest.TestCase):
 
     def test_reported_total_matching_accumulated_rows_is_complete(self) -> None:
         source = _FakePageSource(
-            [_page([_record("fs-u1"), _record("fs-u2")], "page-2", total=3), _page([_record("fs-u3")], None, total=3)]
+            [
+                _page([_record("fs-u1"), _record("fs-u2")], "page-2", total=3),
+                _page([_record("fs-u3")], None, total=3),
+            ]
         )
 
         outcome = read_roster_snapshot(source)
@@ -334,7 +347,9 @@ class RosterIntegrityTest(unittest.TestCase):
 
     def test_a_required_column_absent_from_every_row_is_incomplete(self) -> None:
         # 列被改名或删掉的信号：归一后整列取不到值，比对层会把它当成"全员该字段变空"。
-        source = _FakePageSource([_page([_record(employee_no=None), _record("fs-u2", employee_no=None)], None)])
+        source = _FakePageSource(
+            [_page([_record(employee_no=None), _record("fs-u2", employee_no=None)], None)]
+        )
 
         outcome = read_roster_snapshot(source)
 
@@ -354,7 +369,9 @@ class RosterIntegrityTest(unittest.TestCase):
         self.assertEqual(outcome.integrity.absent_columns, ())
 
     def test_rows_without_personnel_id_are_counted(self) -> None:
-        source = _FakePageSource([_page([_record("fs-u1"), _record(None, record_id="rec-2")], None)])
+        source = _FakePageSource(
+            [_page([_record("fs-u1"), _record(None, record_id="rec-2")], None)]
+        )
 
         outcome = read_roster_snapshot(source)
 
@@ -429,7 +446,15 @@ class RosterIntegrityTest(unittest.TestCase):
     def test_identifiers_are_compared_on_their_full_value(self) -> None:
         # 前 6 位相同、完整值不同的两个 ID 不得被算成同一个人（V-花名册-05 同一口径）。
         source = _FakePageSource(
-            [_page([_record("ou_abc123456789", record_id="rec-1"), _record("ou_abc123999999", record_id="rec-2")], None)]
+            [
+                _page(
+                    [
+                        _record("ou_abc123456789", record_id="rec-1"),
+                        _record("ou_abc123999999", record_id="rec-2"),
+                    ],
+                    None,
+                )
+            ]
         )
 
         outcome = read_roster_snapshot(source)
@@ -441,20 +466,36 @@ class RosterIntegrityTest(unittest.TestCase):
         # PR #208 二级审查 P3-1：同一列在清单里出现两次时，空值统计会对同一行加两次，
         # 于是"整列都取不到值"的判据（计数 == 行数）永远不成立——列被改名或删掉这件事
         # 会被静默放过，这一轮被判成 COMPLETE 并顶掉一份好快照。
-        source = _FakePageSource([_page([_record(employee_no=None), _record("fs-u2", record_id="rec-2", employee_no=None)], None)])
+        source = _FakePageSource(
+            [
+                _page(
+                    [
+                        _record(employee_no=None),
+                        _record("fs-u2", record_id="rec-2", employee_no=None),
+                    ],
+                    None,
+                )
+            ]
+        )
 
         outcome = read_roster_snapshot(source, required_columns=("人员ID", "工号", "工号"))
 
         self.assertEqual(outcome.status, RosterReadStatus.INCOMPLETE)
         self.assertEqual(outcome.integrity.absent_columns, ("工号",))
         # 去重同时保序：完整性事实里每列只出现一次，输出次序仍是首次出现的次序。
-        self.assertEqual([item.column for item in outcome.integrity.blank_column_rows], ["人员ID", "工号"])
-        self.assertEqual({item.column: item.rows for item in outcome.integrity.blank_column_rows}["工号"], 2)
+        self.assertEqual(
+            [item.column for item in outcome.integrity.blank_column_rows], ["人员ID", "工号"]
+        )
+        self.assertEqual(
+            {item.column: item.rows for item in outcome.integrity.blank_column_rows}["工号"], 2
+        )
 
     def test_duplicate_key_fields_are_deduplicated_too(self) -> None:
         source = _FakePageSource([_page([_record(), _record(record_id="rec-2")], None)])
 
-        outcome = read_roster_snapshot(source, duplicate_key_fields=("personnel_id", "personnel_id"))
+        outcome = read_roster_snapshot(
+            source, duplicate_key_fields=("personnel_id", "personnel_id")
+        )
 
         self.assertEqual([item.field for item in outcome.integrity.duplicates], ["personnel_id"])
 
@@ -463,16 +504,22 @@ class RosterIntegrityTest(unittest.TestCase):
 
         outcome = read_roster_snapshot(source, required_columns=("人员ID", "部门"))
 
-        self.assertEqual([item.column for item in outcome.integrity.blank_column_rows], ["人员ID", "部门"])
+        self.assertEqual(
+            [item.column for item in outcome.integrity.blank_column_rows], ["人员ID", "部门"]
+        )
         self.assertEqual(outcome.integrity.absent_columns, ())
 
     def test_configured_columns_do_not_widen_what_the_rows_keep(self) -> None:
         # 形态校验可以看任意一列，但保留下来的仍然只有匹配链需要的四个字段。
-        source = _FakePageSource([_page([_record(extra={"部门": "化名部门", "账号状态": "在职"})], None)])
+        source = _FakePageSource(
+            [_page([_record(extra={"部门": "化名部门", "账号状态": "在职"})], None)]
+        )
 
         outcome = read_roster_snapshot(source, required_columns=("人员ID", "部门", "账号状态"))
 
-        self.assertEqual(RosterRow._fields, ("personnel_id", "email", "name", "employee_no", "record_id"))
+        self.assertEqual(
+            RosterRow._fields, ("personnel_id", "email", "name", "employee_no", "record_id")
+        )
         self.assertNotIn("化名部门", repr(outcome.rows))
         self.assertNotIn("在职", repr(outcome.rows))
 
@@ -495,7 +542,9 @@ class RosterAuditDisciplineTest(unittest.TestCase):
         return (FAKE_NAME, FAKE_EMAIL, FAKE_EMPLOYEE_NO, FAKE_PERSONNEL_ID)
 
     def test_audit_facts_carry_counts_and_codes_only(self) -> None:
-        source = _FakePageSource([_page([_record(), _record("fs-u2", record_id="rec-2")], None, total=2)])
+        source = _FakePageSource(
+            [_page([_record(), _record("fs-u2", record_id="rec-2")], None, total=2)]
+        )
 
         outcome = read_roster_snapshot(source)
         serialized = json.dumps(outcome.audit_facts(), ensure_ascii=False)
@@ -506,7 +555,9 @@ class RosterAuditDisciplineTest(unittest.TestCase):
         self.assertEqual(outcome.audit_facts()["status"], "complete")
 
     def test_failure_audit_names_the_code_but_no_row_data(self) -> None:
-        source = _FakePageSource([_page([_record()], "page-2"), RosterReadError("feishu_code_91403")])
+        source = _FakePageSource(
+            [_page([_record()], "page-2"), RosterReadError("feishu_code_91403")]
+        )
 
         outcome = read_roster_snapshot(source)
         serialized = json.dumps(outcome.audit_facts(), ensure_ascii=False)
@@ -708,7 +759,9 @@ class BitableRosterPagesTest(unittest.TestCase):
         transport = _RecordingTransport(
             [
                 _bitable_response([_record()], has_more=True, page_token="page-2", total=2),
-                _bitable_response([_record("fs-u2", record_id="rec-2", employee_no="700124")], total=2),
+                _bitable_response(
+                    [_record("fs-u2", record_id="rec-2", employee_no="700124")], total=2
+                ),
             ]
         )
 

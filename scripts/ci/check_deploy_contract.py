@@ -53,9 +53,7 @@ SCHEDULER_CREDENTIAL_ROTATION = (
 )
 GATEWAY_CONFIG = REPOSITORY_ROOT / "src" / "lingxi" / "apps" / "gateway" / "config.py"
 WORKER_CONFIG = REPOSITORY_ROOT / "src" / "lingxi" / "apps" / "worker" / "config.py"
-USER_ENVIRONMENT_ADAPTER = (
-    REPOSITORY_ROOT / "src" / "lingxi" / "adapters" / "user_environment.py"
-)
+USER_ENVIRONMENT_ADAPTER = REPOSITORY_ROOT / "src" / "lingxi" / "adapters" / "user_environment.py"
 # Agent SDK 回合的工作目录（`ClaudeAgentOptions.cwd`，见 apps/worker/config.py 的
 # `workspace` 与 adapters/claude_agent_session.py 的 `build_agent_options`）。
 WORKER_WORKSPACE_VARIABLE = "LINGXI_WORKER_WORKSPACE"
@@ -185,9 +183,7 @@ def _postgres_timeout_facts() -> tuple[dict[str, int], int]:
     if isinstance(max_timeout, bool) or not isinstance(max_timeout, int) or max_timeout <= 0:
         raise ValueError(f"读不到或非法的 {POSTGRES_ADAPTER}: MAX_TIMEOUT_SECONDS")
     if any(value > max_timeout for value in defaults.values()):
-        raise ValueError(
-            f"{POSTGRES_ADAPTER} 的默认超时不能超过 MAX_TIMEOUT_SECONDS={max_timeout}"
-        )
+        raise ValueError(f"{POSTGRES_ADAPTER} 的默认超时不能超过 MAX_TIMEOUT_SECONDS={max_timeout}")
     return defaults, max_timeout
 
 
@@ -294,9 +290,15 @@ def _worst_case_seconds() -> float:
     backoff = module_constant(SCHEDULER_CREDENTIAL_ROTATION, "SAVE_RETRY_BACKOFF_SECONDS")
     if not isinstance(http_timeout, (int, float)):
         raise ValueError("读不到 REQUEST_TIMEOUT_SECONDS")
-    if not isinstance(backoff, (tuple, list)) or not all(isinstance(x, (int, float)) for x in backoff):
+    if not isinstance(backoff, (tuple, list)) or not all(
+        isinstance(x, (int, float)) for x in backoff
+    ):
         raise ValueError("读不到 SAVE_RETRY_BACKOFF_SECONDS")
-    return float(http_timeout) + float(sum(backoff)) + _database_operation_seconds() * DATABASE_OPERATION_COUNT
+    return (
+        float(http_timeout)
+        + float(sum(backoff))
+        + _database_operation_seconds() * DATABASE_OPERATION_COUNT
+    )
 
 
 def check_stop_grace_period() -> list[str]:
@@ -313,18 +315,18 @@ def check_stop_grace_period() -> list[str]:
     backoff = module_constant(SCHEDULER_CREDENTIAL_ROTATION, "SAVE_RETRY_BACKOFF_SECONDS")
     if not isinstance(http_timeout, (int, float)):
         return [f"读不到 {FEISHU_DIRECTORY.name} 的 REQUEST_TIMEOUT_SECONDS，无法核算停止宽限期"]
-    if not isinstance(backoff, (tuple, list)) or not all(isinstance(x, (int, float)) for x in backoff):
-        return [f"读不到 {SCHEDULER_CREDENTIAL_ROTATION.name} 的 SAVE_RETRY_BACKOFF_SECONDS，无法核算停止宽限期"]
+    if not isinstance(backoff, (tuple, list)) or not all(
+        isinstance(x, (int, float)) for x in backoff
+    ):
+        return [
+            f"读不到 {SCHEDULER_CREDENTIAL_ROTATION.name} 的 SAVE_RETRY_BACKOFF_SECONDS，无法核算停止宽限期"
+        ]
 
     try:
         _, max_timeout = _postgres_timeout_facts()
         database_operation_seconds = float(max_timeout + 2 * max_timeout)
         database_roundtrip_budget_seconds = database_operation_seconds * DATABASE_OPERATION_COUNT
-        worst_case = (
-            float(http_timeout)
-            + float(sum(backoff))
-            + database_roundtrip_budget_seconds
-        )
+        worst_case = float(http_timeout) + float(sum(backoff)) + database_roundtrip_budget_seconds
     except ValueError as error:
         return [str(error)]
     required = math.ceil(worst_case * SAFETY_FACTOR)
@@ -513,7 +515,9 @@ def _resource_value(service_text: str, key: str) -> str | None:
     return match.group(1).strip() if match else None
 
 
-def _has_env_assignment(text: str, variable: str, value: str, *, allow_comment: bool = False) -> bool:
+def _has_env_assignment(
+    text: str, variable: str, value: str, *, allow_comment: bool = False
+) -> bool:
     """判断文档/env 模板是否出现精确的 ``NAME=value`` 行。"""
 
     prefix = r"#?\s*" if allow_comment else r"\s*"
@@ -625,9 +629,7 @@ def check_worker_concurrency_contract() -> list[str]:
                     "真实值仍须写到未入库的外部 deploy/.env.prod。"
                 )
     if WORKER_MAX_CONCURRENCY_VARIABLE not in checklist or "硬上限" not in checklist:
-        failures.append(
-            "deploy/验收前部署配置清单.md 没有登记 worker-queue 并发硬上限合同。"
-        )
+        failures.append("deploy/验收前部署配置清单.md 没有登记 worker-queue 并发硬上限合同。")
     return failures
 
 
@@ -1275,9 +1277,7 @@ def _tmp_tmpfs_size(compose_path: pathlib.Path, service: str) -> tuple[str | Non
     # `\S+` 切——那会在 prod 的外部合同占位上找不到这一项而给出误导性的报错。
     entry = re.search(r"^\s*-\s*/tmp:(.+?)\s*$", tmpfs_block, re.MULTILINE)
     if entry is None:
-        return None, (
-            f"{service} 在 {display(compose_path)} 的 `tmpfs:` 里找不到 `/tmp` 挂载项"
-        )
+        return None, (f"{service} 在 {display(compose_path)} 的 `tmpfs:` 里找不到 `/tmp` 挂载项")
     # `${...}` 整体作为一个值取走：占位说明里可以出现逗号，按逗号硬切会把它腰斩。
     size = re.search(r"(?:^|,)size=(\$\{[^}]*\}|[^,]+)", entry.group(1))
     if size is None:
@@ -1361,7 +1361,9 @@ def _parse_log_size_mb(raw: str) -> float | None:
     return value / 1024 / 1024
 
 
-def _check_log_retention_floor_in(compose_path: pathlib.Path, *, require_all_services: bool) -> list[str]:
+def _check_log_retention_floor_in(
+    compose_path: pathlib.Path, *, require_all_services: bool
+) -> list[str]:
     """核对一份 compose 文本里，出现了 `logging.options` 的服务是否达到取证
     留存下限。
 
@@ -1530,7 +1532,9 @@ def check_compose_contract() -> list[str]:
     else:
         credential_path = path_match.group(1).strip("'\"")
         mount_targets = re.findall(r"^\s*-\s*[\w.-]+:(/\S+?)\s*$", scheduler, re.MULTILINE)
-        if not any(credential_path.startswith(target.rstrip("/") + "/") for target in mount_targets):
+        if not any(
+            credential_path.startswith(target.rstrip("/") + "/") for target in mount_targets
+        ):
             failures.append(
                 f"专用授权凭据路径 `{credential_path}` 不在 scheduler 的任何持久卷挂载点下"
                 f"（当前挂载点：{mount_targets or '无'}）。\n"
@@ -1540,7 +1544,9 @@ def check_compose_contract() -> list[str]:
             )
 
     # M2-62-28：用户目录与凭据必须是**两个不同的卷**。
-    credential_sources = re.findall(r"^\s*-\s*([\w.-]+):/var/lib/lingxi/credentials", scheduler, re.MULTILINE)
+    credential_sources = re.findall(
+        r"^\s*-\s*([\w.-]+):/var/lib/lingxi/credentials", scheduler, re.MULTILINE
+    )
     user_sources = re.findall(r"^\s*-\s*([\w.-]+):/var/lib/lingxi/users", worker, re.MULTILINE)
     if credential_sources and user_sources and set(credential_sources) & set(user_sources):
         failures.append(
@@ -1556,10 +1562,10 @@ def check_compose_contract() -> list[str]:
     for name, block in (("worker", worker), ("migrate", migrate)):
         restart = re.search(r"^\s*restart:\s*(\S+)\s*$", block, re.MULTILINE)
         if restart is None:
-            failures.append(f"{name} 没有显式 restart 策略；一次性作业必须写明 `restart: \"no\"`")
+            failures.append(f'{name} 没有显式 restart 策略；一次性作业必须写明 `restart: "no"`')
         elif restart.group(1).strip("'\"") != "no":
             failures.append(
-                f"{name} 的 restart 是 `{restart.group(1)}`，必须是 \"no\"。\n"
+                f'{name} 的 restart 是 `{restart.group(1)}`，必须是 "no"。\n'
                 f"      {name} 是**一次性作业**不是常驻服务：worker 跑完一个回合就退出，"
                 "migrate 跑完一次迁移就退出。给它们配重启策略会把「作业正常结束」变成无限重启循环，"
                 "并让人误以为该服务已经上线。"
@@ -1602,7 +1608,7 @@ def check_compose_contract() -> list[str]:
                 failures.append(
                     f"gateway 的 stop_grace_period 是 {gateway_grace.group(1)}，"
                     f"低于要求的 {gateway_required} 秒（停机超时 "
-                    f"{_gateway_shutdown_timeout()}s + 出站 {max(1.0, (_gateway_shutdown_timeout() or 0)/4)}s "
+                    f"{_gateway_shutdown_timeout()}s + 出站 {max(1.0, (_gateway_shutdown_timeout() or 0) / 4)}s "
                     f"+ 数据库 {_database_operation_seconds():.0f}s，再乘 {SAFETY_FACTOR}）。"
                 )
 
@@ -1619,15 +1625,15 @@ def check_compose_contract() -> list[str]:
                 "worker-queue 没有放进 `mvp` profile：Stage/MVP 受控部署形态"
                 "必须能用一个明确命名的 profile 同时拉起它。"
             )
-        if not re.search(r'^\s*restart:\s*unless-stopped\s*$', worker_queue, re.MULTILINE):
+        if not re.search(r"^\s*restart:\s*unless-stopped\s*$", worker_queue, re.MULTILINE):
             failures.append(
                 "worker-queue 是常驻服务，必须 `restart: unless-stopped`"
-                "（与一次性 `worker` job 的 `restart: \"no\"` 刻意不同）。"
+                '（与一次性 `worker` job 的 `restart: "no"` 刻意不同）。'
             )
-        if not re.search(
-            r'^\s*LINGXI_WORKER_MODE:\s*queue\s*$', worker_queue, re.MULTILINE
-        ):
-            failures.append("worker-queue 没有设置 LINGXI_WORKER_MODE=queue，会退化成一次性 turn 模式")
+        if not re.search(r"^\s*LINGXI_WORKER_MODE:\s*queue\s*$", worker_queue, re.MULTILINE):
+            failures.append(
+                "worker-queue 没有设置 LINGXI_WORKER_MODE=queue，会退化成一次性 turn 模式"
+            )
         # 精确解析 volumes: 列表，不再用整块字符串包含判断（Issue #261，对齐
         # check_scheduler_user_volume 已经做的 2026-08-19 修复／外部独立审查 F2 同类
         # 假绿口子）：字符串包含判断分不清"真的挂了这个卷"与"这个子串恰好出现在
@@ -1647,7 +1653,9 @@ def check_compose_contract() -> list[str]:
                 "`lingxi-users:/var/lib/lingxi/users` 而误判为通过。"
             )
         if not re.search(r"^\s*read_only:\s*true\s*$", worker_queue, re.MULTILINE):
-            failures.append("worker-queue 缺 `read_only: true`（断言 V-部署-02，与 scheduler/gateway 同一要求）")
+            failures.append(
+                "worker-queue 缺 `read_only: true`（断言 V-部署-02，与 scheduler/gateway 同一要求）"
+            )
 
         worker_queue_grace = re.search(
             r"^\s*stop_grace_period:\s*(\S+)\s*$", worker_queue, re.MULTILINE
@@ -1697,9 +1705,14 @@ def check_compose_contract() -> list[str]:
             )
 
     # M2-62-29 / M2-62-30：非 root、能力最小。
-    for name, block in (("scheduler", scheduler), ("gateway", gateway),
-                        ("worker", worker), ("worker-queue", worker_queue),
-                        ("migrate", migrate), ("reauthorize", reauthorize)):
+    for name, block in (
+        ("scheduler", scheduler),
+        ("gateway", gateway),
+        ("worker", worker),
+        ("worker-queue", worker_queue),
+        ("migrate", migrate),
+        ("reauthorize", reauthorize),
+    ):
         user = re.search(r"^\s*user:\s*(\S+)\s*$", block, re.MULTILINE)
         if user is None:
             failures.append(f"{name} 没有显式 `user:`，无法在 compose 层面核对非 root")
@@ -1727,9 +1740,7 @@ def check_compose_contract() -> list[str]:
                 continue
             user = re.search(r"^\s*user:\s*(\S+)\s*$", block, re.MULTILINE)
             if user is not None and user.group(1).strip("'\"").split(":")[0] in {"0", "root"}:
-                failures.append(
-                    f"{display(path)} 的 {service} 用覆盖把 user 改成了 root"
-                )
+                failures.append(f"{display(path)} 的 {service} 用覆盖把 user 改成了 root")
             if re.search(r"^\s*cap_add:", block, re.MULTILINE):
                 failures.append(f"{display(path)} 的 {service} 用覆盖加了 cap_add")
             if re.search(r"^\s*privileged:\s*true", block, re.MULTILINE):
@@ -1754,7 +1765,7 @@ def check_compose_contract() -> list[str]:
                 if restart.group(1).strip("'\"") != "no":
                     failures.append(
                         f"{display(path)} 的 {service} 用覆盖把 restart "
-                        f"改成了 {restart.group(1)}；一次性作业必须是 \"no\""
+                        f'改成了 {restart.group(1)}；一次性作业必须是 "no"'
                     )
 
     # ---- 凭据按服务分文件（codex 审查 P1-1；PR #173 复核 P1-2 收紧）-----------
@@ -1796,7 +1807,9 @@ def check_dockerfile() -> list[str]:
     text = strip_comments(read(DOCKERFILE))
 
     # M2-62-29 / D13：每个交付阶段都必须切非 root。
-    delivery_stages = re.findall(r"^FROM\s+\S+\s+AS\s+(scheduler|worker|migrate)\s*$", text, re.MULTILINE)
+    delivery_stages = re.findall(
+        r"^FROM\s+\S+\s+AS\s+(scheduler|worker|migrate)\s*$", text, re.MULTILINE
+    )
     for stage in ("scheduler", "worker", "migrate"):
         if stage not in delivery_stages:
             failures.append(f"Dockerfile 里找不到交付阶段 `{stage}`")
@@ -2030,8 +2043,9 @@ def check_ci_workflow() -> list[str]:
         header = body.split("\n    steps:", 1)[0]
         if not re.search(r"^\s*packages:\s*write\s*$", header, re.MULTILINE):
             continue
-        gated = re.search(r"^\s*if:.*github\.event_name\s*==\s*'push'", header, re.MULTILINE) and \
-            re.search(r"^\s*if:.*refs/heads/main", header, re.MULTILINE)
+        gated = re.search(
+            r"^\s*if:.*github\.event_name\s*==\s*'push'", header, re.MULTILINE
+        ) and re.search(r"^\s*if:.*refs/heads/main", header, re.MULTILINE)
         if not gated:
             failures.append(
                 f"publish.yml 的 job `{job_name}` 声明了 `packages: write`，但没有 "

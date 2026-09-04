@@ -198,7 +198,6 @@ def build_company_function_metric_map(
     if not isinstance(companies, Mapping):
         raise ValueError("公司+职能→指标名映射缺少 [companies] 表")
 
-
     result: dict[str, dict[str, tuple[str, ...]]] = {}
     for raw_company, raw_functions in companies.items():
         company = raw_company.strip() if isinstance(raw_company, str) else ""
@@ -217,9 +216,7 @@ def build_company_function_metric_map(
             if function in functions:
                 raise ValueError(f"公司 {company} 下存在重复的职能标签：{function}")
             if not isinstance(raw_metrics, (list, tuple)) or not raw_metrics:
-                raise ValueError(
-                    f"公司 {company} 职能 {function} 的指标名列表必须是非空列表"
-                )
+                raise ValueError(f"公司 {company} 职能 {function} 的指标名列表必须是非空列表")
             metrics: list[str] = []
             for item in raw_metrics:
                 if not isinstance(item, str) or not item:
@@ -228,9 +225,7 @@ def build_company_function_metric_map(
                     )
                 problem = _malformed_metric_name(item)
                 if problem is not None:
-                    raise ValueError(
-                        f"公司 {company} 职能 {function} 的指标名{problem}"
-                    )
+                    raise ValueError(f"公司 {company} 职能 {function} 的指标名{problem}")
                 metrics.append(item)
             functions[function] = tuple(metrics)
         result[company] = functions

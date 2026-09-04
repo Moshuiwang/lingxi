@@ -146,7 +146,10 @@ class _RevocationIdentityLookup:
         self._timeouts = timeouts
 
     def find_for_revocation(self, *, user_id: str) -> ArchivedIdentity | None:
-        with connect(self._dsn, timeouts=self._timeouts) as connection, connection.cursor() as cursor:
+        with (
+            connect(self._dsn, timeouts=self._timeouts) as connection,
+            connection.cursor() as cursor,
+        ):
             cursor.execute(_REVOCATION_IDENTITY_SQL, (user_id,))
             row = cursor.fetchone()
         if row is None:
@@ -179,7 +182,9 @@ class _RosterRowsAdapter:
         return None if snapshot is None else snapshot.rows
 
 
-def _resolve_target_user_id(dsn: str, timeouts: PostgresTimeouts, pending: PendingAction) -> str | None:
+def _resolve_target_user_id(
+    dsn: str, timeouts: PostgresTimeouts, pending: PendingAction
+) -> str | None:
     if pending.action_type in LOCAL_PERMISSION_ACTION_TYPES:
         return resolve_local_override_target(dsn, pending.id, timeouts=timeouts)
     return resolve_open_id_target(dsn, pending.target_open_id, timeouts=timeouts)
@@ -253,7 +258,9 @@ class PermissionRecomputeAdapter:
             )
             return TargetedRecomputeOutcome(kind=RecomputeKind.SKIPPED, reason="target_unresolved")
 
-        baseline = PostgresRosterBaselineReader(self._dsn, timeouts=self._timeouts).load_active_baseline()
+        baseline = PostgresRosterBaselineReader(
+            self._dsn, timeouts=self._timeouts
+        ).load_active_baseline()
         publish_store = PostgresPermissionPublishStore(self._dsn, timeouts=self._timeouts)
         recompute = TargetedPermissionRecompute(
             identities=_BaselineIdentityLookup(baseline),
@@ -267,7 +274,9 @@ class PermissionRecomputeAdapter:
             metric_translation_map=metric_translation_map,
             audit=self._audit,
             local_overrides=local_override_reader(self._dsn, timeouts=self._timeouts),
-            legacy_all_scope=PostgresLocalPermissionOverrideStore(self._dsn, timeouts=self._timeouts),
+            legacy_all_scope=PostgresLocalPermissionOverrideStore(
+                self._dsn, timeouts=self._timeouts
+            ),
             revocation_identities=_RevocationIdentityLookup(self._dsn, timeouts=self._timeouts),
         )
 
@@ -369,8 +378,8 @@ class BackgroundPermissionRecomputeTrigger:
         self._on_skipped = on_skipped
         self._on_timeout = on_timeout
         self._timeout_seconds = float(timeout_seconds)
-        self._queue: queue.Queue[tuple[PendingAction, _ExecutionWatch, threading.Timer]] = queue.Queue(
-            maxsize=queue_maxsize
+        self._queue: queue.Queue[tuple[PendingAction, _ExecutionWatch, threading.Timer]] = (
+            queue.Queue(maxsize=queue_maxsize)
         )
         self._worker = threading.Thread(
             target=self._run,
@@ -386,7 +395,9 @@ class BackgroundPermissionRecomputeTrigger:
         """
 
         watch = _ExecutionWatch()
-        timer = threading.Timer(self._timeout_seconds, self._on_timeout_fired, args=(pending, watch))
+        timer = threading.Timer(
+            self._timeout_seconds, self._on_timeout_fired, args=(pending, watch)
+        )
         timer.daemon = True
         try:
             self._queue.put_nowait((pending, watch, timer))
@@ -457,11 +468,11 @@ class BackgroundPermissionRecomputeTrigger:
                 # effective.  ``UNCHANGED`` is also left to the status observer: an old
                 # in-flight intent may still be pending.  Only legacy delegates that do
                 # not return a typed outcome retain the historical completed callback.
-                typed_outcome = (
-                    outcome if isinstance(outcome, TargetedRecomputeOutcome) else None
-                )
+                typed_outcome = outcome if isinstance(outcome, TargetedRecomputeOutcome) else None
                 completed = typed_outcome is None
-                queued = typed_outcome is not None and typed_outcome.kind is not RecomputeKind.SKIPPED
+                queued = (
+                    typed_outcome is not None and typed_outcome.kind is not RecomputeKind.SKIPPED
+                )
                 # ``SKIPPED`` 只有在调用方**显式登记** ``on_skipped`` 时才单独分流；
                 # 未登记时仍走下面那条 ``on_failed`` 老路（见 ``on_skipped`` 文档）。
                 skipped = typed_outcome is not None and typed_outcome.kind is RecomputeKind.SKIPPED

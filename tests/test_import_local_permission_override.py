@@ -128,7 +128,9 @@ GRANTED_USER = TOOL.AppUserRecord(
 def _granted_galaxy_snapshot() -> _FakeGalaxySnapshot:
     return _FakeGalaxySnapshot(
         user_rows=({"user_id": "G-10001", "user_name": "10001", "email": GRANTED_USER.email},),
-        country_rows=({"country_key": "101", "name": "ALPHA", "name_cn": "甲国", "boss_company_id": "BC-甲"},),
+        country_rows=(
+            {"country_key": "101", "name": "ALPHA", "name_cn": "甲国", "boss_company_id": "BC-甲"},
+        ),
         _role_rows_by_user={"G-10001": ({"user_id": "G-10001", "role_name": "A运营"},)},
         _datacountry_rows_by_user={"G-10001": ({"user_id": "G-10001", "datacountry_id": "101"},)},
     )
@@ -278,10 +280,17 @@ class PlanImportTests(unittest.TestCase):
         admin_galaxy = _FakeGalaxySnapshot(
             user_rows=({"user_id": "G-10001", "user_name": "10001", "email": GRANTED_USER.email},),
             country_rows=(
-                {"country_key": "101", "name": "ALPHA", "name_cn": "甲国", "boss_company_id": "BC-甲"},
+                {
+                    "country_key": "101",
+                    "name": "ALPHA",
+                    "name_cn": "甲国",
+                    "boss_company_id": "BC-甲",
+                },
             ),
             _role_rows_by_user={"G-10001": ({"user_id": "G-10001", "role_name": "管理员角色"},)},
-            _datacountry_rows_by_user={"G-10001": ({"user_id": "G-10001", "datacountry_id": "101"},)},
+            _datacountry_rows_by_user={
+                "G-10001": ({"user_id": "G-10001", "datacountry_id": "101"},)
+            },
         )
         legacy = {GRANTED_USER.email: {"BC-甲": ("旧表独有指标",)}}
 
@@ -356,12 +365,20 @@ class PlanImportTests(unittest.TestCase):
 
     def test_plan_is_deterministically_ordered_by_email_company_metric(self) -> None:
         user_b = TOOL.AppUserRecord(
-            user_id="usr_b", employee_no="", email="b@example.com",
-            feishu_open_id="ou_b", display_name="乙", account_state="enabled",
+            user_id="usr_b",
+            employee_no="",
+            email="b@example.com",
+            feishu_open_id="ou_b",
+            display_name="乙",
+            account_state="enabled",
         )
         user_a = TOOL.AppUserRecord(
-            user_id="usr_a", employee_no="", email="a@example.com",
-            feishu_open_id="ou_a", display_name="甲", account_state="enabled",
+            user_id="usr_a",
+            employee_no="",
+            email="a@example.com",
+            feishu_open_id="ou_a",
+            display_name="甲",
+            account_state="enabled",
         )
         legacy = {
             user_b.email: {"1099": ("z指标", "a指标")},
@@ -417,7 +434,7 @@ class LoadLegacyExportTests(unittest.TestCase):
 
     def test_a_duplicate_email_is_rejected_not_silently_merged(self) -> None:
         path = self._write(
-            'email,permissions\n'
+            "email,permissions\n"
             'a@example.com,"{""1011"": [""日活""]}"\n'
             'a@example.com,"{""1011"": [""收入""]}"\n'
         )
@@ -451,7 +468,7 @@ class LoadLegacyExportTests(unittest.TestCase):
         """
 
         path = self._write(
-            'email,permissions\n'
+            "email,permissions\n"
             'a@example.com,"{""1011"": [""日活""]}"\n'
             'wildcard@example.com,"{""*"": [""全部指标""]}"\n'
         )
@@ -467,8 +484,7 @@ class LoadLegacyExportTests(unittest.TestCase):
         """通配键与具体公司键混在同一行也一样整体拒绝——不是"只挡纯通配行"。"""
 
         path = self._write(
-            'email,permissions\n'
-            'a@example.com,"{""1011"": [""日活""], ""*"": [""全部指标""]}"\n'
+            'email,permissions\na@example.com,"{""1011"": [""日活""], ""*"": [""全部指标""]}"\n'
         )
 
         with self.assertRaises(ValueError):
@@ -487,7 +503,7 @@ class LoadLegacyExportTests(unittest.TestCase):
         """
 
         path = self._write(
-            'email,permissions\n'
+            "email,permissions\n"
             'ok@example.com,"{""1011"": [""日活""]}"\n'
             'star@example.com,"{""1011"": [""*""]}"\n'
         )
@@ -507,7 +523,7 @@ class LoadLegacyExportTests(unittest.TestCase):
 
     def test_a_blank_metric_value_rejects_the_whole_export(self) -> None:
         path = self._write(
-            'email,permissions\n'
+            "email,permissions\n"
             'ok@example.com,"{""1011"": [""日活""]}"\n'
             'blank@example.com,"{""1011"": [""   ""]}"\n'
         )
@@ -522,10 +538,7 @@ class LoadLegacyExportTests(unittest.TestCase):
         但一个名字里带换行的指标不可能匹配映射里的任何东西，只可能是导出坏了
         或有人在藏东西：整份拒绝，不"尽力解析"。"""
 
-        path = self._write(
-            'email,permissions\n'
-            'nl@example.com,"{""1011"": [""日\\n活""]}"\n'
-        )
+        path = self._write('email,permissions\nnl@example.com,"{""1011"": [""日\\n活""]}"\n')
 
         with self.assertRaises(ValueError) as raised:
             TOOL.load_legacy_export(path)
@@ -566,14 +579,18 @@ class ExistingActiveGrantTests(unittest.TestCase):
         cursor = _FakeCursor(hit=True)
 
         self.assertTrue(
-            TOOL._existing_active_grant(cursor, user_id="usr_1", company_id="1011", metric_name="日活")
+            TOOL._existing_active_grant(
+                cursor, user_id="usr_1", company_id="1011", metric_name="日活"
+            )
         )
 
     def test_no_hit_reports_absent(self) -> None:
         cursor = _FakeCursor(hit=False)
 
         self.assertFalse(
-            TOOL._existing_active_grant(cursor, user_id="usr_1", company_id="1011", metric_name="日活")
+            TOOL._existing_active_grant(
+                cursor, user_id="usr_1", company_id="1011", metric_name="日活"
+            )
         )
 
     def test_the_query_filters_on_grant_direction_only(self) -> None:
@@ -598,11 +615,16 @@ class PrintPlanTests(unittest.TestCase):
         plan = TOOL.ImportPlan(
             grants=(
                 TOOL.PlannedGrant(
-                    email="a@example.com", user_id="usr_a", feishu_open_id="ou_a",
-                    company_id="1011", metric_name="日活",
+                    email="a@example.com",
+                    user_id="usr_a",
+                    feishu_open_id="ou_a",
+                    company_id="1011",
+                    metric_name="日活",
                 ),
             ),
-            skipped=(TOOL.SkippedUser(email="b@example.com", reason=TOOL.REASON_APP_USER_NOT_FOUND),),
+            skipped=(
+                TOOL.SkippedUser(email="b@example.com", reason=TOOL.REASON_APP_USER_NOT_FOUND),
+            ),
         )
 
         buffer = io.StringIO()
@@ -715,8 +737,10 @@ class MainGateTests(unittest.TestCase):
             code = TOOL.main(
                 [
                     str(self._write(csv_text)),
-                    "--initiated-by", initiated_by if initiated_by is not None else self.ADMIN_OPEN_ID,
-                    "--dsn", "postgresql://unused/unused",
+                    "--initiated-by",
+                    initiated_by if initiated_by is not None else self.ADMIN_OPEN_ID,
+                    "--dsn",
+                    "postgresql://unused/unused",
                     "--apply",
                 ]
             )
@@ -733,8 +757,10 @@ class MainGateTests(unittest.TestCase):
                 TOOL.main(
                     [
                         str(self._write(self.GOOD_CSV)),
-                        "--initiated-by", self.ADMIN_OPEN_ID,
-                        "--dsn", "postgresql://unused/unused",
+                        "--initiated-by",
+                        self.ADMIN_OPEN_ID,
+                        "--dsn",
+                        "postgresql://unused/unused",
                         "--ap",
                     ]
                 )
@@ -786,9 +812,7 @@ class MainGateTests(unittest.TestCase):
         """判定复用 `is_authorized_admin`：查到一行不等于是管理员，撤销过的不算。"""
 
         self._install_lookup(
-            _FakeAdminRegistryLookup(
-                authorized_open_id=self.ADMIN_OPEN_ID, entry_status="revoked"
-            )
+            _FakeAdminRegistryLookup(authorized_open_id=self.ADMIN_OPEN_ID, entry_status="revoked")
         )
 
         code, _ = self._run_apply(self.GOOD_CSV)

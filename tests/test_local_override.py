@@ -191,9 +191,7 @@ class ToCompanyMetricMapTests(unittest.TestCase):
         self.assertEqual(to_company_metric_map(frozenset()), {})
 
     def test_pairs_are_grouped_and_sorted_per_company(self) -> None:
-        pairs = frozenset(
-            {("1011", "收入"), ("1011", "日活"), ("1012", "留存")}
-        )
+        pairs = frozenset({("1011", "收入"), ("1011", "日活"), ("1012", "留存")})
 
         result = to_company_metric_map(pairs)
 

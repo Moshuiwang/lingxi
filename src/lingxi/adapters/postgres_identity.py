@@ -139,7 +139,13 @@ class PostgresOrgSnapshotStore:
                              (id, sync_run_id, tenant_key, visible_to_user_identity, member_count)
                            VALUES (%s, %s, %s, %s, %s)""",
                         [
-                            (new_id("tenant"), identifier, scope.tenant_key, scope.visible_to_user_identity, len(scope.user_member_keys))
+                            (
+                                new_id("tenant"),
+                                identifier,
+                                scope.tenant_key,
+                                scope.visible_to_user_identity,
+                                len(scope.user_member_keys),
+                            )
                             for scope in batch.tenants
                         ],
                     )
@@ -149,7 +155,13 @@ class PostgresOrgSnapshotStore:
                                  (id, sync_run_id, tenant_key, department_key, name)
                                VALUES (%s, %s, %s, %s, %s)""",
                             [
-                                (new_id("dept"), identifier, item.tenant_key, item.department_key, item.name)
+                                (
+                                    new_id("dept"),
+                                    identifier,
+                                    item.tenant_key,
+                                    item.department_key,
+                                    item.name,
+                                )
                                 for item in batch.departments
                             ],
                         )
@@ -210,7 +222,10 @@ class PostgresOrgSnapshotStore:
         UTC 再取日期，避免会话时区把"今天"判错。
         """
 
-        with connect(self._dsn, timeouts=self._timeouts) as connection, connection.cursor() as cursor:
+        with (
+            connect(self._dsn, timeouts=self._timeouts) as connection,
+            connection.cursor() as cursor,
+        ):
             cursor.execute(
                 """SELECT 1 FROM feishu_org_sync_run
                     WHERE status = 'complete'
@@ -221,7 +236,10 @@ class PostgresOrgSnapshotStore:
             return cursor.fetchone() is not None
 
     def latest_complete_expiry(self) -> datetime | None:
-        with connect(self._dsn, timeouts=self._timeouts) as connection, connection.cursor() as cursor:
+        with (
+            connect(self._dsn, timeouts=self._timeouts) as connection,
+            connection.cursor() as cursor,
+        ):
             cursor.execute(
                 "SELECT expires_at FROM feishu_org_sync_run WHERE status = 'complete' ORDER BY started_at DESC LIMIT 1"
             )
@@ -268,7 +286,10 @@ class PostgresOrgSnapshotStore:
         if column not in ("open_id", "user_id"):
             raise ValueError("组织快照只支持按 open_id / user_id 定位")
         moment = now or datetime.now(UTC)
-        with connect(self._dsn, timeouts=self._timeouts) as connection, connection.cursor() as cursor:
+        with (
+            connect(self._dsn, timeouts=self._timeouts) as connection,
+            connection.cursor() as cursor,
+        ):
             cursor.execute(
                 "SELECT id, expires_at FROM feishu_org_sync_run WHERE status = 'complete' ORDER BY started_at DESC LIMIT 1"
             )
@@ -299,9 +320,14 @@ class PostgresOrgSnapshotStore:
         )
         return DirectoryLookup(availability, members)
 
-    def _record_failed_run(self, run_id: str, source_app_id: str, started_at: datetime, error: SnapshotIntegrityError) -> None:
+    def _record_failed_run(
+        self, run_id: str, source_app_id: str, started_at: datetime, error: SnapshotIntegrityError
+    ) -> None:
         codes = ",".join(problem.value for problem in error.report.problems)[:120]
-        with connect(self._dsn, timeouts=self._timeouts) as connection, connection.cursor() as cursor:
+        with (
+            connect(self._dsn, timeouts=self._timeouts) as connection,
+            connection.cursor() as cursor,
+        ):
             cursor.execute(
                 """INSERT INTO feishu_org_sync_run
                      (id, source_app_id, status, started_at, completed_at, expires_at, error_code)
@@ -364,7 +390,9 @@ class PostgresAppUserStore:
             return self._rejected(
                 request,
                 rejection,
-                missing_fields=missing if rejection is ProvisioningRejection.INCOMPLETE_IDENTITY else (),
+                missing_fields=missing
+                if rejection is ProvisioningRejection.INCOMPLETE_IDENTITY
+                else (),
             )
         return (
             ProvisioningResult.created(record.id)
@@ -398,7 +426,10 @@ class PostgresAppUserStore:
           用户会因为再发一条消息被打回 ``matching``。
         """
 
-        with connect(self._dsn, timeouts=self._timeouts) as connection, connection.cursor() as cursor:
+        with (
+            connect(self._dsn, timeouts=self._timeouts) as connection,
+            connection.cursor() as cursor,
+        ):
             cursor.execute(
                 """INSERT INTO app_user
                      (id, feishu_open_id, feishu_user_id, feishu_union_id, display_name,
@@ -461,14 +492,21 @@ class PostgresAppUserStore:
         return record
 
     def get_by_open_id(self, open_id: str) -> AppUserRecord | None:
-        with connect(self._dsn, timeouts=self._timeouts) as connection, connection.cursor() as cursor:
+        with (
+            connect(self._dsn, timeouts=self._timeouts) as connection,
+            connection.cursor() as cursor,
+        ):
             cursor.execute(
                 "SELECT id, provisioning_state, permission_record_id, employee_no, email "
                 "FROM app_user WHERE feishu_open_id = %s",
                 (open_id,),
             )
             row = cursor.fetchone()
-        return None if row is None else AppUserRecord(str(row[0]), str(row[1]), row[2], False, row[3], row[4])
+        return (
+            None
+            if row is None
+            else AppUserRecord(str(row[0]), str(row[1]), row[2], False, row[3], row[4])
+        )
 
     def read_status(self, user_id: str) -> UserProvisioningStatus | None:
         """回读该用户此刻的账号状态、开通状态与权限版本（Epic D / S-D-02）。
@@ -480,7 +518,10 @@ class PostgresAppUserStore:
         判据**；把两件事塞进同一个返回值会让调用方分不清自己拿到的是哪一份事实。
         """
 
-        with connect(self._dsn, timeouts=self._timeouts) as connection, connection.cursor() as cursor:
+        with (
+            connect(self._dsn, timeouts=self._timeouts) as connection,
+            connection.cursor() as cursor,
+        ):
             cursor.execute(
                 "SELECT account_state, provisioning_state, permission_version "
                 "FROM app_user WHERE id = %s",
@@ -505,7 +546,9 @@ class PostgresAppUserStore:
 
         if to not in _PROVISIONING_ORDER:
             raise ValueError("不认识的开通状态，拒绝推进")
-        allowed = tuple(state for state, rank in _PROVISIONING_ORDER.items() if rank < _PROVISIONING_ORDER[to])
+        allowed = tuple(
+            state for state, rank in _PROVISIONING_ORDER.items() if rank < _PROVISIONING_ORDER[to]
+        )
         if not allowed:
             # rank 0 的两格（``guest``、``aborted``）都会走到这里：没有任何状态排在
             # 它们前面，因此空表检查照常拒绝、不写库。这正是 `to="aborted"` 不会给本方法
@@ -524,10 +567,15 @@ class PostgresAppUserStore:
         # 却没有租约起点的人，而那正是本列要消灭的那种永久卡住。**不复用 ``updated_at``**：
         # 那一列会被任何无关更新刷新，租约永远不到期。
         stamp = ", provisioning_started_at = now()" if to == "provisioning" else ""
-        with connect(self._dsn, timeouts=self._timeouts) as connection, connection.cursor() as cursor:
+        with (
+            connect(self._dsn, timeouts=self._timeouts) as connection,
+            connection.cursor() as cursor,
+        ):
             cursor.execute(
-                "UPDATE app_user SET provisioning_state = %s, updated_at = now()" + stamp
-                + " WHERE id = %s AND provisioning_state = ANY(%s)" + guard,
+                "UPDATE app_user SET provisioning_state = %s, updated_at = now()"
+                + stamp
+                + " WHERE id = %s AND provisioning_state = ANY(%s)"
+                + guard,
                 (to, user_id, list(allowed)),
             )
             changed = cursor.rowcount
@@ -552,7 +600,10 @@ class PostgresAppUserStore:
         返回是否真的挂起了（影响行数）。
         """
 
-        with connect(self._dsn, timeouts=self._timeouts) as connection, connection.cursor() as cursor:
+        with (
+            connect(self._dsn, timeouts=self._timeouts) as connection,
+            connection.cursor() as cursor,
+        ):
             cursor.execute(
                 """UPDATE app_user SET preprovision_notice_armed_at = now()
                     WHERE feishu_open_id = %s
@@ -611,7 +662,10 @@ class PostgresAppUserStore:
             raise ValueError("必须显式列出允许收口的中途格")
         if not isinstance(reason, str) or not reason.strip():
             raise ValueError("必须说明收口原因")
-        with connect(self._dsn, timeouts=self._timeouts) as connection, connection.cursor() as cursor:
+        with (
+            connect(self._dsn, timeouts=self._timeouts) as connection,
+            connection.cursor() as cursor,
+        ):
             cursor.execute(
                 "UPDATE app_user SET provisioning_state = 'aborted', updated_at = now() "
                 "WHERE id = %s AND provisioning_state = ANY(%s) "
@@ -620,13 +674,14 @@ class PostgresAppUserStore:
             )
             changed = cursor.rowcount
         if changed:
-            logger.info(
-                "开通中途停摆已收口 user=%s reason=%s", user_id, reason.strip()
-            )
+            logger.info("开通中途停摆已收口 user=%s reason=%s", user_id, reason.strip())
         return bool(changed)
 
     def count(self) -> int:
-        with connect(self._dsn, timeouts=self._timeouts) as connection, connection.cursor() as cursor:
+        with (
+            connect(self._dsn, timeouts=self._timeouts) as connection,
+            connection.cursor() as cursor,
+        ):
             cursor.execute("SELECT count(*) FROM app_user")
             row = cursor.fetchone()
         return int(row[0]) if row else 0

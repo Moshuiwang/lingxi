@@ -21,9 +21,16 @@ class FeishuBitableOrgAssociationTest(unittest.TestCase):
 
         report = analyze_association(bitable_rows, snapshot_rows)
 
-        self.assertEqual(report["joins"]["personnel_id_to_user_id"], {"matched_rows": 2, "matched_values": 1})
-        self.assertEqual(report["joins"]["open_id_to_open_id"], {"matched_rows": 1, "matched_values": 1})
-        self.assertEqual(report["joins"]["both_keys_same_member"], {"rows_with_both_keys": 0, "same_member_rows": 0})
+        self.assertEqual(
+            report["joins"]["personnel_id_to_user_id"], {"matched_rows": 2, "matched_values": 1}
+        )
+        self.assertEqual(
+            report["joins"]["open_id_to_open_id"], {"matched_rows": 1, "matched_values": 1}
+        )
+        self.assertEqual(
+            report["joins"]["both_keys_same_member"],
+            {"rows_with_both_keys": 0, "same_member_rows": 0},
+        )
 
     def test_name_only_match_is_reported_as_ambiguous_without_becoming_a_primary_join(self) -> None:
         snapshot_rows = [
@@ -34,12 +41,17 @@ class FeishuBitableOrgAssociationTest(unittest.TestCase):
 
         report = analyze_association(bitable_rows, snapshot_rows)
 
-        self.assertEqual(report["joins"]["name_only"], {
-            "matched_rows": 1,
-            "unique_snapshot_name_matches": 0,
-            "ambiguous_snapshot_name_matches": 1,
-        })
-        self.assertEqual(report["joins"]["personnel_id_to_user_id"], {"matched_rows": 0, "matched_values": 0})
+        self.assertEqual(
+            report["joins"]["name_only"],
+            {
+                "matched_rows": 1,
+                "unique_snapshot_name_matches": 0,
+                "ambiguous_snapshot_name_matches": 1,
+            },
+        )
+        self.assertEqual(
+            report["joins"]["personnel_id_to_user_id"], {"matched_rows": 0, "matched_values": 0}
+        )
 
     def test_bitable_values_can_be_read_from_text_objects_and_snapshot_name_objects(self) -> None:
         snapshot_rows = [
@@ -61,7 +73,10 @@ class FeishuBitableOrgAssociationTest(unittest.TestCase):
 
         report = analyze_association(bitable_rows, snapshot_rows)
 
-        self.assertEqual(report["joins"]["both_keys_same_member"], {"rows_with_both_keys": 1, "same_member_rows": 1})
+        self.assertEqual(
+            report["joins"]["both_keys_same_member"],
+            {"rows_with_both_keys": 1, "same_member_rows": 1},
+        )
 
 
 if __name__ == "__main__":

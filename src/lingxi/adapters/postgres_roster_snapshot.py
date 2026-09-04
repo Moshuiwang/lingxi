@@ -131,7 +131,10 @@ class PostgresRosterSnapshotStore:
         因此这里不能用"零行快照"之类的哨兵对象代替——那会让首轮读失败被报成保旧。
         """
 
-        with connect(self._dsn, timeouts=self._timeouts) as connection, connection.cursor() as cursor:
+        with (
+            connect(self._dsn, timeouts=self._timeouts) as connection,
+            connection.cursor() as cursor,
+        ):
             cursor.execute(LOAD_FACTS_SQL)
             row = cursor.fetchone()
         if row is None:

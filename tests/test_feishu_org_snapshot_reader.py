@@ -51,7 +51,12 @@ class FakeDirectoryClient:
         return self._app_scope[tenant_key].get(department_id, ([], []))
 
     def list_visible_organization(
-        self, *, token: str, tenant_key: str, department_id: str | None = None, department_id_type: str | None = None
+        self,
+        *,
+        token: str,
+        tenant_key: str,
+        department_id: str | None = None,
+        department_id_type: str | None = None,
     ):
         assert token == "user-token"
         key = None if department_id is None else (department_id, department_id_type)
@@ -119,7 +124,9 @@ class HappyPathTest(unittest.TestCase):
         client = FakeDirectoryClient(
             app_tenants=[{"tenant_key": "tenant_a"}],
             user_tenants=[{"tenant_key": "tenant_a"}],
-            app_scope={"tenant_a": {"0": ([{"open_department_id": "0"}], [{"open_user_id": "ou_1"}])}},
+            app_scope={
+                "tenant_a": {"0": ([{"open_department_id": "0"}], [{"open_user_id": "ou_1"}])}
+            },
             user_scope={"tenant_a": {None: ([], [_member("ou_1")])}},
         )
 
@@ -164,7 +171,9 @@ class HappyPathTest(unittest.TestCase):
         batch = read_org_snapshot(client=client, app_token="app-token", user_token="user-token")
 
         shared_rows = [d for d in batch.departments if d.department_key == "od_shared"]
-        self.assertEqual(len(shared_rows), 1, "同一个 department_key 只能落一行，否则违反数据库唯一约束")
+        self.assertEqual(
+            len(shared_rows), 1, "同一个 department_key 只能落一行，否则违反数据库唯一约束"
+        )
 
     def test_tenant_discovery_covers_a_tenant_only_visible_to_the_app_identity(self) -> None:
         """租户发现遍历两条身份路径的并集（Issue #250 编排者复查 F1 修复后的行为）：
@@ -190,7 +199,9 @@ class HappyPathTest(unittest.TestCase):
 class IntegrityHandoffTest(unittest.TestCase):
     """本模块不做完整性判断，只如实组装——这里验证"如实"这件事：读漏了就该被下一层挡住。"""
 
-    def test_an_empty_app_tenant_list_still_surfaces_a_user_only_tenant_and_gets_rejected(self) -> None:
+    def test_an_empty_app_tenant_list_still_surfaces_a_user_only_tenant_and_gets_rejected(
+        self,
+    ) -> None:
         """F1 变异锚点：应用身份路径完全看不到任何租户（例如批次半页 / 权限暂时
         收窄），但用户身份路径看到了 tenant_a。此前的实现只遍历
         ``app_tenant_keys``，tenant_a 会被整个排除在 ``SnapshotBatch`` 之外——
@@ -224,7 +235,9 @@ class IntegrityHandoffTest(unittest.TestCase):
         client = FakeDirectoryClient(
             app_tenants=[{"tenant_key": "tenant_a"}],
             user_tenants=[{"tenant_key": "tenant_a"}],
-            app_scope={"tenant_a": {"0": ([], [{"open_user_id": "ou_1"}, {"open_user_id": "ou_2"}])}},
+            app_scope={
+                "tenant_a": {"0": ([], [{"open_user_id": "ou_1"}, {"open_user_id": "ou_2"}])}
+            },
             user_scope={"tenant_a": {None: ([], [_member("ou_1")])}},
         )
 
@@ -263,7 +276,10 @@ class TenantDiscoveryMissAppSideTest(unittest.TestCase):
     def test_a_tenant_only_visible_to_the_user_identity_is_not_silently_dropped(self) -> None:
         client = FakeDirectoryClient(
             app_tenants=[{"tenant_key": "tenant_visible_to_both"}],
-            user_tenants=[{"tenant_key": "tenant_visible_to_both"}, {"tenant_key": "tenant_only_visible_to_user"}],
+            user_tenants=[
+                {"tenant_key": "tenant_visible_to_both"},
+                {"tenant_key": "tenant_only_visible_to_user"},
+            ],
             app_scope={"tenant_visible_to_both": {"0": ([], [{"open_user_id": "ou_both"}])}},
             user_scope={
                 "tenant_visible_to_both": {None: ([], [_member("ou_both")])},
@@ -288,7 +304,11 @@ class TenantDiscoveryMissAppSideTest(unittest.TestCase):
         missing_side = next(
             scope for scope in batch.tenants if scope.tenant_key == "tenant_only_visible_to_user"
         )
-        self.assertEqual(missing_side.app_member_keys, frozenset(), "应用侧看不到，必须显式置空，不能借用用户侧的值")
+        self.assertEqual(
+            missing_side.app_member_keys,
+            frozenset(),
+            "应用侧看不到，必须显式置空，不能借用用户侧的值",
+        )
         self.assertEqual(missing_side.user_member_keys, frozenset({"ou_user_only"}))
 
         report = verify_batch(batch)
@@ -402,7 +422,14 @@ class MemberIdentityConflictTest(unittest.TestCase):
                     None: ([{"open_department_id": "od_1"}, {"open_department_id": "od_2"}], []),
                     ("od_1", "open_department_id"): (
                         [],
-                        [{"open_user_id": "ou_1", "user_id": "u_1", "union_user_id": "on_1", "user_name": "张一"}],
+                        [
+                            {
+                                "open_user_id": "ou_1",
+                                "user_id": "u_1",
+                                "union_user_id": "on_1",
+                                "user_name": "张一",
+                            }
+                        ],
                     ),
                     ("od_2", "open_department_id"): (
                         [],
@@ -433,7 +460,14 @@ class MemberIdentityConflictTest(unittest.TestCase):
                     None: ([{"open_department_id": "od_1"}, {"open_department_id": "od_2"}], []),
                     ("od_1", "open_department_id"): (
                         [],
-                        [{"open_user_id": "ou_1", "user_id": "u_1", "union_user_id": "on_1", "user_name": "张一"}],
+                        [
+                            {
+                                "open_user_id": "ou_1",
+                                "user_id": "u_1",
+                                "union_user_id": "on_1",
+                                "user_name": "张一",
+                            }
+                        ],
                     ),
                     ("od_2", "open_department_id"): (
                         [],
@@ -493,7 +527,18 @@ class ShapeErrorTest(unittest.TestCase):
             user_tenants=[{"tenant_key": "tenant_a"}],
             app_scope={"tenant_a": {"0": ([], [{"open_user_id": "ou_1"}])}},
             user_scope={
-                "tenant_a": {None: ([], [{"open_user_id": "ou_1", "user_id": "u_1", "user_name": "缺 union_user_id"}])}
+                "tenant_a": {
+                    None: (
+                        [],
+                        [
+                            {
+                                "open_user_id": "ou_1",
+                                "user_id": "u_1",
+                                "user_name": "缺 union_user_id",
+                            }
+                        ],
+                    )
+                }
             },
         )
 
@@ -515,7 +560,12 @@ class ShapeErrorTest(unittest.TestCase):
             user_tenants=[{"tenant_key": "tenant_a"}],
             app_scope={"tenant_a": {"0": ([], [{"open_user_id": "ou_1"}])}},
             user_scope={
-                "tenant_a": {None: ([], [{"open_id": "ou_1", "user_id": "u_1", "union_id": "on_1", "name": "张一"}])}
+                "tenant_a": {
+                    None: (
+                        [],
+                        [{"open_id": "ou_1", "user_id": "u_1", "union_id": "on_1", "name": "张一"}],
+                    )
+                }
             },
         )
 
@@ -544,7 +594,15 @@ class ShapeErrorTest(unittest.TestCase):
             user_tenants=[{"tenant_key": "tenant_a"}],
             app_scope={
                 "tenant_a": {
-                    "0": ([], [{"open_user_id": "ou_1", "name": {"default_value": "张一", "i18n_value": {}}}])
+                    "0": (
+                        [],
+                        [
+                            {
+                                "open_user_id": "ou_1",
+                                "name": {"default_value": "张一", "i18n_value": {}},
+                            }
+                        ],
+                    )
                 }
             },
             user_scope={"tenant_a": {None: ([], [_member("ou_1", "张一")])}},
@@ -601,7 +659,9 @@ class RealResponseShapeTest(unittest.TestCase):
         self.assertEqual(member.display_name, "真实形状张一")
         require_complete_batch(batch)  # 跨路径集合也必须对齐，不只是单条解析成功
 
-    def test_a_real_shape_department_name_resolves_to_the_department_name_field_not_a_key_fallback(self) -> None:
+    def test_a_real_shape_department_name_resolves_to_the_department_name_field_not_a_key_fallback(
+        self,
+    ) -> None:
         """真实形状部门实体（含 ``i18n_department_name`` / ``department_order``
         / ``collaboration_entity_type`` 等不被读取的多余字段），不含 ``name``。
         部门显示名必须取到 ``department_name`` 的值——不是 ``None``、也不是
@@ -635,7 +695,9 @@ class RealResponseShapeTest(unittest.TestCase):
         department = batch.departments[0]
         self.assertEqual(department.department_key, "od_real_1")
         self.assertEqual(department.name, "真实形状研发部")
-        self.assertNotEqual(department.name, department.department_key, "部门名不能退化成部门 key 本身")
+        self.assertNotEqual(
+            department.name, department.department_key, "部门名不能退化成部门 key 本身"
+        )
 
     def test_app_and_user_paths_produce_identical_member_key_sets_with_real_shapes(self) -> None:
         """跨路径一致性回归护栏：应用路径成员键取 ``open_user_id``（既有实现，
@@ -682,7 +744,9 @@ class RealResponseShapeTest(unittest.TestCase):
         self.assertEqual(tenant_a.app_member_keys, frozenset({"ou_real_1", "ou_real_2"}))
         self.assertEqual(tenant_a.app_member_keys, tenant_a.user_member_keys)
         report = verify_batch(batch)
-        self.assertTrue(report.complete, f"真实形状下两条路径本应逐值相等，却出现问题：{report.problems}")
+        self.assertTrue(
+            report.complete, f"真实形状下两条路径本应逐值相等，却出现问题：{report.problems}"
+        )
 
 
 if __name__ == "__main__":

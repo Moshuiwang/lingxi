@@ -74,9 +74,7 @@ class ContentShapeTests(unittest.TestCase):
                 encoding="utf-8",
             )
             aliases = load_admin_metric_alias_map(valid_file)
-        self.assertEqual(
-            aliases, {"新增用户数": "sub_new_count", "充值金额": "sub_recharge_money"}
-        )
+        self.assertEqual(aliases, {"新增用户数": "sub_new_count", "充值金额": "sub_recharge_money"})
 
     def test_entries_with_non_string_values_are_skipped_not_fatal(self) -> None:
         import tempfile

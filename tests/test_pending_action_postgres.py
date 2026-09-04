@@ -121,12 +121,12 @@ class PendingActionPostgresTestCase(unittest.TestCase):
         )
         self.assertTrue(outcome.decision.ok, outcome.decision.message)
         assert outcome.pending is not None
-        self.store.mark_card_delivered(
-            pending_action_id=outcome.pending.id, card_id="cardkit_test"
-        )
+        self.store.mark_card_delivered(pending_action_id=outcome.pending.id, card_id="cardkit_test")
         return outcome.pending.id
 
-    def remember_memory(self, *, user_id: str, memory_key: str = "k", memory_value: str = "v") -> str:
+    def remember_memory(
+        self, *, user_id: str, memory_key: str = "k", memory_value: str = "v"
+    ) -> str:
         """给某个用户直接写一条记忆（Issue #357 S-H3-3），供停用清除钩子测试复用。"""
 
         with connect(self._dsn) as connection:
@@ -141,9 +141,7 @@ class PendingActionPostgresTestCase(unittest.TestCase):
         return memory_id
 
     def memory_count(self, *, user_id: str) -> int:
-        return self.query(
-            "SELECT count(*) FROM user_memory WHERE user_id = %s", (user_id,)
-        )[0][0]
+        return self.query("SELECT count(*) FROM user_memory WHERE user_id = %s", (user_id,))[0][0]
 
 
 class PrepareTests(PendingActionPostgresTestCase):
@@ -198,7 +196,9 @@ class ConfirmHappyPathTests(PendingActionPostgresTestCase):
         self.assertEqual(self.current_account_state(), "suspended")
         assert result.pending is not None
         self.assertEqual(result.pending.status, PendingActionStatus.EXECUTED)
-        self.assertIn("admin.pending_action.confirmed", [action for action, _ in self.audit.records])
+        self.assertIn(
+            "admin.pending_action.confirmed", [action for action, _ in self.audit.records]
+        )
 
     def test_resume_confirm_flips_account_state_back_to_enabled(self) -> None:
         self.add_target_user(account_state="suspended")
@@ -217,15 +217,15 @@ class NotInitiatorRealDbTests(PendingActionPostgresTestCase):
         self.add_target_user(account_state="enabled")
         pending_id = self.prepare_and_deliver()
 
-        result = self.store.confirm(
-            pending_action_id=pending_id, clicker_open_id="ou_impersonator"
-        )
+        result = self.store.confirm(pending_action_id=pending_id, clicker_open_id="ou_impersonator")
 
         self.assertFalse(result.decision.ok)
         self.assertEqual(self.current_account_state(), "enabled", "零业务变更")
         assert result.pending is not None
         self.assertEqual(
-            result.pending.status, PendingActionStatus.PENDING, "非本人点击不改变状态，真正的发起人随后仍可点对"
+            result.pending.status,
+            PendingActionStatus.PENDING,
+            "非本人点击不改变状态，真正的发起人随后仍可点对",
         )
 
         # 真正的发起人随后确实还能点对。
@@ -254,9 +254,7 @@ class NotInitiatorRealDbTests(PendingActionPostgresTestCase):
             (pending_id,),
         )
 
-        result = self.store.confirm(
-            pending_action_id=pending_id, clicker_open_id="ou_impersonator"
-        )
+        result = self.store.confirm(pending_action_id=pending_id, clicker_open_id="ou_impersonator")
 
         self.assertFalse(result.decision.ok)
         self.assertEqual(result.decision.code, "not_authorized")
@@ -275,9 +273,7 @@ class NotInitiatorRealDbTests(PendingActionPostgresTestCase):
         self.assertEqual(self.current_account_state(), "enabled")
 
         # 不误伤：真正的发起人随后点这张已过期的卡，仍然得到"已过期"并首次转终态。
-        expired = self.store.confirm(
-            pending_action_id=pending_id, clicker_open_id=ADMIN_OPEN_ID
-        )
+        expired = self.store.confirm(pending_action_id=pending_id, clicker_open_id=ADMIN_OPEN_ID)
         assert expired.pending is not None
         self.assertEqual(expired.pending.status, PendingActionStatus.EXPIRED)
 
@@ -327,7 +323,9 @@ class DuplicateAndConcurrentConfirmTests(PendingActionPostgresTestCase):
                 # 每个线程用自己的 store（各自独立的审计记录器，避免共享可变状态
                 # 本身成为竞态源；数据库层面的序列化才是本用例真正要证明的东西）。
                 thread_audit = _RecordingAudit()
-                thread_store = PostgresPendingActionStore(self._dsn, audit=thread_audit, metric_map_path=None)
+                thread_store = PostgresPendingActionStore(
+                    self._dsn, audit=thread_audit, metric_map_path=None
+                )
                 results[index] = thread_store.confirm(
                     pending_action_id=pending_id, clicker_open_id=ADMIN_OPEN_ID
                 )
@@ -342,9 +340,7 @@ class DuplicateAndConcurrentConfirmTests(PendingActionPostgresTestCase):
 
         self.assertEqual(errors, [], f"并发确认不应抛出未预期的异常：{errors}")
         outcomes = [result.decision.ok for result in results]
-        self.assertEqual(
-            sorted(outcomes), [False, True], "恰好一个线程执行成功，另一个必须被拒绝"
-        )
+        self.assertEqual(sorted(outcomes), [False, True], "恰好一个线程执行成功，另一个必须被拒绝")
         self.assertEqual(self.current_account_state(), "suspended", "只翻转一次，不是两次或零次")
         executed_rows = self.query(
             "SELECT count(*) FROM pending_action WHERE id = %s AND status = 'executed'",
@@ -436,15 +432,15 @@ class AuditWriteFailureRealDbTests(PendingActionPostgresTestCase):
         self.remember_memory(user_id=target_user_id, memory_key="k", memory_value="v")
         pending_id = self.prepare_and_deliver()
         failing_audit = _RecordingAudit(raise_error=True)
-        failing_store = PostgresPendingActionStore(self._dsn, audit=failing_audit, metric_map_path=None)
+        failing_store = PostgresPendingActionStore(
+            self._dsn, audit=failing_audit, metric_map_path=None
+        )
 
         with self.assertRaises(PendingActionAuditWriteFailed):
             failing_store.confirm(pending_action_id=pending_id, clicker_open_id=ADMIN_OPEN_ID)
 
         self.assertEqual(self.current_account_state(), "enabled", "审计失败后目标账号必须保持不变")
-        status_rows = self.query(
-            "SELECT status FROM pending_action WHERE id = %s", (pending_id,)
-        )
+        status_rows = self.query("SELECT status FROM pending_action WHERE id = %s", (pending_id,))
         self.assertEqual(status_rows[0][0], "pending", "待确认操作必须仍停在 pending，可以重试")
         self.assertEqual(
             self.memory_count(user_id=target_user_id),
@@ -457,9 +453,7 @@ class AuditWriteFailureRealDbTests(PendingActionPostgresTestCase):
         retry = self.store.confirm(pending_action_id=pending_id, clicker_open_id=ADMIN_OPEN_ID)
         self.assertTrue(retry.decision.ok)
         self.assertEqual(self.current_account_state(), "suspended")
-        self.assertEqual(
-            self.memory_count(user_id=target_user_id), 0, "重试成功后记忆才真正被清"
-        )
+        self.assertEqual(self.memory_count(user_id=target_user_id), 0, "重试成功后记忆才真正被清")
 
     def test_audit_failure_on_cancel_also_rolls_back(self) -> None:
         self.add_target_user(account_state="enabled")
@@ -471,9 +465,7 @@ class AuditWriteFailureRealDbTests(PendingActionPostgresTestCase):
         with self.assertRaises(PendingActionAuditWriteFailed):
             failing_store.cancel(pending_action_id=pending_id, clicker_open_id=ADMIN_OPEN_ID)
 
-        status_rows = self.query(
-            "SELECT status FROM pending_action WHERE id = %s", (pending_id,)
-        )
+        status_rows = self.query("SELECT status FROM pending_action WHERE id = %s", (pending_id,))
         self.assertEqual(status_rows[0][0], "pending")
 
 
@@ -539,9 +531,7 @@ class MarkCardDeliveredAndSendFailedTests(PendingActionPostgresTestCase):
         )
         assert outcome.pending is not None
 
-        self.store.mark_card_delivered(
-            pending_action_id=outcome.pending.id, card_id="cardkit_abc"
-        )
+        self.store.mark_card_delivered(pending_action_id=outcome.pending.id, card_id="cardkit_abc")
 
         rows = self.query(
             "SELECT card_delivered, card_id FROM pending_action WHERE id = %s",
@@ -782,7 +772,9 @@ class RoleCheckWithinTransactionRealDbTests(PendingActionPostgresTestCase):
 
         self.assertFalse(result.decision.ok, "撤权先提交，确认必须看到撤权后的角色状态")
         self.assertIs(result.decision.kind, ConfirmResultKind.ROLE_REVOKED)
-        self.assertEqual(self.current_account_state(), "enabled", "角色核对失败，目标账号状态不得改变")
+        self.assertEqual(
+            self.current_account_state(), "enabled", "角色核对失败，目标账号状态不得改变"
+        )
         assert result.pending is not None
         self.assertEqual(result.pending.status, PendingActionStatus.FAILED)
         self.assertEqual(result.pending.reason, "role_revoked")
@@ -968,9 +960,9 @@ class LazyExpirySweepRealDbTests(PendingActionPostgresTestCase):
         )
 
         self.assertTrue(outcome.decision.ok, outcome.decision.message)
-        stale_status = self.query(
-            "SELECT status FROM pending_action WHERE id = %s", (stale_id,)
-        )[0][0]
+        stale_status = self.query("SELECT status FROM pending_action WHERE id = %s", (stale_id,))[
+            0
+        ][0]
         self.assertEqual(stale_status, "expired")
 
     def test_lazy_expiry_is_audited_with_the_flipped_rows_identity(self) -> None:
@@ -1038,7 +1030,9 @@ class LazyExpirySweepRealDbTests(PendingActionPostgresTestCase):
                 # 不是共享的应用层状态（与 DuplicateAndConcurrentConfirmTests 的
                 # 真实并发用例同一姿态）。
                 thread_audit = _RecordingAudit()
-                thread_store = PostgresPendingActionStore(self._dsn, audit=thread_audit, metric_map_path=None)
+                thread_store = PostgresPendingActionStore(
+                    self._dsn, audit=thread_audit, metric_map_path=None
+                )
                 results[index] = thread_store.prepare(
                     action_type=PendingActionType.SUSPEND_USER,
                     target_open_id=TARGET_OPEN_ID,
@@ -1058,9 +1052,9 @@ class LazyExpirySweepRealDbTests(PendingActionPostgresTestCase):
         self.assertEqual(
             sorted(outcomes), [False, True], "恰好一个线程成功创建新的在途操作，另一个被拒绝"
         )
-        stale_status = self.query(
-            "SELECT status FROM pending_action WHERE id = %s", (stale_id,)
-        )[0][0]
+        stale_status = self.query("SELECT status FROM pending_action WHERE id = %s", (stale_id,))[
+            0
+        ][0]
         self.assertEqual(stale_status, "expired", "旧行只应被翻转一次，落到 expired 终态")
         pending_rows = self.query(
             "SELECT count(*) FROM pending_action WHERE target_open_id = %s AND status = 'pending'",
@@ -1092,7 +1086,13 @@ class SuspendPurgeRealDbTests(PendingActionPostgresTestCase):
         self.execute(
             """INSERT INTO conversation (id, user_id, feishu_chat_id, feishu_thread_id, agent_session_id)
                VALUES (%s, %s, %s, %s, %s)""",
-            (conversation_id, user_id, f"chat-{conversation_id}", f"topic-{conversation_id}", agent_session_id),
+            (
+                conversation_id,
+                user_id,
+                f"chat-{conversation_id}",
+                f"topic-{conversation_id}",
+                agent_session_id,
+            ),
         )
         self.execute(
             """INSERT INTO task
@@ -1122,16 +1122,25 @@ class SuspendPurgeRealDbTests(PendingActionPostgresTestCase):
         self.add_target_user(account_state="enabled")
         target_user_id = self.user_id_for(TARGET_OPEN_ID)
         self.seed_delivered_conversation(
-            conversation_id="cnv-a1", task_id="tsk-a1", user_id=target_user_id, agent_session_id="sess-a1"
+            conversation_id="cnv-a1",
+            task_id="tsk-a1",
+            user_id=target_user_id,
+            agent_session_id="sess-a1",
         )
         self.seed_delivered_conversation(
-            conversation_id="cnv-a2", task_id="tsk-a2", user_id=target_user_id, agent_session_id="sess-a2"
+            conversation_id="cnv-a2",
+            task_id="tsk-a2",
+            user_id=target_user_id,
+            agent_session_id="sess-a2",
         )
         # 另一个用户的会话完全不受影响。
         self.add_target_user(open_id="ou_other_user", account_state="enabled")
         other_user_id = self.user_id_for("ou_other_user")
         self.seed_delivered_conversation(
-            conversation_id="cnv-b1", task_id="tsk-b1", user_id=other_user_id, agent_session_id="sess-b1"
+            conversation_id="cnv-b1",
+            task_id="tsk-b1",
+            user_id=other_user_id,
+            agent_session_id="sess-b1",
         )
         pending_id = self.prepare_and_deliver(action_type=PendingActionType.SUSPEND_USER)
 
@@ -1140,24 +1149,36 @@ class SuspendPurgeRealDbTests(PendingActionPostgresTestCase):
         self.assertTrue(result.decision.ok)
         self.assertEqual(self.current_account_state(), "suspended")
         # Outbox 正文：目标用户的两个会话都被清空。
-        self.assertIsNone(self.query("SELECT content FROM task_delivery_event WHERE task_id='tsk-a1'")[0][0])
-        self.assertIsNone(self.query("SELECT content FROM task_delivery_event WHERE task_id='tsk-a2'")[0][0])
+        self.assertIsNone(
+            self.query("SELECT content FROM task_delivery_event WHERE task_id='tsk-a1'")[0][0]
+        )
+        self.assertIsNone(
+            self.query("SELECT content FROM task_delivery_event WHERE task_id='tsk-a2'")[0][0]
+        )
         # 会话上下文指针：硬失效，立即置空，不等两小时规则。
-        self.assertIsNone(self.query("SELECT agent_session_id FROM conversation WHERE id='cnv-a1'")[0][0])
-        self.assertIsNone(self.query("SELECT agent_session_id FROM conversation WHERE id='cnv-a2'")[0][0])
+        self.assertIsNone(
+            self.query("SELECT agent_session_id FROM conversation WHERE id='cnv-a1'")[0][0]
+        )
+        self.assertIsNone(
+            self.query("SELECT agent_session_id FROM conversation WHERE id='cnv-a2'")[0][0]
+        )
         # Agent 会话 JSONL 物理清理已排队，user_id 是目标用户的内部 id。
         self.assertEqual(self.pending_reasons(agent_session_id="sess-a1"), ["user_cleared"])
         self.assertEqual(self.pending_reasons(agent_session_id="sess-a2"), ["user_cleared"])
         self.assertEqual(
-            self.query("SELECT user_id FROM agent_session_cleanup WHERE agent_session_id='sess-a1'")[0][0],
+            self.query(
+                "SELECT user_id FROM agent_session_cleanup WHERE agent_session_id='sess-a1'"
+            )[0][0],
             target_user_id,
         )
         # 另一个用户的会话（正文、会话指针、清理队列）完全不受影响。
         self.assertEqual(
-            self.query("SELECT content FROM task_delivery_event WHERE task_id='tsk-b1'")[0][0], "已送达的答案"
+            self.query("SELECT content FROM task_delivery_event WHERE task_id='tsk-b1'")[0][0],
+            "已送达的答案",
         )
         self.assertEqual(
-            self.query("SELECT agent_session_id FROM conversation WHERE id='cnv-b1'")[0][0], "sess-b1"
+            self.query("SELECT agent_session_id FROM conversation WHERE id='cnv-b1'")[0][0],
+            "sess-b1",
         )
         self.assertEqual(self.pending_reasons(agent_session_id="sess-b1"), [])
 
@@ -1165,7 +1186,10 @@ class SuspendPurgeRealDbTests(PendingActionPostgresTestCase):
         self.add_target_user(account_state="suspended")
         target_user_id = self.user_id_for(TARGET_OPEN_ID)
         self.seed_delivered_conversation(
-            conversation_id="cnv-a1", task_id="tsk-a1", user_id=target_user_id, agent_session_id="sess-a1"
+            conversation_id="cnv-a1",
+            task_id="tsk-a1",
+            user_id=target_user_id,
+            agent_session_id="sess-a1",
         )
         pending_id = self.prepare_and_deliver(action_type=PendingActionType.RESUME_USER)
 
@@ -1176,10 +1200,12 @@ class SuspendPurgeRealDbTests(PendingActionPostgresTestCase):
         # resume 不恢复已清正文（本用例里正文从未被清过），也不主动清除任何东西
         # ——合同只对停用/权限变化两类触发感知即清，resume 不在其中。
         self.assertEqual(
-            self.query("SELECT content FROM task_delivery_event WHERE task_id='tsk-a1'")[0][0], "已送达的答案"
+            self.query("SELECT content FROM task_delivery_event WHERE task_id='tsk-a1'")[0][0],
+            "已送达的答案",
         )
         self.assertEqual(
-            self.query("SELECT agent_session_id FROM conversation WHERE id='cnv-a1'")[0][0], "sess-a1"
+            self.query("SELECT agent_session_id FROM conversation WHERE id='cnv-a1'")[0][0],
+            "sess-a1",
         )
         self.assertEqual(self.pending_reasons(agent_session_id="sess-a1"), [])
 
@@ -1202,9 +1228,7 @@ class SuspendPurgeRealDbTests(PendingActionPostgresTestCase):
 
         self.assertTrue(result.decision.ok)
         self.assertEqual(self.memory_count(user_id=target_user_id), 0)
-        self.assertEqual(
-            self.memory_count(user_id=other_user_id), 1, "其他用户的记忆不受影响"
-        )
+        self.assertEqual(self.memory_count(user_id=other_user_id), 1, "其他用户的记忆不受影响")
 
         resume_id = self.prepare_and_deliver(action_type=PendingActionType.RESUME_USER)
         resume_result = self.store.confirm(
@@ -1213,9 +1237,7 @@ class SuspendPurgeRealDbTests(PendingActionPostgresTestCase):
 
         self.assertTrue(resume_result.decision.ok)
         self.assertEqual(self.current_account_state(), "enabled")
-        self.assertEqual(
-            self.memory_count(user_id=target_user_id), 0, "resume 不恢复已清记忆"
-        )
+        self.assertEqual(self.memory_count(user_id=target_user_id), 0, "resume 不恢复已清记忆")
 
     def test_repeated_confirm_does_not_queue_cleanup_twice(self) -> None:
         """幂等：`decide_confirm` 早已是终态的第二次点击不再进入 EXECUTE 分支
@@ -1226,7 +1248,10 @@ class SuspendPurgeRealDbTests(PendingActionPostgresTestCase):
         self.add_target_user(account_state="enabled")
         target_user_id = self.user_id_for(TARGET_OPEN_ID)
         self.seed_delivered_conversation(
-            conversation_id="cnv-a1", task_id="tsk-a1", user_id=target_user_id, agent_session_id="sess-a1"
+            conversation_id="cnv-a1",
+            task_id="tsk-a1",
+            user_id=target_user_id,
+            agent_session_id="sess-a1",
         )
         pending_id = self.prepare_and_deliver(action_type=PendingActionType.SUSPEND_USER)
 
@@ -1236,7 +1261,9 @@ class SuspendPurgeRealDbTests(PendingActionPostgresTestCase):
         self.assertTrue(first.decision.ok)
         self.assertEqual(second.decision.kind, ConfirmResultKind.ALREADY_TERMINAL)
         self.assertEqual(
-            self.query("SELECT count(*) FROM agent_session_cleanup WHERE agent_session_id='sess-a1'")[0][0],
+            self.query(
+                "SELECT count(*) FROM agent_session_cleanup WHERE agent_session_id='sess-a1'"
+            )[0][0],
             1,
             "重复确认（幂等重放）不得排出第二条清理待办",
         )
@@ -1282,7 +1309,10 @@ class SuspendPurgeRealDbTests(PendingActionPostgresTestCase):
         self.add_target_user(account_state="enabled")
         target_user_id = self.user_id_for(TARGET_OPEN_ID)
         self.seed_delivered_conversation(
-            conversation_id="cnv-a1", task_id="tsk-a1", user_id=target_user_id, agent_session_id="sess-a1"
+            conversation_id="cnv-a1",
+            task_id="tsk-a1",
+            user_id=target_user_id,
+            agent_session_id="sess-a1",
         )
         pending_id = self.prepare_and_deliver(action_type=PendingActionType.SUSPEND_USER)
 
@@ -1293,7 +1323,9 @@ class SuspendPurgeRealDbTests(PendingActionPostgresTestCase):
         def confirm_from_thread(index: int) -> None:
             try:
                 barrier.wait(timeout=5)
-                thread_store = PostgresPendingActionStore(self._dsn, audit=_RecordingAudit(), metric_map_path=None)
+                thread_store = PostgresPendingActionStore(
+                    self._dsn, audit=_RecordingAudit(), metric_map_path=None
+                )
                 results[index] = thread_store.confirm(
                     pending_action_id=pending_id, clicker_open_id=ADMIN_OPEN_ID
                 )
@@ -1311,11 +1343,15 @@ class SuspendPurgeRealDbTests(PendingActionPostgresTestCase):
         self.assertEqual(outcomes, [False, True], "恰好一个线程执行成功，另一个必须被拒绝")
         self.assertEqual(self.current_account_state(), "suspended")
         self.assertEqual(
-            self.query("SELECT count(*) FROM agent_session_cleanup WHERE agent_session_id='sess-a1'")[0][0],
+            self.query(
+                "SELECT count(*) FROM agent_session_cleanup WHERE agent_session_id='sess-a1'"
+            )[0][0],
             1,
             "真实并发的两次确认，清理待办也只能出现恰好一条",
         )
-        self.assertIsNone(self.query("SELECT content FROM task_delivery_event WHERE task_id='tsk-a1'")[0][0])
+        self.assertIsNone(
+            self.query("SELECT content FROM task_delivery_event WHERE task_id='tsk-a1'")[0][0]
+        )
 
 
 class TransientFailureRealDbTests(PendingActionPostgresTestCase):
@@ -1345,7 +1381,13 @@ class TransientFailureRealDbTests(PendingActionPostgresTestCase):
         self.execute(
             """INSERT INTO conversation (id, user_id, feishu_chat_id, feishu_thread_id, agent_session_id)
                VALUES (%s, %s, %s, %s, %s)""",
-            (conversation_id, user_id, f"chat-{conversation_id}", f"topic-{conversation_id}", agent_session_id),
+            (
+                conversation_id,
+                user_id,
+                f"chat-{conversation_id}",
+                f"topic-{conversation_id}",
+                agent_session_id,
+            ),
         )
         self.execute(
             """INSERT INTO task
@@ -1479,9 +1521,7 @@ class LocalPermissionGrantSuppressRealDbTests(PendingActionPostgresTestCase):
         )
         self.assertTrue(outcome.decision.ok, outcome.decision.message)
         assert outcome.pending is not None
-        self.store.mark_card_delivered(
-            pending_action_id=outcome.pending.id, card_id="cardkit_test"
-        )
+        self.store.mark_card_delivered(pending_action_id=outcome.pending.id, card_id="cardkit_test")
         return outcome.pending.id
 
     def add_bystander_pending_action(self, *, pending_id: str) -> str:
@@ -1664,7 +1704,9 @@ class LocalPermissionGrantSuppressRealDbTests(PendingActionPostgresTestCase):
 
         self.add_target_user(account_state="enabled")
         first_pending_id = self.prepare_and_deliver_permission()
-        confirmed = self.store.confirm(pending_action_id=first_pending_id, clicker_open_id=ADMIN_OPEN_ID)
+        confirmed = self.store.confirm(
+            pending_action_id=first_pending_id, clicker_open_id=ADMIN_OPEN_ID
+        )
         self.assertTrue(confirmed.decision.ok)
 
         second_outcome = self.store.prepare(
@@ -1746,7 +1788,9 @@ class LocalPermissionRevokeRealDbTests(PendingActionPostgresTestCase):
         )
         self.assertTrue(outcome.decision.ok, outcome.decision.message)
         assert outcome.pending is not None
-        self.store.mark_card_delivered(pending_action_id=outcome.pending.id, card_id="cardkit_grant")
+        self.store.mark_card_delivered(
+            pending_action_id=outcome.pending.id, card_id="cardkit_grant"
+        )
         confirmed = self.store.confirm(
             pending_action_id=outcome.pending.id, clicker_open_id=ADMIN_OPEN_ID
         )
@@ -1760,7 +1804,11 @@ class LocalPermissionRevokeRealDbTests(PendingActionPostgresTestCase):
         return rows[0][0]
 
     def prepare_and_deliver_revoke(
-        self, *, override_id: str, initiated_by_open_id: str = ADMIN_OPEN_ID, reason: str = REVOKE_REASON
+        self,
+        *,
+        override_id: str,
+        initiated_by_open_id: str = ADMIN_OPEN_ID,
+        reason: str = REVOKE_REASON,
     ):
         """建一条收回待确认操作并标记卡片已送达，返回完整 ``PrepareOutcome``
         （不像其余 ``prepare_and_deliver*`` 只返回 id——本类多个用例需要直接
@@ -1897,7 +1945,9 @@ class LocalPermissionRevokeRealDbTests(PendingActionPostgresTestCase):
 
         self.assertFalse(outcome.decision.ok)
         self.assertEqual(outcome.decision.code, "self_target_forbidden")
-        self.assertEqual(self.query("SELECT count(*) FROM pending_action")[0][0], 1, "只有 grant 那一条")
+        self.assertEqual(
+            self.query("SELECT count(*) FROM pending_action")[0][0], 1, "只有 grant 那一条"
+        )
 
     def test_confirm_downgrades_to_target_drifted_when_another_path_revokes_first(self) -> None:
         """④漂移：prepare 收回后，另一条路径（真实场景例如另一次并发收回，本

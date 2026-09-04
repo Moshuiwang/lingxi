@@ -191,10 +191,7 @@ def main(
         if config.workspace is not None and not _ensure_worker_workspace(
             config.workspace, err=err, trace_id=config.trace_id
         ):
-            message = (
-                f"{ENV_PREFIX}WORKSPACE 不可用：既不存在也无法创建，或存在但不是"
-                "可写目录"
-            )
+            message = f"{ENV_PREFIX}WORKSPACE 不可用：既不存在也无法创建，或存在但不是可写目录"
             _emit(out, config_error_report(trace_id=config.trace_id, message=message))
             return EXIT_CONFIG_ERROR
         _log(
@@ -248,7 +245,9 @@ def main(
             session_root=session_root,
             session_cleanup_batch_limit=config.session_cleanup_batch_limit,
             content_capture_writer=content_capture_writer,
-            on_year_grounding_suspect=_year_grounding_suspect_sink(err=err, trace_id=config.trace_id),
+            on_year_grounding_suspect=_year_grounding_suspect_sink(
+                err=err, trace_id=config.trace_id
+            ),
             user_memory_reader=PostgresUserMemoryReader(dsn),
         )
         try:
@@ -425,7 +424,9 @@ def _terminal_outcome_sink(*, err: TextIO, trace_id: str) -> Callable[[Mapping[s
     return sink
 
 
-def _year_grounding_suspect_sink(*, err: TextIO, trace_id: str) -> Callable[[Mapping[str, Any]], None]:
+def _year_grounding_suspect_sink(
+    *, err: TextIO, trace_id: str
+) -> Callable[[Mapping[str, Any]], None]:
     """年份接地护栏第二层的结构化告警出口（Issue #326，批次 5 卡 E）。
 
     与 :func:`_terminal_outcome_sink` 同一条纪律与同一个理由：``WorkerService``

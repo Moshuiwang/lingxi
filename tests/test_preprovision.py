@@ -91,16 +91,16 @@ ROSTER = (
     roster_row(personnel_id="u_dup_b", email="shared@example.com"),
 )
 
-DIRECTORY = FakeDirectory({"u_ming": (member(),), "u_hong": (member(user_id="u_hong", open_id="ou_hong"),)})
+DIRECTORY = FakeDirectory(
+    {"u_ming": (member(),), "u_hong": (member(user_id="u_hong", open_id="ou_hong"),)}
+)
 
 
 class LocateByEmailTests(unittest.TestCase):
     """邮箱 → 花名册 ``personnel_id`` → 组织快照成员。**任一环节非唯一即跳过。**"""
 
     def test_a_unique_email_locates_the_member(self) -> None:
-        located = locate_by_email(
-            "Xiaoming@Example.com", roster_rows=ROSTER, directory=DIRECTORY
-        )
+        located = locate_by_email("Xiaoming@Example.com", roster_rows=ROSTER, directory=DIRECTORY)
         assert isinstance(located, PreprovisionTarget)
         self.assertEqual(located.personnel_id, "u_ming")
         self.assertEqual(located.open_id, "ou_ming")
@@ -125,7 +125,8 @@ class LocateByEmailTests(unittest.TestCase):
         located = locate_by_email("shared@example.com", roster_rows=ROSTER, directory=directory)
 
         self.assertEqual(
-            located, PreprovisionSkip(email="shared@example.com", reason=SKIP_EMAIL_MULTIPLE_PERSONNEL)
+            located,
+            PreprovisionSkip(email="shared@example.com", reason=SKIP_EMAIL_MULTIPLE_PERSONNEL),
         )
         self.assertEqual(directory.calls, [], "判断多命中不该再去读组织快照")
 
@@ -161,9 +162,7 @@ class LocateByEmailTests(unittest.TestCase):
         """``feishu_org_member_snapshot`` 对 ``user_id`` 没有唯一约束（账号复用换人
         按 #34 方案 C 留给管理员侧审计）。多条候选时不许自己挑一条。"""
 
-        directory = FakeDirectory(
-            {"u_ming": (member(), member(open_id="ou_ming_2"))}
-        )
+        directory = FakeDirectory({"u_ming": (member(), member(open_id="ou_ming_2"))})
         located = locate_by_email("xiaoming@example.com", roster_rows=ROSTER, directory=directory)
         self.assertEqual(
             located,
@@ -174,9 +173,7 @@ class LocateByEmailTests(unittest.TestCase):
         """资料不可用 / 过九十天上限时"查不到"不是事实，只是我们暂时看不见——与
         ``AutoOnboardingRunner._locate`` 同一条纪律，原因码必须分得开。"""
 
-        directory = FakeDirectory(
-            {"u_ming": (member(),)}, availability=DirectoryAvailability.STALE
-        )
+        directory = FakeDirectory({"u_ming": (member(),)}, availability=DirectoryAvailability.STALE)
         located = locate_by_email("xiaoming@example.com", roster_rows=ROSTER, directory=directory)
         self.assertEqual(
             located,
@@ -212,14 +209,18 @@ class PlanPreprovisionTests(unittest.TestCase):
         targets, _ = plan_preprovision(
             ["hong@example.com", "xiaoming@example.com"], roster_rows=ROSTER, directory=DIRECTORY
         )
-        self.assertEqual([target.email for target in targets], ["hong@example.com", "xiaoming@example.com"])
+        self.assertEqual(
+            [target.email for target in targets], ["hong@example.com", "xiaoming@example.com"]
+        )
 
 
 class SkipResultTests(unittest.TestCase):
     """跳过也要有一个可被批量脚本消费的结论。"""
 
     def test_a_skip_is_a_deterministic_business_failure_with_no_user_facing_message(self) -> None:
-        result = PreprovisionSkip(email="x@example.com", reason=SKIP_EMAIL_MULTIPLE_PERSONNEL).as_result()
+        result = PreprovisionSkip(
+            email="x@example.com", reason=SKIP_EMAIL_MULTIPLE_PERSONNEL
+        ).as_result()
 
         self.assertIs(result.state, OnboardingState.NOT_AUTHORIZED)
         self.assertEqual(result.failure_reason, SKIP_EMAIL_MULTIPLE_PERSONNEL)
@@ -244,9 +245,13 @@ class SystemTriggerHelpersTests(unittest.TestCase):
     def test_the_null_ledger_does_nothing_and_raises_nothing(self) -> None:
         """系统触发没有 ``inbound_event`` 行，记账与放回都没有对象。"""
 
-        self.assertIsNone(NULL_DISPATCH_LEDGER.mark_onboarding_dispatched(event_id="preprovision:x"))
         self.assertIsNone(
-            NULL_DISPATCH_LEDGER.release_onboarding_claim(event_id="preprovision:x", claim_token=None)
+            NULL_DISPATCH_LEDGER.mark_onboarding_dispatched(event_id="preprovision:x")
+        )
+        self.assertIsNone(
+            NULL_DISPATCH_LEDGER.release_onboarding_claim(
+                event_id="preprovision:x", claim_token=None
+            )
         )
 
     def test_silent_delivery_reports_delivered_and_arms_only_the_completion_line(self) -> None:

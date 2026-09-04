@@ -84,7 +84,9 @@ class OnboardingServiceTest(unittest.TestCase):
         self.assertEqual(self.store.user_count(), 0)
         self.assertEqual(self.store.saved_business_messages(), ())
 
-    def test_business_message_containing_confirmation_word_does_not_start_authorization(self) -> None:
+    def test_business_message_containing_confirmation_word_does_not_start_authorization(
+        self,
+    ) -> None:
         response = self.service.confirm_start(self.open_id, "帮我确认昨天销量")
 
         self.assertEqual(response.kind, ResponseKind.FULL_GUIDE)

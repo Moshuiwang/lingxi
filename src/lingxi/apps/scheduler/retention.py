@@ -62,7 +62,9 @@ class RetentionCleanupDuty:
         # 形态就是它悄无声息（codex 二轮 P1-3）。
         blocked = getattr(report, "blocked_tables", ())
         if blocked:
-            logger.warning("%s；本轮未清理完：%s 因锁等待超时让路，下一轮重试", rendered, "、".join(blocked))
+            logger.warning(
+                "%s；本轮未清理完：%s 因锁等待超时让路，下一轮重试", rendered, "、".join(blocked)
+            )
         else:
             logger.info("%s", rendered)
         return report
@@ -434,9 +436,7 @@ def _build_permission_retention_duty(
         checks=checks,
         # onboarding_completion_notice（迁移 0066，V-开通-18）同样没有可选前置——
         # 只需要数据库连接串，因此这一面与 publish_outbox 那一面同样无条件装配。
-        notices=PostgresLateReadinessStore(
-            config.postgres_dsn, timeouts=config.postgres_timeouts
-        ),
+        notices=PostgresLateReadinessStore(config.postgres_dsn, timeouts=config.postgres_timeouts),
         audit=audit,
         stop=stop,
     )

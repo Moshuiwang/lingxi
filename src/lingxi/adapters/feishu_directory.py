@@ -165,7 +165,12 @@ def _require_https_uri(value: object, label: str) -> str:
         raise ValueError(f"{label}不能为空")
     text = value.strip()
     parsed = urlparse(text)
-    if parsed.scheme != "https" or not parsed.netloc or parsed.username is not None or parsed.password is not None:
+    if (
+        parsed.scheme != "https"
+        or not parsed.netloc
+        or parsed.username is not None
+        or parsed.password is not None
+    ):
         raise ValueError(f"{label}必须使用不含凭据的 HTTPS 地址")
     if parsed.fragment:
         raise ValueError(f"{label}不得包含 URL fragment")
@@ -173,10 +178,19 @@ def _require_https_uri(value: object, label: str) -> str:
 
 
 class Transport(Protocol):
-    def __call__(self, method: str, url: str, *, body: Mapping[str, Any] | None = ..., token: str | None = ...) -> Any: ...
+    def __call__(
+        self,
+        method: str,
+        url: str,
+        *,
+        body: Mapping[str, Any] | None = ...,
+        token: str | None = ...,
+    ) -> Any: ...
 
 
-def urllib_transport(method: str, url: str, *, body: Mapping[str, Any] | None = None, token: str | None = None) -> Any:
+def urllib_transport(
+    method: str, url: str, *, body: Mapping[str, Any] | None = None, token: str | None = None
+) -> Any:
     """默认传输层：只发 HTTPS，本身不重试。
 
     有副作用的请求（``POST``）到这一层从未重试过，这条不变。**只读的 ``GET``
@@ -441,18 +455,25 @@ class _PagedClient:
 
         attempt = 0
         while True:
-            if self._round_deadline is not None and self._round_deadline_clock() >= self._round_deadline:
+            if (
+                self._round_deadline is not None
+                and self._round_deadline_clock() >= self._round_deadline
+            ):
                 raise FeishuDirectoryError("round_budget_exceeded")
             self._throttle()
             try:
                 return _payload(self._transport("GET", url, body=None, token=token))
             except FeishuDirectoryError as error:
-                if error.code != FEISHU_RATE_LIMIT_ERROR_CODE or attempt >= len(self._rate_limit_retry_backoffs):
+                if error.code != FEISHU_RATE_LIMIT_ERROR_CODE or attempt >= len(
+                    self._rate_limit_retry_backoffs
+                ):
                     raise
                 self._sleep(self._rate_limit_retry_backoffs[attempt])
                 attempt += 1
 
-    def _pages(self, path: str, *, token: str, query: Mapping[str, Any], keys: tuple[str, ...]) -> list[dict[str, Any]]:
+    def _pages(
+        self, path: str, *, token: str, query: Mapping[str, Any], keys: tuple[str, ...]
+    ) -> list[dict[str, Any]]:
         """按候选键名读一份分页列表；**空 ⇒ 空，畸形 ⇒ 抛错**（Issue #268 F2，
         独立审查 2026-08-20 缩窄）。
 
@@ -531,8 +552,11 @@ class _PagedClient:
                     items = value
                     break
             if items is None:
-                if page_token is None and not collected and has_more is False and not any(
-                    candidate in data for candidate in keys
+                if (
+                    page_token is None
+                    and not collected
+                    and has_more is False
+                    and not any(candidate in data for candidate in keys)
                 ):
                     # 只在第一页、还没收集到任何数据时，才可能是"空结果"——见上方
                     # 文档字符串「独立审查 2026-08-20 推翻了…」一节。响应里若还有
@@ -548,7 +572,9 @@ class _PagedClient:
                         # 该函数文档字符串），不只是防止响应塞一个超长字符串把
                         # 审计行撑爆，也防止键名本身带空格 / `=` 之类字符注入
                         # 空格分隔的 `k=v` 审计行。
-                        raise FeishuDirectoryError(f"unexpected_list_key_{_sanitize_code_fragment(stray)}")
+                        raise FeishuDirectoryError(
+                            f"unexpected_list_key_{_sanitize_code_fragment(stray)}"
+                        )
                     return collected
                 raise FeishuDirectoryError(f"missing_{keys[0]}")
             for item in items:
@@ -671,7 +697,9 @@ class _PagedClient:
                         None,
                     )
                     if stray is not None:
-                        raise FeishuDirectoryError(f"unexpected_list_key_{_sanitize_code_fragment(stray)}")
+                        raise FeishuDirectoryError(
+                            f"unexpected_list_key_{_sanitize_code_fragment(stray)}"
+                        )
                     return collected
                 raise FeishuDirectoryError(f"missing_{list_keys[0]}")
             for key in hit_keys:
@@ -749,7 +777,9 @@ class FeishuDirectoryClient(_PagedClient):
                 or department_id_type not in DEPARTMENT_ID_TYPES
             ):
                 # 不回显 ID：调用方误把令牌接到这里时，配置错误也不能泄露原值。
-                raise ValueError("部门 ID 值与类型必须成对，类型只能是 open_department_id 或 department_id")
+                raise ValueError(
+                    "部门 ID 值与类型必须成对，类型只能是 open_department_id 或 department_id"
+                )
             query["target_department_id"] = department_id
             query["department_id_type"] = department_id_type
         entities = self._pages(
@@ -758,8 +788,14 @@ class FeishuDirectoryClient(_PagedClient):
             query=query,
             keys=("collaboration_entity_list", "entities", "items"),
         )
-        departments = [item for item in entities if item.get("open_department_id") or item.get("department_id")]
-        members = [item for item in entities if not (item.get("open_department_id") or item.get("department_id"))]
+        departments = [
+            item for item in entities if item.get("open_department_id") or item.get("department_id")
+        ]
+        members = [
+            item
+            for item in entities
+            if not (item.get("open_department_id") or item.get("department_id"))
+        ]
         return departments, members
 
     def list_collaboration_tenants_as_app(self, *, token: str) -> list[dict[str, Any]]:
@@ -812,7 +848,9 @@ class FeishuDirectoryClient(_PagedClient):
         )
         return collected["share_departments"], collected["share_users"]
 
-    def get_member_detail(self, *, token: str, tenant_key: str, member_id: str, id_type: str = "open_id") -> dict[str, Any]:
+    def get_member_detail(
+        self, *, token: str, tenant_key: str, member_id: str, id_type: str = "open_id"
+    ) -> dict[str, Any]:
         """读取成员详情。**在职状态只能从这里实时取，不从快照取。**"""
 
         url = (
@@ -833,7 +871,14 @@ class FeishuAuthorizationClient:
     飞书响应字典或短期 ``access_token``。
     """
 
-    def __init__(self, *, base_url: str, app_id: str, app_secret: str, transport: Callable[..., Any] | None = None) -> None:
+    def __init__(
+        self,
+        *,
+        base_url: str,
+        app_id: str,
+        app_secret: str,
+        transport: Callable[..., Any] | None = None,
+    ) -> None:
         if not isinstance(base_url, str) or not base_url.strip():
             raise ValueError("base_url 必须由配置注入，不得写死在代码里")
         if not app_id or not app_secret:
@@ -964,7 +1009,9 @@ class FeishuAuthorizationClient:
             access_token_lifetime,
         )
         return (
-            AuthorizationGrant(SecretToken(next_token), expires_in, scope if isinstance(scope, str) else ""),
+            AuthorizationGrant(
+                SecretToken(next_token), expires_in, scope if isinstance(scope, str) else ""
+            ),
             DerivedAccessToken(SecretToken(access_token), access_token_lifetime),
         )
 

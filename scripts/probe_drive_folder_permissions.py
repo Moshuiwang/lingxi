@@ -344,9 +344,7 @@ def load_state(path: Path) -> ProbeState:
 
 def save_state(path: Path, state: ProbeState) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(
-        json.dumps(state.to_json(), ensure_ascii=False, indent=2), encoding="utf-8"
-    )
+    path.write_text(json.dumps(state.to_json(), ensure_ascii=False, indent=2), encoding="utf-8")
 
 
 def _try_save_state(path: Path, state: ProbeState) -> bool:
@@ -544,7 +542,9 @@ def step_1_root_folder_meta(
 
     result = transport.get_root_folder_meta()
     if not result.ok:
-        raise ProbeHalt(1, "root_meta_failed", {"code": result.code, "msg": redact_message(result.msg)})
+        raise ProbeHalt(
+            1, "root_meta_failed", {"code": result.code, "msg": redact_message(result.msg)}
+        )
     token = result.data.get("token")
     if not token:
         raise ProbeHalt(1, "root_meta_missing_token", {"code": result.code})
@@ -560,7 +560,9 @@ def step_2_create_folder(
 
     name = state.folder_name or _generate_unique_folder_name(now)
     parent_display = (
-        redact_id(state.root_folder_token) if state.root_folder_token else "(尚未从步骤 1 取得，非真实标识)"
+        redact_id(state.root_folder_token)
+        if state.root_folder_token
+        else "(尚未从步骤 1 取得，非真实标识)"
     )
     plan = {
         "call": "create_folder",
@@ -572,13 +574,17 @@ def step_2_create_folder(
     state.folder_name = name
     result = transport.create_folder(name=name, parent_token=state.root_folder_token or "")
     if not result.ok:
-        raise ProbeHalt(2, "create_folder_failed", {"code": result.code, "msg": redact_message(result.msg)})
+        raise ProbeHalt(
+            2, "create_folder_failed", {"code": result.code, "msg": redact_message(result.msg)}
+        )
     token = result.data.get("token")
     if not token:
         raise ProbeHalt(2, "create_folder_missing_token", {"code": result.code})
     state.probe_folder_token = token
     return StepOutcome(
-        2, True, {"code": result.code, "folder_token": redact_id(token), "folder_name": redact_id(name)}
+        2,
+        True,
+        {"code": result.code, "folder_token": redact_id(token), "folder_name": redact_id(name)},
     )
 
 
@@ -588,7 +594,10 @@ def step_3_read_initial_collaborators(
     if not dry_run and not state.probe_folder_token:
         raise UsageError("step_3_requires_step_2：先跑 --step 2 创建测试目录")
 
-    plan = {"call": "list_collaborators", "params": {"token": redact_id(state.probe_folder_token), "type": "folder"}}
+    plan = {
+        "call": "list_collaborators",
+        "params": {"token": redact_id(state.probe_folder_token), "type": "folder"},
+    }
     if dry_run:
         return StepOutcome(3, True, {"dry_run": True, "would_call": plan})
 
@@ -608,10 +617,16 @@ def step_3_read_initial_collaborators(
     # "期望里不含创建者"，而如果真实 API 持续把创建者列进 members，步骤 4
     # 会必然误停，窗口报废在第 4 步。
     state.baseline_collaborators = [
-        {"member_type": m.get("member_type"), "member_id": m.get("member_id"), "perm": m.get("perm")}
+        {
+            "member_type": m.get("member_type"),
+            "member_id": m.get("member_id"),
+            "perm": m.get("perm"),
+        }
         for m in members
     ]
-    return StepOutcome(3, True, {"code": result.code, "member_count": len(members), "unexpected_members": False})
+    return StepOutcome(
+        3, True, {"code": result.code, "member_count": len(members), "unexpected_members": False}
+    )
 
 
 def _grant_and_verify(
@@ -634,7 +649,11 @@ def _grant_and_verify(
 
     plan = {
         "call": "add_collaborator",
-        "params": {"token": redact_id(state.probe_folder_token), "member_id": redact_id(member_id), "perm": "edit"},
+        "params": {
+            "token": redact_id(state.probe_folder_token),
+            "member_id": redact_id(member_id),
+            "perm": "edit",
+        },
     }
     if dry_run:
         return StepOutcome(step, True, {"dry_run": True, "would_call": plan})
@@ -648,9 +667,13 @@ def _grant_and_verify(
         notify=False,
     )
     if not add_result.ok:
-        raise ProbeHalt(step, "grant_failed", {"code": add_result.code, "msg": redact_message(add_result.msg)})
+        raise ProbeHalt(
+            step, "grant_failed", {"code": add_result.code, "msg": redact_message(add_result.msg)}
+        )
 
-    read_result = transport.list_collaborators(token=state.probe_folder_token or "", obj_type="folder")
+    read_result = transport.list_collaborators(
+        token=state.probe_folder_token or "", obj_type="folder"
+    )
     if not read_result.ok:
         raise ProbeHalt(step, "read_back_failed", {"code": read_result.code})
 
@@ -661,7 +684,9 @@ def _grant_and_verify(
     # 不是"数量对了 + 目标成员在列表里就算过"。
     expected: Counter = Counter()
     expected.update(_member_signature(m) for m in state.baseline_collaborators)
-    expected.update((g["member_type"], g["member_id"], g["perm"]) for g in state.collaborators_granted)
+    expected.update(
+        (g["member_type"], g["member_id"], g["perm"]) for g in state.collaborators_granted
+    )
     expected[("openid", member_id, "edit")] += 1
     if actual != expected:
         raise ProbeHalt(
@@ -673,14 +698,21 @@ def _grant_and_verify(
     state.collaborators_granted.append(
         {"member_type": "openid", "member_id": member_id, "perm": "edit", "role": role}
     )
-    return StepOutcome(step, True, {"code": add_result.code, "member_count": len(members), "granted_role": role})
+    return StepOutcome(
+        step, True, {"code": add_result.code, "member_count": len(members), "granted_role": role}
+    )
 
 
 def step_4_grant_cross_tenant(
     transport: DriveTransport, config: ProbeConfig, state: ProbeState, *, dry_run: bool
 ) -> StepOutcome:
     return _grant_and_verify(
-        transport, state, step=4, member_id=config.member_cross, role="cross_tenant_positive", dry_run=dry_run
+        transport,
+        state,
+        step=4,
+        member_id=config.member_cross,
+        role="cross_tenant_positive",
+        dry_run=dry_run,
     )
 
 
@@ -688,7 +720,12 @@ def step_5_grant_same_tenant(
     transport: DriveTransport, config: ProbeConfig, state: ProbeState, *, dry_run: bool
 ) -> StepOutcome:
     return _grant_and_verify(
-        transport, state, step=5, member_id=config.member_same, role="same_tenant_control", dry_run=dry_run
+        transport,
+        state,
+        step=5,
+        member_id=config.member_same,
+        role="same_tenant_control",
+        dry_run=dry_run,
     )
 
 
@@ -708,14 +745,18 @@ def step_6_create_probe_document(
         return StepOutcome(6, True, {"dry_run": True, "would_call": plan})
 
     # 先重新读一次目录**当前**的协作者，不用本地内存里"以为授过谁"的那份。
-    folder_read = transport.list_collaborators(token=state.probe_folder_token or "", obj_type="folder")
+    folder_read = transport.list_collaborators(
+        token=state.probe_folder_token or "", obj_type="folder"
+    )
     if not folder_read.ok:
         raise ProbeHalt(6, "read_folder_collaborators_failed", {"code": folder_read.code})
     folder_members = _member_multiset(folder_read.data.get("members", []))
 
     result = transport.create_document(folder_token=state.probe_folder_token or "")
     if not result.ok:
-        raise ProbeHalt(6, "create_document_failed", {"code": result.code, "msg": redact_message(result.msg)})
+        raise ProbeHalt(
+            6, "create_document_failed", {"code": result.code, "msg": redact_message(result.msg)}
+        )
     doc_token = result.data.get("token")
     if not doc_token:
         raise ProbeHalt(6, "create_document_missing_token", {"code": result.code})
@@ -730,13 +771,20 @@ def step_6_create_probe_document(
         raise ProbeHalt(
             6,
             "inheritance_mismatch",
-            {"folder_member_count": sum(folder_members.values()), "document_member_count": sum(doc_members.values())},
+            {
+                "folder_member_count": sum(folder_members.values()),
+                "document_member_count": sum(doc_members.values()),
+            },
         )
 
     return StepOutcome(
         6,
         True,
-        {"code": result.code, "document_token": redact_id(doc_token), "inherited_member_count": sum(doc_members.values())},
+        {
+            "code": result.code,
+            "document_token": redact_id(doc_token),
+            "inherited_member_count": sum(doc_members.values()),
+        },
     )
 
 
@@ -764,12 +812,17 @@ def step_7_repeat_calls(
 
     plan = {
         "call": "create_folder + add_collaborator (repeat)",
-        "params": {"name": redact_id(state.folder_name), "member_id": redact_id(config.member_cross)},
+        "params": {
+            "name": redact_id(state.folder_name),
+            "member_id": redact_id(config.member_cross),
+        },
     }
     if dry_run:
         return StepOutcome(7, True, {"dry_run": True, "would_call": plan})
 
-    repeat_create = transport.create_folder(name=state.folder_name or "", parent_token=state.root_folder_token or "")
+    repeat_create = transport.create_folder(
+        name=state.folder_name or "", parent_token=state.root_folder_token or ""
+    )
     repeat_add = transport.add_collaborator(
         token=state.probe_folder_token or "",
         obj_type="folder",
@@ -781,7 +834,12 @@ def step_7_repeat_calls(
 
     new_token = repeat_create.data.get("token") if repeat_create.ok else None
     same_token = (new_token == state.probe_folder_token) if repeat_create.ok else None
-    if repeat_create.ok and new_token and new_token != state.probe_folder_token and new_token not in state.extra_folder_tokens:
+    if (
+        repeat_create.ok
+        and new_token
+        and new_token != state.probe_folder_token
+        and new_token not in state.extra_folder_tokens
+    ):
         # 独立审查 M3：重复创建如果返回了一个不同的 token，那是一个真实存在、
         # 没有任何变量指向的目录——必须记进状态，否则步骤 9 清理时根本不知道
         # 它的存在，变成清理不掉的遗留对象。
@@ -830,13 +888,17 @@ def step_9_cleanup(transport: DriveTransport, state: ProbeState, *, dry_run: boo
     """
 
     plan_actions: list[dict[str, Any]] = [
-        {"call": "remove_collaborator", "member": redact_id(g["member_id"])} for g in state.collaborators_granted
+        {"call": "remove_collaborator", "member": redact_id(g["member_id"])}
+        for g in state.collaborators_granted
     ]
     if state.probe_document_token:
         plan_actions.append({"call": "delete_file", "target": "document"})
     if state.probe_folder_token:
         plan_actions.append({"call": "delete_file", "target": "folder"})
-    plan_actions += [{"call": "delete_file", "target": f"extra_folder_{i}"} for i in range(len(state.extra_folder_tokens))]
+    plan_actions += [
+        {"call": "delete_file", "target": f"extra_folder_{i}"}
+        for i in range(len(state.extra_folder_tokens))
+    ]
     if dry_run:
         return StepOutcome(9, True, {"dry_run": True, "would_call": plan_actions})
 
@@ -933,7 +995,9 @@ def run_steps(
             elif step == 7:
                 outcome = step_7_repeat_calls(transport, config, state, dry_run=dry_run)
             elif step == 8:
-                outcome = step_8_negative_access_check(state, dry_run=dry_run, observed_result=t_neg_01_result)
+                outcome = step_8_negative_access_check(
+                    state, dry_run=dry_run, observed_result=t_neg_01_result
+                )
             elif step == 9:
                 outcome = step_9_cleanup(transport, state, dry_run=dry_run)
             else:  # pragma: no cover - argparse 的 choices 已经挡住这个分支
@@ -942,7 +1006,11 @@ def run_steps(
             state.halted_at_step = raised.step
             state.halt_reason = raised.reason
             state.step_summaries[f"step_{raised.step}_halt"] = raised.summary
-            outcomes.append(StepOutcome(raised.step, False, {"halted": True, "reason": raised.reason, **raised.summary}))
+            outcomes.append(
+                StepOutcome(
+                    raised.step, False, {"halted": True, "reason": raised.reason, **raised.summary}
+                )
+            )
             halt = raised
             break
         else:
@@ -953,7 +1021,9 @@ def run_steps(
     return outcomes, halt
 
 
-def build_report(outcomes: list[StepOutcome], state: ProbeState, *, dry_run: bool) -> dict[str, Any]:
+def build_report(
+    outcomes: list[StepOutcome], state: ProbeState, *, dry_run: bool
+) -> dict[str, Any]:
     # 独立审查 M6：只有真的非 dry-run、没有命中硬停止、且步骤 3/4/5/6 全部
     # 真实跑完，才能宣称协作者列表符合预期；否则一律 not_established——不能
     # 因为"没有失败"就默认"已经验证过"，那是用低一级证据宣称高一级完成。
@@ -969,7 +1039,9 @@ def build_report(outcomes: list[StepOutcome], state: ProbeState, *, dry_run: boo
         "halted_at_step": state.halted_at_step,
         "halt_reason": state.halt_reason,
         "collaborator_claim": (
-            "collaborator_list_matches_expected" if collaborator_claim_established else NOT_ESTABLISHED
+            "collaborator_list_matches_expected"
+            if collaborator_claim_established
+            else NOT_ESTABLISHED
         ),
         # 常量引用，不是计算结果——见 ONLY_OWNER_ACCESSIBLE_CLAIM 的 docstring。
         "only_owner_accessible": ONLY_OWNER_ACCESSIBLE_CLAIM,
@@ -988,10 +1060,14 @@ def build_arg_parser() -> argparse.ArgumentParser:
     )
     mode = parser.add_mutually_exclusive_group()
     mode.add_argument("--step", type=int, choices=sorted(STEP_FUNCTIONS), help="只跑这一步")
-    mode.add_argument("--from-step", type=int, choices=sorted(STEP_FUNCTIONS), help="从这一步跑到第 9 步")
+    mode.add_argument(
+        "--from-step", type=int, choices=sorted(STEP_FUNCTIONS), help="从这一步跑到第 9 步"
+    )
     mode.add_argument("--all", action="store_true", help="等价于 --from-step 1")
     mode.add_argument("--cleanup-only", action="store_true", help="只跑步骤 9，可重入")
-    parser.add_argument("--execute", action="store_true", help="真实发起请求；不传则只打印计划（默认）")
+    parser.add_argument(
+        "--execute", action="store_true", help="真实发起请求；不传则只打印计划（默认）"
+    )
     parser.add_argument(
         "--t-neg-01-result",
         choices=("allowed", "denied"),
@@ -1099,7 +1175,12 @@ def main(
 
             try:
                 outcomes, halt = run_steps(
-                    transport, config, state, steps, dry_run=dry_run, t_neg_01_result=args.t_neg_01_result
+                    transport,
+                    config,
+                    state,
+                    steps,
+                    dry_run=dry_run,
+                    t_neg_01_result=args.t_neg_01_result,
                 )
             except UsageError as error:
                 print(str(error), file=sys.stderr)
@@ -1133,14 +1214,19 @@ def main(
                         return 1
                     with _locked_sentinel(sentinel_path):
                         if not _try_write_halt_sentinel(
-                            sentinel_path, step=halt.step, reason=halt.reason, state_dir=config.state_dir
+                            sentinel_path,
+                            step=halt.step,
+                            reason=halt.reason,
+                            state_dir=config.state_dir,
                         ):
                             return 1
                     if not any(o.step == 9 for o in outcomes):
                         try:
                             cleanup_outcome = step_9_cleanup(transport, state, dry_run=False)
                         except Exception as error:  # noqa: BLE001 - 清理阶段异常也不能裸崩
-                            state.step_summaries["step_9_crashed"] = {"error_type": type(error).__name__}
+                            state.step_summaries["step_9_crashed"] = {
+                                "error_type": type(error).__name__
+                            }
                             _try_save_state(state_path, state)
                             print(
                                 f"清理阶段抛出异常（{type(error).__name__}）：硬停止状态已落盘，"
@@ -1225,21 +1311,41 @@ class LarkDriveTransport:
     def _result(self, payload: dict[str, Any]) -> ApiResult:
         code = payload.get("code", -1)
         ok = code in (0, "0")
-        return ApiResult(ok=bool(ok), code=int(code) if isinstance(code, (int, str)) and str(code).lstrip("-").isdigit() else -1, msg=str(payload.get("msg", "")), data=payload.get("data") or {})
+        return ApiResult(
+            ok=bool(ok),
+            code=int(code)
+            if isinstance(code, (int, str)) and str(code).lstrip("-").isdigit()
+            else -1,
+            msg=str(payload.get("msg", "")),
+            data=payload.get("data") or {},
+        )
 
     def get_root_folder_meta(self) -> ApiResult:
         return self._result(self._call("GET", "/drive/explorer/v2/root_folder/meta"))
 
     def create_folder(self, *, name: str, parent_token: str) -> ApiResult:
         return self._result(
-            self._call("POST", "/drive/v1/files/create_folder", body={"name": name, "folder_token": parent_token})
+            self._call(
+                "POST",
+                "/drive/v1/files/create_folder",
+                body={"name": name, "folder_token": parent_token},
+            )
         )
 
     def list_collaborators(self, *, token: str, obj_type: str) -> ApiResult:
-        return self._result(self._call("GET", f"/drive/v1/permissions/{token}/members", params={"type": obj_type}))
+        return self._result(
+            self._call("GET", f"/drive/v1/permissions/{token}/members", params={"type": obj_type})
+        )
 
     def add_collaborator(
-        self, *, token: str, obj_type: str, member_type: str, member_id: str, perm: str, notify: bool
+        self,
+        *,
+        token: str,
+        obj_type: str,
+        member_type: str,
+        member_id: str,
+        perm: str,
+        notify: bool,
     ) -> ApiResult:
         return self._result(
             self._call(
@@ -1255,7 +1361,9 @@ class LarkDriveTransport:
             )
         )
 
-    def remove_collaborator(self, *, token: str, obj_type: str, member_type: str, member_id: str) -> ApiResult:
+    def remove_collaborator(
+        self, *, token: str, obj_type: str, member_type: str, member_id: str
+    ) -> ApiResult:
         return self._result(
             self._call(
                 "DELETE",
@@ -1265,10 +1373,14 @@ class LarkDriveTransport:
         )
 
     def create_document(self, *, folder_token: str) -> ApiResult:
-        return self._result(self._call("POST", "/docx/v1/documents", body={"folder_token": folder_token}))
+        return self._result(
+            self._call("POST", "/docx/v1/documents", body={"folder_token": folder_token})
+        )
 
     def delete_file(self, *, token: str, obj_type: str) -> ApiResult:
-        return self._result(self._call("DELETE", f"/drive/v1/files/{token}", params={"type": obj_type}))
+        return self._result(
+            self._call("DELETE", f"/drive/v1/files/{token}", params={"type": obj_type})
+        )
 
 
 if __name__ == "__main__":

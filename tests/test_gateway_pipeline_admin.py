@@ -146,9 +146,7 @@ class AdminRoutingPipelineTests(unittest.TestCase):
         的直接证据。"""
 
         router = FakeAdminRouter()  # 空表：任何 open_id 都得到默认的 handled=False
-        onboarding = FakeOnboarding(
-            result=OnboardingResult(state=OnboardingState.STARTED)
-        )
+        onboarding = FakeOnboarding(result=OnboardingResult(state=OnboardingState.STARTED))
         pipeline = self._pipeline(admin_router=router, onboarding=onboarding)
 
         outcome = pipeline.handle_message(message(open_id="ou_unknown", text="随便问点什么"))
@@ -181,9 +179,7 @@ class AdminRoutingPipelineTests(unittest.TestCase):
         onboarding = FakeOnboarding()
         pipeline = self._pipeline(admin_router=router, onboarding=onboarding)
 
-        outcome = pipeline.handle_message(
-            message(open_id="ou_admin", message_type="image")
-        )
+        outcome = pipeline.handle_message(message(open_id="ou_admin", message_type="image"))
 
         self.assertEqual(router.calls, [])
         # 非文本 + 未开通：仍旧走既有的 AUTO_PROVISIONING 记事件路径（gateway 对
@@ -272,9 +268,7 @@ class WriteCommandContextThreadingTests(unittest.TestCase):
         self.assertEqual(call["message_id"], "om_evt_suspend_1")
 
     def test_main_window_message_passes_thread_id_none(self) -> None:
-        router = FakeAdminRouter(
-            {"ou_admin": AdminRouteOutcome(handled=True, reply_text="ok")}
-        )
+        router = FakeAdminRouter({"ou_admin": AdminRouteOutcome(handled=True, reply_text="ok")})
         pipeline = EventPipeline(
             store=FakeStore(self.state, self.log),
             reactions=FakeReactions(self.log),
@@ -349,9 +343,7 @@ class DelegatedSubjectStructuralExitTests(unittest.TestCase):
         )
         pipeline = self._pipeline(admin_router=router)
 
-        outcome = pipeline.handle_message(
-            message(open_id="ou_delegated", text="/admin help")
-        )
+        outcome = pipeline.handle_message(message(open_id="ou_delegated", text="/admin help"))
 
         self.assertEqual(outcome.handled_as, HandledAs.COMMAND)
         self.assertEqual(len(router.calls), 1)

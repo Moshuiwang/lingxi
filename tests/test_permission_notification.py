@@ -73,7 +73,11 @@ class ContentRegistrationTest(unittest.TestCase):
     """三个键必须登记在案，并且真的能渲染出来（仓库纪律：不允许无消费方的键）。"""
 
     def test_the_three_keys_are_registered(self) -> None:
-        for key in (CONTENT_KEY_RANGE_UPDATED, CONTENT_KEY_RANGE_REVOKED, CONTENT_KEY_ALL_COMPANIES):
+        for key in (
+            CONTENT_KEY_RANGE_UPDATED,
+            CONTENT_KEY_RANGE_REVOKED,
+            CONTENT_KEY_ALL_COMPANIES,
+        ):
             with self.subTest(key):
                 self.assertIn(key, REQUIRED_TEXT_KEYS)
 
@@ -203,9 +207,7 @@ class CompanyNameResolutionTest(unittest.TestCase):
         self.assertEqual(companies, "1011")
 
     def test_unmatched_company_id_falls_back_to_the_bare_id(self) -> None:
-        companies, _ = describe_scope(
-            {"1011": ["日活"]}, company_names=_FakeCompanyNames({})
-        )
+        companies, _ = describe_scope({"1011": ["日活"]}, company_names=_FakeCompanyNames({}))
 
         self.assertEqual(companies, "1011")
 
@@ -219,9 +221,7 @@ class CompanyNameResolutionTest(unittest.TestCase):
             def names_for(self, *, company_ids):
                 raise AssertionError("通配分支不应该调用 company_names")
 
-        companies, _ = describe_scope(
-            {"*": ["日活"]}, company_names=_AssertNotCalled()
-        )
+        companies, _ = describe_scope({"*": ["日活"]}, company_names=_AssertNotCalled())
 
         self.assertEqual(companies, "全部公司")
 
@@ -231,15 +231,14 @@ class CompanyNameResolutionTest(unittest.TestCase):
         """否定断言：解析口本身故障（例如数据库暂时不可用）不得阻塞整条通知——
         降级展示裸编号，与"缺省未接线"同一姿态。"""
 
-        companies, _ = describe_scope(
-            {"1011": ["日活"]}, company_names=_RaisingCompanyNames()
-        )
+        companies, _ = describe_scope({"1011": ["日活"]}, company_names=_RaisingCompanyNames())
 
         self.assertEqual(companies, "1011")
 
     def test_render_scope_notice_passes_the_resolver_through(self) -> None:
         notice = render_scope_notice(
-            GRANTED, company_names=_FakeCompanyNames({"1011": "壹壹测试公司", "1012": "壹贰测试公司"})
+            GRANTED,
+            company_names=_FakeCompanyNames({"1011": "壹壹测试公司", "1012": "壹贰测试公司"}),
         )
 
         self.assertIn("壹壹测试公司（1011）", notice.text)
@@ -280,9 +279,7 @@ class ConnectionStormRegressionTest(unittest.TestCase):
     交叉裁定）。修复后单次调用的连接数应当是与公司数量无关的常数上界。"""
 
     def test_a_single_call_stays_within_a_small_connection_budget(self) -> None:
-        company_names = _ConnectionCountingCompanyNames(
-            {f"c{i}": f"公司{i}" for i in range(40)}
-        )
+        company_names = _ConnectionCountingCompanyNames({f"c{i}": f"公司{i}" for i in range(40)})
         document = {f"c{i}": ["日活"] for i in range(40)}
 
         describe_scope(document, company_names=company_names)
@@ -290,8 +287,7 @@ class ConnectionStormRegressionTest(unittest.TestCase):
         self.assertLessEqual(
             company_names.connection_count,
             5,
-            "一次调用的连接数应当是与公司数量无关的常数上界，不应随权限文档"
-            "里的公司数量线性增长",
+            "一次调用的连接数应当是与公司数量无关的常数上界，不应随权限文档里的公司数量线性增长",
         )
         self.assertEqual(company_names.names_for_calls, 1)
         self.assertEqual(company_names.name_for_calls, 0)
@@ -364,9 +360,7 @@ class DispatcherTest(unittest.TestCase):
         sender, audit = FakeSender(failures=99), FakeAudit()
         dispatcher = self._dispatcher(sender, audit, max_attempts=5)
 
-        dispatcher.notify(
-            user_id=USER, open_id=OPEN_ID, permission_version=3, permissions=GRANTED
-        )
+        dispatcher.notify(user_id=USER, open_id=OPEN_ID, permission_version=3, permissions=GRANTED)
 
         self.assertEqual(self.waits, [0.2, 1.0, 1.0, 1.0])
 
@@ -374,9 +368,7 @@ class DispatcherTest(unittest.TestCase):
         sender = FakeSender(failures=99)
         dispatcher = self._dispatcher(sender, backoff_seconds=())
 
-        dispatcher.notify(
-            user_id=USER, open_id=OPEN_ID, permission_version=3, permissions=GRANTED
-        )
+        dispatcher.notify(user_id=USER, open_id=OPEN_ID, permission_version=3, permissions=GRANTED)
 
         self.assertEqual(self.waits, [])
         self.assertEqual(len(sender.calls), DEFAULT_NOTICE_ATTEMPTS)
@@ -432,7 +424,9 @@ class DispatcherTest(unittest.TestCase):
         )
 
         self.assertEqual(result.error_code, "feishu_code_230002")
-        self.assertEqual(audit.fields_for("permission_notice.failed")[0]["error_code"], "feishu_code_230002")
+        self.assertEqual(
+            audit.fields_for("permission_notice.failed")[0]["error_code"], "feishu_code_230002"
+        )
 
     def test_no_audit_entry_carries_the_body(self) -> None:
         sender, audit = FakeSender(), FakeAudit()

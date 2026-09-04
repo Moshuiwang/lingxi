@@ -215,7 +215,9 @@ def _walk_user_scope(
             department_names[key] = name or key
             if key not in seen_department_keys:
                 seen_department_keys.add(key)
-                departments.append(SnapshotDepartment(tenant_key=tenant_key, department_key=key, name=name))
+                departments.append(
+                    SnapshotDepartment(tenant_key=tenant_key, department_key=key, name=name)
+                )
             if identifier not in visited:
                 queue.append(identifier)
 
@@ -259,7 +261,9 @@ def _walk_user_scope(
                 # 模块该悄悄补全的情况。
                 raise OrgSnapshotReadError("user_scope_member_identity_incomplete")
             existing = members.get(open_id)
-            if existing is not None and (existing.user_id != user_id or existing.union_id != union_id):
+            if existing is not None and (
+                existing.user_id != user_id or existing.union_id != union_id
+            ):
                 # 同一个 open_id 在不同页给出不同 user_id / union_id 是身份矛盾，不是
                 # "后面这条更新"——`dict` 赋值会静默覆盖，让矛盾的那一条悄悄穿过去写进
                 # 基线（Issue #250 编排者复查 F5）。交叉校验只比 open_id 时看不出这种
@@ -385,4 +389,6 @@ def read_org_snapshot(
             )
         )
 
-    return SnapshotBatch(tenants=tuple(tenants), departments=tuple(departments), members=tuple(members))
+    return SnapshotBatch(
+        tenants=tuple(tenants), departments=tuple(departments), members=tuple(members)
+    )

@@ -230,9 +230,7 @@ def decide_prepare(
     """
 
     if current_account_state is None:
-        return PrepareDecision(
-            ok=False, code="not_found", message=_NOT_FOUND_MESSAGE[action_type]
-        )
+        return PrepareDecision(ok=False, code="not_found", message=_NOT_FOUND_MESSAGE[action_type])
     valid_states = VALID_SOURCE_STATES[action_type]
     if current_account_state not in valid_states:
         return PrepareDecision(
@@ -433,8 +431,10 @@ def decide_confirm(
         )
 
     required_role = REQUIRED_ROLE[pending.action_type]
-    if registry_entry is None or not is_authorized_admin(registry_entry) or not registry_entry.has_role(
-        required_role
+    if (
+        registry_entry is None
+        or not is_authorized_admin(registry_entry)
+        or not registry_entry.has_role(required_role)
     ):
         return ConfirmDecision(
             kind=ConfirmResultKind.ROLE_REVOKED,
@@ -495,7 +495,7 @@ class CancelDecision:
 def decide_cancel(
     *, pending: PendingAction | None, clicker_open_id: str, now: datetime
 ) -> CancelDecision:
-    """"取消"按钮的核对链，比确认短：取消不执行任何业务变更，因此不需要重新核对
+    """ "取消"按钮的核对链，比确认短：取消不执行任何业务变更，因此不需要重新核对
     角色或目标状态漂移——放弃一个即将过期的操作，即使角色已经变化也应当总是安全。
 
     判定顺序与 :func:`decide_confirm` 逐条对齐：**发起人判定排在过期判定之前**

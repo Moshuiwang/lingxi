@@ -131,7 +131,9 @@ def _previous(*, captured_at: datetime = YESTERDAY, row_count: int = 1206) -> St
 class _RecordingStore:
     """记录调用的假快照载体。不做任何 I/O。"""
 
-    def __init__(self, previous: StoredSnapshotFacts | None = None, *, error: Exception | None = None) -> None:
+    def __init__(
+        self, previous: StoredSnapshotFacts | None = None, *, error: Exception | None = None
+    ) -> None:
         self.previous = previous
         self.error = error
         self.replacements: list[dict[str, Any]] = []
@@ -142,7 +144,9 @@ class _RecordingStore:
     def replace(self, rows: Any, integrity: Any, *, captured_at: datetime) -> str:
         if self.error is not None:
             raise self.error
-        self.replacements.append({"rows": tuple(rows), "integrity": integrity, "captured_at": captured_at})
+        self.replacements.append(
+            {"rows": tuple(rows), "integrity": integrity, "captured_at": captured_at}
+        )
         return "rsn_new"
 
 
@@ -198,14 +202,18 @@ class ReplacementGateTest(unittest.TestCase):
             ("transport_error", RosterFailureKind.INDETERMINATE),
         ):
             with self.subTest(kind=kind):
-                decision = decide_snapshot_update(_failed(code, kind), previous=_previous(), now=NOW)
+                decision = decide_snapshot_update(
+                    _failed(code, kind), previous=_previous(), now=NOW
+                )
                 self.assertIs(decision.action, SnapshotAction.KEEP_PREVIOUS)
                 self.assertFalse(decision.should_replace)
 
     def test_an_outcome_claiming_complete_without_rows_is_rejected_loudly(self) -> None:
         # 读取层的契约是"COMPLETE 恒非空"。真出现这种对象说明有人改坏了判定；
         # 静默写一份零行快照会清空比对基线。
-        broken = RosterReadOutcome(status=RosterReadStatus.COMPLETE, rows=(), integrity=_integrity(row_count=0))
+        broken = RosterReadOutcome(
+            status=RosterReadStatus.COMPLETE, rows=(), integrity=_integrity(row_count=0)
+        )
 
         with self.assertRaises(ValueError):
             decide_snapshot_update(broken, previous=None, now=NOW)
@@ -235,8 +243,14 @@ class AlertClassificationTest(unittest.TestCase):
         cases = (
             (_empty_source(), SnapshotAlertKind.EMPTY_SOURCE),
             (_incomplete_with_rows(), SnapshotAlertKind.INCOMPLETE),
-            (_failed("feishu_code_99991672", RosterFailureKind.DEFINITE), SnapshotAlertKind.FAILED_DEFINITE),
-            (_failed("transport_error", RosterFailureKind.INDETERMINATE), SnapshotAlertKind.FAILED_INDETERMINATE),
+            (
+                _failed("feishu_code_99991672", RosterFailureKind.DEFINITE),
+                SnapshotAlertKind.FAILED_DEFINITE,
+            ),
+            (
+                _failed("transport_error", RosterFailureKind.INDETERMINATE),
+                SnapshotAlertKind.FAILED_INDETERMINATE,
+            ),
         )
         observed = []
         for outcome, expected in cases:
@@ -248,7 +262,9 @@ class AlertClassificationTest(unittest.TestCase):
 
     def test_the_failure_code_and_class_reach_the_audit_facts(self) -> None:
         decision = decide_snapshot_update(
-            _failed("feishu_code_99991672", RosterFailureKind.DEFINITE), previous=_previous(), now=NOW
+            _failed("feishu_code_99991672", RosterFailureKind.DEFINITE),
+            previous=_previous(),
+            now=NOW,
         )
 
         facts = decision.audit_facts()
@@ -283,7 +299,9 @@ class FirstRoundSemanticsTest(unittest.TestCase):
 
     def test_a_snapshot_facts_object_refuses_a_naive_or_empty_snapshot(self) -> None:
         with self.assertRaises(ValueError):
-            StoredSnapshotFacts(snapshot_id="rsn_x", captured_at=datetime(2026, 8, 16, 3, 0), row_count=1)
+            StoredSnapshotFacts(
+                snapshot_id="rsn_x", captured_at=datetime(2026, 8, 16, 3, 0), row_count=1
+            )
         with self.assertRaises(ValueError):
             StoredSnapshotFacts(snapshot_id="rsn_x", captured_at=YESTERDAY, row_count=0)
 
@@ -316,10 +334,14 @@ class SnapshotUpdaterTest(unittest.TestCase):
                 audit = _RecordingAudit()
                 alerts: list[Any] = []
 
-                RosterSnapshotUpdater(store=store, audit=audit, on_alert=alerts.append).apply(outcome, now=NOW)
+                RosterSnapshotUpdater(store=store, audit=audit, on_alert=alerts.append).apply(
+                    outcome, now=NOW
+                )
 
                 self.assertEqual(store.replacements, [], "本轮不可信却写了快照")
-                self.assertEqual([action for action, _ in audit.records], ["roster_snapshot.kept_previous"])
+                self.assertEqual(
+                    [action for action, _ in audit.records], ["roster_snapshot.kept_previous"]
+                )
                 self.assertEqual(len(alerts), 1)
 
     def test_a_complete_round_raises_no_alert(self) -> None:
@@ -339,13 +361,17 @@ class SnapshotUpdaterTest(unittest.TestCase):
         with self.assertRaises(RuntimeError):
             RosterSnapshotUpdater(store=store, audit=audit).apply(_complete(), now=NOW)
 
-        self.assertEqual([action for action, _ in audit.records], ["roster_snapshot.replace_failed"])
+        self.assertEqual(
+            [action for action, _ in audit.records], ["roster_snapshot.replace_failed"]
+        )
         self.assertEqual(audit.records[0][1]["error"], "RuntimeError")
 
     def test_alerting_is_optional_and_its_absence_does_not_drop_the_audit(self) -> None:
         audit = _RecordingAudit()
 
-        RosterSnapshotUpdater(store=_RecordingStore(_previous()), audit=audit).apply(_empty_source(), now=NOW)
+        RosterSnapshotUpdater(store=_RecordingStore(_previous()), audit=audit).apply(
+            _empty_source(), now=NOW
+        )
 
         self.assertEqual([action for action, _ in audit.records], ["roster_snapshot.kept_previous"])
 
@@ -431,7 +457,10 @@ class SnapshotReadbackConsistencyTest(unittest.TestCase):
     def test_rows_lost_to_a_concurrent_replacement_are_rejected_not_returned(self) -> None:
         from lingxi.adapters.postgres_roster_snapshot import RosterSnapshotInconsistent
 
-        for rows, label in (([], "并发替换已删掉旧行"), ([self._db_row("fs-u-0001")], "只回来一部分")):
+        for rows, label in (
+            ([], "并发替换已删掉旧行"),
+            ([self._db_row("fs-u-0001")], "只回来一部分"),
+        ):
             with self.subTest(label=label):
                 store = self._store(self.HEADER, rows)
                 with self.assertRaises(RosterSnapshotInconsistent) as raised:
@@ -480,7 +509,9 @@ class SnapshotAuditDisciplineTest(unittest.TestCase):
     def test_the_decision_module_does_not_import_adapters(self) -> None:
         # 代码框架第二节第 1 条：`core/` 不 import `adapters/`。判定层靠结构取用读取
         # 结果，因此全部断言可以在没有数据库、没有驱动的机器上跑完。
-        source = (SOURCE_ROOT / "lingxi" / "core" / "identity" / "roster_snapshot.py").read_text(encoding="utf-8")
+        source = (SOURCE_ROOT / "lingxi" / "core" / "identity" / "roster_snapshot.py").read_text(
+            encoding="utf-8"
+        )
         for line in source.splitlines():
             stripped = line.strip()
             if stripped.startswith(("import ", "from ")):
@@ -556,7 +587,9 @@ _TIME_TOKENS = (
 # 到期字段与到期触发器是同一件事的另一种写法：不必写 DELETE 也能让快照被按时清掉
 # （数据库设计与迁移 0063 都写明本表**刻意没有** `expires_at`、没有到期触发器）。
 _EXPIRY_COLUMN = re.compile(r"\bexpire[sd]?_at\b", re.IGNORECASE)
-_CREATE_TRIGGER = re.compile(r"\bcreate\s+(or\s+replace\s+)?(constraint\s+)?trigger\b", re.IGNORECASE)
+_CREATE_TRIGGER = re.compile(
+    r"\bcreate\s+(or\s+replace\s+)?(constraint\s+)?trigger\b", re.IGNORECASE
+)
 # 名字层的绊线：SQL 里不带时间词、改由 Python 侧算好时间再删，语句扫描看不见，
 # 但这种入口一定会叫成"清理 / 过期 / 保留期"里的某个词。
 _TIME_DELETION_NAME = re.compile(
@@ -611,7 +644,11 @@ def _literal_texts(tree: ast.AST) -> list[str]:
 
     texts: list[str] = []
     for node in ast.walk(tree):
-        if isinstance(node, ast.Constant) and isinstance(node.value, str) and id(node) not in docstrings:
+        if (
+            isinstance(node, ast.Constant)
+            and isinstance(node.value, str)
+            and id(node) not in docstrings
+        ):
             texts.append(node.value)
         elif isinstance(node, ast.JoinedStr):
             texts.append(
@@ -674,7 +711,9 @@ def _snapshot_units(source: str) -> list[str]:
     出现动态表名本身就该被重新解释，而不是因为"看不出是哪张表"被静默放过。
     """
 
-    return [unit for unit in _ddl_units(source) if _SNAPSHOT_TABLE.search(unit) or INTERPOLATION in unit]
+    return [
+        unit for unit in _ddl_units(source) if _SNAPSHOT_TABLE.search(unit) or INTERPOLATION in unit
+    ]
 
 
 def _time_conditioned_deletes(source: str) -> list[tuple[str, list[str]]]:
@@ -724,14 +763,16 @@ def _violations(source: str) -> dict[str, list]:
 
 
 def _migrations_touching_the_snapshot() -> list[Path]:
-    return sorted(path for path in MIGRATION_DIRECTORY.glob("*.py") if _SNAPSHOT_TABLE.search(_read(path)))
+    return sorted(
+        path for path in MIGRATION_DIRECTORY.glob("*.py") if _SNAPSHOT_TABLE.search(_read(path))
+    )
 
 
 # 合成源码（不落盘）：把扫描器的四个分类器逐个钉住。每条都是一个完整的 Python 模块
 # 文本，因为扫描器读的就是模块——用片段喂它等于测了一个不存在的输入形态。
 _RED_SAMPLES = {
     "SQL 里按时间删": (
-        'PURGE = "DELETE FROM roster_snapshot WHERE captured_at < now() - interval \'48 hours\'"\n',
+        "PURGE = \"DELETE FROM roster_snapshot WHERE captured_at < now() - interval '48 hours'\"\n",
         "按时间删除快照",
     ),
     "表名被插值的按时间删": (
@@ -739,34 +780,34 @@ _RED_SAMPLES = {
         "按时间删除快照",
     ),
     "op.execute 里按时间删": (
-        'def upgrade():\n'
-        '    op.execute("DELETE FROM roster_snapshot WHERE captured_at < now() - interval \'90 days\'")\n',
+        "def upgrade():\n"
+        "    op.execute(\"DELETE FROM roster_snapshot WHERE captured_at < now() - interval '90 days'\")\n",
         "按时间删除快照",
     ),
     "建表时就带到期列": (
         'SQL = """\nCREATE TABLE roster_snapshot (\n'
-        "    id TEXT PRIMARY KEY,\n    expires_at TIMESTAMPTZ NOT NULL\n);\n\"\"\"\n",
+        '    id TEXT PRIMARY KEY,\n    expires_at TIMESTAMPTZ NOT NULL\n);\n"""\n',
         "到期列或到期触发器",
     ),
     "op.add_column 加到期列": (
-        'def upgrade():\n'
+        "def upgrade():\n"
         '    op.add_column("roster_snapshot", sa.Column("expires_at", sa.TIMESTAMP(timezone=True)))\n',
         "到期列或到期触发器",
     ),
     "op.create_table 带到期列": (
-        'def upgrade():\n'
+        "def upgrade():\n"
         '    op.create_table("roster_snapshot", sa.Column("id"), sa.Column("expires_at"))\n',
         "到期列或到期触发器",
     ),
     "到期触发器": (
         'SQL = """\nCREATE TRIGGER roster_snapshot_expiry\n'
         "    BEFORE INSERT ON roster_snapshot\n"
-        "    FOR EACH ROW EXECUTE FUNCTION set_expiry();\n\"\"\"\n",
+        '    FOR EACH ROW EXECUTE FUNCTION set_expiry();\n"""\n',
         "到期列或到期触发器",
     ),
     "CREATE OR REPLACE TRIGGER 形态": (
         'SQL = """\nCREATE OR REPLACE TRIGGER roster_snapshot_expiry\n'
-        "    BEFORE INSERT ON roster_snapshot FOR EACH ROW EXECUTE FUNCTION set_expiry();\n\"\"\"\n",
+        '    BEFORE INSERT ON roster_snapshot FOR EACH ROW EXECUTE FUNCTION set_expiry();\n"""\n',
         "到期列或到期触发器",
     ),
     "按时间清理的入口名": (
@@ -780,7 +821,7 @@ _GREEN_SAMPLES = {
     "ON DELETE CASCADE 是保证不是路径": (
         'SQL = """\nCREATE TABLE roster_snapshot_row (\n'
         "    snapshot_id TEXT NOT NULL REFERENCES roster_snapshot(id) ON DELETE CASCADE,\n"
-        "    row_index INTEGER NOT NULL\n);\n\"\"\"\n"
+        '    row_index INTEGER NOT NULL\n);\n"""\n'
     ),
     "downgrade 整表删除": 'def downgrade():\n    op.drop_table("roster_snapshot")\n',
     "回读语句带时间列但不删东西": (
@@ -868,7 +909,9 @@ class SnapshotHasNoTimeBasedDeletionPathTest(unittest.TestCase):
         任何一种没被提取，到期列与到期触发器那两条断言都会变成一条永远为真的空断言。
         """
 
-        units = [" ".join(unit.split()).lower() for unit in _snapshot_units(_read(SNAPSHOT_MIGRATION))]
+        units = [
+            " ".join(unit.split()).lower() for unit in _snapshot_units(_read(SNAPSHOT_MIGRATION))
+        ]
 
         self.assertTrue(units, "扫描器没从 0063 提取到任何快照 DDL：这一层等于没扫")
         self.assertTrue(
@@ -899,7 +942,9 @@ class SnapshotHasNoTimeBasedDeletionPathTest(unittest.TestCase):
         self.assertIn(SNAPSHOT_MIGRATION, migrations, "0063 不在扫描范围里：扫描目录或表名不对")
         for path in migrations:
             with self.subTest(migration=path.name):
-                self.assertEqual(_time_conditioned_deletes(_read(path)), [], f"{path.name} 按时间删除快照")
+                self.assertEqual(
+                    _time_conditioned_deletes(_read(path)), [], f"{path.name} 按时间删除快照"
+                )
 
     def test_the_snapshot_tables_carry_no_expiry_column_or_trigger(self) -> None:
         """不写 DELETE 也能按时清掉：加一列 `expires_at` 再挂一个到期触发器即可。

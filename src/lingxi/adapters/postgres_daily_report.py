@@ -97,7 +97,10 @@ class PostgresDailyReportSource:
     def active_user_task_counts(self, *, window_start, window_end) -> tuple[int, ...]:
         """窗口内每个活跃用户的任务数——**只有计数，不含 user_id**。"""
 
-        with connect(self._dsn, timeouts=self._timeouts) as connection, connection.cursor() as cursor:
+        with (
+            connect(self._dsn, timeouts=self._timeouts) as connection,
+            connection.cursor() as cursor,
+        ):
             cursor.execute(
                 _ACTIVE_USER_TASK_COUNTS_SQL,
                 {"window_start": window_start, "window_end": window_end},
@@ -110,7 +113,10 @@ class PostgresDailyReportSource:
     def task_outcomes(self, *, window_start, window_end) -> tuple[TaskOutcomeRow, ...]:
         """窗口内按 `(status, error_kind)` 分组的任务计数——哑分组，不做分类判断。"""
 
-        with connect(self._dsn, timeouts=self._timeouts) as connection, connection.cursor() as cursor:
+        with (
+            connect(self._dsn, timeouts=self._timeouts) as connection,
+            connection.cursor() as cursor,
+        ):
             cursor.execute(
                 _TASK_OUTCOME_ROWS_SQL,
                 {"window_start": window_start, "window_end": window_end},
@@ -121,7 +127,10 @@ class PostgresDailyReportSource:
     def task_durations_seconds(self, *, window_start, window_end) -> tuple[float, ...]:
         """窗口内已完成任务的 Agent 执行耗时样本（秒），只统计已经有始末时间的行。"""
 
-        with connect(self._dsn, timeouts=self._timeouts) as connection, connection.cursor() as cursor:
+        with (
+            connect(self._dsn, timeouts=self._timeouts) as connection,
+            connection.cursor() as cursor,
+        ):
             cursor.execute(
                 _TASK_DURATIONS_SQL,
                 {"window_start": window_start, "window_end": window_end},
@@ -141,14 +150,18 @@ class PostgresDailyReportSource:
         计算或假设"应该"是哪一天。
         """
 
-        with connect(self._dsn, timeouts=self._timeouts) as connection, connection.cursor() as cursor:
+        with (
+            connect(self._dsn, timeouts=self._timeouts) as connection,
+            connection.cursor() as cursor,
+        ):
             cursor.execute(
                 _DELIVERY_OUTCOME_ROWS_SQL,
                 {"window_start": window_start, "window_end": window_end},
             )
             rows = cursor.fetchall()
         return tuple(
-            (kind, bool(received), bool(expired), int(count)) for kind, received, expired, count in rows
+            (kind, bool(received), bool(expired), int(count))
+            for kind, received, expired, count in rows
         )
 
     def guard_denied_count_stats(self, *, window_start, window_end) -> tuple[int, int, int]:
@@ -158,7 +171,10 @@ class PostgresDailyReportSource:
         留给 ``core/daily_report.py::build_denied_count_stats``。
         """
 
-        with connect(self._dsn, timeouts=self._timeouts) as connection, connection.cursor() as cursor:
+        with (
+            connect(self._dsn, timeouts=self._timeouts) as connection,
+            connection.cursor() as cursor,
+        ):
             cursor.execute(
                 _GUARD_DENIED_COUNT_STATS_SQL,
                 {"window_start": window_start, "window_end": window_end},
@@ -166,9 +182,7 @@ class PostgresDailyReportSource:
             covered, uncovered, total = cursor.fetchone()
         return int(covered), int(uncovered), int(total)
 
-    def token_usage_stats(
-        self, *, window_start, window_end
-    ) -> tuple[int, int, int, int, int, int]:
+    def token_usage_stats(self, *, window_start, window_end) -> tuple[int, int, int, int, int, int]:
         """窗口内 ``task.token_usage`` 的哑聚合：``(covered_tasks,
         uncovered_tasks, input_tokens, output_tokens,
         cache_creation_input_tokens, cache_read_input_tokens)``。四个 token
@@ -176,7 +190,10 @@ class PostgresDailyReportSource:
         判断留给 ``core/daily_report.py::build_token_usage_stats``。
         """
 
-        with connect(self._dsn, timeouts=self._timeouts) as connection, connection.cursor() as cursor:
+        with (
+            connect(self._dsn, timeouts=self._timeouts) as connection,
+            connection.cursor() as cursor,
+        ):
             cursor.execute(
                 _TOKEN_USAGE_STATS_SQL,
                 {"window_start": window_start, "window_end": window_end},

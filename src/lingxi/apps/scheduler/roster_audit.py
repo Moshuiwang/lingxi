@@ -530,7 +530,9 @@ def _build_roster_snapshot_sync_duty(
         # 真的没有交出任何供给"，不是"这条链还没接线"（Issue #215 之后 `build_loop`
         # 总会建出一条默认供给）；"配了但拿不到令牌"不走这条分支，职责照常注册，
         # 失败发生在运行期并按分类审计。
-        audit.record("roster_snapshot_sync.duty_not_registered", reason="missing_access_token_supply")
+        audit.record(
+            "roster_snapshot_sync.duty_not_registered", reason="missing_access_token_supply"
+        )
         logger.warning("调用方未提供花名册读取令牌供给，花名册快照写入职责不注册")
         return None
 

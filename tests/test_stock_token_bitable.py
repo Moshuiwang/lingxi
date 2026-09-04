@@ -57,7 +57,9 @@ class RecordingTransport:
         return response
 
 
-def _reader(responses: list[object], **kwargs) -> tuple[BitableStockTokenSource, RecordingTransport]:
+def _reader(
+    responses: list[object], **kwargs
+) -> tuple[BitableStockTokenSource, RecordingTransport]:
     transport = RecordingTransport(responses)
     reader = BitableStockTokenSource(
         base_url=BASE_URL,
@@ -112,15 +114,28 @@ class ConstructionTest(unittest.TestCase):
 
 class LookupRawTest(unittest.TestCase):
     def test_no_match_returns_none(self) -> None:
-        reader, _ = _reader([_page([{"record_id": "rec_1", "fields": {"email": "other@x.invalid"}}])])
+        reader, _ = _reader(
+            [_page([{"record_id": "rec_1", "fields": {"email": "other@x.invalid"}}])]
+        )
         self.assertIsNone(reader.lookup_raw(FAKE_EMAIL))
 
     def test_match_with_cipher(self) -> None:
         cipher = "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8gISIjJCUmJygpKissLS4v"
         reader, _ = _reader(
-            [_page([{"record_id": "rec_1", "fields": {
-                "email": FAKE_EMAIL, "token_cipher": cipher, "status": "approved",
-            }}])]
+            [
+                _page(
+                    [
+                        {
+                            "record_id": "rec_1",
+                            "fields": {
+                                "email": FAKE_EMAIL,
+                                "token_cipher": cipher,
+                                "status": "approved",
+                            },
+                        }
+                    ]
+                )
+            ]
         )
         row = reader.lookup_raw(FAKE_EMAIL)
         self.assertEqual(row, RawStockTokenRow(token_cipher=cipher, status="approved"))
@@ -142,10 +157,20 @@ class LookupRawTest(unittest.TestCase):
         """email 多行命中=按错误处理（不猜哪一行）。"""
 
         reader, _ = _reader(
-            [_page([
-                {"record_id": "rec_1", "fields": {"email": FAKE_EMAIL, "token_cipher": "a"}},
-                {"record_id": "rec_2", "fields": {"email": FAKE_EMAIL, "token_cipher": "b"}},
-            ])]
+            [
+                _page(
+                    [
+                        {
+                            "record_id": "rec_1",
+                            "fields": {"email": FAKE_EMAIL, "token_cipher": "a"},
+                        },
+                        {
+                            "record_id": "rec_2",
+                            "fields": {"email": FAKE_EMAIL, "token_cipher": "b"},
+                        },
+                    ]
+                )
+            ]
         )
         with self.assertRaises(StockTokenSourceError) as caught:
             reader.lookup_raw(FAKE_EMAIL)
@@ -169,8 +194,11 @@ class LookupRawTest(unittest.TestCase):
     def test_pagination_follows_the_cursor(self) -> None:
         reader, transport = _reader(
             [
-                _page([{"record_id": "rec_1", "fields": {"email": "other@x.invalid"}}],
-                      has_more=True, page_token="p2"),
+                _page(
+                    [{"record_id": "rec_1", "fields": {"email": "other@x.invalid"}}],
+                    has_more=True,
+                    page_token="p2",
+                ),
                 _page([{"record_id": "rec_2", "fields": {"email": FAKE_EMAIL}}]),
             ]
         )
@@ -264,9 +292,20 @@ class DecryptingSourceTest(unittest.TestCase):
         plaintext = "stock-secret-plaintext-value"
         cipher_text = _cipher_of(plaintext)
         reader, _ = _reader(
-            [_page([{"record_id": "rec_1", "fields": {
-                "email": FAKE_EMAIL, "token_cipher": cipher_text, "status": "approved",
-            }}])]
+            [
+                _page(
+                    [
+                        {
+                            "record_id": "rec_1",
+                            "fields": {
+                                "email": FAKE_EMAIL,
+                                "token_cipher": cipher_text,
+                                "status": "approved",
+                            },
+                        }
+                    ]
+                )
+            ]
         )
         source = DecryptingStockTokenSource(reader, cipher=McpTokenCipher(SPEC_MASTER_KEY))
         result = source.lookup(FAKE_EMAIL)
@@ -279,9 +318,20 @@ class DecryptingSourceTest(unittest.TestCase):
 
         cipher_text = _cipher_of("some-plaintext", key=SPEC_MASTER_KEY)
         reader, _ = _reader(
-            [_page([{"record_id": "rec_1", "fields": {
-                "email": FAKE_EMAIL, "token_cipher": cipher_text, "status": "approved",
-            }}])]
+            [
+                _page(
+                    [
+                        {
+                            "record_id": "rec_1",
+                            "fields": {
+                                "email": FAKE_EMAIL,
+                                "token_cipher": cipher_text,
+                                "status": "approved",
+                            },
+                        }
+                    ]
+                )
+            ]
         )
         source = DecryptingStockTokenSource(reader, cipher=McpTokenCipher(OTHER_MASTER_KEY))
         result = source.lookup(FAKE_EMAIL)
@@ -290,9 +340,19 @@ class DecryptingSourceTest(unittest.TestCase):
 
     def test_corrupted_cipher_text_becomes_decrypt_failed(self) -> None:
         reader, _ = _reader(
-            [_page([{"record_id": "rec_1", "fields": {
-                "email": FAKE_EMAIL, "token_cipher": "not-a-valid-envelope",
-            }}])]
+            [
+                _page(
+                    [
+                        {
+                            "record_id": "rec_1",
+                            "fields": {
+                                "email": FAKE_EMAIL,
+                                "token_cipher": "not-a-valid-envelope",
+                            },
+                        }
+                    ]
+                )
+            ]
         )
         source = DecryptingStockTokenSource(reader, cipher=McpTokenCipher(SPEC_MASTER_KEY))
         self.assertEqual(source.lookup(FAKE_EMAIL).state, DECRYPT_FAILED)
@@ -300,9 +360,19 @@ class DecryptingSourceTest(unittest.TestCase):
     def test_secret_never_appears_in_repr(self) -> None:
         plaintext = "never-logged-plaintext"
         reader, _ = _reader(
-            [_page([{"record_id": "rec_1", "fields": {
-                "email": FAKE_EMAIL, "token_cipher": _cipher_of(plaintext),
-            }}])]
+            [
+                _page(
+                    [
+                        {
+                            "record_id": "rec_1",
+                            "fields": {
+                                "email": FAKE_EMAIL,
+                                "token_cipher": _cipher_of(plaintext),
+                            },
+                        }
+                    ]
+                )
+            ]
         )
         source = DecryptingStockTokenSource(reader, cipher=McpTokenCipher(SPEC_MASTER_KEY))
         result = source.lookup(FAKE_EMAIL)
@@ -317,10 +387,20 @@ class DecryptingSourceTest(unittest.TestCase):
         """源端失败（多行命中/网络异常）不是四态之一，原样上抛给调用方按本侧故障收口。"""
 
         reader, _ = _reader(
-            [_page([
-                {"record_id": "rec_1", "fields": {"email": FAKE_EMAIL, "token_cipher": "a"}},
-                {"record_id": "rec_2", "fields": {"email": FAKE_EMAIL, "token_cipher": "b"}},
-            ])]
+            [
+                _page(
+                    [
+                        {
+                            "record_id": "rec_1",
+                            "fields": {"email": FAKE_EMAIL, "token_cipher": "a"},
+                        },
+                        {
+                            "record_id": "rec_2",
+                            "fields": {"email": FAKE_EMAIL, "token_cipher": "b"},
+                        },
+                    ]
+                )
+            ]
         )
         source = DecryptingStockTokenSource(reader, cipher=McpTokenCipher(SPEC_MASTER_KEY))
         with self.assertRaises(StockTokenSourceError):
@@ -333,13 +413,26 @@ class PermissionsColumnTest(unittest.TestCase):
 
     def test_lookup_raw_carries_the_permissions_text(self) -> None:
         reader, _ = _reader(
-            [_page([{"record_id": "rec_1", "fields": {
-                "email": FAKE_EMAIL, "token_cipher": "c", "status": "approved",
-                "permissions": ' {"*":["*"]} ',
-            }}])]
+            [
+                _page(
+                    [
+                        {
+                            "record_id": "rec_1",
+                            "fields": {
+                                "email": FAKE_EMAIL,
+                                "token_cipher": "c",
+                                "status": "approved",
+                                "permissions": ' {"*":["*"]} ',
+                            },
+                        }
+                    ]
+                )
+            ]
         )
         raw = reader.lookup_raw(FAKE_EMAIL)
-        self.assertEqual(raw, RawStockTokenRow(token_cipher="c", status="approved", permissions='{"*":["*"]}'))
+        self.assertEqual(
+            raw, RawStockTokenRow(token_cipher="c", status="approved", permissions='{"*":["*"]}')
+        )
 
     def test_missing_permissions_cell_reads_as_empty_text(self) -> None:
         reader, _ = _reader(
@@ -349,10 +442,21 @@ class PermissionsColumnTest(unittest.TestCase):
 
     def test_adoptable_lookup_passes_permissions_through(self) -> None:
         reader, _ = _reader(
-            [_page([{"record_id": "rec_1", "fields": {
-                "email": FAKE_EMAIL, "token_cipher": _cipher_of("plain"), "status": "approved",
-                "permissions": '{"88":["m1"]}',
-            }}])]
+            [
+                _page(
+                    [
+                        {
+                            "record_id": "rec_1",
+                            "fields": {
+                                "email": FAKE_EMAIL,
+                                "token_cipher": _cipher_of("plain"),
+                                "status": "approved",
+                                "permissions": '{"88":["m1"]}',
+                            },
+                        }
+                    ]
+                )
+            ]
         )
         source = DecryptingStockTokenSource(reader, cipher=McpTokenCipher(SPEC_MASTER_KEY))
         result = source.lookup(FAKE_EMAIL)
@@ -361,16 +465,41 @@ class PermissionsColumnTest(unittest.TestCase):
 
     def test_only_adoptable_carries_permissions(self) -> None:
         no_cipher_reader, _ = _reader(
-            [_page([{"record_id": "rec_1", "fields": {"email": FAKE_EMAIL, "permissions": '{"88":["m1"]}'}}])]
+            [
+                _page(
+                    [
+                        {
+                            "record_id": "rec_1",
+                            "fields": {"email": FAKE_EMAIL, "permissions": '{"88":["m1"]}'},
+                        }
+                    ]
+                )
+            ]
         )
         failed_reader, _ = _reader(
-            [_page([{"record_id": "rec_1", "fields": {
-                "email": FAKE_EMAIL, "token_cipher": "not-a-valid-envelope", "permissions": '{"88":["m1"]}',
-            }}])]
+            [
+                _page(
+                    [
+                        {
+                            "record_id": "rec_1",
+                            "fields": {
+                                "email": FAKE_EMAIL,
+                                "token_cipher": "not-a-valid-envelope",
+                                "permissions": '{"88":["m1"]}',
+                            },
+                        }
+                    ]
+                )
+            ]
         )
-        for reader, expected_state in ((no_cipher_reader, NO_CIPHER), (failed_reader, DECRYPT_FAILED)):
+        for reader, expected_state in (
+            (no_cipher_reader, NO_CIPHER),
+            (failed_reader, DECRYPT_FAILED),
+        ):
             with self.subTest(state=expected_state):
-                result = DecryptingStockTokenSource(reader, cipher=McpTokenCipher(SPEC_MASTER_KEY)).lookup(FAKE_EMAIL)
+                result = DecryptingStockTokenSource(
+                    reader, cipher=McpTokenCipher(SPEC_MASTER_KEY)
+                ).lookup(FAKE_EMAIL)
                 self.assertEqual(result.state, expected_state)
                 self.assertIsNone(result.permissions)
 

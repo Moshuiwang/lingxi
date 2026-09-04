@@ -133,7 +133,9 @@ class AdminRoleGrantsAllCompaniesAllMetricsTest(unittest.TestCase):
         self.assertTrue(aggregate.all_companies, "银河「全非」授权必须展开为 all_companies=True")
         self.assertEqual(aggregate.companies, ("1011", "1012"))
         self.assertEqual(aggregate.role_count, 1)
-        self.assertEqual(aggregate.unmapped_role_count, 0, "「后台管理员」必须命中角色映射，不是未映射")
+        self.assertEqual(
+            aggregate.unmapped_role_count, 0, "「后台管理员」必须命中角色映射，不是未映射"
+        )
 
     def test_translation_covers_every_company_and_every_metric(self) -> None:
         """聚合结果经真实翻译映射之后：公司维度用 ``"*"`` 通配键覆盖全公司，指标维度
@@ -208,7 +210,12 @@ class AdminRoleWithoutWildcardCompanyScopeStillTranslatesTest(unittest.TestCase)
             user_role_rows=_role_rows(role_id=ADMIN_ROLE_ID, role_name=ADMIN_ROLE_NAME),
             datacountry_rows=[{"user_id": U1_GALAXY_USER_ID, "datacountry_id": "11"}],
             country_rows=[
-                {"country_key": "11", "name": "示例国家", "name_cn": "示例国家", "boss_company_id": "1"},
+                {
+                    "country_key": "11",
+                    "name": "示例国家",
+                    "name_cn": "示例国家",
+                    "boss_company_id": "1",
+                },
             ],
             role_function_map=self.role_function_map,
         )
@@ -256,7 +263,12 @@ class NonAdminFunctionUserIsUnaffectedByTheSpecialCaseTest(unittest.TestCase):
             user_role_rows=_role_rows(role_id="8", role_name="A运营"),
             datacountry_rows=[{"user_id": U1_GALAXY_USER_ID, "datacountry_id": "11"}],
             country_rows=[
-                {"country_key": "11", "name": "示例国家", "name_cn": "示例国家", "boss_company_id": "1"},
+                {
+                    "country_key": "11",
+                    "name": "示例国家",
+                    "name_cn": "示例国家",
+                    "boss_company_id": "1",
+                },
             ],
             role_function_map=self.role_function_map,
         )
@@ -289,9 +301,7 @@ class WithoutTheMappingEntryTheUserWouldStillBeDeniedTest(unittest.TestCase):
 
     def test_before_the_fix_the_role_alone_fails_closed(self) -> None:
         pre_fix_role_function_map = {
-            key: value
-            for key, value in load_role_function_map().items()
-            if key != ADMIN_ROLE_NAME
+            key: value for key, value in load_role_function_map().items() if key != ADMIN_ROLE_NAME
         }
 
         aggregate = aggregate_permission(

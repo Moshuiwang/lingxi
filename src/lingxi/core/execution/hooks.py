@@ -371,8 +371,12 @@ class ToolGateway:
         # 工具里最经得起重放的那一个。
         return not tool_name.startswith("mcp__")
 
-    def _on_pre_tool_use(self, tool_name: Any, tool_input: Any, call_id: str | None) -> dict[str, Any]:
-        verdict = self._policy.decide(tool_name, tool_input if isinstance(tool_input, Mapping) else None)
+    def _on_pre_tool_use(
+        self, tool_name: Any, tool_input: Any, call_id: str | None
+    ) -> dict[str, Any]:
+        verdict = self._policy.decide(
+            tool_name, tool_input if isinstance(tool_input, Mapping) else None
+        )
         if self._raw_pre_tool_use is not None:
             try:
                 self._raw_pre_tool_use(call_id, tool_input)

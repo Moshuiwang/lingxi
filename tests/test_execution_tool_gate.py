@@ -50,7 +50,9 @@ def build_gateway(rules: ResultRules | None = None) -> ToolGateway:
     return ToolGateway(policy=build_policy(), audit=audit)
 
 
-def pre_tool_use(gateway: ToolGateway, tool_name: object, tool_input: object = None, tool_use_id: str = "toolu_1") -> dict:
+def pre_tool_use(
+    gateway: ToolGateway, tool_name: object, tool_input: object = None, tool_use_id: str = "toolu_1"
+) -> dict:
     return asyncio.run(
         gateway.on_hook_event(
             {
@@ -149,7 +151,9 @@ class DenyByDefaultTest(unittest.TestCase):
     def test_approved_skill_is_allowed_but_an_unapproved_skill_name_is_denied(self) -> None:
         policy = build_policy()
 
-        approved = policy.decide("Skill", {"skill": "lingxi-readonly-bi-report", "args": "查询本周收视率"})
+        approved = policy.decide(
+            "Skill", {"skill": "lingxi-readonly-bi-report", "args": "查询本周收视率"}
+        )
         unapproved = policy.decide("Skill", {"skill": "some-other-skill"})
         missing = policy.decide("Skill", {"args": "没有指定 skill"})
 
@@ -161,7 +165,9 @@ class DenyByDefaultTest(unittest.TestCase):
 class DenyReasonTextTest(unittest.TestCase):
     """拒绝理由原样进入模型上下文，因此它的措辞是被断言的产品行为。"""
 
-    def test_reason_tells_the_model_not_to_retry_and_not_to_expose_internal_tool_names(self) -> None:
+    def test_reason_tells_the_model_not_to_retry_and_not_to_expose_internal_tool_names(
+        self,
+    ) -> None:
         verdict = build_policy().decide("CronCreate", {})
 
         self.assertIsNotNone(verdict.model_reason)
@@ -199,12 +205,18 @@ class DenyReasonTextTest(unittest.TestCase):
 class DeniedTurnStillClosesTest(unittest.TestCase):
     """V-执行-03：被拒回合仍取得非空最终正文和恰好一次终止结果。"""
 
-    def test_v_zhixing_03_denied_turn_still_has_final_text_and_exactly_one_terminal_result(self) -> None:
+    def test_v_zhixing_03_denied_turn_still_has_final_text_and_exactly_one_terminal_result(
+        self,
+    ) -> None:
         gateway = build_gateway()
         pre_tool_use(gateway, "Bash", {"command": "ls"}, tool_use_id="toolu_denied")
         pre_tool_use(gateway, "mcp__bi-metric__list_metrics", {}, tool_use_id="toolu_ok")
-        gateway.audit.record_executed(tool_name="mcp__bi-metric__list_metrics", tool_use_id="toolu_ok")
-        gateway.audit.record_tool_result(tool_use_id="toolu_ok", content='{"data": [{"metric": "收视率"}]}')
+        gateway.audit.record_executed(
+            tool_name="mcp__bi-metric__list_metrics", tool_use_id="toolu_ok"
+        )
+        gateway.audit.record_tool_result(
+            tool_use_id="toolu_ok", content='{"data": [{"metric": "收视率"}]}'
+        )
         gateway.audit.record_final_text("已按可用范围回答，其中一部分无法查询。")
         gateway.audit.record_terminal_result()
 
@@ -235,7 +247,9 @@ class ToolFailureAuditTest(unittest.TestCase):
 
     def test_v_zhixing_04_post_tool_use_failure_is_recorded_with_name_input_and_error(self) -> None:
         gateway = build_gateway()
-        pre_tool_use(gateway, "mcp__bi-metric__describe_metric", {"metric": "收视率"}, tool_use_id="toolu_f")
+        pre_tool_use(
+            gateway, "mcp__bi-metric__describe_metric", {"metric": "收视率"}, tool_use_id="toolu_f"
+        )
         asyncio.run(
             gateway.on_hook_event(
                 {
@@ -293,7 +307,9 @@ class ToolFailureAuditTest(unittest.TestCase):
         """V-审计-03 的否定断言：错误原文不经字段白名单，仍不得落下凭据。"""
 
         gateway = build_gateway()
-        pre_tool_use(gateway, "mcp__bi-metric__describe_metric", {"metric": "收视率"}, tool_use_id="toolu_e")
+        pre_tool_use(
+            gateway, "mcp__bi-metric__describe_metric", {"metric": "收视率"}, tool_use_id="toolu_e"
+        )
         asyncio.run(
             gateway.on_hook_event(
                 {
@@ -320,7 +336,7 @@ class ToolFailureAuditTest(unittest.TestCase):
         gateway = build_gateway()
         gateway.audit.record_tool_result(
             tool_use_id="toolu_orphan",
-            content='auth failed: password=hunter2-DO-NOT-LEAK',
+            content="auth failed: password=hunter2-DO-NOT-LEAK",
             is_error=True,
         )
 
@@ -369,10 +385,14 @@ class UngatedCallAuditTest(unittest.TestCase):
     找不到对应记录。若直接丢弃，这次拦截在审计里就彻底消失了。
     """
 
-    def test_v_zhixing_09_error_result_without_a_pre_tool_use_record_is_kept_as_ungated(self) -> None:
+    def test_v_zhixing_09_error_result_without_a_pre_tool_use_record_is_kept_as_ungated(
+        self,
+    ) -> None:
         gateway = build_gateway()
         pre_tool_use(gateway, "mcp__bi-metric__list_metrics", {}, tool_use_id="toolu_ok")
-        gateway.audit.record_tool_result(tool_use_id="toolu_ok", content='{"data": [{"metric": "收视率"}]}')
+        gateway.audit.record_tool_result(
+            tool_use_id="toolu_ok", content='{"data": [{"metric": "收视率"}]}'
+        )
         gateway.audit.record_tool_result(
             tool_use_id="toolu_never_gated",
             content="No such tool available: Write. Write exists but is not enabled in this context.",
@@ -411,7 +431,11 @@ class UngatedCallAuditTest(unittest.TestCase):
         gateway = build_gateway()
         asyncio.run(
             gateway.on_hook_event(
-                {"hook_event_name": "PostToolUse", "tool_name": "Write", "tool_use_id": "toolu_bypass"}
+                {
+                    "hook_event_name": "PostToolUse",
+                    "tool_name": "Write",
+                    "tool_use_id": "toolu_bypass",
+                }
             )
         )
 
@@ -441,7 +465,9 @@ class UngatedCallAuditTest(unittest.TestCase):
 
     def test_a_turn_whose_only_failure_was_ungated_is_not_reported_as_denied_by_us(self) -> None:
         gateway = build_gateway()
-        gateway.audit.record_tool_result(tool_use_id="toolu_x", content="blocked upstream", is_error=True)
+        gateway.audit.record_tool_result(
+            tool_use_id="toolu_x", content="blocked upstream", is_error=True
+        )
 
         summary = gateway.audit.summary()
 
@@ -456,9 +482,16 @@ class BusinessFailureAuditTest(unittest.TestCase):
     def setUp(self) -> None:
         self.rules = ResultRules(failure_text_markers=("指标不存在",))
 
-    def test_v_zhixing_06_business_failure_wrapped_as_a_normal_response_is_not_obtained(self) -> None:
+    def test_v_zhixing_06_business_failure_wrapped_as_a_normal_response_is_not_obtained(
+        self,
+    ) -> None:
         gateway = build_gateway(rules=self.rules)
-        pre_tool_use(gateway, "mcp__bi-metric__describe_metric", {"metric": "不存在的指标"}, tool_use_id="toolu_b")
+        pre_tool_use(
+            gateway,
+            "mcp__bi-metric__describe_metric",
+            {"metric": "不存在的指标"},
+            tool_use_id="toolu_b",
+        )
         asyncio.run(
             gateway.on_hook_event(
                 {
@@ -542,7 +575,10 @@ class MixedTurnResultTest(unittest.TestCase):
             tool_use_id="toolu_catalog", content='{"data": [{"metric": "收视率"}]}'
         )
         pre_tool_use(
-            gateway, "mcp__bi-metric__describe_metric", {"metric": "收视率"}, tool_use_id="toolu_query"
+            gateway,
+            "mcp__bi-metric__describe_metric",
+            {"metric": "收视率"},
+            tool_use_id="toolu_query",
         )
         if record_result:
             gateway.audit.record_tool_result(
@@ -662,8 +698,12 @@ class ParsableButUnrecognisedResultTest(unittest.TestCase):
 
         for payload in ('{"data": [], "items": [1]}', '{"rows": [1], "results": []}'):
             with self.subTest(payload=payload):
-                forward = ResultRules(empty_collection_keys=("data", "rows", "items", "results", "metrics"))
-                reverse = ResultRules(empty_collection_keys=("metrics", "results", "items", "rows", "data"))
+                forward = ResultRules(
+                    empty_collection_keys=("data", "rows", "items", "results", "metrics")
+                )
+                reverse = ResultRules(
+                    empty_collection_keys=("metrics", "results", "items", "rows", "data")
+                )
                 self.assertIs(
                     classify_tool_result(payload, rules=forward),
                     classify_tool_result(payload, rules=reverse),
@@ -872,7 +912,9 @@ class CredentialsNeverReachTheAuditTest(unittest.TestCase):
         gateway = ToolGateway(policy=policy, audit=TurnAudit())
         pre_tool_use(gateway, "mcp__bi_metric__list_metrics_v2", {}, tool_use_id="t1")
 
-        self.assertEqual(gateway.audit.summary().calls[0].tool_name, "mcp__bi_metric__list_metrics_v2")
+        self.assertEqual(
+            gateway.audit.summary().calls[0].tool_name, "mcp__bi_metric__list_metrics_v2"
+        )
 
     def test_useful_error_wording_survives(self) -> None:
         """L4a 靠这段原文才发现规则层拦截；脱敏不能把它抹没。"""
@@ -1062,19 +1104,22 @@ class RawPreToolUseSinkTest(unittest.TestCase):
         received: list[tuple[str | None, object]] = []
         audit = TurnAudit(redactor=AuditRedactor(allowed_input_fields=()))  # 空白名单
         gateway = ToolGateway(
-            policy=build_policy(), audit=audit, raw_pre_tool_use=lambda call_id, tool_input: received.append((call_id, tool_input)),
+            policy=build_policy(),
+            audit=audit,
+            raw_pre_tool_use=lambda call_id, tool_input: received.append((call_id, tool_input)),
         )
 
         pre_tool_use(
-            gateway, "mcp__bi-metric__list_metrics", {"metric": "sk-live-should-survive-here"}, tool_use_id="t1",
+            gateway,
+            "mcp__bi-metric__list_metrics",
+            {"metric": "sk-live-should-survive-here"},
+            tool_use_id="t1",
         )
 
         self.assertEqual(received, [("t1", {"metric": "sk-live-should-survive-here"})])
         # 对照：同一次调用在审计侧因为空白名单被裁成 {"omitted": True}——证明
         # sink 拿到的确实是审计裁剪**之前**的原始值，不是同一份数据的两个引用。
-        self.assertEqual(
-            gateway.audit.summary().calls[0].tool_input["metric"], {"omitted": True}
-        )
+        self.assertEqual(gateway.audit.summary().calls[0].tool_input["metric"], {"omitted": True})
 
     def test_sink_is_invoked_for_denied_calls_too(self) -> None:
         """模型试图调用什么，即使被拒绝，同样是内容级采集要看的信号。"""
@@ -1082,7 +1127,8 @@ class RawPreToolUseSinkTest(unittest.TestCase):
         received: list[tuple[str | None, object]] = []
         gateway = build_gateway()
         gateway_with_sink = ToolGateway(
-            policy=build_policy(), audit=TurnAudit(),
+            policy=build_policy(),
+            audit=TurnAudit(),
             raw_pre_tool_use=lambda call_id, tool_input: received.append((call_id, tool_input)),
         )
         del gateway  # 只是复用 build_policy() 的白名单常量，不复用这个网关实例
@@ -1098,7 +1144,9 @@ class RawPreToolUseSinkTest(unittest.TestCase):
         def failing_sink(call_id: str | None, tool_input: object) -> None:
             raise RuntimeError("模拟采集收集器故障")
 
-        gateway = ToolGateway(policy=build_policy(), audit=TurnAudit(), raw_pre_tool_use=failing_sink)
+        gateway = ToolGateway(
+            policy=build_policy(), audit=TurnAudit(), raw_pre_tool_use=failing_sink
+        )
 
         result = pre_tool_use(gateway, "mcp__bi-metric__list_metrics", {}, tool_use_id="t1")
 
@@ -1125,7 +1173,13 @@ class McpOversizeResultRewriteTest(unittest.TestCase):
         "or use the Read tool to view sections."
     )
 
-    def _post_tool_use(self, gateway: ToolGateway, tool_name: str, tool_response: object, tool_use_id: str = "toolu_big") -> dict:
+    def _post_tool_use(
+        self,
+        gateway: ToolGateway,
+        tool_name: str,
+        tool_response: object,
+        tool_use_id: str = "toolu_big",
+    ) -> dict:
         return asyncio.run(
             gateway.on_hook_event(
                 {
@@ -1288,7 +1342,12 @@ class WrapperDenialFuseTest(unittest.TestCase):
         gateway.set_wrapper_fuse_listener(received.append)
 
         for index in range(WRAPPER_DENIAL_FUSE_THRESHOLD - 1):
-            pre_tool_use(gateway, "Bash", {"command": f"claude mcp call {index}"}, tool_use_id=f"toolu_{index}")
+            pre_tool_use(
+                gateway,
+                "Bash",
+                {"command": f"claude mcp call {index}"},
+                tool_use_id=f"toolu_{index}",
+            )
 
         self.assertEqual(received, [])
         self.assertEqual(gateway.wrapper_denial_count, WRAPPER_DENIAL_FUSE_THRESHOLD - 1)
@@ -1301,7 +1360,12 @@ class WrapperDenialFuseTest(unittest.TestCase):
         gateway.set_wrapper_fuse_listener(received.append)
 
         for index in range(WRAPPER_DENIAL_FUSE_THRESHOLD):
-            pre_tool_use(gateway, "Bash", {"command": f"claude mcp call {index}"}, tool_use_id=f"toolu_{index}")
+            pre_tool_use(
+                gateway,
+                "Bash",
+                {"command": f"claude mcp call {index}"},
+                tool_use_id=f"toolu_{index}",
+            )
 
         self.assertEqual(received, [WRAPPER_DENIAL_FUSE_THRESHOLD])
         self.assertEqual(gateway.wrapper_denial_count, WRAPPER_DENIAL_FUSE_THRESHOLD)
@@ -1316,7 +1380,12 @@ class WrapperDenialFuseTest(unittest.TestCase):
         gateway.set_wrapper_fuse_listener(received.append)
 
         for index in range(WRAPPER_DENIAL_FUSE_THRESHOLD + 3):
-            pre_tool_use(gateway, "Bash", {"command": f"claude mcp call {index}"}, tool_use_id=f"toolu_{index}")
+            pre_tool_use(
+                gateway,
+                "Bash",
+                {"command": f"claude mcp call {index}"},
+                tool_use_id=f"toolu_{index}",
+            )
 
         self.assertEqual(received, [WRAPPER_DENIAL_FUSE_THRESHOLD])
         self.assertEqual(gateway.wrapper_denial_count, WRAPPER_DENIAL_FUSE_THRESHOLD + 3)
@@ -1349,7 +1418,9 @@ class WrapperDenialFuseTest(unittest.TestCase):
         gateway.set_wrapper_fuse_listener(received.append)
 
         for index in range(WRAPPER_DENIAL_FUSE_THRESHOLD + 5):
-            pre_tool_use(gateway, "mcp__bi-metric__list_metrics", {}, tool_use_id=f"toolu_ok_{index}")
+            pre_tool_use(
+                gateway, "mcp__bi-metric__list_metrics", {}, tool_use_id=f"toolu_ok_{index}"
+            )
 
         self.assertEqual(received, [])
         self.assertEqual(gateway.wrapper_denial_count, 0)
@@ -1371,10 +1442,16 @@ class WrapperDenialFuseTest(unittest.TestCase):
 
         for index in range(WRAPPER_DENIAL_FUSE_THRESHOLD - 1):
             pre_tool_use(gateway, "Bash", {"command": f"b{index}"}, tool_use_id=f"toolu_b{index}")
-        self.assertEqual(received, [WRAPPER_DENIAL_FUSE_THRESHOLD], "还没到新一轮的阈值，不应再次触发")
+        self.assertEqual(
+            received, [WRAPPER_DENIAL_FUSE_THRESHOLD], "还没到新一轮的阈值，不应再次触发"
+        )
 
         pre_tool_use(gateway, "Bash", {"command": "final"}, tool_use_id="toolu_final")
-        self.assertEqual(received, [WRAPPER_DENIAL_FUSE_THRESHOLD, WRAPPER_DENIAL_FUSE_THRESHOLD], "新一轮满阈值后必须能再次触发")
+        self.assertEqual(
+            received,
+            [WRAPPER_DENIAL_FUSE_THRESHOLD, WRAPPER_DENIAL_FUSE_THRESHOLD],
+            "新一轮满阈值后必须能再次触发",
+        )
 
     def test_listener_exception_does_not_break_the_gating_decision(self) -> None:
         """通知失败不得影响工具判定本身——与 ``_mark_side_effect``/其它监听器
@@ -1387,7 +1464,9 @@ class WrapperDenialFuseTest(unittest.TestCase):
         gateway.set_wrapper_fuse_listener(failing_listener)
 
         for index in range(WRAPPER_DENIAL_FUSE_THRESHOLD):
-            result = pre_tool_use(gateway, "Bash", {"command": f"c{index}"}, tool_use_id=f"toolu_c{index}")
+            result = pre_tool_use(
+                gateway, "Bash", {"command": f"c{index}"}, tool_use_id=f"toolu_c{index}"
+            )
             self.assertEqual(deny_decision(result), "deny", "监听器异常不得影响拒绝判定本身")
 
         self.assertEqual(gateway.wrapper_denial_count, WRAPPER_DENIAL_FUSE_THRESHOLD)
@@ -1414,7 +1493,9 @@ class WrapperDenialFuseTest(unittest.TestCase):
         gateway = build_gateway()
 
         for index in range(WRAPPER_DENIAL_FUSE_THRESHOLD):
-            result = pre_tool_use(gateway, "Bash", {"command": f"e{index}"}, tool_use_id=f"toolu_e{index}")
+            result = pre_tool_use(
+                gateway, "Bash", {"command": f"e{index}"}, tool_use_id=f"toolu_e{index}"
+            )
             self.assertEqual(deny_decision(result), "deny")
 
     def test_a_lower_threshold_can_be_configured_for_fast_tests(self) -> None:
@@ -1455,7 +1536,9 @@ class WrapperDenialFuseTest(unittest.TestCase):
 
         self.assertEqual(received, [], "已有放行的原生调用，不应触发熔断")
         self.assertEqual(
-            gateway.wrapper_denial_count, WRAPPER_DENIAL_FUSE_THRESHOLD, "拒绝次数仍如实累计，只是不触发熔断"
+            gateway.wrapper_denial_count,
+            WRAPPER_DENIAL_FUSE_THRESHOLD,
+            "拒绝次数仍如实累计，只是不触发熔断",
         )
 
     def test_a_granted_native_mcp_call_after_the_trip_does_not_retract_it(self) -> None:
@@ -1500,12 +1583,16 @@ class WrapperDenialFuseTest(unittest.TestCase):
         self.assertEqual(gateway.granted_mcp_count, 1)
 
         gateway.reset_wrapper_denial_fuse()
-        self.assertEqual(gateway.granted_mcp_count, 0, "回合边界必须清零合取项计数，不能带着上一次尝试的痕迹")
+        self.assertEqual(
+            gateway.granted_mcp_count, 0, "回合边界必须清零合取项计数，不能带着上一次尝试的痕迹"
+        )
 
         for index in range(WRAPPER_DENIAL_FUSE_THRESHOLD):
             pre_tool_use(gateway, "Bash", {"command": f"h{index}"}, tool_use_id=f"toolu_h{index}")
 
-        self.assertEqual(received, [WRAPPER_DENIAL_FUSE_THRESHOLD], "清零之后新一轮达到阈值必须正常触发")
+        self.assertEqual(
+            received, [WRAPPER_DENIAL_FUSE_THRESHOLD], "清零之后新一轮达到阈值必须正常触发"
+        )
 
 
 if __name__ == "__main__":

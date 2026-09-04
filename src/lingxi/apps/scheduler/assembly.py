@@ -122,12 +122,12 @@ def _build_management_correction_callback(
             return
 
         digest = hashlib.sha256("\n".join(message_ids).encode("utf-8")).hexdigest()[:16]
-        dedupe_key = (
-            f"management-correction:{datetime.now(UTC).date().isoformat()}:{digest}"
+        dedupe_key = f"management-correction:{datetime.now(UTC).date().isoformat()}:{digest}"
+        text = (
+            default_content_catalog()
+            .text("permission.management_correction_summary", count=len(message_ids))
+            .text
         )
-        text = default_content_catalog().text(
-            "permission.management_correction_summary", count=len(message_ids)
-        ).text
         try:
             sender.send_text(
                 chat_id=config.admin_group_chat_id,
@@ -258,9 +258,7 @@ def build_loop(
     permission_retention = _build_permission_retention_duty(config, stop=stop, audit=sink)
     # 内测轮采集内容的九十天到期删除（对抗审查 2026-09-02 C-7）。与上面几条清理同组，
     # 无条件装配：删自己库里的到期内容只需要连接串。生产该表恒空，这条每轮删 0 行。
-    content_capture_retention = _build_content_capture_retention_duty(
-        config, stop=stop, audit=sink
-    )
+    content_capture_retention = _build_content_capture_retention_duty(config, stop=stop, audit=sink)
 
     duties: list[Any] = [
         rotation,
@@ -308,6 +306,7 @@ def build_loop(
     # 那条依赖凭据轮换职责先跑起来，应用身份没有"还没轮换过一次"这种中间状态。挪到每日
     # 重算之前构造：重算与发布面共用同一条供给、同一张表。
     from lingxi.adapters.feishu_tenant_token import FeishuTenantTokenClient
+
     permission_table_supply = (
         permission_table_access_token
         if permission_table_access_token is not None
@@ -387,7 +386,9 @@ def build_loop(
         employment_access_token=supply,
         metric_translation_map=metric_translation_map,
         permission_publish=permission_publish,
-        stock_tokens=build_stock_token_source(config, access_token=permission_table_supply, audit=sink),
+        stock_tokens=build_stock_token_source(
+            config, access_token=permission_table_supply, audit=sink
+        ),
         onboarding_failed=(
             alerting_duty.onboarding_failed_callback() if alerting_duty is not None else None
         ),
@@ -430,13 +431,13 @@ def build_loop(
             stop=stop,
             audit=sink,
             alert=(
-                alerting_duty.onboarding_stalled_callback()
-                if alerting_duty is not None
-                else None
+                alerting_duty.onboarding_stalled_callback() if alerting_duty is not None else None
             ),
         )
     )
-    _wire_document_delivery_maintenance_duty(duties, config, stop=stop, audit=sink, alerting_duty=alerting_duty)
+    _wire_document_delivery_maintenance_duty(
+        duties, config, stop=stop, audit=sink, alerting_duty=alerting_duty
+    )
     if alerting_duty is not None:
         duties.append(alerting_duty)
         if heartbeat is None:

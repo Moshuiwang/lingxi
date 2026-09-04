@@ -362,10 +362,15 @@ class PostgresPermissionPublishStore:
                     permissions_changed = latest is None or _permissions_changed(
                         latest[1], latest[4], row
                     )
-                    if latest is not None and _same_content(latest[1], latest[3], row) and latest[2] in (
-                        "pending",
-                        "publishing",
-                        "published",
+                    if (
+                        latest is not None
+                        and _same_content(latest[1], latest[3], row)
+                        and latest[2]
+                        in (
+                            "pending",
+                            "publishing",
+                            "published",
+                        )
                     ):
                         cursor.execute(
                             "UPDATE app_user SET permission_checked_at = %s, updated_at = now() "
@@ -405,9 +410,9 @@ class PostgresPermissionPublishStore:
                     # ``permissions_changed`` 收窄（Trace #328 opus 审查 P1）：
                     # ENQUEUED 但 permissions 列文本没变时（改名重发、失败重排同
                     # 内容）不清——见方法文档第 4 步的完整理由。
-                    cleared_events = _ConversationTransaction(connection).clear_delivered_content_for_user(
-                        user_id=user_id, reason="user_cleared"
-                    )
+                    cleared_events = _ConversationTransaction(
+                        connection
+                    ).clear_delivered_content_for_user(user_id=user_id, reason="user_cleared")
                     # 用户记忆同一姿态一并清除（Issue #357 S-H3-3 c 节）：同一个
                     # 已持有的 connection/事务，version 推进、发布意图入队与本次
                     # 清除失败一起回滚，不产生"权限已变、记忆却还在"的半套状态。
@@ -558,9 +563,7 @@ class PostgresPermissionPublishStore:
                     return None
                 # 当前权限版本在**同一个事务**里读，与认领是同一时刻的事实；分成两次
                 # 连接会让「认领到的是不是最新版本」建立在两个不同时刻的观察上。
-                cursor.execute(
-                    "SELECT permission_version FROM app_user WHERE id = %s", (row[1],)
-                )
+                cursor.execute("SELECT permission_version FROM app_user WHERE id = %s", (row[1],))
                 current = cursor.fetchone()
         return ClaimedPublish(
             outbox_id=str(row[0]),
@@ -614,7 +617,10 @@ class PostgresPermissionPublishStore:
         # 时保持 NULL：那时我们无法把"自己建的"与"并发写入方建的"区分开，重试按普通
         # 路径收敛，就绪探针是最终的门。
         created = attempt.external_record_id if attempt.action == "create" else None
-        with connect(self._dsn, timeouts=self._timeouts) as connection, connection.cursor() as cursor:
+        with (
+            connect(self._dsn, timeouts=self._timeouts) as connection,
+            connection.cursor() as cursor,
+        ):
             cursor.execute(
                 """UPDATE publish_outbox
                       SET status = %(status)s,
@@ -637,9 +643,7 @@ class PostgresPermissionPublishStore:
                 },
             )
             if cursor.rowcount != 1:
-                raise PublishClaimLost(
-                    f"发布意图记账失败，认领已丢失：outbox={attempt.outbox_id}"
-                )
+                raise PublishClaimLost(f"发布意图记账失败，认领已丢失：outbox={attempt.outbox_id}")
 
     def reclaim_stale(self, *, older_than: timedelta = DEFAULT_RECLAIM_AFTER) -> int:
         """把卡在 ``publishing`` 超过 ``older_than`` 的意图放回 ``pending``，返回条数。
@@ -650,7 +654,10 @@ class PostgresPermissionPublishStore:
 
         if not isinstance(older_than, timedelta) or older_than <= timedelta(0):
             raise ValueError("回收阈值必须是正的时间间隔")
-        with connect(self._dsn, timeouts=self._timeouts) as connection, connection.cursor() as cursor:
+        with (
+            connect(self._dsn, timeouts=self._timeouts) as connection,
+            connection.cursor() as cursor,
+        ):
             cursor.execute(
                 """UPDATE publish_outbox
                       SET status = 'pending', claimed_at = NULL, last_outcome = 'reclaimed'
@@ -678,7 +685,10 @@ class PostgresPermissionPublishStore:
             raise ValueError("到期判定时间必须带时区")
         if isinstance(limit, bool) or not isinstance(limit, int) or limit < 1:
             raise ValueError("limit 必须是正整数")
-        with connect(self._dsn, timeouts=self._timeouts) as connection, connection.cursor() as cursor:
+        with (
+            connect(self._dsn, timeouts=self._timeouts) as connection,
+            connection.cursor() as cursor,
+        ):
             cursor.execute(
                 """UPDATE publish_outbox
                       SET payload = '{}'::jsonb, last_error = NULL
@@ -761,7 +771,10 @@ class PostgresPermissionPublishStore:
         if not wanted:
             raise ValueError("必须指明本调用方负责确认哪些 reason 的发布意图")
         terminal = sorted(item.value for item in TERMINAL_OUTCOMES)
-        with connect(self._dsn, timeouts=self._timeouts) as connection, connection.cursor() as cursor:
+        with (
+            connect(self._dsn, timeouts=self._timeouts) as connection,
+            connection.cursor() as cursor,
+        ):
             cursor.execute(
                 """SELECT o.user_id, o.permission_version, o.payload ->> 'permissions',
                           o.published_at
@@ -841,7 +854,10 @@ class PostgresPermissionPublishStore:
 
         if not isinstance(user_id, str) or not user_id.strip():
             raise ValueError("发布足迹判定必须指明用户")
-        with connect(self._dsn, timeouts=self._timeouts) as connection, connection.cursor() as cursor:
+        with (
+            connect(self._dsn, timeouts=self._timeouts) as connection,
+            connection.cursor() as cursor,
+        ):
             cursor.execute(
                 """SELECT 1 FROM publish_outbox
                     WHERE user_id = %s
@@ -882,7 +898,10 @@ class PostgresPermissionPublishStore:
 
         if not isinstance(user_id, str) or not user_id.strip():
             raise ValueError("通知收件人查询必须指明用户")
-        with connect(self._dsn, timeouts=self._timeouts) as connection, connection.cursor() as cursor:
+        with (
+            connect(self._dsn, timeouts=self._timeouts) as connection,
+            connection.cursor() as cursor,
+        ):
             cursor.execute(
                 """SELECT feishu_open_id
                      FROM app_user
@@ -900,7 +919,10 @@ class PostgresPermissionPublishStore:
     def load(self, outbox_id: str) -> StoredIntent | None:
         """回读一条意图。给运维排查与用例断言用，不在发布链路上。"""
 
-        with connect(self._dsn, timeouts=self._timeouts) as connection, connection.cursor() as cursor:
+        with (
+            connect(self._dsn, timeouts=self._timeouts) as connection,
+            connection.cursor() as cursor,
+        ):
             cursor.execute(
                 """SELECT id, user_id, permission_version, reason, payload, status, attempts,
                           last_outcome, last_error, external_record_id, published_at
@@ -996,7 +1018,10 @@ class PostgresPermissionRefreshBaselineReader:
         只是行集合按 :data:`PERMISSION_REFRESH_BASELINE_SQL` 多排除 ``suspended``。
         """
 
-        with connect(self._dsn, timeouts=self._timeouts) as connection, connection.cursor() as cursor:
+        with (
+            connect(self._dsn, timeouts=self._timeouts) as connection,
+            connection.cursor() as cursor,
+        ):
             cursor.execute(PERMISSION_REFRESH_BASELINE_SQL)
             rows = cursor.fetchall()
 

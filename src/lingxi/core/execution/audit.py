@@ -238,7 +238,9 @@ class TurnAudit:
     调用方（worker）负责把 hook 回调和 SDK 消息流分别喂进来；本类不感知 SDK 类型。
     """
 
-    def __init__(self, *, rules: ResultRules | None = None, redactor: AuditRedactor | None = None) -> None:
+    def __init__(
+        self, *, rules: ResultRules | None = None, redactor: AuditRedactor | None = None
+    ) -> None:
         self._rules = rules or ResultRules()
         self._redactor = redactor or AuditRedactor()
         self.start_turn()
@@ -341,7 +343,9 @@ class TurnAudit:
 
     # ---- 来源三：解析工具回执 ----
 
-    def record_tool_result(self, *, tool_use_id: str | None, content: Any, is_error: Any = None) -> ToolResultKind:
+    def record_tool_result(
+        self, *, tool_use_id: str | None, content: Any, is_error: Any = None
+    ) -> ToolResultKind:
         """解析 SDK 消息流里的工具回执，判定用户这一次到底拿到了什么。
 
         找不到对应 ``PreToolUse`` 记录的失败回执**不丢弃**，而是记成一条"本层未判定"
@@ -433,7 +437,12 @@ class TurnAudit:
         # 没有回执（result_kind is None）与无法归类同样是"证据不足"，不是成功。
         inconclusive = any(kind is None or kind is ToolResultKind.UNCLASSIFIED for kind in kinds)
         failed = any(
-            kind in {ToolResultKind.TOOL_ERROR, ToolResultKind.BUSINESS_FAILURE, ToolResultKind.EMPTY_RESULT}
+            kind
+            in {
+                ToolResultKind.TOOL_ERROR,
+                ToolResultKind.BUSINESS_FAILURE,
+                ToolResultKind.EMPTY_RESULT,
+            }
             for kind in kinds
         )
         if inconclusive:
@@ -464,7 +473,9 @@ class TurnAudit:
             # 白名单来说，"模型试图调用什么"是最重要的那条审计事实，抹掉它等于
             # 让屏障的留痕失去用处。代价是模型若把凭据当成工具名发出来，它会原样
             # 落进审计——这条已知残余缺口见 `V-审计-03`，由产品负责人知情接受。
-            "tool_name": tool_name if is_well_formed_tool_name(tool_name) else _redact_free_text(tool_name),
+            "tool_name": tool_name
+            if is_well_formed_tool_name(tool_name)
+            else _redact_free_text(tool_name),
             "tool_input": self._redactor.redact(tool_input),
             "allowed": allowed,
             "deny_reason_code": None,
@@ -493,12 +504,16 @@ class TurnAudit:
         candidates = [
             record
             for record in self._calls
-            if record["tool_name"] == tool_name and record["allowed"] is True and record["result_kind"] is None
+            if record["tool_name"] == tool_name
+            and record["allowed"] is True
+            and record["result_kind"] is None
         ]
         return candidates[0] if len(candidates) == 1 else None
 
 
-def classify_tool_result(content: Any, *, is_error: Any = None, rules: ResultRules | None = None) -> ToolResultKind:
+def classify_tool_result(
+    content: Any, *, is_error: Any = None, rules: ResultRules | None = None
+) -> ToolResultKind:
     """把一次工具回执归类。
 
     ``is_error`` 为真时直接是工具错误；否则按结构化规则判断业务失败与空结果。

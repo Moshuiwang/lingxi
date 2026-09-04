@@ -128,7 +128,9 @@ class SnapshotCarrierTest(RosterSnapshotPostgresTestCase):
         first = self.store.load_facts()
 
         later = NOW + timedelta(days=1)
-        self.store.replace((_row("fs-u-0009", record_id="rec-0009"),), _integrity(1), captured_at=later)
+        self.store.replace(
+            (_row("fs-u-0009", record_id="rec-0009"),), _integrity(1), captured_at=later
+        )
 
         assert first is not None
         self.assertEqual(self._counts(), (1, 1))
@@ -189,7 +191,9 @@ class AtomicReplacementTest(RosterSnapshotPostgresTestCase):
         with mock.patch.object(postgres_roster_snapshot, "INSERT_ROW_SQL", broken):
             with self.assertRaises(Exception):
                 self.store.replace(
-                    (_row("fs-u-0009", record_id="rec-0009"),), _integrity(1), captured_at=NOW + timedelta(days=1)
+                    (_row("fs-u-0009", record_id="rec-0009"),),
+                    _integrity(1),
+                    captured_at=NOW + timedelta(days=1),
                 )
 
         after = self.store.load()
@@ -205,7 +209,9 @@ class AtomicReplacementTest(RosterSnapshotPostgresTestCase):
         broken = "INSERT INTO roster_snapshot (id, no_such_column) VALUES (%s, %s)"
         with mock.patch.object(postgres_roster_snapshot, "INSERT_SNAPSHOT_SQL", broken):
             with self.assertRaises(Exception):
-                self.store.replace((_row("fs-u-0009"),), _integrity(1), captured_at=NOW + timedelta(days=1))
+                self.store.replace(
+                    (_row("fs-u-0009"),), _integrity(1), captured_at=NOW + timedelta(days=1)
+                )
 
         after = self.store.load()
         assert after is not None

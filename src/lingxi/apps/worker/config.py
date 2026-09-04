@@ -90,7 +90,9 @@ OUTPUT_SAFETY_CANARY_MODES = ("masked", "withheld")
 # 自述身份，用户侧一旦看到就知道这一轮是受控验收注入，不是真实业务结论。改动
 # 此句前先确认它仍不含任何已知敏感模式（系统提示标记、mcp__ 工具名形态等），
 # 否则 masked 档位的"幸存句必然幸存"前提会被自己打破。
-OUTPUT_SAFETY_CANARY_SURVIVOR_BODY = "受控验收合成正文：本句由输出安全注入夹具生成，保留可展示的业务结论。"
+OUTPUT_SAFETY_CANARY_SURVIVOR_BODY = (
+    "受控验收合成正文：本句由输出安全注入夹具生成，保留可展示的业务结论。"
+)
 
 # 内测轮内容级采集（Issue #251/#304 批次 3）：两个裸变量名，**不带**
 # ``LINGXI_WORKER_`` 前缀——与 ``LINGXI_USER_ENV_ROOT``/
@@ -255,8 +257,7 @@ class WorkerConfig:
             or not 1 <= self.max_concurrency <= MAX_CONCURRENCY_HARD_LIMIT
         ):
             raise WorkerConfigError(
-                "max_concurrency 必须在 1 到 "
-                f"{MAX_CONCURRENCY_HARD_LIMIT} 之间（产品并发上限）"
+                f"max_concurrency 必须在 1 到 {MAX_CONCURRENCY_HARD_LIMIT} 之间（产品并发上限）"
             )
         # canary 的**全部**不变量放在类型自身而不是只放在 load_config（独立审核
         # F7，PR #186 补审 P2-2）：直接构造 WorkerConfig 是文档支持的测试/嵌入
@@ -348,9 +349,7 @@ def load_config(
         worker_version_unavailable_seconds=_duration(
             env, "WORKER_VERSION_UNAVAILABLE_SECONDS", 180.0
         ),
-        running_heartbeat_timeout_seconds=_duration(
-            env, "RUNNING_HEARTBEAT_TIMEOUT_SECONDS", 90.0
-        ),
+        running_heartbeat_timeout_seconds=_duration(env, "RUNNING_HEARTBEAT_TIMEOUT_SECONDS", 90.0),
         heartbeat_interval_seconds=_duration(env, "HEARTBEAT_INTERVAL_SECONDS", 30.0),
         stop_poll_interval_seconds=_duration(env, "STOP_POLL_INTERVAL_SECONDS", 1.0),
         poll_interval_seconds=_duration(env, "POLL_INTERVAL_SECONDS", 2.0),
@@ -369,9 +368,7 @@ def load_config(
         session_reclaim_min_age_seconds=_duration(
             env, "SESSION_RECLAIM_MIN_AGE_SECONDS", DEFAULT_SESSION_RECLAIM_MIN_AGE_SECONDS
         ),
-        session_reclaim_interval_seconds=_duration(
-            env, "SESSION_RECLAIM_INTERVAL_SECONDS", 60.0
-        ),
+        session_reclaim_interval_seconds=_duration(env, "SESSION_RECLAIM_INTERVAL_SECONDS", 60.0),
         user_env_root=_user_env_root(env),
         system_prompt_file=system_prompt_file,
         innertest_content_capture_enabled=content_capture_enabled,
@@ -571,7 +568,9 @@ def _innertest_content_capture(env: Mapping[str, str]) -> tuple[bool, bool]:
     if not flag:
         return False, False
     if flag != "1":
-        raise WorkerConfigError(f'环境变量 {CONTENT_CAPTURE_FLAG_VAR} 只接受精确值 "1"（不回显收到的值）')
+        raise WorkerConfigError(
+            f'环境变量 {CONTENT_CAPTURE_FLAG_VAR} 只接受精确值 "1"（不回显收到的值）'
+        )
     if declares_production(env):
         # 代码侧兜底（C-7）：环境自称是生产，采集**一律不生效**，两个变量配得
         # 再对也不行。`misconfigured=True` 让 `apps/worker/cli.py` 打一条显眼的
@@ -592,7 +591,9 @@ def declares_production(env: Mapping[str, str]) -> bool:
     是谁，并把这份声明放在入库的 compose 文件里，使它不能被一份抄来的 env 文件覆盖。
     """
 
-    return (env.get(DEPLOY_ENVIRONMENT_VAR) or "").strip().casefold() in PRODUCTION_ENVIRONMENT_VALUES
+    return (
+        env.get(DEPLOY_ENVIRONMENT_VAR) or ""
+    ).strip().casefold() in PRODUCTION_ENVIRONMENT_VALUES
 
 
 def _document_delivery_enabled(env: Mapping[str, str]) -> bool:
@@ -606,7 +607,7 @@ def _document_delivery_enabled(env: Mapping[str, str]) -> bool:
         return False
     if flag != "1":
         raise WorkerConfigError(
-            f"{ENV_PREFIX}{DOCUMENT_DELIVERY_ENABLED_VAR} 只接受精确值 \"1\"（不回显收到的值）"
+            f'{ENV_PREFIX}{DOCUMENT_DELIVERY_ENABLED_VAR} 只接受精确值 "1"（不回显收到的值）'
         )
     return True
 
@@ -667,14 +668,11 @@ def _validate_output_safety_canary(
         # 不回显收到的值（独立审核 F9，同 _validated_trace_id 与 gateway 卡片
         # 注入开关的既有纪律）：误接进来的可能是口令或提示词原文。
         raise WorkerConfigError(
-            f"{mode_label} 只允许 "
-            + " / ".join(OUTPUT_SAFETY_CANARY_MODES)
-            + "（收到的值不回显）"
+            f"{mode_label} 只允许 " + " / ".join(OUTPUT_SAFETY_CANARY_MODES) + "（收到的值不回显）"
         )
     if not system_prompt:
         raise WorkerConfigError(
-            f"{mode_label} 需要同时配置 {prompt_label}"
-            "（合成 canary 提示是注入内容的唯一来源）"
+            f"{mode_label} 需要同时配置 {prompt_label}（合成 canary 提示是注入内容的唯一来源）"
         )
     # 子串守卫，**双向**（独立审核 F2 实证复现 + PR #186 补审 P2-3）：
     # - 合成提示是受保护文本的子串：出口约束的终态自检
@@ -717,7 +715,9 @@ def _json(raw: str, name: str) -> Any:
         return json.loads(raw)
     except ValueError as error:
         # 原文可能含连接串或令牌，只回报错误位置，不回显内容。
-        raise WorkerConfigError(f"{ENV_PREFIX}{name} 不是合法 JSON：{error.__class__.__name__}") from None
+        raise WorkerConfigError(
+            f"{ENV_PREFIX}{name} 不是合法 JSON：{error.__class__.__name__}"
+        ) from None
 
 
 def _validated_trace_id(value: str) -> str:
@@ -727,7 +727,9 @@ def _validated_trace_id(value: str) -> str:
         return new_ulid()
     if not is_ulid(value):
         # 不回显收到的值：误接进来的可能是令牌。
-        raise WorkerConfigError("LINGXI_WORKER_TRACE_ID 必须是 26 位 Crockford ULID（收到的值不回显）")
+        raise WorkerConfigError(
+            "LINGXI_WORKER_TRACE_ID 必须是 26 位 Crockford ULID（收到的值不回显）"
+        )
     return value
 
 
@@ -794,9 +796,7 @@ def _max_turns(value: str) -> int:
     except ValueError as error:
         raise WorkerConfigError("LINGXI_WORKER_MAX_TURNS 必须是正整数") from error
     if turns <= 0 or turns > MAX_TURNS_HARD_LIMIT:
-        raise WorkerConfigError(
-            f"LINGXI_WORKER_MAX_TURNS 必须在 1 到 {MAX_TURNS_HARD_LIMIT} 之间"
-        )
+        raise WorkerConfigError(f"LINGXI_WORKER_MAX_TURNS 必须在 1 到 {MAX_TURNS_HARD_LIMIT} 之间")
     return turns
 
 

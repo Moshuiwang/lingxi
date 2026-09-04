@@ -52,9 +52,11 @@ class GatewayDeliveryConsumerReuseWiringTests(unittest.TestCase):
         saved = sys.modules.get("lark_oapi")
         sys.modules["lark_oapi"] = module
         self.addCleanup(
-            lambda: sys.modules.__setitem__("lark_oapi", saved)
-            if saved is not None
-            else sys.modules.pop("lark_oapi", None)
+            lambda: (
+                sys.modules.__setitem__("lark_oapi", saved)
+                if saved is not None
+                else sys.modules.pop("lark_oapi", None)
+            )
         )
 
     def test_the_self_built_queue_has_polling_connection_reuse_enabled(self) -> None:
@@ -97,9 +99,7 @@ class WorkerQueueModeReuseWiringTests(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as directory:
             stdout, stderr = io.StringIO(), io.StringIO()
-            with mock.patch(
-                "lingxi.apps.worker.cli._run_queue_worker", _stub_run_queue_worker
-            ):
+            with mock.patch("lingxi.apps.worker.cli._run_queue_worker", _stub_run_queue_worker):
                 code = main(
                     env={
                         "LINGXI_WORKER_MODE": "queue",

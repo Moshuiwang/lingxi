@@ -50,6 +50,7 @@ def as_documents(text_or_documents: str | dict[str, str]) -> dict[str, str]:
         return {MATRIX_DOCUMENT.name: text_or_documents}
     return text_or_documents
 
+
 # 验收矩阵定义的三态。状态列只允许这三个词，多一个同义词就等于多一套不受检查的语义。
 ASSERTION_STATES = ("未认领", "已认领", "已验证")
 MATRIX_HEADER = ("#", "可验证断言", "层级", "状态")
@@ -196,7 +197,9 @@ def parse_coverage(
             where = f"{source} 第 {line_number} 行"
             found_table = True
             if len(cells) != len(COVERAGE_HEADER):
-                errors.append(f"{where}：覆盖清单行有 {len(cells)} 格，应为 {len(COVERAGE_HEADER)} 格")
+                errors.append(
+                    f"{where}：覆盖清单行有 {len(cells)} 格，应为 {len(COVERAGE_HEADER)} 格"
+                )
                 continue
 
             section, raw_references, note = cells
@@ -278,7 +281,9 @@ def cross_check(
         )
     unknown = sorted(set(coverage) - set(sections))
     if unknown:
-        errors.append("覆盖清单登记了产品合同里不存在的章节（章节改名后未同步？）：" + "、".join(unknown))
+        errors.append(
+            "覆盖清单登记了产品合同里不存在的章节（章节改名后未同步？）：" + "、".join(unknown)
+        )
 
     for section, (identifiers, _) in coverage.items():
         for identifier in identifiers:
@@ -319,7 +324,8 @@ def main() -> int:
         return 1
 
     counted = "，".join(
-        f"{state} {sum(1 for value in statuses.values() if value == state)}" for state in ASSERTION_STATES
+        f"{state} {sum(1 for value in statuses.values() if value == state)}"
+        for state in ASSERTION_STATES
     )
     covered = sum(1 for identifiers, _ in coverage.values() if identifiers)
     volumes = len(documents) - 1

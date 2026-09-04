@@ -299,7 +299,11 @@ class ContentCatalog:
         if not isinstance(meta, Mapping) or set(meta) != {"version"}:
             raise ContentValidationError("内容目录 meta 必须只包含 version")
         version = meta.get("version")
-        if not isinstance(version, str) or not version.strip() or not CONTENT_VERSION_PATTERN.fullmatch(version.strip()):
+        if (
+            not isinstance(version, str)
+            or not version.strip()
+            or not CONTENT_VERSION_PATTERN.fullmatch(version.strip())
+        ):
             raise ContentValidationError("内容目录 version 必须是非空的安全版本标识")
         version = version.strip()
 
@@ -433,7 +437,9 @@ class ContentCatalog:
 
         title = _format_template(template.title.template, provided)
         body = _format_template(template.body.template, provided)
-        labels = tuple(_format_template(label.template, provided) for label in template.button_labels)
+        labels = tuple(
+            _format_template(label.template, provided) for label in template.button_labels
+        )
         for rendered in (title, body, *labels):
             _validate_user_visible_text(
                 rendered, internal_terms=internal_terms, contains_model_text=contains_model_text

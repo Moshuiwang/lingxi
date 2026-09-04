@@ -82,7 +82,10 @@ def _failed() -> RosterReadOutcome:
         rows=(),
         integrity=RosterIntegrity(pages_read=2),
         failure=RosterReadFailure(
-            code="feishu_code_91403", kind=RosterFailureKind.DEFINITE, partial_pages=2, partial_rows=700
+            code="feishu_code_91403",
+            kind=RosterFailureKind.DEFINITE,
+            partial_pages=2,
+            partial_rows=700,
         ),
     )
 
@@ -122,9 +125,7 @@ class _Store:
 
 
 def _previous(*, age: timedelta, row_count: int = 1206) -> _StoredSnapshot:
-    facts = StoredSnapshotFacts(
-        snapshot_id="rsn_0001", captured_at=NOW - age, row_count=row_count
-    )
+    facts = StoredSnapshotFacts(snapshot_id="rsn_0001", captured_at=NOW - age, row_count=row_count)
     return _StoredSnapshot(facts, tuple(_row(name=NAME) for _ in range(1)))
 
 
@@ -302,9 +303,11 @@ class DutyBehaviourTest(unittest.TestCase):
             def load_active_baseline(self) -> list[ArchivedIdentity]:
                 return self._people
 
-        people = baseline if baseline is not None else [
-            ArchivedIdentity(USER_ONE, PERSON_ONE, NAME, EMPLOYEE_NO, EMAIL)
-        ]
+        people = (
+            baseline
+            if baseline is not None
+            else [ArchivedIdentity(USER_ONE, PERSON_ONE, NAME, EMPLOYEE_NO, EMAIL)]
+        )
         return RosterAuditDuty(
             baseline_reader=Baseline(people),
             roster_source=_source(outcome, store=store, audit=audit),
@@ -366,7 +369,13 @@ class DutyBehaviourTest(unittest.TestCase):
         store = _Store(stored=None)
         sender, audit, clock = self._Sender(), RecordingAudit(), FixedClock(start=NOW.date())
         people = [
-            ArchivedIdentity(f"usr_{index:026d}", f"ou_p_{index}", f"化名{index}", f"E100{index}", f"p{index}@example.invalid")
+            ArchivedIdentity(
+                f"usr_{index:026d}",
+                f"ou_p_{index}",
+                f"化名{index}",
+                f"E100{index}",
+                f"p{index}@example.invalid",
+            )
             for index in range(6)
         ]
         duty = self._duty(

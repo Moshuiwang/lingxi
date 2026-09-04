@@ -154,7 +154,6 @@ class RequiredConfigTests(unittest.TestCase):
         self.assertIn(f"{ENV_PREFIX}CARD_FAILURE_INJECT", message)
         self.assertNotIn("createx", message, "报错不得回显收到的值")
 
-
     def test_non_finite_numbers_are_rejected(self) -> None:
         """``nan`` / ``inf`` 是合法的 float 字面量，会一路通过后面所有比较。
 
@@ -173,7 +172,6 @@ class RequiredConfigTests(unittest.TestCase):
                 with self.subTest(raw=raw, name=name):
                     with self.assertRaises(GatewayConfigError):
                         load_config(dict(VALID_ENV, **{name: raw}))
-
 
     def test_non_positive_numbers_are_rejected(self) -> None:
         """本组数值全是时长或倍数，0 与负数没有一个有意义。
@@ -235,9 +233,7 @@ class InnertestRosterConfigTests(unittest.TestCase):
         `repr(config)`。"""
 
         legal_member = "ou_rostermembera00000000000"
-        config = load_config(
-            {**VALID_ENV, "LINGXI_INNERTEST_ROSTER_OPEN_IDS": legal_member}
-        )
+        config = load_config({**VALID_ENV, "LINGXI_INNERTEST_ROSTER_OPEN_IDS": legal_member})
 
         self.assertEqual(config.innertest_roster_open_ids, frozenset({legal_member}))
         self.assertNotIn(legal_member, repr(config))
@@ -257,9 +253,7 @@ class InnertestRosterConfigTests(unittest.TestCase):
 
     def test_an_invalid_innertest_roster_error_does_not_echo_the_raw_value(self) -> None:
         with self.assertRaises(GatewayConfigError) as raised:
-            load_config(
-                {**VALID_ENV, "LINGXI_INNERTEST_ROSTER_OPEN_IDS": "totally-not-an-open-id"}
-            )
+            load_config({**VALID_ENV, "LINGXI_INNERTEST_ROSTER_OPEN_IDS": "totally-not-an-open-id"})
         self.assertNotIn("totally-not-an-open-id", str(raised.exception))
 
     def test_the_variable_name_is_not_prefixed_with_lingxi_gateway(self) -> None:
@@ -299,9 +293,7 @@ class BotOpenIdConfigTests(unittest.TestCase):
     def test_the_variable_name_is_not_prefixed_with_lingxi_gateway(self) -> None:
         env = {**VALID_ENV, f"{ENV_PREFIX}BOT_OPEN_ID": "ou_should_be_ignored"}
         config = load_config(env)
-        self.assertIsNone(
-            config.bot_open_id, "带 LINGXI_GATEWAY_ 前缀的同名变量不应该被读取"
-        )
+        self.assertIsNone(config.bot_open_id, "带 LINGXI_GATEWAY_ 前缀的同名变量不应该被读取")
 
 
 class BuildSupervisorTests(unittest.TestCase):
@@ -333,9 +325,11 @@ class BuildSupervisorTests(unittest.TestCase):
         saved = sys.modules.get("lark_oapi")
         sys.modules["lark_oapi"] = module
         self.addCleanup(
-            lambda: sys.modules.__setitem__("lark_oapi", saved)
-            if saved is not None
-            else sys.modules.pop("lark_oapi", None)
+            lambda: (
+                sys.modules.__setitem__("lark_oapi", saved)
+                if saved is not None
+                else sys.modules.pop("lark_oapi", None)
+            )
         )
 
     def test_poll_interval_is_derived_from_the_shutdown_timeout(self) -> None:
@@ -348,9 +342,7 @@ class BuildSupervisorTests(unittest.TestCase):
             5.0,
             "空闲轮询间隔必须由停机超时推导，否则配置里的超时是一句没实现的承诺",
         )
-        self.assertEqual(
-            transport._ack_timeout_seconds, 20.0, "单条事件的 ack 上限取停机超时"
-        )
+        self.assertEqual(transport._ack_timeout_seconds, 20.0, "单条事件的 ack 上限取停机超时")
         self.assertEqual(
             transport._handshake_timeout_seconds,
             20.0,
@@ -359,8 +351,7 @@ class BuildSupervisorTests(unittest.TestCase):
         self.assertEqual(
             self.captured["timeout"],
             5.0,
-            "出站 HTTP 超时必须从停机预算里分配，不能用 SDK 的 30 秒默认值"
-            "——它比停机预算还长",
+            "出站 HTTP 超时必须从停机预算里分配，不能用 SDK 的 30 秒默认值——它比停机预算还长",
         )
         self.assertLess(
             self.captured["timeout"],
@@ -468,9 +459,11 @@ class GatewayOnboardingIsInertTests(unittest.TestCase):
         saved = sys.modules.get("lark_oapi")
         sys.modules["lark_oapi"] = module
         self.addCleanup(
-            lambda: sys.modules.__setitem__("lark_oapi", saved)
-            if saved is not None
-            else sys.modules.pop("lark_oapi", None)
+            lambda: (
+                sys.modules.__setitem__("lark_oapi", saved)
+                if saved is not None
+                else sys.modules.pop("lark_oapi", None)
+            )
         )
 
     def test_the_default_onboarding_only_records(self) -> None:
@@ -491,9 +484,7 @@ class GatewayOnboardingIsInertTests(unittest.TestCase):
         config = load_config(VALID_ENV)
         reported: list[object] = []
 
-        build_supervisor(
-            config, transport=object(), on_onboarding_assembled=reported.append
-        )
+        build_supervisor(config, transport=object(), on_onboarding_assembled=reported.append)
 
         self.assertEqual(len(reported), 1)
         assert_gateway_onboarding_is_inert(*reported)
@@ -549,9 +540,11 @@ class AssembleDeliveryConsumerCardInjectionTests(unittest.TestCase):
         saved = sys.modules.get("lark_oapi")
         sys.modules["lark_oapi"] = module
         self.addCleanup(
-            lambda: sys.modules.__setitem__("lark_oapi", saved)
-            if saved is not None
-            else sys.modules.pop("lark_oapi", None)
+            lambda: (
+                sys.modules.__setitem__("lark_oapi", saved)
+                if saved is not None
+                else sys.modules.pop("lark_oapi", None)
+            )
         )
 
     def test_default_configuration_passes_no_injected_transport(self) -> None:

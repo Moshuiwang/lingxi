@@ -188,9 +188,7 @@ class GroupMentionHintResponder:
         self._throttle.mark_sent(error.chat_id)
         # `chat_id` 只写进这一行脱敏日志，不进下面的结构化审计字段——见本类文档
         # 「`V-花名册-34`」段落。
-        logger.info(
-            "gateway.group_mention_hint.sent chat_id=%s", redact_identifier(error.chat_id)
-        )
+        logger.info("gateway.group_mention_hint.sent chat_id=%s", redact_identifier(error.chat_id))
         self._audit.record(
             "event.group_mention_hint_sent",
             content_key=content.key,

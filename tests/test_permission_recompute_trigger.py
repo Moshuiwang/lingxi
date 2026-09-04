@@ -155,10 +155,7 @@ class BackgroundFailureAuditTests(unittest.TestCase):
         self.assertTrue(_wait_until(lambda: len(delegate.calls) == 2))
         self.assertTrue(
             _wait_until(
-                lambda: len(
-                    audit.fields_for("admin.card_callback.recompute_trigger_failed")
-                )
-                == 2
+                lambda: len(audit.fields_for("admin.card_callback.recompute_trigger_failed")) == 2
             )
         )
 
@@ -171,9 +168,7 @@ class QueueFullDropTests(unittest.TestCase):
     def test_queue_full_drops_the_newest_item_and_audits_distinctly(self) -> None:
         delegate = _SlowDelegate()
         audit = _RecordingAudit()
-        executor = BackgroundPermissionRecomputeTrigger(
-            delegate, audit=audit, queue_maxsize=1
-        )
+        executor = BackgroundPermissionRecomputeTrigger(delegate, audit=audit, queue_maxsize=1)
         first = _pending(pending_id="pac_bg_full_0000000000001")
         second = _pending(pending_id="pac_bg_full_0000000000002")
         third = _pending(pending_id="pac_bg_full_0000000000003")
@@ -227,14 +222,18 @@ class TimeoutAndSkippedOutcomeTests(unittest.TestCase):
             delegate.release.set()
             self.assertTrue(_wait_until(lambda: len(delegate.calls) == 1, timeout=1))
             self.assertEqual(completed, [])
-            self.assertEqual(len(audit.fields_for("admin.card_callback.recompute_trigger_timeout")), 1)
+            self.assertEqual(
+                len(audit.fields_for("admin.card_callback.recompute_trigger_timeout")), 1
+            )
         finally:
             delegate.release.set()
 
     def test_skipped_targeted_recompute_is_not_reported_as_effective(self) -> None:
         class _SkippedDelegate:
             def trigger(self, pending: PendingAction) -> TargetedRecomputeOutcome:
-                return TargetedRecomputeOutcome(kind=RecomputeKind.SKIPPED, reason="snapshot_missing")
+                return TargetedRecomputeOutcome(
+                    kind=RecomputeKind.SKIPPED, reason="snapshot_missing"
+                )
 
         audit = _RecordingAudit()
         completed: list[PendingAction] = []

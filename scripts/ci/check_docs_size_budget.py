@@ -44,7 +44,10 @@ def main() -> int:
         sizes.append((relative, path.stat().st_size))
 
     if missing:
-        print("开工必读集体量预算：以下受预算约束的文件不存在（改名或删除时必须同步更新本检查）：", file=sys.stderr)
+        print(
+            "开工必读集体量预算：以下受预算约束的文件不存在（改名或删除时必须同步更新本检查）：",
+            file=sys.stderr,
+        )
         for relative in missing:
             print(f"  - {relative}", file=sys.stderr)
         return 1

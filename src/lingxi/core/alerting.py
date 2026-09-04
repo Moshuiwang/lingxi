@@ -88,9 +88,11 @@ class AlertPolicy:
         for name, value in durations:
             if not isinstance(value, (int, float)) or not math.isfinite(value) or value <= 0:
                 raise ValueError(f"{name} 必须是正的有限数字")
-        if not isinstance(self.send_failure_threshold, int) or isinstance(
-            self.send_failure_threshold, bool
-        ) or self.send_failure_threshold <= 0:
+        if (
+            not isinstance(self.send_failure_threshold, int)
+            or isinstance(self.send_failure_threshold, bool)
+            or self.send_failure_threshold <= 0
+        ):
             raise ValueError("send_failure_threshold 必须是正整数")
         if self.retry_factor <= 1:
             raise ValueError("retry_factor 必须大于 1，固定间隔不是退避")
@@ -124,9 +126,7 @@ class AlertPolicy:
         return cls(
             heartbeat_timeout_seconds=number("HEARTBEAT_TIMEOUT_SECONDS", 120.0),
             queued_timeout_seconds=number("QUEUED_TIMEOUT_SECONDS", 180.0),
-            running_heartbeat_timeout_seconds=number(
-                "RUNNING_HEARTBEAT_TIMEOUT_SECONDS", 90.0
-            ),
+            running_heartbeat_timeout_seconds=number("RUNNING_HEARTBEAT_TIMEOUT_SECONDS", 90.0),
             send_failure_window_seconds=number("SEND_FAILURE_WINDOW_SECONDS", 300.0),
             send_failure_threshold=integer("SEND_FAILURE_THRESHOLD", 3),
             dedupe_window_seconds=number("DEDUPE_WINDOW_SECONDS", 1800.0),
@@ -141,7 +141,9 @@ class AlertPolicy:
 
         if isinstance(attempt, bool) or attempt < 0:
             raise ValueError("重试次数不能为负")
-        return min(self.retry_base_seconds * (self.retry_factor**attempt), self.retry_ceiling_seconds)
+        return min(
+            self.retry_base_seconds * (self.retry_factor**attempt), self.retry_ceiling_seconds
+        )
 
 
 def _as_utc(value: datetime) -> datetime:
@@ -333,7 +335,9 @@ class HeartbeatRegistry:
             active = (moment - record.last_seen_at).total_seconds() < record.timeout_seconds
             changed = record.previous_active is not None and active != record.previous_active
         # 推进边沿基线——理由见方法文档；只影响 changed，不影响 active 决策。
-        record.previous_active = active if record.last_seen_at is not None else record.previous_active
+        record.previous_active = (
+            active if record.last_seen_at is not None else record.previous_active
+        )
         return HeartbeatStatus(component, record.last_seen_at, active, changed)
 
     def statuses(self, *, at: datetime) -> tuple[HeartbeatStatus, ...]:
@@ -369,9 +373,7 @@ class AlertManager:
         self._windows: dict[tuple[AlertKind, str], _FailureWindow] = {}
 
     def register_process(self, component: str) -> None:
-        self.heartbeats.register(
-            component, timeout_seconds=self.policy.heartbeat_timeout_seconds
-        )
+        self.heartbeats.register(component, timeout_seconds=self.policy.heartbeat_timeout_seconds)
 
     def heartbeat(self, component: str, *, at: datetime) -> None:
         self.heartbeats.beat(component, at=at)
@@ -481,9 +483,11 @@ class AlertManager:
         if not threshold_reached:
             return ()
 
-        if window.last_alert_at is not None and (
-            signal.observed_at - window.last_alert_at
-        ).total_seconds() < self.policy.dedupe_window_seconds:
+        if (
+            window.last_alert_at is not None
+            and (signal.observed_at - window.last_alert_at).total_seconds()
+            < self.policy.dedupe_window_seconds
+        ):
             return ()
 
         window.last_alert_at = signal.observed_at
@@ -906,7 +910,9 @@ class AlertingDuty:
         if self._audit is None:
             return
         for notice in sorted(notices, key=lambda item: item.dedupe_key):
-            action = "alert.recovery_recorded" if notice.action.value == "recovery" else "alert.recorded"
+            action = (
+                "alert.recovery_recorded" if notice.action.value == "recovery" else "alert.recorded"
+            )
             try:
                 self._audit.record(
                     action,

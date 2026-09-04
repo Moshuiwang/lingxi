@@ -70,9 +70,7 @@ class NegativeIdentityFixturesMatchProductionParsingTests(unittest.TestCase):
         """
 
         mapping = load_role_function_map()
-        resolved = resolve_role_functions(
-            self.module.UNSUPPORTED_FUNCTION_ROLE_NAMES, mapping
-        )
+        resolved = resolve_role_functions(self.module.UNSUPPORTED_FUNCTION_ROLE_NAMES, mapping)
         self.assertTrue(resolved, "夹具至少要提供一个角色名")
         for role_function in resolved:
             with self.subTest(role=role_function.role_name):

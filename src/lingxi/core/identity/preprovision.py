@@ -285,9 +285,7 @@ def locate_by_email(
         return PreprovisionSkip(email=email, reason=SKIP_PERSONNEL_NOT_IN_DIRECTORY)
     if len(members) > 1:
         return PreprovisionSkip(email=email, reason=SKIP_DIRECTORY_MULTIPLE_MEMBERS)
-    return PreprovisionTarget(
-        email=email, personnel_id=personnel_ids[0], member=members[0]
-    )
+    return PreprovisionTarget(email=email, personnel_id=personnel_ids[0], member=members[0])
 
 
 def plan_preprovision(
@@ -397,7 +395,12 @@ def import_preprovision_grant(
         initiated_by_open_id=grant.initiated_by_open_id,
     )
     # 审计只记计数类事实，不记权限内容、邮箱或姓名（与本链其余审计同一条纪律）。
-    audit.record("onboarding.preprovision_grant_imported", user=user_id, trace_id=trace_id, report=str(type(report).__name__))
+    audit.record(
+        "onboarding.preprovision_grant_imported",
+        user=user_id,
+        trace_id=trace_id,
+        report=str(type(report).__name__),
+    )
 
 
 class _SystemOnboardingHost(Protocol):
@@ -413,7 +416,15 @@ class _SystemOnboardingHost(Protocol):
     _lock: Any
     _running: dict[str, str]
 
-    def _execute(self, *, event_id: str, open_id: str, trace_id: str, claim_token: Any = None, grant: Any = None) -> Any: ...
+    def _execute(
+        self,
+        *,
+        event_id: str,
+        open_id: str,
+        trace_id: str,
+        claim_token: Any = None,
+        grant: Any = None,
+    ) -> Any: ...
 
     def _release(self, open_id: str, event_id: str) -> None: ...
 
@@ -451,7 +462,8 @@ def run_system_onboarding(
 
     event_id = system_event_id(trace_id)
     grant = (
-        None if preprovision_grant is None
+        None
+        if preprovision_grant is None
         else PreprovisionGrant(plan=preprovision_grant, initiated_by_open_id=initiated_by_open_id)
     )
     with runner._lock:
