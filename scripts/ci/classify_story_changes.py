@@ -153,6 +153,8 @@ FULL_PREFIX_DATA_FILES = frozenset(
     {
         "scripts/ci/size_ratchet_baseline.txt",
         "scripts/ci/matrix_row_size_baseline.txt",
+        "scripts/ci/function_size_ratchet_baseline.txt",
+        "scripts/ci/comment_ratchet_baseline.txt",
     }
 )
 

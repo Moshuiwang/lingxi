@@ -89,6 +89,10 @@ python3 scripts/ci/check_acceptance_matrix.py
 # 新超过阈值。基线由 --refresh 生成，拒绝被手工调大——见该脚本头注释。
 python3 scripts/ci/check_size_ratchet.py
 python3 scripts/ci/check_matrix_row_size_ratchet.py
+# 函数体量与注释卫生两条棘轮，与文件体量棘轮同一纪律（只许收紧）：前者挡
+# src/lingxi/ 下单个函数继续变长，后者挡三类"来历腐烂"信号继续变多。
+python3 scripts/ci/check_function_size_ratchet.py
+python3 scripts/ci/check_comment_ratchet.py
 # 代码框架「二、三层之间的 import 规则」第一条（Issue #238）：core/ 不得 import
 # adapters/、apps/ 或任何外部 SDK。用 ast 遍历整棵树，含函数内延迟导入。
 python3 scripts/ci/check_core_layering.py

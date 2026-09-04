@@ -63,6 +63,14 @@ class StoryClassificationTest(unittest.TestCase):
             "fast",
         )
 
+    def test_function_size_ratchet_baseline_does_not_escalate_to_full_gate(self) -> None:
+        self.assertEqual(
+            CLASSIFIER.classify(["scripts/ci/function_size_ratchet_baseline.txt"]), "fast"
+        )
+
+    def test_comment_ratchet_baseline_does_not_escalate_to_full_gate(self) -> None:
+        self.assertEqual(CLASSIFIER.classify(["scripts/ci/comment_ratchet_baseline.txt"]), "fast")
+
     def test_classifier_script_itself_still_uses_full_gate(self) -> None:
         # 否定用例：分类器自身的 .py 改动可能改变判定逻辑，必须继续提级，
         # 不能因为「登记了一个数据文件豁免」就连带放松脚本改动。
@@ -72,6 +80,12 @@ class StoryClassificationTest(unittest.TestCase):
         # 否定用例：与被登记豁免的 size_ratchet_baseline.txt 同源但不同性质——
         # 这是核对该数据文件的检查脚本本身，改动可能改变门禁判定，必须继续提级。
         self.assertEqual(CLASSIFIER.classify(["scripts/ci/check_size_ratchet.py"]), "full")
+
+    def test_function_size_ratchet_checker_script_still_uses_full_gate(self) -> None:
+        self.assertEqual(CLASSIFIER.classify(["scripts/ci/check_function_size_ratchet.py"]), "full")
+
+    def test_comment_ratchet_checker_script_still_uses_full_gate(self) -> None:
+        self.assertEqual(CLASSIFIER.classify(["scripts/ci/check_comment_ratchet.py"]), "full")
 
     def test_ci_gate_shell_script_still_uses_full_gate(self) -> None:
         # 否定用例：scripts/ci/ 下的门禁 .sh 改动同样必须继续提级。

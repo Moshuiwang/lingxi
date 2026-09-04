@@ -175,6 +175,15 @@ class AssetClassificationTest(unittest.TestCase):
         detail = CLASSIFIER.classify_detail(["scripts/ci/nested/size_ratchet_baseline.txt"])
         self.assertEqual((detail.mode, detail.risk_level), ("full", "full"))
 
+        # 两条新棘轮基线同样只精确豁免登记的路径本身。
+        for nested_path in (
+            "scripts/ci/nested/function_size_ratchet_baseline.txt",
+            "scripts/ci/nested/comment_ratchet_baseline.txt",
+        ):
+            with self.subTest(path=nested_path):
+                detail = CLASSIFIER.classify_detail([nested_path])
+                self.assertEqual((detail.mode, detail.risk_level), ("full", "full"))
+
     def test_reserved_l2_extension_is_not_implemented_as_a_light_gate(self) -> None:
         original = CLASSIFIER.L2_FILES
         CLASSIFIER.L2_FILES = frozenset({"src/lingxi/config/prompt.toml"})
