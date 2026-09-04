@@ -491,7 +491,7 @@ GROUNDED_ATTRIBUTIONS: tuple[GroundedAttribution, ...] = (
     ),
     GroundedAttribution(
         "src/lingxi/apps/scheduler/onboarding.py",
-        "代价是**首次开通要等一个扫描周期**才开始（产品负责人已知情并接受）。合同要求的第一条提示",
+        "合同要求的第一条提示仍由 gateway 即时发出。**前置不齐就不装配**，而不是装",
         "首次对话与自动准入",
     ),
     GroundedAttribution(
