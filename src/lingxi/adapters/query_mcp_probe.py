@@ -1,7 +1,7 @@
 """问数 MCP 的就绪探针：以目标用户身份执行一次 ``list_metrics``。
 
-实现 :class:`lingxi.core.permission.mcp_readiness.McpProbe`。判定（就绪/
-同步中/技术失败怎么分）在 :mod:`lingxi.core.permission.mcp_readiness`，
+实现 :class:`lingxi.core.permission.mcp_readiness_base.McpProbe`。判定（就绪/
+同步中/技术失败怎么分）在 :mod:`lingxi.core.permission.mcp_readiness_base`，
 本模块只负责协议细节与错误翻译。真实 MCP 协议面大半未实测，
 ``list_metrics`` 返回形状已实测到字段级（详见
 :func:`content_text_metrics_reader`）；默认 reader 保持不变、只认历史
@@ -22,7 +22,7 @@ from collections.abc import Callable, Mapping
 from typing import Any, NamedTuple
 
 from lingxi.core.ids import new_ulid
-from lingxi.core.permission.mcp_readiness import McpProbeError
+from lingxi.core.permission.mcp_readiness_base import McpProbeError
 
 logger = logging.getLogger(__name__)
 
@@ -359,7 +359,7 @@ class QueryMcpProbe:
 
     @property
     def timeout_seconds(self) -> int:
-        """单次传输超时。装配层必须让它与 :attr:`lingxi.core.permission.mcp_readiness.ReadinessSchedule.probe_timeout_seconds` 一致——那边算出来的"结论最晚什么时候落地"就是拿这个数算的。"""
+        """单次传输超时。装配层必须让它与 :attr:`lingxi.core.permission.mcp_readiness_base.ReadinessSchedule.probe_timeout_seconds` 一致——那边算出来的"结论最晚什么时候落地"就是拿这个数算的。"""
         return self._timeout_seconds
 
     @property
@@ -370,7 +370,7 @@ class QueryMcpProbe:
     def list_metrics(self, *, user_id: str) -> int:
         """以该用户身份执行一次 ``list_metrics``，返回可见指标条数。
 
-        失败一律抛 :class:`~lingxi.core.permission.mcp_readiness.McpProbeError`，
+        失败一律抛 :class:`~lingxi.core.permission.mcp_readiness_base.McpProbeError`，
         ``denied`` 标明是"MCP 明确拒绝"（同步中）还是"结果不明"（技术失败）。
         """
         if not isinstance(user_id, str) or not user_id.strip():

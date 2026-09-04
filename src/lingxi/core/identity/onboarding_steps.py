@@ -51,7 +51,7 @@ from lingxi.core.identity.provisioning import ProvisioningRejection, Provisionin
 from lingxi.core.identity.stock_token_source import ADOPTABLE, DECRYPT_FAILED, StockTokenLookup
 from lingxi.core.permission.account_match import MATCHED, match_galaxy_account
 from lingxi.core.permission.local_override import ResolvedLocalOverrides, resolve_local_overrides
-from lingxi.core.permission.mcp_readiness import ReadinessBinding, ReadinessOutcome
+from lingxi.core.permission.mcp_readiness_base import ReadinessBinding, ReadinessOutcome
 from lingxi.core.permission.merge_sources import (
     REASON_LOCAL_OVERRIDE_READ_FAILED,
     merge_permission_sources,

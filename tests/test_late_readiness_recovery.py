@@ -54,7 +54,7 @@ from lingxi.apps.scheduler.late_readiness_recovery import (
     LateReadinessRecoveryDuty,
 )
 from lingxi.core.identity.onboarding_runner import FIRST_ONBOARDING_REASON, KEY_COMPLETED
-from lingxi.core.permission.mcp_readiness import (
+from lingxi.core.permission.mcp_readiness_base import (
     ReadinessAttempt,
     ReadinessBinding,
     ReadinessOutcome,

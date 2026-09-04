@@ -257,7 +257,7 @@ class PermissionNoticeDispatcher:
 
     形状与 ``core/permission/publish.PermissionPublishExecutor`` 一致（编排在 ``core``，
     真正的外部调用在注入进来的对象里）。``sleep`` 是**必填**注入点，纪律同
-    ``core/permission/mcp_readiness.McpReadinessConfirmation``：默认一个真 ``sleep``
+    ``core/permission/mcp_readiness_base.McpReadinessConfirmation``：默认一个真 ``sleep``
     会让用例真的等，默认一个空实现又会让"退避"在生产里静默消失。装配层传的是
     ``stop.wait``，因此 ``SIGTERM`` 能立刻打断退避。
     """

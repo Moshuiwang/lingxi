@@ -67,7 +67,7 @@ from lingxi.core.identity.stock_token_source import (
     StockTokenLookup,
 )
 from lingxi.core.permission.local_override import LocalPermissionOverrideEntry, OverrideDirection
-from lingxi.core.permission.mcp_readiness import ReadinessOutcome
+from lingxi.core.permission.mcp_readiness_base import ReadinessOutcome
 from lingxi.core.permission.merge_sources import (
     REASON_GRANT_REDUNDANT_WILDCARD,
     REASON_LOCAL_OVERRIDE_READ_FAILED,

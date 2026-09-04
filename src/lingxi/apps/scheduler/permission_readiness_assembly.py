@@ -20,7 +20,7 @@ from datetime import UTC, datetime
 from lingxi.apps.scheduler.audit import AuditSink
 from lingxi.apps.scheduler.config import SchedulerConfig
 from lingxi.apps.scheduler.permission_publish import ReadinessFollowUp
-from lingxi.core.permission.mcp_readiness import ReadinessSchedule
+from lingxi.core.permission.mcp_readiness_base import ReadinessSchedule
 
 logger = logging.getLogger(__name__)
 
@@ -56,7 +56,7 @@ def _build_readiness_follow_up(
 
     from lingxi.adapters.mcp_token_cipher import McpTokenCipher
     from lingxi.adapters.postgres_mcp_token import PostgresMcpTokenStore
-    from lingxi.core.permission.mcp_readiness import ReadinessTicker
+    from lingxi.core.permission.mcp_readiness_tick import ReadinessTicker
 
     tokens = PostgresMcpTokenStore(
         config.postgres_dsn,

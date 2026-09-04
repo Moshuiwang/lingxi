@@ -17,7 +17,7 @@ from lingxi.core.identity.first_contact import EmploymentStatus
 from lingxi.core.identity.provisioning import UserProvisioningStatus
 from lingxi.core.permission.legacy_diff import LegacyImportPlan, LegacyImportReport
 from lingxi.core.permission.local_override import LocalPermissionOverrideEntry
-from lingxi.core.permission.mcp_readiness import ReadinessBinding
+from lingxi.core.permission.mcp_readiness_base import ReadinessBinding
 
 # ----------------------------------------------------------------------
 # 注入口
@@ -210,7 +210,7 @@ class LegacyPermissionImporter(Protocol):
 
 
 class ReadinessConfirmer(Protocol):
-    """阻塞式 MCP 就绪确认（``core/permission/mcp_readiness.McpReadinessConfirmation``）。"""
+    """阻塞式 MCP 就绪确认（``core/permission/mcp_readiness_base.McpReadinessConfirmation``）。"""
 
     def confirm(self, binding: ReadinessBinding, *, permissions: str) -> Any:
         """跑完一轮就绪确认，返回终态结果。"""

@@ -41,7 +41,7 @@ from lingxi.apps.scheduler.onboarding import (
 )
 from lingxi.apps.scheduler.stalled_provisioning import DEFAULT_STALLED_LEASE_SECONDS
 from lingxi.core.conversation.onboarding_recovery import OnboardingReconciler
-from lingxi.core.permission.mcp_readiness import McpProbeError, ReadinessSchedule
+from lingxi.core.permission.mcp_readiness_base import McpProbeError, ReadinessSchedule
 
 # 32 字节 base64 主密钥（非生产值，只为过形状校验）。
 MASTER_KEY = "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8="

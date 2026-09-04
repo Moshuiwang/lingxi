@@ -19,7 +19,7 @@ from pathlib import Path
 
 from lingxi.adapters.role_function_map_file import load_role_function_map
 from lingxi.core.permission.account_match import MATCHED, NOT_FOUND, match_galaxy_account
-from lingxi.core.permission.mcp_readiness import ReadinessSchedule
+from lingxi.core.permission.mcp_readiness_base import ReadinessSchedule
 from lingxi.core.permission.role_function import resolve_role_functions
 
 REPOSITORY_ROOT = Path(__file__).parents[1]
@@ -140,7 +140,7 @@ class McpReadinessMinimumLegalScheduleTests(unittest.TestCase):
         否则验收窗口会在这一步意外卡住十五分钟。
         """
 
-        from lingxi.core.permission.mcp_readiness import CONTRACT_SCHEDULE
+        from lingxi.core.permission.mcp_readiness_base import CONTRACT_SCHEDULE
 
         minimum = ReadinessSchedule(**self.module.MCP_READINESS_MINIMUM_LEGAL_SCHEDULE_KWARGS)
         self.assertLess(minimum.budget, CONTRACT_SCHEDULE.budget)
@@ -213,7 +213,7 @@ class McpReadinessMinimumLegalScheduleWiredToRealConfirmationTests(unittest.Test
         self.module = _load_script()
 
     def test_never_ready_probe_times_out_after_exactly_two_attempts(self) -> None:
-        from lingxi.core.permission.mcp_readiness import (
+        from lingxi.core.permission.mcp_readiness_base import (
             McpReadinessConfirmation,
             ReadinessBinding,
             ReadinessOutcome,
@@ -242,7 +242,7 @@ class McpReadinessMinimumLegalScheduleWiredToRealConfirmationTests(unittest.Test
         )
         # 记录条数可能多于探针次数——预算耗尽后还会落一条不发探针的合成 timed_out
         # 记录（``error_code=budget_exhausted``）；探针调用次数才是「探几次」的
-        # 权威判据，见 core.permission.mcp_readiness.ReadinessSchedule.attempt_offsets
+        # 权威判据，见 core.permission.mcp_readiness_base.ReadinessSchedule.attempt_offsets
         # 的文档「发几次」一节。
         self.assertGreaterEqual(len(store.records), 2)
         self.assertEqual(probe.calls, ["acceptance-fixture-user", "acceptance-fixture-user"])

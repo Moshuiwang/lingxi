@@ -24,7 +24,7 @@ from lingxi.adapters.postgres import (
 )
 from lingxi.core.alerting import AlertPolicy
 from lingxi.core.identity.roster_snapshot import DEFAULT_SNAPSHOT_STALE_AFTER
-from lingxi.core.permission.mcp_readiness import (
+from lingxi.core.permission.mcp_readiness_base import (
     DEFAULT_PROBE_TIMEOUT_SECONDS,
     ReadinessSchedule,
 )

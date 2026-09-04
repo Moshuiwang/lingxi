@@ -22,7 +22,7 @@ from typing import Any
 from lingxi.adapters.mcp_token_cipher import McpTokenCipher, new_token
 from lingxi.adapters.postgres import DEFAULT_POSTGRES_TIMEOUTS, PostgresTimeouts, connect
 from lingxi.core.ids import new_id
-from lingxi.core.permission.mcp_readiness import ReadinessAttempt
+from lingxi.core.permission.mcp_readiness_base import ReadinessAttempt
 
 logger = logging.getLogger(__name__)
 

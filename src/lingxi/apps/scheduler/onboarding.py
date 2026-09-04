@@ -35,7 +35,7 @@ from lingxi.apps.scheduler.audit import AuditSink
 from lingxi.apps.scheduler.config import SchedulerConfig
 from lingxi.apps.scheduler.permission_publish import PermissionPublishDuty
 from lingxi.core.identity.innertest_roster_gate import build_innertest_roster_gate
-from lingxi.core.permission.mcp_readiness import ReadinessSchedule
+from lingxi.core.permission.mcp_readiness_base import ReadinessSchedule
 from lingxi.core.permission.metric_translation import metric_translation_available
 
 logger = logging.getLogger(__name__)
@@ -116,7 +116,7 @@ class HardDeadlineProbe:
 
     def list_metrics(self, *, user_id: str) -> int:
         """跑一次真实探针，超过执行级硬截止仍未返回就判技术失败。"""
-        from lingxi.core.permission.mcp_readiness import McpProbeError
+        from lingxi.core.permission.mcp_readiness_base import McpProbeError
 
         outcome: list[Any] = []
         failure: list[BaseException] = []
@@ -659,7 +659,7 @@ def _onboarding_readiness_kwargs(
     from lingxi.adapters.feishu_user_message import FeishuUserMessages
     from lingxi.adapters.postgres_permission_publish import PostgresPermissionPublishStore
     from lingxi.config.content import default_content_catalog
-    from lingxi.core.permission.mcp_readiness import McpReadinessConfirmation
+    from lingxi.core.permission.mcp_readiness_base import McpReadinessConfirmation
 
     dsn = config.postgres_dsn
     timeouts = config.postgres_timeouts

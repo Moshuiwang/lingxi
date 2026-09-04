@@ -1500,7 +1500,7 @@ class AwaitingReadinessTest(PermissionPublishPostgresTestCase):
         """
 
         from lingxi.adapters.postgres_mcp_token import PostgresMcpTokenStore
-        from lingxi.core.permission.mcp_readiness import (
+        from lingxi.core.permission.mcp_readiness_base import (
             ReadinessAttempt,
             ReadinessBinding,
             ReadinessOutcome,

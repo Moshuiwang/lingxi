@@ -35,7 +35,7 @@ from lingxi.adapters.query_mcp_probe import (
     default_metrics_reader,
     fetch_metric_catalog,
 )
-from lingxi.core.permission.mcp_readiness import McpProbeError
+from lingxi.core.permission.mcp_readiness_base import McpProbeError
 
 ENDPOINT = "https://mcp.example.invalid/query"
 USER = "usr_A"

@@ -49,13 +49,13 @@ from lingxi.apps.scheduler.permission_refresh import (
     PERMISSION_REFRESH_REASON,
     PERMISSION_REVOKE_REASON,
 )
-from lingxi.core.permission.mcp_readiness import (
+from lingxi.core.permission.mcp_readiness_base import (
     CONTRACT_SCHEDULE,
     ReadinessAttempt,
     ReadinessBinding,
     ReadinessOutcome,
-    ReadinessProgress,
 )
+from lingxi.core.permission.mcp_readiness_tick import ReadinessProgress
 from lingxi.core.permission.notification import NoticeKind, NoticeResult
 
 REPOSITORY_ROOT = pathlib.Path(__file__).parents[1]
