@@ -104,7 +104,14 @@ def _run_command_lines(step_text: str) -> list[str]:
             later_indent = len(later) - len(later.lstrip(" "))
             if later_indent <= base_indent:
                 break
-            block.append(later.strip())
+            stripped = later.strip()
+            # 跳过 shell 注释行：`run: |` 块里一行注释掉的旧安装命令（例如
+            # `# python3 -m pip install '.[old]' 'shellcheck-py==0.9.0'`）
+            # 不应该被当成"这一步真正要执行的命令"去解析版本号——独立审查
+            # 实测坐实过这个误判（取到了注释里的旧版本，不是真正生效的那行）。
+            if stripped.startswith("#"):
+                continue
+            block.append(stripped)
         if not block:
             raise GateSpecError("`run:` 块写法下没有找到任何命令行")
         return block

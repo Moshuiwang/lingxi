@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-"""文件体量棘轮门禁（Issue #238）：已超过阈值的文件只许变小、不许变大。
+"""文件体量棘轮门禁（Issue #238）：已超过阈值的文件——增长立即失败，缩小后需
+``--refresh`` 同步基线。
 
 代码框架长期缺一道挡住「往同一个巨型文件里继续加东西」的门禁：#227 与 S-D-02 各自
 往 2048 行的 ``apps/scheduler/__init__.py`` 里加代码，两次都没有任何检查会红。
@@ -64,9 +65,9 @@ def iter_scope_files() -> list[Path]:
     files = sorted(SOURCE_ROOT.rglob("*.py"))
     if not files:
         # 目录存在但一个 .py 都没扫到：measure() 会得到空字典，基线里的每一条
-        # 登记都因为"实测不到"被 evaluate() 静默跳过（那是给"文件已删除/移出
-        # 扫描范围"设计的分支），最终判绿——这不是"棘轮通过"，是扫描本身坏了，
-        # 必须失败关闭而不是让空枚举冒充"零违规"。
+        # 登记都会被 evaluate() 判成"陈旧登记、实测中已经找不到"而集体判红——
+        # 这仍然不是本门禁想要的失败原因，扫描本身坏了应该在这里直接说清楚，
+        # 而不是让使用者对着一堆"文件找不到"的失败去猜是不是真的被删光了。
         raise BaselineError(f"源码根目录下一个 .py 文件都没扫到：{SOURCE_ROOT}")
     return files
 
@@ -132,8 +133,15 @@ def evaluate(baseline: dict[str, int], current: dict[str, int]) -> list[str]:
     for path, recorded in sorted(baseline.items()):
         actual = current.get(path)
         if actual is None:
-            # 文件已经不在扫描范围内（删除、改名或移出 src/lingxi）：棘轮的目的
-            # 已经达成，不需要门禁介入；基线里的陈旧登记留给 --refresh 自愿清理。
+            # 文件已经不在扫描范围内（删除、改名或移出 src/lingxi）：陈旧登记
+            # 不允许静默保留在基线文件里，必须显式判红并提示 --refresh 清除——
+            # 静默放行会让已经清空的登记条目在基线文件里堆积多年都没人发现。
+            failures.append(
+                f"{path}：棘轮基线登记了 {recorded} 行，但当前扫描范围内已经找不到"
+                "这个文件（可能已删除、改名或移出 src/lingxi/）。基线记录必须与"
+                "实测精确匹配，陈旧登记不允许静默保留。运行 "
+                "python3 scripts/ci/check_size_ratchet.py --refresh 移除。"
+            )
             continue
         if actual > recorded:
             failures.append(

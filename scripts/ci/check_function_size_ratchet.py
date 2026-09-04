@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-"""函数体量棘轮门禁：已超过阈值的函数只许变小、不许变大。
+"""函数体量棘轮门禁：已超过阈值的函数——增长立即失败，缩小后需 ``--refresh``
+同步基线。
 
 与代码框架第一节「文件体量棘轮」（``check_size_ratchet.py``）同一思路，维度从
 「文件行数」换成「函数长度」——文件体量棘轮挡不住「文件本身没超阈值，但里面
@@ -19,6 +20,19 @@
 ——``lineno`` 是 ``def``/``async def`` 关键字所在行（Python 3.8 起 AST 不再把
 装饰器行计入 ``FunctionDef.lineno``，实测确认），因此长度天然不含装饰器，但含
 函数自己的 docstring 与内部注释（它们是函数体的一部分）。
+
+**同一限定名在同一文件里出现多次时取最大值**：property 的 getter/setter
+（同名、不同 ``lineno``）、``if TYPE_CHECKING:`` 分支下的重定义、
+``@overload`` 的多个签名重载，都会让同一个「相对路径::限定名」键对应多个
+``FunctionDef`` 节点——键的形状不变，登记与比较的是这组同名定义里最长的那个，
+不能让后一次定义静默覆盖前一次已经超阈值的登记（独立审查坐实：覆盖会让
+一个真实超过 60 行的 getter 因为后面跟着一个 3 行的 setter 而在门禁眼里
+"缩水"成 3 行）。
+
+已知边界：①与 ``check_size_ratchet.py`` 相同，基线与净增函数若在同一次提交里
+同步改动，本门禁看到的是「记录==实测」，判绿——精确相等只保证净增留下一处可
+审阅的 diff，不构成算法上不可绕过的证明；②不遍历 ``ast.Lambda``，lambda 表达式
+本身不计入函数体量统计。
 
 阈值 60 行：与「新函数目标 40 行、硬限 60 行」的编码纪律对齐（代码框架未成文、
 仅作为审查口径的数字，这里第一次落成会变红的门禁）。
@@ -83,7 +97,12 @@ def _qualified_names(tree: ast.Module, relative_path: str) -> dict[str, int]:
                         f"{relative_path}::{qualname}：AST 节点没有 end_lineno，"
                         "无法丈量长度（本仓要求的 Python 版本应当总是提供它）"
                     )
-                lengths[qualname] = child.end_lineno - child.lineno + 1
+                length = child.end_lineno - child.lineno + 1
+                # 同一限定名可能对应多个节点（property getter/setter、
+                # `if TYPE_CHECKING:` 重定义、`@overload` 多签名）：取 max()，
+                # 不能让后一次定义覆盖前一次已经超阈值的登记。
+                previous = lengths.get(qualname)
+                lengths[qualname] = length if previous is None else max(previous, length)
                 walk(child, (*prefix, child.name))
             elif isinstance(child, ast.ClassDef):
                 walk(child, (*prefix, child.name))
@@ -159,8 +178,15 @@ def evaluate(baseline: dict[str, int], current: dict[str, int]) -> list[str]:
     for key, recorded in sorted(baseline.items()):
         actual = current.get(key)
         if actual is None:
-            # 函数已经不在扫描范围内（删除、改名或被移出 src/lingxi）：棘轮目的
-            # 已经达成，不需要门禁介入；基线里的陈旧登记留给 --refresh 自愿清理。
+            # 函数已经不在扫描范围内（删除、改名或被移出 src/lingxi）：陈旧登记
+            # 不允许静默保留在基线文件里，必须显式判红并提示 --refresh 清除——
+            # 静默放行会让已经清空的登记条目在基线文件里堆积多年都没人发现。
+            failures.append(
+                f"{key}：棘轮基线登记了 {recorded} 行，但当前扫描范围内已经找不到"
+                "这个函数（可能已删除、改名或被移出 src/lingxi/）。基线记录必须与"
+                "实测精确匹配，陈旧登记不允许静默保留。运行 "
+                "python3 scripts/ci/check_function_size_ratchet.py --refresh 移除。"
+            )
             continue
         if actual > recorded:
             failures.append(

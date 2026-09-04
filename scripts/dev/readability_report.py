@@ -2,11 +2,16 @@
 """只读的可读性体检报表——不进任何门禁，供批次前后人工对照读数。
 
 打印一棵目录树（默认 ``src/lingxi``）的：文件数、总行数、纯代码／注释＋
-docstring／空行占比；函数总数与 > 40 / > 60 行个数（与
+docstring／空行占比；函数总数与 > 40 / > 60 行个数（长度算法与
 ``check_function_size_ratchet.py`` 同口径：AST 遍历 ``FunctionDef``/
-``AsyncFunctionDef``，长度 = ``end_lineno - lineno + 1``，不含装饰器）；
-docstring > 10 行个数；连续 ``#`` 注释块 > 5 行个数；来历标记命中的行数与
-文件数（与 ``check_comment_ratchet.py`` 同一份 ``PROVENANCE_PATTERN``）。
+``AsyncFunctionDef``，长度 = ``end_lineno - lineno + 1``，不含装饰器——但
+**计数口径不同**：本报表按 AST 节点逐个计数，同一限定名的多次定义（property
+getter/setter、``@overload`` 等）各自算一个；棘轮门禁按限定名去重、取 max()。
+两者的"函数总数"因此不可直接相加对比，只用于批次前后同一棵树的相对趋势）；
+docstring > 10 行个数（**统一按 10 计**，不区分模块/类/函数——与棘轮
+``docstring_over`` 的口径不同：棘轮模块阈值是 15、类/函数阈值才是 10，见
+``check_comment_ratchet.py``）；连续 ``#`` 注释块 > 5 行个数；来历标记命中的
+行数与文件数（与 ``check_comment_ratchet.py`` 同一份 ``PROVENANCE_PATTERN``）。
 
 ``--root <目录>`` 支持指向任意目录（不要求在本仓库内），用于对旧树/别的
 分支做前后对照——因此本文件刻意不依赖两条棘轮脚本里那些绑定
@@ -157,11 +162,16 @@ class Report:
         self.hash_block_over_5 = 0
         self.provenance_line_count = 0
         self.provenance_file_count = 0
+        #: 读不出来或解析失败的文件——本工具只读、不判红，因此这类文件不参与
+        #: 任何计数，但不能悄悄漏掉：在 render() 末尾列出，供人工核实是不是
+        #: 该批目标树里真的存在坏文件（仍然 exit 0，不影响调用方）。
+        self.parse_failures: list[tuple[Path, str]] = []
 
     def add_file(self, path: Path) -> None:
         try:
             source = path.read_text(encoding="utf-8")
-        except (OSError, UnicodeDecodeError):
+        except (OSError, UnicodeDecodeError) as error:
+            self.parse_failures.append((path, f"读取失败：{error}"))
             return
         lines = source.splitlines()
         self.file_count += 1
@@ -169,7 +179,8 @@ class Report:
 
         try:
             tree = ast.parse(source, filename=str(path))
-        except SyntaxError:
+        except SyntaxError as error:
+            self.parse_failures.append((path, f"解析失败：{error}"))
             return
 
         docstring_spans = _iter_docstrings(tree)
@@ -231,14 +242,21 @@ class Report:
             f"  纯代码占比：{code_ratio:.1%}",
             f"  注释＋docstring 占比：{comment_ratio:.1%}",
             f"  空行占比：{blank_ratio:.1%}",
-            f"  函数总数：{self.function_count}",
+            f"  函数总数：{self.function_count}"
+            "（按 AST 节点计，同名重定义各自计入一次，口径与函数体量棘轮的"
+            "按限定名去重取 max() 不同）",
             f"    > 40 行：{self.function_over_40}",
             f"    > 60 行：{self.function_over_60}",
-            f"  docstring > 10 行个数：{self.docstring_over_10}",
+            f"  docstring > 10 行个数：{self.docstring_over_10}"
+            "（模块/类/函数统一按 10 计，模块口径与棘轮的 15 不同）",
             f"  连续 # 注释块 > 5 行个数：{self.hash_block_over_5}",
             f"  来历标记命中行数：{self.provenance_line_count}",
             f"  来历标记命中文件数：{self.provenance_file_count}",
         ]
+        if self.parse_failures:
+            lines.append(f"  解析失败的文件（{len(self.parse_failures)} 个，不计入以上任何读数）：")
+            for path, reason in self.parse_failures:
+                lines.append(f"    {path}：{reason}")
         return "\n".join(lines)
 
 

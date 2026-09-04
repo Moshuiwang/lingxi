@@ -303,7 +303,7 @@ class FixedSampleAnalysisTest(unittest.TestCase):
         self.assertEqual(result["provenance"], 1)
 
     def test_review_word_hits_provenance(self) -> None:
-        path = self._write("probe.py", "# 审查确认\nx = 1\n")
+        path = self._write("probe.py", "# 独立审查确认\nx = 1\n")
         result = CHECK._analyze_file(path)
         self.assertEqual(result["provenance"], 1)
 
@@ -311,6 +311,33 @@ class FixedSampleAnalysisTest(unittest.TestCase):
         path = self._write("probe.py", "# 单个任务失败不得带走 worker\nx = 1\n")
         result = CHECK._analyze_file(path)
         self.assertEqual(result["provenance"], 0)
+
+    def test_bare_audit_word_in_ordinary_prose_does_not_hit_provenance(self) -> None:
+        """独立审核实测坐实：裸「审核」不贴来历标记时会连坐正常语义，必须收窄。"""
+
+        path = self._write("probe.py", "# 内容审核器\nx = 1\n")
+        result = CHECK._analyze_file(path)
+        self.assertEqual(result["provenance"], 0)
+
+    def test_bare_recheck_word_in_ordinary_prose_does_not_hit_provenance(self) -> None:
+        path = self._write("probe.py", "# 这道复核要挡的是\nx = 1\n")
+        result = CHECK._analyze_file(path)
+        self.assertEqual(result["provenance"], 0)
+
+    def test_qualifier_adjacent_review_word_hits_provenance(self) -> None:
+        path = self._write("probe.py", "# codex 审查 P1-2\nx = 1\n")
+        result = CHECK._analyze_file(path)
+        self.assertEqual(result["provenance"], 1)
+
+    def test_review_word_followed_by_parenthesized_date_hits_provenance(self) -> None:
+        path = self._write("probe.py", "# 审查（2026-09-04）\nx = 1\n")
+        result = CHECK._analyze_file(path)
+        self.assertEqual(result["provenance"], 1)
+
+    def test_ruling_word_followed_by_letter_number_id_hits_provenance(self) -> None:
+        path = self._write("probe.py", "# 裁定 D-15\nx = 1\n")
+        result = CHECK._analyze_file(path)
+        self.assertEqual(result["provenance"], 1)
 
 
 if __name__ == "__main__":

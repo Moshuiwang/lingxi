@@ -29,6 +29,7 @@
 
 from __future__ import annotations
 
+import subprocess
 import tomllib
 import unittest
 from pathlib import Path
@@ -41,6 +42,22 @@ def _load_ruff_config() -> dict:
     with PYPROJECT.open("rb") as handle:
         document = tomllib.load(handle)
     return document["tool"]["ruff"]
+
+
+#: `[tool.ruff]` 顶层 / `[tool.ruff.lint]` 允许出现的键的钉住快照——不是子集
+#: 断言，是**逐字白名单**：出现钉住集合之外的新键（例如
+#: `[tool.ruff.lint.extend-per-file-ignores]`、顶层 `extend-exclude`）即判红。
+#: per-file-ignores 与 format.exclude 两张表仍按各自的"只减不增"子集断言，
+#: 不在本白名单覆盖范围内（它们的钉住快照见上方 PINNED_PER_FILE_IGNORES /
+#: PINNED_FORMAT_EXCLUDE）。
+PINNED_TOP_LEVEL_KEYS = frozenset(["line-length", "lint", "format"])
+PINNED_LINT_KEYS = frozenset(["select", "ignore", "pydocstyle", "pylint", "per-file-ignores"])
+PINNED_FORMAT_KEYS = frozenset(["exclude"])
+PINNED_LINE_LENGTH = 100
+PINNED_SELECT = ["E", "W", "F", "I", "UP", "T10", "N", "D", "PLR0913"]
+PINNED_IGNORE = ["E203", "E501", "UP031", "UP042", "UP040", "UP046", "D400", "D415"]
+PINNED_PYLINT_MAX_ARGS = 10
+PINNED_PYDOCSTYLE_CONVENTION = "google"
 
 
 # 以下常量是接线落地时 pyproject.toml 里 [tool.ruff.lint.per-file-ignores] 的
@@ -299,7 +316,8 @@ class PerFileIgnoresOnlyShrinksTest(unittest.TestCase):
 
 
 class FormatExcludeOnlyShrinksTest(unittest.TestCase):
-    """format.exclude 只许变短；本批是空集，全仓格式化批接线后同步更新钉住快照。"""
+    """format.exclude 只许变短；登记六个暂缓格式化文件，结构性拆分完成、移出
+    exclude 列表后同步收紧这份钉住快照。"""
 
     def test_format_exclude_is_within_the_pinned_set(self) -> None:
         """format.exclude 出现钉住快照没有的新条目即判红。"""
@@ -310,6 +328,92 @@ class FormatExcludeOnlyShrinksTest(unittest.TestCase):
             extra,
             [],
             f"format.exclude 出现钉住快照里没有的新条目：{extra}——只允许收紧。",
+        )
+
+
+class RuffConfigTableWhitelistTest(unittest.TestCase):
+    """`[tool.ruff]` 整张表的白名单钉住：不是子集断言，是逐字相等——任何新键或
+    值变化（`select`/`ignore`/`line-length`/`pylint.max-args`/
+    `pydocstyle.convention`）都必须判红，`per-file-ignores`/`format.exclude`
+    两张表继续走各自的"只减不增"子集断言（见上方两个 Test）。
+
+    变异实测：加 `[tool.ruff.lint.extend-per-file-ignores]`、全局 `ignore`
+    加 `"D"`、顶层加 `extend-exclude` 三种改动各自判红后还原。
+    """
+
+    def test_top_level_keys_match_the_pinned_set_exactly(self) -> None:
+        actual = set(_load_ruff_config().keys())
+        self.assertEqual(
+            actual,
+            set(PINNED_TOP_LEVEL_KEYS),
+            f"[tool.ruff] 顶层键集合变了：实测 {sorted(actual)}，"
+            f"钉住 {sorted(PINNED_TOP_LEVEL_KEYS)}——新增或删除顶层键视为门禁被"
+            "放宽/意外收紧，须先更新本文件的钉住快照并说明理由。",
+        )
+
+    def test_lint_keys_match_the_pinned_set_exactly(self) -> None:
+        actual = set(_load_ruff_config()["lint"].keys())
+        self.assertEqual(
+            actual,
+            set(PINNED_LINT_KEYS),
+            f"[tool.ruff.lint] 键集合变了：实测 {sorted(actual)}，"
+            f"钉住 {sorted(PINNED_LINT_KEYS)}——例如新增 "
+            "`extend-per-file-ignores` 这类旁路键也会在这里判红。",
+        )
+
+    def test_format_keys_match_the_pinned_set_exactly(self) -> None:
+        actual = set(_load_ruff_config()["format"].keys())
+        self.assertEqual(actual, set(PINNED_FORMAT_KEYS))
+
+    def test_select_matches_exactly(self) -> None:
+        self.assertEqual(_load_ruff_config()["lint"]["select"], PINNED_SELECT)
+
+    def test_ignore_matches_exactly(self) -> None:
+        self.assertEqual(_load_ruff_config()["lint"]["ignore"], PINNED_IGNORE)
+
+    def test_line_length_matches_exactly(self) -> None:
+        self.assertEqual(_load_ruff_config()["line-length"], PINNED_LINE_LENGTH)
+
+    def test_pylint_max_args_matches_exactly(self) -> None:
+        self.assertEqual(_load_ruff_config()["lint"]["pylint"]["max-args"], PINNED_PYLINT_MAX_ARGS)
+
+    def test_pydocstyle_convention_matches_exactly(self) -> None:
+        self.assertEqual(
+            _load_ruff_config()["lint"]["pydocstyle"]["convention"],
+            PINNED_PYDOCSTYLE_CONVENTION,
+        )
+
+
+class NoStrayRuffConfigFileTest(unittest.TestCase):
+    """`--config pyproject.toml` 只是第一道防线（显式指定来源）；第二道防线是
+    仓库里压根不允许存在一份会被 ruff 就近发现的旁路配置文件——独立审查实测
+    坐实一份 `ruff.toml`/`.ruff.toml` 即使不被显式传入，仍会被 ruff 的默认
+    配置发现顺序抢先命中。
+
+    变异实测：在 `src/lingxi/core/` 下临时写一份 `ruff.toml`（内容
+    `[lint]\\nselect = []`）——本测试判红；同时 `verify_repository.sh` 因为
+    显式传了 `--config pyproject.toml`，ruff check 仍然按 pyproject.toml 的
+    规则集判定，不会被这份旁路文件放行。验证后删除该临时文件。
+    """
+
+    def test_no_ruff_toml_or_dot_ruff_toml_is_tracked(self) -> None:
+        # 不用 pathspec glob 过滤（git 的 fnmatch 对隐藏文件的 `*` 行为不保证
+        # 跨版本一致）：直接列出全部受版本控制文件，在 Python 里按 basename
+        # 精确匹配，行为不依赖 git 版本或 core.globPathspecs 配置。
+        result = subprocess.run(
+            ["git", "ls-files"],
+            cwd=REPO_ROOT,
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        tracked = [line for line in result.stdout.splitlines() if line]
+        offenders = [path for path in tracked if Path(path).name in ("ruff.toml", ".ruff.toml")]
+        self.assertEqual(
+            offenders,
+            [],
+            f"仓库里出现了会被 ruff 就近发现抢先生效的旁路配置文件：{offenders}——"
+            "唯一合法的配置来源是 pyproject.toml，删除这些文件。",
         )
 
 

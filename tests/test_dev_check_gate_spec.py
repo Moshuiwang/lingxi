@@ -145,6 +145,32 @@ class GateSpecFailsLoudOnUnexpectedShapeTest(unittest.TestCase):
             GATE_SPEC.parse_gate_spec(broken)
 
 
+class RunCommandLinesSkipsCommentsTest(unittest.TestCase):
+    """独立审查实测坐实：`run: |` 块首行若是注释掉的旧安装行，旧解析器会把
+    注释里的版本号当成真正生效的那行——`_run_command_lines` 必须跳过整行都是
+    注释的行，只把真正会被 shell 执行的行当作命令。"""
+
+    def test_a_leading_comment_line_is_skipped_in_favor_of_the_real_command(self) -> None:
+        step_text = (
+            "      - name: 安装依赖\n"
+            "        run: |\n"
+            "          # python3 -m pip install '.[old]' 'shellcheck-py==0.9.0'\n"
+            "          python3 -m pip install '.[scheduler,migrate]' 'shellcheck-py==0.11.0.1' 'ruff==0.16.4'\n"
+        )
+        result = GATE_SPEC._run_command_lines(step_text)
+        self.assertEqual(
+            result,
+            [
+                "python3 -m pip install '.[scheduler,migrate]' 'shellcheck-py==0.11.0.1' 'ruff==0.16.4'"
+            ],
+        )
+
+    def test_a_block_of_only_comments_raises(self) -> None:
+        step_text = "      - name: 安装依赖\n        run: |\n          # 只有注释，没有真正的命令\n"
+        with self.assertRaises(GATE_SPEC.GateSpecError):
+            GATE_SPEC._run_command_lines(step_text)
+
+
 class GateSpecOnRealWorkflowFilesTest(unittest.TestCase):
     """对当前仓库真实的 ci.yml / story.yml 解析一次，锁住「现在读到的就是这些值」。
 

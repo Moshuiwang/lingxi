@@ -77,10 +77,16 @@ class EvaluateTest(unittest.TestCase):
         current = {"src/lingxi/x.py::small": CHECK.THRESHOLD_LINES}
         self.assertEqual(CHECK.evaluate(baseline, current), [])
 
-    def test_deleted_function_leaving_baseline_is_not_a_failure(self) -> None:
+    def test_deleted_function_leaving_baseline_now_fails_and_prompts_refresh(self) -> None:
+        """独立审核实测坐实：函数已删/改名/搬走后基线登记必须判红并提示
+        --refresh，不能静默保留陈旧登记（此前的行为是静默放行）。"""
+
         baseline = {"src/lingxi/x.py::gone": 70}
         current: dict[str, int] = {}
-        self.assertEqual(CHECK.evaluate(baseline, current), [])
+        failures = CHECK.evaluate(baseline, current)
+        self.assertTrue(
+            any("已经找不到这个函数" in f and "--refresh" in f for f in failures), failures
+        )
 
     def test_manually_inflating_the_baseline_without_touching_the_function_is_rejected(
         self,
@@ -191,6 +197,25 @@ class RunRefreshClassificationTest(unittest.TestCase):
         self.assertEqual(exit_code, 1)
         self.assertEqual(CHECK.load_baseline(self.baseline_path), {"src/lingxi/grown.py::f": 90})
 
+    def test_refresh_removes_an_entry_for_a_function_that_no_longer_exists(self) -> None:
+        """函数已删/改名/搬走：evaluate() 现在会判红，--refresh 负责移除这类
+        陈旧条目——同 `test_refresh_removes_an_entry_that_shrank_below_threshold`
+        同一处理路径（该键在 `current` 里找不到，构造 new_baseline 时被滤掉）。"""
+
+        self._write_function("registered.py", "f", 3)  # 仍存在，且已缩小
+        self.baseline_path.write_text(
+            CHECK.render_baseline(
+                {
+                    "src/lingxi/registered.py::f": 90,
+                    "src/lingxi/gone.py::vanished": 90,
+                }
+            ),
+            encoding="utf-8",
+        )
+        exit_code = CHECK.run_refresh()
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(CHECK.load_baseline(self.baseline_path), {})
+
 
 class BootstrapTest(unittest.TestCase):
     """`--bootstrap` 只在基线文件彻底不存在时可用；文件存在时必须拒绝，不能
@@ -274,6 +299,56 @@ class FixedSampleMutationTest(unittest.TestCase):
         self._write(60)  # 1 def line + 60 body lines = 61
         current = CHECK.measure(CHECK.iter_scope_files())
         self.assertEqual(current["src/lingxi/probe.py::probe"], 61)
+        failures = CHECK.evaluate({}, current)
+        self.assertTrue(any("新超过函数体量棘轮阈值" in f for f in failures), failures)
+
+
+class DuplicateQualifiedNameTakesMaxTest(unittest.TestCase):
+    """独立审核实测坐实：property 的 getter/setter 同名不同定义时，此前后一次
+    定义会静默覆盖前一次的登记——一个真实超过阈值的 getter 因为后面跟着一个
+    3 行的 setter 而在门禁眼里"缩水"。键的形状不变，取这组同名定义里的 max()。"""
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        root = Path(self._tmp.name)
+        self.source_root = root / "src" / "lingxi"
+        self.source_root.mkdir(parents=True)
+
+        self._orig_repository_root = CHECK.REPOSITORY_ROOT
+        self._orig_source_root = CHECK.SOURCE_ROOT
+        self._orig_baseline_path = CHECK.BASELINE_PATH
+        CHECK.REPOSITORY_ROOT = root
+        CHECK.SOURCE_ROOT = self.source_root
+        CHECK.BASELINE_PATH = root / "baseline.txt"
+        self.addCleanup(self._restore)
+
+    def _restore(self) -> None:
+        CHECK.REPOSITORY_ROOT = self._orig_repository_root
+        CHECK.SOURCE_ROOT = self._orig_source_root
+        CHECK.BASELINE_PATH = self._orig_baseline_path
+
+    def test_property_getter_100_lines_and_setter_3_lines_registers_the_getter_length(
+        self,
+    ) -> None:
+        getter_body = "\n".join(f"        x{i} = {i}" for i in range(99))  # 100 行 getter
+        setter_body = "        self._x = value"  # 3 行 setter
+        source = (
+            "class Widget:\n"
+            "    @property\n"
+            "    def value(self):\n"
+            f"{getter_body}\n"
+            "        return self._x\n"
+            "\n"
+            "    @value.setter\n"
+            "    def value(self, value):\n"
+            f"{setter_body}\n"
+        )
+        path = self.source_root / "widget.py"
+        path.write_text(source, encoding="utf-8")
+
+        current = CHECK.measure(CHECK.iter_scope_files())
+        self.assertEqual(current["src/lingxi/widget.py::Widget.value"], 101)
         failures = CHECK.evaluate({}, current)
         self.assertTrue(any("新超过函数体量棘轮阈值" in f for f in failures), failures)
 

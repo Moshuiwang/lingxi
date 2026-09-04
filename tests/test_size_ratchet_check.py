@@ -81,12 +81,16 @@ class EvaluateTest(unittest.TestCase):
         current = {"src/lingxi/core/small_module.py": 42}
         self.assertEqual(CHECK.evaluate(baseline, current), [])
 
-    def test_deleted_file_leaving_baseline_is_not_a_failure(self) -> None:
-        """文件已经不在扫描范围内：棘轮的目的已经达成，不强制立即刷新。"""
+    def test_deleted_file_leaving_baseline_now_fails_and_prompts_refresh(self) -> None:
+        """独立审核实测坐实：文件已删/改名/移出 src/lingxi/ 后基线登记必须判红
+        并提示 --refresh，不能静默保留陈旧登记（此前的行为是静默放行）。"""
 
         baseline = {"src/lingxi/apps/scheduler/__init__.py": 2048}
         current: dict[str, int] = {}
-        self.assertEqual(CHECK.evaluate(baseline, current), [])
+        failures = CHECK.evaluate(baseline, current)
+        self.assertTrue(
+            any("已经找不到这个文件" in f and "--refresh" in f for f in failures), failures
+        )
 
     def test_manually_inflating_the_baseline_without_touching_the_file_is_rejected(self) -> None:
         """自证：试图把基线调大 ⇒ 红。文件实际还是 2048 行，基线被手工改成 9999。"""
@@ -307,6 +311,25 @@ class RunRefreshClassificationTest(unittest.TestCase):
         exit_code = CHECK.run_refresh()
         self.assertEqual(exit_code, 1)
         self.assertEqual(CHECK.load_baseline(self.baseline_path), {"src/lingxi/grown.py": 2000})
+
+    def test_refresh_removes_an_entry_for_a_file_that_no_longer_exists(self) -> None:
+        """文件已删/改名/移出 src/lingxi/：evaluate() 现在会判红，--refresh
+        负责移除这类陈旧条目（该键在 current 里找不到，构造 new_baseline 时
+        被滤掉，与"缩到阈值以下"走同一处理路径）。"""
+
+        self._write_module("registered.py", 100)  # 仍存在，且已缩小
+        self.baseline_path.write_text(
+            CHECK.render_baseline(
+                {
+                    "src/lingxi/registered.py": 2000,
+                    "src/lingxi/gone.py": 2000,
+                }
+            ),
+            encoding="utf-8",
+        )
+        exit_code = CHECK.run_refresh()
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(CHECK.load_baseline(self.baseline_path), {})
 
 
 if __name__ == "__main__":
