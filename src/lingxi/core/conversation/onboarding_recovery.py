@@ -37,8 +37,8 @@ from __future__ import annotations
 
 import logging
 import time
+from collections.abc import Callable
 from datetime import timedelta
-from typing import Callable
 
 from .ports import (
     RETRYABLE_REASONS,

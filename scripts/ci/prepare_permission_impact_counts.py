@@ -22,7 +22,6 @@ import sys
 from pathlib import Path
 from typing import Any
 
-
 REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
 MANIFEST_PATH = REPOSITORY_ROOT / ".github" / "permission-impact-counts.json"
 

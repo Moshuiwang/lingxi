@@ -15,6 +15,7 @@
 from __future__ import annotations
 
 import unittest
+from datetime import UTC
 
 from lingxi.config.content import default_content_catalog
 from lingxi.core.admin.pending_action import PendingAction, PendingActionStatus, PendingActionType
@@ -232,9 +233,9 @@ class FakeConfirmCards:
 def _prepared_pending(
     *, action_type: PendingActionType = PendingActionType.SUSPEND_USER
 ) -> PendingAction:
-    from datetime import datetime, timedelta, timezone
+    from datetime import datetime, timedelta
 
-    now = datetime(2026, 8, 24, 12, 0, 0, tzinfo=timezone.utc)
+    now = datetime(2026, 8, 24, 12, 0, 0, tzinfo=UTC)
     return PendingAction(
         id="pac_router_test0000000000",
         action_type=action_type,
@@ -2046,7 +2047,7 @@ class LinkifiedEmailRoutingTests(unittest.TestCase):
         unsupported = (
             f"/admin user <{_LINK_TEST_EMAIL}>",
             f"/admin user `{_LINK_TEST_EMAIL}`",
-            f"/admin user [ou_abc123](mailto:ou_abc123)",
+            "/admin user [ou_abc123](mailto:ou_abc123)",
             f"/admin user [seen@example.com](mailto:{_LINK_TEST_EMAIL})",
             f"/admin user [{_LINK_TEST_EMAIL}](https://example.com/user)",
         )

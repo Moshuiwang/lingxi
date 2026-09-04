@@ -20,7 +20,7 @@ import os
 import tempfile
 import threading
 import unittest
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 from lingxi.apps.scheduler import (
@@ -274,7 +274,7 @@ class RealDatabaseTest(unittest.TestCase):
             PostgresContentCaptureRetention,
         )
 
-        now = datetime.now(timezone.utc)
+        now = datetime.now(UTC)
         self._insert("icc_expired", created_at=now - timedelta(days=91))
         self._insert("icc_fresh", created_at=now - timedelta(days=1))
 

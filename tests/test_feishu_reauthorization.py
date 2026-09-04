@@ -12,11 +12,10 @@ import logging
 import stat
 import tempfile
 import unittest
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
-from lingxi.apps.reauthorize import handle_bridge_message
 from lingxi.adapters.feishu_directory import AuthorizationExchange
 from lingxi.adapters.feishu_reauthorization import (
     MODE_BOOTSTRAP,
@@ -26,10 +25,10 @@ from lingxi.adapters.feishu_reauthorization import (
     SubjectAlreadyRegisteredError,
 )
 from lingxi.adapters.oauth_bridge_client import OAuthBridgeClient, OAuthBridgeMessage
+from lingxi.apps.reauthorize import handle_bridge_message
 from lingxi.core.identity.credentials import AuthorizationGrant, SecretToken
 
-
-NOW = datetime(2026, 8, 8, 7, 0, tzinfo=timezone.utc)
+NOW = datetime(2026, 8, 8, 7, 0, tzinfo=UTC)
 EXPECTED_SUBJECT = "ou_delegated_subject"
 OTHER_SUBJECT = "ou_other_subject"
 FAKE_CODE = "fake-one-time-code"
@@ -222,7 +221,7 @@ class ReauthorizationEntryTest(unittest.TestCase):
         self.assertEqual(self.vault.saved[0][1].refresh_token.reveal(), FAKE_REFRESH_TOKEN)
 
     def test_oauth_bridge_injection_routes_to_formal_reauthorization_without_onboarding(self) -> None:
-        state = self._begin(now=datetime.now(timezone.utc))
+        state = self._begin(now=datetime.now(UTC))
         sender = FakeBridgeResultSender()
         onboarding_messages: list[OAuthBridgeMessage] = []
         bridge = OAuthBridgeClient(
@@ -245,7 +244,7 @@ class ReauthorizationEntryTest(unittest.TestCase):
         self.assertEqual(self.exchanger.calls[0][0], FAKE_CODE)
 
     def test_oauth_bridge_cancellation_uses_formal_retry_result(self) -> None:
-        state = self._begin(now=datetime.now(timezone.utc))
+        state = self._begin(now=datetime.now(UTC))
         sender = FakeBridgeResultSender()
 
         result = handle_bridge_message(

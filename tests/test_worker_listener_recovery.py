@@ -35,7 +35,7 @@ class _FlakyListener:
         self.wait_calls = 0
         self.exit_calls = 0
 
-    def __enter__(self) -> "_FlakyListener":
+    def __enter__(self) -> _FlakyListener:
         return self
 
     def __exit__(self, *_args: object) -> None:

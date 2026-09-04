@@ -200,7 +200,10 @@ class LarkCardTransport:
         return CardCreated(card_id=card_id, message_id=send_response.data.message_id)
 
     def update(self, *, card_id: str, sequence: int, card: RenderedCard) -> None:
-        from lark_oapi.api.cardkit.v1 import ContentCardElementRequest, ContentCardElementRequestBody
+        from lark_oapi.api.cardkit.v1 import (
+            ContentCardElementRequest,
+            ContentCardElementRequestBody,
+        )
 
         request = (
             ContentCardElementRequest.builder()
@@ -228,7 +231,12 @@ class LarkCardTransport:
         整卡级 ``sequence`` 计数器，必须无缝递增（跨接口拼接见探针记录）。
         """
 
-        from lark_oapi.api.cardkit.v1 import Config, Settings, SettingsCardRequest, SettingsCardRequestBody
+        from lark_oapi.api.cardkit.v1 import (
+            Config,
+            Settings,
+            SettingsCardRequest,
+            SettingsCardRequestBody,
+        )
 
         settings = Settings.builder().config(Config.builder().streaming_mode(False).build()).build()
         request = (

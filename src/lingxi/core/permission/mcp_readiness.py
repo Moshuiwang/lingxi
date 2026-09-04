@@ -111,16 +111,17 @@ tick 形态的全部状态从 ``mcp_sync_check`` 重建（:class:`ReadinessProgr
 from __future__ import annotations
 
 import logging
+from collections.abc import Callable
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from enum import Enum
-from typing import Any, Callable, Protocol
+from typing import Any, Protocol
 
 from lingxi.core.permission.publish_row import lookup_metrics, parse_permissions
 
 logger = logging.getLogger(__name__)
 
-_UTC = timezone.utc
+_UTC = UTC
 
 #: 合同节奏：立即一次，此后每三分钟一次，十五分钟停止（产品合同「首次开通」第 8 条）。
 DEFAULT_INTERVAL_SECONDS = 180
@@ -310,7 +311,7 @@ class ReadinessBinding:
 
 
 def _require_attempt_shape(
-    outcome: "ReadinessOutcome", error_code: str | None, metric_count: int | None
+    outcome: ReadinessOutcome, error_code: str | None, metric_count: int | None
 ) -> None:
     """五路结论各自的**精确形状**。与迁移 ``0065`` 的 CHECK 一一对应，两处必须同时改。
 
@@ -896,7 +897,7 @@ class ReadinessProgress:
             raise ValueError("确认起点必须是带时区的时间")
 
     @classmethod
-    def from_checks(cls, checks: Any) -> "ReadinessProgress":
+    def from_checks(cls, checks: Any) -> ReadinessProgress:
         """从 ``mcp_sync_check`` 回读出来的判定行重建进度。
 
         只读三样东西：条数、第一行的 ``started_at``、有没有终态结论。刻意按**鸭子类型**

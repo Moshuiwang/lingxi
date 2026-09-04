@@ -16,9 +16,9 @@ import unittest
 from lingxi.core.execution.audit import TurnAudit, redact_free_text, redact_free_text_with_count
 from lingxi.core.execution.tool_policy import ToolPolicy
 from lingxi.core.innertest_content_capture import (
+    MAX_TOOL_RESULT_SUMMARY_BYTES,
     CapturedToolCall,
     ContentCaptureRecord,
-    MAX_TOOL_RESULT_SUMMARY_BYTES,
     RawTurnCapture,
 )
 

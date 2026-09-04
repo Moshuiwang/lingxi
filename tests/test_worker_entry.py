@@ -213,7 +213,7 @@ class FakeAgentSDK:
         self.mcp_status: dict = mcp_status if mcp_status is not None else {"mcpServers": []}
         self.mcp_status_calls = 0
 
-    def install(self, testcase) -> "FakeAgentSDK":
+    def install(self, testcase) -> FakeAgentSDK:
         module = types.ModuleType("claude_agent_sdk")
         module.HookMatcher = StubHookMatcher
         module.ClaudeAgentOptions = StubAgentOptions

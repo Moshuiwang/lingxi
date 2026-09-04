@@ -23,7 +23,8 @@ import signal
 import sys
 import threading
 import time
-from typing import Any, Callable, Mapping
+from collections.abc import Callable, Mapping
+from typing import Any
 
 from lingxi.adapters.feishu_events import (
     CARD_ACTION_TRIGGER_EVENT,
@@ -40,6 +41,7 @@ from lingxi.adapters.feishu_longconn import (
     TerminationReason,
 )
 from lingxi.apps.liveness import touch_liveness
+from lingxi.core.admin.card_dispatch import ManagementCardContext, management_card_fingerprint
 from lingxi.core.admin.management_card import (
     ADMIN_ACTION_CANCEL,
     ADMIN_ACTION_GRANT,
@@ -47,7 +49,6 @@ from lingxi.core.admin.management_card import (
     GRANT_SUBMIT_BUTTON_NAME,
     render_management_card,
 )
-from lingxi.core.admin.card_dispatch import ManagementCardContext, management_card_fingerprint
 from lingxi.core.conversation.pipeline import EventPipeline
 from lingxi.core.conversation.ports import OnboardingResult, OnboardingRunner, OnboardingState
 from lingxi.core.execution.card_stream import CardCreated, CardTransport, DeliveryRejected
@@ -57,11 +58,17 @@ from .config import GatewayConfig, GatewayConfigError, load_config
 from .delivery import LOOP_ALERT_TRACE_ID
 from .document_delivery import (
     LOOP_ALERT_TRACE_ID as DOCUMENT_DELIVERY_LOOP_ALERT_TRACE_ID,
+)
+from .document_delivery import (
     assemble_document_delivery_consumer,
 )
 from .group_mention_hint import GroupMentionHintResponder, build_group_mention_hint_throttle
 from .log_redaction import install_credential_redaction
-from .management_status import PUBLISHING_STATUS_TEXT, rendered_dispatch_status, skipped_recompute_status_message
+from .management_status import (
+    PUBLISHING_STATUS_TEXT,
+    rendered_dispatch_status,
+    skipped_recompute_status_message,
+)
 from .onboarding import assert_gateway_onboarding_is_inert
 
 logger = logging.getLogger(__name__)
@@ -677,7 +684,9 @@ def build_supervisor(
     而那正是断言要验的东西（缺省落桩就发生在这一行）。
     """
 
+    from lingxi.adapters.admin_post_callback import BackgroundPostCallbackExecutor
     from lingxi.adapters.admin_registry import PostgresAdminQueries, PostgresAdminRegistryLookup
+
     # 刻意从 `delegated_subject_lookup`（不是 `delegated_credentials`）导入：后者
     # 的其它函数用到 cryptography（Fernet 密文读写），而 `pyproject.toml` 的
     # `gateway` extras 组明确不含 cryptography——gateway 不碰 Fernet（2026-08-18
@@ -696,7 +705,6 @@ def build_supervisor(
     from lingxi.adapters.postgres_management_card_context import (
         PostgresManagementCardContextStore,
     )
-    from lingxi.adapters.admin_post_callback import BackgroundPostCallbackExecutor
     from lingxi.adapters.postgres_pending_action import PostgresPendingActionStore
     from lingxi.adapters.postgres_permission_recompute_trigger import (
         BackgroundPermissionRecomputeTrigger,

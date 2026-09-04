@@ -23,9 +23,11 @@ from __future__ import annotations
 import logging
 import threading
 from collections.abc import Callable, Sequence
-from datetime import date, datetime, timezone
+from datetime import UTC, date, datetime
 from typing import Protocol
 
+from lingxi.apps.scheduler.audit import AuditSink
+from lingxi.apps.scheduler.config import SchedulerConfig
 from lingxi.core.identity.roster_audit import ArchivedIdentity, RosterAuditReport, compare_roster
 from lingxi.core.identity.roster_report import render_daily_report_content
 from lingxi.core.identity.roster_snapshot import (
@@ -34,9 +36,6 @@ from lingxi.core.identity.roster_snapshot import (
     RosterSnapshotUpdater,
     SnapshotDecision,
 )
-
-from lingxi.apps.scheduler.audit import AuditSink
-from lingxi.apps.scheduler.config import SchedulerConfig
 
 logger = logging.getLogger(__name__)
 
@@ -132,7 +131,7 @@ class RosterAuditDuty:
         self._audit = audit
         self._chat_id = chat_id
         # 时钟注入：跨轮判重的用例要能自己决定「今天」是哪天，不能靠等到明天。
-        self._clock = clock or (lambda: datetime.now(timezone.utc))
+        self._clock = clock or (lambda: datetime.now(UTC))
         self._stop = threading.Event() if stop is None else stop
         self._completed_on: date | None = None
 
@@ -340,7 +339,7 @@ class RosterSnapshotSyncDuty:
         stop: threading.Event | None = None,
     ) -> None:
         self._roster_source = roster_source
-        self._clock = clock or (lambda: datetime.now(timezone.utc))
+        self._clock = clock or (lambda: datetime.now(UTC))
         self._stop = threading.Event() if stop is None else stop
         self._completed_on: date | None = None
 

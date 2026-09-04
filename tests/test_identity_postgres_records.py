@@ -19,8 +19,10 @@ import dataclasses
 import os
 import time
 import unittest
-from datetime import date, datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
+
+from postgres_schema import psycopg_available, reset_production_rows
 
 from lingxi.adapters.postgres import connect
 from lingxi.adapters.postgres_identity import IdentityStorageIntegrityError
@@ -44,8 +46,6 @@ from lingxi.core.identity.provisioning import (
     ProvisioningRejection,
     ProvisioningRequest,
 )
-
-from postgres_schema import psycopg_available, reset_production_rows
 
 FAKE_TOKEN = "fake-refresh-token-for-tests-only"
 DELEGATED_SUBJECT = "ou_delegated_authorization_subject"
@@ -144,7 +144,7 @@ class DelegatedCredentialTest(IdentityPostgresTestCase):
         self.addCleanup(self._dir.cleanup)
         self.path = Path(self._dir.name) / "delegated-credential.enc"
         self.vault = HostFileDelegatedCredentialVault(self._dsn, Fernet.generate_key().decode(), str(self.path))
-        self.issued_at = datetime.now(timezone.utc)
+        self.issued_at = datetime.now(UTC)
 
     def _save(self, *, seconds: int = 7 * 24 * 3600, token: str = FAKE_TOKEN, issued_at: datetime | None = None) -> None:
         self.vault.save(
@@ -238,7 +238,7 @@ class DelegatedCredentialTest(IdentityPostgresTestCase):
 
     def test_claiming_a_due_credential_succeeds_exactly_once(self) -> None:
         # 一次性凭据不能被同一轮扫描领两次；消费标记就是那道门。
-        self._save(seconds=3600, issued_at=datetime.now(timezone.utc) - timedelta(seconds=3500))
+        self._save(seconds=3600, issued_at=datetime.now(UTC) - timedelta(seconds=3500))
 
         first = self.vault.claim_due()
         second = self.vault.claim_due()
@@ -255,7 +255,7 @@ class DelegatedCredentialTest(IdentityPostgresTestCase):
         """fcntl 排他锁扮演数据库版 SKIP LOCKED 的角色：并发领取恰好一个成功。"""
         import threading as _threading
 
-        self._save(seconds=3600, issued_at=datetime.now(timezone.utc) - timedelta(seconds=3500))
+        self._save(seconds=3600, issued_at=datetime.now(UTC) - timedelta(seconds=3500))
         results: list[object] = []
 
         def worker() -> None:
@@ -363,7 +363,7 @@ class ConsumedCredentialTest(IdentityPostgresTestCase):
         self.addCleanup(self._dir.cleanup)
         self.path = Path(self._dir.name) / "delegated-credential.enc"
         self.vault = HostFileDelegatedCredentialVault(self._dsn, Fernet.generate_key().decode(), str(self.path))
-        self.issued_at = datetime.now(timezone.utc) - timedelta(days=6)
+        self.issued_at = datetime.now(UTC) - timedelta(days=6)
         self.vault.save(
             subject_open_id=DELEGATED_SUBJECT,
             grant=AuthorizationGrant(SecretToken(FAKE_TOKEN), 7 * 24 * 3600, "offline_access"),
@@ -378,7 +378,7 @@ class ConsumedCredentialTest(IdentityPostgresTestCase):
         # 现在与任何未来时刻都一样（挡住重放的是消费标记本身）。
         self.assertIsNone(self.vault.load())
         self.assertIsNone(self.vault.claim_due())
-        later = datetime.now(timezone.utc) + timedelta(seconds=3600)
+        later = datetime.now(UTC) + timedelta(seconds=3600)
         self.assertIsNone(self.vault.claim_due(now=later))
         self.assertIsNone(self.vault.load(now=later))
 
@@ -396,7 +396,7 @@ class ConsumedCredentialTest(IdentityPostgresTestCase):
         self.vault.claim_due()
 
         with self.assertLogs("lingxi.adapters.delegated_credentials", level="ERROR") as captured:
-            cleared = self.vault.revoke_stale_consumed(max_age_seconds=0, now=datetime.now(timezone.utc) + timedelta(seconds=1))
+            cleared = self.vault.revoke_stale_consumed(max_age_seconds=0, now=datetime.now(UTC) + timedelta(seconds=1))
 
         self.assertTrue(cleared)
         self.assertTrue(any("不可恢复" in line for line in captured.output))
@@ -449,7 +449,7 @@ class OnDemandRefreshCeilingTest(IdentityPostgresTestCase):
             self._dsn, Fernet.generate_key().decode(), str(self.path)
         )
         # 刚发放：轮换点在 5.6 天之后，因此"到期领取"这条路径拿不到它。
-        self.issued_at = datetime.now(timezone.utc)
+        self.issued_at = datetime.now(UTC)
 
     def _save(
         self,
@@ -483,11 +483,11 @@ class OnDemandRefreshCeilingTest(IdentityPostgresTestCase):
         """
 
         self._save()
-        before = datetime.now(timezone.utc)
+        before = datetime.now(UTC)
 
         claimed = self.vault.claim_due(for_supply=True)
 
-        after = datetime.now(timezone.utc)
+        after = datetime.now(UTC)
         self.assertIsNotNone(claimed.consumed_at)
         self.assertGreaterEqual(claimed.consumed_at, before)
         self.assertLessEqual(claimed.consumed_at, after)
@@ -514,7 +514,7 @@ class OnDemandRefreshCeilingTest(IdentityPostgresTestCase):
                 fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
                 holding.set()
                 time.sleep(0.2)
-                released_at.append(datetime.now(timezone.utc))
+                released_at.append(datetime.now(UTC))
                 fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
 
         holder = threading.Thread(target=hold_the_lock)
@@ -532,7 +532,7 @@ class OnDemandRefreshCeilingTest(IdentityPostgresTestCase):
 
     # 一个远离 UTC 午夜的固定锚点：涉及"同一 UTC 日"的用例用它，避免真的在 CI 跑到
     # 接近午夜时产生偶发的跨日误判（Issue #276 新增用例的确定性要求）。
-    NOON = datetime(2026, 8, 18, 12, 0, 0, tzinfo=timezone.utc)
+    NOON = datetime(2026, 8, 18, 12, 0, 0, tzinfo=UTC)
 
     def test_a_second_claim_within_the_minimum_interval_is_refused(self) -> None:
         """距上一次消费未满最小间隔（默认 5 分钟）：被拒，且不置位消费标记。
@@ -625,7 +625,10 @@ class OnDemandRefreshCeilingTest(IdentityPostgresTestCase):
     def test_the_two_ceilings_are_distinguishable_on_the_same_credential(self) -> None:
         """同一条领取路径下，最小间隔与当日上界必须能被明确区分（约束 2 的直接钉子）。"""
 
-        from lingxi.core.identity.credentials import RefreshDailyLimitReached, RefreshMinIntervalNotElapsed
+        from lingxi.core.identity.credentials import (
+            RefreshDailyLimitReached,
+            RefreshMinIntervalNotElapsed,
+        )
 
         self._save(refresh_consumed_at=self.NOON, refresh_consumed_count=1)
 
@@ -645,7 +648,7 @@ class OnDemandRefreshCeilingTest(IdentityPostgresTestCase):
 
         from lingxi.core.identity.credentials import RefreshDailyLimitReached
 
-        near_midnight = datetime(2026, 8, 18, 23, 59, 30, tzinfo=timezone.utc)
+        near_midnight = datetime(2026, 8, 18, 23, 59, 30, tzinfo=UTC)
         self._save(refresh_consumed_at=near_midnight, refresh_consumed_count=1)
 
         # 6 分钟之后（已过最小间隔）、仍是 8-19 的 00:05:30——已经跨过 UTC 午夜，
@@ -701,7 +704,7 @@ class OnDemandRefreshCeilingTest(IdentityPostgresTestCase):
 
         from lingxi.core.identity.credentials import RefreshRateLimited
 
-        moment = datetime.now(timezone.utc)
+        moment = datetime.now(UTC)
         self._save(refresh_consumed_at=moment, refresh_consumed_count=1, seconds=3600)
 
         later = moment + timedelta(seconds=3601)
@@ -825,7 +828,7 @@ class CredentialGenerationGuardTest(IdentityPostgresTestCase):
         self.vault.save(
             subject_open_id=DELEGATED_SUBJECT,
             grant=AuthorizationGrant(SecretToken(FAKE_TOKEN), 3600, ""),
-            issued_at=datetime.now(timezone.utc) - timedelta(seconds=3500),
+            issued_at=datetime.now(UTC) - timedelta(seconds=3500),
         )
 
     def test_a_reauthorization_between_claim_and_save_wins(self) -> None:
@@ -1058,7 +1061,7 @@ class SnapshotCommitOrderingTest(IdentityPostgresTestCase):
         """两轮同步重叠时，后提交但**更早启动**的那轮不得取代更新的数据；
         started_at 经 commit_batch 参数按同步真实开始时刻传入。"""
         store = self._store()
-        now = datetime.now(timezone.utc)
+        now = datetime.now(UTC)
         newer = store.commit_batch(batch((member(),)), source_app_id="cli_fake", started_at=now)
 
         older = store.commit_batch(
@@ -1232,7 +1235,7 @@ class OrgSnapshotTest(IdentityPostgresTestCase):
         self.store.commit_batch(
             batch((member(),)),
             source_app_id="cli_fake",
-            started_at=datetime.now(timezone.utc) - timedelta(days=91),
+            started_at=datetime.now(UTC) - timedelta(days=91),
         )
 
         lookup = self.store.lookup("ou_zhang")
@@ -1250,7 +1253,7 @@ class OrgSnapshotTest(IdentityPostgresTestCase):
         """F8：当日水位必须能对进程重启保持——真库上验证 ``has_complete_run_on``
         只认 ``started_at`` 落在查询那个 UTC 日历日、且状态是 ``complete`` 的批次。"""
 
-        today = datetime.now(timezone.utc)
+        today = datetime.now(UTC)
         self.assertFalse(self.store.has_complete_run_on(today.date()), "还没提交过任何批次")
 
         self.store.commit_batch(batch((member(),)), source_app_id="cli_fake", started_at=today)
@@ -1266,7 +1269,7 @@ class OrgSnapshotTest(IdentityPostgresTestCase):
             self.store.commit_batch(batch((member(open_id="  "),)), source_app_id="cli_fake")
 
         self.assertFalse(
-            self.store.has_complete_run_on(datetime.now(timezone.utc).date()),
+            self.store.has_complete_run_on(datetime.now(UTC).date()),
             "失败批次不能让水位查询误判成“今天已经成功过一轮”",
         )
 
@@ -2395,10 +2398,11 @@ class AppUserEmailBindingTest(IdentityPostgresTestCase):
         零新增行、``publish_outbox`` 零行。
         """
 
+        from test_onboarding_runner import OPEN_ID, ROSTER_ROWS, FakeRoster, run_once
+
         from lingxi.adapters.postgres_email_binding import PostgresEmailBindingSource
         from lingxi.adapters.postgres_identity import PostgresAppUserStore
         from lingxi.adapters.postgres_permission_publish import PostgresPermissionPublishStore
-        from test_onboarding_runner import OPEN_ID, ROSTER_ROWS, FakeRoster, run_once
 
         roster_email = ROSTER_ROWS[0]["email"]
         self._insert("usr_incumbent", "ou_someone_else", roster_email)

@@ -44,8 +44,8 @@ class _StubSDK(unittest.TestCase):
 class HookMatcherShapeTest(_StubSDK):
     def test_registers_every_decision_event_and_the_observation_events(self) -> None:
         from lingxi.adapters.claude_agent_hooks import build_hook_matchers
-        from lingxi.core.execution.hooks import HOOK_EVENTS, OBSERVATION_ONLY_EVENTS, ToolGateway
         from lingxi.core.execution.audit import TurnAudit
+        from lingxi.core.execution.hooks import HOOK_EVENTS, OBSERVATION_ONLY_EVENTS, ToolGateway
         from lingxi.core.execution.tool_policy import ToolPolicy
 
         gateway = ToolGateway(policy=ToolPolicy(allowed_tools=("mcp__q",)), audit=TurnAudit())
@@ -63,8 +63,8 @@ class HookMatcherShapeTest(_StubSDK):
 
     def test_observation_events_can_be_left_out_without_touching_decision_events(self) -> None:
         from lingxi.adapters.claude_agent_hooks import build_hook_matchers
-        from lingxi.core.execution.hooks import HOOK_EVENTS, ToolGateway
         from lingxi.core.execution.audit import TurnAudit
+        from lingxi.core.execution.hooks import HOOK_EVENTS, ToolGateway
         from lingxi.core.execution.tool_policy import ToolPolicy
 
         gateway = ToolGateway(policy=ToolPolicy(allowed_tools=("mcp__q",)), audit=TurnAudit())
@@ -77,8 +77,8 @@ class CallbackSignatureTest(_StubSDK):
     """SDK 可能按位置或按关键字传第三个参数；两种都不能让门禁塌掉。"""
 
     def _gateway(self):
-        from lingxi.core.execution.hooks import ToolGateway
         from lingxi.core.execution.audit import TurnAudit
+        from lingxi.core.execution.hooks import ToolGateway
         from lingxi.core.execution.tool_policy import ToolPolicy
 
         return ToolGateway(policy=ToolPolicy(allowed_tools=("mcp__q",)), audit=TurnAudit())

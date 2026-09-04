@@ -15,8 +15,21 @@ from __future__ import annotations
 
 import threading
 import unittest
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from typing import Any
+
+from test_roster_audit_duty import (
+    COMPLETE_ENV,
+    EMAIL,
+    EMPLOYEE_NO,
+    FAKE_CHAT_ID,
+    NAME,
+    NEW_NAME,
+    PERSON_ONE,
+    USER_ONE,
+    FixedClock,
+    RecordingAudit,
+)
 
 from lingxi.adapters.feishu_roster_bitable import (
     RosterFailureKind,
@@ -35,20 +48,7 @@ from lingxi.core.identity.roster_snapshot import (
     StoredSnapshotFacts,
 )
 
-from test_roster_audit_duty import (
-    COMPLETE_ENV,
-    EMAIL,
-    EMPLOYEE_NO,
-    FAKE_CHAT_ID,
-    NAME,
-    NEW_NAME,
-    PERSON_ONE,
-    USER_ONE,
-    FixedClock,
-    RecordingAudit,
-)
-
-NOW = datetime(2026, 8, 17, 3, 0, tzinfo=timezone.utc)
+NOW = datetime(2026, 8, 17, 3, 0, tzinfo=UTC)
 STALE_AFTER = DEFAULT_SNAPSHOT_STALE_AFTER
 
 

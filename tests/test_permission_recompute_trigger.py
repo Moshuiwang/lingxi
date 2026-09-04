@@ -18,7 +18,7 @@ import threading
 import time
 import unittest
 from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 
 from lingxi.adapters.postgres_permission_recompute_trigger import (
     BackgroundPermissionRecomputeTrigger,
@@ -28,7 +28,7 @@ from lingxi.core.admin.notification import DECISION_CONFIRM
 from lingxi.core.admin.pending_action import PendingAction, PendingActionStatus, PendingActionType
 from lingxi.core.permission.targeted_recompute import RecomputeKind, TargetedRecomputeOutcome
 
-NOW = datetime(2026, 8, 30, 12, 0, 0, tzinfo=timezone.utc)
+NOW = datetime(2026, 8, 30, 12, 0, 0, tzinfo=UTC)
 
 
 def _pending(

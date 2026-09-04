@@ -19,8 +19,8 @@ from __future__ import annotations
 
 import os
 import time
+from collections.abc import Callable
 from pathlib import Path
-from typing import Callable
 
 DEFAULT_DIRECTORY = Path("/tmp")
 FILENAME_TEMPLATE = "lingxi-{role}-liveness"

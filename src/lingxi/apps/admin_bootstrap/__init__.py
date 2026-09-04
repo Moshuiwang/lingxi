@@ -38,7 +38,8 @@ import argparse
 import logging
 import os
 import sys
-from typing import Callable, Mapping, Sequence, TextIO
+from collections.abc import Callable, Mapping, Sequence
+from typing import TextIO
 
 from lingxi.core.admin.registry import AdminRegistrySeedConflict
 from lingxi.core.identity.identifiers import redact_identifier

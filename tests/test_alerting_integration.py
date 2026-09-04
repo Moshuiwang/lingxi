@@ -8,7 +8,7 @@ import os
 import pathlib
 import subprocess
 import unittest
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 
 from lingxi.adapters.feishu_group_message import FeishuGroupMessages
 from lingxi.adapters.feishu_longconn import LongConnectionSupervisor, TerminationReason
@@ -21,12 +21,11 @@ from lingxi.apps.scheduler import (
 )
 from lingxi.apps.worker.config import WorkerConfig
 from lingxi.apps.worker.service import WorkerService
+from lingxi.config.content import default_content_catalog
 from lingxi.core.alerting import AlertManager, AlertPolicy
 from lingxi.core.execution.card_stream import CardCreated, CardStream, DeliveryRejected
-from lingxi.config.content import default_content_catalog
 
-
-UTC = timezone.utc
+UTC = UTC
 START = datetime(2026, 8, 8, 0, 0, tzinfo=UTC)
 
 

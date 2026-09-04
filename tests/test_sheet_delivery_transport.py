@@ -41,6 +41,7 @@ production_schema``/``reset_production_rows``），只新增表格分支特有�
 from __future__ import annotations
 
 import json
+import os
 import unittest
 from typing import Any
 
@@ -54,9 +55,6 @@ from lingxi.adapters.postgres_document_delivery import (
     PostgresDocumentDeliveryStore,
 )
 from lingxi.apps.gateway.document_delivery import DocumentDeliveryConsumer
-from lingxi.apps.worker.config import WorkerConfig
-
-import os
 
 DSN = os.environ.get("LINGXI_POSTGRES_DSN")
 SKIP_REASON = (

@@ -25,11 +25,11 @@ from __future__ import annotations
 
 import ast
 import importlib.util
-import pathlib
 import json
+import pathlib
 import threading
 import unittest
-from datetime import date, datetime, timedelta, timezone
+from datetime import UTC, date, datetime, timedelta, timezone
 
 from lingxi.adapters.postgres_galaxy_snapshot import GalaxyPermissionSnapshot
 from lingxi.adapters.postgres_permission_publish import PERMISSION_REFRESH_BASELINE_SQL
@@ -53,7 +53,6 @@ from lingxi.apps.scheduler.permission_refresh import (
     SKIP_NO_GALAXY_BATCH,
     SKIP_NO_PUBLISHED_ROW,
     SKIP_STALE_SNAPSHOT,
-    TRIGGER_GRANT,
     TRIGGER_REVOKE,
 )
 from lingxi.core.identity.roster_audit import ArchivedIdentity
@@ -108,7 +107,7 @@ def duty_code() -> str:
     return code_without_docstrings(DUTY_SOURCE)
 
 
-TODAY = datetime(2026, 8, 17, 3, 0, tzinfo=timezone.utc)
+TODAY = datetime(2026, 8, 17, 3, 0, tzinfo=UTC)
 
 # 资料值：报告、审计与日志里一个都不许出现。
 NAME_ONE = "化名甲"
@@ -264,7 +263,7 @@ class FakeLegacyAllScope:
     """「全部」组补行口的假实现（rc25 S-1 方案 E）：记录调用；``overrides`` 给定时把补的
     行同步写进假本地覆盖源，模拟"落库后重读能看到"。"""
 
-    def __init__(self, *, overrides: "FakeLocalOverrides | None" = None, error: Exception | None = None) -> None:
+    def __init__(self, *, overrides: FakeLocalOverrides | None = None, error: Exception | None = None) -> None:
         self._overrides = overrides
         self._error = error
         self.calls: list[dict[str, object]] = []
@@ -656,7 +655,7 @@ class UtcDayBoundaryTest(unittest.TestCase):
 
         duty, parts = build_duty(
             identities=(identity(),),
-            roster_captured_at=datetime(2026, 8, 16, 20, 0, tzinfo=timezone.utc),
+            roster_captured_at=datetime(2026, 8, 16, 20, 0, tzinfo=UTC),
             clock=FixedClock(self.LOCAL_MIDNIGHT),
         )
 
@@ -674,7 +673,7 @@ class UtcDayBoundaryTest(unittest.TestCase):
 
         duty, parts = build_duty(
             identities=(identity(),),
-            roster_captured_at=datetime(2026, 8, 17, 1, 0, tzinfo=timezone.utc),
+            roster_captured_at=datetime(2026, 8, 17, 1, 0, tzinfo=UTC),
             clock=FixedClock(self.LOCAL_MIDNIGHT),
         )
 

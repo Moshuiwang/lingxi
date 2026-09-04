@@ -41,8 +41,9 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
-from datetime import date, timezone
+from datetime import UTC, date
 
+from lingxi.config.content import ContentCatalog, RenderedContent, default_content_catalog
 from lingxi.core.identity.roster_audit import (
     ARCHIVED_FIELDS,
     ArchivedIdentity,
@@ -51,7 +52,6 @@ from lingxi.core.identity.roster_audit import (
     RosterAuditReport,
 )
 from lingxi.core.identity.roster_snapshot import RosterSnapshotStatus
-from lingxi.config.content import ContentCatalog, RenderedContent, default_content_catalog
 
 _CATALOG = default_content_catalog()
 REPORT_TITLE = _CATALOG.text("roster.report_title").text
@@ -179,7 +179,7 @@ def _snapshot_lines(status: RosterSnapshotStatus, *, catalog) -> list[str]:
             ).text
         ]
 
-    moment = status.captured_at.astimezone(timezone.utc).strftime(_MOMENT_FORMAT)
+    moment = status.captured_at.astimezone(UTC).strftime(_MOMENT_FORMAT)
     if status.refreshed:
         lines = [
             catalog.text(

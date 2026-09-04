@@ -9,8 +9,9 @@ Gateway 侧确认送达（``confirm_delivery``）、二十四小时到期强制�
 from __future__ import annotations
 
 import logging
+from collections.abc import Mapping
 from datetime import timedelta
-from typing import Any, Mapping
+from typing import Any
 
 from lingxi.adapters.postgres import connect
 from lingxi.core.delivery.ports import (

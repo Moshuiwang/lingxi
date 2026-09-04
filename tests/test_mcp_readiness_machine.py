@@ -39,7 +39,7 @@ import ast
 import inspect
 import textwrap
 import unittest
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 
 from lingxi.core.permission.mcp_readiness import (
     CONTRACT_SCHEDULE,
@@ -62,7 +62,7 @@ from lingxi.core.permission.mcp_readiness import (
     next_probe_due,
 )
 
-START = datetime(2026, 8, 17, 3, 0, tzinfo=timezone.utc)
+START = datetime(2026, 8, 17, 3, 0, tzinfo=UTC)
 USER = "usr_A"
 VERSION = 7
 PERMISSIONS = '{"1011":["日活","收入"]}'

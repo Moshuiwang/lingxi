@@ -9,9 +9,10 @@ G-3 裁定 Option A）：只搬定义，不改任何签名或文档字符串；`
 
 from __future__ import annotations
 
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Any, Mapping, Protocol, Sequence
+from typing import Any, Protocol
 
 from lingxi.core.identity.first_contact import EmploymentStatus
 from lingxi.core.identity.provisioning import UserProvisioningStatus

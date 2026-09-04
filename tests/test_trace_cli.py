@@ -11,7 +11,7 @@ import ast
 import io
 import os
 import unittest
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 from postgres_schema import ensure_production_schema, psycopg_available, reset_production_rows
@@ -135,11 +135,11 @@ class TraceLookupRealDatabaseTests(unittest.TestCase):
                    VALUES (%s, %s, %s, %s, 'auto_provisioning', %s, %s)""",
                 (
                     "evt_trace_1",
-                    datetime.now(timezone.utc) - timedelta(minutes=5),
+                    datetime.now(UTC) - timedelta(minutes=5),
                     "im.message.receive_v1",
                     "ou_trace_1",
                     "trc_lookup_1",
-                    datetime.now(timezone.utc) - timedelta(minutes=5),
+                    datetime.now(UTC) - timedelta(minutes=5),
                 ),
             )
 

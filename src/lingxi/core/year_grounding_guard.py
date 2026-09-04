@@ -80,8 +80,9 @@ Issue #326 记录的内测事故：用户问「最近、尤其是 7 月之后」
 from __future__ import annotations
 
 import re
+from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
-from typing import Any, Iterable, Mapping, Protocol, Sequence
+from typing import Any, Protocol
 
 from lingxi.core.mcp_naming import QUERY_MCP_SERVER_NAME
 

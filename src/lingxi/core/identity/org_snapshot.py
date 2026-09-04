@@ -15,10 +15,10 @@
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from enum import Enum
-from typing import Sequence
 
 # 与产品的九十天可识别内容上限一致，用固定小时数避免时区与夏令时造成的漂移。
 SNAPSHOT_RETENTION_DAYS = 90

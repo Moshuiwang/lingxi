@@ -227,7 +227,7 @@ class ProvisioningRequest:
     @classmethod
     def from_roster_row(
         cls, identity: IdentityRecordDraft, row: Mapping[str, object] | None = None
-    ) -> "ProvisioningRequest":
+    ) -> ProvisioningRequest:
         """从判定层草稿 + 一行花名册记录组装请求。
 
         `row` 接受 `adapters.feishu_roster_bitable.RosterRow`（它实现了 `get`）或任何
@@ -315,17 +315,17 @@ class ProvisioningResult:
         return self.outcome is not ProvisioningOutcome.REJECTED
 
     @classmethod
-    def created(cls, app_user_id: str) -> "ProvisioningResult":
+    def created(cls, app_user_id: str) -> ProvisioningResult:
         return cls(ProvisioningOutcome.CREATED, app_user_id)
 
     @classmethod
-    def already_provisioned(cls, app_user_id: str) -> "ProvisioningResult":
+    def already_provisioned(cls, app_user_id: str) -> ProvisioningResult:
         return cls(ProvisioningOutcome.ALREADY_PROVISIONED, app_user_id)
 
     @classmethod
     def rejected(
         cls, rejection: ProvisioningRejection, *, missing_fields: tuple[str, ...] = ()
-    ) -> "ProvisioningResult":
+    ) -> ProvisioningResult:
         return cls(
             ProvisioningOutcome.REJECTED, None, rejection, missing_fields
         )

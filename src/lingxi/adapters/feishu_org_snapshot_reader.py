@@ -39,10 +39,16 @@ Issue #250：`feishu_org_*` 四张快照表当前全空，且产品侧没有任�
 
 from __future__ import annotations
 
-from typing import Any, Mapping
+from collections.abc import Mapping
+from typing import Any
 
 from lingxi.adapters.feishu_directory import FeishuDirectoryClient, department_identifier
-from lingxi.core.identity.org_snapshot import SnapshotBatch, SnapshotDepartment, SnapshotMember, TenantScope
+from lingxi.core.identity.org_snapshot import (
+    SnapshotBatch,
+    SnapshotDepartment,
+    SnapshotMember,
+    TenantScope,
+)
 
 # 单个租户部门树的安全遍历上界。真实规模约 25 个部门/租户（Issue #250 编排者
 # 2026-08-19 实测，8 个租户合计约 710 名成员），这里留出远超真实规模的余量，

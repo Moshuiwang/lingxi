@@ -55,8 +55,9 @@
 from __future__ import annotations
 
 import json
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
-from typing import Any, Mapping, Sequence
+from typing import Any
 
 from lingxi.core.execution.audit import TurnAuditSummary, redact_free_text_with_count
 

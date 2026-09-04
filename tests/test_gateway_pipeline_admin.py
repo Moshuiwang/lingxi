@@ -26,12 +26,22 @@ from __future__ import annotations
 
 import unittest
 
-from gateway_fakes import CallLog, FakeAudit, FakeOnboarding, FakeReactions, FakeReplies, FakeState, FakeStore, provisioned_user
+from gateway_fakes import (
+    CallLog,
+    FakeAudit,
+    FakeOnboarding,
+    FakeReactions,
+    FakeReplies,
+    FakeState,
+    FakeStore,
+    provisioned_user,
+)
+from test_gateway_pipeline import message
+
 from lingxi.apps.gateway import make_event_handler
 from lingxi.core.admin.router import AdminRouteOutcome
 from lingxi.core.conversation import EventPipeline
 from lingxi.core.conversation.ports import HandledAs, OnboardingResult, OnboardingState
-from test_gateway_pipeline import message
 
 
 class FakeAdminRouter:

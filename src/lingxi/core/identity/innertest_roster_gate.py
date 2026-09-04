@@ -60,9 +60,8 @@
 
 from __future__ import annotations
 
-from typing import Callable
-
 import re
+from collections.abc import Callable
 
 #: 飞书用户 open_id 的前缀，与 ``adapters/feishu_user_message.py`` 的
 #: ``USER_OPEN_ID_PREFIX`` 同一个字面量。这里不从 adapters 反向 import——``core/``

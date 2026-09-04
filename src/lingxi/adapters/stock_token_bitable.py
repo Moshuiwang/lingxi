@@ -44,7 +44,8 @@ identity/onboarding_runner.py` 的 ``_issue_token``）。**全程只读**——�
 from __future__ import annotations
 
 import logging
-from typing import Any, Callable, NamedTuple
+from collections.abc import Callable
+from typing import Any, NamedTuple
 from urllib.parse import quote, urlencode
 
 from lingxi.adapters.feishu_directory import FeishuDirectoryError, urllib_transport

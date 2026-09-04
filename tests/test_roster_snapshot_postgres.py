@@ -17,7 +17,7 @@ from __future__ import annotations
 
 import os
 import unittest
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from unittest import mock
 
 from postgres_schema import ensure_production_schema, psycopg_available
@@ -43,7 +43,7 @@ FAKE_EMAIL = "jiaming.jia@example.invalid"
 FAKE_EMPLOYEE_NO = "700123"
 FAKE_PERSONNEL_ID = "fs-u-0001"
 
-NOW = datetime(2026, 8, 17, 3, 0, tzinfo=timezone.utc)
+NOW = datetime(2026, 8, 17, 3, 0, tzinfo=UTC)
 
 
 def _row(

@@ -14,7 +14,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 from unittest.mock import patch
 
@@ -30,7 +30,6 @@ from lingxi.apps.reauthorize import (
     main,
     validate_reauthorization_paths,
 )
-
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
 ONBOARDING_MODULE = "lingxi.core.identity.onboarding"
@@ -59,7 +58,7 @@ class FakeReauthorizationEntry:
         return ReauthorizationStart(
             "https://accounts.example.test/authorize?state=" + self.state,
             self.state,
-            datetime.now(timezone.utc),
+            datetime.now(UTC),
         )
 
     def handle_callback(
@@ -130,7 +129,7 @@ class FakeBridgeThread:
 
 
 class FakeBridge:
-    instances: list["FakeBridge"] = []
+    instances: list[FakeBridge] = []
 
     def __init__(self, url: str, token: str) -> None:
         self.url = url

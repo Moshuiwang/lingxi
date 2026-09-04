@@ -75,10 +75,10 @@
 from __future__ import annotations
 
 import logging
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from enum import Enum
-from typing import Any, Callable, NamedTuple, Protocol
+from typing import Any, NamedTuple, Protocol
 
 from lingxi.core.permission.publish_row import (
     TOKEN_CIPHER_FIELD,
@@ -276,13 +276,13 @@ class ExistingPermissionRow(NamedTuple):
 
         return readback_text(self.fields.get("permissions"))
 
-    def content_fields(self, row: "PublishRow") -> dict[str, str]:
+    def content_fields(self, row: PublishRow) -> dict[str, str]:
         """按 ``row.content_fields`` 的键集（五个内容字段＝六字段去 ``updated_at``）读回本行对应值，
         归一走同一个 :func:`readback_text`——与逐字段读回比对是同一把尺子。"""
 
         return {name: readback_text(self.fields.get(name)) for name in row.content_fields}
 
-    def content_matches(self, row: "PublishRow") -> bool:
+    def content_matches(self, row: PublishRow) -> bool:
         """内容是否与待写行**逐字段相同**（不看 ``updated_at``，rc25 S-1「不变不回写」）。"""
 
         return self.content_fields(row) == row.content_fields

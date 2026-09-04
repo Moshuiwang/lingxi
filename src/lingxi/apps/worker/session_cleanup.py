@@ -97,9 +97,9 @@ import os
 import re
 import shutil
 import time
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable, Mapping
 
 logger = logging.getLogger(__name__)
 

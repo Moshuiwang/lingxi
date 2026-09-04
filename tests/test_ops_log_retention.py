@@ -25,7 +25,7 @@ import subprocess
 import tempfile
 import time
 import unittest
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 
 ROOT = Path(__file__).parents[1]
@@ -175,7 +175,7 @@ class MonitoringSampleRetentionTest(unittest.TestCase):
             )
             self.assertTrue(unrelated.exists(), "不匹配文件名的东西一个都不许动")
 
-            today = datetime.now(timezone.utc).strftime("%Y%m%d")
+            today = datetime.now(UTC).strftime("%Y%m%d")
             self.assertTrue((output_dir / f"resource-{today}.log").exists(), "本轮样本要写出来")
 
     def test_the_retention_window_is_configurable_and_can_be_disabled(self) -> None:

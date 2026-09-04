@@ -11,9 +11,9 @@
 from __future__ import annotations
 
 import math
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Mapping
 
 from lingxi.adapters.postgres import (
     DEFAULT_POSTGRES_TIMEOUTS,

@@ -15,18 +15,17 @@ from pathlib import Path
 
 from lingxi.config.content import (
     CONTENT_PATH,
+    REQUIRED_CARD_KEYS,
+    REQUIRED_TEXT_KEYS,
     ContentCatalog,
     ContentRenderError,
     ContentSafetyError,
     ContentValidationError,
-    REQUIRED_CARD_KEYS,
-    REQUIRED_TEXT_KEYS,
     default_content_catalog,
     validate_user_visible_text,
 )
 from lingxi.core.identity.roster_audit import ArchivedIdentity, compare_roster
 from lingxi.core.identity.roster_report import render_daily_report
-
 
 _FORMAL_RENDERING_MODULES = (
     "lingxi.core.conversation.pipeline",

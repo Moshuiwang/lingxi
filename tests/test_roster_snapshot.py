@@ -19,7 +19,7 @@ from __future__ import annotations
 import ast
 import re
 import unittest
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 from unittest import mock
@@ -49,7 +49,7 @@ FAKE_EMPLOYEE_NO = "700123"
 FAKE_PERSONNEL_ID = "fs-u-0001"
 FAKE_RECORD_ID = "rec-0001"
 
-NOW = datetime(2026, 8, 17, 3, 0, tzinfo=timezone.utc)
+NOW = datetime(2026, 8, 17, 3, 0, tzinfo=UTC)
 YESTERDAY = NOW - timedelta(days=1)
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
@@ -358,7 +358,7 @@ class _FakeCursor:
         self._rows = rows
         self.statements: list[str] = []
 
-    def __enter__(self) -> "_FakeCursor":
+    def __enter__(self) -> _FakeCursor:
         return self
 
     def __exit__(self, *_exc: Any) -> None:
@@ -379,13 +379,13 @@ class _FakeConnection:
     def __init__(self, cursor: _FakeCursor) -> None:
         self._cursor = cursor
 
-    def __enter__(self) -> "_FakeConnection":
+    def __enter__(self) -> _FakeConnection:
         return self
 
     def __exit__(self, *_exc: Any) -> None:
         return None
 
-    def transaction(self) -> "_FakeConnection":
+    def transaction(self) -> _FakeConnection:
         return self
 
     def cursor(self) -> _FakeCursor:

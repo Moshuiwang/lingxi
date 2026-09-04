@@ -4,7 +4,7 @@ PostgresTaskQueue`` 按读写边界拆分而来）。原班注释见类体内的
 
 from __future__ import annotations
 
-from typing import Sequence
+from collections.abc import Sequence
 
 from lingxi.adapters.postgres import connect
 

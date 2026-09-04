@@ -33,7 +33,7 @@ DerivedAccessTokenHolder`——它是一个只回答"密文 + 过期时间 + 安
 from __future__ import annotations
 
 from collections.abc import Callable
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 from lingxi.core.identity.access_token_supply import DerivedAccessTokenHolder
 from lingxi.core.identity.credentials import DerivedAccessToken
@@ -78,7 +78,7 @@ class TenantAccessTokenSupply:
             raise ValueError("fetch 必须是返回 DerivedAccessToken 的可调用对象")
         self._fetch = fetch
         self._holder = holder if holder is not None else DerivedAccessTokenHolder()
-        self._clock = clock or (lambda: datetime.now(timezone.utc))
+        self._clock = clock or (lambda: datetime.now(UTC))
 
     def __call__(self) -> str:
         now = self._clock()

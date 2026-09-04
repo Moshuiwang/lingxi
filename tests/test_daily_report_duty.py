@@ -17,7 +17,7 @@ from __future__ import annotations
 import threading
 import time
 import unittest
-from datetime import date, datetime, timedelta, timezone
+from datetime import UTC, date, datetime, timedelta
 
 from lingxi.apps.scheduler.daily_report import DailyReportDuty
 
@@ -192,7 +192,7 @@ class FixedClock:
         self.today = start
 
     def __call__(self) -> datetime:
-        return datetime(self.today.year, self.today.month, self.today.day, 9, 0, tzinfo=timezone.utc)
+        return datetime(self.today.year, self.today.month, self.today.day, 9, 0, tzinfo=UTC)
 
     def advance(self, days: int = 1) -> None:
         self.today = self.today + timedelta(days=days)
@@ -271,8 +271,8 @@ class WindowComputationTests(unittest.TestCase):
         duty, parts = build_duty(clock=FixedClock(date(2026, 8, 24)))
         duty.run_once()
         window_start, window_end = parts["source"].calls["task_outcomes"][0]
-        self.assertEqual(window_start, datetime(2026, 8, 23, tzinfo=timezone.utc))
-        self.assertEqual(window_end, datetime(2026, 8, 24, tzinfo=timezone.utc))
+        self.assertEqual(window_start, datetime(2026, 8, 23, tzinfo=UTC))
+        self.assertEqual(window_end, datetime(2026, 8, 24, tzinfo=UTC))
 
     def test_three_of_four_sources_receive_the_same_window(self) -> None:
         """`active_user_task_counts`/`task_outcomes`/`task_durations_seconds`

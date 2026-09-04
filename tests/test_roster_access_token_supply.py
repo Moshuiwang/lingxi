@@ -27,7 +27,7 @@ import ast
 import pathlib
 import threading
 import unittest
-from datetime import date, datetime, timedelta, timezone
+from datetime import UTC, date, datetime, timedelta, timezone
 from typing import NamedTuple
 from unittest import mock
 
@@ -53,7 +53,7 @@ SOURCE_ROOT = REPOSITORY_ROOT / "src" / "lingxi"
 FAKE_REFRESH_TOKEN = "fake-refresh-token-for-tests-only"
 FAKE_ACCESS_TOKEN = "fake-access-token-for-tests-only"
 FAKE_NEXT_REFRESH_TOKEN = "fake-next-refresh-token-for-tests-only"
-DAY = datetime(2026, 8, 18, 9, 0, tzinfo=timezone.utc)
+DAY = datetime(2026, 8, 18, 9, 0, tzinfo=UTC)
 
 
 def derived(*, lifetime: int | None = 7200, value: str = FAKE_ACCESS_TOKEN) -> DerivedAccessToken:
@@ -315,8 +315,8 @@ class ProviderAuditDateMonotonicTest(unittest.TestCase):
         holder = DerivedAccessTokenHolder()
         provider = RosterAccessTokenProvider(holder=holder, refresh=lambda: None)
 
-        day_one = datetime(2026, 8, 27, 23, 59, 59, tzinfo=timezone.utc)
-        day_two = datetime(2026, 8, 28, 0, 0, 1, tzinfo=timezone.utc)
+        day_one = datetime(2026, 8, 27, 23, 59, 59, tzinfo=UTC)
+        day_two = datetime(2026, 8, 28, 0, 0, 1, tzinfo=UTC)
 
         # 先到达的是"新一天"的调用（模拟它先进锁），把 _audited_on 推进到 day_two，
         # 并记下一个分类。
@@ -354,9 +354,9 @@ class ProviderAuditDateMonotonicTest(unittest.TestCase):
         audit = RecordingAudit()
         provider = RosterAccessTokenProvider(holder=holder, refresh=lambda: None, audit=audit)
 
-        day_one = datetime(2026, 8, 27, 23, 59, 59, tzinfo=timezone.utc)
-        day_two_first = datetime(2026, 8, 28, 0, 0, 1, tzinfo=timezone.utc)
-        day_two_again = datetime(2026, 8, 28, 0, 5, 0, tzinfo=timezone.utc)
+        day_one = datetime(2026, 8, 27, 23, 59, 59, tzinfo=UTC)
+        day_two_first = datetime(2026, 8, 28, 0, 0, 1, tzinfo=UTC)
+        day_two_again = datetime(2026, 8, 28, 0, 5, 0, tzinfo=UTC)
 
         provider._record("refresh_error", day_two_first)  # 新一天先到
         provider._record("refresh_error", day_one)  # 旧一天迟到
@@ -729,7 +729,7 @@ class ScriptedVault:
 
         same_utc_day = (
             self.consumed_at is not None
-            and self.consumed_at.astimezone(timezone.utc).date() == moment.astimezone(timezone.utc).date()
+            and self.consumed_at.astimezone(UTC).date() == moment.astimezone(UTC).date()
         )
         count_today = self.consumed_count if same_utc_day else 0
 
@@ -1282,7 +1282,7 @@ class OnDemandRefreshTest(unittest.TestCase):
         call = fixture.vault.claim_calls[0]
         self.assertEqual(sorted(call), ["for_supply", "moment"], "除了模式没有别的入参")
         self.assertEqual(
-            fixture.vault.consumed_at.astimezone(timezone.utc).date(), date(2026, 8, 18)
+            fixture.vault.consumed_at.astimezone(UTC).date(), date(2026, 8, 18)
         )
 
     def test_the_two_moments_of_one_refresh_are_kept_apart(self) -> None:
@@ -1832,7 +1832,7 @@ class AssembledSupplyTest(unittest.TestCase):
 
         holder = rotation.derived_token_holder
         self.assertIsNotNone(holder, "装配必须给轮换职责一个持有者")
-        holder.store(derived(value="assembled-token"), now=datetime.now(timezone.utc))
+        holder.store(derived(value="assembled-token"), now=datetime.now(UTC))
 
         self.assertEqual(supply(), "assembled-token")
 

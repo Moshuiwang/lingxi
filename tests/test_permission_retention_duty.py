@@ -28,7 +28,7 @@ import os
 import tempfile
 import threading
 import unittest
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 from postgres_schema import ensure_production_schema, psycopg_available, reset_production_rows
@@ -426,7 +426,7 @@ class RetentionSweepPostgresTest(unittest.TestCase):
             ReadinessOutcome,
         )
 
-        started = datetime.now(timezone.utc) - timedelta(days=age_days)
+        started = datetime.now(UTC) - timedelta(days=age_days)
         return self.checks.record_attempt(
             ReadinessAttempt(
                 binding=ReadinessBinding(user_id, version),

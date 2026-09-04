@@ -32,7 +32,8 @@ from __future__ import annotations
 
 import queue
 import threading
-from typing import Callable, Protocol
+from collections.abc import Callable
+from typing import Protocol
 
 
 class AuditSink(Protocol):

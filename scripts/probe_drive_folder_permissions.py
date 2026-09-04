@@ -135,8 +135,8 @@ import re
 import secrets
 import sys
 from collections import Counter
-from dataclasses import dataclass, field, asdict
-from datetime import datetime, timezone
+from dataclasses import asdict, dataclass, field
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Protocol
 
@@ -324,7 +324,7 @@ class ProbeState:
         return payload
 
     @classmethod
-    def from_json(cls, payload: dict[str, Any]) -> "ProbeState":
+    def from_json(cls, payload: dict[str, Any]) -> ProbeState:
         known_fields = set(cls.__dataclass_fields__)
         return cls(**{k: v for k, v in payload.items() if k in known_fields})
 
@@ -434,7 +434,7 @@ def _load_halt_sentinel(path: Path) -> dict[str, Any] | None:
 def _write_halt_sentinel(path: Path, *, step: int, reason: str, state_dir: Path) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     payload = {
-        "halted_at": datetime.now(timezone.utc).isoformat(),
+        "halted_at": datetime.now(UTC).isoformat(),
         "step": step,
         "reason": reason,
         "state_dir": redact_path(state_dir),
@@ -494,7 +494,7 @@ class StepOutcome:
 
 
 def _generate_unique_folder_name(now: datetime | None = None) -> str:
-    moment = now or datetime.now(timezone.utc)
+    moment = now or datetime.now(UTC)
     return f"lingxi-drive-probe-{moment:%Y%m%d}-{secrets.token_hex(4)}"
 
 

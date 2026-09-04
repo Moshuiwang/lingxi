@@ -242,13 +242,15 @@ import logging
 import threading
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
-from datetime import date, datetime, timezone
+from datetime import UTC, date, datetime
 from typing import Any, Protocol
 
 from lingxi.adapters.postgres_local_permission import (
     PostgresLocalPermissionOverrideStore,
     local_override_reader,
 )
+from lingxi.apps.scheduler.audit import AuditSink
+from lingxi.apps.scheduler.config import SchedulerConfig
 from lingxi.core.identity.roster_audit import ArchivedIdentity
 from lingxi.core.identity.roster_snapshot import StoredSnapshotFacts
 from lingxi.core.permission.account_match import MATCHED, match_galaxy_account
@@ -275,12 +277,9 @@ from lingxi.core.permission.publish_row import (
     build_translated_publish_row,
 )
 
-from lingxi.apps.scheduler.audit import AuditSink
-from lingxi.apps.scheduler.config import SchedulerConfig
-
 logger = logging.getLogger(__name__)
 
-_UTC = timezone.utc
+_UTC = UTC
 
 #: 写进发布意图 ``reason`` 列的原因码。它回答"这条意图是谁排的"，与首次开通那条
 #: （``first_onboarding``）区分开，让运维能一眼看出某次外部写入来自每日刷新。
@@ -1367,6 +1366,9 @@ def _build_permission_refresh_duty(
         )
         return None, None
 
+    from lingxi.adapters.company_function_metric_map_file import (
+        load_company_function_metric_map,
+    )
     from lingxi.adapters.mcp_token_cipher import McpTokenCipher
     from lingxi.adapters.postgres_galaxy_snapshot import PostgresGalaxySnapshotReader
     from lingxi.adapters.postgres_mcp_token import PostgresMcpTokenStore
@@ -1375,9 +1377,6 @@ def _build_permission_refresh_duty(
         PostgresPermissionRefreshBaselineReader,
     )
     from lingxi.adapters.postgres_roster_snapshot import PostgresRosterSnapshotStore
-    from lingxi.adapters.company_function_metric_map_file import (
-        load_company_function_metric_map,
-    )
     from lingxi.adapters.role_function_map_file import load_role_function_map
 
     try:

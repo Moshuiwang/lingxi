@@ -16,13 +16,12 @@ from __future__ import annotations
 
 import logging
 import threading
-from datetime import datetime, timezone
-
-from lingxi.core.permission.mcp_readiness import ReadinessSchedule
+from datetime import UTC, datetime
 
 from lingxi.apps.scheduler.audit import AuditSink
 from lingxi.apps.scheduler.config import SchedulerConfig
 from lingxi.apps.scheduler.permission_publish import ReadinessFollowUp
+from lingxi.core.permission.mcp_readiness import ReadinessSchedule
 
 logger = logging.getLogger(__name__)
 
@@ -120,7 +119,7 @@ def _build_readiness_follow_up(
             probe=probe,
             store=tokens,
             audit=audit,
-            clock=lambda: datetime.now(timezone.utc),
+            clock=lambda: datetime.now(UTC),
             schedule=schedule,
         ),
         checks=tokens,

@@ -12,7 +12,6 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
-from typing import Mapping
 
 from lingxi.adapters.postgres_conversation import ClaimedTask, TaskContext
 from lingxi.apps.worker.config import WorkerConfig

@@ -8,7 +8,8 @@ CI 里被完整覆盖。SDK 绑定见 ``lingxi.adapters.claude_agent_hooks``。
 from __future__ import annotations
 
 import re
-from typing import Any, Callable, Mapping
+from collections.abc import Callable, Mapping
+from typing import Any
 
 from .audit import TurnAudit
 from .tool_policy import ToolPolicy

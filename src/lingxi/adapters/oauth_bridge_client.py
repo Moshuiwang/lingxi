@@ -11,15 +11,15 @@ import json
 import re
 import threading
 import time
+from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Callable, Protocol
-
+from typing import Protocol
 
 _STATE_PATTERN = re.compile(r"[A-Za-z0-9_-]{32,256}\Z")
 
 
 class OAuthBridgeMessageHandler(Protocol):
-    def process(self, message: "OAuthBridgeMessage") -> None: ...
+    def process(self, message: OAuthBridgeMessage) -> None: ...
 
 
 class OAuthBridgeResultSender(Protocol):
@@ -41,7 +41,7 @@ class OAuthBridgeMessage:
     code: str | None = None
 
     @classmethod
-    def parse(cls, raw: str) -> "OAuthBridgeMessage":
+    def parse(cls, raw: str) -> OAuthBridgeMessage:
         value = json.loads(raw)
         if not isinstance(value, dict) or value.get("type") not in {"oauth_code", "oauth_cancelled"}:
             raise ValueError("未识别的 OAuth 桥接消息")

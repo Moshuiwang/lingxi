@@ -9,24 +9,24 @@ header），并要求落盘凭据参照 biai-agent 先例做权限纪律：**文
 
 from __future__ import annotations
 
+import errno
 import json
 import logging
-import errno
 import os
 import stat
 import tempfile
 import unittest
-from unittest import mock
 from pathlib import Path
+from unittest import mock
 
 from lingxi.adapters.user_environment import (
     CREDENTIAL_FILE_MODE,
-    TEMPORARY_PREFIX,
-    TEMPORARY_SUFFIX,
     HOME_DIR_MODE,
+    MCP_CONFIG_FILENAME,
     QUERY_MCP_SERVER_NAME,
     ROOT_DIR_MODE,
-    MCP_CONFIG_FILENAME,
+    TEMPORARY_PREFIX,
+    TEMPORARY_SUFFIX,
     LocalUserEnvironment,
     UserEnvironmentError,
     build_mcp_config,

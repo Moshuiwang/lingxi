@@ -85,10 +85,10 @@ parse_permissions` 解析出来的那份文档，也就是 outbox 快照里、�
 from __future__ import annotations
 
 import logging
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from enum import Enum
-from typing import Any, Callable, Protocol
+from typing import Any, Protocol
 
 from lingxi.config.content import ContentCatalog, RenderedContent, default_content_catalog
 from lingxi.core.permission.publish_row import (

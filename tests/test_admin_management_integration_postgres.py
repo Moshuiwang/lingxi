@@ -23,7 +23,7 @@ import os
 import threading
 import unittest
 from concurrent.futures import ThreadPoolExecutor
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 
 from postgres_schema import ensure_production_schema, psycopg_available, reset_production_rows
 
@@ -39,9 +39,9 @@ from lingxi.adapters.postgres_pending_action import PostgresPendingActionStore
 from lingxi.core.admin.card_callback import AdminCardCallbackHandler
 from lingxi.core.admin.card_dispatch import ConfirmCardDispatcher
 from lingxi.core.admin.router import AdminCommandRouter
+from lingxi.core.admin.views import AdminUserStatusView
 from lingxi.core.ids import new_id
 from lingxi.core.permission.local_override import OverrideDirection
-from lingxi.core.admin.views import AdminUserStatusView
 
 DSN = os.environ.get("LINGXI_POSTGRES_DSN")
 SKIP_REASON = (
@@ -158,7 +158,7 @@ class ManagementCardCallbackIntegrationTestCase(unittest.TestCase):
     def _ensure_management_context(self, message_id: str, identifier: str) -> None:
         """职位表单的反向 FK 与生产管理卡发送侧登记保持同一前置。"""
 
-        now = datetime.now(timezone.utc) + timedelta(hours=1)
+        now = datetime.now(UTC) + timedelta(hours=1)
         self.execute(
             """INSERT INTO management_card_context
                  (message_id, card_id, identifier, chat_id, initiated_by_open_id,
@@ -307,7 +307,7 @@ class RevokeButtonClickCreatesARealPendingActionTests(ManagementCardCallbackInte
         )
         user_id = user_row[0][0]
         grant_pending_id = new_id("pac")
-        now = datetime.now(timezone.utc)
+        now = datetime.now(UTC)
         self.execute(
             """INSERT INTO pending_action
                    (id, action_type, target_open_id, target_state_snapshot,
@@ -513,7 +513,7 @@ class ManagementCorrectionRealDbTests(ManagementCardCallbackIntegrationTestCase)
     """#493 P1：只有真实 daily publish 才能产生每日纠偏群摘要水位。"""
 
     def _seed_context_and_executed_action(self, message_id: str) -> PostgresManagementCardContextStore:
-        now = datetime.now(timezone.utc)
+        now = datetime.now(UTC)
         context_store = PostgresManagementCardContextStore(self._dsn)
         context_store.remember(
             message_id=message_id,
@@ -552,7 +552,7 @@ class ManagementCorrectionRealDbTests(ManagementCardCallbackIntegrationTestCase)
         reason: str,
         permission_version: int = 1,
     ) -> None:
-        now = datetime.now(timezone.utc)
+        now = datetime.now(UTC)
         user_id = self.query(
             "SELECT id FROM app_user WHERE feishu_open_id = %s", (TARGET_OPEN_ID,)
         )[0][0]
@@ -646,7 +646,7 @@ class ManagementCardStateCasRealDbTests(ManagementCardCallbackIntegrationTestCas
             chat_id="oc_1",
             initiated_by_open_id=ADMIN_OPEN_ID,
             snapshot_fingerprint="fp",
-            context_deadline_at=datetime.now(timezone.utc) + timedelta(hours=1),
+            context_deadline_at=datetime.now(UTC) + timedelta(hours=1),
         )
         store.update_state(
             message_id=message_id, state="effective", dispatch_status="effective"

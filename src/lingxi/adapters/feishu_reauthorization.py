@@ -38,7 +38,7 @@ import re
 import secrets
 import tempfile
 from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any, Protocol
 from urllib.parse import urlencode, urlparse
@@ -140,7 +140,7 @@ class HostFileAuthorizationStateStore:
         subject = _required_text(expected_subject_open_id, "专用授权主体")
         if not isinstance(ttl_seconds, int) or isinstance(ttl_seconds, bool) or ttl_seconds <= 0:
             raise ValueError("重授权 state 有效期必须是正整数秒")
-        moment = _aware_utc(now or datetime.now(timezone.utc), "当前时间")
+        moment = _aware_utc(now or datetime.now(UTC), "当前时间")
         expires_at = moment + timedelta(seconds=ttl_seconds)
         state = secrets.token_urlsafe(32)
         payload = {
@@ -159,7 +159,7 @@ class HostFileAuthorizationStateStore:
 
         if not isinstance(state, str) or _STATE_PATTERN.fullmatch(state) is None:
             return None
-        moment = _aware_utc(now or datetime.now(timezone.utc), "当前时间")
+        moment = _aware_utc(now or datetime.now(UTC), "当前时间")
         with _FileLock(self._lock_path):
             valid, pending = self._read()
             if not valid:
@@ -489,7 +489,7 @@ def _required_text(value: object, label: str) -> str:
 def _aware_utc(value: datetime, label: str) -> datetime:
     if value.tzinfo is None or value.utcoffset() is None:
         raise ValueError(f"{label}必须带时区")
-    return value.astimezone(timezone.utc)
+    return value.astimezone(UTC)
 
 
 def _https_url(value: object, label: str) -> str:

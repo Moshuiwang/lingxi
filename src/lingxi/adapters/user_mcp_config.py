@@ -88,8 +88,9 @@ import json
 import os
 import re
 import stat
+from collections.abc import Mapping
 from pathlib import Path
-from typing import Any, Mapping
+from typing import Any
 
 from lingxi.core.mcp_naming import QUERY_MCP_SERVER_NAME
 

@@ -19,6 +19,8 @@ from lingxi.adapters.postgres import (
 )
 from lingxi.adapters.postgres_conversation import (
     DEFAULT_CONNECT_TIMEOUT_SECONDS as GATEWAY_DEFAULT_CONNECT_TIMEOUT_SECONDS,
+)
+from lingxi.adapters.postgres_conversation import (
     PostgresGatewayStore,
 )
 from lingxi.adapters.retention import (
@@ -29,7 +31,6 @@ from lingxi.adapters.retention import (
     RETENTION_FUNCTION_LOCK_WAIT_COUNT,
     PostgresRetentionCleaner,
 )
-
 
 REPOSITORY_ROOT = Path(__file__).parents[1]
 CHECK_PATH = REPOSITORY_ROOT / "scripts" / "ci" / "check_db_timeouts.py"

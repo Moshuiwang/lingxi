@@ -20,12 +20,12 @@ from __future__ import annotations
 
 import os
 import unittest
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 
 from postgres_schema import ensure_production_schema, psycopg_available, reset_production_rows
 
-from lingxi.adapters.postgres import connect
 from lingxi.adapters.mcp_token_cipher import McpTokenCipher, McpTokenCipherError, new_token
+from lingxi.adapters.postgres import connect
 from lingxi.adapters.postgres_mcp_token import PostgresMcpTokenStore
 from lingxi.core.permission.mcp_readiness import (
     ReadinessAttempt,
@@ -43,7 +43,7 @@ SKIP_REASON = (
 SPEC_MASTER_KEY = "MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY="
 OTHER_MASTER_KEY = "enp6enp6enp6enp6enp6enp6enp6enp6enp6enp6eno="
 
-NOW = datetime(2026, 8, 17, 3, 0, tzinfo=timezone.utc)
+NOW = datetime(2026, 8, 17, 3, 0, tzinfo=UTC)
 USER_A = "usr_token_a"
 USER_B = "usr_token_b"
 EMAIL_A = "jiaming.jia@example.invalid"

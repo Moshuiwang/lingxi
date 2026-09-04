@@ -31,9 +31,10 @@ import os
 import shutil
 import socket
 import sys
-from datetime import datetime, timezone
+from collections.abc import Mapping
+from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any, Mapping
+from typing import Any
 
 # docker stats 的人类可读尺寸后缀（先按后缀长度降序匹配，避免 "B" 提前命中
 # "KiB"/"MiB" 的结尾）。同时兼容十进制（kB/MB/GB，docker 早期版本偶见）与
@@ -329,7 +330,7 @@ def main(argv: list[str] | None = None) -> int:
     state_path = args.state_dir / "resource_prev.json"
     prev_state = load_prev_state(state_path)
 
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
     sample, next_state = build_sample(
         docker_stats_text=docker_stats_text,
         missing_text=missing_text,

@@ -36,13 +36,13 @@ class GatewayDeliveryConsumerReuseWiringTests(unittest.TestCase):
         module = types.ModuleType("lark_oapi")
 
         class _Builder:
-            def app_id(self, value: object) -> "_Builder":
+            def app_id(self, value: object) -> _Builder:
                 return self
 
-            def app_secret(self, value: object) -> "_Builder":
+            def app_secret(self, value: object) -> _Builder:
                 return self
 
-            def timeout(self, value: object) -> "_Builder":
+            def timeout(self, value: object) -> _Builder:
                 return self
 
             def build(self) -> object:

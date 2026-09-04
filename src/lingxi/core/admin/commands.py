@@ -336,7 +336,7 @@ def _link_payload_email(token: str) -> str | None:
     return token if _EMAIL_PATTERN.fullmatch(token) else None
 
 
-def _collapse_link_pair(match: "re.Match[str]") -> str:
+def _collapse_link_pair(match: re.Match[str]) -> str:
     """显示与目标是同一个邮箱才合并成一段；否则原样退回（fail closed）。"""
 
     display = _link_payload_email(match.group("display"))

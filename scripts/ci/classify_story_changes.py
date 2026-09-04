@@ -11,7 +11,6 @@ import argparse
 import subprocess
 from pathlib import Path
 
-
 DOCUMENT_PREFIXES = ("docs/",)
 DOCUMENT_FILES = {"AGENTS.md", "README.md"}
 FULL_PREFIXES = (".github/workflows/", "deploy/", "migrations/", "scripts/ci/")

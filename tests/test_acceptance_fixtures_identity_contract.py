@@ -14,7 +14,7 @@ from __future__ import annotations
 import importlib.util
 import sys
 import unittest
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 REPOSITORY_ROOT = Path(__file__).parents[1]
@@ -153,7 +153,7 @@ class McpReadinessMinimumLegalScheduleTests(unittest.TestCase):
         """
 
         schedule = ReadinessSchedule(**self.module.MCP_READINESS_MINIMUM_LEGAL_SCHEDULE_KWARGS)
-        started = datetime(2026, 1, 1, tzinfo=timezone.utc)
+        started = datetime(2026, 1, 1, tzinfo=UTC)
         due_times = [started + timedelta(seconds=offset) for offset in schedule.attempt_offsets()]
         self.assertEqual(due_times, [started, started + timedelta(seconds=1)])
 
@@ -222,7 +222,7 @@ class McpReadinessMinimumLegalScheduleWiredToRealConfirmationTests(unittest.Test
         )
 
         schedule = ReadinessSchedule(**self.module.MCP_READINESS_MINIMUM_LEGAL_SCHEDULE_KWARGS)
-        clock = _FakeClock(datetime(2026, 1, 1, tzinfo=timezone.utc))
+        clock = _FakeClock(datetime(2026, 1, 1, tzinfo=UTC))
         probe = _FakeNeverReadyProbe()
         store = _FakeReadinessStore()
         audit = _FakeReadinessAudit()

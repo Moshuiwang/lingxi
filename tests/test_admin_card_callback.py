@@ -17,7 +17,7 @@ from __future__ import annotations
 
 import unittest
 from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 
 from lingxi.core.admin.card_callback import AdminCardCallbackHandler
 from lingxi.core.admin.notification import DECISION_CANCEL, DECISION_CONFIRM
@@ -30,7 +30,7 @@ from lingxi.core.admin.pending_action import (
     PendingActionType,
 )
 
-NOW = datetime(2026, 8, 24, 12, 0, 0, tzinfo=timezone.utc)
+NOW = datetime(2026, 8, 24, 12, 0, 0, tzinfo=UTC)
 
 
 def _pending(
@@ -186,8 +186,8 @@ def _build_handler(
     group_chat_id: str | None = "oc_admin_group",
     audit: _RecordingAudit | None = None,
     management_actions: object | None = None,
-    recompute_trigger: "_FakeRecomputeTrigger | None" = None,
-    display_names: "FakeDisplayNames | None" = None,
+    recompute_trigger: _FakeRecomputeTrigger | None = None,
+    display_names: FakeDisplayNames | None = None,
     post_callback_executor: object | None = None,
 ) -> tuple[AdminCardCallbackHandler, _RecordingAudit]:
     audit = audit or _RecordingAudit()

@@ -253,7 +253,10 @@ class GalaxyImportPostgresTest(unittest.TestCase):
     def test_readback_mismatch_aborts_the_batch(self) -> None:
         """V-银河-07：回读计数对不上即整批回滚，批次不得标记完成。"""
 
-        from lingxi.adapters.galaxy_import import GalaxyImportVerificationError, PostgresGalaxyImportStore
+        from lingxi.adapters.galaxy_import import (
+            GalaxyImportVerificationError,
+            PostgresGalaxyImportStore,
+        )
 
         class _LosingStore(PostgresGalaxyImportStore):
             def _insert_rows(self, cursor, source_table, rows):  # type: ignore[no-untyped-def]

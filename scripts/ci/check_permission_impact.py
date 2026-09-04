@@ -38,7 +38,6 @@ from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Any
 
-
 REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
 ROLE_MAP_PATH = "src/lingxi/config/galaxy_role_function_map.toml"
 METRIC_MAP_PATH = "src/lingxi/config/company_function_metric_map.toml"
@@ -496,7 +495,7 @@ def _validate_user_counts(
                 "environment": "repository",
                 "dataset": "permission-facts",
                 "query_version": "static-diff/v1",
-                "captured_at": dt.datetime.now(dt.timezone.utc).isoformat(),
+                "captured_at": dt.datetime.now(dt.UTC).isoformat(),
             },
         }
 
@@ -519,7 +518,7 @@ def _validate_user_counts(
                 "environment": "test",
                 "dataset": "pure-counts",
                 "query_version": "test/v1",
-                "captured_at": dt.datetime.now(dt.timezone.utc).isoformat(),
+                "captured_at": dt.datetime.now(dt.UTC).isoformat(),
             },
         }
 

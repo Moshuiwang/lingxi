@@ -27,7 +27,6 @@ from lingxi.adapters.feishu_directory import (
 from lingxi.core.identity.credentials import AuthorizationGrant, SecretToken
 from lingxi.core.identity.first_contact import EmploymentStatus
 
-
 BASE_URL = "https://feishu.invalid/open-apis"
 FAKE_TOKEN = "fake-refresh-token-for-tests-only"
 

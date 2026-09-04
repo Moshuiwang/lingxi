@@ -15,9 +15,8 @@ V-花名册-48。
 from __future__ import annotations
 
 import unittest
-from datetime import date, datetime, timezone
+from datetime import UTC, date, datetime
 
-from lingxi.core.ids import is_ulid
 from lingxi.core.identity.identifiers import redact_identifier
 from lingxi.core.identity.roster_audit import ArchivedIdentity, RosterAuditReport, compare_roster
 from lingxi.core.identity.roster_report import HANDOVER_MARK, render_daily_report
@@ -25,6 +24,7 @@ from lingxi.core.identity.roster_snapshot import (
     DEFAULT_SNAPSHOT_STALE_AFTER,
     RosterSnapshotStatus,
 )
+from lingxi.core.ids import is_ulid
 
 REPORT_DATE = date(2026, 8, 6)
 
@@ -113,7 +113,7 @@ def baseline() -> list[ArchivedIdentity]:
 
 
 STALE_AFTER_SECONDS = DEFAULT_SNAPSHOT_STALE_AFTER.total_seconds()
-SNAPSHOT_MOMENT = datetime(2026, 8, 6, 1, 30, tzinfo=timezone.utc)
+SNAPSHOT_MOMENT = datetime(2026, 8, 6, 1, 30, tzinfo=UTC)
 
 
 def fresh_snapshot() -> RosterSnapshotStatus:

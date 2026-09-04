@@ -15,7 +15,8 @@ Issue #29 的结论是审计链必须自己合成，来源有三个：hook 判�
 
 from __future__ import annotations
 
-from typing import Any, Mapping
+from collections.abc import Mapping
+from typing import Any
 
 from .audit import TurnAudit
 

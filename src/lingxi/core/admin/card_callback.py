@@ -81,18 +81,18 @@ from __future__ import annotations
 
 import inspect
 import json
+from collections.abc import Callable
 from dataclasses import dataclass
-from datetime import datetime, timezone
-from typing import Any, Callable, Protocol
+from datetime import UTC, datetime
+from typing import Any, Protocol
 
-from lingxi.core.admin.display_names import AdminDisplayNames
-from lingxi.core.admin.management_card import (
-    ADMIN_ACTION_CANCEL,
-    ADMIN_ACTION_GRANT,
-)
 from lingxi.core.admin.card_dispatch import (
     ManagementCardContext,
     management_card_fingerprint,
+)
+from lingxi.core.admin.display_names import AdminDisplayNames
+from lingxi.core.admin.management_card import (
+    ADMIN_ACTION_GRANT,
 )
 from lingxi.core.admin.notification import (
     DECISION_CANCEL,
@@ -316,7 +316,7 @@ class AdminCardCallbackHandler:
         management_context_store: ManagementCardContextReader | None = None,
         management_state_lookup: Callable[[str], AdminUserStatusView | None] | None = None,
         management_card_refresher: ManagementCardRefresher | None = None,
-        post_callback_executor: "PostCallbackExecutor | None" = None,
+        post_callback_executor: PostCallbackExecutor | None = None,
     ) -> None:
         self._pending_actions = pending_actions
         self._confirm_cards = confirm_cards
@@ -640,7 +640,7 @@ class AdminCardCallbackHandler:
                 state=context.state,
             )
             return _ManagementContextCheck(context=context, status=None, stale=True)
-        expired = context.context_deadline_at <= datetime.now(timezone.utc)
+        expired = context.context_deadline_at <= datetime.now(UTC)
         if expired:
             self._audit.record(
                 "admin.card_callback.management_context_expired", trace_id=trace_id

@@ -24,7 +24,7 @@ import textwrap
 import threading
 import time
 import unittest
-from datetime import date, datetime, timedelta, timezone
+from datetime import UTC, date, datetime, timedelta
 
 from lingxi.apps.scheduler import (
     RosterAuditDuty,
@@ -95,7 +95,7 @@ def fresh_snapshot(*, captured_at: datetime | None = None) -> RosterSnapshotStat
         action="replace",
         read_status="complete",
         stale_after_seconds=STALE_AFTER_SECONDS,
-        captured_at=captured_at or datetime(2026, 8, 6, 9, 0, tzinfo=timezone.utc),
+        captured_at=captured_at or datetime(2026, 8, 6, 9, 0, tzinfo=UTC),
         row_count=SNAPSHOT_ROWS,
         age_seconds=0.0,
     )
@@ -111,7 +111,7 @@ def stale_snapshot(*, age_seconds: float = STALE_AFTER_SECONDS + 3600) -> Roster
         alert="failed_indeterminate",
         failure_code="pagination_stalled",
         failure_kind="indeterminate",
-        captured_at=datetime(2026, 8, 3, 9, 0, tzinfo=timezone.utc),
+        captured_at=datetime(2026, 8, 3, 9, 0, tzinfo=UTC),
         row_count=SNAPSHOT_ROWS,
         age_seconds=age_seconds,
     )
@@ -202,7 +202,7 @@ class FixedClock:
         self.today = start
 
     def __call__(self) -> datetime:
-        return datetime(self.today.year, self.today.month, self.today.day, 9, 0, tzinfo=timezone.utc)
+        return datetime(self.today.year, self.today.month, self.today.day, 9, 0, tzinfo=UTC)
 
     def advance(self, days: int = 1) -> None:
         self.today = self.today + timedelta(days=days)
@@ -901,7 +901,10 @@ class GroupSenderTest(unittest.TestCase):
         self.assertNotIn("secret_fake", str(calls[0]["url"]))
 
     def test_a_business_error_code_is_raised_and_carries_no_credential_or_chat_id(self) -> None:
-        from lingxi.adapters.feishu_group_message import FeishuGroupMessageError, FeishuGroupMessages
+        from lingxi.adapters.feishu_group_message import (
+            FeishuGroupMessageError,
+            FeishuGroupMessages,
+        )
 
         def transport(method: str, url: str, *, body=None, token=None):
             if "tenant_access_token" in url:
@@ -1124,7 +1127,7 @@ class DutyRegistrationTest(unittest.TestCase):
     用例（``tests/test_permission_refresh_duty.py``）钉住。
     """
 
-    def _roster_records(self, audit: "RecordingAudit") -> list[tuple[str, dict]]:
+    def _roster_records(self, audit: RecordingAudit) -> list[tuple[str, dict]]:
         """只取花名册审计日报职责留下的那些审计行。"""
 
         return [record for record in audit.records if record[0].startswith("roster_audit.")]

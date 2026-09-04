@@ -219,7 +219,8 @@ from __future__ import annotations
 
 import logging
 import threading
-from typing import Any, Callable
+from collections.abc import Callable
+from typing import Any
 
 from lingxi.adapters.postgres_document_delivery import (
     DELIVERY_TYPE_DOCX,

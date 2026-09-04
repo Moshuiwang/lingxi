@@ -8,10 +8,10 @@ from __future__ import annotations
 
 import math
 import os
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from datetime import timedelta
 from pathlib import Path
-from typing import Mapping
 
 from lingxi.adapters.company_function_metric_map_file import (
     METRIC_MAP_PATH_ENV,
@@ -230,7 +230,7 @@ class SchedulerConfig:
     )
 
     @classmethod
-    def from_env(cls, environ: Mapping[str, str] | None = None) -> "SchedulerConfig":
+    def from_env(cls, environ: Mapping[str, str] | None = None) -> SchedulerConfig:
         """一次性读完全部配置。缺项只报变量名，绝不回显取到的值。"""
 
         source = os.environ if environ is None else environ

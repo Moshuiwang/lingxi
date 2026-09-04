@@ -55,7 +55,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable
-from datetime import date, datetime, timezone
+from datetime import UTC, date, datetime
 from typing import Protocol
 
 #: 供给失败的全部分类。刻意用固定词表：分类会进审计与异常正文，新增分类要先想清楚
@@ -113,7 +113,7 @@ class PermissionTableAccessTokenProvider:
             raise ValueError("fetch 必须是返回短期令牌明文的可调用对象")
         self._fetch = fetch
         self._audit = audit
-        self._clock = clock or (lambda: datetime.now(timezone.utc))
+        self._clock = clock or (lambda: datetime.now(UTC))
         self._audited_on: date | None = None
         self._audited_reasons: set[str] = set()
 

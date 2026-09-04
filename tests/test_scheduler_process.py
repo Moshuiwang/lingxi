@@ -18,15 +18,15 @@ import os
 import signal
 import subprocess
 import sys
-import threading
 import textwrap
+import threading
 import time
 import unittest
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
-from lingxi.adapters.feishu_directory import FeishuDirectoryError
 from lingxi.adapters.delegated_credentials import StoredCredential
+from lingxi.adapters.feishu_directory import FeishuDirectoryError
 from lingxi.apps.scheduler import (
     IDLE_CONVERSATION_SWEEP_AFTER,
     CredentialRotationLoop,
@@ -43,7 +43,6 @@ from lingxi.core.identity.credentials import (
     RefreshDailyLimitReached,
     SecretToken,
 )
-
 
 REPOSITORY_ROOT = Path(__file__).parents[1]
 FAKE_TOKEN = "fake-refresh-token-for-tests-only"
@@ -62,7 +61,7 @@ def replacement_grant(*, seconds: int = 604800) -> AuthorizationGrant:
 
 
 def credential(*, subject: str = "ou_delegated", seconds: int = 604800) -> StoredCredential:
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
     return StoredCredential(
         subject_open_id=subject,
         grant=AuthorizationGrant(SecretToken(FAKE_TOKEN), seconds, "offline_access"),
@@ -93,7 +92,7 @@ class FakeVault:
         self.last_require_due = require_due
         self.last_refuse_if_consumed_on = refuse_if_consumed_on
         if refuse_if_consumed_on is not None and refuse_if_consumed_on in self.consumed_days:
-            raise RefreshDailyLimitReached(consumed_at=datetime.now(timezone.utc))
+            raise RefreshDailyLimitReached(consumed_at=datetime.now(UTC))
         return self._claims.pop(0) if self._claims else None
 
     def save(

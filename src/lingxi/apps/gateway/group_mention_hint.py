@@ -34,7 +34,8 @@ from __future__ import annotations
 
 import logging
 import time
-from typing import Any, Callable
+from collections.abc import Callable
+from typing import Any
 
 from lingxi.adapters.feishu_events import NonPrivateChatError
 from lingxi.config.content import default_content_catalog
@@ -152,7 +153,7 @@ class GroupMentionHintResponder:
         self._audit = audit
         self._throttle = throttle
 
-    def maybe_respond(self, error: "NonPrivateChatError") -> None:
+    def maybe_respond(self, error: NonPrivateChatError) -> None:
         try:
             self._maybe_respond(error)
         except Exception as failure:  # noqa: BLE001 - 引导是尽力而为的旁路，
@@ -164,7 +165,7 @@ class GroupMentionHintResponder:
             )
             self._audit.record("event.group_mention_hint_failed", error=type(failure).__name__)
 
-    def _maybe_respond(self, error: "NonPrivateChatError") -> None:
+    def _maybe_respond(self, error: NonPrivateChatError) -> None:
         if not self._bot_open_id:
             return
         if self._bot_open_id not in error.mentioned_open_ids:

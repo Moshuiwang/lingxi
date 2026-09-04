@@ -21,7 +21,7 @@ import secrets
 import threading
 import time
 import unittest
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from unittest import mock
 
 from postgres_schema import ensure_production_schema, psycopg_available, reset_production_rows
@@ -38,14 +38,14 @@ from lingxi.apps.scheduler.permission_publish import DEFAULT_PUBLISH_LIMIT
 from lingxi.core.ids import new_id
 from lingxi.core.permission.publish import (
     DEFAULT_MAX_ATTEMPTS,
+    STATUS_FAILED,
+    STATUS_PUBLISHED,
     PermissionDecisionTransientFailure,
     PermissionGrantBlockedByAccountState,
     PermissionPublishExecutor,
     PermissionTableError,
     PublishAttempt,
     PublishOutcome,
-    STATUS_FAILED,
-    STATUS_PUBLISHED,
 )
 from lingxi.core.permission.publish_row import (
     CREATED_FIELD_NAMES,
@@ -63,7 +63,7 @@ SKIP_REASON = (
     else "跳过：LINGXI_POSTGRES_DSN 已设置但未安装 psycopg 驱动，权限发布 outbox 的真库断言未验证"
 )
 
-NOW = datetime(2026, 8, 17, 3, 0, tzinfo=timezone.utc)
+NOW = datetime(2026, 8, 17, 3, 0, tzinfo=UTC)
 USER_A = "usr_publish_a"
 USER_B = "usr_publish_b"
 EMAIL_A = "jiaming.jia@example.invalid"
@@ -1505,7 +1505,7 @@ class AwaitingReadinessTest(PermissionPublishPostgresTestCase):
         """
 
         self._publish()
-        self._record_check(USER_A, 1, "waiting", at=datetime.now(timezone.utc))
+        self._record_check(USER_A, 1, "waiting", at=datetime.now(UTC))
 
         self.assertEqual(self._candidates(), (), "刚探过，三分钟内不该再取回")
 
@@ -1517,7 +1517,7 @@ class AwaitingReadinessTest(PermissionPublishPostgresTestCase):
             USER_A,
             1,
             "waiting",
-            at=datetime.now(timezone.utc) - timedelta(seconds=self.INTERVAL_SECONDS + 20),
+            at=datetime.now(UTC) - timedelta(seconds=self.INTERVAL_SECONDS + 20),
         )
 
         self.assertEqual(len(self._candidates()), 1)
@@ -1542,7 +1542,7 @@ class AwaitingReadinessTest(PermissionPublishPostgresTestCase):
         """
 
         self._publish()
-        started = datetime.now(timezone.utc) - timedelta(seconds=950)
+        started = datetime.now(UTC) - timedelta(seconds=950)
         for _ in range(6):
             self._record_check(USER_A, 1, "waiting", at=started)
 

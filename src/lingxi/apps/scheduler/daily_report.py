@@ -125,9 +125,11 @@ from __future__ import annotations
 import logging
 import threading
 from collections.abc import Callable, Sequence
-from datetime import date, datetime, timedelta, timezone
+from datetime import UTC, date, datetime, timedelta
 from typing import Protocol
 
+from lingxi.apps.scheduler.audit import AuditSink
+from lingxi.apps.scheduler.config import SchedulerConfig
 from lingxi.core.daily_report import (
     DENIED_COUNT_ALL_NULL_REASON,
     RESOURCE_USAGE_ALL_NULL_REASON,
@@ -154,9 +156,6 @@ from lingxi.core.daily_report import (
     build_token_usage_stats,
     render_daily_report,
 )
-
-from lingxi.apps.scheduler.audit import AuditSink
-from lingxi.apps.scheduler.config import SchedulerConfig
 
 logger = logging.getLogger(__name__)
 
@@ -282,7 +281,7 @@ class DailyReportDuty:
         self._sender = sender
         self._audit = audit
         self._chat_id = chat_id
-        self._clock = clock or (lambda: datetime.now(timezone.utc))
+        self._clock = clock or (lambda: datetime.now(UTC))
         self._stop = threading.Event() if stop is None else stop
         self._aggregation_join_timeout_seconds = aggregation_join_timeout_seconds
         self._completed_on: date | None = None
@@ -400,7 +399,7 @@ class DailyReportDuty:
         # 约定（`roster_report.py`「时间一律 UTC 标注」），取昨天而不是「今天已过去
         # 的部分」，是为了让每一份通报覆盖的都是一个**完整**的自然日，不会因为
         # scheduler 首轮 tick 落在当天早晚不同时刻而让统计口径每天不一样。
-        window_end = datetime(today.year, today.month, today.day, tzinfo=timezone.utc)
+        window_end = datetime(today.year, today.month, today.day, tzinfo=UTC)
         window_start = window_end - timedelta(days=1)
         # 投递结果段独立用**再早一天**的窗口（opus 批量审查 P2 修复，见
         # `core/daily_report.py` 模块文档「投递结果段为什么用一个独立、更早的

@@ -11,9 +11,10 @@
 from __future__ import annotations
 
 import re
+from collections.abc import Mapping
 from dataclasses import dataclass
 from enum import Enum
-from typing import Any, Mapping
+from typing import Any
 
 _VALID_TOOL_NAME = re.compile(r"\A[A-Za-z0-9_.-]+\Z")
 _MCP_TOOL_PREFIX = "mcp__"

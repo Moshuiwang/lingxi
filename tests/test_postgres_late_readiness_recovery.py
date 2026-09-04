@@ -27,7 +27,7 @@ from __future__ import annotations
 
 import os
 import unittest
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 
 from postgres_schema import ensure_production_schema, psycopg_available, reset_production_rows
 
@@ -41,7 +41,7 @@ from lingxi.core.permission.mcp_readiness import (
     ReadinessBinding,
     ReadinessOutcome,
 )
-from lingxi.core.permission.publish import PublishAttempt, PublishOutcome, STATUS_PUBLISHED
+from lingxi.core.permission.publish import STATUS_PUBLISHED, PublishAttempt, PublishOutcome
 from lingxi.core.permission.publish_row import PublishRow
 
 SPEC_MASTER_KEY = "MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY="
@@ -52,7 +52,7 @@ SKIP_REASON = (
     else "跳过：LINGXI_POSTGRES_DSN 已设置但未安装 psycopg 驱动，迟到就绪恢复的真库断言未验证"
 )
 
-NOW = datetime(2026, 8, 20, 3, 0, tzinfo=timezone.utc)
+NOW = datetime(2026, 8, 20, 3, 0, tzinfo=UTC)
 REASON = "first_onboarding"
 USER_A = "usr_late_recovery_a"
 USER_B = "usr_late_recovery_b"
@@ -150,7 +150,7 @@ class LateReadinessRecoveryPostgresTestCase(unittest.TestCase):
         # 比较的是真库的 ``now()``，固定常量一旦落在真实墙钟之后就会让"已经超时一小时"
         # 变成一句假话，候选查询因此正确地把它判成"还没到期"——这是测试夹具的时间基准
         # 错误，不是候选查询的缺陷。
-        moment = at or (datetime.now(timezone.utc) - timedelta(hours=1))
+        moment = at or (datetime.now(UTC) - timedelta(hours=1))
         PostgresMcpTokenStore(self._dsn, cipher=McpTokenCipher(SPEC_MASTER_KEY)).record_attempt(
             ReadinessAttempt(
                 binding=ReadinessBinding(user_id, version),
@@ -212,7 +212,7 @@ class CandidateQueryTest(LateReadinessRecoveryPostgresTestCase):
 
         version = self._publish()
         self._stuck()
-        old = datetime.now(timezone.utc) - timedelta(hours=1)
+        old = datetime.now(UTC) - timedelta(hours=1)
         self._record_timed_out(USER_A, version, at=old)
         PostgresMcpTokenStore(self._dsn, cipher=McpTokenCipher(SPEC_MASTER_KEY)).record_attempt(
             ReadinessAttempt(
@@ -585,7 +585,7 @@ class NoticeOutboxTest(LateReadinessRecoveryPostgresTestCase):
         # 墙钟走。固定常量一旦落在真实墙钟 40 小时之后（NOW + 2160h < 写入时刻 + 2160h），
         # ``far_future`` 就会小于 ``content_expires_at``，purge 判它"还没到期"而删 0 行，
         # 这是测试夹具的时间基准错误，不是 purge 的缺陷（日界翻转型 flaky）。
-        far_future = datetime.now(timezone.utc) + timedelta(hours=2200)  # 远超过 2160 小时的到期上限
+        far_future = datetime.now(UTC) + timedelta(hours=2200)  # 远超过 2160 小时的到期上限
         purged = self.store.purge_expired_notices(now=far_future)
 
         self.assertEqual(purged, 1, "只删已送达且过期的那一条")

@@ -7,7 +7,7 @@
 from __future__ import annotations
 
 import unittest
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 
 from lingxi.core.identity.org_snapshot import (
     SNAPSHOT_RETENTION_DAYS,
@@ -214,7 +214,7 @@ class BatchIntegrityTest(unittest.TestCase):
 
 class SnapshotExpiryTest(unittest.TestCase):
     def setUp(self) -> None:
-        self.started_at = datetime(2026, 8, 5, 3, 0, tzinfo=timezone.utc)
+        self.started_at = datetime(2026, 8, 5, 3, 0, tzinfo=UTC)
 
     def test_a_batch_expires_ninety_days_after_it_started(self) -> None:
         self.assertEqual(SNAPSHOT_RETENTION_DAYS, 90)

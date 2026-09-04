@@ -5,12 +5,13 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
+from collections.abc import Callable, Mapping
 from dataclasses import replace
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Any, Callable, Mapping, Protocol
+from typing import Any, Protocol
 
-from lingxi.adapters.postgres_conversation import ClaimedTask, PostgresTaskQueue, TerminalTask
+from lingxi.adapters.postgres_conversation import ClaimedTask, TerminalTask
 from lingxi.adapters.user_mcp_config import UserMcpConfigError, load_user_mcp_servers
 from lingxi.apps.worker.config import QUERY_MCP_TOOL_PREFIX, WorkerConfig
 from lingxi.apps.worker.report_extraction import (
@@ -24,11 +25,14 @@ from lingxi.apps.worker.report_extraction import (
     _report_sheet_request,
     _report_token_usage,
     _tool_result_count,
-    sanitize_failure_signature,
     _unnamed_failure_code,
     failure_with_signature,
+    sanitize_failure_signature,
 )
-from lingxi.apps.worker.session_cleanup import delete_agent_session_files, run_session_transcript_reclaim
+from lingxi.apps.worker.session_cleanup import (
+    delete_agent_session_files,
+    run_session_transcript_reclaim,
+)
 from lingxi.apps.worker.turn import MCP_BAD_GATEWAY_FAILURE_CODE, WorkerTurnExecutor
 from lingxi.config.content import ContentCatalog, RenderedContent, default_content_catalog
 from lingxi.core.delivery.ports import DeliveryEventType, TerminalKind, assert_content_allowed

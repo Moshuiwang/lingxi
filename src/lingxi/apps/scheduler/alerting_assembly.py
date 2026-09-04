@@ -12,10 +12,9 @@ import logging
 from collections.abc import Callable
 from typing import Any
 
-from lingxi.core.alerting import AlertDispatcher, AlertingDuty, AlertManager
-
 from lingxi.apps.scheduler.audit import AuditSink
 from lingxi.apps.scheduler.config import SchedulerConfig
+from lingxi.core.alerting import AlertDispatcher, AlertingDuty, AlertManager
 
 
 class _LogOnlyAlertSender:

@@ -41,8 +41,9 @@ import logging
 import select
 import threading
 import time
+from collections.abc import Mapping
 from dataclasses import dataclass
-from typing import Any, Mapping
+from typing import Any
 
 logger = logging.getLogger(__name__)
 
@@ -132,7 +133,7 @@ class PostgresTimeouts:
         environment: Mapping[str, str],
         *,
         prefix: str = "LINGXI_POSTGRES_",
-    ) -> "PostgresTimeouts":
+    ) -> PostgresTimeouts:
         """从已由 ``apps`` 传入的环境映射构造配置，不直接读取进程环境。"""
 
         return cls(

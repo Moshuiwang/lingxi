@@ -106,9 +106,10 @@ from __future__ import annotations
 import logging
 import threading
 import time
+from collections.abc import Callable
 from datetime import timedelta
 from enum import Enum
-from typing import Any, Callable
+from typing import Any
 
 from lingxi.config.content import ContentCatalog, RenderedContent, default_content_catalog
 from lingxi.core.delivery.ports import TerminalKind

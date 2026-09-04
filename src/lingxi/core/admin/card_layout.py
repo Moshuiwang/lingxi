@@ -26,7 +26,8 @@ name 校验（Issue #439 PM 补充裁定第 6/5 条，Trace #469 S-1）。
 
 from __future__ import annotations
 
-from typing import Any, Mapping, Sequence
+from collections.abc import Mapping, Sequence
+from typing import Any
 
 
 def button_row(buttons: Sequence[Mapping[str, Any]]) -> dict[str, Any]:

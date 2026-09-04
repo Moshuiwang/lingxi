@@ -107,7 +107,7 @@ from __future__ import annotations
 import re
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from typing import Generic, TypeVar
 
 T = TypeVar("T")
@@ -249,11 +249,11 @@ class Section(Generic[T]):
     undetermined_reason: str | None = None
 
     @classmethod
-    def of(cls, value: T) -> "Section[T]":
+    def of(cls, value: T) -> Section[T]:
         return cls(value=value, undetermined_reason=None)
 
     @classmethod
-    def undetermined(cls, reason: str) -> "Section[T]":
+    def undetermined(cls, reason: str) -> Section[T]:
         if not reason or not reason.strip():
             raise ValueError("不可判定必须给出非空原因，不能只留一个空段落")
         return cls(value=None, undetermined_reason=reason)
@@ -426,7 +426,7 @@ class DailyReportInputs:
     #:
     #: 放在字段列表末尾并给默认值，是为了不打破既有全部调用点（生产代码与测试）
     #: 现有的关键字参数构造方式——本字段是纯新增，不重排、不改动任何既有字段。
-    metric_coverage_gap: "Section[MetricCoverageGap | None] | None" = None
+    metric_coverage_gap: Section[MetricCoverageGap | None] | None = None
     #: 「本地权限覆盖活动」段（Issue #319 S-P-1c）。三态语义与
     #: :attr:`metric_coverage_gap` 完全一致（只是数据源换成 `local_permission_
     #: override` 表，见 ``apps/scheduler/daily_report.py`` 的装配文档）：
@@ -440,7 +440,7 @@ class DailyReportInputs:
     #:   出现「本地权限覆盖活动」段，只含计数，不含 open_id/公司/指标名/理由。
     #:
     #: 同样放在字段列表末尾并给默认值，理由与 `metric_coverage_gap` 相同。
-    local_override_activity: "Section[LocalOverrideActivity | None] | None" = None
+    local_override_activity: Section[LocalOverrideActivity | None] | None = None
 
 
 # --------------------------------------------------------------------------
@@ -726,8 +726,8 @@ def _format_window_header(window_start: datetime, window_end: datetime) -> str:
     量）。
     """
 
-    utc_start = window_start.astimezone(timezone.utc)
-    utc_end = window_end.astimezone(timezone.utc)
+    utc_start = window_start.astimezone(UTC)
+    utc_end = window_end.astimezone(UTC)
     beijing_start = utc_start + _BEIJING_OFFSET
     beijing_end = utc_end + _BEIJING_OFFSET
     return (
@@ -876,8 +876,8 @@ def _format_delivery_window_note(window_start: datetime, window_end: datetime) -
     默认它跟页首那一行是同一个窗口。
     """
 
-    utc_start = window_start.astimezone(timezone.utc)
-    utc_end = window_end.astimezone(timezone.utc)
+    utc_start = window_start.astimezone(UTC)
+    utc_end = window_end.astimezone(UTC)
     beijing_start = utc_start + _BEIJING_OFFSET
     beijing_end = utc_end + _BEIJING_OFFSET
     return (
@@ -903,7 +903,7 @@ def _render_delivery_outcome(
     )
 
 
-def _render_metric_coverage_gap(section: "Section[MetricCoverageGap | None] | None") -> str:
+def _render_metric_coverage_gap(section: Section[MetricCoverageGap | None] | None) -> str:
     """「待分配」段（Issue #320 并入项）。返回空字符串表示**这一段完全不出现**——
     与其余段落不同，本段允许彻底不出现，见 :attr:`DailyReportInputs.metric_coverage_gap`
     的三态说明。未接线（``section is None``）与「接线了、查过、没有差异」
@@ -926,7 +926,7 @@ def _render_metric_coverage_gap(section: "Section[MetricCoverageGap | None] | No
 
 
 def _render_local_override_activity(
-    section: "Section[LocalOverrideActivity | None] | None",
+    section: Section[LocalOverrideActivity | None] | None,
 ) -> str:
     """「本地权限覆盖活动」段（Issue #319 S-P-1c）。返回空字符串表示这一段完全
     不出现——与 :func:`_render_metric_coverage_gap` 同一姿态：未接线

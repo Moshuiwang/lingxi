@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import os
 import unittest
-from datetime import date, datetime, timezone
+from datetime import UTC, date, datetime
 
 from postgres_schema import ensure_production_schema, psycopg_available
 
@@ -198,7 +198,7 @@ class RosterAuditPostgresTestCase(unittest.TestCase):
             audit=audit,
             chat_id="oc_fake_admin_group_for_tests",
             clock=lambda: datetime(
-                report_date.year, report_date.month, report_date.day, 9, 0, tzinfo=timezone.utc
+                report_date.year, report_date.month, report_date.day, 9, 0, tzinfo=UTC
             ),
         )
         return duty.run_once(), sender, audit

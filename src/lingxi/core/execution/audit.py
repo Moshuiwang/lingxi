@@ -24,9 +24,10 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from enum import Enum
-from typing import Any, Iterable, Mapping, Sequence
+from typing import Any
 
 from .tool_policy import DenyReasonCode, PolicyVerdict, is_well_formed_tool_name
 

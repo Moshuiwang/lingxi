@@ -44,8 +44,8 @@ from __future__ import annotations
 
 import re
 import tomllib
+from collections.abc import Mapping
 from pathlib import Path
-from typing import Mapping
 
 #: 与 ``core/admin/commands.py`` 的 ``_METRIC_TOKEN_PATTERN`` 逐字同一形状——
 #: 不 import 那个模块的私有常量（本仓库既有的"结构相同、不共享导入"惯例，见

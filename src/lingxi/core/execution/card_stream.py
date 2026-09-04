@@ -58,11 +58,16 @@ from __future__ import annotations
 
 import time
 from collections import deque
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
-from typing import Callable, Protocol, Sequence
+from typing import Protocol
 
-from lingxi.config.content import ContentCatalog, RenderedCard, RenderedContent, default_content_catalog
-
+from lingxi.config.content import (
+    ContentCatalog,
+    RenderedCard,
+    RenderedContent,
+    default_content_catalog,
+)
 
 # 语义化进度动作码（Issue #321 方向 C，产品负责人 2026-08-27 裁定；Issue #407
 # 增粒度，产品负责人 2026-08-29 方向 A+B 裁定）：``apps/worker/service.py`` 编码

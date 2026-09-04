@@ -31,7 +31,7 @@ import pathlib
 import tempfile
 import threading
 import unittest
-from datetime import date, datetime, timedelta, timezone
+from datetime import UTC, date, datetime, timedelta
 from unittest import mock
 
 from lingxi.apps.scheduler import (
@@ -114,7 +114,7 @@ class FixedClock:
         self.today = start
 
     def __call__(self) -> datetime:
-        return datetime(self.today.year, self.today.month, self.today.day, 9, 0, tzinfo=timezone.utc)
+        return datetime(self.today.year, self.today.month, self.today.day, 9, 0, tzinfo=UTC)
 
     def advance(self, days: int = 1) -> None:
         self.today = self.today + timedelta(days=days)

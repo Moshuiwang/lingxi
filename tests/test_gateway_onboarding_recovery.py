@@ -14,6 +14,7 @@ import unittest
 from datetime import timedelta
 
 from gateway_fakes import CallLog, FakeAudit, FakeOnboarding, FakeState, FakeStore
+
 from lingxi.core.conversation.onboarding_recovery import (
     DEFAULT_MAX_PER_SWEEP,
     DEFAULT_MIN_INTERVAL_SECONDS,

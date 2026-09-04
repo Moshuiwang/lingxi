@@ -50,7 +50,8 @@ import argparse
 import json
 import os
 import sys
-from typing import Any, Iterable
+from collections.abc import Iterable
+from typing import Any
 
 # 出站 HTTP 超时：一次性只读探针，固定 10 秒即可；不复用 gateway 的停机预算
 # 推导——这里没有停机承诺要守。

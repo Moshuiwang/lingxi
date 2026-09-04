@@ -44,7 +44,7 @@ from __future__ import annotations
 
 import threading
 import unittest
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from types import SimpleNamespace
 
 from lingxi.apps.scheduler.late_readiness_recovery import (
@@ -52,7 +52,6 @@ from lingxi.apps.scheduler.late_readiness_recovery import (
     DEFAULT_RECOVERY_INTERVAL_SECONDS,
     DEFAULT_RECOVERY_LIMIT,
     LateReadinessRecoveryDuty,
-    LateReadinessRecoveryReport,
 )
 from lingxi.core.identity.onboarding_runner import FIRST_ONBOARDING_REASON, KEY_COMPLETED
 from lingxi.core.permission.mcp_readiness import (
@@ -66,7 +65,7 @@ USER_B = "usr_01JQZX3M5N7P9R1T3V5W7Y9A0C"
 OPEN_ID = "ou_fake_open_id_for_tests"
 PERMISSIONS = '{"1011":["日活"]}'
 VERSION = 3
-MOMENT = datetime(2026, 8, 20, 3, 0, tzinfo=timezone.utc)
+MOMENT = datetime(2026, 8, 20, 3, 0, tzinfo=UTC)
 
 
 def _candidate(

@@ -12,8 +12,9 @@ from __future__ import annotations
 
 import json
 import posixpath
+from collections.abc import Mapping
 from dataclasses import dataclass, field
-from typing import Any, Mapping
+from typing import Any
 
 from lingxi.apps.worker.session_cleanup import (
     DEFAULT_SESSION_DISK_BUDGET_BYTES,

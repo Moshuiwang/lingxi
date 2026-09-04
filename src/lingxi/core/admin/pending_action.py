@@ -18,7 +18,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from enum import Enum
 
 from lingxi.core.admin.registry import AdminRegistryEntry, AdminRole, is_authorized_admin
@@ -305,8 +305,8 @@ def format_in_flight_conflict_message(*, blocking: PendingAction) -> str:
     恒等操作，加这一步没有代价。
     """
 
-    started = blocking.created_at.astimezone(timezone.utc) + _DISPLAY_TIMEZONE_OFFSET
-    deadline = blocking.confirm_deadline_at.astimezone(timezone.utc) + _DISPLAY_TIMEZONE_OFFSET
+    started = blocking.created_at.astimezone(UTC) + _DISPLAY_TIMEZONE_OFFSET
+    deadline = blocking.confirm_deadline_at.astimezone(UTC) + _DISPLAY_TIMEZONE_OFFSET
     action_name = _ACTION_TYPE_DISPLAY_NAME[blocking.action_type]
     return (
         "该用户当前已有一条待确认操作在途："

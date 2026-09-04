@@ -18,7 +18,7 @@ import sys
 import tempfile
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -478,7 +478,7 @@ class SyntheticPendingActionTest(unittest.TestCase):
             user_id="usr_1",
             target_open_id="ou_target",
             plan=_plan(),
-            now=datetime(2026, 9, 3, tzinfo=timezone.utc),
+            now=datetime(2026, 9, 3, tzinfo=UTC),
             initiated_by_open_id="ou_admin",
         )
 

@@ -36,10 +36,11 @@
 from __future__ import annotations
 
 import logging
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from enum import Enum
-from typing import Any, Mapping, Protocol, Sequence
+from typing import Any, Protocol
 
 from lingxi.adapters.postgres import DEFAULT_POSTGRES_TIMEOUTS, PostgresTimeouts, connect
 from lingxi.adapters.postgres_conversation import _Transaction as _ConversationTransaction
@@ -67,7 +68,7 @@ from lingxi.core.permission.publish_row import (
 
 logger = logging.getLogger(__name__)
 
-_UTC = timezone.utc
+_UTC = UTC
 
 #: 一条 ``publishing`` 卡多久之后可以放回 ``pending``。取值远大于一次外部写读回的耗时，
 #: 又远小于一天：太短会让一次慢调用被重复执行（安全但浪费配额），太长会让一次进程崩溃

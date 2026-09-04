@@ -21,7 +21,7 @@ import os
 import threading
 import time
 import unittest
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 
 from postgres_schema import ensure_production_schema, psycopg_available, reset_production_rows
 
@@ -1492,7 +1492,7 @@ class LocalPermissionGrantSuppressRealDbTests(PendingActionPostgresTestCase):
         ``pending_action_single_pending_target_idx`` 的名额）。
         """
 
-        now = datetime.now(timezone.utc)
+        now = datetime.now(UTC)
         self.execute(
             """INSERT INTO pending_action
                    (id, action_type, target_open_id, target_state_snapshot,
@@ -1922,8 +1922,8 @@ class LocalPermissionRevokeRealDbTests(PendingActionPostgresTestCase):
                 bystander_pending_id,
                 f"ou_bystander_for_{bystander_pending_id}",
                 ADMIN_OPEN_ID,
-                datetime.now(timezone.utc) + timedelta(minutes=10),
-                datetime.now(timezone.utc),
+                datetime.now(UTC) + timedelta(minutes=10),
+                datetime.now(UTC),
                 ADMIN_OPEN_ID,
             ),
         )

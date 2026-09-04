@@ -38,7 +38,6 @@ from typing import Any
 from lingxi.config.content import default_content_catalog
 from lingxi.core.execution.card_stream import CardCreated, DeliveryRejected
 
-
 # --------------------------------------------------------------------------------------
 # 桩 SDK：只提供 adapters.feishu_delivery 真正用到的 builder 与模型
 # --------------------------------------------------------------------------------------
@@ -68,7 +67,7 @@ class _Builder:
         self._fields: dict[str, Any] = {}
 
     def __getattr__(self, name: str):
-        def collect(value: Any) -> "_Builder":
+        def collect(value: Any) -> _Builder:
             self._fields[name] = value
             return self
 

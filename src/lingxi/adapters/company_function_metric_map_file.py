@@ -62,9 +62,9 @@ from __future__ import annotations
 
 import hashlib
 import logging
+import tomllib
 from collections.abc import Mapping
 from pathlib import Path
-import tomllib
 
 from lingxi.core.permission.metric_translation import build_company_function_metric_map
 

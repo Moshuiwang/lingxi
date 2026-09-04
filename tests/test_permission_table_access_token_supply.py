@@ -21,7 +21,7 @@
 from __future__ import annotations
 
 import unittest
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 
 from lingxi.core.permission.table_access_token_supply import (
     TABLE_TOKEN_SUPPLY_FAILURE_REASONS,
@@ -30,7 +30,7 @@ from lingxi.core.permission.table_access_token_supply import (
 )
 
 FAKE_TOKEN = "fake-permission-table-token-for-tests-only"
-DAY = datetime(2026, 8, 18, 9, 0, tzinfo=timezone.utc)
+DAY = datetime(2026, 8, 18, 9, 0, tzinfo=UTC)
 
 
 class MovableClock:

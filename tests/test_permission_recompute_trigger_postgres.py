@@ -19,7 +19,7 @@ from __future__ import annotations
 import json
 import os
 import unittest
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 from postgres_schema import ensure_production_schema, psycopg_available, reset_production_rows
 
@@ -28,7 +28,7 @@ from lingxi.adapters.postgres import connect
 from lingxi.adapters.postgres_pending_action import PostgresPendingActionStore
 from lingxi.adapters.postgres_permission_publish import PostgresPermissionPublishStore
 from lingxi.adapters.postgres_permission_recompute_trigger import PermissionRecomputeAdapter
-from lingxi.core.admin.card_callback import AdminCardCallbackHandler, DECISION_CONFIRM
+from lingxi.core.admin.card_callback import DECISION_CONFIRM, AdminCardCallbackHandler
 from lingxi.core.admin.pending_action import PendingActionType
 from lingxi.core.ids import new_id
 from lingxi.core.permission.publish_row import build_translated_publish_row
@@ -127,7 +127,7 @@ class PermissionRecomputeTriggerPostgresTestCase(unittest.TestCase):
             company_metrics={"1011": ("daily_active",)},
             email=TARGET_EMAIL,
             display_name="化名用户",
-            decided_at=datetime(2026, 8, 1, tzinfo=timezone.utc),
+            decided_at=datetime(2026, 8, 1, tzinfo=UTC),
             token_cipher=TOKEN_CIPHER,
         )
         decision = self.publish_store.record_decision(
@@ -135,7 +135,7 @@ class PermissionRecomputeTriggerPostgresTestCase(unittest.TestCase):
             user_id=user_id,
             row=row,
             reason="test_seed",
-            decided_at=datetime(2026, 8, 1, tzinfo=timezone.utc),
+            decided_at=datetime(2026, 8, 1, tzinfo=UTC),
         )
         self.assertTrue(decision.enqueued)
 

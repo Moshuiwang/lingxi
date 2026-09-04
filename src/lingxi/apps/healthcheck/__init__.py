@@ -86,8 +86,8 @@ import argparse
 import os
 import sys
 import time
+from collections.abc import Callable, Mapping, Sequence
 from pathlib import Path
-from typing import Callable, Mapping, Sequence
 
 from lingxi.apps.liveness import liveness_path, read_liveness_age_seconds, touch_liveness
 

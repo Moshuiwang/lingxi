@@ -36,8 +36,8 @@ Issue #291 根因 #1 同一形状：两侧各自维护一份、悄悄不一致�
 from __future__ import annotations
 
 import re
+from collections.abc import Iterable
 from dataclasses import dataclass
-from typing import Iterable
 
 from .input_safety import constrain_output
 

@@ -98,9 +98,11 @@ import logging
 import threading
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from typing import Any, Protocol
 
+from lingxi.apps.scheduler.audit import AuditSink
+from lingxi.apps.scheduler.config import SchedulerConfig
 from lingxi.apps.scheduler.permission_refresh import (
     PERMISSION_REFRESH_REASON,
     PERMISSION_REVOKE_REASON,
@@ -113,12 +115,9 @@ from lingxi.core.permission.mcp_readiness import (
 )
 from lingxi.core.permission.notification import NoticeResult
 
-from lingxi.apps.scheduler.audit import AuditSink
-from lingxi.apps.scheduler.config import SchedulerConfig
-
 logger = logging.getLogger(__name__)
 
-_UTC = timezone.utc
+_UTC = UTC
 
 #: **本职责负责确认哪一类发布意图。** 每日刷新与撤权这两条是它自己排出来的；
 #: 首次开通那条（``first_onboarding``）**刻意不在其中**——它由 Epic D 的开通编排自己

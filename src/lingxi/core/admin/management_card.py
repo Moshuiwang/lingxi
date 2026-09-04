@@ -60,8 +60,9 @@ Trace #544 D-5 起**不再渲染任何写入表单**——它原先那两个按�
 
 from __future__ import annotations
 
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
-from typing import Any, Callable, Mapping, Protocol, Sequence
+from typing import Any, Protocol
 
 from lingxi.core.admin.card_layout import assert_unique_named_form_elements, button_row
 from lingxi.core.admin.display_names import AdminDisplayNames

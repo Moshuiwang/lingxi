@@ -28,8 +28,9 @@ from __future__ import annotations
 
 import json
 import re
+from collections.abc import Mapping
 from dataclasses import dataclass
-from typing import Any, Mapping, Protocol
+from typing import Any, Protocol
 
 from lingxi.core.admin.card_layout import button_row
 from lingxi.core.admin.pending_action import (

@@ -23,13 +23,14 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from lingxi.apps.gateway.onboarding import assert_gateway_onboarding_is_inert
+from gateway_fakes import FakeOnboarding
+
 from lingxi.apps.gateway import (
     build_supervisor,
     main,
 )
 from lingxi.apps.gateway.config import ENV_PREFIX, GatewayConfigError, load_config
-from gateway_fakes import FakeOnboarding
+from lingxi.apps.gateway.onboarding import assert_gateway_onboarding_is_inert
 from lingxi.core.conversation.ports import OnboardingState
 
 REPOSITORY_ROOT = Path(__file__).parents[1]

@@ -17,12 +17,17 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from enum import Enum
-from typing import Any, Mapping, Sequence
+from typing import Any
 
 from lingxi.config.content import ContentRenderError, default_content_catalog
-from lingxi.core.identity.org_snapshot import DirectoryAvailability, SnapshotMember, index_members_by_open_id
+from lingxi.core.identity.org_snapshot import (
+    DirectoryAvailability,
+    SnapshotMember,
+    index_members_by_open_id,
+)
 
 
 class LocationOutcome(str, Enum):
@@ -76,7 +81,7 @@ class EmploymentStatus:
         return self.is_activated and not (self.is_exited or self.is_frozen or self.is_resigned or self.is_unjoin)
 
     @classmethod
-    def from_feishu(cls, payload: Any) -> "EmploymentStatus | None":
+    def from_feishu(cls, payload: Any) -> EmploymentStatus | None:
         """把飞书返回的 ``status`` 转成判定投影；任何字段缺失或非布尔即返回 ``None``。
 
         返回 ``None`` 表示**不可判定**，调用方必须拒绝开通，不得当作在职。默认成

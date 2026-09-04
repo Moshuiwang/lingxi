@@ -10,11 +10,11 @@
 from __future__ import annotations
 
 import dataclasses
-
+from collections.abc import Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta, timezone
-from typing import Any, Iterator
+from datetime import UTC, datetime, timedelta
+from typing import Any
 
 from lingxi.core.conversation.ports import (
     ConversationRecord,
@@ -407,7 +407,7 @@ class FakeTransaction:
             memory_type=memory_type,
             memory_key=memory_key,
             memory_value=memory_value,
-            created_at=datetime.now(timezone.utc),
+            created_at=datetime.now(UTC),
         )
         entries.append(new_entry)
         return new_entry.memory_id
@@ -517,7 +517,7 @@ class FakeStore:
         # 并把那个时刻当作**认领代次**返回。假实现必须同样做，否则「没跑成就要放回去」
         # 与「不得撤销别人的认领」两条断言在假实现上都恒真。
         self._state.claim_generation += 1
-        token = datetime(2026, 8, 19, tzinfo=timezone.utc) + timedelta(
+        token = datetime(2026, 8, 19, tzinfo=UTC) + timedelta(
             seconds=self._state.claim_generation
         )
         self._state.onboarding_dispatched[pending.event_id] = token

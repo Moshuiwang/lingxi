@@ -11,7 +11,6 @@ from __future__ import annotations
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 
-
 ALL_COMPANIES_SCOPE = "*"
 
 #: 预开通预授权（Issue #541，rc25 S-8b）合成 ``pending_action`` 的 ``reason``。

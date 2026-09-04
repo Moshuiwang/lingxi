@@ -24,7 +24,7 @@ from __future__ import annotations
 import os
 import pathlib
 import unittest
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 
 from postgres_schema import ensure_production_schema, psycopg_available, reset_production_rows
@@ -92,7 +92,7 @@ SKIP_REASON = (
 #: biai-agent 加密规格 v1 的**公开测试向量**（非生产密钥）。
 SPEC_MASTER_KEY = "MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY="
 
-NOW = datetime(2026, 8, 17, 3, 0, tzinfo=timezone.utc)
+NOW = datetime(2026, 8, 17, 3, 0, tzinfo=UTC)
 
 ACTIVE_USER = "usr_refresh_active"
 GUEST_USER = "usr_refresh_guest"

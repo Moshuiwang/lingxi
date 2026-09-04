@@ -13,8 +13,9 @@ from __future__ import annotations
 
 import threading
 import unittest
-from datetime import datetime, timezone
-from typing import Any, Mapping, Sequence
+from collections.abc import Mapping, Sequence
+from datetime import UTC, datetime
+from typing import Any
 
 from lingxi.core.conversation.ports import RETRYABLE_REASONS, OnboardingState
 from lingxi.core.identity.first_contact import (
@@ -35,8 +36,8 @@ from lingxi.core.identity.onboarding_runner import (
     KEY_INTERNAL_ERROR,
     KEY_NOT_AUTHORIZED,
     KEY_SUSPENDED,
-    KEY_SYNCING,
     KEY_SYNC_TIMEOUT,
+    KEY_SYNCING,
     STATE_ACTIVE,
     STATE_MCP_SYNCING,
     STATE_PROVISIONING,
@@ -69,7 +70,7 @@ from lingxi.core.permission.metric_translation import translate_company_function
 from lingxi.core.permission.publish import PermissionGrantBlockedByAccountState
 from lingxi.core.permission.publish_row import ADMIN_FULL_ACCESS_FUNCTION
 
-UTC = timezone.utc
+UTC = UTC
 OPEN_ID = "ou_employee_1"
 USER_ID = "usr_01HTEST"
 

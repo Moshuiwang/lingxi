@@ -25,7 +25,7 @@ import json
 import sys
 import types
 import unittest
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest import mock
@@ -78,7 +78,7 @@ GATEWAY_ENV = {
     f"{ENV_PREFIX}POSTGRES_DSN": "postgresql://lingxi:fake-password-for-tests-only@db.invalid/lingxi",
 }
 
-NOW = datetime(2026, 9, 2, 12, 0, tzinfo=timezone.utc)
+NOW = datetime(2026, 9, 2, 12, 0, tzinfo=UTC)
 
 
 class _ExternalMapFixture(unittest.TestCase):
@@ -199,7 +199,7 @@ class ManagementCardCatalogTests(_ExternalMapFixture):
 
 
 class _NullContext:
-    def __enter__(self) -> "_NullContext":
+    def __enter__(self) -> _NullContext:
         return self
 
     def __exit__(self, *exc_info: object) -> bool:
@@ -214,7 +214,7 @@ class _FakeCursor:
         self._last = ""
         self.rowcount = 0
 
-    def __enter__(self) -> "_FakeCursor":
+    def __enter__(self) -> _FakeCursor:
         return self
 
     def __exit__(self, *exc_info: object) -> bool:
@@ -276,7 +276,7 @@ class _FakeConnection:
     def __init__(self, journal: list[tuple[str, tuple]]) -> None:
         self._cursor = _FakeCursor(journal)
 
-    def __enter__(self) -> "_FakeConnection":
+    def __enter__(self) -> _FakeConnection:
         return self
 
     def __exit__(self, *exc_info: object) -> bool:
@@ -508,10 +508,10 @@ class GatewayAssemblyWiringTests(_ExternalMapFixture):
         )
 
     def _assemble(self, env_value: str | None) -> dict[str, object]:
-        from lingxi.apps.gateway import build_supervisor
         import lingxi.adapters.feishu_admin_card as admin_card_module
         import lingxi.adapters.postgres_pending_action as pending_action_module
         import lingxi.adapters.postgres_permission_recompute_trigger as recompute_module
+        from lingxi.apps.gateway import build_supervisor
 
         env = dict(GATEWAY_ENV)
         if env_value is not None:

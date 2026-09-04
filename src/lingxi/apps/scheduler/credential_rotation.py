@@ -11,9 +11,10 @@ import logging
 import threading
 from collections.abc import Callable
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from typing import Any, Protocol
 
+from lingxi.apps.scheduler.config import DEFAULT_INTERVAL_SECONDS
 from lingxi.core.identity.access_token_supply import (
     AccessTokenUnavailable,
     DerivedAccessTokenHolder,
@@ -30,8 +31,6 @@ from lingxi.core.identity.credentials import (
     decide_after_refresh,
 )
 from lingxi.core.identity.identifiers import redact_identifier
-
-from lingxi.apps.scheduler.config import DEFAULT_INTERVAL_SECONDS
 
 logger = logging.getLogger(__name__)
 
@@ -114,7 +113,7 @@ class CredentialRotationLoop:
         # 派生短期令牌的进程内持有者。没有它时轮换照常工作，只是派生令牌被丢弃
         # （接线之前的行为）；有它时到期轮换与按需续期都把令牌喂进去。
         self._holder = holder
-        self._clock = clock or (lambda: datetime.now(timezone.utc))
+        self._clock = clock or (lambda: datetime.now(UTC))
         # 「上一次消费换回来的那份派生令牌不可用」的记号，值是**那一次消费的权威时刻**。
         # 没有它的话，当天后续每一轮都只会看到「今天已经换过了」，而真正的原因（飞书没给
         # 寿命、或令牌一到手就临期）再也不会出现在审计里——一个真实故障被一个例行拒绝

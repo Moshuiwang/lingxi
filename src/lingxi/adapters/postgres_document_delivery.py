@@ -36,7 +36,6 @@ from datetime import timedelta
 from typing import Any
 
 from lingxi.adapters.postgres import DEFAULT_POSTGRES_TIMEOUTS, PostgresTimeouts, connect
-from lingxi.core.ids import new_id
 
 #: 崩溃恢复重试上限（#341 评论 5434520679 审定设计第 5 条）：认领时超过这个
 #: attempts 计数的 pending 行不再参与认领，由 :meth:`PostgresDocumentDeliveryStore.

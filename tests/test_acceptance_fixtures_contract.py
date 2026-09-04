@@ -48,8 +48,10 @@ def _load_script():
 
 
 # 两个生产配置加载器与本文件同套断言复用同一份解析逻辑，不是重新实现一遍。
-from lingxi.apps.gateway.config import GatewayConfigError, load_config as load_gateway_config
-from lingxi.apps.worker.config import WorkerConfigError, load_config as load_worker_config
+from lingxi.apps.gateway.config import GatewayConfigError
+from lingxi.apps.gateway.config import load_config as load_gateway_config
+from lingxi.apps.worker.config import WorkerConfigError
+from lingxi.apps.worker.config import load_config as load_worker_config
 
 # 最小合法基线环境：字段取值只用于让 load_config 通过必填项校验，不是真实凭据。
 GATEWAY_BASE_ENV = {

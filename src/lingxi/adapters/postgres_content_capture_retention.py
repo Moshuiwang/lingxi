@@ -21,7 +21,7 @@
 from __future__ import annotations
 
 import logging
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 from lingxi.adapters.postgres import DEFAULT_POSTGRES_TIMEOUTS, PostgresTimeouts, connect
 
@@ -52,7 +52,7 @@ class PostgresContentCaptureRetention:
         积压交给下一轮，两条都是幂等的。
         """
 
-        moment = now or datetime.now(timezone.utc)
+        moment = now or datetime.now(UTC)
         if moment.tzinfo is None or moment.utcoffset() is None:
             raise ValueError("到期判定时间必须带时区")
         if isinstance(limit, bool) or not isinstance(limit, int) or limit < 1:

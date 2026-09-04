@@ -15,7 +15,7 @@ import inspect
 import threading
 import time
 import unittest
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 
 from lingxi.apps.scheduler import org_snapshot_sync as org_snapshot_sync_module
 from lingxi.apps.scheduler.org_snapshot_sync import (
@@ -74,7 +74,7 @@ class FakeStore:
 
 
 EMPTY_BATCH = SnapshotBatch(tenants=(), departments=(), members=())
-FIXED_NOW = datetime(2026, 8, 19, 12, 0, tzinfo=timezone.utc)
+FIXED_NOW = datetime(2026, 8, 19, 12, 0, tzinfo=UTC)
 
 
 def integrity_error() -> SnapshotIntegrityError:

@@ -72,8 +72,9 @@ import logging
 import os
 import sys
 import urllib.parse
+from collections.abc import Iterator
 from pathlib import Path
-from typing import Any, Iterator
+from typing import Any
 
 # 只依赖生产入口已经公开的两个常量，不重新发明"什么算私聊消息"这条规则——
 # 与 lingxi.adapters.feishu_events 的既有定义保持单一来源。

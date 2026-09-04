@@ -13,9 +13,10 @@
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Protocol, Sequence
+from typing import Protocol
 
 #: D1 范围固定的三类记忆，与迁移 0076 的 CHECK 约束、``/memory remember`` 命令解析
 #: （``core/conversation/commands.py``）三处共享同一份取值域。

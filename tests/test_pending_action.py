@@ -10,15 +10,15 @@ from __future__ import annotations
 
 import dataclasses
 import unittest
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta, timezone
 
 from lingxi.core.admin.pending_action import (
+    _ACTION_TYPE_DISPLAY_NAME,
+    _TARGET_STATE_CHANGED_MESSAGE,
     PENDING_ACTION_TTL_SECONDS,
     REQUIRED_ROLE,
     TARGET_ACCOUNT_STATE,
     VALID_SOURCE_STATES,
-    _ACTION_TYPE_DISPLAY_NAME,
-    _TARGET_STATE_CHANGED_MESSAGE,
     CancelResultKind,
     ConfirmResultKind,
     PendingAction,
@@ -31,7 +31,7 @@ from lingxi.core.admin.pending_action import (
 )
 from lingxi.core.admin.registry import ALL_ADMIN_ROLES, AdminRegistryEntry, AdminRole
 
-NOW = datetime(2026, 8, 24, 12, 0, 0, tzinfo=timezone.utc)
+NOW = datetime(2026, 8, 24, 12, 0, 0, tzinfo=UTC)
 INITIATOR = "ou_admin_initiator"
 OTHER_OPEN_ID = "ou_not_the_admin"
 TARGET_OPEN_ID = "ou_target_user"

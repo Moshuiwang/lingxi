@@ -91,24 +91,24 @@ import queue
 import threading
 import time
 import traceback
-from datetime import datetime, timedelta, timezone
-from typing import Any, Callable, Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
+from datetime import UTC, datetime, timedelta
+from typing import Any
 
 from lingxi.adapters.postgres_local_permission import (
     PostgresLocalPermissionOverrideStore,
     local_override_reader,
 )
+from lingxi.apps.scheduler.audit import AuditSink
+from lingxi.apps.scheduler.config import SchedulerConfig
+from lingxi.apps.scheduler.permission_publish import PermissionPublishDuty
 from lingxi.core.identity.innertest_roster_gate import build_innertest_roster_gate
 from lingxi.core.permission.mcp_readiness import ReadinessSchedule
 from lingxi.core.permission.metric_translation import metric_translation_available
 
-from lingxi.apps.scheduler.audit import AuditSink
-from lingxi.apps.scheduler.config import SchedulerConfig
-from lingxi.apps.scheduler.permission_publish import PermissionPublishDuty
-
 logger = logging.getLogger(__name__)
 
-_UTC = timezone.utc
+_UTC = UTC
 
 #: 执行级硬截止相对单次探针超时的余量。给传输层自己的超时留出返回的机会——看门狗只该在
 #: 传输层**根本不遵守**超时时才动手，不该抢在它前面把一次正常的慢响应判死。

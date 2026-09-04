@@ -44,8 +44,9 @@ Epic D/E 联合验收要用到的受控失败旅程列为四类夹具，本模�
 
 from __future__ import annotations
 
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
-from typing import Any, Mapping, Sequence
+from typing import Any
 
 # ---------------------------------------------------------------------------
 # 一、确定性无权限身份夹具：零条 / 多条 / 双键冲突 / 资料不完整 / 无支持职能

@@ -9,7 +9,8 @@ G-3 裁定 Option A）：只搬定义，不改任何逻辑或文档字符串；`
 
 from __future__ import annotations
 
-from typing import Any, Mapping, Sequence
+from collections.abc import Mapping, Sequence
+from typing import Any
 
 from lingxi.core.identity.first_contact import IdentityRecordDraft
 from lingxi.core.identity.org_snapshot import SnapshotMember

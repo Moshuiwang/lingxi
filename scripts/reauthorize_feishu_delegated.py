@@ -27,6 +27,5 @@ from __future__ import annotations
 
 from lingxi.apps.reauthorize import main
 
-
 if __name__ == "__main__":
     raise SystemExit(main())

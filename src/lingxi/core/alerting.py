@@ -13,17 +13,18 @@ import logging
 import math
 import re
 import threading
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from enum import Enum
-from typing import Callable, Mapping, Protocol, Sequence
+from typing import Protocol
 
 logger = logging.getLogger(__name__)
 
 
 _SAFE_CATEGORY = re.compile(r"^[a-z][a-z0-9_.-]{0,63}$")
 _SAFE_TRACE_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$")
-_UTC = timezone.utc
+_UTC = UTC
 
 
 class AlertKind(str, Enum):
@@ -99,7 +100,7 @@ class AlertPolicy:
     @classmethod
     def from_mapping(
         cls, values: Mapping[str, str], *, prefix: str = "LINGXI_ALERT_"
-    ) -> "AlertPolicy":
+    ) -> AlertPolicy:
         """从调用方已读取的配置构造策略；错误信息不回显任何取值。"""
 
         def number(name: str, default: float) -> float:
@@ -604,7 +605,7 @@ class AlertDispatcher:
         self._chat_id = chat_id
         self._policy = policy or AlertPolicy()
         self._audit = audit
-        self._clock = clock or (lambda: datetime.now(timezone.utc))
+        self._clock = clock or (lambda: datetime.now(UTC))
         self._pending: dict[str, _PendingAlert] = {}
         self.observed_delays: list[float] = []
 
@@ -699,7 +700,7 @@ class AlertingDuty:
         self._manager = manager
         self._dispatcher = dispatcher
         self._audit = audit
-        self._clock = clock or (lambda: datetime.now(timezone.utc))
+        self._clock = clock or (lambda: datetime.now(UTC))
         self._stop = threading.Event() if stop is None else stop
 
     @property

@@ -60,7 +60,7 @@ from __future__ import annotations
 
 import threading
 from collections.abc import Callable
-from datetime import date, datetime, timedelta, timezone
+from datetime import UTC, date, datetime, timedelta
 from typing import Protocol
 
 from lingxi.core.identity.credentials import DerivedAccessToken, SecretToken
@@ -123,7 +123,7 @@ class AccessTokenUnavailable(RuntimeError):
 def _require_utc(moment: datetime, name: str) -> datetime:
     if not isinstance(moment, datetime) or moment.tzinfo is None or moment.utcoffset() is None:
         raise ValueError(f"{name} 必须是带时区的 UTC 时间")
-    return moment.astimezone(timezone.utc)
+    return moment.astimezone(UTC)
 
 
 class DerivedAccessTokenHolder:
@@ -314,7 +314,7 @@ class RosterAccessTokenProvider:
         self._holder = holder
         self._refresh = refresh
         self._audit = audit
-        self._clock = clock or (lambda: datetime.now(timezone.utc))
+        self._clock = clock or (lambda: datetime.now(UTC))
         self._audited_on: date | None = None
         self._audited_reasons: set[str] = set()
         # 审计去重专用锁（Issue #284 C 组 #7）：只包住 `_record` 内部对

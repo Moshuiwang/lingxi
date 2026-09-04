@@ -29,7 +29,6 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-
 REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
 DSN_ENV = "LINGXI_POSTGRES_DSN"
 

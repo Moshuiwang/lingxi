@@ -74,8 +74,8 @@ from __future__ import annotations
 
 import json
 import logging
-from collections.abc import Mapping, Sequence
-from typing import Any, Callable, Protocol
+from collections.abc import Callable, Mapping, Sequence
+from typing import Any, Protocol
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode, urlparse
 from urllib.request import Request, urlopen

@@ -104,7 +104,7 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Protocol
 
@@ -344,7 +344,7 @@ class PostgresPendingActionStore:
 
         from psycopg.errors import UniqueViolation
 
-        moment = now or datetime.now(timezone.utc)
+        moment = now or datetime.now(UTC)
         pending_id = new_id("pac")
         is_local_permission_action = action_type in _DIRECTION_BY_ACTION_TYPE
         is_revoke_action = action_type is PendingActionType.LOCAL_PERMISSION_REVOKE
@@ -365,7 +365,9 @@ class PostgresPendingActionStore:
                     )
                 )
             try:
-                from lingxi.adapters.company_function_metric_map_file import load_company_function_metric_map
+                from lingxi.adapters.company_function_metric_map_file import (
+                    load_company_function_metric_map,
+                )
                 from lingxi.adapters.role_function_map_file import load_role_function_map
 
                 company_map = load_company_function_metric_map(self._metric_map_path)
@@ -710,7 +712,7 @@ class PostgresPendingActionStore:
         无限期停留在看似"仍在等待"的 ``pending``。
         """
 
-        moment = now or datetime.now(timezone.utc)
+        moment = now or datetime.now(UTC)
         with connect(self._dsn, timeouts=self._timeouts) as connection, connection.cursor() as cursor:
             cursor.execute(
                 "UPDATE pending_action SET status = 'failed', reason = 'card_send_failed',"
@@ -887,7 +889,7 @@ class PostgresPendingActionStore:
                     # 期间如果被并发事务卡住，锁前取的时间会比真正执行判定的时刻更早，
                     # 让本该过期的操作因为一段等锁窗口而被误判为"仍然有效"。显式注入的
                     # ``now`` 原样使用，不重新取时钟（测试需要确定性时钟）。
-                    moment = now if now is not None else datetime.now(timezone.utc)
+                    moment = now if now is not None else datetime.now(UTC)
 
                     decision = decide_confirm(
                         pending=pending,
@@ -1125,7 +1127,7 @@ class PostgresPendingActionStore:
                     row = cursor.fetchone()
                     pending = _row_to_pending_action(row) if row is not None else None
 
-                    moment = now if now is not None else datetime.now(timezone.utc)
+                    moment = now if now is not None else datetime.now(UTC)
 
                     decision = decide_cancel(
                         pending=pending, clicker_open_id=clicker_open_id, now=moment

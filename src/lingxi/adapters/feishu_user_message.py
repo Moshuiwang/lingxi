@@ -30,8 +30,8 @@ from __future__ import annotations
 
 import json
 import logging
-from collections.abc import Mapping
-from typing import Any, Callable
+from collections.abc import Callable, Mapping
+from typing import Any
 
 from lingxi.adapters.feishu_group_message import delivery_uuid
 

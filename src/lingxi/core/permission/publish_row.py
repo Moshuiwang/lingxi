@@ -229,7 +229,7 @@ import hashlib
 import json
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from typing import Any
 
 from lingxi.core.permission.account_match import normalize_email
@@ -240,7 +240,7 @@ from lingxi.core.permission.galaxy_scope import (
 )
 from lingxi.core.permission.role_function import resolve_role_functions
 
-_UTC = timezone.utc
+_UTC = UTC
 
 #: 「全非」通配在 ``permissions`` 里的键。既有行用它表示「所有公司」，因此我们不把
 #: 通配展开成几十个重复条目——展开规则是我们这一侧的解释，消费方已有自己的约定。
@@ -783,7 +783,7 @@ class PublishRow:
         }
 
     @classmethod
-    def from_fields(cls, fields: Mapping[str, Any]) -> "PublishRow":
+    def from_fields(cls, fields: Mapping[str, Any]) -> PublishRow:
         """从 outbox payload 还原成发布行。
 
         payload 是**当初决定发布的那一版内容快照**，回读时逐键取；缺键或多键都直接

@@ -15,7 +15,7 @@ from lingxi.adapters.feishu_org_snapshot_reader import (
     OrgSnapshotReadError,
     read_org_snapshot,
 )
-from lingxi.core.identity.org_snapshot import require_complete_batch, verify_batch, IntegrityProblem
+from lingxi.core.identity.org_snapshot import IntegrityProblem, require_complete_batch, verify_batch
 
 
 class FakeDirectoryClient:

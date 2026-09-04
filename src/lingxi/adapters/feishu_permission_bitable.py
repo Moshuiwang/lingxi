@@ -50,8 +50,8 @@
 from __future__ import annotations
 
 import logging
-from collections.abc import Mapping
-from typing import Any, Callable
+from collections.abc import Callable, Mapping
+from typing import Any
 from urllib.parse import quote, urlencode
 
 from lingxi.adapters.feishu_directory import FeishuDirectoryError, urllib_transport

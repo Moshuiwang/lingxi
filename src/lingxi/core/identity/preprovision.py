@@ -84,9 +84,10 @@
 
 from __future__ import annotations
 
+from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Any, Iterable, Mapping, Protocol, Sequence
+from typing import Any, Protocol
 
 from lingxi.core.conversation.ports import OnboardingResult, OnboardingState
 from lingxi.core.identity.onboarding_terminal import (

@@ -163,14 +163,12 @@ import os
 import sys
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Protocol
 
 from lingxi.core.permission.account_match import MATCHED, match_galaxy_account, normalize_email
 from lingxi.core.permission.legacy_diff import (
-    IMPORT_REASON,
-    PENDING_ACTION_REASON,
     SHAPE_SPECIFIC,
     LegacyImportPlan,
     classify_legacy_permissions,
@@ -180,7 +178,11 @@ from lingxi.core.permission.metric_translation import (
     UncoveredPermissionCombination,
     translate_company_functions,
 )
-from lingxi.core.permission.publish_row import ALL_COMPANIES_KEY, aggregate_permission, parse_permissions
+from lingxi.core.permission.publish_row import (
+    ALL_COMPANIES_KEY,
+    aggregate_permission,
+    parse_permissions,
+)
 
 # ``IMPORT_REASON``/``PENDING_ACTION_REASON``/``compute_company_diff`` 自 rc25 S-1
 # （Issue #540）起住在 ``core/permission/legacy_diff.py``——首聊自动路径与本脚本共用
@@ -763,7 +765,7 @@ def main(argv: list[str] | None = None) -> int:
 
     # 写入阶段：每条 PlannedGrant 各自开一条连接/事务（见 apply_grant 文档），
     # 不复用上面的只读连接——避免让整批导入共享同一个长事务、同一把连接级锁。
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
     report = ApplyReport()
     for grant in plan.grants:
         if apply_grant(dsn, grant=grant, initiated_by_open_id=initiated_by_open_id, now=now):

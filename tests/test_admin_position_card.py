@@ -3,8 +3,9 @@
 from __future__ import annotations
 
 import unittest
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 
+from lingxi.config.content import default_content_catalog
 from lingxi.core.admin.card_dispatch import (
     MANAGEMENT_CARD_CONTEXT_DEFAULT_TTL_SECONDS,
     MANAGEMENT_CARD_CONTEXT_MAX_TTL_SECONDS,
@@ -17,10 +18,9 @@ from lingxi.core.admin.management_card import (
     ADMIN_ACTION_GRANT,
     render_management_card,
 )
-from lingxi.core.admin.router import AdminRouteOutcome
 from lingxi.core.admin.pending_action import PendingAction, PendingActionStatus, PendingActionType
+from lingxi.core.admin.router import AdminRouteOutcome
 from lingxi.core.admin.views import AdminUserStatusView, LocalPermissionOverrideView
-from lingxi.config.content import default_content_catalog
 from lingxi.core.permission.position_override import expand_position_scope
 from lingxi.core.permission.targeted_recompute import (
     SKIP_ACCOUNT_NOT_ENABLED,
@@ -28,8 +28,7 @@ from lingxi.core.permission.targeted_recompute import (
     TargetedRecomputeOutcome,
 )
 
-
-NOW = datetime(2026, 8, 31, 12, 0, tzinfo=timezone.utc)
+NOW = datetime(2026, 8, 31, 12, 0, tzinfo=UTC)
 
 
 class _PositionCatalog:
@@ -309,7 +308,10 @@ class PositionManagementCardTests(unittest.TestCase):
     def test_recovery_scanner_drops_old_visual_when_state_changes_after_snapshot(self) -> None:
         """scanner 读旧行后，状态推进必须让旧视觉在取号 CAS 处放弃。"""
 
-        from lingxi.apps.gateway import _GatewayManagementCardRefresher, _ManagementCardRecoveryScanner
+        from lingxi.apps.gateway import (
+            _GatewayManagementCardRefresher,
+            _ManagementCardRecoveryScanner,
+        )
 
         class _Transport:
             def __init__(self) -> None:
@@ -553,7 +555,7 @@ class TerminalOutcomeTextTests(unittest.TestCase):
 class ContextSequenceTests(unittest.TestCase):
     def test_default_context_ttl_is_forty_minutes_and_explicit_deadline_is_hard_capped_at_24h(self) -> None:
         store = ManagementCardContextStore()
-        before = datetime.now(timezone.utc)
+        before = datetime.now(UTC)
         store.remember(
             message_id="om_ttl",
             identifier="u@example.com",
@@ -625,7 +627,7 @@ class ContextSequenceTests(unittest.TestCase):
             chat_id="oc_1",
             initiated_by_open_id="ou_admin",
             snapshot_fingerprint="fp",
-            context_deadline_at=datetime.now(timezone.utc) + timedelta(hours=1),
+            context_deadline_at=datetime.now(UTC) + timedelta(hours=1),
             card_sequence=2,
         )
         self.assertEqual(store.next_card_sequence(message_id="om_1"), 3)
@@ -723,7 +725,7 @@ class ManagementCardCallbackSecurityTests(unittest.TestCase):
             chat_id="oc_1",
             initiated_by_open_id="ou_admin",
             snapshot_fingerprint=management_card_fingerprint(status),
-            context_deadline_at=datetime.now(timezone.utc) + timedelta(hours=1),
+            context_deadline_at=datetime.now(UTC) + timedelta(hours=1),
         )
         return store
 

@@ -6,7 +6,7 @@
 from __future__ import annotations
 
 import unittest
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 
 from lingxi.core.admin.card_dispatch import (
     CardDispatchResult,
@@ -18,7 +18,7 @@ from lingxi.core.admin.notification import AdminCardCreated, AdminCardDeliveryRe
 from lingxi.core.admin.pending_action import PendingAction, PendingActionStatus, PendingActionType
 from lingxi.core.admin.views import AdminUserStatusView
 
-NOW = datetime(2026, 8, 24, 12, 0, 0, tzinfo=timezone.utc)
+NOW = datetime(2026, 8, 24, 12, 0, 0, tzinfo=UTC)
 
 
 def _pending() -> PendingAction:

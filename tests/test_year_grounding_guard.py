@@ -10,8 +10,9 @@
 from __future__ import annotations
 
 import unittest
+from collections.abc import Mapping
 from dataclasses import dataclass
-from typing import Any, Mapping
+from typing import Any
 
 from lingxi.core.year_grounding_guard import (
     QUERY_METRIC_TOOL_NAME,

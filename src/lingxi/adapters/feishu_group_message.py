@@ -24,8 +24,8 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
-from collections.abc import Mapping
-from typing import Any, Callable
+from collections.abc import Callable, Mapping
+from typing import Any
 
 from lingxi.adapters.feishu_directory import urllib_transport
 
@@ -74,7 +74,7 @@ def delivery_uuid(chat_id: str, dedupe_key: str, *, prefix: str = DELIVERY_UUID_
     还是权限通知。取值域仍由长度上限守着（下面那一行按实际前缀算，不是按默认值算）。
     """
 
-    digest = hashlib.sha256(f"{chat_id}\n{dedupe_key}".encode("utf-8")).hexdigest()[:32]
+    digest = hashlib.sha256(f"{chat_id}\n{dedupe_key}".encode()).hexdigest()[:32]
     if not isinstance(prefix, str) or not prefix.strip() or prefix.strip() != prefix:
         raise ValueError("投递去重 ID 的前缀必须是不含首尾空白的非空文本")
     value = f"{prefix}{digest}"

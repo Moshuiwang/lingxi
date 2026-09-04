@@ -48,7 +48,7 @@ class _Builder:
         self._fields: dict[str, Any] = {}
 
     def __getattr__(self, name: str):
-        def collect(value: Any) -> "_Builder":
+        def collect(value: Any) -> _Builder:
             self._fields[name] = value
             return self
 

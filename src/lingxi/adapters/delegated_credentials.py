@@ -42,7 +42,7 @@ import logging
 import os
 import tempfile
 from dataclasses import dataclass, replace
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -241,7 +241,7 @@ class HostFileDelegatedCredentialVault:
             ):
                 raise ValueError("当日消费计数必须是非负整数")
 
-        moment = issued_at or datetime.now(timezone.utc)
+        moment = issued_at or datetime.now(UTC)
         from lingxi.core.ids import new_ulid
 
         with self._locked():
@@ -344,7 +344,7 @@ class HostFileDelegatedCredentialVault:
         这种文件意味着进程在续期后、落盘前死掉：旧令牌已被飞书作废，留着密文
         只会诱使未来的代码路径重放它。"""
 
-        moment = now or datetime.now(timezone.utc)
+        moment = now or datetime.now(UTC)
         with self._locked():
             payload = self._read_payload()
             if payload is None:
@@ -375,7 +375,7 @@ class HostFileDelegatedCredentialVault:
     def load(self, *, now: datetime | None = None) -> StoredCredential | None:
         """取出当前凭据供同步使用。解密失败或已失效时撤销并返回 ``None``。"""
 
-        moment = now or datetime.now(timezone.utc)
+        moment = now or datetime.now(UTC)
         with self._locked():
             payload = self._read_payload()
         if payload is None:
@@ -459,7 +459,7 @@ class HostFileDelegatedCredentialVault:
             raise ValueError("当日消费上界必须是正整数")
         with self._locked():
             # 时刻在锁内取：等锁可能跨越 UTC 午夜，锁外算好的日期会判错一整天。
-            moment = now or datetime.now(timezone.utc)
+            moment = now or datetime.now(UTC)
             payload = self._read_payload()
             if payload is None:
                 return None
@@ -484,7 +484,7 @@ class HostFileDelegatedCredentialVault:
             last_consumed_at = _parse_utc(payload.get("refresh_consumed_at"))
             same_utc_day = (
                 last_consumed_at is not None
-                and last_consumed_at.date() == moment.astimezone(timezone.utc).date()
+                and last_consumed_at.date() == moment.astimezone(UTC).date()
             )
             # 当日消费计数的基线：跨了 UTC 日界（或从未消费过）就是 0，否则沿用落盘的
             # 那个值——旧凭据文件没有这个字段时按 0 处理（向后兼容）。
@@ -588,7 +588,7 @@ class HostFileDelegatedCredentialVault:
         expires_at = _parse_moment(payload.get("expires_at"))
         if not isinstance(token, str) or not token or not isinstance(subject, str) or refresh_at is None or expires_at is None:
             return None
-        remaining = max(int((expires_at - datetime.now(timezone.utc)).total_seconds()), 1)
+        remaining = max(int((expires_at - datetime.now(UTC)).total_seconds()), 1)
         return StoredCredential(
             subject_open_id=subject,
             grant=AuthorizationGrant(SecretToken(token), remaining, str(payload.get("scope") or "")),
@@ -619,8 +619,8 @@ def _parse_utc(value: Any) -> datetime | None:
     if moment is None:
         return None
     if moment.tzinfo is None or moment.utcoffset() is None:
-        return moment.replace(tzinfo=timezone.utc)
-    return moment.astimezone(timezone.utc)
+        return moment.replace(tzinfo=UTC)
+    return moment.astimezone(UTC)
 
 
 def _parse_supply_count(value: Any) -> int:
@@ -646,7 +646,7 @@ class _FileLock:
         self._path = path
         self._handle = None
 
-    def __enter__(self) -> "_FileLock":
+    def __enter__(self) -> _FileLock:
         self._path.parent.mkdir(parents=True, exist_ok=True)
         self._handle = open(self._path, "a+b")  # noqa: SIM115 - 锁的生命周期由上下文管理
         os.fchmod(self._handle.fileno(), 0o600)

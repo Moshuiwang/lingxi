@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import pathlib
 import unittest
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 
 import lingxi.core.admin.notification as notification_module
 from lingxi.core.admin.notification import (
@@ -20,7 +20,7 @@ from lingxi.core.admin.notification import (
 )
 from lingxi.core.admin.pending_action import PendingAction, PendingActionStatus, PendingActionType
 
-NOW = datetime(2026, 8, 24, 12, 0, 0, tzinfo=timezone.utc)
+NOW = datetime(2026, 8, 24, 12, 0, 0, tzinfo=UTC)
 TARGET_OPEN_ID = "ou_target_user_masked"
 
 

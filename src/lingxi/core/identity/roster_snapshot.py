@@ -42,12 +42,13 @@ S-B-04 把这个注入点接上了 scheduler 的结构化告警日志，而**面
 
 from __future__ import annotations
 
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from enum import Enum
-from typing import Any, Callable, Protocol, Sequence
+from typing import Any, Protocol
 
-_UTC = timezone.utc
+_UTC = UTC
 
 # 读取层四态的字面量。与 `adapters/feishu_roster_bitable.RosterReadStatus` 的 `value`
 # 一一对应；这里重列一遍是本模块不 import adapters 的代价，也是"新状态必须被显式

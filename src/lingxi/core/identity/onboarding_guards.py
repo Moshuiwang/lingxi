@@ -26,10 +26,11 @@
 from __future__ import annotations
 
 import logging
-from typing import Any, Callable
+from collections.abc import Callable
+from typing import Any
 
 from lingxi.core.identity.onboarding_ports import EmailBindingSource, _AuditSink
-from lingxi.core.identity.onboarding_terminal import _Terminal, _internal, _not_authorized
+from lingxi.core.identity.onboarding_terminal import _internal, _not_authorized, _Terminal
 from lingxi.core.permission.account_match import normalize_email
 from lingxi.core.permission.local_override import ResolvedLocalOverrides
 from lingxi.core.permission.merge_sources import merge_permission_sources

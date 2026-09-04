@@ -282,7 +282,7 @@ class ContentCatalog:
         self._cards = dict(cards)
 
     @classmethod
-    def from_mapping(cls, document: Mapping[str, Any]) -> "ContentCatalog":
+    def from_mapping(cls, document: Mapping[str, Any]) -> ContentCatalog:
         """从 TOML 等价映射构造并完整校验目录。
 
         测试通过这个入口喂缺键、多余键和危险卡片字段，证明失败发生在任何渲染之前。
@@ -356,7 +356,7 @@ class ContentCatalog:
         return cls(version=version, texts=texts, cards=cards)
 
     @classmethod
-    def from_file(cls, path: Path = CONTENT_PATH) -> "ContentCatalog":
+    def from_file(cls, path: Path = CONTENT_PATH) -> ContentCatalog:
         """读取随包发布的 TOML 文件；文件损坏时不创建部分可用目录。"""
 
         try:

@@ -16,7 +16,7 @@ import importlib.util
 import logging
 import tempfile
 import unittest
-from datetime import date, datetime, timedelta, timezone
+from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 
 from lingxi.core.identity.credentials import (
@@ -30,7 +30,6 @@ from lingxi.core.identity.credentials import (
     expiry_moment,
     rotation_deadline,
 )
-
 
 FAKE_TOKEN = "fake-refresh-token-for-tests-only"
 
@@ -76,7 +75,7 @@ class RotationDeadlineTest(unittest.TestCase):
     """轮换点跟着飞书返回的有效期走，不写死周期。"""
 
     def setUp(self) -> None:
-        self.issued_at = datetime(2026, 8, 5, 3, 0, tzinfo=timezone.utc)
+        self.issued_at = datetime(2026, 8, 5, 3, 0, tzinfo=UTC)
 
     def test_rotation_is_scheduled_at_eighty_percent_of_the_returned_lifetime(self) -> None:
         seven_days = 7 * 24 * 3600
@@ -109,7 +108,7 @@ class RotationDeadlineTest(unittest.TestCase):
 
 class CredentialStateTest(unittest.TestCase):
     def setUp(self) -> None:
-        self.now = datetime(2026, 8, 5, 3, 0, tzinfo=timezone.utc)
+        self.now = datetime(2026, 8, 5, 3, 0, tzinfo=UTC)
 
     def test_states_are_derived_from_the_two_stored_moments(self) -> None:
         cases = (
@@ -294,7 +293,7 @@ class UndecryptableCredentialFileTest(unittest.TestCase):
         return Fernet(key.encode()).encrypt(json.dumps(payload).encode())
 
     def _valid_payload(self) -> dict:
-        moment = datetime.now(timezone.utc)
+        moment = datetime.now(UTC)
         return {
             "generation": "01JCREDENTIALGENERATION0001",
             "subject_open_id": "ou_delegated_authorization_subject",

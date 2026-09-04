@@ -27,22 +27,22 @@ from __future__ import annotations
 
 import json
 import logging
+from collections.abc import Sequence
 from dataclasses import dataclass
-from datetime import datetime, timezone
-from typing import Any, Sequence
-
-from lingxi.adapters.postgres import DEFAULT_POSTGRES_TIMEOUTS, PostgresTimeouts, connect
+from datetime import UTC, datetime
+from typing import Any
 
 # 行形态只保留一份定义：读取层产出 `RosterRow`，快照回读也还它同一个类型，比对层
 # 因此不必区分"这行是刚读的还是从快照回来的"。在这里重新定义一个同字段的类，会让
 # 两条路径的行形态在某次改字段时悄悄分叉（读取层给了工号、快照层还叫 work_no 这类）。
 from lingxi.adapters.feishu_roster_bitable import RosterRow
+from lingxi.adapters.postgres import DEFAULT_POSTGRES_TIMEOUTS, PostgresTimeouts, connect
 from lingxi.core.identity.roster_snapshot import StoredSnapshotFacts
 from lingxi.core.ids import new_id
 
 logger = logging.getLogger(__name__)
 
-_UTC = timezone.utc
+_UTC = UTC
 
 # 元信息只有一行（``singleton`` 唯一约束），因此不需要 ORDER BY / LIMIT。
 LOAD_FACTS_SQL = "SELECT id, captured_at, row_count FROM roster_snapshot"

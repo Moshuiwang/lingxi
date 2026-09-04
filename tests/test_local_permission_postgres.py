@@ -17,7 +17,7 @@ from __future__ import annotations
 
 import os
 import unittest
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 
 from postgres_schema import ensure_production_schema, psycopg_available, reset_production_rows
 
@@ -87,7 +87,7 @@ class LocalPermissionOverridePostgresTestCase(unittest.TestCase):
         """
 
         resolved_target_open_id = target_open_id or f"ou_target_for_{pending_id}"
-        now = datetime.now(timezone.utc)
+        now = datetime.now(UTC)
         self.execute(
             """INSERT INTO pending_action
                  (id, action_type, target_open_id, target_state_snapshot,
@@ -182,10 +182,14 @@ class LegacyImportPostgresTests(LocalPermissionOverridePostgresTestCase):
         )
 
     def _now(self):
-        return datetime(2026, 9, 2, 8, 0, tzinfo=timezone.utc)
+        return datetime(2026, 9, 2, 8, 0, tzinfo=UTC)
 
     def test_specific_pairs_and_the_all_scope_group_land_in_one_transaction(self) -> None:
-        from lingxi.core.permission.legacy_diff import ALL_SCOPE_POSITION_NAME, IMPORT_REASON, LEGACY_IMPORT_ACTOR
+        from lingxi.core.permission.legacy_diff import (
+            ALL_SCOPE_POSITION_NAME,
+            IMPORT_REASON,
+            LEGACY_IMPORT_ACTOR,
+        )
 
         report = self.store.import_legacy_plan(
             user_id=TARGET_USER_ID,
@@ -541,16 +545,16 @@ class DailyActivityStatsTests(LocalPermissionOverridePostgresTestCase):
     #319 S-P-1c，内测每日通报「本地权限覆盖活动」段的哑聚合）。"""
 
     def test_an_empty_table_reports_all_zeros(self) -> None:
-        window_start = datetime(2026, 8, 26, tzinfo=timezone.utc)
-        window_end = datetime(2026, 8, 27, tzinfo=timezone.utc)
+        window_start = datetime(2026, 8, 26, tzinfo=UTC)
+        window_end = datetime(2026, 8, 27, tzinfo=UTC)
 
         stats = self.store.daily_activity_stats(window_start=window_start, window_end=window_end)
 
         self.assertEqual(stats, (0, 0, 0, 0, 0, 0))
 
     def test_grant_and_suppress_created_inside_the_window_are_counted_separately(self) -> None:
-        window_start = datetime(2026, 8, 26, tzinfo=timezone.utc)
-        window_end = datetime(2026, 8, 27, tzinfo=timezone.utc)
+        window_start = datetime(2026, 8, 26, tzinfo=UTC)
+        window_end = datetime(2026, 8, 27, tzinfo=UTC)
         inside_window = window_start + timedelta(hours=6)
 
         self.insert_override(
@@ -585,8 +589,8 @@ class DailyActivityStatsTests(LocalPermissionOverridePostgresTestCase):
         self.assertEqual(affected_user_count, 1)  # 同一用户两条覆盖，去重后仍是 1
 
     def test_a_row_created_outside_the_window_is_excluded_from_todays_counts(self) -> None:
-        window_start = datetime(2026, 8, 26, tzinfo=timezone.utc)
-        window_end = datetime(2026, 8, 27, tzinfo=timezone.utc)
+        window_start = datetime(2026, 8, 26, tzinfo=UTC)
+        window_end = datetime(2026, 8, 27, tzinfo=UTC)
         before_window = window_start - timedelta(hours=1)
 
         stored = self.insert_override(company_id="1011", metric_name="日活")
@@ -604,8 +608,8 @@ class DailyActivityStatsTests(LocalPermissionOverridePostgresTestCase):
     def test_a_revocation_inside_the_window_is_counted_regardless_of_original_direction(
         self,
     ) -> None:
-        window_start = datetime(2026, 8, 26, tzinfo=timezone.utc)
-        window_end = datetime(2026, 8, 27, tzinfo=timezone.utc)
+        window_start = datetime(2026, 8, 26, tzinfo=UTC)
+        window_end = datetime(2026, 8, 27, tzinfo=UTC)
         inside_window = window_start + timedelta(hours=3)
 
         stored = self.insert_override(
@@ -649,8 +653,8 @@ class DailyActivityStatsTests(LocalPermissionOverridePostgresTestCase):
             direction=OverrideDirection.GRANT,
         )
 
-        window_start = datetime(2020, 1, 1, tzinfo=timezone.utc)
-        window_end = datetime(2020, 1, 2, tzinfo=timezone.utc)
+        window_start = datetime(2020, 1, 1, tzinfo=UTC)
+        window_end = datetime(2020, 1, 2, tzinfo=UTC)
         stats = self.store.daily_activity_stats(window_start=window_start, window_end=window_end)
 
         self.assertEqual(stats[3], 2)  # active_grant_total

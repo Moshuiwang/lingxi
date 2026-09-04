@@ -12,7 +12,8 @@ from __future__ import annotations
 
 import hashlib
 import re
-from typing import Any, Mapping
+from collections.abc import Mapping
+from typing import Any
 
 _MAX_LOG_TOKEN_CHARS = 64
 # 独立审查（Issue #291 拒绝文案对用户承诺"问题已经被记录"）：一次回合里模型

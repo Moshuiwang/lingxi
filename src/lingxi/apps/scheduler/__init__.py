@@ -199,15 +199,7 @@ import logging
 import sys
 import traceback
 
-from lingxi.core.alerting import (
-    AlertDispatcher,
-    AlertingDuty,
-    AlertManager,
-    AlertPolicy,
-    AlertSender as _AlertSender,
-)
-
-from lingxi.apps.scheduler.alerting_assembly import build_alerting_duty, _combined_heartbeat
+from lingxi.apps.scheduler.alerting_assembly import _combined_heartbeat, build_alerting_duty
 from lingxi.apps.scheduler.assembly import (
     _build_late_readiness_recovery_duty,
     _build_onboarding_duty,
@@ -270,6 +262,15 @@ from lingxi.apps.scheduler.stalled_provisioning import (
     DEFAULT_STALLED_LIMIT,
     StalledProvisioningDuty,
     StalledProvisioningReport,
+)
+from lingxi.core.alerting import (
+    AlertDispatcher,
+    AlertingDuty,
+    AlertManager,
+    AlertPolicy,
+)
+from lingxi.core.alerting import (
+    AlertSender as _AlertSender,
 )
 
 logger = logging.getLogger(__name__)

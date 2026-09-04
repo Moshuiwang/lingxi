@@ -10,7 +10,7 @@
 from __future__ import annotations
 
 import unittest
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 
 from lingxi.core.identity.access_token_supply import (
     DEFAULT_ACCESS_TOKEN_SAFETY_MARGIN,
@@ -23,7 +23,7 @@ from lingxi.core.permission.table_access_token_supply import (
 from lingxi.core.permission.tenant_token_supply import TenantAccessTokenSupply
 
 FAKE_TOKEN = "fake-tenant-token-for-tests-only"
-DAY = datetime(2026, 8, 18, 9, 0, tzinfo=timezone.utc)
+DAY = datetime(2026, 8, 18, 9, 0, tzinfo=UTC)
 
 
 class MovableClock:

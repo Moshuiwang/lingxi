@@ -42,7 +42,8 @@ from __future__ import annotations
 
 import json
 import logging
-from typing import Any, Callable, Mapping, Protocol
+from collections.abc import Callable, Mapping
+from typing import Any, Protocol
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlparse
 from urllib.request import Request, urlopen

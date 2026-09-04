@@ -91,10 +91,11 @@ scheduler 侧）。两个口刻意不合并：放宽授权侧基线会让开通�
 
 from __future__ import annotations
 
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from enum import Enum
-from typing import Any, Callable, Mapping, Protocol, Sequence
+from typing import Any, Protocol
 
 from lingxi.core.identity.roster_audit import ArchivedIdentity
 from lingxi.core.permission.account_match import MATCHED, match_galaxy_account
@@ -283,7 +284,7 @@ class TargetedPermissionRecompute:
         self._audit = audit
         self._local_overrides = local_overrides
         self._legacy_all_scope = legacy_all_scope
-        self._clock = clock or (lambda: datetime.now(timezone.utc))
+        self._clock = clock or (lambda: datetime.now(UTC))
 
     # ------------------------------------------------------------------
     # 停用：不管银河怎么说，立刻清空（模块文档「为什么是两个方法」）

@@ -29,15 +29,16 @@ AuditSink``/``core/admin/card_callback.AuditSink`` 结构相同的独立 ``Audit
 
 from __future__ import annotations
 
-import time
 import hashlib
 import json
 import math
 import threading
+import time
 from collections import OrderedDict
+from collections.abc import Callable
 from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
-from typing import Callable, Protocol
+from datetime import UTC, datetime, timedelta
+from typing import Protocol
 
 from lingxi.core.admin.display_names import AdminDisplayNames
 from lingxi.core.admin.management_card import (
@@ -53,7 +54,6 @@ from lingxi.core.admin.notification import (
 )
 from lingxi.core.admin.pending_action import PendingAction
 from lingxi.core.admin.views import AdminUserStatusView
-
 
 # 管理卡上下文只允许在这段时间内接受旧卡回调。它是一个内部保护窗口，不是
 # 待确认操作或本地授权的有效期；但无论调用方如何配置，都不能超过 24 小时。
@@ -86,15 +86,15 @@ def bounded_management_card_deadline(
     """返回不晚于 ``now + 24h`` 的管理卡上下文截止时间。"""
 
     if now.tzinfo is None:
-        now = now.replace(tzinfo=timezone.utc)
+        now = now.replace(tzinfo=UTC)
     elif now.utcoffset() is None:
-        now = now.replace(tzinfo=timezone.utc)
+        now = now.replace(tzinfo=UTC)
     if requested is None:
         deadline = now + timedelta(seconds=bounded_management_card_ttl_seconds(ttl_seconds))
     else:
         deadline = requested
         if deadline.tzinfo is None or deadline.utcoffset() is None:
-            deadline = deadline.replace(tzinfo=timezone.utc)
+            deadline = deadline.replace(tzinfo=UTC)
     hard_deadline = now + timedelta(seconds=MANAGEMENT_CARD_CONTEXT_MAX_TTL_SECONDS)
     return min(deadline, hard_deadline)
 
@@ -370,7 +370,7 @@ class ManagementCardContextStore:
             return
         expires_at = self._clock() + self._ttl_seconds
         deadline = bounded_management_card_deadline(
-            now=datetime.now(timezone.utc),
+            now=datetime.now(UTC),
             requested=context_deadline_at,
             ttl_seconds=self._ttl_seconds,
         )
@@ -524,7 +524,7 @@ class ManagementCardContextStore:
                 daily_correction_reported_at=(
                     context.daily_correction_reported_at
                     if state != "effective" or context.daily_correction_pending
-                    else context.daily_correction_reported_at or datetime.now(timezone.utc)
+                    else context.daily_correction_reported_at or datetime.now(UTC)
                 ),
                 # ``incomplete`` 只是失败状态，不足以证明每日批已补齐；保留既有
                 # qualification，只有 settle_published_contexts 才能置位它。

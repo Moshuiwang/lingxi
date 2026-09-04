@@ -26,7 +26,6 @@ from lingxi.core.identity.first_contact import (
 from lingxi.core.identity.identifiers import redact_identifier
 from lingxi.core.identity.org_snapshot import DirectoryAvailability, SnapshotMember
 
-
 DELEGATED_SUBJECT = "ou_delegated_authorization_subject"
 
 

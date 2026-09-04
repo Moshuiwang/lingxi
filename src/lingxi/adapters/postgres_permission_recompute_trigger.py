@@ -81,8 +81,9 @@ from __future__ import annotations
 
 import queue
 import threading
+from collections.abc import Callable, Mapping, Sequence
 from pathlib import Path
-from typing import Any, Callable, Mapping, Sequence
+from typing import Any
 
 from lingxi.adapters.postgres import DEFAULT_POSTGRES_TIMEOUTS, PostgresTimeouts, connect
 from lingxi.adapters.postgres_targeted_recompute_lookup import (
@@ -218,7 +219,9 @@ class PermissionRecomputeAdapter:
         # 延迟导入：与仓库既有的 Postgres 适配器同一惯例（构造时不连接数据库，
         # 调用时才建连接），也让"哪些依赖真的被这条调用路径用到"在 import 时机
         # 上一目了然。
-        from lingxi.adapters.company_function_metric_map_file import load_company_function_metric_map
+        from lingxi.adapters.company_function_metric_map_file import (
+            load_company_function_metric_map,
+        )
         from lingxi.adapters.postgres_galaxy_snapshot import PostgresGalaxySnapshotReader
         from lingxi.adapters.postgres_local_permission import (
             PostgresLocalPermissionOverrideStore,

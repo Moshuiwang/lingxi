@@ -24,7 +24,7 @@ import base64
 import json
 import secrets
 import unittest
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta, timezone
 
 from lingxi.core.permission.publish_row import (
     ALL_COMPANIES_KEY,
@@ -59,7 +59,7 @@ TOKEN_CIPHER = "RklYRURJVjEyMzQ1Njc4OX5gpf2vKqJiLgzu2n4kug1V1rz6DDt1OCgAZVpg1pL+
 FAKE_GALAXY_USER = "9001"
 FAKE_EMAIL = "jiaming.jia@example.invalid"
 FAKE_NAME = "化名甲"
-DECIDED_AT = datetime(2026, 8, 17, 3, 0, tzinfo=timezone.utc)
+DECIDED_AT = datetime(2026, 8, 17, 3, 0, tzinfo=UTC)
 
 # 只登记两个受支持角色：`APP产品运营` / `A海外本地员工营业厅` 刻意不在映射里
 # （Issue #17 明确它们不映射），用例据此证明未映射角色不产生职能。
@@ -451,7 +451,7 @@ class TranslatedPublishRowTest(unittest.TestCase):
             company_metrics={"1011": ["日活", "收入"]},
             email=" Jia.Ming@Example.INVALID ",
             display_name="化名甲",
-            decided_at=datetime(2026, 8, 17, 3, 0, tzinfo=timezone.utc),
+            decided_at=datetime(2026, 8, 17, 3, 0, tzinfo=UTC),
             token_cipher=token_cipher,
         )
 
@@ -472,7 +472,7 @@ class TranslatedPublishRowTest(unittest.TestCase):
                 company_metrics={"1011": ["日活"]},
                 email="   ",
                 display_name="化名甲",
-                decided_at=datetime(2026, 8, 17, 3, 0, tzinfo=timezone.utc),
+                decided_at=datetime(2026, 8, 17, 3, 0, tzinfo=UTC),
             )
 
     def test_missing_display_name_is_rejected(self) -> None:
@@ -481,7 +481,7 @@ class TranslatedPublishRowTest(unittest.TestCase):
                 company_metrics={"1011": ["日活"]},
                 email="jia.ming@example.invalid",
                 display_name="  ",
-                decided_at=datetime(2026, 8, 17, 3, 0, tzinfo=timezone.utc),
+                decided_at=datetime(2026, 8, 17, 3, 0, tzinfo=UTC),
             )
 
     def test_uncovered_translation_input_cannot_produce_a_row(self) -> None:
@@ -493,7 +493,7 @@ class TranslatedPublishRowTest(unittest.TestCase):
                 company_metrics={},
                 email="jia.ming@example.invalid",
                 display_name="化名甲",
-                decided_at=datetime(2026, 8, 17, 3, 0, tzinfo=timezone.utc),
+                decided_at=datetime(2026, 8, 17, 3, 0, tzinfo=UTC),
             )
 
     def test_token_cipher_is_optional_like_the_untranslated_path(self) -> None:

@@ -21,7 +21,7 @@
 from __future__ import annotations
 
 import unittest
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 from lingxi.core.permission.local_override import (
     LocalPermissionOverrideEntry,
@@ -32,7 +32,7 @@ from lingxi.core.permission.local_override import (
     to_company_metric_map,
 )
 
-_NOW = datetime(2026, 8, 27, 3, 0, 0, tzinfo=timezone.utc)
+_NOW = datetime(2026, 8, 27, 3, 0, 0, tzinfo=UTC)
 
 
 def _entry(

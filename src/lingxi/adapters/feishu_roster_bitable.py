@@ -38,10 +38,10 @@ bootstrap 重授权。本模块因此**不 import 任何 SDK、不读任何凭�
 from __future__ import annotations
 
 import logging
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from enum import Enum
-from typing import Any, Callable, NamedTuple, Protocol
+from typing import Any, NamedTuple, Protocol
 from urllib.parse import quote, urlencode
 
 from lingxi.adapters.feishu_directory import FeishuDirectoryError, urllib_transport

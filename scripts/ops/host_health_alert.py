@@ -113,10 +113,10 @@ import subprocess
 import sys
 import urllib.error
 import urllib.request
+from collections.abc import Iterator, Mapping, Sequence
 from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import Iterator, Mapping, Sequence
 
 # ---------------------------------------------------------------------------
 # 常量
@@ -714,7 +714,7 @@ def single_instance_lock(path: Path) -> Iterator[bool]:
 
 
 def _now_iso() -> str:
-    return datetime.now(timezone.utc).astimezone().isoformat(timespec="seconds")
+    return datetime.now(UTC).astimezone().isoformat(timespec="seconds")
 
 
 def _configure_logger(log_file: str) -> logging.Logger:
@@ -962,7 +962,7 @@ def _run_threshold_checks(
         logger.warning("负载阈值检查跳过 error=%s", error)
 
     monitoring_dir = Path(args.monitoring_dir)
-    now_dt = datetime.now(timezone.utc)
+    now_dt = datetime.now(UTC)
     for key, prefix, label in (
         (THRESHOLD_STALE_RESOURCE, "resource", "资源采样文件停更"),
         (THRESHOLD_STALE_DB_BUSINESS, "db_business", "数据库/业务采样文件停更"),

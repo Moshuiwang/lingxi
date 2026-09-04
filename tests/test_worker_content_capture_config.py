@@ -18,9 +18,9 @@ from lingxi.apps.worker.config import (
     PRODUCTION_ENVIRONMENT_VALUES,
     WorkerConfig,
     WorkerConfigError,
+    _innertest_content_capture,
     declares_production,
     load_config,
-    _innertest_content_capture,
 )
 
 _READ_ONLY_TOOL = "mcp__query__list_metrics"

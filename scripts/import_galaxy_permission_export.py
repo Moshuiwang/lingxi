@@ -20,8 +20,8 @@ from __future__ import annotations
 
 import argparse
 import os
-from pathlib import Path
 import sys
+from pathlib import Path
 
 from lingxi.adapters.galaxy_csv_export import load_export_directory
 from lingxi.adapters.galaxy_import import ALREADY_IMPORTED, REJECTED, PostgresGalaxyImportStore

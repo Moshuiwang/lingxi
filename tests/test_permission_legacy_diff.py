@@ -9,7 +9,7 @@ LegacyPermissionImportTests``；落库原子性与幂等在 ``tests/test_local_p
 from __future__ import annotations
 
 import unittest
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 from lingxi.core.permission.legacy_diff import (
     ALL_SCOPE_EXPLICIT_POSITION_NAME,
@@ -259,7 +259,7 @@ def _entry(
         reason="2.0 迁移导入",
         initiated_by_open_id="lingxi:legacy_import_2_0",
         pending_action_id="pac_1",
-        created_at=datetime(2026, 9, 2, tzinfo=timezone.utc),
+        created_at=datetime(2026, 9, 2, tzinfo=UTC),
         position_name=position_name,
         company_scope="*" if group_id else None,
         permission_group_id=group_id,

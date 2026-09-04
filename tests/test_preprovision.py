@@ -10,9 +10,11 @@
 from __future__ import annotations
 
 import unittest
-from typing import Any, Mapping, Sequence
+from collections.abc import Mapping, Sequence
+from typing import Any
 
 from lingxi.core.conversation.ports import OnboardingState
+from lingxi.core.identity.onboarding_terminal import KEY_COMPLETED, KEY_SYNCING
 from lingxi.core.identity.org_snapshot import DirectoryAvailability, SnapshotMember
 from lingxi.core.identity.preprovision import (
     NULL_DISPATCH_LEDGER,
@@ -33,7 +35,6 @@ from lingxi.core.identity.preprovision import (
     plan_preprovision,
     system_event_id,
 )
-from lingxi.core.identity.onboarding_terminal import KEY_COMPLETED, KEY_SYNCING
 
 
 def member(*, user_id: str = "u_ming", open_id: str = "ou_ming") -> SnapshotMember:

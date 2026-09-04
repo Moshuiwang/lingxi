@@ -34,7 +34,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from typing import Any
 
 from lingxi.adapters.mcp_token_cipher import McpTokenCipher, new_token
@@ -44,7 +44,7 @@ from lingxi.core.permission.mcp_readiness import ReadinessAttempt
 
 logger = logging.getLogger(__name__)
 
-_UTC = timezone.utc
+_UTC = UTC
 
 
 @dataclass(frozen=True)

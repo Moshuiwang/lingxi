@@ -58,9 +58,10 @@ import logging
 import random
 import re
 import time
+from collections.abc import Callable, Iterator, Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass
-from typing import Any, Callable, Iterator, Mapping, Protocol
+from typing import Any, Protocol
 from urllib.error import HTTPError, URLError
 from urllib.parse import quote, urlencode, urlparse
 from urllib.request import Request, urlopen
@@ -988,7 +989,7 @@ class FeishuEmploymentReader:
     def __init__(
         self,
         *,
-        client: "FeishuDirectoryClient",
+        client: FeishuDirectoryClient,
         access_token: Callable[[], str],
     ) -> None:
         if not callable(access_token):

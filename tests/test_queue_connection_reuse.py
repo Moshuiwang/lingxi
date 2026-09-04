@@ -34,7 +34,7 @@ class _FakeCursor:
         self.rows = rows or []
         self.executed: list[tuple] = []
 
-    def __enter__(self) -> "_FakeCursor":
+    def __enter__(self) -> _FakeCursor:
         return self
 
     def __exit__(self, exc_type: object, exc: object, tb: object) -> bool:
@@ -84,7 +84,7 @@ class _FakeConnection:
         self.closed = True
         self.close_calls += 1
 
-    def __enter__(self) -> "_FakeConnection":
+    def __enter__(self) -> _FakeConnection:
         return self
 
     def __exit__(self, exc_type: object, exc: object, tb: object) -> bool:

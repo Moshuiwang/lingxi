@@ -38,7 +38,7 @@ from __future__ import annotations
 
 import os
 import unittest
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 
 from postgres_schema import ensure_production_schema, psycopg_available, reset_production_rows
 
@@ -511,7 +511,7 @@ class AdminQueriesTests(AdminRegistryPostgresTestCase):
         ``tests/test_pending_action_postgres.py`` 的
         ``add_bystander_pending_action`` 同一手法。"""
 
-        now = datetime.now(timezone.utc)
+        now = datetime.now(UTC)
         self.execute(
             """INSERT INTO pending_action
                    (id, action_type, target_open_id, target_state_snapshot,
@@ -594,7 +594,7 @@ class AdminQueriesTests(AdminRegistryPostgresTestCase):
         self.assertTrue(override_view.created_at)
 
     def test_recent_events_scoped_by_identifier_and_window(self) -> None:
-        now = datetime.now(timezone.utc)
+        now = datetime.now(UTC)
         self.add_event(
             event_id="evt_in_window", open_id="ou_a", received_at=now - timedelta(hours=1), trace_id="trc_in"
         )
@@ -614,7 +614,7 @@ class AdminQueriesTests(AdminRegistryPostgresTestCase):
         self.assertEqual([event.trace_id for event in events], ["trc_in"])
 
     def test_recent_events_without_identifier_covers_all_users(self) -> None:
-        now = datetime.now(timezone.utc)
+        now = datetime.now(UTC)
         self.add_event(
             event_id="evt_1", open_id="ou_a", received_at=now - timedelta(minutes=5), trace_id="trc_1"
         )
@@ -628,7 +628,7 @@ class AdminQueriesTests(AdminRegistryPostgresTestCase):
         self.assertEqual({event.trace_id for event in events}, {"trc_1", "trc_2"})
 
     def test_recent_events_respects_limit_and_orders_newest_first(self) -> None:
-        now = datetime.now(timezone.utc)
+        now = datetime.now(UTC)
         for index in range(5):
             self.add_event(
                 event_id=f"evt_{index}",
@@ -665,7 +665,7 @@ class TraceLookupTests(AdminRegistryPostgresTestCase):
         self.add_event(
             event_id="evt_ok",
             open_id="ou_ok",
-            received_at=datetime.now(timezone.utc),
+            received_at=datetime.now(UTC),
             trace_id="trc_ok",
         )
         queries = PostgresAdminQueries(self._dsn)
@@ -686,7 +686,7 @@ class TraceLookupTests(AdminRegistryPostgresTestCase):
         self.add_event(
             event_id="evt_fail",
             open_id="ou_fail",
-            received_at=datetime.now(timezone.utc),
+            received_at=datetime.now(UTC),
             trace_id="trc_fail",
         )
         recorder = PostgresFailureReasonRecorder(self._dsn)
@@ -715,7 +715,7 @@ class TraceLookupTests(AdminRegistryPostgresTestCase):
         self.add_event(
             event_id="evt_secret",
             open_id="ou_should_not_appear",
-            received_at=datetime.now(timezone.utc),
+            received_at=datetime.now(UTC),
             trace_id="trc_secret",
         )
         queries = PostgresAdminQueries(self._dsn)
@@ -754,7 +754,7 @@ class TraceLookupTests(AdminRegistryPostgresTestCase):
         self.add_event(
             event_id="evt_task",
             open_id="ou_task",
-            received_at=datetime.now(timezone.utc),
+            received_at=datetime.now(UTC),
             trace_id="trc_task",
         )
         self.add_task(
@@ -784,7 +784,7 @@ class TraceLookupTests(AdminRegistryPostgresTestCase):
         self.add_event(
             event_id="evt_doc",
             open_id="ou_doc",
-            received_at=datetime.now(timezone.utc),
+            received_at=datetime.now(UTC),
             trace_id="trc_doc",
         )
         self.add_task(
@@ -822,7 +822,7 @@ class TraceLookupTests(AdminRegistryPostgresTestCase):
         self.add_event(
             event_id="evt_doc_failed",
             open_id="ou_doc_failed",
-            received_at=datetime.now(timezone.utc),
+            received_at=datetime.now(UTC),
             trace_id="trc_doc_failed",
         )
         self.add_task(
@@ -860,7 +860,7 @@ class TraceLookupTests(AdminRegistryPostgresTestCase):
         self.add_event(
             event_id="evt_notask",
             open_id="ou_notask",
-            received_at=datetime.now(timezone.utc),
+            received_at=datetime.now(UTC),
             trace_id="trc_notask",
         )
         queries = PostgresAdminQueries(self._dsn)
@@ -885,7 +885,7 @@ class TraceLookupTests(AdminRegistryPostgresTestCase):
             self.add_event(
                 event_id=f"evt_{suffix}",
                 open_id=f"ou_{suffix}",
-                received_at=datetime.now(timezone.utc),
+                received_at=datetime.now(UTC),
                 trace_id=f"trc_{suffix}",
             )
         self.add_task(
@@ -964,7 +964,7 @@ class ResolveOverrideIdTests(AdminRegistryPostgresTestCase):
     形状）：按「open_id + 公司 + 指标」真库反查当前生效的覆盖行 override_id。"""
 
     def add_pending_action_for_override(self, *, pending_id: str) -> str:
-        now = datetime.now(timezone.utc)
+        now = datetime.now(UTC)
         self.execute(
             """INSERT INTO pending_action
                    (id, action_type, target_open_id, target_state_snapshot,

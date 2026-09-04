@@ -10,11 +10,12 @@ from __future__ import annotations
 
 import logging
 import traceback
+from collections.abc import Mapping, Sequence
 from datetime import datetime
-from typing import Any, Mapping, NoReturn, Sequence
+from typing import Any, NoReturn
 
 from lingxi.core.identity.onboarding_ports import LegacyPermissionImporter, _AuditSink
-from lingxi.core.identity.onboarding_terminal import OnboardingChainError, _Terminal, _internal
+from lingxi.core.identity.onboarding_terminal import OnboardingChainError, _internal, _Terminal
 from lingxi.core.permission.legacy_diff import (
     REASON_ALL_METRICS_UNAVAILABLE,
     SHAPE_UNSUPPORTED_WILDCARD,

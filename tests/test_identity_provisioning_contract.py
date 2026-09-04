@@ -14,6 +14,8 @@ from __future__ import annotations
 import dataclasses
 import unittest
 
+from postgres_schema import MIGRATIONS_DIRECTORY, VERSIONS_DIRECTORY
+
 from lingxi.core.identity.first_contact import IdentityRecordDraft
 from lingxi.core.identity.provisioning import (
     DELEGATED_SUBJECT_REJECTION_MARKER,
@@ -31,8 +33,6 @@ from lingxi.core.identity.provisioning import (
 )
 from lingxi.core.identity.roster_audit import ArchivedIdentity, compare_roster
 from lingxi.core.permission.account_match import match_galaxy_account
-
-from postgres_schema import MIGRATIONS_DIRECTORY, VERSIONS_DIRECTORY
 
 # `app_user` 的两条迁移血统正文：冻结的顶层编号 SQL 与 alembic 基线 revision
 # （代码框架第六节：基线是编号文件的逐字节副本）。**按内容筛选而不是写死文件名**——

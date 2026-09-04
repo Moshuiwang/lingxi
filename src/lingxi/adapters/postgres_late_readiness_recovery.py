@@ -48,12 +48,12 @@ purge）应得的边界。
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 from lingxi.adapters.postgres import DEFAULT_POSTGRES_TIMEOUTS, PostgresTimeouts, connect
 from lingxi.core.ids import new_id
 
-_UTC = timezone.utc
+_UTC = UTC
 
 #: 通知认领时的退避节奏：5 分钟起步，封顶一小时。认领本身就是记账，见
 #: :meth:`PostgresLateReadinessStore.claim_one_due_notice` 的文档。

@@ -16,8 +16,8 @@ import copy
 import re
 import sys
 import time
-
-from typing import Any, Callable, Iterable, Mapping
+from collections.abc import Callable, Iterable, Mapping
+from typing import Any
 
 from lingxi.core.execution.hooks import ToolGateway
 

@@ -20,23 +20,7 @@ from __future__ import annotations
 
 import json
 import unittest
-from datetime import datetime, timezone
-
-from lingxi.core.identity.roster_audit import ArchivedIdentity
-from lingxi.core.permission.local_override import LocalPermissionOverrideEntry, OverrideDirection
-from lingxi.core.permission.targeted_recompute import (
-    RecomputeKind,
-    SKIP_ACCOUNT_NOT_ENABLED,
-    SKIP_ARCHIVED_IDENTITY_INCOMPLETE,
-    SKIP_MATCH_FAILED,
-    SKIP_METRIC_TRANSLATION_UNAVAILABLE,
-    SKIP_MISSING_PERSONNEL_ID,
-    SKIP_MISSING_ROSTER_SNAPSHOT,
-    SKIP_NO_GALAXY_BATCH,
-    SKIP_NO_PUBLISHED_ROW,
-    SKIP_USER_NOT_ACTIVE,
-    TargetedPermissionRecompute,
-)
+from datetime import UTC, datetime
 
 from test_permission_refresh_duty import (
     COMPANY_ID,
@@ -60,7 +44,23 @@ from test_permission_refresh_duty import (
     roster_row,
 )
 
-NOW = datetime(2026, 8, 30, 12, 0, tzinfo=timezone.utc)
+from lingxi.core.identity.roster_audit import ArchivedIdentity
+from lingxi.core.permission.local_override import LocalPermissionOverrideEntry, OverrideDirection
+from lingxi.core.permission.targeted_recompute import (
+    SKIP_ACCOUNT_NOT_ENABLED,
+    SKIP_ARCHIVED_IDENTITY_INCOMPLETE,
+    SKIP_MATCH_FAILED,
+    SKIP_METRIC_TRANSLATION_UNAVAILABLE,
+    SKIP_MISSING_PERSONNEL_ID,
+    SKIP_MISSING_ROSTER_SNAPSHOT,
+    SKIP_NO_GALAXY_BATCH,
+    SKIP_NO_PUBLISHED_ROW,
+    SKIP_USER_NOT_ACTIVE,
+    RecomputeKind,
+    TargetedPermissionRecompute,
+)
+
+NOW = datetime(2026, 8, 30, 12, 0, tzinfo=UTC)
 
 
 class FakeIdentities:

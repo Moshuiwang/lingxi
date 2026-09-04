@@ -23,7 +23,7 @@ from __future__ import annotations
 
 import unittest
 import unittest.mock
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 
 from gateway_fakes import (
     CallLog,
@@ -37,6 +37,7 @@ from gateway_fakes import (
     FakeTask,
     provisioned_user,
 )
+
 from lingxi.adapters.feishu_events import (
     EventParseError,
     NonPrivateChatError,
@@ -46,7 +47,6 @@ from lingxi.config.content import (
     KEY_PREPROVISIONED_FIRST_CHAT,
     ContentCatalog,
     ContentRenderError,
-    RenderedContent,
     default_content_catalog,
 )
 from lingxi.core.conversation import (
@@ -56,12 +56,16 @@ from lingxi.core.conversation import (
     UserRecord,
     UserState,
 )
-from lingxi.core.user_memory import UserMemoryEntry
-from lingxi.core.conversation.ports import HandledAs
-from lingxi.core.conversation.ports import OnboardingMessage, OnboardingResult, OnboardingState
+from lingxi.core.conversation.ports import (
+    HandledAs,
+    OnboardingMessage,
+    OnboardingResult,
+    OnboardingState,
+)
 from lingxi.core.conversation.session_window import should_resume_session
+from lingxi.core.user_memory import UserMemoryEntry
 
-NOW = datetime(2026, 8, 6, 12, 0, tzinfo=timezone.utc)
+NOW = datetime(2026, 8, 6, 12, 0, tzinfo=UTC)
 # 产品负责人 2026-08-16 定稿的 `/new` 成功文字确认（Issue #175 评论 5306860379），
 # 逐字比对；下方 ``test_new_session_text_matches_the_pm_final_copy`` 另外断言内容
 # 目录里的实际值与这个定稿一致，两头都不能漂移。

@@ -30,7 +30,7 @@ import inspect
 import pathlib
 import threading
 import unittest
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 
 from lingxi.apps.scheduler import (
     PermissionPublishDuty,
@@ -41,7 +41,6 @@ from lingxi.apps.scheduler import (
     build_loop,
 )
 from lingxi.apps.scheduler.permission_publish import (
-    DEFAULT_PUBLISH_LIMIT,
     DEFAULT_READINESS_LIMIT,
     FOLLOW_UP_REASONS,
     REVOKE_ONLY_REASONS,
@@ -88,7 +87,7 @@ def duty_code() -> str:
     return ast.unparse(tree)
 
 
-NOW = datetime(2026, 8, 18, 3, 0, tzinfo=timezone.utc)
+NOW = datetime(2026, 8, 18, 3, 0, tzinfo=UTC)
 USER_ONE = "usr_01JQZX3M5N7P9R1T3V5W7Y9A0B"
 USER_TWO = "usr_01JQZX3M5N7P9R1T3V5W7Y9A0C"
 OPEN_ID = "ou_fake_open_id_for_tests"

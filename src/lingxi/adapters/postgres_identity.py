@@ -13,7 +13,7 @@ from __future__ import annotations
 import logging
 from collections.abc import Sequence
 from dataclasses import dataclass
-from datetime import date, datetime, timezone
+from datetime import UTC, date, datetime
 from typing import Any
 
 from lingxi.adapters.postgres import DEFAULT_POSTGRES_TIMEOUTS, PostgresTimeouts, connect
@@ -108,7 +108,7 @@ class PostgresOrgSnapshotStore:
         """
 
         identifier = run_id or new_id("orgsync")
-        moment = started_at or datetime.now(timezone.utc)
+        moment = started_at or datetime.now(UTC)
         try:
             report = require_complete_batch(batch)
         except SnapshotIntegrityError as error:
@@ -267,7 +267,7 @@ class PostgresOrgSnapshotStore:
 
         if column not in ("open_id", "user_id"):
             raise ValueError("组织快照只支持按 open_id / user_id 定位")
-        moment = now or datetime.now(timezone.utc)
+        moment = now or datetime.now(UTC)
         with connect(self._dsn, timeouts=self._timeouts) as connection, connection.cursor() as cursor:
             cursor.execute(
                 "SELECT id, expires_at FROM feishu_org_sync_run WHERE status = 'complete' ORDER BY started_at DESC LIMIT 1"
@@ -277,10 +277,10 @@ class PostgresOrgSnapshotStore:
             if run is None or availability is not DirectoryAvailability.AVAILABLE:
                 return DirectoryLookup(availability, ())
             cursor.execute(
-                """SELECT tenant_key, member_key, open_id, user_id, union_id,
+                f"""SELECT tenant_key, member_key, open_id, user_id, union_id,
                           display_name, display_name_locale, department_names
                      FROM feishu_org_member_snapshot
-                    WHERE sync_run_id = %s AND {column} = %s""".format(column=column),
+                    WHERE sync_run_id = %s AND {column} = %s""",
                 (run[0], value),
             )
             rows = cursor.fetchall()

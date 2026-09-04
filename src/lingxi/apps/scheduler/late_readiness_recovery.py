@@ -186,9 +186,11 @@ import logging
 import threading
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from typing import Any, Protocol
 
+from lingxi.apps.scheduler.audit import AuditSink
+from lingxi.apps.scheduler.config import SchedulerConfig
 from lingxi.core.identity.onboarding_runner import KEY_COMPLETED
 from lingxi.core.permission.mcp_readiness import (
     ReadinessAttempt,
@@ -198,9 +200,6 @@ from lingxi.core.permission.mcp_readiness import (
 )
 from lingxi.core.permission.notification import describe_scope
 from lingxi.core.permission.publish_row import parse_permissions
-
-from lingxi.apps.scheduler.audit import AuditSink
-from lingxi.apps.scheduler.config import SchedulerConfig
 
 logger = logging.getLogger(__name__)
 
@@ -809,7 +808,7 @@ def _build_late_readiness_recovery_duty(
             probe=probe,
             store=tokens,
             audit=audit,
-            clock=lambda: datetime.now(timezone.utc),
+            clock=lambda: datetime.now(UTC),
             schedule=schedule,
         )
 

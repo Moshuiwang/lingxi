@@ -5,9 +5,9 @@
 
 from __future__ import annotations
 
-from pathlib import Path
 import tempfile
 import unittest
+from pathlib import Path
 
 from lingxi.adapters.galaxy_csv_export import (
     EXPORT_FILE_NAMES,
@@ -140,7 +140,7 @@ class CsvStrictParsingTest(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "user.csv"
-            path.write_bytes('user_id,nick_name\nU1,"未闭合\nU2,正常\n'.encode("utf-8"))
+            path.write_bytes('user_id,nick_name\nU1,"未闭合\nU2,正常\n'.encode())
             with self.assertRaises(ValueError):
                 read_csv_table(path)
 

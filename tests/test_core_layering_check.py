@@ -29,7 +29,7 @@ CHECK = _load_script()
 class _TempSourceTree:
     """搭一棵 ``<root>/lingxi/core/...`` 目录，把 ``find_violations`` 指向它。"""
 
-    def __enter__(self) -> "_TempSourceTree":
+    def __enter__(self) -> _TempSourceTree:
         self._tmp = tempfile.TemporaryDirectory()
         self.source_root = Path(self._tmp.name) / "lingxi"
         self.core_root = self.source_root / "core"

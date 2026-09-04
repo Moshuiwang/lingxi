@@ -35,7 +35,6 @@ from dataclasses import dataclass
 from functools import lru_cache
 from typing import NamedTuple, TypeAlias
 
-
 EXTERNAL_TEXT_LABEL = "待分析内容"
 SAFE_OUTPUT_FALLBACK = "本次未取得可确认结果，请稍后重试。"
 # 与 SAFE_OUTPUT_FALLBACK 刻意不同：后者是"模型没给出内容"，与安全无关；这一条

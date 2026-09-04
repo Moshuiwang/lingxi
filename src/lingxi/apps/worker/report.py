@@ -24,12 +24,13 @@
 
 from __future__ import annotations
 
-from typing import Any, Iterable, Mapping
+from collections.abc import Iterable, Mapping
+from typing import Any
 
 from lingxi.core.execution.audit import ToolCallAudit, TurnAuditSummary, redact_free_text
 from lingxi.core.execution.document_delivery import DocumentRequest, SheetRequest
-from lingxi.core.execution.message_stream import TurnStreamRecorder
 from lingxi.core.execution.input_safety import constrain_output
+from lingxi.core.execution.message_stream import TurnStreamRecorder
 
 _GUARD_FAILURE_CODES = frozenset({"max_turns_exceeded", "turn_timeout", "cancelled", "drain_timeout"})
 # 独立、可查询的安全拒发终态；命名与 #141/#149 产品决定一致，"最终命名可由实现

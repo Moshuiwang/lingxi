@@ -203,7 +203,7 @@ def main() -> int:
             }
         )
 
-    generated_at = dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    generated_at = dt.datetime.now(dt.UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
     document = manifest_document(
         repository=args.repository,
         pr_number=args.pr_number,

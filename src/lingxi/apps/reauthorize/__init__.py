@@ -37,7 +37,7 @@ import socket
 import sys
 import threading
 from collections.abc import Mapping, Sequence
-from datetime import datetime, timezone
+from datetime import UTC, datetime, timezone
 from pathlib import Path
 from typing import TextIO
 
@@ -57,7 +57,6 @@ from lingxi.adapters.oauth_bridge_client import (
     OAuthBridgeResultSender,
 )
 from lingxi.core.identity.identifiers import redact_identifier
-
 
 logger = logging.getLogger(__name__)
 DEFAULT_BRIDGE_WAIT_SECONDS = 10 * 60
@@ -205,7 +204,7 @@ def _write_audit(
     返回是否确实落地。失败绝不吞掉——调用方据此中止或按不可恢复上报。
     """
 
-    moment = (now or datetime.now(timezone.utc)).astimezone(timezone.utc)
+    moment = (now or datetime.now(UTC)).astimezone(UTC)
     before = handler.written
     try:
         logger.info(

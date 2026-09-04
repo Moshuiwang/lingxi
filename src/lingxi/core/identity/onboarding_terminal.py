@@ -10,8 +10,8 @@ G-3 裁定 Option A）：只搬定义，不改任何签名、判据或文档字�
 
 from __future__ import annotations
 
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
-from typing import Mapping, Sequence
 
 from lingxi.core.conversation.ports import (
     OnboardingMessage,

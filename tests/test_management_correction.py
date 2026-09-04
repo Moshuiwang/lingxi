@@ -18,7 +18,7 @@ class _Audit:
 
 
 class _Store:
-    instances: list["_Store"] = []
+    instances: list[_Store] = []
 
     def __init__(self, *args, **kwargs) -> None:
         del args, kwargs
@@ -40,7 +40,7 @@ class _Store:
 
 
 class _Sender:
-    instances: list["_Sender"] = []
+    instances: list[_Sender] = []
     fail = False
 
     def __init__(self, **kwargs) -> None:

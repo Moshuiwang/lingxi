@@ -7,7 +7,7 @@ gateway 的 needs_refresh scanner 只重试已落库状态的 CardKit 更新，�
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 from lingxi.adapters.postgres import DEFAULT_POSTGRES_TIMEOUTS, PostgresTimeouts, connect
 from lingxi.core.admin.card_dispatch import (
@@ -16,7 +16,6 @@ from lingxi.core.admin.card_dispatch import (
     bounded_management_card_deadline,
     bounded_management_card_ttl_seconds,
 )
-
 
 # 内部缓存保留窗口，不对管理员承诺；用户可见的确认窗口仍由 pending_action 的
 # 产品合同控制。它只避免永久保留消息映射，具体值可随部署配置调整。
@@ -91,7 +90,7 @@ class PostgresManagementCardContextStore:
         if not all((message_id, identifier, card_id, chat_id, initiated_by_open_id, snapshot_fingerprint)):
             raise ValueError("管理卡持久上下文缺少必填字段")
         deadline = bounded_management_card_deadline(
-            now=datetime.now(timezone.utc),
+            now=datetime.now(UTC),
             requested=context_deadline_at,
             ttl_seconds=self._ttl_seconds,
         )
@@ -140,7 +139,7 @@ class PostgresManagementCardContextStore:
 
     def lookup(self, *, message_id: str) -> str | None:
         context = self.lookup_context(message_id=message_id)
-        if context is None or context.context_deadline_at <= datetime.now(timezone.utc):
+        if context is None or context.context_deadline_at <= datetime.now(UTC):
             return None
         return context.identifier
 

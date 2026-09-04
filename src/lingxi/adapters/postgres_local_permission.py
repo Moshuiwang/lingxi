@@ -49,7 +49,7 @@ from __future__ import annotations
 import json
 from collections.abc import Sequence
 from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 
 from lingxi.adapters.postgres import DEFAULT_POSTGRES_TIMEOUTS, PostgresTimeouts, connect
 from lingxi.core.ids import new_id
@@ -304,7 +304,7 @@ class PostgresLocalPermissionOverrideStore:
         异常的形式暴露，好过本方法悄悄把它也翻译成一个看似"正常业务分支"的返回值。
         """
 
-        moment = now or datetime.now(timezone.utc)
+        moment = now or datetime.now(UTC)
         # 校验先于任何写入：direction/company_id/metric_name/reason/
         # initiated_by_open_id/pending_action_id 任意一项为空或形状不对，这里
         # 直接抛 ValueError，INSERT 语句从未发出。
@@ -349,7 +349,7 @@ class PostgresLocalPermissionOverrideStore:
         约束，与 :meth:`insert` 同一姿态，不在本方法内额外捕获或翻译。
         """
 
-        moment = now or datetime.now(timezone.utc)
+        moment = now or datetime.now(UTC)
         with connect(self._dsn, timeouts=self._timeouts) as connection, connection.cursor() as cursor:
             return _revoke_locked(
                 cursor, override_id=override_id, revoked_pending_action_id=revoked_pending_action_id, moment=moment
@@ -373,7 +373,7 @@ class PostgresLocalPermissionOverrideStore:
 
         if not permission_group_id or not expected_override_ids:
             return False
-        moment = now or datetime.now(timezone.utc)
+        moment = now or datetime.now(UTC)
         with connect(self._dsn, timeouts=self._timeouts) as connection, connection.cursor() as cursor:
             return _revoke_group_locked(
                 cursor,

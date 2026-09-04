@@ -802,7 +802,7 @@ _REJECTED_MULTI_TOKEN_EMAIL_FORMS: dict[str, str] = {
     "display_and_target_differ": f"seen@example.com (mailto:{_PLAIN_EMAIL})",
     "target_is_http_link": f"{_PLAIN_EMAIL} (https://example.com/{_PLAIN_EMAIL})",
     "target_is_open_id": f"{_PLAIN_EMAIL} (mailto:ou_abc123)",
-    "display_is_open_id": f"ou_abc123 (mailto:ou_abc123)",
+    "display_is_open_id": "ou_abc123 (mailto:ou_abc123)",
     "target_is_not_an_email": f"{_PLAIN_EMAIL} (mailto:not-an-email)",
 }
 

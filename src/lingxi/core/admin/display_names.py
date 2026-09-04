@@ -24,7 +24,8 @@
 
 from __future__ import annotations
 
-from typing import Mapping, Protocol, Sequence
+from collections.abc import Mapping, Sequence
+from typing import Protocol
 
 
 class AdminDisplayNames(Protocol):

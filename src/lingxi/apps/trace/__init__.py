@@ -42,8 +42,9 @@ from __future__ import annotations
 
 import argparse
 import sys
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
-from typing import Any, Callable, Mapping, Sequence
+from typing import Any
 
 #: scheduler 角色使用的连接串环境变量名，与 ``apps/healthcheck`` 的角色映射保持
 #: 同一个变量（本命令按设计固定在 scheduler 容器内执行，见模块文档）。

@@ -80,7 +80,7 @@ class AssertionRowParsingTest(unittest.TestCase):
         current = CHECK.measure_rows(text)
         self.assertIn("V-开通-01", current)
         expected_bytes = len(
-            "| V-开通-01 | 一句判定 | L2（真库） | 已认领 |".encode("utf-8")
+            "| V-开通-01 | 一句判定 | L2（真库） | 已认领 |".encode()
         )
         self.assertEqual(current["V-开通-01"], expected_bytes)
 

@@ -25,22 +25,22 @@ import os
 import signal
 import stat
 import sys
+from collections.abc import Callable, Mapping, Sequence
 from pathlib import Path
-from typing import Any, Callable, Mapping, Sequence, TextIO
+from typing import Any, TextIO
 
+from lingxi.adapters.postgres_content_capture import PostgresContentCaptureWriter
+from lingxi.adapters.postgres_conversation import PostgresTaskQueue, PostgresTaskQueueListener
+from lingxi.adapters.postgres_user_memory import PostgresUserMemoryReader
+from lingxi.apps.liveness import touch_liveness
 from lingxi.core.execution.audit import redact_free_text
 from lingxi.core.ids import is_ulid, new_ulid
-from lingxi.adapters.postgres_conversation import PostgresTaskQueue, PostgresTaskQueueListener
-from lingxi.adapters.postgres_content_capture import PostgresContentCaptureWriter
-from lingxi.adapters.postgres_user_memory import PostgresUserMemoryReader
-
-from lingxi.apps.liveness import touch_liveness
 
 from .config import ENV_PREFIX, WorkerConfig, WorkerConfigError, load_config
 from .report import config_error_report
+from .service import WorkerService
 from .session_cleanup import default_session_root
 from .turn import WorkerTurnExecutor
-from .service import WorkerService
 
 EXIT_OK = 0
 EXIT_TURN_NOT_CLOSED = 2
@@ -687,7 +687,7 @@ async def _run_queue_worker(
         # 走到这里说明是信号触发的停机：run_task 仍在跑，给它一个有界预算收口。
         try:
             await asyncio.wait_for(run_task, timeout=shutdown_timeout_seconds)
-        except asyncio.TimeoutError:
+        except TimeoutError:
             _log(
                 err,
                 trace_id,

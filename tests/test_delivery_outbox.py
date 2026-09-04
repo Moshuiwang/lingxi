@@ -18,7 +18,7 @@ import asyncio
 import os
 import threading
 import unittest
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 from postgres_schema import ensure_production_schema, psycopg_available, reset_production_rows
@@ -1234,7 +1234,7 @@ class NegativeConstraintTests(DeliveryOutboxTestCase):
 
     def test_platform_received_at_rejected_outside_terminal(self) -> None:
         with self.assertRaises(self._psycopg.errors.CheckViolation):
-            self._insert(event_type="progress", platform_received_at=datetime.now(timezone.utc))
+            self._insert(event_type="progress", platform_received_at=datetime.now(UTC))
 
     def test_unknown_event_type_rejected(self) -> None:
         with self.assertRaises(self._psycopg.errors.CheckViolation):

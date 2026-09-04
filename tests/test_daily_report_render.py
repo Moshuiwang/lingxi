@@ -10,7 +10,7 @@ V-通报-06（UTC+北京双时区标注）。真库聚合断言在
 from __future__ import annotations
 
 import unittest
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 
 from lingxi.core.daily_report import (
     CALL_COUNT_BASELINE_UNAVAILABLE_REASON,
@@ -42,12 +42,12 @@ from lingxi.core.daily_report import (
     render_daily_report,
 )
 
-WINDOW_START = datetime(2026, 8, 23, tzinfo=timezone.utc)
-WINDOW_END = datetime(2026, 8, 24, tzinfo=timezone.utc)
+WINDOW_START = datetime(2026, 8, 23, tzinfo=UTC)
+WINDOW_END = datetime(2026, 8, 24, tzinfo=UTC)
 # 投递结果段独立窗口（opus 批量审查 P2 修复）：比其余段落的统计窗口早一整天，
 # 见 `core/daily_report.py` 模块文档「投递结果段为什么用一个独立、更早的窗口」。
-DELIVERY_WINDOW_START = datetime(2026, 8, 22, tzinfo=timezone.utc)
-DELIVERY_WINDOW_END = datetime(2026, 8, 23, tzinfo=timezone.utc)
+DELIVERY_WINDOW_START = datetime(2026, 8, 22, tzinfo=UTC)
+DELIVERY_WINDOW_END = datetime(2026, 8, 23, tzinfo=UTC)
 
 # 用于「正文绝不含用户标识/原文」断言的固定敏感值：真实姓名、工号、邮箱、飞书标识、
 # 内部 ULID 各一个，一个都不许出现在渲染结果里。

@@ -23,7 +23,6 @@ import re
 import sys
 from pathlib import Path
 
-
 REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
 MATRIX_DOCUMENT = REPOSITORY_ROOT / "docs" / "技术设计" / "验收矩阵.md"
 # 分册命名空间：与总册同目录、同前缀。改这个 glob 等于改读取范围，须与总册
@@ -45,7 +44,7 @@ def matrix_documents() -> dict[str, str]:
     return documents
 
 
-def as_documents(text_or_documents: "str | dict[str, str]") -> dict[str, str]:
+def as_documents(text_or_documents: str | dict[str, str]) -> dict[str, str]:
     """允许单份正文直接传入（单元测试与单文件调用），统一成「显示名 → 正文」。"""
     if isinstance(text_or_documents, str):
         return {MATRIX_DOCUMENT.name: text_or_documents}
@@ -113,7 +112,7 @@ def iter_tables(text: str):
         yield header, index + 1, split_row(line)
 
 
-def parse_matrix(text_or_documents: "str | dict[str, str]") -> tuple[dict[str, str], list[str]]:
+def parse_matrix(text_or_documents: str | dict[str, str]) -> tuple[dict[str, str], list[str]]:
     """读出「断言编号 → 状态」，并报出所有不合格的断言行。
 
     入参是「显示名 → 正文」的多份文档（总册 + 分册）；只传一份正文时按单文档处理。
@@ -178,7 +177,7 @@ def expand_reference(reference: str) -> tuple[list[str], str | None]:
 
 
 def parse_coverage(
-    text_or_documents: "str | dict[str, str]",
+    text_or_documents: str | dict[str, str],
 ) -> tuple[dict[str, tuple[list[str], str]], list[str]]:
     """读出「合同章节 → (断言编号, 说明)」。
 

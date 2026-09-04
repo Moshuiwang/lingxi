@@ -30,44 +30,43 @@ import tempfile
 import threading
 import time
 import unittest
-from datetime import datetime, timedelta, timezone
+from collections.abc import Mapping
+from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Mapping
 
-from gateway_fakes import FakeAudit, FakeReactions, FakeReplies, CallLog
+from gateway_fakes import CallLog, FakeAudit, FakeReactions, FakeReplies
+from postgres_schema import ensure_production_schema, psycopg_available, reset_production_rows
+
 from lingxi.adapters.postgres import connect
 from lingxi.adapters.postgres_conversation import (
     ClaimedTask,
     PostgresGatewayStore,
     PostgresTaskQueue,
     PostgresTaskQueueListener,
-    TerminalTask,
     _Transaction,
 )
 from lingxi.apps.worker.config import WorkerConfig
 from lingxi.apps.worker.service import WorkerService
 from lingxi.config.content import default_content_catalog
-from lingxi.core.innertest_content_capture import CapturedToolCall, ContentCaptureRecord
-from lingxi.core.year_grounding_guard import QUERY_METRIC_TOOL_NAME
 from lingxi.core.conversation import EventPipeline, InboundMessage
+from lingxi.core.delivery.ports import PROGRESS_CONTENT_MAX_LENGTH
 from lingxi.core.execution.card_stream import (
     CARD_AUTO_CLOSE_HANDOFF_SECONDS,
-    CardCreated,
-    CardRateLimiter,
-    CardStream,
-    DeliveryRejected,
     KNOWN_QUERY_STEPS,
     PROGRESS_ACTION_COMPOSING,
     PROGRESS_ACTION_PROCESSING,
     PROGRESS_ACTION_QUERYING,
     PROGRESS_ACTION_WORKING,
+    CardCreated,
+    CardRateLimiter,
+    CardStream,
+    DeliveryRejected,
     ProgressStepSnapshot,
     decode_progress_action,
     encode_progress_action,
 )
-from lingxi.core.delivery.ports import PROGRESS_CONTENT_MAX_LENGTH
-from postgres_schema import ensure_production_schema, psycopg_available, reset_production_rows
-
+from lingxi.core.innertest_content_capture import CapturedToolCall, ContentCaptureRecord
+from lingxi.core.year_grounding_guard import QUERY_METRIC_TOOL_NAME
 
 DSN = os.environ.get("LINGXI_POSTGRES_DSN")
 SKIP_DB = (
@@ -1094,7 +1093,7 @@ class DroppingNotifyListener:
         self.wait_started = threading.Event()
         self.wait_calls: list[float] = []
 
-    def __enter__(self) -> "DroppingNotifyListener":
+    def __enter__(self) -> DroppingNotifyListener:
         return self
 
     def wait(self, *, timeout_seconds: float) -> bool:
@@ -4909,7 +4908,7 @@ class YearGroundingSuspectAlertTests(unittest.TestCase):
         *,
         on_year_grounding_suspect: Any = None,
         content_capture_writer: Any = None,
-    ) -> "FakeWorkerQueue":
+    ) -> FakeWorkerQueue:
         queue = FakeWorkerQueue()
 
         class Executor:

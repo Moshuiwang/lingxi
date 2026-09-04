@@ -9,7 +9,7 @@
 from __future__ import annotations
 
 import unittest
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 
 from lingxi.core.user_memory import (
     MEMORY_TYPES,
@@ -35,7 +35,7 @@ def _entry(
     memory_type: str = "term_mapping",
     memory_key: str = "大尼日",
     memory_value: str = "尼日利亚",
-    created_at: datetime = datetime(2026, 8, 20, tzinfo=timezone.utc),
+    created_at: datetime = datetime(2026, 8, 20, tzinfo=UTC),
 ) -> UserMemoryEntry:
     return UserMemoryEntry(
         memory_id=memory_id,
@@ -69,12 +69,12 @@ class RenderContentTests(unittest.TestCase):
         newer = _entry(
             memory_id="mem_new",
             memory_key="新条目",
-            created_at=datetime(2026, 8, 25, tzinfo=timezone.utc),
+            created_at=datetime(2026, 8, 25, tzinfo=UTC),
         )
         older = _entry(
             memory_id="mem_old",
             memory_key="老条目",
-            created_at=datetime(2026, 8, 10, tzinfo=timezone.utc),
+            created_at=datetime(2026, 8, 10, tzinfo=UTC),
         )
 
         result = render_user_memory_prompt((newer, older), type_label=_label)
@@ -105,7 +105,7 @@ class TruncationTests(unittest.TestCase):
         self.assertEqual(result.kept_entries, 3)
 
     def test_over_the_limit_drops_the_oldest_entries_first(self) -> None:
-        base = datetime(2026, 8, 1, tzinfo=timezone.utc)
+        base = datetime(2026, 8, 1, tzinfo=UTC)
         entries = tuple(
             _entry(
                 memory_id=f"mem_{i}",

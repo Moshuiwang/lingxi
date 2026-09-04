@@ -17,15 +17,15 @@ from __future__ import annotations
 import importlib.util
 import threading
 import unittest
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
+from lingxi.adapters.stock_token_bitable import DecryptingStockTokenSource
 from lingxi.apps.scheduler import (
     SchedulerConfig,
     _build_onboarding_duty,
     _build_stalled_provisioning_duty,
 )
-from lingxi.adapters.stock_token_bitable import DecryptingStockTokenSource
 from lingxi.apps.scheduler.onboarding import (
     DISPATCH_AFTER,
     ONBOARDING_SHUTDOWN_JOIN_TIMEOUT_SECONDS,
@@ -641,7 +641,7 @@ class HandoffAssertionTests(unittest.TestCase):
         second = clock()
         self.assertIsNotNone(first.tzinfo)
         self.assertGreaterEqual(second, first)
-        self.assertLess(abs(second - datetime.now(timezone.utc)), timedelta(seconds=5))
+        self.assertLess(abs(second - datetime.now(UTC)), timedelta(seconds=5))
 
     def test_the_watchdog_margin_is_above_the_transport_timeout(self) -> None:
         """看门狗只该在传输层**根本不遵守**超时时动手，不该抢在它前面。"""

@@ -20,9 +20,8 @@ import json
 import re
 import sys
 import time
-
-from collections.abc import Iterable, Mapping
-from typing import Any, Callable
+from collections.abc import Callable, Iterable, Mapping
+from typing import Any
 
 from lingxi.adapters.claude_agent_session import (
     AgentSessionInterrupted,
@@ -280,7 +279,8 @@ class WorkerTurnExecutor:
         说明），只有真正开启这个开关的进程才会付出这次 import 成本。
         """
 
-        from claude_agent_sdk import create_sdk_mcp_server, tool as sdk_tool
+        from claude_agent_sdk import create_sdk_mcp_server
+        from claude_agent_sdk import tool as sdk_tool
 
         executor = self
 

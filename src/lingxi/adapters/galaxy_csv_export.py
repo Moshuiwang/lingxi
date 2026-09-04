@@ -11,9 +11,9 @@
 from __future__ import annotations
 
 import csv
+import hashlib
 from collections.abc import Mapping
 from dataclasses import dataclass
-import hashlib
 from pathlib import Path
 
 from lingxi.core.permission.galaxy_export import SOURCE_TABLES

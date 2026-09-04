@@ -13,8 +13,9 @@
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from datetime import timedelta
-from typing import Any, Sequence
+from typing import Any
 
 from lingxi.adapters.postgres import connect
 from lingxi.core.delivery.ports import DeliveryEventType, TerminalKind

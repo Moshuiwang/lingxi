@@ -20,10 +20,11 @@ from __future__ import annotations
 import os
 import threading
 import unittest
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 
 from gateway_fakes import CallLog, FakeAudit, FakeOnboarding, FakeReactions, FakeReplies
 from postgres_schema import ensure_production_schema, psycopg_available, reset_production_rows
+
 from lingxi.adapters.postgres_conversation import (
     TASK_QUEUED_CHANNEL,
     PostgresGatewayStore,
@@ -38,7 +39,7 @@ SKIP_REASON = (
     if not os.environ.get("LINGXI_POSTGRES_DSN")
     else "跳过：LINGXI_POSTGRES_DSN 已设置但未安装 psycopg 驱动，数据库约束类断言未验证"
 )
-NOW = datetime(2026, 8, 6, 12, 0, tzinfo=timezone.utc)
+NOW = datetime(2026, 8, 6, 12, 0, tzinfo=UTC)
 
 
 def inbound(

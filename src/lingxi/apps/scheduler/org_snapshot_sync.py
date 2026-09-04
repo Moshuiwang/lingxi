@@ -106,13 +106,12 @@ import logging
 import re
 import threading
 from collections.abc import Callable
-from datetime import date, datetime, timedelta, timezone
+from datetime import UTC, date, datetime, timedelta
 from typing import Any, Protocol
-
-from lingxi.core.identity.org_snapshot import SnapshotBatch, SnapshotIntegrityError
 
 from lingxi.apps.scheduler.audit import AuditSink
 from lingxi.apps.scheduler.config import SchedulerConfig
+from lingxi.core.identity.org_snapshot import SnapshotBatch, SnapshotIntegrityError
 
 logger = logging.getLogger(__name__)
 
@@ -264,7 +263,7 @@ class OrgSnapshotSyncDuty:
         self._store = store
         self._audit = audit
         self._source_app_id = source_app_id
-        self._clock = clock or (lambda: datetime.now(timezone.utc))
+        self._clock = clock or (lambda: datetime.now(UTC))
         self._stop = threading.Event() if stop is None else stop
         self._round_join_timeout_seconds = round_join_timeout_seconds
         # 上一次派发的后台"跑一轮"线程（Issue #340，见模块文档「为什么整轮要挪出

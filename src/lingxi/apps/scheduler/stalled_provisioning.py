@@ -160,10 +160,12 @@ from __future__ import annotations
 import logging
 import threading
 import time
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
-from typing import Any, Callable, Protocol
+from typing import Any, Protocol
 
+from lingxi.apps.scheduler.audit import AuditSink
+from lingxi.apps.scheduler.config import SchedulerConfig
 from lingxi.core.identity.onboarding_ports import FailureReasonRecorder
 from lingxi.core.identity.onboarding_runner import (
     KEY_STALLED,
@@ -172,9 +174,6 @@ from lingxi.core.identity.onboarding_runner import (
 )
 from lingxi.core.identity.preprovision import is_system_trigger
 from lingxi.core.permission.mcp_readiness import ReadinessSchedule
-
-from lingxi.apps.scheduler.audit import AuditSink
-from lingxi.apps.scheduler.config import SchedulerConfig
 
 logger = logging.getLogger(__name__)
 

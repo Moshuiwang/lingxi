@@ -17,7 +17,7 @@ import stat
 import sys
 import tempfile
 import unittest
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from unittest import mock
 
@@ -586,12 +586,12 @@ class ThresholdIOTests(unittest.TestCase):
     def test_read_sample_age_seconds_missing_both_candidates_returns_none(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             age = host_health_alert.read_sample_age_seconds(
-                Path(tmp), "resource", now=datetime(2026, 8, 29, 12, 0, 0, tzinfo=timezone.utc)
+                Path(tmp), "resource", now=datetime(2026, 8, 29, 12, 0, 0, tzinfo=UTC)
             )
         self.assertIsNone(age)
 
     def test_read_sample_age_seconds_uses_todays_file_when_present(self) -> None:
-        now = datetime(2026, 8, 29, 12, 0, 0, tzinfo=timezone.utc)
+        now = datetime(2026, 8, 29, 12, 0, 0, tzinfo=UTC)
         with tempfile.TemporaryDirectory() as tmp:
             tmp_path = Path(tmp)
             today_file = tmp_path / "resource-20260829.log"
@@ -605,7 +605,7 @@ class ThresholdIOTests(unittest.TestCase):
     def test_read_sample_age_seconds_falls_back_to_yesterdays_file_near_midnight(self) -> None:
         # 刚过 UTC 零点，今天的文件还不存在——不应该被误判成"停更"，应该拿昨天
         # 文件的 mtime 作为参照（见函数文档「同时看两个候选」）。
-        now = datetime(2026, 8, 29, 0, 2, 0, tzinfo=timezone.utc)
+        now = datetime(2026, 8, 29, 0, 2, 0, tzinfo=UTC)
         with tempfile.TemporaryDirectory() as tmp:
             tmp_path = Path(tmp)
             yesterday_file = tmp_path / "resource-20260828.log"
@@ -687,7 +687,7 @@ class RunThresholdIntegrationTests(unittest.TestCase):
         self.monitoring_dir.mkdir()
         # 默认放两份"新鲜"的采样文件，让不针对停更判据的用例不会被停更检查的
         # 告警噪声污染 `sender.call_count`；专门测停更的用例自己删掉这两个文件。
-        today = datetime.now(timezone.utc).strftime("%Y%m%d")
+        today = datetime.now(UTC).strftime("%Y%m%d")
         (self.monitoring_dir / f"resource-{today}.log").write_text("{}\n", encoding="utf-8")
         (self.monitoring_dir / f"db_business-{today}.log").write_text("{}\n", encoding="utf-8")
 

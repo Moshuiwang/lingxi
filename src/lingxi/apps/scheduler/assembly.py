@@ -13,29 +13,21 @@ import hashlib
 import logging
 import threading
 from collections.abc import Callable
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from typing import Any
 
-from lingxi.core.alerting import AlertingDuty
-from lingxi.core.identity.access_token_supply import (
-    DerivedAccessTokenHolder,
-    RosterAccessTokenProvider,
-)
-from lingxi.core.permission.table_access_token_supply import (
-    PermissionTableAccessTokenProvider,
-)
-from lingxi.core.permission.tenant_token_supply import TenantAccessTokenSupply
 from lingxi.apps.scheduler.audit import AuditSink, StructuredLogAuditSink
 from lingxi.apps.scheduler.config import SchedulerConfig
 from lingxi.apps.scheduler.credential_rotation import CredentialRotationLoop
 from lingxi.apps.scheduler.daily_report import _wire_daily_report_duty
-from lingxi.apps.scheduler.document_delivery_dead_letter import _wire_document_delivery_maintenance_duty
+from lingxi.apps.scheduler.document_delivery_dead_letter import (
+    _wire_document_delivery_maintenance_duty,
+)
 from lingxi.apps.scheduler.late_readiness_recovery import _build_late_readiness_recovery_duty
 from lingxi.apps.scheduler.loop import SchedulerLoop
 from lingxi.apps.scheduler.onboarding import _build_onboarding_duty
 from lingxi.apps.scheduler.org_snapshot_sync import _build_org_snapshot_sync_duty
 from lingxi.apps.scheduler.permission_publish import _build_permission_publish_duty
-from lingxi.apps.scheduler.permission_readiness_assembly import _build_readiness_follow_up
 from lingxi.apps.scheduler.permission_refresh import _build_permission_refresh_duty
 from lingxi.apps.scheduler.retention import (
     IDLE_CONVERSATION_SWEEP_AFTER,
@@ -49,6 +41,15 @@ from lingxi.apps.scheduler.roster_audit import (
     _build_roster_snapshot_sync_duty,
 )
 from lingxi.apps.scheduler.stalled_provisioning import _build_stalled_provisioning_duty
+from lingxi.core.alerting import AlertingDuty
+from lingxi.core.identity.access_token_supply import (
+    DerivedAccessTokenHolder,
+    RosterAccessTokenProvider,
+)
+from lingxi.core.permission.table_access_token_supply import (
+    PermissionTableAccessTokenProvider,
+)
+from lingxi.core.permission.tenant_token_supply import TenantAccessTokenSupply
 
 logger = logging.getLogger(__name__)
 
@@ -115,7 +116,7 @@ def _build_management_correction_callback(
 
         digest = hashlib.sha256("\n".join(message_ids).encode("utf-8")).hexdigest()[:16]
         dedupe_key = (
-            f"management-correction:{datetime.now(timezone.utc).date().isoformat()}:{digest}"
+            f"management-correction:{datetime.now(UTC).date().isoformat()}:{digest}"
         )
         text = default_content_catalog().text(
             "permission.management_correction_summary", count=len(message_ids)

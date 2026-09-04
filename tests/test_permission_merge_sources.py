@@ -44,7 +44,7 @@ from __future__ import annotations
 
 import json
 import unittest
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 from lingxi.core.permission.local_override import (
     LocalPermissionOverrideEntry,
@@ -61,7 +61,7 @@ from lingxi.core.permission.merge_sources import (
 )
 from lingxi.core.permission.publish_row import lookup_metrics, serialize_translated_permissions
 
-_NOW = datetime(2026, 8, 27, 3, 0, 0, tzinfo=timezone.utc)
+_NOW = datetime(2026, 8, 27, 3, 0, 0, tzinfo=UTC)
 
 
 def _entry(
