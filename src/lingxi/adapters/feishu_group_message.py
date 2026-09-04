@@ -1,22 +1,16 @@
 """向管理群发一条纯文本消息（自建群发出站）。
 
-**为什么不复用 #57 的出站层**：`adapters/feishu_outbound.py` 的 `LarkReplies` 只能
-「回复某条消息」——它的目标由被回复的消息决定，正是为了让「必须发到同一私聊或同一话题」
-由参数表保证。每日日报没有可回复的消息，它要**主动发进一个群**，这是另一个接口
-（`im/v1/messages` 而不是 `im/v1/messages/:id/reply`）。「复用 #57」字面不可行，
-编排者已核实并登记（Issue #52 决策登记）。
+为什么不复用 `adapters/feishu_outbound.py` 的 `LarkReplies`：它只能「回复某条
+消息」，目标由被回复的消息决定，正是为了让「必须发到同一私聊或同一话题」由
+参数表保证；每日日报没有可回复的消息，要主动发进一个群，这是另一个接口
+（`im/v1/messages` 而不是 reply 接口），字面不可行。
 
-**为什么用标准库 urllib 而不是 `lark-oapi`**：同链上的 `adapters/feishu_directory.py`
-已经用 urllib 直接调飞书开放平台，`scheduler` 组因此至今不含 `lark-oapi`
-（见 pyproject.toml 该组的依据注释）。走 SDK 就要把 `lark-oapi` 加进 `scheduler` 运行时
-依赖——为一个还没有真实调用方的职责扩大常驻进程的依赖面。用 urllib 则**本切片零新增
-依赖**：`scheduler` 组、`PROCESS_RUNTIME_IMPORTS` 与 CI 的 extras 矩阵都不动。
-
-**本模块的真实调用未验证（证据等级 1）**，与 `feishu_directory.py` 同一姿态：全部断言跑在
-注入的假传输层上，真实群通知属 L4a（Issue #52「不在本批」明列）。
-
-凭据边界：`app_secret` 只出现在**请求体**里，不进 URL、不进日志、不进异常消息。
-群 ID 从环境变量注入，代码库里没有任何真实值（`V-花名册-28`）。
+为什么用标准库 urllib 而不是 `lark-oapi`：同链上的 `feishu_directory.py` 已经
+用 urllib 直接调飞书开放平台，`scheduler` 组因此不含 `lark-oapi`；走 SDK 就要
+为一个还没有真实调用方的职责扩大常驻进程的依赖面，用 urllib 则本切片零新增
+依赖。本模块的真实调用未验证：全部断言跑在注入的假传输层上。凭据边界：
+`app_secret` 只出现在请求体里，不进 URL/日志/异常消息；群 ID 从环境变量
+注入，代码库里没有任何真实值。
 """
 
 from __future__ import annotations
@@ -38,12 +32,11 @@ GROUP_CHAT_ID_PREFIX = "oc_"
 # 投递去重 ID。飞书的 `im/v1/messages` 接受一个开发者自备的 `uuid`，用于**服务端**
 # 对重复请求去重。长度上限 50，这里的取值恒为 14 + 32 = 46。
 DELIVERY_UUID_PREFIX = "lingxi-roster-"
-#: 内测每日通报（Issue #303 S-O-01）专用去重前缀——与花名册日报共用同一个群、
-#: 同一个 `im/v1/messages` 接口，但是两条独立的投递语义，必须各自的前缀（见
+#: 内测每日通报专用去重前缀——与花名册日报共用同一个群、同一个 `im/v1/messages`
+#: 接口，但是两条独立的投递语义，必须各自的前缀（见
 #: `FeishuGroupMessages.__init__` 的 `uuid_prefix` 参数文档）。取值恒为
-#: 13 + 32 = 45，仍在飞书的 50 字符上限内（由 `delivery_uuid` 校验；原
-#: `"lingxi-daily-report-"` 为 20 + 32 = 52，超限导致每日通报发送前必抛
-#: `ValueError`、通报永远发不出，opus 批量审查 P1 修复）。
+#: 13 + 32 = 45，仍在飞书的 50 字符上限内（超限会让 `delivery_uuid` 发送前必抛
+#: `ValueError`、通报永远发不出）。
 DAILY_REPORT_UUID_PREFIX = "lingxi-daily-"
 #: 管理卡每日补偿通报专用去重前缀。它和花名册/内测日报/管理终态通知虽然都发到
 #: 管理群，但代表独立的投递语义，不能让飞书把不同消息误判为同一逻辑投递。长度为
@@ -56,22 +49,11 @@ SendOutcomeCallback = Callable[[str, bool], None]
 def delivery_uuid(chat_id: str, dedupe_key: str, *, prefix: str = DELIVERY_UUID_PREFIX) -> str:
     """由「接收方 ID + 去重键」算出稳定的投递去重 ID。
 
-    **它解决的是"不确定态"，不是跨重启幂等。** HTTP POST 已经被飞书收下、而响应在
-    回程超时的那一刻，调用方无法区分"没发出去"和"发出去了但没听见回音"——重试是唯一
-    选择，而重试就会重复投递。带上同一个 `uuid` 之后，重试请求在服务端被认作同一条，
-    这条路径因此从"确定会重复"变成"由平台去重"。
-
-    取哈希而不是拼原值：群 ID 是外部标识，拼进 `uuid` 会让它出现在请求体的第二个位置，
-    也会随日志与错误上下文扩散。同样输入永远得到同样输出，这正是重试要复用它的前提。
-
-    **平台侧的去重窗口是飞书的属性，本切片未验证**（真实调用属 L4a）。因此本模块能
-    承诺的是"重试一定携带同一个 `uuid`"这个**代码事实**，不是"平台一定不会重复投递"
-    这个**平台行为**；后者要等 L4a 受控验收才能声称。
-
-    `prefix` 参数化（Issue #156 / S-C-03b）：权限变化通知走的是同一个
-    `im/v1/messages` 接口、需要的是同一种"重试携带同一个 uuid"的保证，但它是**另一条
-    投递语义**——两条链共用同一个前缀，会让运维在飞书侧再也分不出一个 uuid 属于日报
-    还是权限通知。取值域仍由长度上限守着（下面那一行按实际前缀算，不是按默认值算）。
+    解决的是"不确定态"、不是跨重启幂等：HTTP POST 已被飞书收下而响应超时时，
+    调用方无法区分"没发出去"和"发出去了但没听见回音"，带上同一个 `uuid` 后
+    重试在服务端被认作同一条。取哈希而非拼原值：群 ID 不该随日志与错误上下文
+    扩散。`prefix` 参数化：不同投递语义共用同一接口，若共用同一前缀，运维在
+    飞书侧就分不出 uuid 属于哪一条链。
     """
     digest = hashlib.sha256(f"{chat_id}\n{dedupe_key}".encode()).hexdigest()[:32]
     if not isinstance(prefix, str) or not prefix.strip() or prefix.strip() != prefix:
@@ -101,8 +83,8 @@ def validate_group_chat_id(value: str, *, variable_name: str = "LINGXI_ADMIN_GRO
     群 ID 本身不是密钥，但它是一个外部标识：错误消息里带上它，就会被日志、CI 输出和
     工单一路复制出去。只报变量名足以定位问题。``variable_name`` 可覆盖——scheduler
     与 gateway 各自读取自己命名空间下的变量（`LINGXI_ADMIN_GROUP_CHAT_ID` /
-    `LINGXI_GATEWAY_ADMIN_GROUP_CHAT_ID`，Issue #153），错误消息必须指向调用方
-    真正读取的那一个，否则会把运维导向去改一个不存在效果的变量。
+    `LINGXI_GATEWAY_ADMIN_GROUP_CHAT_ID`），错误消息必须指向调用方真正读取的
+    那一个，否则会把运维导向去改一个不存在效果的变量。
     """
     text = (value or "").strip()
     if not text.startswith(GROUP_CHAT_ID_PREFIX) or len(text) <= len(GROUP_CHAT_ID_PREFIX):
@@ -184,17 +166,13 @@ class FeishuGroupMessages:
         return token
 
     def send_text(self, *, chat_id: str, text: str, dedupe_key: str) -> None:
-        """向 `chat_id` 发一条 **纯文本** 消息。
+        """向 `chat_id` 发一条纯文本消息。
 
-        刻意只支持文本、不支持卡片：卡片能带按钮，而管理群通知**不得有任何可执行入口**
-        （`V-花名册-24`）。想加按钮的人会先撞上这个方法签名里没有卡片这件事。
-
-        `dedupe_key` 标识"这是同一次逻辑投递"。调用方对同一天的日报（含失败重试）必须
-        传同一个值，由 :func:`delivery_uuid` 折成飞书的 `uuid` 字段。做成**必填参数**
-        而不是可选：忘了传就等于回到"不确定态必然重复投递"，那正是这次要修的缺陷，
-        不该由一个默认值悄悄承担。
-
-        取令牌那一步没有 `uuid`：它是幂等的读操作，重复取令牌不产生任何用户可见后果。
+        刻意只支持文本、不支持卡片：卡片能带按钮，而管理群通知不得有任何可执行
+        入口。`dedupe_key` 标识"这是同一次逻辑投递"，调用方对同一天的日报（含
+        失败重试）必须传同一个值，做成必填参数而不是可选——忘了传就等于回到
+        "不确定态必然重复投递"，不该由默认值悄悄承担。取令牌那一步没有 `uuid`：
+        它是幂等的读操作。
         """
         try:
             token = self._tenant_access_token()

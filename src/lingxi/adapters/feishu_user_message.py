@@ -1,29 +1,17 @@
-"""向**用户本人**主动发一条纯文本消息（权限变化通知的出站面）。
+"""向用户本人主动发一条纯文本消息（权限变化通知的出站面）。
 
-[Issue #156](https://github.com/Moshuiwang/lingxi/issues/156) 的 S-C-03b。什么时候发、
-发什么字，见 :mod:`lingxi.core.permission.notification`；本模块只把协议细节做对。
+什么时候发、发什么字，见 :mod:`lingxi.core.permission.notification`；本模块
+只把协议细节做对。与 :mod:`lingxi.adapters.feishu_group_message` 同一个飞书
+接口（``im/v1/messages``），只是 ``receive_id_type`` 从 ``chat_id`` 换成
+``open_id``，沿用同一套姿态：urllib、零新增依赖、去重 ``uuid`` 由同一个
+:func:`~lingxi.adapters.feishu_group_message.delivery_uuid` 算。
 
-**与 :mod:`lingxi.adapters.feishu_group_message` 的关系**：同一个飞书接口
-（``im/v1/messages``），只是 ``receive_id_type`` 从 ``chat_id`` 换成 ``open_id``。
-沿用同一套姿态——urllib、**零新增依赖**、构造函数只存参数不建 client、去重 ``uuid``
-由同一个 :func:`~lingxi.adapters.feishu_group_message.delivery_uuid` 算（前缀不同，
-理由见那个函数的文档）。
-
-**为什么不把两者合成一个类**：两条链的**收件人语义**完全不同，而这正是最不该被一个
-参数悄悄切换的东西。管理群那条有一条硬约束——正文里不得有任何可执行入口
-（`V-花名册-24`），且收件人是一个受控群；这条的收件人是**具体的自然人**，正文里带着
-他自己的权限范围。合成一个类之后，"发错对象"退化成一次传参错误：把用户 open_id 传给
-日报、或者把群 ID 传给权限通知，两次都能发出去。分成两个类之后，两边各自在入口校验
-自己的收件人形状（``ou_`` / ``oc_``），传错在**发出去之前**就失败。
-
-**本模块的真实调用未验证（证据等级 1）**，与 ``feishu_group_message.py`` 同一姿态：
-全部断言跑在注入的假传输层上。「重试携带同一个 ``uuid``」是**代码事实**；「飞书因此
-一定不会重复投递」是**平台行为**，未验证，属 L4a。同样未验证的还有：应用能不能主动
-向一个从未与它对话过的用户发起私聊（真实私聊行为）。这两条沿用既有登记，不在本切片
-声称。
-
-凭据边界：``app_secret`` 只出现在**请求体**里，不进 URL、不进日志、不进异常消息；
-``open_id`` 是外部标识，不进错误消息与日志正文；通知正文一个字都不进日志。
+为什么不合成一个类：两条链的收件人语义完全不同——群那条收件人是受控群、
+正文不得有可执行入口；这条收件人是具体自然人、正文带着他自己的权限范围。
+合成一个类后"发错对象"退化成一次传参错误；分开后各自在入口校验自己的
+收件人形状（``ou_`` / ``oc_``），传错在发出去之前就失败。
+真实调用未验证：断言跑在注入的假传输层上。凭据边界：``app_secret`` 只
+出现在请求体里，不进 URL/日志/异常消息；``open_id`` 与通知正文都不进日志。
 """
 
 from __future__ import annotations
@@ -89,15 +77,12 @@ def _require_https(base_url: str) -> str:
 
 
 def _no_redirect_opener() -> Any:
-    """构造一个**不跟随重定向**的 opener（与 ``query_mcp_probe`` 同一条理由）。
+    """构造一个不跟随重定向的 opener。
 
-    ``urllib`` 默认会自动跟随 3xx，并且**把 ``Authorization`` 请求头一起转发到新地址**。
-    本模块的请求头里带的是应用身份令牌（``tenant_access_token``），一个被劫持或误配的
-    ``302`` 就能把它送到另一个主机、甚至从 https 降级到 http 明文——而调用方只会看到一次
-    "成功"。:func:`_require_https` 只管得住我们**主动**填的那个地址，管不住服务端让我们
-    再去哪里。
-
-    做法是让 ``redirect_request`` 返回 ``None``：``urllib`` 于是把 3xx 当成
+    ``urllib`` 默认会自动跟随 3xx 并把 ``Authorization`` 请求头一起转发到新
+    地址——本模块请求头里带的是应用身份令牌，一个被劫持或误配的 302 就能把
+    它送到另一个主机甚至降级到 http 明文，而调用方只会看到一次"成功"。做法
+    是让 ``redirect_request`` 返回 ``None``，``urllib`` 于是把 3xx 当成
     :class:`HTTPError` 抛出，落进下面的错误分类。
     """
     from urllib.request import HTTPRedirectHandler, build_opener
@@ -198,18 +183,13 @@ class FeishuUserMessages:
         return token
 
     def send_text(self, *, open_id: str, text: str, dedupe_key: str) -> None:
-        """向 ``open_id`` 这个人发一条**纯文本**消息。
+        """向 ``open_id`` 这个人发一条纯文本消息。
 
-        刻意只支持文本、不支持卡片：权限变化通知是一条告知，**没有任何可操作入口**——
-        用户要做的事（发起一次查询、联系管理员）都在正文里说清楚了，加按钮只会制造一个
-        我们还没有定义过语义的回调面。
-
-        ``dedupe_key`` 标识"这是同一次逻辑通知"。同一次变化的首发与全部重试必须传同一个
-        值（调用方用 ``(用户, 权限版本)``），由 :func:`~lingxi.adapters.
-        feishu_group_message.delivery_uuid` 折成飞书的 ``uuid`` 交服务端去重。做成
-        **必填参数**而不是可选：忘了传就等于回到"结果不明时必然重复投递"。
-
-        取令牌那一步没有 ``uuid``：它是幂等的读操作，重复取令牌不产生任何用户可见后果。
+        刻意只支持文本、不支持卡片：权限变化通知是一条告知，没有任何可操作
+        入口——用户要做的事都在正文里说清楚了，加按钮只会制造一个还没定义
+        过语义的回调面。``dedupe_key`` 标识"这是同一次逻辑通知"，同一次变化
+        的首发与全部重试必须传同一个值，做成必填参数而不是可选：忘了传就
+        等于回到"结果不明时必然重复投递"。
         """
         receiver = validate_user_open_id(open_id)
         if not isinstance(text, str) or not text.strip():
