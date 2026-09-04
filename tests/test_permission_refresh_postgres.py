@@ -24,7 +24,7 @@ from __future__ import annotations
 import os
 import pathlib
 import unittest
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 
 from postgres_schema import ensure_production_schema, psycopg_available, reset_production_rows
@@ -46,6 +46,7 @@ from lingxi.apps.scheduler.permission_refresh import (
     SKIP_ACCOUNT_NOT_ENABLED,
     SKIP_NO_PUBLISHED_ROW,
     PermissionRefreshDuty,
+    PermissionRefreshSources,
 )
 from lingxi.core.ids import new_id
 from lingxi.core.permission.publish import (
@@ -92,7 +93,7 @@ SKIP_REASON = (
 #: biai-agent 加密规格 v1 的**公开测试向量**（非生产密钥）。
 SPEC_MASTER_KEY = "MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY="
 
-NOW = datetime(2026, 8, 17, 3, 0, tzinfo=timezone.utc)
+NOW = datetime(2026, 8, 17, 3, 0, tzinfo=UTC)
 
 ACTIVE_USER = "usr_refresh_active"
 GUEST_USER = "usr_refresh_guest"
@@ -289,19 +290,21 @@ class PermissionRefreshPostgresTestCase(unittest.TestCase):
         # **只控制先后顺序、不改变任何被测判据**的装饰器（见 WindowSuspendTest）。
         publish_store = publish_store or PostgresPermissionPublishStore(self._dsn)
         return PermissionRefreshDuty(
-            baseline_reader=PostgresPermissionRefreshBaselineReader(self._dsn),
-            roster_snapshot=PostgresRosterSnapshotStore(self._dsn),
-            galaxy=PostgresGalaxySnapshotReader(self._dsn),
-            decisions=publish_store,
-            publish_history=publish_store,
-            token_ciphers=self._token_store(),
-            role_function_map=ROLE_FUNCTION_MAP,
-            metric_translation_map=(
-                METRIC_TRANSLATION_MAP if metric_translation_map is None else metric_translation_map
+            sources=PermissionRefreshSources(
+                baseline_reader=PostgresPermissionRefreshBaselineReader(self._dsn),
+                roster_snapshot=PostgresRosterSnapshotStore(self._dsn),
+                galaxy=PostgresGalaxySnapshotReader(self._dsn),
+                decisions=publish_store,
+                publish_history=publish_store,
+                token_ciphers=self._token_store(),
+                local_overrides=local_overrides,
             ),
+            role_function_map=ROLE_FUNCTION_MAP,
+            metric_translation_map=METRIC_TRANSLATION_MAP
+            if metric_translation_map is None
+            else metric_translation_map,
             audit=self.audit,
             clock=self.clock,
-            local_overrides=local_overrides,
         )
 
     # ---- 断言辅助 ----------------------------------------------------
@@ -354,7 +357,9 @@ class _RecordingTransport:
     """
 
     def __init__(self, existing: dict[str, dict] | None = None) -> None:
-        self._rows: dict[str, dict] = {rid: dict(fields) for rid, fields in (existing or {}).items()}
+        self._rows: dict[str, dict] = {
+            rid: dict(fields) for rid, fields in (existing or {}).items()
+        }
         #: 每一次外部写入的 (record_id, 字段快照)。``record_id`` 为 ``None`` 表示新建。
         self.writes: list[tuple[str | None, dict]] = []
 
@@ -379,7 +384,9 @@ class _RecordingTransport:
         return dict(self._rows[record_id])
 
     def permissions_written(self) -> list[str]:
-        return [fields["permissions"] for _record_id, fields in self.writes if "permissions" in fields]
+        return [
+            fields["permissions"] for _record_id, fields in self.writes if "permissions" in fields
+        ]
 
 
 class _Clock:
@@ -492,14 +499,18 @@ class SuspendedUserExcludedTest(PermissionRefreshPostgresTestCase):
         report = self._duty().run_once()
 
         self.assertEqual(report.examined, 2, "恢复之后重新进入遍历，与 ACTIVE_USER 一起被检查")
-        self.assertEqual(report.enqueued, 1, "只有新纳入的这个人产生新意图，ACTIVE_USER 判 UNCHANGED")
+        self.assertEqual(
+            report.enqueued, 1, "只有新纳入的这个人产生新意图，ACTIVE_USER 判 UNCHANGED"
+        )
         payload = self._latest_payload(SUSPENDED_USER)
         self.assertEqual(
             payload["permissions"],
             f'{{"BC-甲":["{METRIC_NAME}"]}}',
             "恢复后必须重新拿到与 ACTIVE_USER 一致的真实权限",
         )
-        self.assertEqual(self._version(SUSPENDED_USER), 1, "恢复后的这一次决定才是他的第一次权限决定")
+        self.assertEqual(
+            self._version(SUSPENDED_USER), 1, "恢复后的这一次决定才是他的第一次权限决定"
+        )
 
 
 class UnchangedAcrossRoundsTest(PermissionRefreshPostgresTestCase):
@@ -731,7 +742,9 @@ class RevokedUserTest(PermissionRefreshPostgresTestCase):
         self.assertEqual(report.enqueued, 0)
         self.assertEqual(self._outbox(), [], "撤权不产生发布意图")
         self.assertEqual(self._version(ACTIVE_USER), 0, "撤权不推进权限版本")
-        skipped = [fields for action, fields in self.audit.records if action.endswith("user_skipped")]
+        skipped = [
+            fields for action, fields in self.audit.records if action.endswith("user_skipped")
+        ]
         self.assertEqual(skipped[0]["reason"], "no_galaxy_roles")
 
 
@@ -1002,6 +1015,7 @@ class GalaxySnapshotReaderTest(PermissionRefreshPostgresTestCase):
         self.assertEqual(snapshot.batch_id, second)
         # 两批的行数相同，因此只有批次标识能区分——读到的必须是新批次那一份。
         self.assertEqual(len(snapshot.user_rows), len(PERSONNEL))
+
 
 # --------------------------------------------------------------------------
 # Issue #483：落决定的行锁里复检账号状态

@@ -134,9 +134,7 @@ class QueueModeUserEnvRootPrecheckTests(unittest.TestCase):
     def test_a_blank_user_env_root_is_treated_as_missing(self) -> None:
         stdout, stderr = io.StringIO(), io.StringIO()
 
-        code = main(
-            env=_worker_queue_env(LINGXI_USER_ENV_ROOT="   "), stdout=stdout, stderr=stderr
-        )
+        code = main(env=_worker_queue_env(LINGXI_USER_ENV_ROOT="   "), stdout=stdout, stderr=stderr)
 
         self.assertEqual(code, EXIT_CONFIG_ERROR)
         payload = json.loads(stdout.getvalue())
@@ -191,9 +189,7 @@ class QueueModeUserEnvRootPrecheckTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             stdout, stderr = io.StringIO(), io.StringIO()
 
-            with mock.patch(
-                "lingxi.apps.worker.cli._run_queue_worker", _stub_run_queue_worker
-            ):
+            with mock.patch("lingxi.apps.worker.cli._run_queue_worker", _stub_run_queue_worker):
                 code = main(
                     env=_worker_queue_env(LINGXI_USER_ENV_ROOT=directory),
                     stdout=stdout,

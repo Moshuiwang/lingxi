@@ -74,6 +74,9 @@ REQUIRED_MODULES = (
     # `apps/gateway/onboarding.py` 在函数内 import，后者同理——两者都必须随制品发布，
     # 否则「本地测试全绿但 wheel 里没有这个模块」会在部署当天才暴露（`V-部署-10`）。
     "lingxi.core.identity.onboarding_runner",
+    # onboarding_runner 拆分（#592 B-1）：注入口的参数对象与链上各步的实现。
+    "lingxi.core.identity.onboarding_config",
+    "lingxi.core.identity.onboarding_steps",
     # Trace #358 S-H-1（Issue #350 Gate G-3 裁定 Option A）纯移动拆分：14 个
     # Protocol + `EnvironmentResult` 搬进本模块，`onboarding_runner.py` 顶部
     # `from .onboarding_ports import (...)`。随 `onboarding_runner.py` 同一条
@@ -141,11 +144,15 @@ REQUIRED_MODULES = (
     "lingxi.core.permission.publish_row",
     "lingxi.core.permission.publish",
     "lingxi.adapters.postgres_permission_publish",
+    # 权限决定/发布意图写入路径，从上一条按体量棘轮纯移动拆出（#592 可读性批）；
+    # postgres_permission_publish.py 顶层 import 它，随它同一条发布理由。
+    "lingxi.adapters.postgres_permission_publish_decision",
     "lingxi.adapters.feishu_permission_bitable",
     # MCP 令牌签发与就绪状态机（Issue #156 / S-C-02）：五路分流状态机在 core，
     # 加解密、令牌与就绪记录读写、问数 MCP 探针在 adapters。与上面四个同一姿态——
     # 生产调用方是 Epic D 的 OnboardingRunner 与每日刷新职责，本 Story 不接进程。
-    "lingxi.core.permission.mcp_readiness",
+    "lingxi.core.permission.mcp_readiness_base",
+    "lingxi.core.permission.mcp_readiness_tick",
     "lingxi.adapters.mcp_token_cipher",
     "lingxi.adapters.postgres_mcp_token",
     "lingxi.adapters.query_mcp_probe",
@@ -185,6 +192,10 @@ REQUIRED_MODULES = (
     # 的形状。判重水位持久化（Issue #325）新增独立的 watermark 适配器，读写路径
     # 分开（`postgres_daily_report` 只读，本模块只写判重标记），同样按需加载。
     "lingxi.core.daily_report",
+    # `daily_report.py` 拆分出的同包子模块（rc25 B-5 可读性重构）：统计聚合的
+    # 纯函数部分，由 `daily_report.py` 模块级 import，随它一起进入 scheduler
+    # 的运行时闭包。
+    "lingxi.core.daily_report_stats",
     "lingxi.adapters.postgres_daily_report",
     "lingxi.adapters.postgres_daily_report_watermark",
     # 内测轮内容级采集（Issue #251/#304 批次 3）：凭据形状过滤、原始素材收集与
@@ -224,6 +235,10 @@ REQUIRED_MODULES = (
     "lingxi.core.permission.local_override",
     "lingxi.core.permission.position_override",
     "lingxi.adapters.postgres_local_permission",
+    # 存量差集导入/职位范围预授权的落库细节，从 `postgres_local_permission.py`
+    # 按体量棘轮纯移动拆出（#592 可读性批）；`postgres_local_permission.py`
+    # 顶层 import 它，随它同一条发布理由，见下面 scheduler/gateway 闭包同名注释。
+    "lingxi.adapters.postgres_local_permission_import",
     "lingxi.core.permission.merge_sources",
     # 存量用户首聊差集导入的纯逻辑（rc25 S-1，Issue #540）：开通编排、每日/定向重算
     # 与本地覆盖适配器都消费它（见下面 scheduler/gateway 闭包）；开通链的两步编排
@@ -239,6 +254,7 @@ REQUIRED_MODULES = (
     "lingxi.core.permission.tenant_token_supply",
     "lingxi.adapters.feishu_tenant_token",
     "lingxi.adapters.feishu_directory",
+    "lingxi.adapters.feishu_paged_client",
     "lingxi.adapters.delegated_credentials",
     "lingxi.adapters.delegated_subject_lookup",
     "lingxi.adapters.oauth_bridge_client",
@@ -252,6 +268,8 @@ REQUIRED_MODULES = (
     # 每日权限重算职责（Issue #156 / S-C-03a）。它由 `build_loop` 在**模块级**
     # import，因此漏登记会直接让 scheduler 起不来；仍然逐项写出来，理由同上一条。
     "lingxi.apps.scheduler.permission_refresh",
+    # permission_refresh 拆分（#592 B-1）：端口协议、原因码与报告形状。
+    "lingxi.apps.scheduler.permission_refresh_ports",
     # 权限发布消费与就绪确认职责（Issue #156 / S-C-03b），同样是模块级 import。
     "lingxi.apps.scheduler.permission_publish",
     # Trace #358 S-H-2（Issue #350 Gate G-3 裁定 Option A）纯移动拆分：就绪确认+
@@ -271,6 +289,10 @@ REQUIRED_MODULES = (
     "lingxi.apps.scheduler.retention",
     "lingxi.apps.scheduler.roster_audit",
     "lingxi.apps.scheduler.daily_report",
+    # 内测每日通报的段落组装/渲染纯函数，从 `daily_report.py` 拆出来把它压回文件
+    # 体量棘轮阈值以内（本批可读性重构）——不是 `__init__.py` 直接 import，而是被
+    # `daily_report.py` 模块级 import，因此同样在 scheduler 进程起来时必然已装入。
+    "lingxi.apps.scheduler.daily_report_sections",
     "lingxi.apps.scheduler.loop",
     "lingxi.apps.scheduler.assembly",
     "lingxi.apps.scheduler.alerting_assembly",
@@ -296,6 +318,9 @@ REQUIRED_MODULES = (
     "lingxi.core.admin.registry",
     "lingxi.core.admin.commands",
     "lingxi.core.admin.router",
+    # router.py 拆分（#592 B-1）：端口协议与文本渲染。
+    "lingxi.core.admin.router_ports",
+    "lingxi.core.admin.router_render",
     "lingxi.core.admin.views",
     "lingxi.adapters.admin_registry",
     # 失败原因落库（Issue #337，S-H3-1）：`onboarding_failure` 表（迁移 0077）的
@@ -312,7 +337,13 @@ REQUIRED_MODULES = (
     "lingxi.core.admin.notification",
     "lingxi.core.admin.card_dispatch",
     "lingxi.core.admin.card_callback",
+    # `card_callback.py` 拆分出的两个同包子模块（rc25 B-5 可读性重构）：端口
+    # Protocol 声明与管理卡表单/撤销分支的 mixin 实现，均由 `card_callback.py`
+    # 模块级 import，随它一起进入 gateway 的运行时闭包，不单独被其它进程消费。
+    "lingxi.core.admin.card_callback_ports",
+    "lingxi.core.admin.card_callback_management",
     "lingxi.adapters.postgres_pending_action",
+    "lingxi.adapters.postgres_pending_action_execution",
     "lingxi.adapters.postgres_management_card_context",
     "lingxi.adapters.feishu_admin_card",
     # 回调应答之后那批网络往返的后台执行器（#493 块 B）：确认成功后的出带外换卡、
@@ -334,6 +365,13 @@ REQUIRED_MODULES = (
     "lingxi.apps.worker.report",
     "lingxi.apps.worker.turn",
     "lingxi.apps.worker.service",
+    # service.py 拆分（#592 B-1）：端口协议、巡检、终态审计与内容采集。
+    "lingxi.apps.worker.content_capture",
+    "lingxi.apps.worker.progress_reporting",
+    "lingxi.apps.worker.task_processing",
+    "lingxi.apps.worker.housekeeping",
+    "lingxi.apps.worker.service_ports",
+    "lingxi.apps.worker.terminal_outcome",
     # Trace #358 S-H-2（Issue #350 Gate G-3 裁定 Option A）纯移动拆分：8 个
     # 报告字段提取纯函数从 service.py 搬出。`service.py` 顶部**模块级** import
     # 本模块，`apps/worker/cli.py` 也直接 `from .service import
@@ -348,6 +386,10 @@ REQUIRED_MODULES = (
     "lingxi.core.conversation.session_window",
     "lingxi.core.conversation.ports",
     "lingxi.core.conversation.pipeline",
+    # 管线拆分（#592 B-1）：文案取值口、/memory 命令面、开通结果渲染层。
+    "lingxi.core.conversation.gateway_texts",
+    "lingxi.core.conversation.memory_commands",
+    "lingxi.core.conversation.onboarding_replies",
     # Issue #65 轻审 P2-2：未开通首聊交接对账扫描，由 apps/gateway 的 main() 装配。
     "lingxi.core.conversation.onboarding_recovery",
     # 用户记忆（Issue #357 S-H3-3，D1 显式登记范围）：core.conversation.commands/
@@ -377,6 +419,15 @@ REQUIRED_MODULES = (
     "lingxi.apps.gateway",
     "lingxi.apps.gateway.config",
     "lingxi.apps.gateway.__main__",
+    # gateway 入口拆分（#592 B-1）：装配、事件入口、后台循环存活保障、审计与告警
+    # 出口、管理卡收敛、投递装配，全部由 `apps/gateway/__init__.py` 模块级 import。
+    "lingxi.apps.gateway.alerting",
+    "lingxi.apps.gateway.assembly",
+    "lingxi.apps.gateway.audit_log",
+    "lingxi.apps.gateway.background_loops",
+    "lingxi.apps.gateway.delivery_assembly",
+    "lingxi.apps.gateway.event_handler",
+    "lingxi.apps.gateway.management_cards",
     # Gateway 投递消费循环（Issue #152）：CardKit 流式卡片/文本兜底 adapter 与
     # 消费循环编排，各自都在制品里必须能 import。
     "lingxi.adapters.feishu_delivery",
@@ -524,6 +575,7 @@ PROCESS_RUNTIME_IMPORTS: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {
             # `core.permission` 整组、发布 outbox 与令牌读取口都进了 scheduler 的运行时
             # 闭包。这是它们**第一次**有真实进程调用方，此前只随制品发布。
             "lingxi.apps.scheduler.permission_refresh",
+            "lingxi.apps.scheduler.permission_refresh_ports",
             # 权限发布消费与就绪确认（Issue #156 / S-C-03b）：它把 S-C-01 的发布执行器、
             # S-C-02 的就绪状态机与探针、以及权限变化通知全部接进了本进程，因此发布表
             # 传输、问数 MCP 探针与用户私聊出站三个 adapter 也进了运行时闭包。
@@ -536,7 +588,9 @@ PROCESS_RUNTIME_IMPORTS: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {
             # 它的适配器，因此必须显式登记——不列进来，extras 那条干净环境的腿永远
             # 不会红（与本文件其余「函数内 import」条目同一条理由）。
             "lingxi.apps.scheduler.onboarding",
+            "lingxi.core.identity.onboarding_config",
             "lingxi.core.identity.onboarding_runner",
+            "lingxi.core.identity.onboarding_steps",
             # Trace #358 S-H-1（Issue #350 Gate G-3 裁定 Option A）纯移动拆分：
             # `onboarding_runner.py` 顶部**模块级** import 本模块，因此它随
             # `onboarding_runner.py` 一起进了 scheduler 的静态 import 闭包
@@ -619,6 +673,8 @@ PROCESS_RUNTIME_IMPORTS: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {
             "lingxi.adapters.postgres_content_capture_retention",
             "lingxi.apps.scheduler.roster_audit",
             "lingxi.apps.scheduler.daily_report",
+            # 理由见 REQUIRED_MODULES 同名条目：`daily_report.py` 模块级 import 它。
+            "lingxi.apps.scheduler.daily_report_sections",
             "lingxi.apps.scheduler.loop",
             "lingxi.apps.scheduler.assembly",
             "lingxi.apps.scheduler.alerting_assembly",
@@ -629,6 +685,9 @@ PROCESS_RUNTIME_IMPORTS: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {
             "lingxi.adapters.postgres_galaxy_snapshot",
             "lingxi.adapters.galaxy_import",
             "lingxi.adapters.postgres_permission_publish",
+            # 权限决定/发布意图写入路径，随 postgres_permission_publish 同一条
+            # 发布理由（#592 可读性批体量棘轮纯移动拆出）。
+            "lingxi.adapters.postgres_permission_publish_decision",
             "lingxi.adapters.mcp_token_cipher",
             "lingxi.adapters.postgres_mcp_token",
             "lingxi.adapters.role_function_map_file",
@@ -649,6 +708,7 @@ PROCESS_RUNTIME_IMPORTS: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {
             # 闭包里了）。
             "lingxi.core.permission.local_override",
             "lingxi.adapters.postgres_local_permission",
+            "lingxi.adapters.postgres_local_permission_import",
             "lingxi.core.permission.merge_sources",
             # 存量差集导入纯逻辑（rc25 S-1）：`onboarding_runner`/`permission_refresh`/
             # `postgres_local_permission` 模块级 import；开通链两步编排随 runner 进闭包。
@@ -668,7 +728,8 @@ PROCESS_RUNTIME_IMPORTS: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {
             "lingxi.core.permission.account_match",
             "lingxi.core.permission.galaxy_export",
             "lingxi.core.permission.galaxy_scope",
-            "lingxi.core.permission.mcp_readiness",
+            "lingxi.core.permission.mcp_readiness_base",
+            "lingxi.core.permission.mcp_readiness_tick",
             "lingxi.core.permission.publish",
             "lingxi.core.permission.publish_row",
             "lingxi.core.permission.role_function",
@@ -722,6 +783,7 @@ PROCESS_RUNTIME_IMPORTS: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {
             # extras 依赖，只是让静态闭包清单如实反映新的 import 边。
             "lingxi.adapters.delegated_subject_lookup",
             "lingxi.adapters.feishu_directory",
+            "lingxi.adapters.feishu_paged_client",
             "lingxi.adapters.retention",
             "lingxi.adapters.feishu_group_message",
             "lingxi.adapters.feishu_roster_bitable",
@@ -799,6 +861,7 @@ PROCESS_RUNTIME_IMPORTS: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {
             # 模块级 import 聚合与渲染层，与上面三个花名册 core 模块同一条"进程
             # 起来时必然已被 import 过一遍"的理由。
             "lingxi.core.daily_report",
+            "lingxi.core.daily_report_stats",
             "lingxi.core.alerting",
             "lingxi.core.ids",
             # 独立审查（分支 fix/291-280-user-experience 收尾）：`adapters.
@@ -807,7 +870,10 @@ PROCESS_RUNTIME_IMPORTS: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {
             "lingxi.core.mcp_naming",
             "lingxi.core.conversation",
             "lingxi.core.conversation.commands",
+            "lingxi.core.conversation.gateway_texts",
+            "lingxi.core.conversation.memory_commands",
             "lingxi.core.conversation.onboarding_recovery",
+            "lingxi.core.conversation.onboarding_replies",
             "lingxi.core.conversation.pipeline",
             "lingxi.core.conversation.ports",
             "lingxi.core.conversation.session_window",
@@ -840,6 +906,7 @@ PROCESS_RUNTIME_IMPORTS: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {
             # extras 依赖，只是让静态闭包清单如实反映新的 import 边。
             "lingxi.adapters.delegated_subject_lookup",
             "lingxi.adapters.feishu_directory",
+            "lingxi.adapters.feishu_paged_client",
             "lingxi.adapters.feishu_reauthorization",
             "lingxi.adapters.oauth_bridge_client",
             "lingxi.adapters.postgres",
@@ -869,7 +936,13 @@ PROCESS_RUNTIME_IMPORTS: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {
             "lingxi.apps.worker.config",
             "lingxi.apps.worker.report",
             "lingxi.apps.worker.turn",
+            "lingxi.apps.worker.content_capture",
+            "lingxi.apps.worker.progress_reporting",
+            "lingxi.apps.worker.task_processing",
+            "lingxi.apps.worker.housekeeping",
             "lingxi.apps.worker.service",
+            "lingxi.apps.worker.service_ports",
+            "lingxi.apps.worker.terminal_outcome",
             # Trace #358 S-H-2 纯移动拆分：`service.py` 顶部**模块级** import
             # 本模块（理由见 REQUIRED_MODULES 同名条目）。
             "lingxi.apps.worker.report_extraction",
@@ -915,7 +988,10 @@ PROCESS_RUNTIME_IMPORTS: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {
             "lingxi.core.alerting",
             "lingxi.core.conversation",
             "lingxi.core.conversation.commands",
+            "lingxi.core.conversation.gateway_texts",
+            "lingxi.core.conversation.memory_commands",
             "lingxi.core.conversation.onboarding_recovery",
+            "lingxi.core.conversation.onboarding_replies",
             "lingxi.core.conversation.pipeline",
             "lingxi.core.conversation.ports",
             "lingxi.core.conversation.session_window",
@@ -979,7 +1055,14 @@ PROCESS_RUNTIME_IMPORTS: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {
             "lingxi",
             "lingxi.apps",
             "lingxi.apps.gateway",
+            "lingxi.apps.gateway.alerting",
+            "lingxi.apps.gateway.assembly",
+            "lingxi.apps.gateway.audit_log",
+            "lingxi.apps.gateway.background_loops",
             "lingxi.apps.gateway.config",
+            "lingxi.apps.gateway.delivery_assembly",
+            "lingxi.apps.gateway.event_handler",
+            "lingxi.apps.gateway.management_cards",
             "lingxi.apps.gateway.__main__",
             "lingxi.apps.liveness",
             "lingxi.apps.healthcheck",
@@ -1017,6 +1100,7 @@ PROCESS_RUNTIME_IMPORTS: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {
             # 类型），因此这条链一并登记，与 scheduler 组同一份依赖来源。
             "lingxi.adapters.feishu_group_message",
             "lingxi.adapters.feishu_directory",
+            "lingxi.adapters.feishu_paged_client",
             # 管理命令面（Issue #95 S-M-01）：build_supervisor 在函数内 import
             # PostgresAdminRegistryLookup/PostgresAdminQueries，无条件装配（不受
             # 任何 feature flag 控制，见该函数内注释），因此这条闭包必须显式登记。
@@ -1043,6 +1127,8 @@ PROCESS_RUNTIME_IMPORTS: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {
             "lingxi.core.admin.registry",
             "lingxi.core.admin.commands",
             "lingxi.core.admin.router",
+            "lingxi.core.admin.router_ports",
+            "lingxi.core.admin.router_render",
             "lingxi.core.admin.views",
             # 待确认操作全链路（Issue #96 S-M-02）：build_supervisor 在函数内
             # import PostgresPendingActionStore、LarkAdminCardTransport、
@@ -1057,7 +1143,12 @@ PROCESS_RUNTIME_IMPORTS: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {
             "lingxi.core.admin.notification",
             "lingxi.core.admin.card_dispatch",
             "lingxi.core.admin.card_callback",
+            # `card_callback.py` 拆分出的两个同包子模块（rc25 B-5 可读性重构），
+            # 见上面 REQUIRED_MODULES 同名条目的注释。
+            "lingxi.core.admin.card_callback_ports",
+            "lingxi.core.admin.card_callback_management",
             "lingxi.adapters.postgres_pending_action",
+            "lingxi.adapters.postgres_pending_action_execution",
             "lingxi.adapters.postgres_management_card_context",
             "lingxi.adapters.feishu_admin_card",
             "lingxi.adapters.admin_post_callback",
@@ -1078,14 +1169,15 @@ PROCESS_RUNTIME_IMPORTS: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {
             # 一起进入 gateway 的运行时闭包。
             "lingxi.core.admin.card_layout",
             "lingxi.core.admin.display_names",
-            # 本地权限授权/抑制全链路（#319 S-P-1b）：
-            # adapters.postgres_pending_action 模块级 import 了
-            # adapters.postgres_local_permission 的 _insert_locked/
-            # DuplicateActiveOverride（confirm() 同一事务内落库本地权限覆盖行，
-            # 见该模块文档「为什么拆分」），以及 core.permission.local_override
-            # 的 LocalPermissionOverrideEntry/OverrideDirection（纯类型，供
-            # confirm() 解析 payload 后构造要写入的条目）。
+            # 本地权限授权/抑制全链路：adapters.postgres_pending_action_execution
+            # （待确认操作里"自己不开连接"的纯执行辅助方法，见该模块文档）模块级
+            # import 了 adapters.postgres_local_permission 的 _insert_locked/
+            # DuplicateActiveOverrideError（confirm() 同一事务内落库本地权限覆盖
+            # 行），以及 core.permission.local_override 的
+            # LocalPermissionOverrideEntry/OverrideDirection（纯类型，供 confirm()
+            # 解析 payload 后构造要写入的条目）。
             "lingxi.adapters.postgres_local_permission",
+            "lingxi.adapters.postgres_local_permission_import",
             "lingxi.core.permission.local_override",
             "lingxi.core.permission.position_override",
             # 管理员写动作确认执行成功后的定向单用户权限重算+发布（Issue #438）：
@@ -1120,9 +1212,12 @@ PROCESS_RUNTIME_IMPORTS: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {
             # 与 onboarding.completed 同一来源）。
             "lingxi.core.permission.notification",
             "lingxi.core.permission.publish",
-            "lingxi.core.permission.mcp_readiness",
+            "lingxi.core.permission.mcp_readiness_base",
             "lingxi.core.permission.role_function",
             "lingxi.adapters.postgres_permission_publish",
+            # 权限决定/发布意图写入路径，随 postgres_permission_publish 同一条
+            # 发布理由（#592 可读性批体量棘轮纯移动拆出）。
+            "lingxi.adapters.postgres_permission_publish_decision",
             "lingxi.adapters.role_function_map_file",
             "lingxi.core.alerting",
             "lingxi.core.identity",
@@ -1147,7 +1242,10 @@ PROCESS_RUNTIME_IMPORTS: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {
             "lingxi.core.identity.org_snapshot",
             "lingxi.core.conversation",
             "lingxi.core.conversation.commands",
+            "lingxi.core.conversation.gateway_texts",
+            "lingxi.core.conversation.memory_commands",
             "lingxi.core.conversation.onboarding_recovery",
+            "lingxi.core.conversation.onboarding_replies",
             "lingxi.core.conversation.pipeline",
             "lingxi.core.conversation.ports",
             "lingxi.core.conversation.session_window",
@@ -1429,9 +1527,7 @@ def check_module_manifests(
     process = (
         PROCESS_RUNTIME_IMPORTS if process_runtime_imports is None else process_runtime_imports
     )
-    actual_exemptions = dict(
-        MODULE_MANIFEST_EXEMPTIONS if exemptions is None else exemptions
-    )
+    actual_exemptions = dict(MODULE_MANIFEST_EXEMPTIONS if exemptions is None else exemptions)
     failures: list[str] = []
 
     if not files:
@@ -1446,9 +1542,7 @@ def check_module_manifests(
     if set(frozen_exemption_reasons) != frozen_exemption_names:
         failures.append("模块豁免冻结键集与冻结理由全文不一致，冻结清单本身需要修复。")
     for name in sorted(actual_exemption_names - frozen_exemption_names):
-        failures.append(
-            f"豁免 `{name}`：不是已批准的模块豁免；不能用错误豁免掩盖制品清单漏项。"
-        )
+        failures.append(f"豁免 `{name}`：不是已批准的模块豁免；不能用错误豁免掩盖制品清单漏项。")
     for name in sorted(frozen_exemption_names - actual_exemption_names):
         failures.append(f"豁免 `{name}`：已批准但未登记，必须保留可审查理由。")
     for name, reason in sorted(actual_exemptions.items()):
@@ -1505,7 +1599,9 @@ def check_module_manifests(
         try:
             expected = process_source_closure(extra, files)
         except (OSError, SyntaxError) as error:
-            failures.append(f"进程 `{extra}`：无法解析源码 import 闭包（{type(error).__name__}: {error}）。")
+            failures.append(
+                f"进程 `{extra}`：无法解析源码 import 闭包（{type(error).__name__}: {error}）。"
+            )
             expected = set()
 
         for name in sorted(expected - listed_set):
@@ -1520,13 +1616,9 @@ def check_module_manifests(
             )
 
         if expected and extra in PROCESS_ENTRY_EXEMPTIONS:
-            failures.append(
-                f"进程 `{extra}`：存在实际 lingxi import 闭包，却登记为入口豁免。"
-            )
+            failures.append(f"进程 `{extra}`：存在实际 lingxi import 闭包，却登记为入口豁免。")
         if not expected and extra not in PROCESS_ENTRY_EXEMPTIONS:
-            failures.append(
-                f"进程 `{extra}`：没有模块但缺少显式 PROCESS_ENTRY_EXEMPTIONS 理由。"
-            )
+            failures.append(f"进程 `{extra}`：没有模块但缺少显式 PROCESS_ENTRY_EXEMPTIONS 理由。")
 
         for name in sorted(listed_set):
             # 2026-08-23 #146 清退：此前 `bot-test` 进程组本身合法依赖自己的豁免
@@ -1552,7 +1644,9 @@ def _print_module_manifest_summary() -> None:
     print(f"  - 正式制品清单（{len(REQUIRED_MODULES)}）：{', '.join(REQUIRED_MODULES)}")
     for extra in sorted(PROCESS_RUNTIME_IMPORTS):
         lingxi_modules, _third_party_modules = PROCESS_RUNTIME_IMPORTS[extra]
-        print(f"  - 进程 `{extra}` 清单（{len(lingxi_modules)}）：{', '.join(lingxi_modules) or '（无）'}")
+        print(
+            f"  - 进程 `{extra}` 清单（{len(lingxi_modules)}）：{', '.join(lingxi_modules) or '（无）'}"
+        )
     print(
         f"  - 制品显式豁免（{len(MODULE_MANIFEST_EXEMPTIONS)}）："
         + ", ".join(
@@ -1562,8 +1656,7 @@ def _print_module_manifest_summary() -> None:
     print(
         "  - 进程入口显式豁免："
         + ", ".join(
-            f"{name}（{reason}）"
-            for name, reason in sorted(PROCESS_ENTRY_EXEMPTIONS.items())
+            f"{name}（{reason}）" for name, reason in sorted(PROCESS_ENTRY_EXEMPTIONS.items())
         )
     )
 
@@ -1599,7 +1692,9 @@ def check_ci_matrix(declared: set[str], workflow_text: str | None) -> list[str]:
         return [f"{CI_WORKFLOW}：读不到 CI 配置，无法核对 extras 矩阵"]
     matrix = ci_matrix_extras(workflow_text)
     if matrix is None:
-        return ["ci.yml：找不到 `extra: [...]` 矩阵行，extras 矩阵无法核对（改了写法就同步本脚本的正则）"]
+        return [
+            "ci.yml：找不到 `extra: [...]` 矩阵行，extras 矩阵无法核对（改了写法就同步本脚本的正则）"
+        ]
 
     failures: list[str] = []
     for name in sorted(declared - matrix - MATRIX_EXEMPT_EXTRAS):
@@ -1669,7 +1764,9 @@ def _check_process(name: str) -> list[str]:
         try:
             location = _installed_module_location(module_name)
         except Exception as error:  # noqa: BLE001 - 任何导入失败都是制品问题
-            failures.append(f"{name} 进程入口 {module_name}：导入失败（{type(error).__name__}: {error}）")
+            failures.append(
+                f"{name} 进程入口 {module_name}：导入失败（{type(error).__name__}: {error}）"
+            )
             continue
         if not any(marker in location.parts for marker in _INSTALL_MARKERS):
             failures.append(

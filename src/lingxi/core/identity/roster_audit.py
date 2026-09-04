@@ -1,41 +1,17 @@
 """每日花名册资料比对：花名册当前值 vs 建档时刻存档的三字段。
 
-比对模型由产品负责人 2026-08-06 拍板为**选项 A**（[Issue #52]
-(https://github.com/Moshuiwang/lingxi/issues/52)）：基线不是「昨天的快照」，而是
-`app_user` 上建档时刻就存下来的 `display_name` / `employee_no` / `email` 三个字段
-（数据库设计[「三、身份与权限」](../../../../docs/技术设计/数据库设计.md#三身份与权限)：
-「**比对基线这一侧**不需要额外的历史表」）。**那句话只管基线这一侧**：花名册**读取
-结果**那一侧另有一份持久快照（两张表、迁移与行表的 ``ON DELETE CASCADE`` 见
-``0063_roster_snapshot`` 与数据库设计[「花名册持久快照」]
-(../../../../docs/技术设计/数据库设计.md#花名册持久快照)），2026-08-08 的 D2 裁定
-已经推翻了此前「本切片零新表、零迁移、无 CASCADE 联动」的说法。**本模块自身仍然不建表、
-不读库、不认识快照**：读写快照是 ``adapters/postgres_roster_snapshot.py`` 的事，
-这里只拿到别人取来的行做比对。
+基线不是「昨天的快照」，而是 `app_user` 上建档时刻就存下来的 `display_name` /
+`employee_no` / `email` 三个字段；花名册**读取结果**那一侧另有一份持久快照，但
+**本模块自身不建表、不读库、不认识快照**——读写快照是
+``adapters/postgres_roster_snapshot.py`` 的事，这里只拿到别人取来的行做比对。
 
-已知代价（决策时已接受，PR 登记为 R1）：同一处漂移在人工处理前会**每天重复**出现在
-日报里。持久快照**不改变**这一条——它保的是「花名册这一轮读得可不可信」，不是「昨天的
-比对结论」。日对日快照能去掉这份噪声，但代价是再长期存一份可识别用户内容。
+三条容易写错、且每一条都有对应断言的地方：人员 ID 用完整值查表绝不截断，短前缀
+在实测中有大量碰撞（`V-花名册-05`）；空值口径不对称（`V-花名册-07`）——存档为空
+的字段不参与比对，但存档有值、花名册变空必须报（丢值往往是转交前兆）；输出对象
+里没有任何字段值（`V-花名册-08`），:class:`PersonDiff` 只有内部标识、变化的字段
+名和转交标志，取值是渲染层的事。
 
-**渲染层按 D2 的改造已由 S-B-04 交付**：``core/identity/roster_report.py`` 现在渲染的
-就是 D2 形态（受控管理群的日报**允许**出现姓名 / 工号 / 邮箱原值）。本模块的比对语义与
-输出形态在 D2 之后**没有改**：基线仍是建档存档三字段，:class:`PersonDiff` 仍不带值——
-理由见下面第 3 条。
-
-三条容易写错、且每一条都有对应断言的地方：
-
-1. **人员 ID 用完整值查表，绝不截断。** `open_user_id` 的 6 位前缀在 710 人实测中有
-   57 组碰撞（[当前能力](../../../../docs/当前能力.md)），截断比对会把两个人判成同一个人
-   （`V-花名册-05`）。
-2. **空值口径是不对称的**（`V-花名册-07`）。存档为空的字段不参与比对——否则一个建档时
-   就没留邮箱的用户会天天被误报；但存档有值、花名册变空**必须报**，丢值往往是转交前兆。
-3. **输出对象里没有任何字段值**（`V-花名册-08`）。:class:`PersonDiff` 只有内部标识、
-   变化的**字段名**和转交标志，值根本没进来过。这条在 D2 之后仍然成立，但**理由变了**：
-   它不再是「日报只展示脱敏摘要」那条已被覆盖的产品承诺的落点，而是分层——比对层只
-   回答「哪个字段变了」，取值是渲染层拿基线与花名册行去做的事。
-
-本模块是 `core/`：纯函数、无 I/O、不 import `adapters/`，同样输入永远得到同样输出
-（`V-花名册-31` 第③面要求重启后当日重发的载荷与首次逐字段一致，因此输出顺序也不能
-依赖集合迭代序——凡是进入结果的序列都按固定次序生成）。
+本模块是 `core/`：纯函数、无 I/O，同样输入永远得到同样输出，输出顺序不依赖集合迭代序。
 """
 
 from __future__ import annotations
@@ -57,12 +33,9 @@ FIELD_LABELS: Mapping[str, str] = {
 
 # 存档字段名 → 花名册行里的键名。花名册行的键沿用
 # `adapters/feishu_roster_bitable.RosterRow` 的字段名，本模块不认识多维表格的中文列名。
-#
 # **这张表只有三项，是本切片数据范围的边界。** 部门与账号状态即便出现在输入行里也
 # 不会进差异集（`V-花名册-09`）：部门属组织快照持续同步的范畴，飞书在职状态按设计
-# 「按需回读、不落库」（数据库设计「三、身份与权限」的「飞书在职状态不落库，每次按需
-# 回读」一段；**不写行号**——行号会随文档增删漂移，此处此前指向的 :150 就已经不对了）。
-# 往这里加键＝扩大读取面，须先改定案。
+# 「按需回读、不落库」。往这里加键＝扩大读取面，须先改定案。
 ROSTER_KEYS: Mapping[str, str] = {
     "display_name": "name",
     "employee_no": "employee_no",
@@ -120,6 +93,8 @@ class PersonDiff:
 
 @dataclass(frozen=True)
 class RosterAuditReport:
+    """一轮比对的完整结果：全部差异条目 + 纳入比对的用户数。"""
+
     entries: tuple[PersonDiff, ...] = ()
     # 本轮纳入比对的已开通用户数。只是计数，不含任何人的资料。
     examined: int = 0
@@ -127,25 +102,26 @@ class RosterAuditReport:
     @property
     def is_empty(self) -> bool:
         """没有任何差异。空差异日不发日报，只记一条审计（`V-花名册-25`）。"""
-
         return not self.entries
 
     @property
     def handover_count(self) -> int:
+        """疑似转交的条目数。"""
         return sum(1 for entry in self.entries if entry.handover)
 
     @property
     def removed_count(self) -> int:
+        """花名册里查无此人的条目数。"""
         return sum(1 for entry in self.entries if entry.kind is DiffKind.REMOVED)
 
     @property
     def ambiguous_count(self) -> int:
+        """同一人员 ID 命中多行、无法判定的条目数。"""
         return sum(1 for entry in self.entries if entry.kind is DiffKind.AMBIGUOUS)
 
 
 def _text(value: object) -> str:
     """取成可比较的文本。`None` 与空白一律归一为空串，不产生 ``"None"``。"""
-
     if value is None:
         return ""
     if isinstance(value, str):
@@ -155,7 +131,6 @@ def _text(value: object) -> str:
 
 def _field_changed(archived: ArchivedIdentity, row: Mapping[str, object], field: str) -> bool:
     """单个字段是否变化。不对称空值口径见模块文档第 2 条。"""
-
     stored = _text(getattr(archived, field))
     if not stored:
         # 存档就没有这个字段：没有基线就没有「变化」可言。缺邮箱的用户不得天天误报。
@@ -176,7 +151,6 @@ def compare_roster(
     比对集的过滤（`provisioning_state='active'` 且 `account_state` 不在删除态）在
     读取层的 SQL 里完成，本函数只对拿到的基线逐个判断——它不知道也不该知道状态字段。
     """
-
     # 按完整人员 ID 建索引。计数与取行分开：重复行只让计数变大，不让任何一行被选中。
     occurrences: dict[str, int] = {}
     first_row: dict[str, Mapping[str, object]] = {}

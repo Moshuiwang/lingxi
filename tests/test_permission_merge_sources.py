@@ -44,7 +44,7 @@ from __future__ import annotations
 
 import json
 import unittest
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 from lingxi.core.permission.local_override import (
     LocalPermissionOverrideEntry,
@@ -61,7 +61,7 @@ from lingxi.core.permission.merge_sources import (
 )
 from lingxi.core.permission.publish_row import lookup_metrics, serialize_translated_permissions
 
-_NOW = datetime(2026, 8, 27, 3, 0, 0, tzinfo=timezone.utc)
+_NOW = datetime(2026, 8, 27, 3, 0, 0, tzinfo=UTC)
 
 
 def _entry(
@@ -196,7 +196,9 @@ class LocalAllScopeTests(unittest.TestCase):
         """精确形状（独立审核 P2-3）：``"*"`` 只放组本身；银河各公司值留在各自具体键下
         （＝ ``"*"`` ∪ 该公司值），不被抹平到全部公司。"""
 
-        local = _resolved(_entry(company_id="*", metric_name="m1"), _entry(company_id="*", metric_name="m2"))
+        local = _resolved(
+            _entry(company_id="*", metric_name="m1"), _entry(company_id="*", metric_name="m2")
+        )
 
         result = merge_permission_sources(
             galaxy={"88": ("g1",), "99": ("g2",)}, local=local, full_access_wildcard=False
@@ -215,7 +217,9 @@ class LocalAllScopeTests(unittest.TestCase):
 
         local = _resolved(*(_entry(company_id="*", metric_name=m) for m in ("g1", "g2", "m1")))
 
-        result = merge_permission_sources(galaxy={"88": ("g1",), "99": ("g2",)}, local=local, full_access_wildcard=False)
+        result = merge_permission_sources(
+            galaxy={"88": ("g1",), "99": ("g2",)}, local=local, full_access_wildcard=False
+        )
 
         self.assertEqual(result.permissions, {"*": ("g1", "g2", "m1")})
 
@@ -230,9 +234,13 @@ class LocalAllScopeTests(unittest.TestCase):
         """不扩权（独立审核 P2-3）：40 号公司专有的本地授权只出现在 ``"40"`` 键下，
         不会因为存在「全部」组就被发给全部公司；``"40"`` 键仍 ⊇ ``"*"``（防窄化）。"""
 
-        local = _resolved(_entry(company_id="*", metric_name="m1"), _entry(company_id="40", metric_name="x9"))
+        local = _resolved(
+            _entry(company_id="*", metric_name="m1"), _entry(company_id="40", metric_name="x9")
+        )
 
-        result = merge_permission_sources(galaxy={"88": ("g1",)}, local=local, full_access_wildcard=False)
+        result = merge_permission_sources(
+            galaxy={"88": ("g1",)}, local=local, full_access_wildcard=False
+        )
 
         self.assertEqual(result.permissions, {"*": ("m1",), "40": ("m1", "x9"), "88": ("g1", "m1")})
 
@@ -242,7 +250,9 @@ class LocalAllScopeTests(unittest.TestCase):
         from lingxi.core.permission.publish_row import lookup_metrics
 
         galaxy = {"88": ("g1", "g2"), "99": ("g3",)}
-        local = _resolved(_entry(company_id="*", metric_name="m1"), _entry(company_id="99", metric_name="x9"))
+        local = _resolved(
+            _entry(company_id="*", metric_name="m1"), _entry(company_id="99", metric_name="x9")
+        )
         result = merge_permission_sources(galaxy=galaxy, local=local, full_access_wildcard=False)
 
         star = set(result.permissions["*"])
@@ -259,7 +269,9 @@ class LocalAllScopeTests(unittest.TestCase):
     def test_limited_galaxy_wildcard_keeps_v2_behaviour(self) -> None:
         local = _resolved(_entry(company_id="*", metric_name="m1"))
 
-        result = merge_permission_sources(galaxy={"*": ("g1",)}, local=local, full_access_wildcard=False)
+        result = merge_permission_sources(
+            galaxy={"*": ("g1",)}, local=local, full_access_wildcard=False
+        )
 
         self.assertEqual(result.permissions, {"*": ("g1", "m1")})
         self.assertEqual(result.skipped_reasons, ())
@@ -267,7 +279,9 @@ class LocalAllScopeTests(unittest.TestCase):
     def test_true_full_access_galaxy_wildcard_still_skips_the_group(self) -> None:
         local = _resolved(_entry(company_id="*", metric_name="m1"))
 
-        result = merge_permission_sources(galaxy={"*": ("g1",)}, local=local, full_access_wildcard=True)
+        result = merge_permission_sources(
+            galaxy={"*": ("g1",)}, local=local, full_access_wildcard=True
+        )
 
         self.assertEqual(result.permissions, {"*": ("g1",)})
         self.assertIn(REASON_GRANT_REDUNDANT_WILDCARD, result.skipped_reasons)
@@ -279,9 +293,13 @@ class LocalAllScopeTests(unittest.TestCase):
             _entry(company_id="88", metric_name="m2", direction=OverrideDirection.SUPPRESS),
         )
 
-        result = merge_permission_sources(galaxy={"99": ("g1",)}, local=local, full_access_wildcard=False)
+        result = merge_permission_sources(
+            galaxy={"99": ("g1",)}, local=local, full_access_wildcard=False
+        )
 
-        self.assertEqual(result.permissions, {"*": ("m1", "m2"), "88": ("m1",), "99": ("g1", "m1", "m2")})
+        self.assertEqual(
+            result.permissions, {"*": ("m1", "m2"), "88": ("m1",), "99": ("g1", "m1", "m2")}
+        )
         self.assertEqual(result.unrepresentable_companies, ())
 
     def test_a_suppression_that_does_not_bite_emits_no_specific_key(self) -> None:
@@ -315,7 +333,9 @@ class LocalAllScopeTests(unittest.TestCase):
             _entry(company_id="*", metric_name="m2", direction=OverrideDirection.SUPPRESS),
         )
         # 同键 grant+suppress 已由 resolve_local_overrides 判 suppress 赢；这里只剩 m1。
-        result = merge_permission_sources(galaxy={"88": ("m2",)}, local=local, full_access_wildcard=False)
+        result = merge_permission_sources(
+            galaxy={"88": ("m2",)}, local=local, full_access_wildcard=False
+        )
 
         self.assertEqual(
             result.permissions,
@@ -332,7 +352,9 @@ class LocalAllScopeTests(unittest.TestCase):
             _entry(company_id="*", metric_name="m1", direction=OverrideDirection.SUPPRESS),
         )
 
-        result = merge_permission_sources(galaxy={"88": ("g1",)}, local=local, full_access_wildcard=False)
+        result = merge_permission_sources(
+            galaxy={"88": ("g1",)}, local=local, full_access_wildcard=False
+        )
 
         self.assertEqual(result.permissions, {"88": ("g1",)})
         self.assertEqual(result.unrepresentable_companies, ())
@@ -372,7 +394,9 @@ class WildcardRoleTests(unittest.TestCase):
             galaxy={ALL_COMPANIES_KEY: ("全部指标",)}, local=local, full_access_wildcard=True
         )
 
-        self.assertEqual(result.permissions, {ALL_COMPANIES_KEY: ("全部指标",)}, "通配下 grant 是冗余")
+        self.assertEqual(
+            result.permissions, {ALL_COMPANIES_KEY: ("全部指标",)}, "通配下 grant 是冗余"
+        )
         self.assertIn(REASON_GRANT_REDUNDANT_WILDCARD, result.skipped_reasons)
 
     def test_wildcard_skips_suppress_with_a_reason(self) -> None:
@@ -487,9 +511,7 @@ class LimitedWildcardTests(unittest.TestCase):
             full_access_wildcard=False,
         )
 
-        self.assertEqual(
-            result.permissions, {ALL_COMPANIES_KEY: ("客户数", "收入", "留存率")}
-        )
+        self.assertEqual(result.permissions, {ALL_COMPANIES_KEY: ("客户数", "收入", "留存率")})
 
     def test_no_narrowing_regression_no_specific_company_key_is_ever_produced(
         self,
@@ -543,9 +565,7 @@ class LimitedWildcardTests(unittest.TestCase):
         )
 
         self.assertEqual(result.permissions, {})
-        self.assertNotIn(
-            ALL_COMPANIES_KEY, result.permissions, "抑制到空必须丢弃键，不写空列表"
-        )
+        self.assertNotIn(ALL_COMPANIES_KEY, result.permissions, "抑制到空必须丢弃键，不写空列表")
 
     def test_no_local_source_is_identity_under_the_limited_form_too(self) -> None:
         result = merge_permission_sources(
@@ -592,9 +612,7 @@ class PublishRowReadbackSelfProofTests(unittest.TestCase):
                 self.assertEqual(
                     lookup_metrics(read_back, company_id), ("净利润", "客户数", "收入")
                 )
-                self.assertNotIn(
-                    company_id, read_back, "不得因为合并而凭空长出具体公司键"
-                )
+                self.assertNotIn(company_id, read_back, "不得因为合并而凭空长出具体公司键")
 
     def test_a_caller_that_hardcodes_true_reproduces_the_pre_440_misjudgment(self) -> None:
         """红/绿对照的「红」半边：模拟一个调用点没有做「真全指标通配 vs 有限指标
@@ -618,9 +636,7 @@ class PublishRowReadbackSelfProofTests(unittest.TestCase):
             {ALL_COMPANIES_KEY: baseline},
             "错误地传 full_access_wildcard=True 时，补授的指标不出现在结果里——这就是误判本身",
         )
-        self.assertIn(
-            REASON_GRANT_REDUNDANT_WILDCARD, misjudged.skipped_reasons
-        )
+        self.assertIn(REASON_GRANT_REDUNDANT_WILDCARD, misjudged.skipped_reasons)
 
 
 class RequiredParameterTests(unittest.TestCase):

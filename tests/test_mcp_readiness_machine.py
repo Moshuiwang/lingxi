@@ -8,7 +8,7 @@
 
 `V-权限-06` 的措辞 2026-08-17 由「回读版本比对」改写为「探针法」：发布表侧没有版本字段
 （G-155 终判，全表回源核对），回读比对不可行。改写依据与新判定见
-``src/lingxi/core/permission/mcp_readiness.py`` 模块文档。
+``src/lingxi/core/permission/mcp_readiness_base.py`` 模块文档。
 
 **一秒都不用真的等**：时钟与 ``sleep`` 都是注入的，用例里用假时钟把十五分钟走完。
 
@@ -39,9 +39,9 @@ import ast
 import inspect
 import textwrap
 import unittest
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 
-from lingxi.core.permission.mcp_readiness import (
+from lingxi.core.permission.mcp_readiness_base import (
     CONTRACT_SCHEDULE,
     DEFAULT_BUDGET_SECONDS,
     DEFAULT_INTERVAL_SECONDS,
@@ -52,17 +52,19 @@ from lingxi.core.permission.mcp_readiness import (
     ReadinessAttempt,
     ReadinessBinding,
     ReadinessOutcome,
-    ReadinessProgress,
-    ReadinessRecoveryTicker,
     ReadinessSchedule,
     ReadinessSession,
-    ReadinessTicker,
     classify_probe,
     evaluate_permission_presence,
+)
+from lingxi.core.permission.mcp_readiness_tick import (
+    ReadinessProgress,
+    ReadinessRecoveryTicker,
+    ReadinessTicker,
     next_probe_due,
 )
 
-START = datetime(2026, 8, 17, 3, 0, tzinfo=timezone.utc)
+START = datetime(2026, 8, 17, 3, 0, tzinfo=UTC)
 USER = "usr_A"
 VERSION = 7
 PERMISSIONS = '{"1011":["日活","收入"]}'
@@ -170,9 +172,7 @@ class ScheduleTest(unittest.TestCase):
         self.assertEqual(CONTRACT_SCHEDULE.budget_seconds, DEFAULT_BUDGET_SECONDS)
         self.assertEqual(DEFAULT_INTERVAL_SECONDS, 180)
         self.assertEqual(DEFAULT_BUDGET_SECONDS, 900)
-        self.assertEqual(
-            CONTRACT_SCHEDULE.attempt_offsets(), (0, 180, 360, 540, 720, 900)
-        )
+        self.assertEqual(CONTRACT_SCHEDULE.attempt_offsets(), (0, 180, 360, 540, 720, 900))
         self.assertEqual(CONTRACT_SCHEDULE.max_attempts, 6)
 
     def test_minimal_legal_configuration_shortens_the_window(self) -> None:
@@ -242,7 +242,7 @@ class ScheduleTest(unittest.TestCase):
 
 
 class PermissionPresenceTest(unittest.TestCase):
-    """"明确无权限"只从**数据库侧**得出，且按回退制（不取并集）。"""
+    """ "明确无权限"只从**数据库侧**得出，且按回退制（不取并集）。"""
 
     def test_present_permissions_are_waitable(self) -> None:
         self.assertTrue(evaluate_permission_presence(PERMISSIONS))
@@ -255,7 +255,9 @@ class PermissionPresenceTest(unittest.TestCase):
 
     def test_company_key_present_does_not_fall_back_to_wildcard(self) -> None:
         # 回退制：显式键存在（哪怕是空列表）就到此为止，**不并入通配**。
-        self.assertFalse(evaluate_permission_presence('{"1011":[],"*":["日活"]}', company_id="1011"))
+        self.assertFalse(
+            evaluate_permission_presence('{"1011":[],"*":["日活"]}', company_id="1011")
+        )
         self.assertTrue(evaluate_permission_presence('{"1011":[],"*":["日活"]}', company_id="1012"))
 
     def test_unreadable_permissions_raise_instead_of_denying(self) -> None:
@@ -389,9 +391,11 @@ class ConfirmationTest(unittest.TestCase):
         """计数把 ``waiting`` 也算进去，会让"等不到"与"压根没探成"在告警里混成一件事。"""
 
         confirmation, _, _, _, _ = _confirmation(
-            0, McpProbeError("transport_error"), schedule=ReadinessSchedule(
+            0,
+            McpProbeError("transport_error"),
+            schedule=ReadinessSchedule(
                 interval_seconds=1, budget_seconds=2, probe_timeout_seconds=1
-            )
+            ),
         )
         session = confirmation.confirm(BINDING, permissions=PERMISSIONS)
         self.assertEqual(session.attempt_count, 4)  # 空结果 + 技术失败 + 空结果 + 超时
@@ -437,7 +441,9 @@ class BudgetTest(unittest.TestCase):
 
     def test_full_contract_window_uses_six_probes_over_fifteen_minutes(self) -> None:
         clock = FakeClock()
-        confirmation, probe, _, _, _ = _confirmation(0, 0, 0, 0, 0, 0, schedule=CONTRACT_SCHEDULE, clock=clock)
+        confirmation, probe, _, _, _ = _confirmation(
+            0, 0, 0, 0, 0, 0, schedule=CONTRACT_SCHEDULE, clock=clock
+        )
         session = confirmation.confirm(BINDING, permissions=PERMISSIONS)
         self.assertEqual(session.outcome, ReadinessOutcome.TIMED_OUT)
         self.assertEqual(len(probe.calls), 6)
@@ -788,9 +794,7 @@ class AttemptInvariantTest(unittest.TestCase):
             error_code="budget_exhausted",
         )
         with self.assertRaises(ValueError):
-            ReadinessSession(
-                binding=BINDING, outcome=ReadinessOutcome.READY, attempts=(timed_out,)
-            )
+            ReadinessSession(binding=BINDING, outcome=ReadinessOutcome.READY, attempts=(timed_out,))
 
 
 class ClockTest(unittest.TestCase):
@@ -853,7 +857,9 @@ class SleeperTest(unittest.TestCase):
         """反面参照：注入了 sleeper 之后，整轮确认确实走过了完整预算。"""
 
         clock = FakeClock()
-        confirmation, _, _, _, _ = _confirmation(0, 0, 0, 0, 0, 0, schedule=CONTRACT_SCHEDULE, clock=clock)
+        confirmation, _, _, _, _ = _confirmation(
+            0, 0, 0, 0, 0, 0, schedule=CONTRACT_SCHEDULE, clock=clock
+        )
         confirmation.confirm(BINDING, permissions=PERMISSIONS)
         self.assertEqual(sum(clock.slept), 900.0)
 
@@ -970,7 +976,7 @@ class ReadinessProgressTest(unittest.TestCase):
 
 
 class NextProbeDueTest(unittest.TestCase):
-    """"下一次什么时候到期"是纯函数，计划表与阻塞形态**同一份**。"""
+    """ "下一次什么时候到期"是纯函数，计划表与阻塞形态**同一份**。"""
 
     def test_the_offsets_match_the_blocking_engine(self) -> None:
         for count, expected in enumerate(CONTRACT_SCHEDULE.attempt_offsets()):
@@ -1193,7 +1199,7 @@ class ReadinessTickerTest(unittest.TestCase):
         return ticker, store, the_clock
 
     def test_a_probe_that_ignores_its_own_timeout_is_still_capped(self) -> None:
-        """"探针链失控"那一种仍然挡得住：无视自己超时的成功**不算就绪**。"""
+        """ "探针链失控"那一种仍然挡得住：无视自己超时的成功**不算就绪**。"""
 
         ticker, _, _ = self._slow_ticker(CONTRACT_SCHEDULE.probe_timeout_seconds + 5)
 
@@ -1290,7 +1296,11 @@ class ReadinessTickerTest(unittest.TestCase):
 
         store = FakeStore()
         ticker = ReadinessTicker(
-            probe=None, store=store, audit=FakeAudit(), clock=FakeClock(), schedule=CONTRACT_SCHEDULE
+            probe=None,
+            store=store,
+            audit=FakeAudit(),
+            clock=FakeClock(),
+            schedule=CONTRACT_SCHEDULE,
         )
 
         for count in (1, 6):
@@ -1355,9 +1365,7 @@ class ReadinessTickerTest(unittest.TestCase):
     def test_the_two_forms_share_one_probe_step(self) -> None:
         """两种形态**共用同一份**"发一次探针并落库"的实现，不是两套语义。"""
 
-        self.assertIs(
-            McpReadinessConfirmation._probe_once, ReadinessTicker._probe_once
-        )
+        self.assertIs(McpReadinessConfirmation._probe_once, ReadinessTicker._probe_once)
         self.assertIs(McpReadinessConfirmation._attempt, ReadinessTicker._attempt)
 
     def test_the_ticker_rejects_a_binding_of_the_wrong_type(self) -> None:
@@ -1515,9 +1523,7 @@ class ReadinessRecoveryTickerTest(unittest.TestCase):
     def test_it_shares_the_same_probe_step_as_the_other_two_forms(self) -> None:
         """三种形态**共用同一份**"发一次探针并落库"的实现，不是第三套判据。"""
 
-        self.assertIs(
-            McpReadinessConfirmation._probe_once, ReadinessRecoveryTicker._probe_once
-        )
+        self.assertIs(McpReadinessConfirmation._probe_once, ReadinessRecoveryTicker._probe_once)
         self.assertIs(McpReadinessConfirmation._attempt, ReadinessRecoveryTicker._attempt)
         self.assertIs(ReadinessTicker._probe_once, ReadinessRecoveryTicker._probe_once)
 
@@ -1550,16 +1556,16 @@ class ReadinessRecoveryTickerTest(unittest.TestCase):
     def test_record_processing_failure_shares_the_same_attempt_helper(self) -> None:
         """与探针路径共用同一份落库 + 审计实现，不是第二套形状。"""
 
-        self.assertIs(
-            McpReadinessConfirmation._attempt, ReadinessRecoveryTicker._attempt
-        )
+        self.assertIs(McpReadinessConfirmation._attempt, ReadinessRecoveryTicker._attempt)
 
     def test_record_processing_failure_rejects_a_binding_of_the_wrong_type(self) -> None:
         ticker, _, _, _, _ = _recovery_ticker(3)
 
         with self.assertRaises(TypeError):
             ticker.record_processing_failure(
-                ("usr_A", 7), attempt_no=1, code="x"  # type: ignore[arg-type]
+                ("usr_A", 7),
+                attempt_no=1,
+                code="x",  # type: ignore[arg-type]
             )
 
     def test_record_processing_failure_rejects_an_illegal_attempt_number(self) -> None:
@@ -1569,7 +1575,9 @@ class ReadinessRecoveryTickerTest(unittest.TestCase):
             with self.subTest(bad=repr(bad)):
                 with self.assertRaises(ValueError):
                     ticker.record_processing_failure(
-                        BINDING, attempt_no=bad, code="x"  # type: ignore[arg-type]
+                        BINDING,
+                        attempt_no=bad,
+                        code="x",  # type: ignore[arg-type]
                     )
 
     def test_record_processing_failure_requires_a_code(self) -> None:

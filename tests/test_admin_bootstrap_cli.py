@@ -11,7 +11,7 @@ import io
 import unittest
 
 from lingxi.apps import admin_bootstrap
-from lingxi.core.admin.registry import AdminRegistrySeedConflict
+from lingxi.core.admin.registry import AdminRegistrySeedConflictError
 
 
 class MissingDsnTests(unittest.TestCase):
@@ -137,7 +137,7 @@ class ConfirmedWriteTests(unittest.TestCase):
         err = io.StringIO()
 
         def conflicting_seed(open_id: str) -> bool:
-            raise AdminRegistrySeedConflict(mismatched_fields=("label",))
+            raise AdminRegistrySeedConflictError(mismatched_fields=("label",))
 
         code = admin_bootstrap.run(
             ["--confirm"],

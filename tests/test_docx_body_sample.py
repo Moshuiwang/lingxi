@@ -100,8 +100,10 @@ class ComprehensiveHistogramTest(unittest.TestCase):
 
     def test_quote_code_and_divider_counts_match_the_histogram(self) -> None:
         self.assertEqual(self._count(r"> "), COMPREHENSIVE_BLOCK_TYPE_HISTOGRAM[34])
-        self.assertEqual(self._count(r"```\w") , COMPREHENSIVE_BLOCK_TYPE_HISTOGRAM[14])
-        self.assertEqual(sum(1 for line in self.LINES if line == "---"), COMPREHENSIVE_BLOCK_TYPE_HISTOGRAM[22])
+        self.assertEqual(self._count(r"```\w"), COMPREHENSIVE_BLOCK_TYPE_HISTOGRAM[14])
+        self.assertEqual(
+            sum(1 for line in self.LINES if line == "---"), COMPREHENSIVE_BLOCK_TYPE_HISTOGRAM[22]
+        )
 
     def test_table_cell_count_matches_the_declared_rows(self) -> None:
         cells = sum(len(row) for row in COMPREHENSIVE_TABLE_ROWS)

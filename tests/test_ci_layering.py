@@ -9,7 +9,6 @@ import tempfile
 import unittest
 from pathlib import Path
 
-
 ROOT = Path(__file__).parents[1]
 
 
@@ -37,7 +36,9 @@ class StoryClassificationTest(unittest.TestCase):
         self.assertEqual(CLASSIFIER.classify(["docs/协作约定.md", "AGENTS.md"]), "docs")
 
     def test_normal_code_uses_fast_gate(self) -> None:
-        self.assertEqual(CLASSIFIER.classify(["src/lingxi/core/ids.py", "tests/test_core_ids.py"]), "fast")
+        self.assertEqual(
+            CLASSIFIER.classify(["src/lingxi/core/ids.py", "tests/test_core_ids.py"]), "fast"
+        )
 
     def test_ci_deploy_migration_and_dependency_changes_use_full_gate(self) -> None:
         for path in (
@@ -62,6 +63,14 @@ class StoryClassificationTest(unittest.TestCase):
             "fast",
         )
 
+    def test_function_size_ratchet_baseline_does_not_escalate_to_full_gate(self) -> None:
+        self.assertEqual(
+            CLASSIFIER.classify(["scripts/ci/function_size_ratchet_baseline.txt"]), "fast"
+        )
+
+    def test_comment_ratchet_baseline_does_not_escalate_to_full_gate(self) -> None:
+        self.assertEqual(CLASSIFIER.classify(["scripts/ci/comment_ratchet_baseline.txt"]), "fast")
+
     def test_classifier_script_itself_still_uses_full_gate(self) -> None:
         # 否定用例：分类器自身的 .py 改动可能改变判定逻辑，必须继续提级，
         # 不能因为「登记了一个数据文件豁免」就连带放松脚本改动。
@@ -71,6 +80,12 @@ class StoryClassificationTest(unittest.TestCase):
         # 否定用例：与被登记豁免的 size_ratchet_baseline.txt 同源但不同性质——
         # 这是核对该数据文件的检查脚本本身，改动可能改变门禁判定，必须继续提级。
         self.assertEqual(CLASSIFIER.classify(["scripts/ci/check_size_ratchet.py"]), "full")
+
+    def test_function_size_ratchet_checker_script_still_uses_full_gate(self) -> None:
+        self.assertEqual(CLASSIFIER.classify(["scripts/ci/check_function_size_ratchet.py"]), "full")
+
+    def test_comment_ratchet_checker_script_still_uses_full_gate(self) -> None:
+        self.assertEqual(CLASSIFIER.classify(["scripts/ci/check_comment_ratchet.py"]), "full")
 
     def test_ci_gate_shell_script_still_uses_full_gate(self) -> None:
         # 否定用例：scripts/ci/ 下的门禁 .sh 改动同样必须继续提级。
@@ -121,23 +136,49 @@ class StoryClassificationTest(unittest.TestCase):
             subprocess.run(["git", "init", "-q"], cwd=repository, check=True)
             subprocess.run(["git", "add", "."], cwd=repository, check=True)
             subprocess.run(
-                ["git", "-c", "user.name=test", "-c", "user.email=test@example.invalid", "commit", "-qm", "base"],
+                [
+                    "git",
+                    "-c",
+                    "user.name=test",
+                    "-c",
+                    "user.email=test@example.invalid",
+                    "commit",
+                    "-qm",
+                    "base",
+                ],
                 cwd=repository,
                 check=True,
             )
             base = subprocess.run(
-                ["git", "rev-parse", "HEAD"], cwd=repository, check=True, capture_output=True, text=True
+                ["git", "rev-parse", "HEAD"],
+                cwd=repository,
+                check=True,
+                capture_output=True,
+                text=True,
             ).stdout.strip()
             (repository / "deploy/compose.yaml").unlink()
             (repository / "docs/note.md").write_text("after\n", encoding="utf-8")
             subprocess.run(["git", "add", "-A"], cwd=repository, check=True)
             subprocess.run(
-                ["git", "-c", "user.name=test", "-c", "user.email=test@example.invalid", "commit", "-qm", "change"],
+                [
+                    "git",
+                    "-c",
+                    "user.name=test",
+                    "-c",
+                    "user.email=test@example.invalid",
+                    "commit",
+                    "-qm",
+                    "change",
+                ],
                 cwd=repository,
                 check=True,
             )
             head = subprocess.run(
-                ["git", "rev-parse", "HEAD"], cwd=repository, check=True, capture_output=True, text=True
+                ["git", "rev-parse", "HEAD"],
+                cwd=repository,
+                check=True,
+                capture_output=True,
+                text=True,
             ).stdout.strip()
 
             paths = CLASSIFIER.changed_paths(base, head, repository=repository)
@@ -154,22 +195,48 @@ class StoryClassificationTest(unittest.TestCase):
             subprocess.run(["git", "init", "-q"], cwd=repository, check=True)
             subprocess.run(["git", "add", "."], cwd=repository, check=True)
             subprocess.run(
-                ["git", "-c", "user.name=test", "-c", "user.email=test@example.invalid", "commit", "-qm", "base"],
+                [
+                    "git",
+                    "-c",
+                    "user.name=test",
+                    "-c",
+                    "user.email=test@example.invalid",
+                    "commit",
+                    "-qm",
+                    "base",
+                ],
                 cwd=repository,
                 check=True,
             )
             base = subprocess.run(
-                ["git", "rev-parse", "HEAD"], cwd=repository, check=True, capture_output=True, text=True
+                ["git", "rev-parse", "HEAD"],
+                cwd=repository,
+                check=True,
+                capture_output=True,
+                text=True,
             ).stdout.strip()
             (repository / "scripts/ci/check.py").rename(repository / "docs/check.py")
             subprocess.run(["git", "add", "-A"], cwd=repository, check=True)
             subprocess.run(
-                ["git", "-c", "user.name=test", "-c", "user.email=test@example.invalid", "commit", "-qm", "rename"],
+                [
+                    "git",
+                    "-c",
+                    "user.name=test",
+                    "-c",
+                    "user.email=test@example.invalid",
+                    "commit",
+                    "-qm",
+                    "rename",
+                ],
                 cwd=repository,
                 check=True,
             )
             head = subprocess.run(
-                ["git", "rev-parse", "HEAD"], cwd=repository, check=True, capture_output=True, text=True
+                ["git", "rev-parse", "HEAD"],
+                cwd=repository,
+                check=True,
+                capture_output=True,
+                text=True,
             ).stdout.strip()
 
             paths = CLASSIFIER.changed_paths(base, head, repository=repository)
@@ -183,22 +250,49 @@ class StoryClassificationTest(unittest.TestCase):
             (repository / "docs/参考证据").mkdir(parents=True)
             subprocess.run(["git", "init", "-q"], cwd=repository, check=True)
             subprocess.run(
-                ["git", "-c", "user.name=test", "-c", "user.email=test@example.invalid", "commit", "--allow-empty", "-qm", "base"],
+                [
+                    "git",
+                    "-c",
+                    "user.name=test",
+                    "-c",
+                    "user.email=test@example.invalid",
+                    "commit",
+                    "--allow-empty",
+                    "-qm",
+                    "base",
+                ],
                 cwd=repository,
                 check=True,
             )
             base = subprocess.run(
-                ["git", "rev-parse", "HEAD"], cwd=repository, check=True, capture_output=True, text=True
+                ["git", "rev-parse", "HEAD"],
+                cwd=repository,
+                check=True,
+                capture_output=True,
+                text=True,
             ).stdout.strip()
             (repository / "docs/参考证据/验收.md").write_text("通过\n", encoding="utf-8")
             subprocess.run(["git", "add", "."], cwd=repository, check=True)
             subprocess.run(
-                ["git", "-c", "user.name=test", "-c", "user.email=test@example.invalid", "commit", "-qm", "docs"],
+                [
+                    "git",
+                    "-c",
+                    "user.name=test",
+                    "-c",
+                    "user.email=test@example.invalid",
+                    "commit",
+                    "-qm",
+                    "docs",
+                ],
                 cwd=repository,
                 check=True,
             )
             head = subprocess.run(
-                ["git", "rev-parse", "HEAD"], cwd=repository, check=True, capture_output=True, text=True
+                ["git", "rev-parse", "HEAD"],
+                cwd=repository,
+                check=True,
+                capture_output=True,
+                text=True,
             ).stdout.strip()
 
             paths = CLASSIFIER.changed_paths(base, head, repository=repository)
@@ -212,22 +306,49 @@ class StoryClassificationTest(unittest.TestCase):
             (repository / " docs").mkdir()
             subprocess.run(["git", "init", "-q"], cwd=repository, check=True)
             subprocess.run(
-                ["git", "-c", "user.name=test", "-c", "user.email=test@example.invalid", "commit", "--allow-empty", "-qm", "base"],
+                [
+                    "git",
+                    "-c",
+                    "user.name=test",
+                    "-c",
+                    "user.email=test@example.invalid",
+                    "commit",
+                    "--allow-empty",
+                    "-qm",
+                    "base",
+                ],
                 cwd=repository,
                 check=True,
             )
             base = subprocess.run(
-                ["git", "rev-parse", "HEAD"], cwd=repository, check=True, capture_output=True, text=True
+                ["git", "rev-parse", "HEAD"],
+                cwd=repository,
+                check=True,
+                capture_output=True,
+                text=True,
             ).stdout.strip()
             (repository / " docs/验收.md").write_text("未知目录\n", encoding="utf-8")
             subprocess.run(["git", "add", "."], cwd=repository, check=True)
             subprocess.run(
-                ["git", "-c", "user.name=test", "-c", "user.email=test@example.invalid", "commit", "-qm", "space"],
+                [
+                    "git",
+                    "-c",
+                    "user.name=test",
+                    "-c",
+                    "user.email=test@example.invalid",
+                    "commit",
+                    "-qm",
+                    "space",
+                ],
                 cwd=repository,
                 check=True,
             )
             head = subprocess.run(
-                ["git", "rev-parse", "HEAD"], cwd=repository, check=True, capture_output=True, text=True
+                ["git", "rev-parse", "HEAD"],
+                cwd=repository,
+                check=True,
+                capture_output=True,
+                text=True,
             ).stdout.strip()
 
             paths = CLASSIFIER.changed_paths(base, head, repository=repository)
@@ -244,23 +365,49 @@ class StoryClassificationTest(unittest.TestCase):
             subprocess.run(["git", "init", "-q"], cwd=repository, check=True)
             subprocess.run(["git", "add", "."], cwd=repository, check=True)
             subprocess.run(
-                ["git", "-c", "user.name=test", "-c", "user.email=test@example.invalid", "commit", "-qm", "base"],
+                [
+                    "git",
+                    "-c",
+                    "user.name=test",
+                    "-c",
+                    "user.email=test@example.invalid",
+                    "commit",
+                    "-qm",
+                    "base",
+                ],
                 cwd=repository,
                 check=True,
             )
             base = subprocess.run(
-                ["git", "rev-parse", "HEAD"], cwd=repository, check=True, capture_output=True, text=True
+                ["git", "rev-parse", "HEAD"],
+                cwd=repository,
+                check=True,
+                capture_output=True,
+                text=True,
             ).stdout.strip()
             changed.unlink()
             changed.symlink_to("target.py")
             subprocess.run(["git", "add", "-A"], cwd=repository, check=True)
             subprocess.run(
-                ["git", "-c", "user.name=test", "-c", "user.email=test@example.invalid", "commit", "-qm", "type"],
+                [
+                    "git",
+                    "-c",
+                    "user.name=test",
+                    "-c",
+                    "user.email=test@example.invalid",
+                    "commit",
+                    "-qm",
+                    "type",
+                ],
                 cwd=repository,
                 check=True,
             )
             head = subprocess.run(
-                ["git", "rev-parse", "HEAD"], cwd=repository, check=True, capture_output=True, text=True
+                ["git", "rev-parse", "HEAD"],
+                cwd=repository,
+                check=True,
+                capture_output=True,
+                text=True,
             ).stdout.strip()
 
             paths = CLASSIFIER.changed_paths(base, head, repository=repository)

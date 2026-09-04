@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import os
 import unittest
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 
 from postgres_schema import ensure_production_schema, psycopg_available, reset_production_rows
 
@@ -22,8 +22,12 @@ from lingxi.adapters.postgres_late_readiness_recovery import PostgresLateReadine
 from lingxi.adapters.postgres_mcp_token import PostgresMcpTokenStore
 from lingxi.adapters.postgres_permission_publish import PostgresPermissionPublishStore
 from lingxi.adapters.postgres_stalled_provisioning import PostgresStalledProvisioningStore
-from lingxi.core.permission.mcp_readiness import ReadinessAttempt, ReadinessBinding, ReadinessOutcome
-from lingxi.core.permission.publish import PublishAttempt, PublishOutcome, STATUS_PUBLISHED
+from lingxi.core.permission.mcp_readiness_base import (
+    ReadinessAttempt,
+    ReadinessBinding,
+    ReadinessOutcome,
+)
+from lingxi.core.permission.publish import STATUS_PUBLISHED, PublishAttempt, PublishOutcome
 from lingxi.core.permission.publish_row import PublishRow
 
 SPEC_MASTER_KEY = "MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY="
@@ -114,12 +118,17 @@ class StalledProvisioningPostgresTestCase(unittest.TestCase):
 
         decision = self.publish_store.record_decision(
             require_enabled_account=True,
-            user_id=user_id, row=row or _row(), reason=reason, decided_at=datetime.now(timezone.utc)
+            user_id=user_id,
+            row=row or _row(),
+            reason=reason,
+            decided_at=datetime.now(UTC),
         )
         claimed = self.publish_store.claim_next()
         assert claimed is not None
         self.publish_store.complete(
-            _publish_attempt(claimed.outbox_id, version=claimed.permission_version, user_id=user_id),
+            _publish_attempt(
+                claimed.outbox_id, version=claimed.permission_version, user_id=user_id
+            ),
             status=STATUS_PUBLISHED,
         )
         return int(decision.permission_version)
@@ -146,9 +155,7 @@ class StalledProvisioningPostgresTestCase(unittest.TestCase):
         `OnboardingReconciler` 的候选集合。"""
 
         with connect(self._dsn) as connection, connection.cursor() as cursor:
-            cursor.execute(
-                "SELECT feishu_open_id FROM app_user WHERE id = %s", (user_id,)
-            )
+            cursor.execute("SELECT feishu_open_id FROM app_user WHERE id = %s", (user_id,))
             open_id = cursor.fetchone()[0]
             cursor.execute(
                 """INSERT INTO inbound_event
@@ -157,7 +164,7 @@ class StalledProvisioningPostgresTestCase(unittest.TestCase):
                    VALUES (%s, %s, %s, %s, 'auto_provisioning', %s, %s)""",
                 (
                     event_id,
-                    dispatched_at or datetime.now(timezone.utc),
+                    dispatched_at or datetime.now(UTC),
                     "im.message.receive_v1",
                     open_id,
                     trace_id or f"trc_{event_id}",
@@ -187,7 +194,7 @@ class StalledProvisioningPostgresTestCase(unittest.TestCase):
             )
 
     def _record_timed_out(self, user_id: str, version: int, *, at: datetime | None = None) -> None:
-        moment = at or (datetime.now(timezone.utc) - timedelta(hours=1))
+        moment = at or (datetime.now(UTC) - timedelta(hours=1))
         PostgresMcpTokenStore(self._dsn, cipher=McpTokenCipher(SPEC_MASTER_KEY)).record_attempt(
             ReadinessAttempt(
                 binding=ReadinessBinding(user_id, version),
@@ -210,7 +217,7 @@ class StalledProvisioningPostgresTestCase(unittest.TestCase):
     def _expired(self, extra_seconds: int = 60) -> datetime:
         """比租约边界更早（因此判定为"已超期"）的认领时刻。"""
 
-        return datetime.now(timezone.utc) - timedelta(seconds=LEASE_SECONDS + extra_seconds)
+        return datetime.now(UTC) - timedelta(seconds=LEASE_SECONDS + extra_seconds)
 
 
 class CandidateQueryTest(StalledProvisioningPostgresTestCase):
@@ -246,7 +253,7 @@ class CandidateQueryTest(StalledProvisioningPostgresTestCase):
         self._set_state(state="provisioning")
         self._dispatch(
             "evt_a",
-            dispatched_at=datetime.now(timezone.utc) - timedelta(seconds=LEASE_SECONDS - 1),
+            dispatched_at=datetime.now(UTC) - timedelta(seconds=LEASE_SECONDS - 1),
         )
 
         self.assertEqual(self._candidates(), ())
@@ -287,7 +294,7 @@ class CandidateQueryTest(StalledProvisioningPostgresTestCase):
 
         self._set_state(state="provisioning")
         self._dispatch("evt_old", dispatched_at=self._expired(extra_seconds=3600))
-        self._dispatch("evt_recent", dispatched_at=datetime.now(timezone.utc) - timedelta(seconds=5))
+        self._dispatch("evt_recent", dispatched_at=datetime.now(UTC) - timedelta(seconds=5))
 
         self.assertEqual(
             self._candidates(),
@@ -355,7 +362,7 @@ class PreprovisionedCandidateTest(StalledProvisioningPostgresTestCase):
         """**否定断言**：正在跑的预开通链不能被判成僵尸。"""
 
         self._set_state(state="provisioning")
-        self._start_provisioning_at(datetime.now(timezone.utc) - timedelta(seconds=LEASE_SECONDS - 1))
+        self._start_provisioning_at(datetime.now(UTC) - timedelta(seconds=LEASE_SECONDS - 1))
 
         self.assertEqual(self._candidates(), ())
 
@@ -384,7 +391,7 @@ class PreprovisionedCandidateTest(StalledProvisioningPostgresTestCase):
 
         self._set_state(state="provisioning")
         self._start_provisioning_at(self._expired())
-        self._dispatch("evt_a", dispatched_at=datetime.now(timezone.utc))
+        self._dispatch("evt_a", dispatched_at=datetime.now(UTC))
 
         self.assertEqual(self._candidates(), ())
 
@@ -425,9 +432,7 @@ class ComplementaryCandidateSetsTest(StalledProvisioningPostgresTestCase):
         }
 
         self.assertEqual(stalled, {USER_A})
-        self.assertEqual(
-            late_readiness, {USER_B}, "夹具必须让 USER_B 真的出现在对方的候选集合里"
-        )
+        self.assertEqual(late_readiness, {USER_B}, "夹具必须让 USER_B 真的出现在对方的候选集合里")
         self.assertEqual(stalled & late_readiness, set())
 
 

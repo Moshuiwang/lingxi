@@ -1,10 +1,8 @@
-"""内测每日通报的统计读取（Issue #303 S-O-01；`guard_denied_count_stats`/
-`token_usage_stats` 两个方法为 Issue #304 批次 4 新增）。**本模块只读，一个写
-语句都没有。**
+"""内测每日通报的统计读取。**本模块只读，一个写语句都没有。**
 
 六个方法各对应 `core/daily_report.py` 里独立的一段统计，刻意分开而不是一次查询
 返回全部——这样`apps/scheduler/daily_report.py` 才能在其中任意一段查询失败时，
-只把那一段标记「不可判定」，其余段落照常渲染（#303 的「不可判定」显式呈现要求）。
+只把那一段标记「不可判定」，其余段落照常渲染。
 
 SQL 只做**哑分组**（`GROUP BY` 若干列后 `COUNT(*)`），不做任何业务分类判断——
 「哪个原因码算超时」「哪个算护栏触发」这类规则全部留在 `core/daily_report.py` 的
@@ -57,12 +55,10 @@ SELECT platform_message_kind,
  GROUP BY 1, 2, 3
 """
 
-# 通报补数（Issue #303/#304 批次 4，迁移 0070）：两段哑聚合，只做 COUNT/SUM，
-# 不判断"取不到算不算不可判定"——那条判定在 core/daily_report.py 的
-# build_denied_count_stats/build_token_usage_stats（模块文档「SQL 只做哑分组」
-# 同一条纪律）。`SUM` 对 SQL NULL 天然跳过不计入，`->>'字段名'` 对整行是 NULL
-# 或该字段缺失都返回 NULL，因此"覆盖的任务只对有值的部分求和"不需要额外的
-# CASE 分支。
+# 通报补数（迁移 0070）：两段哑聚合，只做 COUNT/SUM，不判断"取不到算不算不可
+# 判定"——那条判定在 core/daily_report.py 的 build_denied_count_stats/
+# build_token_usage_stats。`SUM` 对 SQL NULL 天然跳过不计入，因此"覆盖的任务
+# 只对有值的部分求和"不需要额外的 CASE 分支。
 _GUARD_DENIED_COUNT_STATS_SQL = """
 SELECT
     COUNT(*) FILTER (WHERE guard_denied_count IS NOT NULL) AS covered_tasks,
@@ -91,13 +87,16 @@ class PostgresDailyReportSource:
     """每日通报四段真实数据的读取口。构造时不连接数据库，每次调用自带连接。"""
 
     def __init__(self, dsn: str, *, timeouts: PostgresTimeouts = DEFAULT_POSTGRES_TIMEOUTS) -> None:
+        """记下 DSN 与超时配置；不在构造时连接数据库。"""
         self._dsn = dsn
         self._timeouts = timeouts
 
     def active_user_task_counts(self, *, window_start, window_end) -> tuple[int, ...]:
         """窗口内每个活跃用户的任务数——**只有计数，不含 user_id**。"""
-
-        with connect(self._dsn, timeouts=self._timeouts) as connection, connection.cursor() as cursor:
+        with (
+            connect(self._dsn, timeouts=self._timeouts) as connection,
+            connection.cursor() as cursor,
+        ):
             cursor.execute(
                 _ACTIVE_USER_TASK_COUNTS_SQL,
                 {"window_start": window_start, "window_end": window_end},
@@ -109,8 +108,10 @@ class PostgresDailyReportSource:
 
     def task_outcomes(self, *, window_start, window_end) -> tuple[TaskOutcomeRow, ...]:
         """窗口内按 `(status, error_kind)` 分组的任务计数——哑分组，不做分类判断。"""
-
-        with connect(self._dsn, timeouts=self._timeouts) as connection, connection.cursor() as cursor:
+        with (
+            connect(self._dsn, timeouts=self._timeouts) as connection,
+            connection.cursor() as cursor,
+        ):
             cursor.execute(
                 _TASK_OUTCOME_ROWS_SQL,
                 {"window_start": window_start, "window_end": window_end},
@@ -120,8 +121,10 @@ class PostgresDailyReportSource:
 
     def task_durations_seconds(self, *, window_start, window_end) -> tuple[float, ...]:
         """窗口内已完成任务的 Agent 执行耗时样本（秒），只统计已经有始末时间的行。"""
-
-        with connect(self._dsn, timeouts=self._timeouts) as connection, connection.cursor() as cursor:
+        with (
+            connect(self._dsn, timeouts=self._timeouts) as connection,
+            connection.cursor() as cursor,
+        ):
             cursor.execute(
                 _TASK_DURATIONS_SQL,
                 {"window_start": window_start, "window_end": window_end},
@@ -132,33 +135,40 @@ class PostgresDailyReportSource:
     def delivery_outcomes(self, *, window_start, window_end) -> tuple[DeliveryOutcomeRow, ...]:
         """窗口内投递终态按 `(卡片/文本, 是否已确认送达, 是否已过 24h 到期)` 的分组计数。
 
-        **调用方通常传入与其余三个方法不同的窗口**（opus 批量审查 P2 修复，见
-        `core/daily_report.py` 模块文档「投递结果段为什么用一个独立、更早的
-        窗口」）：`expires_at = created_at + 24h`，如果这里查的是"昨天"这个刚
+        **调用方通常传入与其余三个方法不同的窗口**（见 `core/daily_report.py`
+        模块文档「投递结果段为什么用一个独立、更早的窗口」）：
+        `expires_at = created_at + 24h`，如果这里查的是"昨天"这个刚
         结束不久的窗口，绝大多数行的 24 小时确认期在通报运行时还没关闭，"过期"
         这一桶会结构上恒为零。本方法自己不做任何日期偏移——完全信任调用方传入
         的 `window_start`/`window_end` 就是它想要问的那个窗口，不在这里重新
         计算或假设"应该"是哪一天。
         """
-
-        with connect(self._dsn, timeouts=self._timeouts) as connection, connection.cursor() as cursor:
+        with (
+            connect(self._dsn, timeouts=self._timeouts) as connection,
+            connection.cursor() as cursor,
+        ):
             cursor.execute(
                 _DELIVERY_OUTCOME_ROWS_SQL,
                 {"window_start": window_start, "window_end": window_end},
             )
             rows = cursor.fetchall()
         return tuple(
-            (kind, bool(received), bool(expired), int(count)) for kind, received, expired, count in rows
+            (kind, bool(received), bool(expired), int(count))
+            for kind, received, expired, count in rows
         )
 
     def guard_denied_count_stats(self, *, window_start, window_end) -> tuple[int, int, int]:
-        """窗口内 ``task.guard_denied_count`` 的哑聚合：``(covered_tasks,
-        uncovered_tasks, total)``——分别是"该字段非 NULL 的任务数"「该字段是
-        NULL 的任务数」「非 NULL 那些任务的求和」。分类判断（是否整段不可判定）
-        留给 ``core/daily_report.py::build_denied_count_stats``。
-        """
+        """窗口内 ``task.guard_denied_count`` 的哑聚合。
 
-        with connect(self._dsn, timeouts=self._timeouts) as connection, connection.cursor() as cursor:
+        返回 ``(covered_tasks, uncovered_tasks, total)``：分别是"该字段非 NULL
+        的任务数"「该字段是 NULL 的任务数」「非 NULL 那些任务的求和」。分类
+        判断（是否整段不可判定）留给
+        ``core/daily_report.py::build_denied_count_stats``。
+        """
+        with (
+            connect(self._dsn, timeouts=self._timeouts) as connection,
+            connection.cursor() as cursor,
+        ):
             cursor.execute(
                 _GUARD_DENIED_COUNT_STATS_SQL,
                 {"window_start": window_start, "window_end": window_end},
@@ -166,17 +176,18 @@ class PostgresDailyReportSource:
             covered, uncovered, total = cursor.fetchone()
         return int(covered), int(uncovered), int(total)
 
-    def token_usage_stats(
-        self, *, window_start, window_end
-    ) -> tuple[int, int, int, int, int, int]:
-        """窗口内 ``task.token_usage`` 的哑聚合：``(covered_tasks,
-        uncovered_tasks, input_tokens, output_tokens,
-        cache_creation_input_tokens, cache_read_input_tokens)``。四个 token
-        计数各自独立求和（`SUM` 对 SQL NULL 天然跳过，取到几个算几个）；分类
-        判断留给 ``core/daily_report.py::build_token_usage_stats``。
-        """
+    def token_usage_stats(self, *, window_start, window_end) -> tuple[int, int, int, int, int, int]:
+        """窗口内 ``task.token_usage`` 的哑聚合。
 
-        with connect(self._dsn, timeouts=self._timeouts) as connection, connection.cursor() as cursor:
+        返回 ``(covered_tasks, uncovered_tasks, input_tokens, output_tokens,
+        cache_creation_input_tokens, cache_read_input_tokens)``。四个 token
+        计数各自独立求和（``SUM`` 对 SQL NULL 天然跳过，取到几个算几个）；
+        分类判断留给 ``core/daily_report.py::build_token_usage_stats``。
+        """
+        with (
+            connect(self._dsn, timeouts=self._timeouts) as connection,
+            connection.cursor() as cursor,
+        ):
             cursor.execute(
                 _TOKEN_USAGE_STATS_SQL,
                 {"window_start": window_start, "window_end": window_end},

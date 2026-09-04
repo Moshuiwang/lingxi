@@ -48,7 +48,7 @@ class _Builder:
         self._fields: dict[str, Any] = {}
 
     def __getattr__(self, name: str):
-        def collect(value: Any) -> "_Builder":
+        def collect(value: Any) -> _Builder:
             self._fields[name] = value
             return self
 
@@ -64,7 +64,13 @@ class _StubModel:
         return _Builder()
 
 
-_CARDKIT_NAMES = ("CreateCardRequest", "CreateCardRequestBody", "Card", "UpdateCardRequest", "UpdateCardRequestBody")
+_CARDKIT_NAMES = (
+    "CreateCardRequest",
+    "CreateCardRequestBody",
+    "Card",
+    "UpdateCardRequest",
+    "UpdateCardRequestBody",
+)
 _IM_NAMES = ("ReplyMessageRequest", "ReplyMessageRequestBody")
 
 
@@ -146,9 +152,7 @@ class _FakeClient:
         self.reply_endpoint = _Endpoint(_Response(data=_Built(message_id="om_fake_1")))
         self.cardkit = types.SimpleNamespace(
             v1=types.SimpleNamespace(
-                card=types.SimpleNamespace(
-                    create=self.create_endpoint, update=self.update_endpoint
-                )
+                card=types.SimpleNamespace(create=self.create_endpoint, update=self.update_endpoint)
             )
         )
         self.im = types.SimpleNamespace(

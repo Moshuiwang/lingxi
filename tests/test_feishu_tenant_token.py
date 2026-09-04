@@ -43,7 +43,9 @@ class ClientConstructionTest(unittest.TestCase):
     def test_a_non_https_base_url_is_rejected(self) -> None:
         with self.assertRaises(ValueError):
             FeishuTenantTokenClient(
-                base_url="http://feishu.invalid/open-apis", app_id="cli_fake", app_secret=FAKE_APP_SECRET
+                base_url="http://feishu.invalid/open-apis",
+                app_id="cli_fake",
+                app_secret=FAKE_APP_SECRET,
             )
 
     def test_missing_credentials_are_rejected_at_construction(self) -> None:
@@ -115,13 +117,22 @@ class FetchTest(unittest.TestCase):
         """与专用授权续期不同：这里没有别的东西需要抢救（没有 refresh_token 要落盘），
         寿命缺失就直接拒绝，不把判断推给缓存层。"""
 
-        for bad_lifetime in ({}, {"expire": 0}, {"expire": "7200"}, {"expire": True}, {"expire": -1}):
+        for bad_lifetime in (
+            {},
+            {"expire": 0},
+            {"expire": "7200"},
+            {"expire": True},
+            {"expire": -1},
+        ):
             with self.subTest(bad_lifetime=bad_lifetime):
                 transport = RecordingTransport(
                     [{"code": 0, "tenant_access_token": "t-fake-tenant-token", **bad_lifetime}]
                 )
                 client = FeishuTenantTokenClient(
-                    base_url=BASE_URL, app_id="cli_fake", app_secret=FAKE_APP_SECRET, transport=transport
+                    base_url=BASE_URL,
+                    app_id="cli_fake",
+                    app_secret=FAKE_APP_SECRET,
+                    transport=transport,
                 )
 
                 with self.assertRaises(FeishuTenantTokenError) as raised:

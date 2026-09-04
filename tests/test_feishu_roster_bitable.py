@@ -45,8 +45,30 @@ class FeishuRosterBitableTest(unittest.TestCase):
     def test_all_pages_are_read_until_the_page_token_is_exhausted(self) -> None:
         source = _FakePageSource(
             [
-                ([{"fields": {"人员ID": "fs-u1", "邮箱": "jiaming.jia@example.invalid", "人员姓名": "化名甲"}}], "page-2"),
-                ([{"fields": {"人员ID": "fs-u2", "邮箱": "yiming.yi@example.invalid", "人员姓名": "化名乙"}}], None),
+                (
+                    [
+                        {
+                            "fields": {
+                                "人员ID": "fs-u1",
+                                "邮箱": "jiaming.jia@example.invalid",
+                                "人员姓名": "化名甲",
+                            }
+                        }
+                    ],
+                    "page-2",
+                ),
+                (
+                    [
+                        {
+                            "fields": {
+                                "人员ID": "fs-u2",
+                                "邮箱": "yiming.yi@example.invalid",
+                                "人员姓名": "化名乙",
+                            }
+                        }
+                    ],
+                    None,
+                ),
             ]
         )
 
@@ -76,15 +98,29 @@ class FeishuRosterBitableTest(unittest.TestCase):
             ]
         )
 
-        self.assertEqual(rows[0], RosterRow("fs-u1", "jiaming.jia@example.invalid", "化名甲", "10001", "rec1"))
+        self.assertEqual(
+            rows[0], RosterRow("fs-u1", "jiaming.jia@example.invalid", "化名甲", "10001", "rec1")
+        )
 
     def test_duplicate_personnel_id_rows_are_preserved_for_the_matcher(self) -> None:
         rows = _rows(
             [
                 (
                     [
-                        {"fields": {"人员ID": "fs-u1", "邮箱": "a@example.invalid", "人员姓名": "化名甲"}},
-                        {"fields": {"人员ID": "fs-u1", "邮箱": "b@example.invalid", "人员姓名": "化名甲"}},
+                        {
+                            "fields": {
+                                "人员ID": "fs-u1",
+                                "邮箱": "a@example.invalid",
+                                "人员姓名": "化名甲",
+                            }
+                        },
+                        {
+                            "fields": {
+                                "人员ID": "fs-u1",
+                                "邮箱": "b@example.invalid",
+                                "人员姓名": "化名甲",
+                            }
+                        },
                     ],
                     None,
                 )
@@ -102,7 +138,9 @@ class FeishuRosterBitableTest(unittest.TestCase):
 
     def test_rows_expose_only_the_fields_the_match_chain_needs(self) -> None:
         self.assertEqual(ROSTER_FIELD_NAMES, ("人员ID", "邮箱", "人员姓名", "工号"))
-        self.assertEqual(RosterRow._fields, ("personnel_id", "email", "name", "employee_no", "record_id"))
+        self.assertEqual(
+            RosterRow._fields, ("personnel_id", "email", "name", "employee_no", "record_id")
+        )
 
     def test_rows_can_be_handed_to_the_matcher_as_mappings(self) -> None:
         from lingxi.core.permission.account_match import MATCHED, match_galaxy_account
@@ -131,7 +169,14 @@ class FeishuRosterBitableTest(unittest.TestCase):
         result = match_galaxy_account(
             "fs-u1",
             rows,
-            [{"user_id": "U1", "user_name": "10001", "email": "jiaming.jia@example.invalid", "nick_name": "化名甲"}],
+            [
+                {
+                    "user_id": "U1",
+                    "user_name": "10001",
+                    "email": "jiaming.jia@example.invalid",
+                    "nick_name": "化名甲",
+                }
+            ],
         )
 
         self.assertEqual(result.state, MATCHED)

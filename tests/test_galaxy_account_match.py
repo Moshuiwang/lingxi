@@ -37,7 +37,10 @@ class GalaxyAccountMatchedTest(unittest.TestCase):
     """工号唯一命中即采用；工号缺失或未命中时邮箱回退。"""
 
     def test_unique_employee_no_hit_is_matched(self) -> None:
-        rows = [galaxy_row(), galaxy_row(user_id="U-2", user_name="80002", email="other@example-corp.invalid")]
+        rows = [
+            galaxy_row(),
+            galaxy_row(user_id="U-2", user_name="80002", email="other@example-corp.invalid"),
+        ]
         result = match_galaxy_account("ou_p1", [roster_row()], rows)
         self.assertEqual(result.state, MATCHED)
         self.assertEqual(result.reason, "unique_employee_no_match")
@@ -50,13 +53,17 @@ class GalaxyAccountMatchedTest(unittest.TestCase):
 
     def test_missing_employee_no_falls_back_to_unique_email(self) -> None:
         # V-开通-09：工号缺失但邮箱可用时按合同走邮箱回退。
-        result = match_galaxy_account("ou_p1", [roster_row(employee_no="")], [galaxy_row(user_name="99999")])
+        result = match_galaxy_account(
+            "ou_p1", [roster_row(employee_no="")], [galaxy_row(user_name="99999")]
+        )
         self.assertEqual((result.state, result.reason), (MATCHED, "unique_email_match"))
         self.assertEqual(result.matched_key, "email")
 
     def test_employee_no_miss_falls_back_to_unique_email(self) -> None:
         # 决策记录：「工号缺失**或未命中**时以邮箱匹配」。
-        result = match_galaxy_account("ou_p1", [roster_row(employee_no="70000")], [galaxy_row(user_name="80001")])
+        result = match_galaxy_account(
+            "ou_p1", [roster_row(employee_no="70000")], [galaxy_row(user_name="80001")]
+        )
         self.assertEqual((result.state, result.reason), (MATCHED, "unique_email_match"))
 
     def test_email_is_normalized_but_employee_no_is_exact(self) -> None:
@@ -68,9 +75,12 @@ class GalaxyAccountMatchedTest(unittest.TestCase):
         self.assertEqual(result.state, MATCHED)
         # 工号是字符串精确比较：0012 与 12 是两个账号，不做数值化。
         result = match_galaxy_account(
-            "ou_p1", [roster_row(employee_no="0012", email="")], [galaxy_row(user_name="12", email="")]
+            "ou_p1",
+            [roster_row(employee_no="0012", email="")],
+            [galaxy_row(user_name="12", email="")],
         )
         self.assertEqual(result.state, NOT_FOUND)
+
 
 class GalaxyAccountNotAuthorizedTest(unittest.TestCase):
     """任何非唯一成功都统一走无可用银河权限出口，同时保留内部原因。"""
@@ -91,7 +101,9 @@ class GalaxyAccountNotAuthorizedTest(unittest.TestCase):
 
     def test_missing_both_keys_is_not_authorized(self) -> None:
         # V-开通-06：工号与邮箱等必要资料均缺失。
-        result = match_galaxy_account("ou_p1", [roster_row(employee_no="", email="")], [galaxy_row()])
+        result = match_galaxy_account(
+            "ou_p1", [roster_row(employee_no="", email="")], [galaxy_row()]
+        )
         self.assertEqual((result.state, result.reason), (NOT_FOUND, "required_fields_missing"))
 
     def test_employee_no_hitting_two_accounts_is_not_authorized(self) -> None:
@@ -153,7 +165,9 @@ class GalaxyAccountNotFoundTest(unittest.TestCase):
 
     def test_employee_no_miss_without_email_is_not_found(self) -> None:
         # 产品负责人 2026-08-05 确认「缺邮箱按工号」：工号查无即申请指引。
-        result = match_galaxy_account("ou_p1", [roster_row(email="")], [galaxy_row(user_name="99999")])
+        result = match_galaxy_account(
+            "ou_p1", [roster_row(email="")], [galaxy_row(user_name="99999")]
+        )
         self.assertEqual(result.state, NOT_FOUND)
 
     def test_email_miss_without_employee_no_is_not_found(self) -> None:
@@ -216,12 +230,19 @@ class GalaxyAccountNickNameIsAdvisoryOnlyTest(unittest.TestCase):
     def test_nick_name_collision_does_not_change_a_matched_result(self) -> None:
         rows = [
             galaxy_row(),
-            galaxy_row(user_id="U-2", user_name="80002", email="other@example-corp.invalid", nick_name="何虚工"),
+            galaxy_row(
+                user_id="U-2",
+                user_name="80002",
+                email="other@example-corp.invalid",
+                nick_name="何虚工",
+            ),
         ]
         result = match_galaxy_account("ou_p1", [roster_row()], rows)
         self.assertEqual((result.state, result.galaxy_user_id), (MATCHED, "U-1"))
 
-    def test_duplicate_employee_no_stays_not_authorized_even_when_one_nick_name_matches(self) -> None:
+    def test_duplicate_employee_no_stays_not_authorized_even_when_one_nick_name_matches(
+        self,
+    ) -> None:
         # 变异守卫：两行同工号、姓名一同一异，若实现偷偷用姓名挑一条，本用例变红。
         rows = [
             galaxy_row(user_id="U-1", nick_name="何虚工", email="a@example-corp.invalid"),
@@ -231,22 +252,30 @@ class GalaxyAccountNickNameIsAdvisoryOnlyTest(unittest.TestCase):
         self.assertEqual((result.state, result.reason), (NOT_FOUND, "employee_no_multiple_hits"))
 
     def test_nick_name_cannot_rescue_a_missed_lookup(self) -> None:
-        rows = [galaxy_row(user_name="99999", email="other@example-corp.invalid", nick_name="何虚工")]
+        rows = [
+            galaxy_row(user_name="99999", email="other@example-corp.invalid", nick_name="何虚工")
+        ]
         result = match_galaxy_account("ou_p1", [roster_row()], rows)
         self.assertEqual(result.state, NOT_FOUND)
 
     def test_outcome_is_identical_when_every_nick_name_changes(self) -> None:
         rows_a = [
             galaxy_row(nick_name="甲"),
-            galaxy_row(user_id="U-2", user_name="70002", email="x@example-corp.invalid", nick_name="乙"),
+            galaxy_row(
+                user_id="U-2", user_name="70002", email="x@example-corp.invalid", nick_name="乙"
+            ),
         ]
         rows_b = [
             galaxy_row(nick_name="丙"),
-            galaxy_row(user_id="U-2", user_name="70002", email="x@example-corp.invalid", nick_name="丁"),
+            galaxy_row(
+                user_id="U-2", user_name="70002", email="x@example-corp.invalid", nick_name="丁"
+            ),
         ]
         a = match_galaxy_account("ou_p1", [roster_row()], rows_a)
         b = match_galaxy_account("ou_p1", [roster_row()], rows_b)
-        self.assertEqual((a.state, a.reason, a.galaxy_user_id), (b.state, b.reason, b.galaxy_user_id))
+        self.assertEqual(
+            (a.state, a.reason, a.galaxy_user_id), (b.state, b.reason, b.galaxy_user_id)
+        )
 
     def test_nick_name_is_reported_as_advisory_context(self) -> None:
         result = match_galaxy_account("ou_p1", [roster_row()], [galaxy_row()])

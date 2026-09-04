@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-"""文件体量棘轮门禁（Issue #238）：已超过阈值的文件只许变小、不许变大。
+"""文件体量棘轮门禁（Issue #238）：已超过阈值的文件——增长立即失败，缩小后需
+``--refresh`` 同步基线。
 
 代码框架长期缺一道挡住「往同一个巨型文件里继续加东西」的门禁：#227 与 S-D-02 各自
 往 2048 行的 ``apps/scheduler/__init__.py`` 里加代码，两次都没有任何检查会红。
@@ -8,7 +9,7 @@
 行里很大一块是连贯的中文正文说明），一个偏低的绝对上限只会逼人把连贯逻辑劈成互相
 牵连、更难读的两半。改用**棘轮**：
 
-- 已经超过阈值（1500 行）的文件，登记在
+- 已经超过阈值（1000 行）的文件，登记在
   ``scripts/ci/size_ratchet_baseline.txt`` 里，只许变小、不许变大；
 - 未超阈值的文件不得新超过阈值——不存在"先登记后随便涨"的口子；
 - 基线**必须是生成的**：``--refresh`` 重新丈量已登记文件的当前行数，只会调小或整条
@@ -16,13 +17,9 @@
   文件的行数比基线记录的还多，``--refresh`` 直接拒绝写入并报错，不会把这次增长当成
   新的基线；这正是"棘轮"这个名字的来源。
 
-阈值取 1500 行：本仓库 ``src/lingxi/`` 下一次真实丈量显示，绝大多数模块（含文档字符串
-很重的 ``publish_row.py`` 980 行、``mcp_readiness.py`` 1140 行）都在 1500 行以内，
-只有 ``adapters/postgres_conversation.py``（1951 行）与 ``apps/scheduler/__init__.py``
-（2048 行）这两个已知需要拆分的文件超过它——这正是 Issue #238 点名允许存量存在、
-但要求今后只减不增的两个文件。取更低的阈值会把 publish_row.py / mcp_readiness.py
-这类偏长但内聚、连贯的文件也提前拖进棘轮，逼着今后自然的补充硬拆成不连贯的两半，
-不符合 Issue 的明确要求。
+阈值取 1000 行：文件体量、函数体量、注释卫生三条棘轮合力让「压缩注释、内联调用」不再是
+合规路径，拆分成为唯一路径；1000 行是一次结构性清理收官后 ``src/lingxi/`` 全部文件都已
+落在其下的值，此后只减不增。
 
 范围只覆盖 ``src/lingxi/`` 下的正式代码：测试文件按用例数量自然变长是正常现象，
 拆分测试的成本和收益与拆分业务逻辑完全不同，不在本门禁的目标问题（生产代码里的
@@ -41,7 +38,7 @@ from pathlib import Path
 REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
 SOURCE_ROOT = REPOSITORY_ROOT / "src" / "lingxi"
 BASELINE_PATH = REPOSITORY_ROOT / "scripts" / "ci" / "size_ratchet_baseline.txt"
-THRESHOLD_LINES = 1500
+THRESHOLD_LINES = 1000
 
 BASELINE_HEADER = (
     f"# 文件体量棘轮基线（Issue #238）：登记当前已超过 {THRESHOLD_LINES} 行的文件与其行数上限。",
@@ -64,9 +61,9 @@ def iter_scope_files() -> list[Path]:
     files = sorted(SOURCE_ROOT.rglob("*.py"))
     if not files:
         # 目录存在但一个 .py 都没扫到：measure() 会得到空字典，基线里的每一条
-        # 登记都因为"实测不到"被 evaluate() 静默跳过（那是给"文件已删除/移出
-        # 扫描范围"设计的分支），最终判绿——这不是"棘轮通过"，是扫描本身坏了，
-        # 必须失败关闭而不是让空枚举冒充"零违规"。
+        # 登记都会被 evaluate() 判成"陈旧登记、实测中已经找不到"而集体判红——
+        # 这仍然不是本门禁想要的失败原因，扫描本身坏了应该在这里直接说清楚，
+        # 而不是让使用者对着一堆"文件找不到"的失败去猜是不是真的被删光了。
         raise BaselineError(f"源码根目录下一个 .py 文件都没扫到：{SOURCE_ROOT}")
     return files
 
@@ -132,8 +129,15 @@ def evaluate(baseline: dict[str, int], current: dict[str, int]) -> list[str]:
     for path, recorded in sorted(baseline.items()):
         actual = current.get(path)
         if actual is None:
-            # 文件已经不在扫描范围内（删除、改名或移出 src/lingxi）：棘轮的目的
-            # 已经达成，不需要门禁介入；基线里的陈旧登记留给 --refresh 自愿清理。
+            # 文件已经不在扫描范围内（删除、改名或移出 src/lingxi）：陈旧登记
+            # 不允许静默保留在基线文件里，必须显式判红并提示 --refresh 清除——
+            # 静默放行会让已经清空的登记条目在基线文件里堆积多年都没人发现。
+            failures.append(
+                f"{path}：棘轮基线登记了 {recorded} 行，但当前扫描范围内已经找不到"
+                "这个文件（可能已删除、改名或移出 src/lingxi/）。基线记录必须与"
+                "实测精确匹配，陈旧登记不允许静默保留。运行 "
+                "python3 scripts/ci/check_size_ratchet.py --refresh 移除。"
+            )
             continue
         if actual > recorded:
             failures.append(
@@ -250,16 +254,17 @@ def run_refresh() -> int:
         return 0
 
     lowered = sorted(
-        path
-        for path in new_baseline
-        if path in baseline and new_baseline[path] < baseline[path]
+        path for path in new_baseline if path in baseline and new_baseline[path] < baseline[path]
     )
     removed = sorted(path for path in baseline if path not in new_baseline)
 
     BASELINE_PATH.write_text(render_baseline(new_baseline), encoding="utf-8")
 
     if lowered:
-        print("已调低：" + "、".join(f"{path}（{baseline[path]}→{new_baseline[path]}）" for path in lowered))
+        print(
+            "已调低："
+            + "、".join(f"{path}（{baseline[path]}→{new_baseline[path]}）" for path in lowered)
+        )
     if removed:
         print("已移除（已缩到阈值以下或已删除）：" + "、".join(removed))
     print(f"文件体量棘轮基线已刷新：{len(new_baseline)} 条登记")

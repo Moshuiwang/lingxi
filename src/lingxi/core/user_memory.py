@@ -1,4 +1,4 @@
-"""用户记忆（Issue #357 S-H3-3，D1 显式登记范围）：数据形状与纯渲染逻辑。
+"""用户记忆：数据形状与纯渲染逻辑（D1 显式登记范围）。
 
 只放不碰数据库、不做 I/O 的部分——真正的存取在 ``adapters/postgres_conversation``
 （``/memory`` 命令面复用的 CRUD 四方法）与 ``adapters/postgres_user_memory``
@@ -13,9 +13,10 @@
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Protocol, Sequence
+from typing import Protocol
 
 #: D1 范围固定的三类记忆，与迁移 0076 的 CHECK 约束、``/memory remember`` 命令解析
 #: （``core/conversation/commands.py``）三处共享同一份取值域。
@@ -36,9 +37,7 @@ MAX_MEMORY_ENTRIES_PER_USER = 50
 #: 出半条记忆，格式不完整）。
 DEFAULT_MAX_PROMPT_CHARS = 6000
 
-_PROMPT_HEADER = (
-    "## 已登记的用户记忆（用户可通过 /memory 查看、删除或清空；不代表当前查询结果）"
-)
+_PROMPT_HEADER = "## 已登记的用户记忆（用户可通过 /memory 查看、删除或清空；不代表当前查询结果）"
 
 
 @dataclass(frozen=True)
@@ -61,7 +60,9 @@ class MemoryTypeLabels(Protocol):
     dataclass/枚举常量外零依赖。
     """
 
-    def __call__(self, memory_type: str) -> str: ...
+    def __call__(self, memory_type: str) -> str:
+        """按记忆类型取一个短标签字符串。"""
+        ...
 
 
 @dataclass(frozen=True)
@@ -89,7 +90,6 @@ def render_user_memory_prompt(
     丢弃，直到剩余文本落在上限之内——保留的是「最近登记」的记忆，与产品直觉一致
     （越新登记的口径偏好/术语映射越可能仍然有效）。
     """
-
     if not entries:
         return RenderedUserMemoryPrompt(text="", truncated=False, total_entries=0, kept_entries=0)
 

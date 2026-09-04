@@ -34,7 +34,6 @@ import tomllib
 from pathlib import Path
 from typing import Any
 
-
 REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
 CONTENT_PATH = REPOSITORY_ROOT / "src" / "lingxi" / "config" / "content.toml"
 LOCK_PATH = REPOSITORY_ROOT / "src" / "lingxi" / "config" / "content.lock.toml"
@@ -319,9 +318,7 @@ def run_refresh(content_path: Path, lock_path: Path) -> int:
             return 1
         if version in retired:
             _print_refresh_failure(
-                [
-                    f"拒绝刷新：版本 {version!r} 是已经登记过的旧标识，不能复用；请改用一个新标识。"
-                ]
+                [f"拒绝刷新：版本 {version!r} 是已经登记过的旧标识，不能复用；请改用一个新标识。"]
             )
             return 1
         if lock["version"] not in retired:

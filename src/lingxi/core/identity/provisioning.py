@@ -1,72 +1,17 @@
 """身份匹配成功之后的**写侧建档服务合同**（纯逻辑，无 I/O）。
 
-本模块回答一件事：正式 `OnboardingRunner`（[Issue #65](https://github.com/Moshuiwang/lingxi/issues/65)
-的编排层，实现属 Epic D）在「身份唯一、花名册唯一、银河权限有效」之后，**用什么调用面
-把这个人写进 `app_user`**，以及它能从返回值里分辨出什么。判定规则本身不在这里：
-定位与建档前提在 :mod:`lingxi.core.identity.first_contact`，银河账号匹配在
-:mod:`lingxi.core.permission.account_match`，本模块只负责「已经确定要建档」之后的写入面。
-
-实现住在 :class:`lingxi.adapters.postgres_identity.PostgresAppUserStore`；这里是
-`core/`，因此只有数据形状、原因分类和 :class:`IdentityProvisioning` 注入口。
-
-## 三个结果与三个拒绝原因
-
-| 结果 | 含义 | runner 应当怎么读 |
-|---|---|---|
-| `CREATED` | 本次调用新建了 `app_user` 行 | 继续后续开通步骤 |
-| `ALREADY_PROVISIONED` | 同一 `feishu_open_id` 已有档，本次幂等返回同一条 | 与 `CREATED` 等价地继续，不得当成失败 |
-| `REJECTED` | 约束防线拒绝，库里**零行残留** | 按 `rejection` 分流，见下表 |
-
-| `rejection` | 触发点 | 属于 |
-|---|---|---|
-| `INCOMPLETE_IDENTITY` | 身份六字段「全有或全无」CHECK（`migrations/008`）拒绝，或请求本身没有 `feishu_open_id` | 确定性业务失败：走 PR #105 冻结的「无可用银河权限」终态 |
-| `DELEGATED_SUBJECT` | `app_user_no_delegated_subject` 触发器拒绝（专用授权账号不建档，`V-身份-02`） | 确定性业务失败：走既有「专用主体忽略」出口，不回普通员工路径 |
-| `STORAGE_INTEGRITY` | 写入-回读不一致（工号 / 邮箱被静默丢弃或改写，`V-开通-15`） | **存储侧故障，不是业务结论**：走 `LX-ONBOARD-001` 内部故障出口 |
-
-把 `STORAGE_INTEGRITY` 混进前两类，用户会看到「没有银河权限」而事实是我们的库把工号
-吞了——这是一条会误导用户去银河申请的错误结论，因此
-:attr:`ProvisioningRejection.is_storage_fault` 把这条分界写成可判定的属性，而不是靠
-runner 记得区分。
-
-## 幂等：同一 `open_id` 重复建档返回「已存在」，不报错
+回答一件事：正式 ``OnboardingRunner`` 在「身份唯一、花名册唯一、银河权限有效」
+之后，用什么调用面把这个人写进 ``app_user``。判定规则不在这里：定位与建档前提
+在 first_contact.py，银河账号匹配在 account_match.py。三态结果：``CREATED``
+（新建）、``ALREADY_PROVISIONED``（幂等返回、与 ``CREATED`` 等价地继续）、
+``REJECTED``（约束防线拒绝，库里零行残留，按 ``rejection`` 分流：
+``INCOMPLETE_IDENTITY``/``DELEGATED_SUBJECT`` 是业务失败，``STORAGE_INTEGRITY``
+是存储侧故障要走内部故障出口）。
 
 `OnboardingRunner.start` 的合同要求按 `event_id` / `open_id` 幂等，而
-`core.conversation.onboarding_recovery` 的对账扫描会把「已认领、没确认交接」的孤儿
-事件**再交接一次**，崩溃点还可能落在「编排已经跑了一半」之后（见
-`core/conversation/ports.py` 的 `OnboardingRunner` 文档）。如果重复建档报错，重入路径
-会把一次**已经成功**的建档判成内部故障：用户拿到 `LX-ONBOARD-001`，库里其实已经有档，
-而且没有任何东西会再来收拾它——正是 Issue #65 轻审 P2-2 要避免的悬空形状。
-
-因此幂等语义是「返回已存在」，并且：
-
-- 不回退 `provisioning_state`：已经推进到发布或同步中的用户不会因为重入被打回 `matching`；
-- 不触碰 `permission_record_id` / `permission_version`：匹配确认前不占位、确认后不被重入抹掉（`V-开通-01`）；
-- 不触碰 `account_state`：**重入不复活被停用的账号**；
-- 会按新快照刷新身份资料与花名册字段（沿用既有 `record_identity` 语义），因为重入时
-  runner 手里的资料只会更新、不会更旧。
-
-**`already_provisioned` 不等于「这个人现在还该被开通」。** 收到它之后、继续用户环境
-创建与权限发布之前，runner 必须复核该用户的当前状态（`account_state` 与
-`provisioning_state`）：孤儿事件的重交接窗口可能长达对账扫描的一整个周期，管理员在
-这段时间里停用账号是真实形状（Issue #65 轻审 P2-2 的孤儿窗口）。建档服务只保证
-「档在、且这次重入没有把它写坏」，它既不知道也不判断这个人此刻还该不该继续开通——
-把这条判断留在这里会让写侧悄悄替编排层做准入决定。
-
-## 花名册字段存的是**花名册原值**，不是匹配用的归一值
-
-`app_user.employee_no` / `email` 落库的用途是[数据库设计第三节](../../../../docs/技术设计/数据库设计.md)
-说的「匹配时刻的存档」，与姓名一起构成 [Issue #52](https://github.com/Moshuiwang/lingxi/issues/52)
-每日日报的比对基线，而 :func:`lingxi.core.identity.roster_audit.compare_roster` 做的是
-**去空白后的精确字符串比较**。
-
-`AccountMatch.matched_email` 是 `normalize_email` 小写归一之后的比较值（见
-`core/permission/account_match.py`）。把它当存档写进去，任何邮箱含大写字母的用户都会
-**天天**出现在管理群日报里，而资料其实一个字都没变。所以 :meth:`ProvisioningRequest.from_roster_row`
-只从花名册行取原值（仅去首尾空白），银河匹配结果对本合同的输入**没有贡献**。
-
-同理，请求里没有、也不会有任何权限字段：`permission_record_id` 在
-:class:`lingxi.core.identity.first_contact.IdentityRecordDraft` 上是恒为 `None` 的常量字段，
-「先占位再回填」在类型上就做不到（`V-开通-01`）。
+重复建档因此**返回已存在、不报错**：不回退状态、不触碰权限字段，但按新快照
+刷新身份与花名册字段；"已存在"不等于"现在还该被开通"，仍须复核当前状态。
+**花名册字段存原值**：工号/邮箱不做归一，银河匹配结果对输入没有贡献。
 """
 
 from __future__ import annotations
@@ -143,27 +88,22 @@ class ProvisioningRejection(str, Enum):
     def is_storage_fault(self) -> bool:
         """这条拒绝是**存储侧故障**而不是「这个人不该建档」的业务结论。
 
-        runner 据此分流：`True` 走内部故障码 `LX-ONBOARD-001`，`False` 走 PR #105
+        runner 据此分流：``True`` 走内部故障码 ``LX-ONBOARD-001``，``False`` 走
         冻结的确定性失败终态。把两者合并会让一次「库把工号吞了」显示成「你没有银河
         权限」，把用户引到银河去申请一个他其实已经有的权限。
         """
-
         return self is ProvisioningRejection.STORAGE_INTEGRITY
 
 
 def _archive_text(value: object) -> str | None:
     """花名册存档值的归一：只去首尾空白，**不小写、不截断、不补零**。
 
-    空白与缺失都归一为 `None` 而不是空串：空串会被写进库，而
-    `roster_audit.compare_roster` 把「存档为空」读作「没有基线、不比对」，
-    两者在日报里是同一个结论，但库里留空串会让「有没有存档过」这件事无法回读。
-
-    与数据库口径**不完全等价**：Python 的 `str.strip()` 剥掉全部 Unicode 空白，是
-    `migrations/008` 里 `BTRIM(x)`（默认只剥半角空格）的**超集**。这个方向是失败
-    关闭的——判空更严只会让写侧更早拒绝、或把一个全角空格存成 `NULL`，不会把数据库
-    认为有值的字段当成空值放行。
+    空白与缺失都归一为 ``None`` 而不是空串：空串会被写进库，而库里留空串会让
+    「有没有存档过」这件事无法回读。与数据库口径不完全等价：``str.strip()``
+    剥掉全部 Unicode 空白，是数据库 ``BTRIM(x)``（默认只剥半角空格）的超集，
+    这个方向是失败关闭的——判空更严只会让写侧更早拒绝，不会放行数据库认为
+    有值的字段。
     """
-
     if value is None:
         return None
     text = value.strip() if isinstance(value, str) else str(value).strip()
@@ -171,18 +111,14 @@ def _archive_text(value: object) -> str | None:
 
 
 def missing_identity_fields(draft: IdentityRecordDraft) -> tuple[str, ...]:
-    """按 `migrations/008` 的空白语义（`NULLIF(BTRIM(x), '')`）列出为空的身份字段名。
-    两侧口径的细微差异与它失败关闭的方向见 :func:`_archive_text`。
+    """按数据库的空白语义列出为空的身份字段名，口径差异见 :func:`_archive_text`。
 
     **这不是那条 CHECK 的替代品**，是它的翻译器：写侧路径照常把语句发给数据库，
-    由数据库拒绝；本函数只在拒绝之后把「为什么被拒」翻译成 runner 能分辨的字段名。
-    因此它返回的是**字段名**，从不返回字段值——诊断信息不搬运身份原值。
-
-    唯一的例外见 :meth:`ProvisioningRequest.blocking_gap`：`feishu_open_id` 为空时
-    数据库**故意不拒绝**（六字段全空是账号删除完成后的合法形态），那一格只能由写侧
+    由数据库拒绝；本函数只在拒绝之后把「为什么被拒」翻译成 runner 能分辨的字段名，
+    返回的是字段名，从不返回字段值。唯一的例外见 :meth:`ProvisioningRequest.
+    blocking_gap`：``feishu_open_id`` 为空时数据库故意不拒绝，那一格只能由写侧
     自己守。
     """
-
     return tuple(
         field
         for field in IDENTITY_REQUIRED_FIELDS
@@ -203,7 +139,6 @@ def classify_write_failure(
     `INCOMPLETE_IDENTITY`，用户会得到一个确定性的「无可用银河权限」，而真实原因
     再也没人看得见。
     """
-
     if sqlstate == SQLSTATE_RAISE_EXCEPTION and DELEGATED_SUBJECT_REJECTION_MARKER in message:
         return ProvisioningRejection.DELEGATED_SUBJECT
     if sqlstate == SQLSTATE_CHECK_VIOLATION and missing_fields:
@@ -227,14 +162,13 @@ class ProvisioningRequest:
     @classmethod
     def from_roster_row(
         cls, identity: IdentityRecordDraft, row: Mapping[str, object] | None = None
-    ) -> "ProvisioningRequest":
+    ) -> ProvisioningRequest:
         """从判定层草稿 + 一行花名册记录组装请求。
 
         `row` 接受 `adapters.feishu_roster_bitable.RosterRow`（它实现了 `get`）或任何
         同键名映射；`None` 表示这次没有花名册行（工号 / 邮箱留空，建档不以它们为前提）。
         取的是**原值**，理由见模块文档「花名册字段存的是花名册原值」。
         """
-
         if row is None:
             return cls(identity=identity)
         return cls(
@@ -245,6 +179,7 @@ class ProvisioningRequest:
 
     @property
     def missing_identity_fields(self) -> tuple[str, ...]:
+        """本请求的身份草稿里，哪些必填字段为空。"""
         return missing_identity_fields(self.identity)
 
     @property
@@ -259,7 +194,6 @@ class ProvisioningRequest:
         其余字段的残缺**照常交给数据库拒绝**，写侧不抢在前面短路——那条 CHECK 是
         「任何代码路径都绕不过去」的那一道，只有真的走一遍才证明得了它还在。
         """
-
         if _archive_text(self.identity.feishu_open_id) is None:
             return self.missing_identity_fields
         return ()
@@ -271,13 +205,10 @@ class ProvisioningRequest:
         自行构造了带花名册字段的草稿却没有同时填进请求，这里**直接失败**而不是静默
         丢值：工号是匹配银河的主键，静默丢掉它等于把这个人退化成纯邮箱匹配。
         """
-
         for field in ROSTER_ARCHIVE_FIELDS:
             if getattr(self.identity, field) is not None and getattr(self, field) is None:
                 raise ValueError(f"建档请求的花名册字段 {field} 只在草稿上有值，会被静默丢弃")
-        return dataclasses.replace(
-            self.identity, employee_no=self.employee_no, email=self.email
-        )
+        return dataclasses.replace(self.identity, employee_no=self.employee_no, email=self.email)
 
 
 @dataclass(frozen=True)
@@ -297,6 +228,7 @@ class ProvisioningResult:
     missing_fields: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
+        """校验成功/拒绝两种状态各自的字段形状不变量。"""
         if self.outcome is ProvisioningOutcome.REJECTED:
             if self.rejection is None:
                 raise ValueError("建档拒绝必须带可分辨的原因")
@@ -311,43 +243,37 @@ class ProvisioningResult:
     @property
     def provisioned(self) -> bool:
         """建档这一步是否已经成立（新建或早已存在）。runner 据此继续后续步骤。"""
-
         return self.outcome is not ProvisioningOutcome.REJECTED
 
     @classmethod
-    def created(cls, app_user_id: str) -> "ProvisioningResult":
+    def created(cls, app_user_id: str) -> ProvisioningResult:
+        """构造一次「新建成功」的结果。"""
         return cls(ProvisioningOutcome.CREATED, app_user_id)
 
     @classmethod
-    def already_provisioned(cls, app_user_id: str) -> "ProvisioningResult":
+    def already_provisioned(cls, app_user_id: str) -> ProvisioningResult:
+        """构造一次「幂等返回已有档案」的结果。"""
         return cls(ProvisioningOutcome.ALREADY_PROVISIONED, app_user_id)
 
     @classmethod
     def rejected(
         cls, rejection: ProvisioningRejection, *, missing_fields: tuple[str, ...] = ()
-    ) -> "ProvisioningResult":
-        return cls(
-            ProvisioningOutcome.REJECTED, None, rejection, missing_fields
-        )
+    ) -> ProvisioningResult:
+        """构造一次「建档被拒」的结果。"""
+        return cls(ProvisioningOutcome.REJECTED, None, rejection, missing_fields)
 
 
 class IdentityProvisioning(Protocol):
-    """建档服务的注入口：runner 只依赖这个签名，真实实现住在 `adapters/`。
+    """建档服务的注入口：runner 只依赖这个签名，真实实现住在 ``adapters/``。
 
-    **事务边界（本合同承诺什么、不承诺什么）**
-
-    - 承诺：一次 :meth:`provision` 在**一个数据库事务**内完成 `app_user` 的完整写入；
-      任何拒绝（CHECK、触发器、写入-回读不一致）都整条回滚，库里不留半行，
-      也不破坏该 `open_id` 已有的档案。
-    - 承诺：返回时事务**已提交**。建档结果对后续步骤、对账扫描与 #52 日报立即可见。
-    - 不承诺：跨系统原子性。用户环境创建、权限发布 outbox、MCP 同步确认、飞书回复都在
-      本合同之外，它们的补偿与重入属 `OnboardingRunner`（Issue #65 / Epic D）。
-    - **不接收调用方事务对象**，与 `enqueue_publish` / `audit.record` 的「必须传 tx」
-      刚好相反（[接口设计八](../../../../docs/技术设计/接口设计.md#八领域服务接口)）：
-      那两个要的是「审计与状态变更同事务」，而建档是编排的第一步，后面全是跨系统的
-      长动作。把建档挂在调用方事务里有两个后果——一次开通会把数据库连接和行锁按分钟级
-      占住；更要紧的是「建档已经成功」在崩溃后不可判定，重入既读不到它、又要重新建，
-      而幂等恰恰依赖它已经落地。
+    事务边界：一次 :meth:`provision` 在一个数据库事务内完成 ``app_user`` 的
+    完整写入并提交（任何拒绝整条回滚，不留半行）；不承诺跨系统原子性，用户
+    环境创建、权限发布、MCP 同步确认、飞书回复都在本合同之外。**不接收调用方
+    事务对象**（与 ``enqueue_publish``/``audit.record`` 的"必须传 tx"相反）：
+    建档是编排的第一步，把它挂在调用方事务里会把数据库连接和行锁按分钟级
+    占住，且"建档已经成功"在崩溃后不可判定，而幂等恰恰依赖它已经落地。
     """
 
-    def provision(self, request: ProvisioningRequest) -> ProvisioningResult: ...
+    def provision(self, request: ProvisioningRequest) -> ProvisioningResult:
+        """建档；成功（新建或已存在）返回带用户标识的结果，否则返回拒绝原因。"""
+        ...

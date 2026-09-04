@@ -33,7 +33,9 @@ def _payload(
         event["operator"] = {"open_id": operator_open_id}
     event["action"] = {
         "tag": "button",
-        "value": action_value if action_value is not None else {
+        "value": action_value
+        if action_value is not None
+        else {
             "pending_action_id": "pac_1",
             "decision": "confirm",
         },

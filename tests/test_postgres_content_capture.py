@@ -12,11 +12,10 @@ from __future__ import annotations
 
 import os
 import unittest
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 
 from postgres_schema import ensure_production_schema, psycopg_available, reset_production_rows
 
-from lingxi.adapters.postgres import connect
 from lingxi.adapters.postgres_content_capture import PostgresContentCaptureWriter
 from lingxi.core.innertest_content_capture import CapturedToolCall, ContentCaptureRecord
 
@@ -115,7 +114,9 @@ class WriteAndReadBackTests(ContentCapturePostgresTestCase):
         self.assertEqual(row["tool_calls"], record.tool_calls_payload())
         self.assertEqual(row["tool_calls_redaction_count"], 0)
 
-    def test_multiple_rows_for_the_same_task_are_ordered_newest_first_and_respect_limit(self) -> None:
+    def test_multiple_rows_for_the_same_task_are_ordered_newest_first_and_respect_limit(
+        self,
+    ) -> None:
         self.seed_task(task_id="t1")
         self.writer.write(self.sample_record(task_id="t1", worker_id="worker-a"))
         self.writer.write(self.sample_record(task_id="t1", worker_id="worker-b"))
@@ -149,7 +150,7 @@ class ExpiryTriggerTests(ContentCapturePostgresTestCase):
     def test_update_cannot_move_expires_at_regardless_of_what_is_written(self) -> None:
         self.seed_task(task_id="t1")
         row_id = self.writer.write(self.sample_record(task_id="t1"))
-        far_future = datetime.now(timezone.utc) + timedelta(days=3650)
+        far_future = datetime.now(UTC) + timedelta(days=3650)
 
         self.execute(
             "UPDATE innertest_content_capture SET expires_at = %s WHERE id = %s",
@@ -216,9 +217,9 @@ class RoundEndCleanupTests(ContentCapturePostgresTestCase):
             """,
             (old_row,),
         )
-        new_row = self.writer.write(self.sample_record(task_id="t-new"))
-        round_start = datetime.now(timezone.utc) - timedelta(days=1)
-        round_end = datetime.now(timezone.utc) + timedelta(days=1)
+        self.writer.write(self.sample_record(task_id="t-new"))
+        round_start = datetime.now(UTC) - timedelta(days=1)
+        round_end = datetime.now(UTC) + timedelta(days=1)
 
         self.execute(
             "DELETE FROM innertest_content_capture WHERE created_at >= %s AND created_at < %s",

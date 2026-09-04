@@ -57,7 +57,10 @@ def main() -> int:
 
     expected = set(HOOK_EVENTS) | set(OBSERVATION_ONLY_EVENTS)
     if set(matchers) != expected:
-        print(f"真实 SDK 冒烟：注册的事件集合是 {sorted(matchers)}，预期 {sorted(expected)}", file=sys.stderr)
+        print(
+            f"真实 SDK 冒烟：注册的事件集合是 {sorted(matchers)}，预期 {sorted(expected)}",
+            file=sys.stderr,
+        )
         return 1
 
     for event, entries in matchers.items():
@@ -78,7 +81,9 @@ def main() -> int:
 
     version = getattr(claude_agent_sdk, "__version__", "未知")
     print(f"真实 SDK 冒烟：claude-agent-sdk {version} 可构造 {len(matchers)} 个事件的 hooks 配置")
-    print(f"真实 SDK 冒烟：worker 入口可构造 ClaudeAgentOptions，消息类型齐备（{', '.join(MESSAGE_TYPE_NAMES)}）")
+    print(
+        f"真实 SDK 冒烟：worker 入口可构造 ClaudeAgentOptions，消息类型齐备（{', '.join(MESSAGE_TYPE_NAMES)}）"
+    )
     print("（本检查不覆盖「事件是否真的触发」，那一层只有 L4a 能答）")
     return 0
 

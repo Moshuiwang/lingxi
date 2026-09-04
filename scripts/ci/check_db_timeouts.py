@@ -44,7 +44,9 @@ def _is_self_psycopg_connect(node: ast.Call) -> bool:
 # 故意不做成“任意 `psycopg.*` 子模块都禁止”：`psycopg.types.json` 之类的类型
 # 适配子模块与建连无关，adapters 层已有合法的 `from psycopg.types.json import Json`
 # 用法，不应被这条门禁误杀。
-_PSYCOPG_CONNECTION_MODULES = frozenset({"psycopg", "psycopg.connection", "psycopg.connection_async"})
+_PSYCOPG_CONNECTION_MODULES = frozenset(
+    {"psycopg", "psycopg.connection", "psycopg.connection_async"}
+)
 
 
 def _is_psycopg_connection_module(module: str | None) -> bool:
@@ -68,7 +70,9 @@ def check_runtime_connections(source_root: pathlib.Path = RUNTIME_SOURCE_ROOT) -
         try:
             tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
         except (OSError, SyntaxError, UnicodeDecodeError) as error:
-            failures.append(f"{_relative(path, source_root)}：无法解析，数据库连接门禁无法判断（{type(error).__name__}）")
+            failures.append(
+                f"{_relative(path, source_root)}：无法解析，数据库连接门禁无法判断（{type(error).__name__}）"
+            )
             continue
 
         psycopg_names = {"psycopg"}
@@ -116,8 +120,11 @@ def check_runtime_connections(source_root: pathlib.Path = RUNTIME_SOURCE_ROOT) -
                     and isinstance(function.value, ast.Name)
                     and function.value.id in connection_class_names
                 )
-                if direct or class_connect or _is_self_psycopg_connect(node) or (
-                    isinstance(function, ast.Name) and function.id in raw_connect_names
+                if (
+                    direct
+                    or class_connect
+                    or _is_self_psycopg_connect(node)
+                    or (isinstance(function, ast.Name) and function.id in raw_connect_names)
                 ):
                     failures.append(
                         f"{_relative(path, source_root)}:{node.lineno} 发现裸 PostgreSQL 连接："
@@ -133,7 +140,9 @@ def check_migration_connection() -> list[str]:
     env_source = MIGRATION_ENV.read_text(encoding="utf-8")
     dsn_source = MIGRATION_DSN.read_text(encoding="utf-8")
     if "connect_args=migration_connect_args()" not in env_source:
-        failures.append("migrations/alembic/env.py：create_engine 必须传入 migration_connect_args()")
+        failures.append(
+            "migrations/alembic/env.py：create_engine 必须传入 migration_connect_args()"
+        )
     required_names = (
         "MIGRATION_CONNECT_TIMEOUT_SECONDS",
         "MIGRATION_STATEMENT_TIMEOUT_SECONDS",

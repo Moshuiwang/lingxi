@@ -241,9 +241,7 @@ class HealthcheckDatabaseCacheTests(unittest.TestCase):
             with patch.dict("os.environ", {"LINGXI_LIVENESS_DIR": tmp}):
                 liveness.touch_liveness("scheduler-db")
                 with self.assertRaises(healthcheck.HealthcheckError):
-                    healthcheck._check_database(
-                        "scheduler", 0.0, {"LINGXI_POSTGRES_DSN": self.DSN}
-                    )
+                    healthcheck._check_database("scheduler", 0.0, {"LINGXI_POSTGRES_DSN": self.DSN})
 
 
 class HealthcheckEnvIsolationTests(unittest.TestCase):
@@ -304,7 +302,10 @@ class HealthcheckEnvIsolationTests(unittest.TestCase):
         证明结果不是意外借道真实环境凑巧对上的。
         """
 
-        with tempfile.TemporaryDirectory() as target_tmp, tempfile.TemporaryDirectory() as decoy_tmp:
+        with (
+            tempfile.TemporaryDirectory() as target_tmp,
+            tempfile.TemporaryDirectory() as decoy_tmp,
+        ):
             with patch.dict("os.environ", {"LINGXI_LIVENESS_DIR": decoy_tmp}):
                 liveness.touch_liveness("scheduler-db", directory=Path(target_tmp))
                 liveness.touch_liveness("scheduler", directory=Path(target_tmp))
@@ -325,7 +326,10 @@ class HealthcheckEnvIsolationTests(unittest.TestCase):
         参数指向的 target_tmp 里什么都没有——`run()` 必须如实报不健康，证明它
         没有反过来"偷看"真实 os.environ 又把结果判成健康。"""
 
-        with tempfile.TemporaryDirectory() as target_tmp, tempfile.TemporaryDirectory() as decoy_tmp:
+        with (
+            tempfile.TemporaryDirectory() as target_tmp,
+            tempfile.TemporaryDirectory() as decoy_tmp,
+        ):
             with patch.dict("os.environ", {"LINGXI_LIVENESS_DIR": decoy_tmp}):
                 liveness.touch_liveness("scheduler-db", directory=Path(decoy_tmp))
                 liveness.touch_liveness("scheduler", directory=Path(decoy_tmp))
@@ -444,7 +448,9 @@ class HealthcheckCommandRealDatabaseTests(unittest.TestCase):
         """
 
         with tempfile.TemporaryDirectory() as tmp:
-            with patch.dict(os.environ, {"LINGXI_LIVENESS_DIR": "/nonexistent-should-never-be-read"}):
+            with patch.dict(
+                os.environ, {"LINGXI_LIVENESS_DIR": "/nonexistent-should-never-be-read"}
+            ):
                 liveness.touch_liveness("scheduler", directory=Path(tmp))
                 err = io.StringIO()
                 code = healthcheck.run(
@@ -587,9 +593,7 @@ class HealthcheckFreeSpaceTests(unittest.TestCase):
             healthcheck._check_free_space(
                 "worker",
                 directory=Path(tmp),
-                statvfs=_fake_statvfs(
-                    total_bytes=256 * 1024 * 1024, free_bytes=160 * 1024 * 1024
-                ),
+                statvfs=_fake_statvfs(total_bytes=256 * 1024 * 1024, free_bytes=160 * 1024 * 1024),
             )
 
     def test_the_ratio_scales_with_each_service_own_tmpfs_size(self) -> None:
@@ -626,9 +630,7 @@ class HealthcheckFreeSpaceTests(unittest.TestCase):
             healthcheck._check_free_space(
                 "worker",
                 directory=Path(tmp),
-                statvfs=_fake_statvfs(
-                    total_bytes=500 * 1024**3, free_bytes=1 * 1024**3
-                ),
+                statvfs=_fake_statvfs(total_bytes=500 * 1024**3, free_bytes=1 * 1024**3),
             )
 
     def test_a_large_filesystem_that_is_actually_full_is_still_unhealthy(self) -> None:

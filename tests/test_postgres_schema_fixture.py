@@ -82,7 +82,10 @@ class ProductionChainFixtureTest(unittest.TestCase):
         for needle in ("lingxi_retention_cleanup", "galaxy_import_batch_fix_expiry", "CREATE ROLE"):
             with self.subTest(needle=needle):
                 self.assertIn(needle, upgrade)
-        for needle in ("DROP FUNCTION IF EXISTS public.lingxi_retention_cleanup", "DROP TRIGGER IF EXISTS"):
+        for needle in (
+            "DROP FUNCTION IF EXISTS public.lingxi_retention_cleanup",
+            "DROP TRIGGER IF EXISTS",
+        ):
             with self.subTest(needle=needle):
                 self.assertIn(needle, downgrade)
 

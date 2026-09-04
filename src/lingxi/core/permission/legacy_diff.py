@@ -1,61 +1,14 @@
-"""存量用户首聊差集导入的纯逻辑（rc25 S-1，Issue #540；沿用 #441 差集口径）。
+"""存量用户首聊差集导入的纯逻辑。
 
 旧系统正式权限多维表格里已有行的用户在 Lingxi 首次开通时，把「旧行权限 − 银河当前
-翻译」落成管理员本地授权（``local_permission_override``，方向 grant，原因
-:data:`IMPORT_REASON`），随后仍按 ``(银河 ∪ 本地) − 抑制`` 合成发布——「银河是银河的，
-本地是本地的」（PM 2026-09-02 裁定）。本模块**零 I/O**：只回答"给定旧行、银河当前翻译
-与指标映射，要导入哪些行"，真正的读表在 ``adapters/stock_token_bitable.py``、落库在
-``adapters/postgres_local_permission.py::import_legacy_plan``、编排在
-``core/identity/onboarding_runner.py``。
+翻译」落成管理员本地授权（``local_permission_override``，方向 grant），随后仍按
+``(银河 ∪ 本地) − 抑制`` 合成发布——银河是银河的，本地是本地的。本模块零 I/O：
+只回答"给定旧行、银河当前翻译与指标映射，要导入哪些行"，真正的读表、落库、编排
+都在别处。
 
-## 旧行的四种形状（:func:`classify_legacy_permissions`）
-
-| 形状 | 判据 | 落法 |
-| --- | --- | --- |
-| :data:`SHAPE_SPECIFIC` | 键与值都不含 ``"*"``（含空对象 ``{}``） | 按公司键逐一求差集，每对一行 grant（无组） |
-| :data:`SHAPE_FULL_WILDCARD` | ``"*"`` 键的值恰为 ``["*"]`` | 一组 ``company_id="*"`` × 映射全部指标（:func:`all_metrics`），标签 :data:`ALL_SCOPE_POSITION_NAME`，随映射新增指标补行 |
-| :data:`SHAPE_ALL_SCOPE_EXPLICIT` | ``"*"`` 键的值是不含 ``"*"`` 的显式指标列表 | 一组 ``company_id="*"`` × 该列表，标签 :data:`ALL_SCOPE_EXPLICIT_POSITION_NAME`，**永不**自动扩指标 |
-| :data:`SHAPE_UNSUPPORTED_WILDCARD` | 其余含 ``"*"`` 的形状（``["*","x"]``、具体公司值里出现 ``"*"``） | 调用方 fail-closed，外部表零写入 |
-
-两种「全部」形状都可以附带具体公司键（如 ``{"*": [...], "40": [...]}``）：具体键按差集
-另落无组行。**公司维度保留 ``*``、指标维度显式展开**是 PM 的明示裁定：新公司无需改表
-（问数 MCP 读侧按 ``"*"`` 回退），新指标进入映射后由每日/定向重算补齐同组缺行
-（:func:`missing_all_scope_metrics`）。
-
-## 差集口径
-
-- 银河**非通配**：每个具体公司键 ``旧行[公司] − 银河[公司]``；``"*"`` 组不减（银河没有
-  ``"*"``，合并层会把组与银河各公司值一起收敛到 ``"*"`` 键）。
-- 银河**有限通配**（``"*"`` 键但非真全指标，Issue #440 v2）：合并层把全部本地 grant 指标
-  并进 ``"*"`` 清单，因此组与具体键都减去 ``银河["*"]``。
-- 银河**真全指标通配**（``full_access_wildcard``，后台管理员）：本地源整体不参与合并，
-  什么都不导入，理由码 :data:`REASON_WILDCARD_GALAXY_CURRENT`。
-- **映射外公司照导入**（PM「本地是本地的」；问数 MCP 认识这些公司），只计数
-  :attr:`LegacyImportPlan.unmapped_companies_kept` 供审计。
-
-## 值严格、公司键不查目录（rc25 S-2d，对抗审查 P-2；两条口径的差异在此显式登记）
-
-:func:`classify_legacy_permissions` 是**脚本路径与首聊自动路径共用的那一层**
-（脚本 ``scripts/ops/import_local_permission_override.py::load_legacy_export`` 与自动路径
-``core/identity/legacy_permission_import.py`` → :func:`plan_legacy_import` 都必经此处），
-两侧的取值口径因此不可能分叉。它对**值**与**键**做的是**同一套卫生检查**、**不同的目录
-态度**：
-
-- **卫生（形状）——键、值一样严**：空白、含换行/制表/零宽等不可见字符、把 ``"*"`` 混进
-  名字里（``"日活*"``）一律判**解析失败**（``ValueError``），调用方整份 fail-closed，不是
-  跳过这一条继续。一份值写坏的旧行被"尽力解析"出来的结果，方向是**给错范围**。
-- **目录（内容）——只对值有要求，键一概不查**：指标维度的 ``"*"`` 只在 ``"*"`` 键下、
-  且整列恰为 ``["*"]`` 时才有意义（:data:`SHAPE_FULL_WILDCARD`）；出现在具体公司键下是
-  :data:`SHAPE_UNSUPPORTED_WILDCARD`，调用方 fail-closed。而公司键**不核对**它在不在
-  ``company_function_metric_map`` 里——「映射外公司照常导入」是 PM 2026-09-02 的明示裁定
-  （见上一节），只计数供审计。
-
-**为什么键宽松、值严格**（不是疏漏，是两种不同的后果）：值决定**给多大范围**——``"*"``
-一旦落进 ``local_permission_override``，读侧 :func:`~lingxi.core.permission.publish_row.
-lookup_metrics` 的回退制会让它等于该公司**全部指标（含未来新增）**，而且此后针对单个
-指标的抑制对它无效；公司键只决定**给哪一家公司**，写错一个公司号导入的是一条谁也用不
-上的死行，不扩大任何人的可见范围。因此把键一起收紧成「必须在映射内」既推翻已裁定的产品
-口径，又挡不住 P-2 真正的那条路。
+旧行的四种形状与落法见 :func:`classify_legacy_permissions`；差集按银河是否通配
+分三种口径见 :func:`plan_legacy_import`；公司键与指标名的取值卫生判据（同一套
+形状检查、不同的目录态度）见 :func:`_malformed`。
 """
 
 from __future__ import annotations
@@ -85,8 +38,8 @@ ALL_SCOPE_REFRESH_REASON = "legacy_all_scope_refresh"
 ALL_SCOPE_POSITION_NAME = "2.0 迁移导入·全部"
 
 #: ``{"*":[显式列表]}`` 落成的组的职位标签：公司维度同样保留 ``*``，但指标是旧行
-#: **列出的那几个**，语义不是「全部指标」，因此**永不**随映射自动扩指标（独立审核
-#: P1 坐实：两种形状共用一个标签会让显式列表用户在次日重算被静默扩成映射全部指标）。
+#: 列出的那几个，语义不是「全部指标」，因此永不随映射自动扩指标——两种形状共用
+#: 一个标签会让显式列表用户在次日重算被静默扩成映射全部指标。
 ALL_SCOPE_EXPLICIT_POSITION_NAME = "2.0 迁移导入·全部公司（指定指标）"
 
 #: 导入行的 ``initiated_by_open_id``/``decided_by_open_id``：系统常量，不冒充任何真人。
@@ -115,17 +68,14 @@ _FORBIDDEN_CHARACTER_CATEGORIES = frozenset({"Cc", "Cf", "Cs", "Co", "Zl", "Zp"}
 
 
 def _malformed(value: object) -> str | None:
-    """公司键 / 指标名的**卫生**判据（模块文档「值严格、公司键不查目录」一节）：不合格
-    返回原因短语，合格返回 ``None``。
+    """公司键 / 指标名的卫生判据：不合格返回原因短语，合格返回 ``None``。
 
-    与「目录」判据（这个公司在不在映射里、这个指标在不在映射里）是**两件事**：本函数
-    只看形状，键与值走同一套；目录态度的差异写在模块文档里，不在这里。
-
-    刻意**不**管的一件事：名字首尾的普通空格（``" 日活"``）。它不匹配映射里的任何指标，
-    导入的是一条谁也用不上的死行——方向是给得更少，不是给错范围；而真实旧表导出里这类
-    脏数据很常见，为它整份拒绝只会平白挡住 #263 硬切。
+    只看形状（键与值走同一套），不看目录——公司/指标在不在映射里由调用方各自处理，
+    值必须在目录内，公司键不核对。键宽松、值严格是刻意的：值决定给多大范围
+    （``"*"`` 落库后回退制会让它等于该公司全部指标含未来新增），公司键只决定给
+    哪一家公司，写错了只是一条没人用的死行。同理，刻意不管名字首尾的普通空格：
+    真实旧表导出里这类脏数据很常见，为它整份拒绝没有必要。
     """
-
     if not isinstance(value, str) or not value.strip():
         return "不得为空白"
     for character in value:
@@ -139,11 +89,16 @@ def _malformed(value: object) -> str | None:
 
 
 def classify_legacy_permissions(document: Mapping[str, Sequence[str]]) -> str:
-    """判定旧行形状（模块文档的表）。键或指标名不合卫生（:func:`_malformed`：空白、含
-    换行/制表/零宽等不可见字符、把 ``"*"`` 混进名字里）时抛 ``ValueError``——那是解析
-    失败，与「形状不受支持」是两种不同的 fail-closed 原因，但**后果相同**：调用方整份
-    不导入、零写入。"""
+    """判定旧行形状；键或指标名不合卫生（见 :func:`_malformed`）时抛 ``ValueError``。
 
+    - :data:`SHAPE_SPECIFIC`：键与值都不含 ``"*"``，按公司键求差集，每对一行 grant。
+    - :data:`SHAPE_FULL_WILDCARD`：``"*"`` 键的值恰为 ``["*"]``，落一组映射全部
+      指标，随映射新增指标补行。
+    - :data:`SHAPE_ALL_SCOPE_EXPLICIT`：``"*"`` 键的值是不含 ``"*"`` 的显式列表，
+      落一组该列表，永不自动扩指标。
+    - :data:`SHAPE_UNSUPPORTED_WILDCARD`：其余含 ``"*"`` 的形状，调用方 fail-closed，
+      与解析失败同属 fail-closed、后果相同（整份不导入、零写入），原因不同。
+    """
     for company, metrics in document.items():
         problem = _malformed(company)
         if problem is not None:
@@ -168,7 +123,6 @@ def classify_legacy_permissions(document: Mapping[str, Sequence[str]]) -> str:
 
 def all_metrics(mapping: Mapping[str, Mapping[str, Sequence[str]]]) -> tuple[str, ...]:
     """映射里全部公司、全部职能的指标名并集（排序去重）——``{"*":["*"]}`` 的显式展开。"""
-
     collected: set[str] = set()
     for functions in mapping.values():
         for metrics in functions.values():
@@ -186,7 +140,6 @@ def compute_company_diff(
     分辨通配形态）；首聊自动路径请用 :func:`plan_legacy_import`，它按
     ``full_access_wildcard`` 区分两种通配。
     """
-
     if ALL_COMPANIES_KEY in galaxy_current:
         return {}
     result: dict[str, tuple[str, ...]] = {}
@@ -199,9 +152,12 @@ def compute_company_diff(
 
 @dataclass(frozen=True)
 class LegacyImportReport:
-    """一次存量差集导入的落库结果：只有计数与组 ID，不含任何公司键或指标名——它直接
-    进审计。住在本纯模块（而不是 ``core/identity/onboarding_ports.py``）是为了让
-    ``adapters/postgres_local_permission.py`` 不必反向依赖开通编排的端口模块。"""
+    """一次存量差集导入的落库结果。
+
+    只有计数与组 ID，不含任何公司键或指标名——它直接进审计。住在本纯模块（而不是
+    ``core/identity/onboarding_ports.py``）是为了让
+    ``adapters/postgres_local_permission.py`` 不必反向依赖开通编排的端口模块。
+    """
 
     imported: int
     already_present: int
@@ -225,14 +181,16 @@ class LegacyImportPlan:
 
     @property
     def nothing_to_import(self) -> bool:
+        """整份计划是否没有任何要导入的内容。"""
         return not self.pairs and not self.all_scope_metrics
 
     @property
     def all_scope_position_name(self) -> str:
-        """「全部」组落库用的职位标签：全通配形状用 :data:`ALL_SCOPE_POSITION_NAME`
-        （会随映射补齐指标），显式列表形状用 :data:`ALL_SCOPE_EXPLICIT_POSITION_NAME`
-        （永不自动扩指标）。"""
+        """「全部」组落库用的职位标签。
 
+        全通配形状用 :data:`ALL_SCOPE_POSITION_NAME`（会随映射补齐指标），显式
+        列表形状用 :data:`ALL_SCOPE_EXPLICIT_POSITION_NAME`（永不自动扩指标）。
+        """
         if self.shape == SHAPE_FULL_WILDCARD:
             return ALL_SCOPE_POSITION_NAME
         return ALL_SCOPE_EXPLICIT_POSITION_NAME
@@ -245,14 +203,14 @@ def plan_legacy_import(
     full_access_wildcard: bool,
     mapping: Mapping[str, Mapping[str, Sequence[str]]],
 ) -> LegacyImportPlan:
-    """把「旧行 + 银河当前翻译 + 映射」编排成导入计划（模块文档「差集口径」）。
+    """把「旧行 + 银河当前翻译 + 映射」编排成导入计划。
 
-    ``legacy`` 是 :func:`~lingxi.core.permission.publish_row.parse_permissions` 的产出；
-    ``galaxy_current`` 是 :func:`~lingxi.core.permission.metric_translation.
-    translate_company_functions` 的产出（零银河用户传 ``{}``）；``full_access_wildcard``
-    与 :func:`~lingxi.core.permission.merge_sources.merge_permission_sources` 同一判据。
+    差集按银河是否通配分三种口径：银河非通配——每个具体公司键单独求差集，``"*"``
+    组不减；银河有限通配（``"*"`` 键非真全指标）——组与具体键都减去银河 ``"*"``；
+    银河真全指标通配（``full_access_wildcard``）——本地源整体不导入。映射外公司
+    照常导入，只计数供审计。两种「全部」形状可附带具体公司键，按差集另落无组行——
+    公司维度保留 ``*``、指标维度显式展开，新公司无需改表，新指标由重算补齐。
     """
-
     shape = classify_legacy_permissions(legacy)
     if shape == SHAPE_UNSUPPORTED_WILDCARD:
         return LegacyImportPlan(shape, (), (), (REASON_SHAPE_UNSUPPORTED,), 0)
@@ -300,13 +258,14 @@ def missing_all_scope_metrics(
     entries: Iterable[LocalPermissionOverrideEntry],
     mapping: Mapping[str, Mapping[str, Sequence[str]]],
 ) -> dict[str, tuple[str, ...]]:
-    """对当前生效的「全部指标」组（``direction=grant``、``company_id="*"``、
-    ``position_name`` **恰为** :data:`ALL_SCOPE_POSITION_NAME`、带组 ID），算出映射里
-    已有、组里还没有的指标——新指标进来时重算据此补行。显式列表组
-    （:data:`ALL_SCOPE_EXPLICIT_POSITION_NAME`）**不参与**：它的指标是旧行列出的那几个，
-    自动扩成映射全部指标就是越权。只看传入的（生效）条目：撤销过的组不在其中，因此不会
-    复活。返回 ``{组 ID: (缺的指标, …)}``，没有缺项的组不出现。"""
+    """算出每个生效「全部指标」组里，映射已有但组里还没有的指标。
 
+    只看 ``direction=grant``、``company_id="*"``、``position_name`` 恰为
+    :data:`ALL_SCOPE_POSITION_NAME` 的带组 ID 条目；显式列表组
+    （:data:`ALL_SCOPE_EXPLICIT_POSITION_NAME`）不参与，自动扩成全部指标就是
+    越权。只看传入的（生效）条目，撤销过的组不会复活。返回
+    ``{组 ID: (缺的指标, …)}``，没有缺项的组不出现。
+    """
     present: dict[str, set[str]] = {}
     for entry in entries:
         if (

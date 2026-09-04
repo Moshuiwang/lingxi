@@ -13,7 +13,6 @@ docker，留给 `scripts/ci/verify_image_contract.sh`、`verify_compose_structur
 from __future__ import annotations
 
 import importlib.util
-import json
 import os
 import subprocess
 import sys
@@ -37,7 +36,9 @@ def _load_module(path: Path, name: str):
     return module
 
 
-DEPENDENCIES = _load_module(SCRIPTS / "check_runtime_dependencies.py", "runtime_dependency_check_under_test")
+DEPENDENCIES = _load_module(
+    SCRIPTS / "check_runtime_dependencies.py", "runtime_dependency_check_under_test"
+)
 CONTRACT = _load_module(SCRIPTS / "check_deploy_contract.py", "deploy_contract_check_under_test")
 PUSH = _load_module(SCRIPTS / "push_image.py", "push_image_under_test")
 
@@ -62,14 +63,22 @@ class ExactPinTest(unittest.TestCase):
     """安全边界组件必须锁 `==`。这一组对应变异 D7。"""
 
     def test_range_is_rejected(self) -> None:
-        failures = DEPENDENCIES.check_pins({"cryptography": [("scheduler", ">=45.0.7")],
-                                            "claude-agent-sdk": [("worker", "==0.2.128")]})
+        failures = DEPENDENCIES.check_pins(
+            {
+                "cryptography": [("scheduler", ">=45.0.7")],
+                "claude-agent-sdk": [("worker", "==0.2.128")],
+            }
+        )
         self.assertTrue(any("cryptography" in line for line in failures))
 
     def test_wildcard_pin_is_rejected(self) -> None:
         # `==45.0.*` 看起来像精确锁，其实是一个范围——补丁版本可以自己变。
-        failures = DEPENDENCIES.check_pins({"cryptography": [("scheduler", "==45.0.*")],
-                                            "claude-agent-sdk": [("worker", "==0.2.128")]})
+        failures = DEPENDENCIES.check_pins(
+            {
+                "cryptography": [("scheduler", "==45.0.*")],
+                "claude-agent-sdk": [("worker", "==0.2.128")],
+            }
+        )
         self.assertTrue(any("cryptography" in line for line in failures))
 
     def test_missing_declaration_is_rejected(self) -> None:
@@ -78,16 +87,22 @@ class ExactPinTest(unittest.TestCase):
 
     def test_every_occurrence_is_checked_not_just_the_first(self) -> None:
         # cryptography 同时出现在 scheduler 与 bot-test 两组；只看第一处会漏掉后一处。
-        failures = DEPENDENCIES.check_pins({
-            "cryptography": [("scheduler", "==45.0.7"), ("bot-test", ">=45.0.7")],
-            "claude-agent-sdk": [("worker", "==0.2.128")],
-        })
+        failures = DEPENDENCIES.check_pins(
+            {
+                "cryptography": [("scheduler", "==45.0.7"), ("bot-test", ">=45.0.7")],
+                "claude-agent-sdk": [("worker", "==0.2.128")],
+            }
+        )
         self.assertTrue(any("bot-test" in line for line in failures))
 
     def test_exact_pin_passes(self) -> None:
-        failures = DEPENDENCIES.check_pins({"cryptography": [("scheduler", "==45.0.7")],
-                                            "claude-agent-sdk": [("worker", "==0.2.128")],
-                                            "lark-oapi": [("gateway", "==1.7.1")]})
+        failures = DEPENDENCIES.check_pins(
+            {
+                "cryptography": [("scheduler", "==45.0.7")],
+                "claude-agent-sdk": [("worker", "==0.2.128")],
+                "lark-oapi": [("gateway", "==1.7.1")],
+            }
+        )
         self.assertEqual(failures, [])
 
 
@@ -266,7 +281,9 @@ class ImmutableTagOverwriteTest(unittest.TestCase):
 
     def test_missing_labels_yield_none(self) -> None:
         for stdout in ("<no value> <no value>\n", "unknown unknown\n", "\n"):
-            self.assertIsNone(PUSH.image_source_identity("x:y", runner=self._runner(0, stdout=stdout)))
+            self.assertIsNone(
+                PUSH.image_source_identity("x:y", runner=self._runner(0, stdout=stdout))
+            )
 
     def test_partial_failure_is_recoverable(self) -> None:
         """一次部分推送失败之后的补推：已推上去的跳过，没推的照常推。
@@ -291,7 +308,9 @@ class OverrideBypassTest(unittest.TestCase):
     def _with_override(self, body: str):
         directory = Path(self.enterContext(__import__("tempfile").TemporaryDirectory()))
         override = directory / "compose.prod.yaml"
-        override.write_text("services:\n" + textwrap.indent(textwrap.dedent(body), "  "), encoding="utf-8")
+        override.write_text(
+            "services:\n" + textwrap.indent(textwrap.dedent(body), "  "), encoding="utf-8"
+        )
         original = CONTRACT.COMPOSE_PROD
         CONTRACT.COMPOSE_PROD = override
         try:
@@ -321,8 +340,7 @@ class OverrideBypassTest(unittest.TestCase):
 
     def test_shared_env_file_across_services_is_caught(self) -> None:
         failures = self._with_override(
-            "scheduler:\n  env_file:\n    - ./.env.prod\n"
-            "worker:\n  env_file:\n    - ./.env.prod\n"
+            "scheduler:\n  env_file:\n    - ./.env.prod\nworker:\n  env_file:\n    - ./.env.prod\n"
         )
         self.assertTrue(any("env_file" in line for line in failures), failures)
 
@@ -336,8 +354,12 @@ class SchedulerUserVolumeTest(unittest.TestCase):
         directory = Path(self.enterContext(__import__("tempfile").TemporaryDirectory()))
         stage = directory / "compose.stage.yaml"
         prod = directory / "compose.prod.yaml"
-        stage.write_text("services:\n" + textwrap.indent(textwrap.dedent(stage_body), "  "), encoding="utf-8")
-        prod.write_text("services:\n" + textwrap.indent(textwrap.dedent(prod_body), "  "), encoding="utf-8")
+        stage.write_text(
+            "services:\n" + textwrap.indent(textwrap.dedent(stage_body), "  "), encoding="utf-8"
+        )
+        prod.write_text(
+            "services:\n" + textwrap.indent(textwrap.dedent(prod_body), "  "), encoding="utf-8"
+        )
         original_stage, original_prod = CONTRACT.COMPOSE_STAGE, CONTRACT.COMPOSE_PROD
         CONTRACT.COMPOSE_STAGE, CONTRACT.COMPOSE_PROD = stage, prod
         try:
@@ -349,7 +371,9 @@ class SchedulerUserVolumeTest(unittest.TestCase):
         """变异验红：把本该出现在 stage 覆盖文件里的 lingxi-users 挂载去掉，
         必须让本检查变红——这正是 Epic D 闸⑤修复前的真实缺陷形状。"""
 
-        body_without_mount = "scheduler:\n  volumes:\n    - lingxi-credentials:/var/lib/lingxi/credentials\n"
+        body_without_mount = (
+            "scheduler:\n  volumes:\n    - lingxi-credentials:/var/lib/lingxi/credentials\n"
+        )
         body_with_mount = (
             "scheduler:\n  volumes:\n"
             "    - lingxi-credentials:/var/lib/lingxi/credentials\n"
@@ -370,14 +394,18 @@ class SchedulerUserVolumeTest(unittest.TestCase):
             "    - lingxi-credentials:/var/lib/lingxi/credentials\n"
             "    - lingxi-users:/var/lib/lingxi/users\n"
         )
-        body_without_mount = "scheduler:\n  volumes:\n    - lingxi-credentials:/var/lib/lingxi/credentials\n"
+        body_without_mount = (
+            "scheduler:\n  volumes:\n    - lingxi-credentials:/var/lib/lingxi/credentials\n"
+        )
         failures = self._with_overrides(stage_body=body_with_mount, prod_body=body_without_mount)
         self.assertTrue(
             any("compose.prod.yaml" in f and "lingxi-users" in f for f in failures), failures
         )
 
     def test_a_missing_scheduler_service_is_reported_not_silently_skipped(self) -> None:
-        failures = self._with_overrides(stage_body="worker:\n  image: x\n", prod_body="worker:\n  image: x\n")
+        failures = self._with_overrides(
+            stage_body="worker:\n  image: x\n", prod_body="worker:\n  image: x\n"
+        )
         self.assertTrue(any("找不到 scheduler service" in f for f in failures), failures)
 
     def test_a_read_only_mount_is_caught_not_treated_as_mounted(self) -> None:
@@ -397,9 +425,7 @@ class SchedulerUserVolumeTest(unittest.TestCase):
             "    - lingxi-users:/var/lib/lingxi/users\n"
         )
         failures = self._with_overrides(stage_body=body_readonly, prod_body=body_with_mount)
-        self.assertTrue(
-            any("compose.stage.yaml" in f and "只读" in f for f in failures), failures
-        )
+        self.assertTrue(any("compose.stage.yaml" in f and "只读" in f for f in failures), failures)
         self.assertFalse(
             any("compose.prod.yaml" in f for f in failures),
             "prod 那份是可写挂载，不该被误报",
@@ -441,7 +467,7 @@ class ResourceLimitsTest(unittest.TestCase):
 
     FULL_SERVICE = (
         "scheduler:\n"
-        '  image: ${LINGXI_IMAGE_REGISTRY:?x}/lingxi-scheduler:${LINGXI_IMAGE_TAG:?y}\n'
+        "  image: ${LINGXI_IMAGE_REGISTRY:?x}/lingxi-scheduler:${LINGXI_IMAGE_TAG:?y}\n"
         '  user: "10001:10001"\n'
         "  deploy:\n"
         "    resources:\n"
@@ -454,7 +480,9 @@ class ResourceLimitsTest(unittest.TestCase):
     def _with_base(self, body: str) -> list[str]:
         directory = Path(self.enterContext(__import__("tempfile").TemporaryDirectory()))
         base = directory / "compose.yaml"
-        base.write_text("services:\n" + textwrap.indent(textwrap.dedent(body), "  "), encoding="utf-8")
+        base.write_text(
+            "services:\n" + textwrap.indent(textwrap.dedent(body), "  "), encoding="utf-8"
+        )
         original = CONTRACT.COMPOSE_BASE
         CONTRACT.COMPOSE_BASE = base
         try:
@@ -480,12 +508,12 @@ class ResourceLimitsTest(unittest.TestCase):
         deploy.resources.limits 这个块存在。"""
 
         body = (
-            'scheduler:\n'
-            '  deploy:\n'
-            '    resources:\n'
-            '      limits:\n'
+            "scheduler:\n"
+            "  deploy:\n"
+            "    resources:\n"
+            "      limits:\n"
             '        cpus: "1.0"\n'
-            '        memory: 1G\n'
+            "        memory: 1G\n"
         )
         failures = self._with_base(body)
         self.assertTrue(any("scheduler" in f and "`pids`" in f for f in failures), failures)
@@ -505,7 +533,9 @@ class ResourceLimitsTest(unittest.TestCase):
     def _with_stage_override(self, body: str) -> list[str]:
         directory = Path(self.enterContext(__import__("tempfile").TemporaryDirectory()))
         stage = directory / "compose.stage.yaml"
-        stage.write_text("services:\n" + textwrap.indent(textwrap.dedent(body), "  "), encoding="utf-8")
+        stage.write_text(
+            "services:\n" + textwrap.indent(textwrap.dedent(body), "  "), encoding="utf-8"
+        )
         original = CONTRACT.COMPOSE_STAGE
         CONTRACT.COMPOSE_STAGE = stage
         try:
@@ -518,13 +548,13 @@ class ResourceLimitsTest(unittest.TestCase):
         ``pids: 0`` 的语义是整个不下发这项限制，等于没设，必须变红。"""
 
         body = (
-            'scheduler:\n'
-            '  deploy:\n'
-            '    resources:\n'
-            '      limits:\n'
+            "scheduler:\n"
+            "  deploy:\n"
+            "    resources:\n"
+            "      limits:\n"
             '        cpus: "1.0"\n'
-            '        memory: 1G\n'
-            '        pids: 0\n'
+            "        memory: 1G\n"
+            "        pids: 0\n"
         )
         failures = self._with_stage_override(body)
         self.assertTrue(any("scheduler" in f and "`pids`" in f for f in failures), failures)
@@ -581,7 +611,9 @@ class WorkerConcurrencyContractTest(unittest.TestCase):
         def mutated_read(path: Path) -> str:
             text = original_read(path)
             if path == CONTRACT.WORKER_CONFIG:
-                text = text.replace("MAX_CONCURRENCY_HARD_LIMIT = 4", "MAX_CONCURRENCY_HARD_LIMIT = 8", 1)
+                text = text.replace(
+                    "MAX_CONCURRENCY_HARD_LIMIT = 4", "MAX_CONCURRENCY_HARD_LIMIT = 8", 1
+                )
             return text
 
         CONTRACT.read = mutated_read
@@ -590,7 +622,9 @@ class WorkerConcurrencyContractTest(unittest.TestCase):
         finally:
             CONTRACT.read = original_read
 
-        self.assertTrue(any("MAX_CONCURRENCY_HARD_LIMIT" in failure for failure in failures), failures)
+        self.assertTrue(
+            any("MAX_CONCURRENCY_HARD_LIMIT" in failure for failure in failures), failures
+        )
 
 
 class ProdExternalHostSpecLimitsTest(unittest.TestCase):
@@ -603,7 +637,9 @@ class ProdExternalHostSpecLimitsTest(unittest.TestCase):
     def _with_prod_override(self, body: str) -> list[str]:
         directory = Path(self.enterContext(__import__("tempfile").TemporaryDirectory()))
         prod = directory / "compose.prod.yaml"
-        prod.write_text("services:\n" + textwrap.indent(textwrap.dedent(body), "  "), encoding="utf-8")
+        prod.write_text(
+            "services:\n" + textwrap.indent(textwrap.dedent(body), "  "), encoding="utf-8"
+        )
         original = CONTRACT.COMPOSE_PROD
         CONTRACT.COMPOSE_PROD = prod
         try:
@@ -639,9 +675,7 @@ class ProdExternalHostSpecLimitsTest(unittest.TestCase):
             '"${LINGXI_WORKER_QUEUE_CPU_LIMIT:?待定}"', '"4.0"'
         )
         failures = self._with_prod_override(body)
-        self.assertTrue(
-            any("worker-queue" in f and "`cpus`" in f for f in failures), failures
-        )
+        self.assertTrue(any("worker-queue" in f and "`cpus`" in f for f in failures), failures)
 
     def test_the_external_contract_form_passes(self) -> None:
         failures = self._with_prod_override(self.EXTERNAL_CONTRACT_BODY)
@@ -694,9 +728,7 @@ class ProdExternalHostSpecLimitsTest(unittest.TestCase):
 
     def test_the_external_contract_form_passes_for_scheduler_and_gateway(self) -> None:
         failures = self._with_prod_override(self.SCHEDULER_GATEWAY_BODY)
-        self.assertEqual(
-            [f for f in failures if "scheduler" in f or "gateway" in f], []
-        )
+        self.assertEqual([f for f in failures if "scheduler" in f or "gateway" in f], [])
 
     def test_the_external_key_registry_still_lists_all_three_services(self) -> None:
         """把某个服务从登记表里悄悄摘掉，这道闸对它就整个不生效了。"""
@@ -723,13 +755,15 @@ class ProdDeclaresDeployEnvironmentTest(unittest.TestCase):
         "worker-queue:\n"
         "  environment:\n"
         '    LINGXI_DEPLOY_ENVIRONMENT: "prod"\n'
-        "    LINGXI_WORKER_WORKSPACE: \"/tmp/lingxi-workspace\"\n"
+        '    LINGXI_WORKER_WORKSPACE: "/tmp/lingxi-workspace"\n'
     )
 
     def _with_prod(self, body: str) -> list[str]:
         directory = Path(self.enterContext(__import__("tempfile").TemporaryDirectory()))
         prod = directory / "compose.prod.yaml"
-        prod.write_text("services:\n" + textwrap.indent(textwrap.dedent(body), "  "), encoding="utf-8")
+        prod.write_text(
+            "services:\n" + textwrap.indent(textwrap.dedent(body), "  "), encoding="utf-8"
+        )
         original = CONTRACT.COMPOSE_PROD
         CONTRACT.COMPOSE_PROD = prod
         try:
@@ -773,7 +807,9 @@ class ComposeInterpolationYamlSafetyTest(unittest.TestCase):
     def _with_prod(self, body: str) -> list[str]:
         directory = Path(self.enterContext(__import__("tempfile").TemporaryDirectory()))
         prod = directory / "compose.prod.yaml"
-        prod.write_text("services:\n" + textwrap.indent(textwrap.dedent(body), "  "), encoding="utf-8")
+        prod.write_text(
+            "services:\n" + textwrap.indent(textwrap.dedent(body), "  "), encoding="utf-8"
+        )
         original = CONTRACT.COMPOSE_PROD
         CONTRACT.COMPOSE_PROD = prod
         try:
@@ -928,7 +964,9 @@ class LogRetentionFloorTest(unittest.TestCase):
     def _with_base(self, body: str) -> list[str]:
         directory = Path(self.enterContext(__import__("tempfile").TemporaryDirectory()))
         base = directory / "compose.yaml"
-        base.write_text("services:\n" + textwrap.indent(textwrap.dedent(body), "  "), encoding="utf-8")
+        base.write_text(
+            "services:\n" + textwrap.indent(textwrap.dedent(body), "  "), encoding="utf-8"
+        )
         original = CONTRACT.COMPOSE_BASE
         CONTRACT.COMPOSE_BASE = base
         try:
@@ -947,10 +985,10 @@ class LogRetentionFloorTest(unittest.TestCase):
         """变异验红：把 max-size 改回本卡修复前的 20m，必须变红。"""
 
         body = (
-            'scheduler:\n'
-            '  logging:\n'
-            '    driver: json-file\n'
-            '    options:\n'
+            "scheduler:\n"
+            "  logging:\n"
+            "    driver: json-file\n"
+            "    options:\n"
             '      max-size: "20m"\n'
             '      max-file: "5"\n'
         )
@@ -959,10 +997,10 @@ class LogRetentionFloorTest(unittest.TestCase):
 
     def test_a_max_file_below_the_floor_is_caught(self) -> None:
         body = (
-            'scheduler:\n'
-            '  logging:\n'
-            '    driver: json-file\n'
-            '    options:\n'
+            "scheduler:\n"
+            "  logging:\n"
+            "    driver: json-file\n"
+            "    options:\n"
             '      max-size: "50m"\n'
             '      max-file: "3"\n'
         )
@@ -971,14 +1009,16 @@ class LogRetentionFloorTest(unittest.TestCase):
 
     def test_missing_logging_options_is_caught(self) -> None:
         failures = self._with_base('scheduler:\n  user: "10001:10001"\n')
-        self.assertTrue(any("scheduler" in f and "logging.options" in f for f in failures), failures)
+        self.assertTrue(
+            any("scheduler" in f and "logging.options" in f for f in failures), failures
+        )
 
     def test_at_the_floor_passes(self) -> None:
         body = (
-            'scheduler:\n'
-            '  logging:\n'
-            '    driver: json-file\n'
-            '    options:\n'
+            "scheduler:\n"
+            "  logging:\n"
+            "    driver: json-file\n"
+            "    options:\n"
             '      max-size: "50m"\n'
             '      max-file: "5"\n'
         )
@@ -996,7 +1036,9 @@ class LogRetentionFloorTest(unittest.TestCase):
     def _with_stage_override(self, body: str) -> list[str]:
         directory = Path(self.enterContext(__import__("tempfile").TemporaryDirectory()))
         stage = directory / "compose.stage.yaml"
-        stage.write_text("services:\n" + textwrap.indent(textwrap.dedent(body), "  "), encoding="utf-8")
+        stage.write_text(
+            "services:\n" + textwrap.indent(textwrap.dedent(body), "  "), encoding="utf-8"
+        )
         original = CONTRACT.COMPOSE_STAGE
         CONTRACT.COMPOSE_STAGE = stage
         try:
@@ -1008,10 +1050,10 @@ class LogRetentionFloorTest(unittest.TestCase):
         """变异验红对应用例：stage 覆盖文件把 max-size 改成 1m，必须变红。"""
 
         body = (
-            'scheduler:\n'
-            '  logging:\n'
-            '    driver: json-file\n'
-            '    options:\n'
+            "scheduler:\n"
+            "  logging:\n"
+            "    driver: json-file\n"
+            "    options:\n"
             '      max-size: "1m"\n'
             '      max-file: "5"\n'
         )
@@ -1121,7 +1163,9 @@ class PublishJobGuardTest(unittest.TestCase):
               - run: python3 scripts/ci/push_image.py x
     """
 
-    def _with_workflows(self, *, full: str | None = None, story: str | None = None, publish: str | None = None):
+    def _with_workflows(
+        self, *, full: str | None = None, story: str | None = None, publish: str | None = None
+    ):
         directory = Path(self.enterContext(__import__("tempfile").TemporaryDirectory()))
         paths = {
             "CI_WORKFLOW": directory / "ci.yml",
@@ -1130,7 +1174,9 @@ class PublishJobGuardTest(unittest.TestCase):
         }
         paths["CI_WORKFLOW"].write_text(textwrap.dedent(full or self.FULL), encoding="utf-8")
         paths["STORY_WORKFLOW"].write_text(textwrap.dedent(story or self.STORY), encoding="utf-8")
-        paths["PUBLISH_WORKFLOW"].write_text(textwrap.dedent(publish or self.PUBLISH), encoding="utf-8")
+        paths["PUBLISH_WORKFLOW"].write_text(
+            textwrap.dedent(publish or self.PUBLISH), encoding="utf-8"
+        )
         originals = {name: getattr(CONTRACT, name) for name in paths}
         for name, path in paths.items():
             setattr(CONTRACT, name, path)
@@ -1145,10 +1191,14 @@ class PublishJobGuardTest(unittest.TestCase):
             "if: github.event_name == 'push' && github.ref == 'refs/heads/main'", "if: always()"
         )
         failures = self._with_workflows(publish=publish)
-        self.assertTrue(any("packages: write" in f and "refs/heads/main" in f for f in failures), failures)
+        self.assertTrue(
+            any("packages: write" in f and "refs/heads/main" in f for f in failures), failures
+        )
 
     def test_publish_without_candidate_in_needs_is_caught(self) -> None:
-        failures = self._with_workflows(publish=self.PUBLISH.replace("needs: [candidate]", "needs: []"))
+        failures = self._with_workflows(
+            publish=self.PUBLISH.replace("needs: [candidate]", "needs: []")
+        )
         self.assertTrue(any("needs" in f and "candidate" in f for f in failures), failures)
 
     def test_wellformed_publish_job_passes(self) -> None:
@@ -1184,7 +1234,8 @@ class PublishJobGuardTest(unittest.TestCase):
 
     def test_candidate_must_need_all_full_legs(self) -> None:
         full = self.FULL.replace(
-            "needs: [classify, docs, l1, gate, extras, image]", "needs: [classify, docs, l1, gate, extras]"
+            "needs: [classify, docs, l1, gate, extras, image]",
+            "needs: [classify, docs, l1, gate, extras]",
         )
         failures = self._with_workflows(full=full)
         self.assertTrue(any("candidate needs" in failure for failure in failures), failures)
@@ -1227,9 +1278,7 @@ class CandidateSummaryRoutingTest(unittest.TestCase):
         start = workflow.index(step)
         run = "        run: |\n"
         body_start = workflow.index(run, start) + len(run)
-        body_end = workflow.index(
-            "\n      # 三步都额外要求 image 真正 success", body_start
-        )
+        body_end = workflow.index("\n      # 三步都额外要求 image 真正 success", body_start)
         return textwrap.dedent(workflow[body_start:body_end]).strip() + "\n"
 
     @staticmethod
@@ -1424,6 +1473,7 @@ class CandidateSummaryRoutingTest(unittest.TestCase):
                 result = self._run_summary(workflow, **environment)
                 self.assertEqual(result.returncode == 0, expected, result.stdout + result.stderr)
 
+
 class RealWorkflowTest(unittest.TestCase):
     """真实 ci.yml 的两腿构建必须走同一条路径（验收微验 P1）。
 
@@ -1444,7 +1494,7 @@ class RealWorkflowTest(unittest.TestCase):
 
         text = CONTRACT.read(CONTRACT.CI_WORKFLOW)
         index = text.index("verify_image_contract.sh")
-        invocation = text[index:index + 400]
+        invocation = text[index : index + 400]
         # 取到该命令的结尾（下一个不以续行符结尾的行）
         lines = []
         for line in invocation.splitlines()[:6]:
@@ -1454,27 +1504,31 @@ class RealWorkflowTest(unittest.TestCase):
         joined = " ".join(lines)
         for service in ("scheduler", "worker", "migrate", "gateway"):
             self.assertIn(
-                f"lingxi-{service}:build-a", joined,
+                f"lingxi-{service}:build-a",
+                joined,
                 f"ci.yml 调用 verify_image_contract.sh 时漏了 {service}；"
                 "脚本会回落到 :probe 默认值，CI 上不存在",
             )
 
     def test_both_build_legs_use_the_same_script(self) -> None:
         text = CONTRACT.read(CONTRACT.CI_WORKFLOW)
-        image_job = text[text.index("  image:"):text.index("  candidate:")]
+        image_job = text[text.index("  image:") : text.index("  candidate:")]
         bare_builds = [
             line.strip()
             for line in image_job.splitlines()
             if "docker build" in line and not line.lstrip().startswith("#")
         ]
         self.assertEqual(
-            bare_builds, [],
+            bare_builds,
+            [],
             "image job 里出现了裸 docker build；两腿都必须走 scripts/ci/build_image.sh，"
             "否则构建参数会在两腿之间漂移（来源标签就是这么漂的）",
         )
         self.assertEqual(image_job.count("scripts/ci/build_image.sh"), 2)
 
-    def test_permission_impact_ci_requires_external_registration_without_new_privilege(self) -> None:
+    def test_permission_impact_ci_requires_external_registration_without_new_privilege(
+        self,
+    ) -> None:
         """P2：PR claim 不能独自成为 stage 证据，且当前不偷偷申请新权限。"""
 
         text = CONTRACT.read(CONTRACT.CI_WORKFLOW)
@@ -1623,7 +1677,9 @@ class GatewayOrchestrationTest(unittest.TestCase):
 
     def test_gateway_short_stop_grace_is_caught(self) -> None:
         failures = self._with_base(self.SHORT_GRACE)
-        self.assertTrue(any("gateway" in f and "stop_grace_period" in f for f in failures), failures)
+        self.assertTrue(
+            any("gateway" in f and "stop_grace_period" in f for f in failures), failures
+        )
 
     def test_gateway_budget_is_derived_from_its_own_config(self) -> None:
         # 停机超时来自 apps/gateway/config.py 的默认值，出站取它的 1/4。
@@ -1644,13 +1700,12 @@ class WorkerQueueUserVolumeTest(unittest.TestCase):
         directory = Path(self.enterContext(__import__("tempfile").TemporaryDirectory()))
         base = directory / "compose.yaml"
         body = (
-            'worker-queue:\n'
-            '  image: ${LINGXI_IMAGE_REGISTRY:?x}/lingxi-worker:${LINGXI_IMAGE_TAG:?y}\n'
+            "worker-queue:\n"
+            "  image: ${LINGXI_IMAGE_REGISTRY:?x}/lingxi-worker:${LINGXI_IMAGE_TAG:?y}\n"
             '  profiles: ["mvp"]\n'
-            '  restart: unless-stopped\n'
+            "  restart: unless-stopped\n"
             '  user: "10001:10001"\n'
-            '  read_only: true\n'
-            + volumes_or_decoy
+            "  read_only: true\n" + volumes_or_decoy
         )
         base.write_text("services:\n" + textwrap.indent(body, "  "), encoding="utf-8")
         original = CONTRACT.COMPOSE_BASE
@@ -1665,25 +1720,23 @@ class WorkerQueueUserVolumeTest(unittest.TestCase):
         "已挂载"——这正是外部独立审查 F2 在 scheduler 侧坐实过的同一类假绿口子，
         这里补的是 worker-queue 那一侧。"""
 
-        failures = self._with_base('  volumes:\n    - lingxi-users:/var/lib/lingxi/users:ro\n')
-        self.assertTrue(
-            any("worker-queue" in f and "只读" in f for f in failures), failures
-        )
+        failures = self._with_base("  volumes:\n    - lingxi-users:/var/lib/lingxi/users:ro\n")
+        self.assertTrue(any("worker-queue" in f and "只读" in f for f in failures), failures)
 
     def test_mount_string_appearing_elsewhere_does_not_produce_a_false_pass(self) -> None:
         """卷实际没挂、只是这个子串恰好出现在 ``environment`` 里，必须仍然变红——
         证明真正生效的是对 ``volumes:`` 列表的精确解析，不是子串命中。"""
 
-        failures = self._with_base('  environment:\n    NOTE: lingxi-users:/var/lib/lingxi/users\n')
-        self.assertTrue(
-            any("worker-queue 必须挂载用户环境持久卷" in f for f in failures), failures
-        )
+        failures = self._with_base("  environment:\n    NOTE: lingxi-users:/var/lib/lingxi/users\n")
+        self.assertTrue(any("worker-queue 必须挂载用户环境持久卷" in f for f in failures), failures)
 
     def test_real_compose_worker_queue_volume_passes(self) -> None:
         """真实仓库状态必须通过——防止本检查因为文件结构变化而变成空转。"""
 
         failures = [
-            f for f in CONTRACT.check_compose_contract() if "worker-queue" in f and "lingxi-users" in f
+            f
+            for f in CONTRACT.check_compose_contract()
+            if "worker-queue" in f and "lingxi-users" in f
         ]
         self.assertEqual(failures, [])
 
@@ -1713,11 +1766,7 @@ class WorkerWorkspaceIsolationTest(unittest.TestCase):
             environment = "  environment:\n    LINGXI_WORKER_MODE: queue\n"
             if workspace is not None:
                 environment += f'    LINGXI_WORKER_WORKSPACE: "{workspace}"\n'
-            body = (
-                "worker-queue:\n"
-                + environment
-                + f"  volumes:\n    - {users_mount}\n"
-            )
+            body = "worker-queue:\n" + environment + f"  volumes:\n    - {users_mount}\n"
             path = directory / name
             path.write_text("services:\n" + textwrap.indent(body, "  "), encoding="utf-8")
             return path
@@ -1725,9 +1774,7 @@ class WorkerWorkspaceIsolationTest(unittest.TestCase):
         base = directory / "compose.yaml"
         base.write_text(
             "services:\n"
-            + textwrap.indent(
-                f"worker-queue:\n  volumes:\n    - {users_mount}\n", "  "
-            ),
+            + textwrap.indent(f"worker-queue:\n  volumes:\n    - {users_mount}\n", "  "),
             encoding="utf-8",
         )
         saved = (CONTRACT.COMPOSE_BASE, CONTRACT.COMPOSE_STAGE, CONTRACT.COMPOSE_PROD)
@@ -1770,16 +1817,18 @@ class WorkerWorkspaceIsolationTest(unittest.TestCase):
         停在用户目录根上正是这么发生的。stage 与 prod 各判一条。"""
 
         failures = self._failures(stage_workspace=None, prod_workspace=None)
-        self.assertTrue(any("compose.stage.yaml" in f and "没有显式声明" in f for f in failures), failures)
-        self.assertTrue(any("compose.prod.yaml" in f and "没有显式声明" in f for f in failures), failures)
+        self.assertTrue(
+            any("compose.stage.yaml" in f and "没有显式声明" in f for f in failures), failures
+        )
+        self.assertTrue(
+            any("compose.prod.yaml" in f and "没有显式声明" in f for f in failures), failures
+        )
 
     def test_an_interpolated_value_is_caught(self) -> None:
         """留 ``${VAR:-...}`` 插值等于把安全边界的取值交回给未入库的 env 文件。"""
 
         failures = self._failures(stage_workspace="${LINGXI_WORKER_WORKSPACE:-/tmp/x}")
-        self.assertTrue(
-            any("compose.stage.yaml" in f and "插值" in f for f in failures), failures
-        )
+        self.assertTrue(any("compose.stage.yaml" in f and "插值" in f for f in failures), failures)
 
     def test_a_relative_path_is_caught(self) -> None:
         failures = self._failures(stage_workspace="workspace")
@@ -1870,7 +1919,7 @@ class RealRepositoryTest(unittest.TestCase):
     def test_scheduler_constants_are_readable(self) -> None:
         # 停止宽限期的联动检查依赖这两个常量读得到；读不到时它会退化成不判定。
         self.assertIsInstance(
-            CONTRACT.module_constant(CONTRACT.FEISHU_DIRECTORY, "REQUEST_TIMEOUT_SECONDS"), int
+            CONTRACT.module_constant(CONTRACT.FEISHU_PAGED_CLIENT, "REQUEST_TIMEOUT_SECONDS"), int
         )
         backoff = CONTRACT.module_constant(
             CONTRACT.SCHEDULER_CREDENTIAL_ROTATION, "SAVE_RETRY_BACKOFF_SECONDS"
@@ -1881,8 +1930,14 @@ class RealRepositoryTest(unittest.TestCase):
         self.assertEqual(CONTRACT.check_stop_grace_period(), [])
 
     def test_deploy_files_exist(self) -> None:
-        for path in (CONTRACT.DOCKERFILE, CONTRACT.DOCKERIGNORE, CONTRACT.COMPOSE_BASE,
-                     CONTRACT.COMPOSE_STAGE, CONTRACT.COMPOSE_PROD, CONTRACT.ENV_EXAMPLE):
+        for path in (
+            CONTRACT.DOCKERFILE,
+            CONTRACT.DOCKERIGNORE,
+            CONTRACT.COMPOSE_BASE,
+            CONTRACT.COMPOSE_STAGE,
+            CONTRACT.COMPOSE_PROD,
+            CONTRACT.ENV_EXAMPLE,
+        ):
             self.assertTrue(path.is_file(), f"{path} 不存在，对应的检查会变成空转")
 
 
@@ -1894,9 +1949,15 @@ class ContentCaptureProdGuardTest(unittest.TestCase):
     def _with_compose_overrides(self, *, base: str = "", stage: str = "", prod: str = ""):
         directory = Path(self.enterContext(__import__("tempfile").TemporaryDirectory()))
         paths = {}
-        for name, body in (("compose.yaml", base), ("compose.stage.yaml", stage), ("compose.prod.yaml", prod)):
+        for name, body in (
+            ("compose.yaml", base),
+            ("compose.stage.yaml", stage),
+            ("compose.prod.yaml", prod),
+        ):
             path = directory / name
-            path.write_text(f"services:\n{textwrap.indent(textwrap.dedent(body), '  ')}", encoding="utf-8")
+            path.write_text(
+                f"services:\n{textwrap.indent(textwrap.dedent(body), '  ')}", encoding="utf-8"
+            )
             paths[name] = path
         originals = (CONTRACT.COMPOSE_BASE, CONTRACT.COMPOSE_STAGE, CONTRACT.COMPOSE_PROD)
         CONTRACT.COMPOSE_BASE = paths["compose.yaml"]

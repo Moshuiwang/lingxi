@@ -124,10 +124,7 @@ class InstallCredentialRedactionTests(unittest.TestCase):
             install_credential_redaction(source_logger_names=())
 
             self.assertTrue(
-                any(
-                    isinstance(f, CredentialQueryRedactingFilter)
-                    for f in probe_handler.filters
-                )
+                any(isinstance(f, CredentialQueryRedactingFilter) for f in probe_handler.filters)
             )
         finally:
             root.removeHandler(probe_handler)
@@ -150,9 +147,7 @@ class InstallCredentialRedactionTests(unittest.TestCase):
         try:
             install_credential_redaction(source_logger_names=())
 
-            other_logger.info(
-                "connected to wss://example.invalid/ws?ticket=fake-ticket-value"
-            )
+            other_logger.info("connected to wss://example.invalid/ws?ticket=fake-ticket-value")
 
             self.assertNotIn("fake-ticket-value", stream.getvalue())
             self.assertIn("ticket=***", stream.getvalue())

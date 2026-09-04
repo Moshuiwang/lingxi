@@ -24,7 +24,7 @@ import textwrap
 import threading
 import time
 import unittest
-from datetime import date, datetime, timedelta, timezone
+from datetime import UTC, date, datetime, timedelta
 
 from lingxi.apps.scheduler import (
     RosterAuditDuty,
@@ -33,7 +33,7 @@ from lingxi.apps.scheduler import (
     StructuredLogAuditSink,
     build_loop,
 )
-from lingxi.core.identity.access_token_supply import AccessTokenUnavailable
+from lingxi.core.identity.access_token_supply import AccessTokenUnavailableError
 from lingxi.core.identity.roster_audit import ArchivedIdentity, DiffKind
 from lingxi.core.identity.roster_snapshot import (
     DEFAULT_SNAPSHOT_STALE_AFTER,
@@ -74,7 +74,9 @@ def baseline_of_one() -> list[ArchivedIdentity]:
 
 
 def changed_rows() -> list[dict[str, object]]:
-    return [{"personnel_id": PERSON_ONE, "name": NEW_NAME, "employee_no": EMPLOYEE_NO, "email": EMAIL}]
+    return [
+        {"personnel_id": PERSON_ONE, "name": NEW_NAME, "employee_no": EMPLOYEE_NO, "email": EMAIL}
+    ]
 
 
 def unchanged_rows() -> list[dict[str, object]]:
@@ -95,7 +97,7 @@ def fresh_snapshot(*, captured_at: datetime | None = None) -> RosterSnapshotStat
         action="replace",
         read_status="complete",
         stale_after_seconds=STALE_AFTER_SECONDS,
-        captured_at=captured_at or datetime(2026, 8, 6, 9, 0, tzinfo=timezone.utc),
+        captured_at=captured_at or datetime(2026, 8, 6, 9, 0, tzinfo=UTC),
         row_count=SNAPSHOT_ROWS,
         age_seconds=0.0,
     )
@@ -111,7 +113,7 @@ def stale_snapshot(*, age_seconds: float = STALE_AFTER_SECONDS + 3600) -> Roster
         alert="failed_indeterminate",
         failure_code="pagination_stalled",
         failure_kind="indeterminate",
-        captured_at=datetime(2026, 8, 3, 9, 0, tzinfo=timezone.utc),
+        captured_at=datetime(2026, 8, 3, 9, 0, tzinfo=UTC),
         row_count=SNAPSHOT_ROWS,
         age_seconds=age_seconds,
     )
@@ -202,7 +204,7 @@ class FixedClock:
         self.today = start
 
     def __call__(self) -> datetime:
-        return datetime(self.today.year, self.today.month, self.today.day, 9, 0, tzinfo=timezone.utc)
+        return datetime(self.today.year, self.today.month, self.today.day, 9, 0, tzinfo=UTC)
 
     def advance(self, days: int = 1) -> None:
         self.today = self.today + timedelta(days=days)
@@ -472,9 +474,7 @@ class SnapshotWriteIsNotHostageToTheBaselineTest(unittest.TestCase):
         `examined` 仍然取自基线人数（`V-花名册-48`）。"""
 
         source = FakeRosterSource([], snapshot=absent_snapshot())
-        duty, sender, audit, _clock, reader = build_duty(
-            baseline=baseline_of_one(), source=source
-        )
+        duty, sender, audit, _clock, reader = build_duty(baseline=baseline_of_one(), source=source)
 
         report = duty.run_once()
 
@@ -695,7 +695,9 @@ class RemovalTakesNoActionTest(unittest.TestCase):
     改 app_user、停用账号、发布权限或建待办的地方——这条断言把那个结构钉住。
     """
 
-    def test_a_person_missing_from_the_roster_produces_one_report_line_and_nothing_else(self) -> None:
+    def test_a_person_missing_from_the_roster_produces_one_report_line_and_nothing_else(
+        self,
+    ) -> None:
         duty, sender, audit, _clock, _reader = build_duty(rows=[])
 
         report = duty.run_once()
@@ -710,9 +712,9 @@ class RemovalTakesNoActionTest(unittest.TestCase):
 
     def test_the_duty_exposes_no_collaborator_that_could_mutate_anything(self) -> None:
         # #237 拆分后 `RosterAuditDuty` 搬进了 roster_audit 子模块。
-        source = (
-            SOURCE_ROOT / "lingxi" / "apps" / "scheduler" / "roster_audit.py"
-        ).read_text(encoding="utf-8")
+        source = (SOURCE_ROOT / "lingxi" / "apps" / "scheduler" / "roster_audit.py").read_text(
+            encoding="utf-8"
+        )
         tree = ast.parse(source)
         duty_class = next(
             node
@@ -725,7 +727,15 @@ class RemovalTakesNoActionTest(unittest.TestCase):
             if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
         }
 
-        for forbidden in ("save", "update", "commit_batch", "record_identity", "revoke", "publish", "execute"):
+        for forbidden in (
+            "save",
+            "update",
+            "commit_batch",
+            "record_identity",
+            "revoke",
+            "publish",
+            "execute",
+        ):
             self.assertNotIn(forbidden, called_attributes, f"日报职责不得调用 {forbidden}")
 
 
@@ -784,9 +794,7 @@ class IdempotenceTest(unittest.TestCase):
         second_instance.run_once()
 
         self.assertEqual(len(sender.payloads), 2, "重启当日会重发一次（R2 知情接受）")
-        self.assertEqual(
-            sender.payloads[0], sender.payloads[1], "重发的载荷必须与首次逐字段一致"
-        )
+        self.assertEqual(sender.payloads[0], sender.payloads[1], "重发的载荷必须与首次逐字段一致")
 
         # 新实例的第三轮不再发送：判重在这个实例内照样生效。
         second_instance.run_once()
@@ -856,10 +864,14 @@ class GroupSenderTest(unittest.TestCase):
             if isinstance(node, ast.ClassDef) and node.name == "FeishuGroupMessages"
         )
         constructor = next(
-            node for node in sender_class.body if isinstance(node, ast.FunctionDef) and node.name == "__init__"
+            node
+            for node in sender_class.body
+            if isinstance(node, ast.FunctionDef) and node.name == "__init__"
         )
 
-        imports = [node for node in ast.walk(constructor) if isinstance(node, (ast.Import, ast.ImportFrom))]
+        imports = [
+            node for node in ast.walk(constructor) if isinstance(node, (ast.Import, ast.ImportFrom))
+        ]
         self.assertEqual(imports, [], "构造函数里不得有任何 import")
         called = {
             node.func.attr
@@ -901,7 +913,10 @@ class GroupSenderTest(unittest.TestCase):
         self.assertNotIn("secret_fake", str(calls[0]["url"]))
 
     def test_a_business_error_code_is_raised_and_carries_no_credential_or_chat_id(self) -> None:
-        from lingxi.adapters.feishu_group_message import FeishuGroupMessageError, FeishuGroupMessages
+        from lingxi.adapters.feishu_group_message import (
+            FeishuGroupMessageError,
+            FeishuGroupMessages,
+        )
 
         def transport(method: str, url: str, *, body=None, token=None):
             if "tenant_access_token" in url:
@@ -960,9 +975,9 @@ class GroupSenderTest(unittest.TestCase):
 
     def test_the_chat_id_is_only_ever_read_from_the_environment(self) -> None:
         # #237 拆分后 `SchedulerConfig`（读这个环境变量的地方）搬进了 config 子模块。
-        source = (
-            SOURCE_ROOT / "lingxi" / "apps" / "scheduler" / "config.py"
-        ).read_text(encoding="utf-8")
+        source = (SOURCE_ROOT / "lingxi" / "apps" / "scheduler" / "config.py").read_text(
+            encoding="utf-8"
+        )
 
         self.assertIn("LINGXI_ADMIN_GROUP_CHAT_ID", source)
         self.assertIn("LINGXI_ADMIN_GROUP_CHAT_ID", SchedulerConfig.ENVIRONMENT_KEYS)
@@ -1067,7 +1082,10 @@ class DeliveryIdempotenceTest(unittest.TestCase):
         clock.advance()
         duty.run_once()
 
-        self.assertEqual([payload["dedupe_key"] for payload in sender.payloads], [first_day, clock.today.isoformat()])
+        self.assertEqual(
+            [payload["dedupe_key"] for payload in sender.payloads],
+            [first_day, clock.today.isoformat()],
+        )
 
 
 class ChatIdValidationTest(unittest.TestCase):
@@ -1079,7 +1097,9 @@ class ChatIdValidationTest(unittest.TestCase):
         self.assertIsNone(config.admin_group_chat_id)
 
     def test_a_wellformed_variable_is_accepted(self) -> None:
-        config = SchedulerConfig.from_env({**COMPLETE_ENV, "LINGXI_ADMIN_GROUP_CHAT_ID": FAKE_CHAT_ID})
+        config = SchedulerConfig.from_env(
+            {**COMPLETE_ENV, "LINGXI_ADMIN_GROUP_CHAT_ID": FAKE_CHAT_ID}
+        )
 
         self.assertEqual(config.admin_group_chat_id, FAKE_CHAT_ID)
 
@@ -1090,14 +1110,18 @@ class ChatIdValidationTest(unittest.TestCase):
             with self.subTest(value=bad):
                 if bad.strip():
                     with self.assertRaises(ValueError) as raised:
-                        SchedulerConfig.from_env({**COMPLETE_ENV, "LINGXI_ADMIN_GROUP_CHAT_ID": bad})
+                        SchedulerConfig.from_env(
+                            {**COMPLETE_ENV, "LINGXI_ADMIN_GROUP_CHAT_ID": bad}
+                        )
 
                     message = str(raised.exception)
                     self.assertIn("LINGXI_ADMIN_GROUP_CHAT_ID", message)
                     self.assertNotIn(bad, message, "错误消息不得回显取到的值")
                 else:
                     # 纯空白＝没配，走"可选"那条路，不是错配。
-                    config = SchedulerConfig.from_env({**COMPLETE_ENV, "LINGXI_ADMIN_GROUP_CHAT_ID": bad})
+                    config = SchedulerConfig.from_env(
+                        {**COMPLETE_ENV, "LINGXI_ADMIN_GROUP_CHAT_ID": bad}
+                    )
                     self.assertIsNone(config.admin_group_chat_id)
 
     def test_the_bare_prefix_alone_is_rejected(self) -> None:
@@ -1124,7 +1148,7 @@ class DutyRegistrationTest(unittest.TestCase):
     用例（``tests/test_permission_refresh_duty.py``）钉住。
     """
 
-    def _roster_records(self, audit: "RecordingAudit") -> list[tuple[str, dict]]:
+    def _roster_records(self, audit: RecordingAudit) -> list[tuple[str, dict]]:
         """只取花名册审计日报职责留下的那些审计行。"""
 
         return [record for record in audit.records if record[0].startswith("roster_audit.")]
@@ -1140,7 +1164,9 @@ class DutyRegistrationTest(unittest.TestCase):
             {
                 **COMPLETE_ENV,
                 "LINGXI_DELEGATED_CREDENTIAL_KEY": Fernet.generate_key().decode(),
-                "LINGXI_DELEGATED_CREDENTIAL_PATH": str(pathlib.Path(directory.name) / "delegated.enc"),
+                "LINGXI_DELEGATED_CREDENTIAL_PATH": str(
+                    pathlib.Path(directory.name) / "delegated.enc"
+                ),
                 **extra,
             }
         )
@@ -1184,7 +1210,10 @@ class DutyRegistrationTest(unittest.TestCase):
 
         cases = (
             ({}, "LINGXI_ROSTER_BITABLE_APP_TOKEN"),
-            ({"LINGXI_ROSTER_BITABLE_APP_TOKEN": "bascnFakeAppToken"}, "LINGXI_ROSTER_BITABLE_TABLE_ID"),
+            (
+                {"LINGXI_ROSTER_BITABLE_APP_TOKEN": "bascnFakeAppToken"},
+                "LINGXI_ROSTER_BITABLE_TABLE_ID",
+            ),
         )
         for extra, expected in cases:
             with self.subTest(variable=expected):
@@ -1292,7 +1321,7 @@ class DutyRegistrationTest(unittest.TestCase):
         failing_audit = RecordingAudit()
 
         def always_failing() -> str:
-            raise AccessTokenUnavailable("no_credential_available")
+            raise AccessTokenUnavailableError("no_credential_available")
 
         registered = _build_roster_audit_duty(
             config,
@@ -1304,8 +1333,10 @@ class DutyRegistrationTest(unittest.TestCase):
         self.assertIsNotNone(registered, "供给存在但会失败时，职责照常注册")
         self.assertEqual(failing_audit.records, [], "运行期失败不产生『未注册』审计")
 
-    def test_with_every_prerequisite_the_duty_is_registered_by_the_existing_entry_point(self) -> None:
-        """"谁会调用它"的落点：日报职责由**已存在**的 `lingxi-scheduler` 进程装配。
+    def test_with_every_prerequisite_the_duty_is_registered_by_the_existing_entry_point(
+        self,
+    ) -> None:
+        """ "谁会调用它"的落点：日报职责由**已存在**的 `lingxi-scheduler` 进程装配。
 
         `build_loop` 是 `main()` 唯一的装配入口，因此这条断言就是"读取、快照、比对、
         渲染、发送整条链真的有调用方"的证据。装配过程不发任何请求：令牌供给这里没被
@@ -1376,8 +1407,18 @@ class AuditTest(unittest.TestCase):
             ArchivedIdentity(USER_TWO, PERSON_TWO, "李四", "E1002", "lisi@example.com"),
         ]
         rows = [
-            {"personnel_id": PERSON_ONE, "name": NEW_NAME, "employee_no": EMPLOYEE_NO, "email": NEW_EMAIL},
-            {"personnel_id": PERSON_TWO, "name": "李四", "employee_no": "E1002", "email": "lisi@example.com"},
+            {
+                "personnel_id": PERSON_ONE,
+                "name": NEW_NAME,
+                "employee_no": EMPLOYEE_NO,
+                "email": NEW_EMAIL,
+            },
+            {
+                "personnel_id": PERSON_TWO,
+                "name": "李四",
+                "employee_no": "E1002",
+                "email": "lisi@example.com",
+            },
         ]
         duty, _sender, audit, _clock, _reader = build_duty(baseline=baseline, rows=rows)
 
@@ -1385,7 +1426,16 @@ class AuditTest(unittest.TestCase):
             duty.run_once()
 
         haystack = repr(audit.records) + "\n" + "\n".join(captured.output)
-        for value in (NAME, EMPLOYEE_NO, EMAIL, NEW_NAME, NEW_EMAIL, "李四", "E1002", "lisi@example.com"):
+        for value in (
+            NAME,
+            EMPLOYEE_NO,
+            EMAIL,
+            NEW_NAME,
+            NEW_EMAIL,
+            "李四",
+            "E1002",
+            "lisi@example.com",
+        ):
             with self.subTest(value=value):
                 self.assertNotIn(value, haystack, f"审计与日志里不得出现资料值：{value}")
         # 外部标识同样不进审计与日志的明文。
@@ -1417,7 +1467,9 @@ class RedactedIdentifierUsageTest(unittest.TestCase):
         every: list[ast.Call] = [
             node
             for node in ast.walk(tree)
-            if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id == "redact_identifier"
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id == "redact_identifier"
         ]
         inside_logging: list[ast.Call] = []
         for node in ast.walk(tree):
@@ -1455,9 +1507,9 @@ class RedactedIdentifierUsageTest(unittest.TestCase):
         self.assertGreaterEqual(checked, 3)
 
     def test_the_report_body_never_uses_the_redacted_form(self) -> None:
-        report_source = (SOURCE_ROOT / "lingxi" / "core" / "identity" / "roster_report.py").read_text(
-            encoding="utf-8"
-        )
+        report_source = (
+            SOURCE_ROOT / "lingxi" / "core" / "identity" / "roster_report.py"
+        ).read_text(encoding="utf-8")
         tree = ast.parse(report_source)
         every, _inside = self._redaction_calls(tree)
 

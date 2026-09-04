@@ -20,14 +20,14 @@ from __future__ import annotations
 
 import os
 import unittest
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 
 from postgres_schema import ensure_production_schema, psycopg_available, reset_production_rows
 
-from lingxi.adapters.postgres import connect
 from lingxi.adapters.mcp_token_cipher import McpTokenCipher, McpTokenCipherError, new_token
+from lingxi.adapters.postgres import connect
 from lingxi.adapters.postgres_mcp_token import PostgresMcpTokenStore
-from lingxi.core.permission.mcp_readiness import (
+from lingxi.core.permission.mcp_readiness_base import (
     ReadinessAttempt,
     ReadinessBinding,
     ReadinessOutcome,
@@ -43,7 +43,7 @@ SKIP_REASON = (
 SPEC_MASTER_KEY = "MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY="
 OTHER_MASTER_KEY = "enp6enp6enp6enp6enp6enp6enp6enp6enp6enp6eno="
 
-NOW = datetime(2026, 8, 17, 3, 0, tzinfo=timezone.utc)
+NOW = datetime(2026, 8, 17, 3, 0, tzinfo=UTC)
 USER_A = "usr_token_a"
 USER_B = "usr_token_b"
 EMAIL_A = "jiaming.jia@example.invalid"
@@ -143,7 +143,14 @@ class TokenIssuanceTest(McpTokenPostgresTestCase):
 
         columns = self._columns("mcp_access_token")
         self.assertEqual(columns, {"user_id", "token_cipher", "issued_at", "created_at"})
-        for forbidden in ("token", "token_plain", "plaintext", "secret", "token_hash", "fingerprint"):
+        for forbidden in (
+            "token",
+            "token_plain",
+            "plaintext",
+            "secret",
+            "token_hash",
+            "fingerprint",
+        ):
             self.assertNotIn(forbidden, columns)
 
     def test_issue_stores_only_ciphertext(self) -> None:
@@ -630,9 +637,7 @@ class SyncCheckRecordTest(McpTokenPostgresTestCase):
             holder.join(timeout=10)
         # 锁放开之后照常记账。
         self.store.record_attempt(_attempt())
-        self.assertEqual(
-            [item.attempt_no for item in self.store.load_checks(USER_A, VERSION)], [1]
-        )
+        self.assertEqual([item.attempt_no for item in self.store.load_checks(USER_A, VERSION)], [1])
 
     def test_expiry_is_derived_and_cannot_be_moved(self) -> None:
         self.store.record_attempt(_attempt())

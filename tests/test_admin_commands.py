@@ -190,9 +190,7 @@ class RetiredPermissionCommandTests(unittest.TestCase):
     def test_retired_commands_are_unknown_subcommand(self) -> None:
         for name in self.RETIRED:
             with self.subTest(name=name):
-                command = parse_admin_command(
-                    f"/admin {name} ou_abc123 1011 daily_active 特批"
-                )
+                command = parse_admin_command(f"/admin {name} ou_abc123 1011 daily_active 特批")
                 self.assertEqual(command.kind, AdminCommandKind.UNKNOWN)
                 self.assertEqual(command.reject_reason, AdminRejectReason.UNKNOWN_SUBCOMMAND)
 
@@ -227,9 +225,7 @@ class RetiredPermissionCommandTests(unittest.TestCase):
     def test_revoke_permission_shape_two_still_parses(self) -> None:
         """不误伤：与撤除命令共用参数形状的 ``revoke_permission`` 形状 2 不受影响。"""
 
-        command = parse_admin_command(
-            "/admin revoke_permission ou_abc123 1011 daily_active 收回"
-        )
+        command = parse_admin_command("/admin revoke_permission ou_abc123 1011 daily_active 收回")
         self.assertEqual(command.kind, AdminCommandKind.REVOKE_PERMISSION)
         self.assertEqual(command.company_id, "1011")
         self.assertEqual(command.metric_name, "daily_active")
@@ -274,9 +270,7 @@ class RevokePermissionParsingTests(unittest.TestCase):
         self.assertEqual(command.identifier, _VALID_LEGACY_PERMISSION_GROUP_ID)
 
     def test_case_insensitive_and_whitespace_tolerant(self) -> None:
-        command = parse_admin_command(
-            f"  /ADMIN Revoke_Permission  {_VALID_OVERRIDE_ID}  离职  "
-        )
+        command = parse_admin_command(f"  /ADMIN Revoke_Permission  {_VALID_OVERRIDE_ID}  离职  ")
         self.assertEqual(command.kind, AdminCommandKind.REVOKE_PERMISSION)
         self.assertEqual(command.identifier, _VALID_OVERRIDE_ID)
         self.assertEqual(command.reason, "离职")
@@ -333,9 +327,7 @@ class RevokePermissionShapeTwoParsingTests(unittest.TestCase):
     同一参数形状，服务端反查覆盖 ID（router.py 职责，这里只验证语法层解析）。"""
 
     def test_identifier_company_metric_reason_shape_is_recognized(self) -> None:
-        command = parse_admin_command(
-            "/admin revoke_permission ou_abc123 1011 daily_active 离职"
-        )
+        command = parse_admin_command("/admin revoke_permission ou_abc123 1011 daily_active 离职")
         self.assertEqual(command.kind, AdminCommandKind.REVOKE_PERMISSION)
         self.assertEqual(command.identifier, "ou_abc123")
         self.assertEqual(command.company_id, "1011")
@@ -439,12 +431,12 @@ class UnknownAndInjectionShapedInputTests(unittest.TestCase):
     def test_plain_business_question_is_unknown(self) -> None:
         """普通问数式文本（专用账号非管理路径时的历史行为）不被误判成任何命令。"""
 
-        self.assertEqual(
-            parse_admin_command("本月销售额是多少").kind, AdminCommandKind.UNKNOWN
-        )
+        self.assertEqual(parse_admin_command("本月销售额是多少").kind, AdminCommandKind.UNKNOWN)
 
     def test_unknown_subcommand_is_unknown(self) -> None:
-        self.assertEqual(parse_admin_command("/admin delete_user ou_1").kind, AdminCommandKind.UNKNOWN)
+        self.assertEqual(
+            parse_admin_command("/admin delete_user ou_1").kind, AdminCommandKind.UNKNOWN
+        )
 
     def test_sql_injection_shaped_identifier_rejected(self) -> None:
         command = parse_admin_command("/admin user 1; DROP TABLE app_user;--")
@@ -586,9 +578,7 @@ class LinkifiedIdentifierParsingTests(unittest.TestCase):
 
     def test_display_text_must_match_the_link_target(self) -> None:
         """显示邮箱和 mailto 目标不一致时拒绝，避免"看到 A、操作 B"的错位。"""
-        command = parse_admin_command(
-            "/admin user [seen@example.com](mailto:hidden@example.com)"
-        )
+        command = parse_admin_command("/admin user [seen@example.com](mailto:hidden@example.com)")
         self.assertEqual(command.kind, AdminCommandKind.UNKNOWN)
         self.assertEqual(command.reject_reason, AdminRejectReason.BAD_IDENTIFIER)
 
@@ -633,9 +623,7 @@ class LinkNormalizationDoesNotWidenTheCharsetTests(unittest.TestCase):
         self.assertEqual(command.reject_reason, AdminRejectReason.BAD_IDENTIFIER)
 
     def test_http_markdown_link_is_rejected(self) -> None:
-        command = parse_admin_command(
-            f"/admin user [{_PLAIN_EMAIL}](https://example.com/user)"
-        )
+        command = parse_admin_command(f"/admin user [{_PLAIN_EMAIL}](https://example.com/user)")
         self.assertEqual(command.kind, AdminCommandKind.UNKNOWN)
         self.assertEqual(command.reject_reason, AdminRejectReason.BAD_IDENTIFIER)
 
@@ -662,9 +650,7 @@ class LinkNormalizationDoesNotWidenTheCharsetTests(unittest.TestCase):
     def test_only_a_whole_token_is_unwrapped_not_a_link_shaped_substring(self) -> None:
         """剥壳锚定整个 token：``[a](b)`` 后面还挂着别的字符时不剥，照旧 UNKNOWN。"""
 
-        command = parse_admin_command(
-            f"/admin user [{_PLAIN_EMAIL}](mailto:{_PLAIN_EMAIL})尾巴"
-        )
+        command = parse_admin_command(f"/admin user [{_PLAIN_EMAIL}](mailto:{_PLAIN_EMAIL})尾巴")
         self.assertEqual(command.kind, AdminCommandKind.UNKNOWN)
         self.assertEqual(command.reject_reason, AdminRejectReason.BAD_IDENTIFIER)
 
@@ -729,17 +715,29 @@ class RejectReasonSegmentationTests(unittest.TestCase):
             ("/admin user", AdminRejectReason.WRONG_ARGUMENT_COUNT),
             ("/admin user ou_a extra", AdminRejectReason.WRONG_ARGUMENT_COUNT),
             ("/admin help now", AdminRejectReason.WRONG_ARGUMENT_COUNT),
-            ("/admin revoke_permission ou_a 1011 daily_active", AdminRejectReason.WRONG_ARGUMENT_COUNT),
+            (
+                "/admin revoke_permission ou_a 1011 daily_active",
+                AdminRejectReason.WRONG_ARGUMENT_COUNT,
+            ),
             # 用户标识那一段
             ("/admin user ou_a;b", AdminRejectReason.BAD_IDENTIFIER),
             ("/admin suspend <a b>", AdminRejectReason.WRONG_ARGUMENT_COUNT),
             ("/admin audit ou_a;b", AdminRejectReason.BAD_IDENTIFIER),
             ("/admin audit ou_a;b 48", AdminRejectReason.BAD_IDENTIFIER),
             # 指标那一段
-            ("/admin revoke_permission ou_a 1011 daily;active 特批", AdminRejectReason.BAD_METRIC_NAME),
+            (
+                "/admin revoke_permission ou_a 1011 daily;active 特批",
+                AdminRejectReason.BAD_METRIC_NAME,
+            ),
             # 原因那一段
-            ("/admin revoke_permission ou_a 1011 daily_active " + "长" * 501, AdminRejectReason.BAD_REASON),
-            (f"/admin revoke_permission {_VALID_OVERRIDE_ID} " + "长" * 501, AdminRejectReason.BAD_REASON),
+            (
+                "/admin revoke_permission ou_a 1011 daily_active " + "长" * 501,
+                AdminRejectReason.BAD_REASON,
+            ),
+            (
+                f"/admin revoke_permission {_VALID_OVERRIDE_ID} " + "长" * 501,
+                AdminRejectReason.BAD_REASON,
+            ),
             # 小时数那一段
             ("/admin audit 0", AdminRejectReason.BAD_WINDOW_HOURS),
             ("/admin audit 721", AdminRejectReason.BAD_WINDOW_HOURS),
@@ -802,7 +800,7 @@ _REJECTED_MULTI_TOKEN_EMAIL_FORMS: dict[str, str] = {
     "display_and_target_differ": f"seen@example.com (mailto:{_PLAIN_EMAIL})",
     "target_is_http_link": f"{_PLAIN_EMAIL} (https://example.com/{_PLAIN_EMAIL})",
     "target_is_open_id": f"{_PLAIN_EMAIL} (mailto:ou_abc123)",
-    "display_is_open_id": f"ou_abc123 (mailto:ou_abc123)",
+    "display_is_open_id": "ou_abc123 (mailto:ou_abc123)",
     "target_is_not_an_email": f"{_PLAIN_EMAIL} (mailto:not-an-email)",
 }
 
@@ -852,9 +850,7 @@ class MultiTokenLinkifiedIdentifierTests(unittest.TestCase):
     def test_a_mismatched_pair_never_leaks_either_side_as_the_identifier(self) -> None:
         """否定断言：既不能拿显示文本当标识，也不能拿链接目标当标识。"""
 
-        command = parse_admin_command(
-            f"/admin user seen@example.com (mailto:{_PLAIN_EMAIL})"
-        )
+        command = parse_admin_command(f"/admin user seen@example.com (mailto:{_PLAIN_EMAIL})")
 
         self.assertEqual(command.kind, AdminCommandKind.UNKNOWN)
         self.assertIsNone(command.identifier)
@@ -896,7 +892,7 @@ class CollapseDoesNotChangeAnythingThatAlreadyParsedTests(unittest.TestCase):
         for text in (
             "不知道说什么",
             f"帮我看看 {_PLAIN_EMAIL} (mailto:{_PLAIN_EMAIL}) 的权限",
-            "今天的数据 <a href=\"mailto:a@b.com\">a@b.com</a> 有问题吗",
+            '今天的数据 <a href="mailto:a@b.com">a@b.com</a> 有问题吗',
         ):
             with self.subTest(text=text):
                 command = parse_admin_command(text)
@@ -930,9 +926,7 @@ class CollapseDoesNotChangeAnythingThatAlreadyParsedTests(unittest.TestCase):
     def test_a_genuinely_unknown_command_keeps_its_original_failure_reason(self) -> None:
         """归一化救不回来时返回**原样解析**的失败原因，不换一个更迷惑的落点。"""
 
-        command = parse_admin_command(
-            f"/admin delete_user {_PLAIN_EMAIL} (mailto:{_PLAIN_EMAIL})"
-        )
+        command = parse_admin_command(f"/admin delete_user {_PLAIN_EMAIL} (mailto:{_PLAIN_EMAIL})")
 
         self.assertEqual(command.kind, AdminCommandKind.UNKNOWN)
         self.assertEqual(command.reject_reason, AdminRejectReason.UNKNOWN_SUBCOMMAND)
@@ -1041,7 +1035,7 @@ class LinkCollapseCostTests(unittest.TestCase):
             ("bracket", "/admin user [" + "a" * 20000 + "]"),
             ("angle", "/admin user <" + "a" * 20000 + ">"),
             ("mailto", "/admin user mailto:" + "a" * 20000),
-            ("anchor", "/admin user <a href=\"mailto:" + "a" * 20000 + "\">x</a>"),
+            ("anchor", '/admin user <a href="mailto:' + "a" * 20000 + '">x</a>'),
         ):
             with self.subTest(marker=name):
                 elapsed, command = self._elapsed(text)
@@ -1056,7 +1050,7 @@ class LinkCollapseCostTests(unittest.TestCase):
             "/admin user [a@b.com](mailto:a@b.com)",
             "/admin user a@b.com (mailto:a@b.com)",
             "/admin user a@b.com mailto:a@b.com",
-            "/admin user <a href=\"mailto:a@b.com\">a@b.com</a>",
+            '/admin user <a href="mailto:a@b.com">a@b.com</a>',
         ):
             with self.subTest(text=text):
                 command = parse_admin_command(text)

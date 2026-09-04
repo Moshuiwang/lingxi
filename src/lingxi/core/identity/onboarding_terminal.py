@@ -1,17 +1,17 @@
-"""首次开通编排（``onboarding_runner.py``）的内部终态：``_Terminal``/停机与本侧故障两个
-异常类/``_with_reference``/两个失败工厂/全部 ``STATE_*``、``KEY_*`` 常量。
+"""首次开通编排（``onboarding_runner.py``）的内部终态。
 
-从 ``core/identity/onboarding_runner.py`` 纯移动拆出（Trace #358 S-H-1，Issue #350 Gate
-G-3 裁定 Option A）：只搬定义，不改任何签名、判据或文档字符串；``AutoOnboardingRunner``
-通过 ``from .onboarding_terminal import (...)`` 取回这些名字，因此本模块的公开名字（含
-``_KEYS_REQUIRING_REFERENCE``，供 ``tests/test_content_catalog.py`` 按模块属性核对）都会
-作为 ``onboarding_runner`` 模块的属性再次可见。
+``_Terminal``/停机与本侧故障两个异常类/``_with_reference``/两个失败工厂/全部
+``STATE_*``、``KEY_*`` 常量。``AutoOnboardingRunner`` 通过
+``from .onboarding_terminal import (...)`` 取回这些
+名字，因此本模块的公开名字（含 ``_KEYS_REQUIRING_REFERENCE``，供既有测试按模块属性
+核对）都会作为 ``onboarding_runner`` 模块的属性再次可见，搬动本模块时不得断开这条
+转发。
 """
 
 from __future__ import annotations
 
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
-from typing import Mapping, Sequence
 
 from lingxi.core.conversation.ports import (
     OnboardingMessage,
@@ -35,25 +35,22 @@ KEY_COMPLETED = "onboarding.completed"
 KEY_NOT_AUTHORIZED = "onboarding.not_authorized"
 KEY_SYNC_TIMEOUT = "onboarding.sync_timeout"
 KEY_INTERNAL_ERROR = "onboarding.internal_error"
-#: 开通中途停摆收口（``apps/scheduler/stalled_provisioning.py``，Issue #282）专用文案键
-#: （Issue #280 裁定 B2-2）。此前该职责复用 ``KEY_INTERNAL_ERROR`` 逐字发送；产品负责人
+#: 开通中途停摆收口专用文案键。此前该职责复用 ``KEY_INTERNAL_ERROR`` 逐字发送；产品
 #: 要求换成专门说明"等待已久、可再发一条消息重试"的措辞，不再套用一般性的内部故障话术。
 KEY_STALLED = "onboarding.stalled"
 KEY_DELEGATED_SUBJECT = "onboarding.delegated_subject"
 KEY_SUSPENDED = "gateway.suspended"
-#: 内测名单闸拒绝时的文案键（Issue #302 S-N-01）。名单外的 open_id 在身份定位、
-#: 花名册与银河匹配、建档、用户环境与权限发布**发生之前**得到这句结论——不是
-#: 「无可用银河权限」（那会误导用户去银河申请一个与本闸无关的权限），也不带
-#: 追溯号（这是确定性业务结论，不是需要管理员介入的故障，见
-#: ``lingxi.core.identity.innertest_roster_gate`` 模块文档）。
+#: 内测名单闸拒绝时的文案键。名单外的 open_id 在身份定位、花名册与银河匹配、建档、
+#: 用户环境与权限发布**发生之前**得到这句结论——不是「无可用银河权限」（那会误导
+#: 用户去银河申请一个与本闸无关的权限），也不带追溯号（这是确定性业务结论，不是
+#: 需要管理员介入的故障）。
 KEY_INNERTEST_NOT_OPEN = "onboarding.innertest_not_open"
 
-#: 需要追溯号占位（``{reference}``）的文案键集合（Issue #280 §7.1）。占位名**不能**叫
-#: ``trace_id``——那会命中 ``config/content.py`` 的内容安全正则，在目录加载期就让三个
-#: 进程全部起不来（联合设计 §0.1）。集中在一处维护，供 :func:`_with_reference` 与
-#: ``core/conversation/pipeline.py`` 各自的同名辅助函数共用同一份判据来源（后者是
-#: 不同的渲染入口，各自维护一份字面量集合，靠这份常量的字面值对齐，不做跨模块 import
-#: ——两条渲染路径此前就是各自独立的失败关闭桩，见模块文档「共用线程复核」）。
+#: 需要追溯号占位（``{reference}``）的文案键集合。占位名**不能**叫 ``trace_id``——
+#: 那会命中 ``config/content.py`` 的内容安全正则，在目录加载期就让三个进程全部起
+#: 不来。集中在一处维护，供 :func:`_with_reference` 与 ``core/conversation/
+#: pipeline.py`` 各自的同名辅助函数共用同一份判据来源（后者是不同的渲染入口，各自
+#: 维护一份字面量集合，靠这份常量的字面值对齐，不做跨模块 import）。
 _KEYS_REQUIRING_REFERENCE: frozenset[str] = frozenset({KEY_INTERNAL_ERROR, KEY_SYNC_TIMEOUT})
 
 
@@ -66,14 +63,13 @@ def _with_reference(
     调用方已经显式传过一次导致 ``ContentRenderError`` 的重复变量错误——虽然当前
     没有任何调用方会这样做，用 ``setdefault`` 而不是无条件覆盖仍然是更安全的形状）。
     """
-
     merged = dict(values)
     if key in _KEYS_REQUIRING_REFERENCE:
         merged.setdefault("reference", trace_id)
     return merged
 
 
-class _ChainAborted(Exception):
+class _ChainAbortedError(Exception):
     """停机信号落在链的中途：**不通知、不记账、把认领放回去**。
 
     不能当成一次失败终态告诉用户——那会在每次滚动部署时给正在开通的人推一条
@@ -88,6 +84,7 @@ class OnboardingChainError(RuntimeError):
     """
 
     def __init__(self, code: str) -> None:
+        """记录本侧故障码，供审计与日志使用。"""
         super().__init__(code)
         self.code = code
 
@@ -104,7 +101,7 @@ class _Terminal:
     key: str
     values: tuple[tuple[str, object], ...] = ()
     reason: str | None = None
-    #: rc25 修复包 F2：见 ``core/conversation/ports.OnboardingResult.grant_not_applied``。
+    #: 见 ``core/conversation/ports.OnboardingResult.grant_not_applied``。
     #: 刻意不复用 ``reason``——``reason`` 非空在 ``_execute`` 里意味着"失败终态"
     #: （触发失败原因落库与 ``onboarding.result`` 审计的 failure_reason 栏），而这
     #: 一格是**成功终态上的清单标注**，混用会把一次正常收口记成一次失败。
@@ -119,7 +116,6 @@ class _Terminal:
         就被拒绝的场景仍然有 ``trace_id``，这里留 ``None`` 只是防御性缺省，不代表
         生产中真的会用到它）。
         """
-
         values = self.values
         if trace_id is not None:
             values = tuple(_with_reference(self.key, values, trace_id).items())

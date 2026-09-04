@@ -15,18 +15,17 @@ from pathlib import Path
 
 from lingxi.config.content import (
     CONTENT_PATH,
+    REQUIRED_CARD_KEYS,
+    REQUIRED_TEXT_KEYS,
     ContentCatalog,
     ContentRenderError,
     ContentSafetyError,
     ContentValidationError,
-    REQUIRED_CARD_KEYS,
-    REQUIRED_TEXT_KEYS,
     default_content_catalog,
     validate_user_visible_text,
 )
 from lingxi.core.identity.roster_audit import ArchivedIdentity, compare_roster
 from lingxi.core.identity.roster_report import render_daily_report
-
 
 _FORMAL_RENDERING_MODULES = (
     "lingxi.core.conversation.pipeline",
@@ -98,8 +97,7 @@ for loaded_name in sorted(sys.modules):
     )
     if completed.returncode != 0:
         raise AssertionError(
-            "正式渲染入口导入失败：\n"
-            + (completed.stderr or completed.stdout).strip()
+            "正式渲染入口导入失败：\n" + (completed.stderr or completed.stdout).strip()
         )
     return tuple(line for line in completed.stdout.splitlines() if line)
 
@@ -114,7 +112,12 @@ def _code_string_literals(path: Path):
             yield node.value
         if isinstance(node, (ast.Module, ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)):
             body = list(node.body)
-            if body and isinstance(body[0], ast.Expr) and isinstance(body[0].value, ast.Constant) and isinstance(body[0].value.value, str):
+            if (
+                body
+                and isinstance(body[0], ast.Expr)
+                and isinstance(body[0].value, ast.Constant)
+                and isinstance(body[0].value.value, str)
+            ):
                 body = body[1:]
             for child in body:
                 yield from visit(child)
@@ -243,9 +246,7 @@ class ContentDirectoryTests(unittest.TestCase):
         for key in REQUIRED_TEXT_KEYS:
             template = document["texts"][key]
             variables = {
-                field
-                for _literal, field, _spec, _conv in Formatter().parse(template)
-                if field
+                field for _literal, field, _spec, _conv in Formatter().parse(template) if field
             }
             if "reference" not in variables:
                 continue
@@ -380,7 +381,14 @@ class ContentDirectoryTests(unittest.TestCase):
         changed = ContentCatalog.from_mapping(document)
         report = compare_roster(
             [ArchivedIdentity("usr_1", "person_1", "张三", "E1", "a@example.com")],
-            [{"personnel_id": "person_1", "name": "张三改名", "employee_no": "E1", "email": "a@example.com"}],
+            [
+                {
+                    "personnel_id": "person_1",
+                    "name": "张三改名",
+                    "employee_no": "E1",
+                    "email": "a@example.com",
+                }
+            ],
         )
 
         rendered = render_daily_report(report, report_date=date(2026, 8, 8), catalog=changed)
@@ -390,6 +398,9 @@ class ContentDirectoryTests(unittest.TestCase):
         source_root = Path(__file__).parents[1] / "src" / "lingxi"
         formal_renderers = (
             source_root / "core" / "conversation" / "pipeline.py",
+            source_root / "core" / "conversation" / "gateway_texts.py",
+            source_root / "core" / "conversation" / "memory_commands.py",
+            source_root / "core" / "conversation" / "onboarding_replies.py",
             source_root / "core" / "identity" / "first_contact.py",
             source_root / "core" / "identity" / "roster_report.py",
         )
@@ -407,8 +418,7 @@ class ContentDirectoryTests(unittest.TestCase):
         self.assertEqual(
             imported,
             (),
-            "正式渲染入口的传递导入闭包不得包含 Bot-Test 资产模块："
-            + ", ".join(imported),
+            "正式渲染入口的传递导入闭包不得包含 Bot-Test 资产模块：" + ", ".join(imported),
         )
 
     def test_the_six_naming_keys_render_bi_plus_and_never_the_internal_codename(self) -> None:

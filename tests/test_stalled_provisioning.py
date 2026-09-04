@@ -113,9 +113,7 @@ class FakeNotifier:
         self._fail_for = fail_for
         self._order = order
 
-    def send(
-        self, *, open_id: str, key: str, values: Any, dedupe_key: str
-    ) -> None:
+    def send(self, *, open_id: str, key: str, values: Any, dedupe_key: str) -> None:
         self.calls.append(open_id)
         if self._order is not None:
             self._order.append("notify")
@@ -214,7 +212,8 @@ class HappyPathTests(unittest.TestCase):
             [(OPEN_ID_A, KEY_STALLED, {"reference": "trc_a"}, "onboarding:stalled:evt_a")],
         )
         self.assertEqual(
-            aborter.calls, [(USER_A, (STATE_PROVISIONING, STATE_MCP_SYNCING), "stalled_lease_expired")]
+            aborter.calls,
+            [(USER_A, (STATE_PROVISIONING, STATE_MCP_SYNCING), "stalled_lease_expired")],
         )
         self.assertIn("stalled_provisioning.aborted", audit.actions())
 
@@ -223,7 +222,9 @@ class HappyPathTests(unittest.TestCase):
         不同键，两者不会互相去重掉。"""
 
         notifier = FakeNotifier()
-        duty, _ = build_duty(candidates=FakeCandidates([_candidate(event_id="evt_x")]), notifier=notifier)
+        duty, _ = build_duty(
+            candidates=FakeCandidates([_candidate(event_id="evt_x")]), notifier=notifier
+        )
 
         duty.run_once()
 
@@ -271,7 +272,10 @@ class NegativeAssertionTests(unittest.TestCase):
         notifier = FakeNotifier(error=RuntimeError("feishu down"))
         audit = RecordingAudit()
         duty, _ = build_duty(
-            candidates=FakeCandidates([_candidate()]), aborter=aborter, notifier=notifier, audit=audit
+            candidates=FakeCandidates([_candidate()]),
+            aborter=aborter,
+            notifier=notifier,
+            audit=audit,
         )
 
         report = duty.run_once()
@@ -287,7 +291,9 @@ class NegativeAssertionTests(unittest.TestCase):
         order: list[str] = []
         aborter = FakeAborter(order=order)
         notifier = FakeNotifier(order=order)
-        duty, _ = build_duty(candidates=FakeCandidates([_candidate()]), aborter=aborter, notifier=notifier)
+        duty, _ = build_duty(
+            candidates=FakeCandidates([_candidate()]), aborter=aborter, notifier=notifier
+        )
 
         duty.run_once()
 
@@ -334,7 +340,10 @@ class NegativeAssertionTests(unittest.TestCase):
 
         aborter = StoppingAborter()
         candidates = FakeCandidates(
-            [_candidate(user_id=USER_A, event_id="evt_a"), _candidate(user_id=USER_B, event_id="evt_b")]
+            [
+                _candidate(user_id=USER_A, event_id="evt_a"),
+                _candidate(user_id=USER_B, event_id="evt_b"),
+            ]
         )
         duty, _ = build_duty(candidates=candidates, aborter=aborter, stop=stop)
 
@@ -352,7 +361,10 @@ class NegativeAssertionTests(unittest.TestCase):
         aborter = FakeAborter(result=False)
         audit = RecordingAudit()
         duty, _ = build_duty(
-            candidates=FakeCandidates([_candidate()]), aborter=aborter, notifier=notifier, audit=audit
+            candidates=FakeCandidates([_candidate()]),
+            aborter=aborter,
+            notifier=notifier,
+            audit=audit,
         )
 
         report = duty.run_once()
@@ -365,7 +377,10 @@ class NegativeAssertionTests(unittest.TestCase):
     def test_one_candidate_s_failure_does_not_take_down_the_round(self) -> None:
         aborter = FakeAborter(error=RuntimeError("boom"))
         candidates = FakeCandidates(
-            [_candidate(user_id=USER_A, event_id="evt_a"), _candidate(user_id=USER_B, event_id="evt_b")]
+            [
+                _candidate(user_id=USER_A, event_id="evt_a"),
+                _candidate(user_id=USER_B, event_id="evt_b"),
+            ]
         )
         audit = RecordingAudit()
         duty, _ = build_duty(candidates=candidates, aborter=aborter, audit=audit)
@@ -487,7 +502,9 @@ class NotifyBackoffTests(unittest.TestCase):
 
         clock = FakeClock()
         poisoned = [
-            _candidate(user_id=f"usr_poison_{i}", open_id=f"ou_poison_{i}", event_id=f"evt_poison_{i}")
+            _candidate(
+                user_id=f"usr_poison_{i}", open_id=f"ou_poison_{i}", event_id=f"evt_poison_{i}"
+            )
             for i in range(3)
         ]
         fresh = _candidate(user_id="usr_fresh", open_id="ou_fresh", event_id="evt_fresh")
@@ -516,9 +533,7 @@ class NotifyBackoffTests(unittest.TestCase):
 
         assert report is not None
         self.assertIn("ou_fresh", failing_notifier.calls, "全新候选必须被真正尝试到")
-        self.assertEqual(
-            report.examined, 1, "本轮真正处理的只有全新候选，三个毒候选都被退避跳过"
-        )
+        self.assertEqual(report.examined, 1, "本轮真正处理的只有全新候选，三个毒候选都被退避跳过")
         self.assertEqual(report.notify_failed, 0, "全新候选通知应当成功")
         self.assertEqual(report.notified, 1)
 
@@ -606,9 +621,7 @@ class FailureReasonRecordingTests(unittest.TestCase):
 
     def test_an_aborted_candidate_records_the_failure_reason(self) -> None:
         recorder = RecordingFailureReasons()
-        duty, _ = build_duty(
-            candidates=FakeCandidates([_candidate()]), failure_reasons=recorder
-        )
+        duty, _ = build_duty(candidates=FakeCandidates([_candidate()]), failure_reasons=recorder)
 
         report = duty.run_once()
 

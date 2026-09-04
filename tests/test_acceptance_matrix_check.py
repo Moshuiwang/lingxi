@@ -51,9 +51,7 @@ GOOD_COVERAGE = (
     "| 动态工作的去向 | 无对应断言 | 只规定工作项去向，不产生用户可见规则 |\n"
 )
 CONTRACT = (
-    "# 产品合同与外部边界\n\n"
-    "## 首次对话与自动准入\n\n正文。\n\n"
-    "## 动态工作的去向\n\n正文。\n"
+    "# 产品合同与外部边界\n\n## 首次对话与自动准入\n\n正文。\n\n## 动态工作的去向\n\n正文。\n"
 )
 
 
@@ -69,7 +67,10 @@ class MatrixStatusColumnTest(unittest.TestCase):
         )
 
     def test_missing_status_cell_fails(self) -> None:
-        rows = GOOD_MATRIX.replace("| V-开通-02 | 命中多条不自动选择 | L2（真库） | 未认领 |", "| V-开通-02 | 命中多条不自动选择 | L2（真库） |")
+        rows = GOOD_MATRIX.replace(
+            "| V-开通-02 | 命中多条不自动选择 | L2（真库） | 未认领 |",
+            "| V-开通-02 | 命中多条不自动选择 | L2（真库） |",
+        )
         statuses, errors = CHECK.parse_matrix(gate_document(rows, GOOD_COVERAGE))
         self.assertNotIn("V-开通-02", statuses)
         self.assertTrue(any("应为 4 格" in error for error in errors), errors)
@@ -81,7 +82,9 @@ class MatrixStatusColumnTest(unittest.TestCase):
             CHECK.split_row(row),
             ["V-执行-07", "白名单不接受 `a|b` 这类正则", "L2", "已认领"],
         )
-        statuses, errors = CHECK.parse_matrix(gate_document(GOOD_MATRIX + row + "\n", GOOD_COVERAGE))
+        statuses, errors = CHECK.parse_matrix(
+            gate_document(GOOD_MATRIX + row + "\n", GOOD_COVERAGE)
+        )
         self.assertEqual(errors, [])
         self.assertEqual(statuses["V-执行-07"], "已认领")
 
@@ -179,7 +182,9 @@ class MultipleVolumeTest(unittest.TestCase):
                 "| V-权限-01 | 状态写错 | L2 | 待实现 |\n",
             )
         )
-        self.assertTrue(any("验收矩阵-二册.md" in error and "待实现" in error for error in errors), errors)
+        self.assertTrue(
+            any("验收矩阵-二册.md" in error and "待实现" in error for error in errors), errors
+        )
 
     def test_a_coverage_list_moved_into_a_volume_is_still_seen(self) -> None:
         """覆盖清单被搬进分册也必须被解析到，而不是因为「只读总册」静默漏掉。"""
@@ -233,11 +238,18 @@ class CoverageListTest(unittest.TestCase):
         expanded, error = CHECK.expand_reference("V-管理-01…03")
         self.assertIsNone(error)
         self.assertEqual(expanded, ["V-管理-01", "V-管理-02", "V-管理-03"])
-        self.assertEqual(CHECK.expand_reference("V-管理-03…01")[1], "区间的起止顺序不对：'V-管理-03…01'")
+        self.assertEqual(
+            CHECK.expand_reference("V-管理-03…01")[1], "区间的起止顺序不对：'V-管理-03…01'"
+        )
 
 
 class CrossCheckTest(unittest.TestCase):
-    def _parts(self, matrix_rows: str = GOOD_MATRIX, coverage_rows: str = GOOD_COVERAGE, contract: str = CONTRACT):
+    def _parts(
+        self,
+        matrix_rows: str = GOOD_MATRIX,
+        coverage_rows: str = GOOD_COVERAGE,
+        contract: str = CONTRACT,
+    ):
         document = gate_document(matrix_rows, coverage_rows)
         statuses, _ = CHECK.parse_matrix(document)
         coverage, _ = CHECK.parse_coverage(document)

@@ -90,7 +90,18 @@ class ClientConstructionTest(unittest.TestCase):
 class CreateSpreadsheetTest(unittest.TestCase):
     def test_a_successful_create_returns_token_and_url_matching_the_probed_shape(self) -> None:
         transport = RecordingTransport(
-            [{"code": 0, "data": {"spreadsheet": {"spreadsheet_token": SPREADSHEET_TOKEN, "url": SPREADSHEET_URL, "title": "本月销售分析"}}}]
+            [
+                {
+                    "code": 0,
+                    "data": {
+                        "spreadsheet": {
+                            "spreadsheet_token": SPREADSHEET_TOKEN,
+                            "url": SPREADSHEET_URL,
+                            "title": "本月销售分析",
+                        }
+                    },
+                }
+            ]
         )
         client = _client(transport)
 
@@ -133,7 +144,9 @@ class CreateSpreadsheetTest(unittest.TestCase):
         存在的判据删掉，本用例会从抛出 ``LookupError`` 变红。
         """
 
-        transport = RecordingTransport([{"code": 0, "data": {"spreadsheet": {"url": SPREADSHEET_URL}}}])
+        transport = RecordingTransport(
+            [{"code": 0, "data": {"spreadsheet": {"url": SPREADSHEET_URL}}}]
+        )
         client = _client(transport)
 
         with self.assertRaises(LookupError):
@@ -165,7 +178,14 @@ class CreateSpreadsheetTest(unittest.TestCase):
 class GetDefaultSheetIdTest(unittest.TestCase):
     def test_a_successful_query_returns_the_first_sheet_id(self) -> None:
         transport = RecordingTransport(
-            [{"code": 0, "data": {"sheets": [{"sheet_id": SHEET_ID, "title": "Sheet1"}, {"sheet_id": "other"}]}}]
+            [
+                {
+                    "code": 0,
+                    "data": {
+                        "sheets": [{"sheet_id": SHEET_ID, "title": "Sheet1"}, {"sheet_id": "other"}]
+                    },
+                }
+            ]
         )
         client = _client(transport)
 
@@ -211,7 +231,9 @@ class GetDefaultSheetIdTest(unittest.TestCase):
 
 class WriteValuesTest(unittest.TestCase):
     def test_a_successful_write_uses_the_v2_endpoint_and_range_from_a1(self) -> None:
-        transport = RecordingTransport([{"code": 0, "data": {"updatedRange": f"{SHEET_ID}!A1:B2", "updatedCells": 4}}])
+        transport = RecordingTransport(
+            [{"code": 0, "data": {"updatedRange": f"{SHEET_ID}!A1:B2", "updatedCells": 4}}]
+        )
         client = _client(transport)
 
         client.write_values(SPREADSHEET_TOKEN, SHEET_ID, [["a", "b"], ["c", "d"]])
@@ -337,15 +359,21 @@ class RowsShapeValidationTest(unittest.TestCase):
 
 class GrantFullAccessTest(unittest.TestCase):
     def test_a_successful_grant_uses_type_sheet_and_matches_the_probed_shape(self) -> None:
-        transport = RecordingTransport([{"code": 0, "data": {"member": {"member_id": OPEN_ID, "perm": "full_access"}}}])
+        transport = RecordingTransport(
+            [{"code": 0, "data": {"member": {"member_id": OPEN_ID, "perm": "full_access"}}}]
+        )
         client = _client(transport)
 
         client.grant_full_access(SPREADSHEET_TOKEN, OPEN_ID)
 
         method, url, body, token = transport.calls[0]
         self.assertEqual(method, "POST")
-        self.assertEqual(url, f"{BASE_URL}/drive/v1/permissions/{SPREADSHEET_TOKEN}/members?type=sheet")
-        self.assertEqual(body, {"member_type": "openid", "member_id": OPEN_ID, "perm": "full_access"})
+        self.assertEqual(
+            url, f"{BASE_URL}/drive/v1/permissions/{SPREADSHEET_TOKEN}/members?type=sheet"
+        )
+        self.assertEqual(
+            body, {"member_type": "openid", "member_id": OPEN_ID, "perm": "full_access"}
+        )
         self.assertEqual(token, FAKE_TOKEN)
 
     def test_an_open_id_without_the_user_prefix_is_rejected_before_any_call(self) -> None:
@@ -377,8 +405,17 @@ class ReadMembersTest(unittest.TestCase):
                     "code": 0,
                     "data": {
                         "items": [
-                            {"member_type": "openid", "member_id": OPEN_ID, "perm": "full_access", "perm_type": "container"},
-                            {"member_type": "openid", "member_id": "ou_app_self", "perm": "full_access"},
+                            {
+                                "member_type": "openid",
+                                "member_id": OPEN_ID,
+                                "perm": "full_access",
+                                "perm_type": "container",
+                            },
+                            {
+                                "member_type": "openid",
+                                "member_id": "ou_app_self",
+                                "perm": "full_access",
+                            },
                         ]
                     },
                 }
@@ -397,7 +434,9 @@ class ReadMembersTest(unittest.TestCase):
         )
         method, url, body, token = transport.calls[0]
         self.assertEqual(method, "GET")
-        self.assertEqual(url, f"{BASE_URL}/drive/v1/permissions/{SPREADSHEET_TOKEN}/members?type=sheet")
+        self.assertEqual(
+            url, f"{BASE_URL}/drive/v1/permissions/{SPREADSHEET_TOKEN}/members?type=sheet"
+        )
 
     def test_a_missing_items_field_is_a_lookup_error(self) -> None:
         """真实响应形状是 ``data.items``（同 docx），不是 ``data.members``——
@@ -488,7 +527,18 @@ class MissingCodeTest(unittest.TestCase):
     """
 
     def test_a_response_missing_code_is_rejected_and_indefinite(self) -> None:
-        transport = RecordingTransport([{"data": {"spreadsheet": {"spreadsheet_token": SPREADSHEET_TOKEN, "url": SPREADSHEET_URL}}}])
+        transport = RecordingTransport(
+            [
+                {
+                    "data": {
+                        "spreadsheet": {
+                            "spreadsheet_token": SPREADSHEET_TOKEN,
+                            "url": SPREADSHEET_URL,
+                        }
+                    }
+                }
+            ]
+        )
         client = _client(transport)
 
         with self.assertRaises(FeishuSheetsDeliveryError) as raised:
@@ -521,7 +571,13 @@ class MissingCodeTest(unittest.TestCase):
         import lingxi.adapters.feishu_sheets_delivery as module
 
         def boom(*_args, **_kwargs):
-            raise HTTPError(f"{BASE_URL}/sheets/v3/spreadsheets", 500, "Internal Server Error", {}, io.BytesIO(b"{}"))
+            raise HTTPError(
+                f"{BASE_URL}/sheets/v3/spreadsheets",
+                500,
+                "Internal Server Error",
+                {},
+                io.BytesIO(b"{}"),
+            )
 
         original = module.urlopen
         module.urlopen = boom
@@ -539,7 +595,17 @@ class MissingCodeTest(unittest.TestCase):
 
 class ColumnLetterTest(unittest.TestCase):
     def test_known_values_match_spreadsheet_column_convention(self) -> None:
-        cases = {1: "A", 2: "B", 26: "Z", 27: "AA", 28: "AB", 52: "AZ", 53: "BA", 702: "ZZ", 703: "AAA"}
+        cases = {
+            1: "A",
+            2: "B",
+            26: "Z",
+            27: "AA",
+            28: "AB",
+            52: "AZ",
+            53: "BA",
+            702: "ZZ",
+            703: "AAA",
+        }
         for column_count, expected in cases.items():
             with self.subTest(column_count=column_count):
                 self.assertEqual(_column_letter(column_count), expected)
@@ -565,7 +631,12 @@ class UrllibTransportSmokeTest(unittest.TestCase):
         module.urlopen = boom
         try:
             with self.assertRaises(FeishuSheetsDeliveryError) as raised:
-                urllib_transport("POST", f"{BASE_URL}/sheets/v3/spreadsheets", body={"title": "x"}, token=FAKE_TOKEN)
+                urllib_transport(
+                    "POST",
+                    f"{BASE_URL}/sheets/v3/spreadsheets",
+                    body={"title": "x"},
+                    token=FAKE_TOKEN,
+                )
             self.assertEqual(raised.exception.code, "transport_error")
             self.assertFalse(raised.exception.definite)
         finally:

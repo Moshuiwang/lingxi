@@ -20,11 +20,10 @@ from typing import Any
 
 from postgres_schema import ensure_production_schema, psycopg_available, reset_production_rows
 
-from lingxi.adapters.postgres import connect
 from lingxi.adapters.postgres_conversation import PostgresTaskQueue
 from lingxi.apps.gateway.delivery import DeliveryConsumer
 from lingxi.config.content import default_content_catalog
-from lingxi.core.execution.card_stream import CardCreated, DeliveryRejected
+from lingxi.core.execution.card_stream import CardCreated, DeliveryRejectedError
 
 SKIP_REASON = (
     "跳过：未设置 LINGXI_POSTGRES_DSN，Gateway 投递消费的数据库约束类断言未验证"
@@ -35,10 +34,10 @@ SKIP_REASON = (
 
 class RecordingCards:
     """记录调用；``fail_at`` 控制第几次调用（1-based）开始抛出同步异常，
-    ``fail_error`` 控制抛出的异常类型（默认 ``DeliveryRejected``，模拟服务端明确
+    ``fail_error`` 控制抛出的异常类型（默认 ``DeliveryRejectedError``，模拟服务端明确
     拒绝；传入其它任何异常类型——``TimeoutError`` 等 ``OSError`` 子类、
     ``json.JSONDecodeError``、或任何未预期的异常——都模拟独立审核 R-1 的"结果
-    不明"场景：白名单反转后，只有 ``DeliveryRejected`` 才是"明确失败"，除它以外
+    不明"场景：白名单反转后，只有 ``DeliveryRejectedError`` 才是"明确失败"，除它以外
     的一切都不确定服务端是否已经处理）。
     """
 
@@ -46,7 +45,7 @@ class RecordingCards:
         self,
         *,
         fail_at: int | None = None,
-        fail_error: type[BaseException] = DeliveryRejected,
+        fail_error: type[BaseException] = DeliveryRejectedError,
     ) -> None:
         self._fail_at = fail_at
         self._fail_error = fail_error
@@ -79,7 +78,7 @@ class RecordingCards:
 
 
 class RecordingText:
-    """``fail_error`` 默认 ``DeliveryRejected``（明确失败）；传入其它异常类型模拟
+    """``fail_error`` 默认 ``DeliveryRejectedError``（明确失败）；传入其它异常类型模拟
     独立审核 R-1 的"结果不明"场景，见 ``RecordingCards`` 的类文档。
     """
 
@@ -88,7 +87,7 @@ class RecordingText:
         *,
         fail: bool = False,
         message_id: str = "msg-text-1",
-        fail_error: type[BaseException] = DeliveryRejected,
+        fail_error: type[BaseException] = DeliveryRejectedError,
     ) -> None:
         self.fail = fail
         self.message_id = message_id
@@ -224,14 +223,19 @@ class DeliveryConsumerTestCase(unittest.TestCase):
 
     def start_task(self, task_id: str) -> None:
         self.queue.append_delivery_event(
-            task_id=task_id, worker_id="worker-1", event_type="started",
+            task_id=task_id,
+            worker_id="worker-1",
+            event_type="started",
             idempotency_key=f"{task_id}:a1:started",
         )
 
     def finish_task(self, task_id: str, *, content: str = "已送达的答案") -> None:
         self.queue.write_terminal_event(
-            task_id=task_id, worker_id="worker-1", terminal_kind="success",
-            error_kind=None, content=content,
+            task_id=task_id,
+            worker_id="worker-1",
+            terminal_kind="success",
+            error_kind=None,
+            content=content,
         )
 
 
@@ -256,8 +260,11 @@ class HappyPathCardDeliveryTests(DeliveryConsumerTestCase):
 
         clock[0] = 0.6
         self.queue.append_delivery_event(
-            task_id="tsk-1", worker_id="worker-1", event_type="progress",
-            idempotency_key="tsk-1:a1:progress:1", elapsed_seconds=3,
+            task_id="tsk-1",
+            worker_id="worker-1",
+            event_type="progress",
+            idempotency_key="tsk-1:a1:progress:1",
+            elapsed_seconds=3,
         )
         self.finish_task("tsk-1")
         processed = consumer.run_once()
@@ -265,7 +272,8 @@ class HappyPathCardDeliveryTests(DeliveryConsumerTestCase):
         self.assertEqual(processed, 1)
         self.assertEqual(len(cards.create_calls), 1, "只建一次卡片")
         self.assertEqual(
-            [call["sequence"] for call in cards.update_calls], [1, 2],
+            [call["sequence"] for call in cards.update_calls],
+            [1, 2],
             "进度更新 + 终态更新共用整卡级严格递增序号",
         )
         self.assertEqual([call["sequence"] for call in cards.close_calls], [3])
@@ -310,8 +318,11 @@ class HappyPathCardDeliveryTests(DeliveryConsumerTestCase):
 
         clock[0] = 0.6  # 越过 `V-卡片-02` 的 500ms 单话题节流窗口
         self.queue.append_delivery_event(
-            task_id="tsk-1", worker_id="worker-1", event_type="progress",
-            idempotency_key="tsk-1:a1:progress:1", elapsed_seconds=5,
+            task_id="tsk-1",
+            worker_id="worker-1",
+            event_type="progress",
+            idempotency_key="tsk-1:a1:progress:1",
+            elapsed_seconds=5,
             content=encode_progress_action(PROGRESS_ACTION_QUERYING, query_count=2),
         )
         consumer.run_once()
@@ -355,8 +366,11 @@ class HappyPathCardDeliveryTests(DeliveryConsumerTestCase):
 
         clock[0] = 0.6
         self.queue.append_delivery_event(
-            task_id="tsk-1", worker_id="worker-1", event_type="progress",
-            idempotency_key="tsk-1:a1:progress:1", elapsed_seconds=5,
+            task_id="tsk-1",
+            worker_id="worker-1",
+            event_type="progress",
+            idempotency_key="tsk-1:a1:progress:1",
+            elapsed_seconds=5,
             content=encode_progress_action(
                 PROGRESS_ACTION_QUERYING, query_count=1, query_step="list_metrics"
             ),
@@ -367,8 +381,11 @@ class HappyPathCardDeliveryTests(DeliveryConsumerTestCase):
 
         clock[0] = 1.2
         self.queue.append_delivery_event(
-            task_id="tsk-1", worker_id="worker-1", event_type="progress",
-            idempotency_key="tsk-1:a1:progress:2", elapsed_seconds=9,
+            task_id="tsk-1",
+            worker_id="worker-1",
+            event_type="progress",
+            idempotency_key="tsk-1:a1:progress:2",
+            elapsed_seconds=9,
             content=encode_progress_action(PROGRESS_ACTION_COMPOSING),
         )
         consumer.run_once()  # 第三轮：又一次全新的 CardStream，处理第二条 progress。
@@ -391,7 +408,9 @@ class HappyPathCardDeliveryTests(DeliveryConsumerTestCase):
         texts = RecordingText()
         consumer = DeliveryConsumer(queue=self.queue, cards=cards, texts=texts)
         consumer.run_once()
-        first_round_calls = len(cards.create_calls) + len(cards.update_calls) + len(cards.close_calls)
+        first_round_calls = (
+            len(cards.create_calls) + len(cards.update_calls) + len(cards.close_calls)
+        )
 
         consumer.run_once()
         second_round_calls = (
@@ -467,21 +486,21 @@ class CardFailureFallsBackToTextTests(DeliveryConsumerTestCase):
 
 class CardFailureInjectionAcceptanceFixtureTests(DeliveryConsumerTestCase):
     """S-A-07 受控验收缺口专用注入开关（Issue #152 验收缺口、#154 评论
-    5306860510、#162 E-022）：``apps.gateway._RejectingCards`` 命中被选中的那一步
-    时确定性抛出 ``DeliveryRejected``，走的正是 ``CardFailureFallsBackToTextTests``
+    5306860510、#162 E-022）：``apps.gateway.RejectingCards`` 命中被选中的那一步
+    时确定性抛出 ``DeliveryRejectedError``，走的正是 ``CardFailureFallsBackToTextTests``
     已经验证过的既有降级路径——这里额外验证的是注入开关本身"命中步骤即拒绝、
     未命中步骤直通真实 transport"这条装配契约，而不是重新验证降级路径本身。
     """
 
     def test_create_injection_falls_back_to_a_single_text_terminal(self) -> None:
-        from lingxi.apps.gateway import _RejectingCards
+        from lingxi.apps.gateway.delivery_assembly import RejectingCards
 
         self.seed_running_task(task_id="tsk-1", conversation_id="cnv-1")
         self.start_task("tsk-1")
         self.finish_task("tsk-1", content="已产生的答案")
 
         real_cards = RecordingCards()
-        cards = _RejectingCards(real_cards, inject="create")
+        cards = RejectingCards(real_cards, inject="create")
         texts = RecordingText()
         consumer = DeliveryConsumer(queue=self.queue, cards=cards, texts=texts)
         consumer.run_once()
@@ -501,17 +520,17 @@ class CardFailureInjectionAcceptanceFixtureTests(DeliveryConsumerTestCase):
 
     def test_only_the_configured_step_is_rejected(self) -> None:
         """`update` 命中时 create 仍直通真实 transport——只有被选中的那一步拒绝，
-        这是 ``_RejectingCards`` 文档写明的设计取舍，必须能被证伪。
+        这是 ``RejectingCards`` 文档写明的设计取舍，必须能被证伪。
         """
 
-        from lingxi.apps.gateway import _RejectingCards
+        from lingxi.apps.gateway.delivery_assembly import RejectingCards
 
         self.seed_running_task(task_id="tsk-1", conversation_id="cnv-1")
         self.start_task("tsk-1")
         self.finish_task("tsk-1", content="已产生的答案")
 
         real_cards = RecordingCards()
-        cards = _RejectingCards(real_cards, inject="update")
+        cards = RejectingCards(real_cards, inject="update")
         texts = RecordingText()
         consumer = DeliveryConsumer(queue=self.queue, cards=cards, texts=texts)
         consumer.run_once()
@@ -685,14 +704,14 @@ class CrashRecoveryDoesNotDuplicateDeliveryTests(DeliveryConsumerTestCase):
 
 class NetworkResultUnknownDoesNotDuplicateDeliveryTests(DeliveryConsumerTestCase):
     """独立审核 B-1（红线，P1）首次修复、独立审核 R-1（红线家族）反转为白名单：
-    只有 ``DeliveryRejected``（服务端已经给出完整响应且业务错误码明确拒绝）才是
+    只有 ``DeliveryRejectedError``（服务端已经给出完整响应且业务错误码明确拒绝）才是
     "明确失败"；除它以外的一切——`requests` 的超时/连接类异常（真实 adapter 走
     lark-oapi，其 transport 是 ``requests.request(...)``，全部继承内置
     ``OSError``）、JSON 解析失败（``json.JSONDecodeError``）、响应结构缺失
     （``success()`` 为真但拿不到可回读标识）、任何其它未预期的异常——都不得被
     当成"明确失败"清预留位、降级或重试，必须转入 ``uncertain``、告警、预留位
     原样保留。用 ``TimeoutError``、``json.JSONDecodeError``、``LookupError``
-    （模拟"success 真但缺可回读标识"）分别覆盖这几类成因，与 ``DeliveryRejected``
+    （模拟"success 真但缺可回读标识"）分别覆盖这几类成因，与 ``DeliveryRejectedError``
     模拟的"服务端明确拒绝"区分开（后者行为不变，见其余测试类）。
     """
 
@@ -774,7 +793,7 @@ class NetworkResultUnknownDoesNotDuplicateDeliveryTests(DeliveryConsumerTestCase
         self.start_task("tsk-1")
         self.finish_task("tsk-1", content="已产生的答案")
 
-        # create 本身明确失败（DeliveryRejected，行为不变），直接走文本通道；
+        # create 本身明确失败（DeliveryRejectedError，行为不变），直接走文本通道；
         # 文本发送这一步改为超时。
         cards = RecordingCards(fail_at=1)
         texts = RecordingText(fail=True, fail_error=TimeoutError)
@@ -796,7 +815,7 @@ class NetworkResultUnknownDoesNotDuplicateDeliveryTests(DeliveryConsumerTestCase
         self.assertEqual(len(texts.calls), 1, "结果不明不得自动重发")
 
     def test_an_explicit_rejection_is_unaffected_and_still_retries(self) -> None:
-        """明确失败路径行为不变：`DeliveryRejected`（服务端明确拒绝，独立审核
+        """明确失败路径行为不变：`DeliveryRejectedError`（服务端明确拒绝，独立审核
         R-1 用它取代此前注入 ``RuntimeError`` 的既有测试写法）仍然立即清预留位、
         允许下一轮重试——与上面几条"结果不明"用例对照，证明白名单反转只改变了
         判别方向，没有改变既有的"明确失败"语义。
@@ -805,7 +824,7 @@ class NetworkResultUnknownDoesNotDuplicateDeliveryTests(DeliveryConsumerTestCase
         self.seed_running_task(task_id="tsk-1", conversation_id="cnv-1")
         self.start_task("tsk-1")
 
-        cards = RecordingCards(fail_at=1, fail_error=DeliveryRejected)
+        cards = RecordingCards(fail_at=1, fail_error=DeliveryRejectedError)
         texts = RecordingText()
         consumer = DeliveryConsumer(queue=self.queue, cards=cards, texts=texts)
         consumer.run_once()
@@ -813,13 +832,15 @@ class NetworkResultUnknownDoesNotDuplicateDeliveryTests(DeliveryConsumerTestCase
         row = self.query("SELECT dispatch_reserved_kind, fallback_text FROM task WHERE id='tsk-1'")[
             0
         ]
-        self.assertIsNone(row[0], "明确失败必须清空预留位，允许下一轮重试——与上面三条 TimeoutError 用例的行为相反")
+        self.assertIsNone(
+            row[0], "明确失败必须清空预留位，允许下一轮重试——与上面三条 TimeoutError 用例的行为相反"
+        )
         self.assertTrue(row[1], "明确失败整体降级为文本通道，这个既有语义没有被本次修复改变")
 
     def test_a_json_decode_error_during_card_create_does_not_retry_automatically(self) -> None:
         """独立审核 R-1 新增：`lark_oapi` 内部响应体解析失败时抛出的
         `json.JSONDecodeError` 不是黑名单能挡住的 `OSError`——旧的黑名单实现会把它
-        当成"明确失败"清预留位、立即降级；白名单反转后，除 `DeliveryRejected`
+        当成"明确失败"清预留位、立即降级；白名单反转后，除 `DeliveryRejectedError`
         以外的一切异常默认归"结果不明"，这条用例正是证伪旧实现、证明新实现的
         对照组。
         """
@@ -856,7 +877,7 @@ class NetworkResultUnknownDoesNotDuplicateDeliveryTests(DeliveryConsumerTestCase
     ) -> None:
         """独立审核 R-1 新增：`response.success()` 为真但拿不到 `message_id`
         （真实 adapter 遇到这种响应形状时显式抛出 `LookupError`，见
-        `adapters.feishu_delivery` 的模块说明）同样不是 `DeliveryRejected`——
+        `adapters.feishu_delivery` 的模块说明）同样不是 `DeliveryRejectedError`——
         没有任何证据表明服务端拒绝了这次调用，反而它可能已经受理，只是响应缺失
         可回读标识，必须归"结果不明"，不得当成"明确失败"清预留位后按退避重发。
         """
@@ -921,9 +942,7 @@ class UncertainTasksStopAlertingAfterExpiryTests(DeliveryConsumerTestCase):
             uncertain_after, [], "任务已经被到期路径收敛为 failed，不应该继续被当作 uncertain 告警"
         )
 
-        row = self.query(
-            "SELECT status, dispatch_reserved_kind FROM task WHERE id='tsk-1'"
-        )[0]
+        row = self.query("SELECT status, dispatch_reserved_kind FROM task WHERE id='tsk-1'")[0]
         self.assertEqual(row[0], "failed", "到期路径的业务结论不受预留位状态影响")
         self.assertEqual(
             row[1],
@@ -940,8 +959,11 @@ class RateLimitingTests(DeliveryConsumerTestCase):
         self.start_task("tsk-1")
         for index in range(1, 4):
             self.queue.append_delivery_event(
-                task_id="tsk-1", worker_id="worker-1", event_type="progress",
-                idempotency_key=f"tsk-1:a1:progress:{index}", elapsed_seconds=index,
+                task_id="tsk-1",
+                worker_id="worker-1",
+                event_type="progress",
+                idempotency_key=f"tsk-1:a1:progress:{index}",
+                elapsed_seconds=index,
             )
 
         # 注入受控时钟：建卡消费掉话题的首个限流名额后，三次 progress 全部落在
@@ -955,15 +977,20 @@ class RateLimitingTests(DeliveryConsumerTestCase):
         )
         consumer.run_once()
 
-        self.assertEqual(len(cards.update_calls), 0, "建卡本身消费了首个限流名额，同一时刻的更新被抑制")
+        self.assertEqual(
+            len(cards.update_calls), 0, "建卡本身消费了首个限流名额，同一时刻的更新被抑制"
+        )
         cursor = self.scalar("SELECT delivery_consumed_sequence FROM task WHERE id='tsk-1'")
         self.assertEqual(cursor, 4, "游标必须推进到最后一个序号，即使更新被限流抑制")
 
         # 时钟前进超过 500ms 后的下一轮：限流解除，用最新状态发一次更新。
         clock[0] = 0.6
         self.queue.append_delivery_event(
-            task_id="tsk-1", worker_id="worker-1", event_type="progress",
-            idempotency_key="tsk-1:a1:progress:4", elapsed_seconds=9,
+            task_id="tsk-1",
+            worker_id="worker-1",
+            event_type="progress",
+            idempotency_key="tsk-1:a1:progress:4",
+            elapsed_seconds=9,
         )
         consumer.run_once()
         self.assertEqual(len(cards.update_calls), 1, "窗口之外的更新应当被放行")
@@ -1018,9 +1045,7 @@ class PreprovisionNoticeConsumptionTests(DeliveryConsumerTestCase):
             return tx.consume_preprovision_notice(user_id="usr-1")
 
     def test_an_armed_line_is_consumed_exactly_once(self) -> None:
-        self.execute(
-            "UPDATE app_user SET preprovision_notice_armed_at = now() WHERE id = 'usr-1'"
-        )
+        self.execute("UPDATE app_user SET preprovision_notice_armed_at = now() WHERE id = 'usr-1'")
 
         self.assertTrue(self._consume(), "挂起过就该在首聊时命中一次")
         self.assertFalse(self._consume(), "同一次挂起只提示一次")
@@ -1133,7 +1158,13 @@ class QueueDelayHintTests(DeliveryConsumerTestCase):
                 content_expires_at)
                VALUES (%s,%s,'usr-1',%s,'问题','queued','stable',0,%s,
                        now() - %s * interval '1 second', now())""",
-            (task_id, conversation_id, f"event-{task_id}", reply_to_message_id, created_seconds_ago),
+            (
+                task_id,
+                conversation_id,
+                f"event-{task_id}",
+                reply_to_message_id,
+                created_seconds_ago,
+            ),
         )
 
     def test_only_tasks_past_the_threshold_are_returned(self) -> None:

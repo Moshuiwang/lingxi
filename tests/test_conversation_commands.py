@@ -39,14 +39,10 @@ class ListClearParsingTests(unittest.TestCase):
         )
 
     def test_list_with_extra_argument_is_none(self) -> None:
-        self.assertEqual(
-            parse_memory_command("/memory list extra").kind, MemoryCommandKind.NONE
-        )
+        self.assertEqual(parse_memory_command("/memory list extra").kind, MemoryCommandKind.NONE)
 
     def test_clear_with_extra_argument_is_none(self) -> None:
-        self.assertEqual(
-            parse_memory_command("/memory clear now").kind, MemoryCommandKind.NONE
-        )
+        self.assertEqual(parse_memory_command("/memory clear now").kind, MemoryCommandKind.NONE)
 
     def test_bare_memory_with_no_subcommand_is_none(self) -> None:
         self.assertEqual(parse_memory_command("/memory").kind, MemoryCommandKind.NONE)
@@ -112,21 +108,15 @@ class NewlineInjectionGuardTests(unittest.TestCase):
         """反向哨兵：单行命令后面只是跟了个换行/空白收尾（常见于聊天客户端
         自动加的结尾换行），不该被这道新判据误伤——依然是合法的 clear。"""
 
-        self.assertEqual(
-            parse_memory_command("/memory clear\n").kind, MemoryCommandKind.CLEAR
-        )
-        self.assertEqual(
-            parse_memory_command("/memory clear\n   \n").kind, MemoryCommandKind.CLEAR
-        )
+        self.assertEqual(parse_memory_command("/memory clear\n").kind, MemoryCommandKind.CLEAR)
+        self.assertEqual(parse_memory_command("/memory clear\n   \n").kind, MemoryCommandKind.CLEAR)
 
     def test_single_line_tab_separated_subcommand_still_recognized(self) -> None:
         """反向哨兵：本修复只收紧「跨行」，不影响同一行内的 Tab 分隔词边界
         （上一修复包 P2-4 的既有意图，见 ``ListClearParsingTests``
         对应用例）。"""
 
-        self.assertEqual(
-            parse_memory_command("/memory\tlist").kind, MemoryCommandKind.LIST
-        )
+        self.assertEqual(parse_memory_command("/memory\tlist").kind, MemoryCommandKind.LIST)
 
     def test_still_belongs_to_the_memory_command_surface_not_unrecognized_slash(self) -> None:
         """即使子命令解析因跨行而判 NONE，这条消息依然属于 /memory 命令面

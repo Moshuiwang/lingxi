@@ -19,7 +19,7 @@ import json
 import sys
 import tempfile
 import unittest
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 
 MODULE_PATH = Path(__file__).parents[1] / "scripts" / "ops" / "monitoring" / "_resource_sample.py"
@@ -131,7 +131,7 @@ class ComputeRateTests(unittest.TestCase):
 
 class BuildSampleTests(unittest.TestCase):
     def test_first_sample_has_no_rates(self) -> None:
-        now = datetime(2026, 8, 29, 10, 0, 0, tzinfo=timezone.utc)
+        now = datetime(2026, 8, 29, 10, 0, 0, tzinfo=UTC)
         sample, next_state = resource_sample.build_sample(
             docker_stats_text=json.dumps({"Name": "c1", "PIDs": "1"}) + "\n",
             missing_text="c2\n",
@@ -150,11 +150,11 @@ class BuildSampleTests(unittest.TestCase):
         self.assertIn("disks", next_state)
 
     def test_second_sample_computes_growth_from_state(self) -> None:
-        now1 = datetime(2026, 8, 29, 10, 0, 0, tzinfo=timezone.utc)
+        now1 = datetime(2026, 8, 29, 10, 0, 0, tzinfo=UTC)
         _, state1 = resource_sample.build_sample(
             docker_stats_text="", missing_text="", disk_mounts=["/"], prev_state={}, now=now1
         )
-        now2 = datetime(2026, 8, 29, 10, 1, 0, tzinfo=timezone.utc)
+        now2 = datetime(2026, 8, 29, 10, 1, 0, tzinfo=UTC)
         sample2, _ = resource_sample.build_sample(
             docker_stats_text="", missing_text="", disk_mounts=["/"], prev_state=state1, now=now2
         )
@@ -166,7 +166,7 @@ class BuildSampleTests(unittest.TestCase):
 
 class AppendSampleTests(unittest.TestCase):
     def test_appends_one_line_per_call_to_day_partitioned_file(self) -> None:
-        now = datetime(2026, 8, 29, 10, 0, 0, tzinfo=timezone.utc)
+        now = datetime(2026, 8, 29, 10, 0, 0, tzinfo=UTC)
         with tempfile.TemporaryDirectory() as tmp:
             output_dir = Path(tmp)
             path1 = resource_sample.append_sample(output_dir, {"a": 1}, now=now)

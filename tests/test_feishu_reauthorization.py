@@ -12,11 +12,10 @@ import logging
 import stat
 import tempfile
 import unittest
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
-from lingxi.apps.reauthorize import handle_bridge_message
 from lingxi.adapters.feishu_directory import AuthorizationExchange
 from lingxi.adapters.feishu_reauthorization import (
     MODE_BOOTSTRAP,
@@ -26,10 +25,10 @@ from lingxi.adapters.feishu_reauthorization import (
     SubjectAlreadyRegisteredError,
 )
 from lingxi.adapters.oauth_bridge_client import OAuthBridgeClient, OAuthBridgeMessage
+from lingxi.apps.reauthorize import handle_bridge_message
 from lingxi.core.identity.credentials import AuthorizationGrant, SecretToken
 
-
-NOW = datetime(2026, 8, 8, 7, 0, tzinfo=timezone.utc)
+NOW = datetime(2026, 8, 8, 7, 0, tzinfo=UTC)
 EXPECTED_SUBJECT = "ou_delegated_subject"
 OTHER_SUBJECT = "ou_other_subject"
 FAKE_CODE = "fake-one-time-code"
@@ -68,7 +67,9 @@ class FakeExchanger:
 
 
 class FakeVault:
-    def __init__(self, registered_subject: str | None = EXPECTED_SUBJECT, save_result: bool = True) -> None:
+    def __init__(
+        self, registered_subject: str | None = EXPECTED_SUBJECT, save_result: bool = True
+    ) -> None:
         self.registered_subject = registered_subject
         self.save_result = save_result
         self.saved: list[tuple[str, AuthorizationGrant]] = []
@@ -212,17 +213,30 @@ class ReauthorizationEntryTest(unittest.TestCase):
 
         result = self.entry.handle_callback(state, code=FAKE_CODE, now=NOW + timedelta(seconds=1))
 
-        self.assertEqual(result, ReauthorizationResult(True, "completed", "专用授权已更新，可以继续组织目录同步。", False))
+        self.assertEqual(
+            result,
+            ReauthorizationResult(
+                True, "completed", "专用授权已更新，可以继续组织目录同步。", False
+            ),
+        )
         self.assertEqual(
             self.exchanger.calls,
-            [(FAKE_CODE, "https://stage.example.test/reauth/callback", "auth:user.id:read offline_access")],
+            [
+                (
+                    FAKE_CODE,
+                    "https://stage.example.test/reauth/callback",
+                    "auth:user.id:read offline_access",
+                )
+            ],
         )
         self.assertEqual(len(self.vault.saved), 1)
         self.assertEqual(self.vault.saved[0][0], EXPECTED_SUBJECT)
         self.assertEqual(self.vault.saved[0][1].refresh_token.reveal(), FAKE_REFRESH_TOKEN)
 
-    def test_oauth_bridge_injection_routes_to_formal_reauthorization_without_onboarding(self) -> None:
-        state = self._begin(now=datetime.now(timezone.utc))
+    def test_oauth_bridge_injection_routes_to_formal_reauthorization_without_onboarding(
+        self,
+    ) -> None:
+        state = self._begin(now=datetime.now(UTC))
         sender = FakeBridgeResultSender()
         onboarding_messages: list[OAuthBridgeMessage] = []
         bridge = OAuthBridgeClient(
@@ -238,14 +252,21 @@ class ReauthorizationEntryTest(unittest.TestCase):
 
         bridge.handle_message(OAuthBridgeMessage("oauth_code", state, FAKE_CODE))
 
-        self.assertEqual(results, [ReauthorizationResult(True, "completed", "专用授权已更新，可以继续组织目录同步。", False)])
+        self.assertEqual(
+            results,
+            [
+                ReauthorizationResult(
+                    True, "completed", "专用授权已更新，可以继续组织目录同步。", False
+                )
+            ],
+        )
         self.assertEqual(onboarding_messages, [])
         self.assertEqual(sender.results, [(state, "identity_confirmed")])
         self.assertEqual(self.vault.saved[0][0], EXPECTED_SUBJECT)
         self.assertEqual(self.exchanger.calls[0][0], FAKE_CODE)
 
     def test_oauth_bridge_cancellation_uses_formal_retry_result(self) -> None:
-        state = self._begin(now=datetime.now(timezone.utc))
+        state = self._begin(now=datetime.now(UTC))
         sender = FakeBridgeResultSender()
 
         result = handle_bridge_message(
@@ -254,7 +275,12 @@ class ReauthorizationEntryTest(unittest.TestCase):
             OAuthBridgeMessage("oauth_cancelled", state),
         )
 
-        self.assertEqual(result, ReauthorizationResult(False, "cancelled", "已取消本次授权，未修改凭据，请重新发起授权。", True))
+        self.assertEqual(
+            result,
+            ReauthorizationResult(
+                False, "cancelled", "已取消本次授权，未修改凭据，请重新发起授权。", True
+            ),
+        )
         self.assertEqual(sender.results, [(state, "retry")])
         self.assertEqual(self.exchanger.calls, [])
         self.assertEqual(self.vault.saved, [])
@@ -262,25 +288,39 @@ class ReauthorizationEntryTest(unittest.TestCase):
     def test_success_result_and_logs_never_contain_authorization_values(self) -> None:
         state = self._begin()
 
-        with self.assertLogs("lingxi.adapters.feishu_reauthorization", level=logging.INFO) as captured:
+        with self.assertLogs(
+            "lingxi.adapters.feishu_reauthorization", level=logging.INFO
+        ) as captured:
             result = self.entry.handle_callback(state, code=FAKE_CODE, now=NOW)
 
         self._assert_authorization_values_are_absent(result, captured.output)
 
-    def test_missing_expired_and_replayed_states_are_rejected_and_mismatch_does_not_consume_valid_state(self) -> None:
+    def test_missing_expired_and_replayed_states_are_rejected_and_mismatch_does_not_consume_valid_state(
+        self,
+    ) -> None:
         self.assertFalse(self.entry.handle_callback("s" * 32, code=FAKE_CODE).ok)
 
         expired = self.entry.begin(now=NOW)
         self.assertFalse(
-            self.entry.handle_callback(expired.state, code=FAKE_CODE, now=NOW + timedelta(seconds=601)).ok
+            self.entry.handle_callback(
+                expired.state, code=FAKE_CODE, now=NOW + timedelta(seconds=601)
+            ).ok
         )
 
         state = self._begin()
-        self.assertFalse(self.entry.handle_callback("x" * len(state), code=FAKE_CODE, now=NOW + timedelta(seconds=1)).ok)
+        self.assertFalse(
+            self.entry.handle_callback(
+                "x" * len(state), code=FAKE_CODE, now=NOW + timedelta(seconds=1)
+            ).ok
+        )
         self.assertEqual(self.exchanger.calls, [])
-        self.assertTrue(self.entry.handle_callback(state, code=FAKE_CODE, now=NOW + timedelta(seconds=2)).ok)
+        self.assertTrue(
+            self.entry.handle_callback(state, code=FAKE_CODE, now=NOW + timedelta(seconds=2)).ok
+        )
         self.assertEqual(len(self.exchanger.calls), 1)
-        self.assertFalse(self.entry.handle_callback(state, code=FAKE_CODE, now=NOW + timedelta(seconds=3)).ok)
+        self.assertFalse(
+            self.entry.handle_callback(state, code=FAKE_CODE, now=NOW + timedelta(seconds=3)).ok
+        )
         self.assertEqual(len(self.vault.saved), 1)
 
     def test_callback_identity_is_read_from_feishu_and_mismatch_does_not_save(self) -> None:
@@ -315,7 +355,9 @@ class ReauthorizationEntryTest(unittest.TestCase):
 
     def test_subject_registration_change_between_read_and_save_is_rejected_by_cas(self) -> None:
         state = self._begin()
-        self.vault.after_registered_subject_read = lambda: setattr(self.vault, "registered_subject", OTHER_SUBJECT)
+        self.vault.after_registered_subject_read = lambda: setattr(
+            self.vault, "registered_subject", OTHER_SUBJECT
+        )
 
         result = self.entry.handle_callback(state, code=FAKE_CODE, now=NOW + timedelta(seconds=1))
 
@@ -349,7 +391,9 @@ class ReauthorizationEntryTest(unittest.TestCase):
 
     def test_cancel_and_exchange_failure_consume_state_without_saving(self) -> None:
         cancelled_state = self._begin()
-        cancelled = self.entry.handle_callback(cancelled_state, error="access_denied", now=NOW + timedelta(seconds=1))
+        cancelled = self.entry.handle_callback(
+            cancelled_state, error="access_denied", now=NOW + timedelta(seconds=1)
+        )
         self.assertEqual(cancelled.code, "cancelled")
         self.assertEqual(self.exchanger.calls, [])
         self.assertIsNone(
@@ -359,8 +403,12 @@ class ReauthorizationEntryTest(unittest.TestCase):
 
         failed_state = self._begin()
         self.exchanger.result = RuntimeError("secret error must not be logged")
-        with self.assertLogs("lingxi.adapters.feishu_reauthorization", level=logging.INFO) as captured:
-            failed = self.entry.handle_callback(failed_state, code=FAKE_CODE, now=NOW + timedelta(seconds=2))
+        with self.assertLogs(
+            "lingxi.adapters.feishu_reauthorization", level=logging.INFO
+        ) as captured:
+            failed = self.entry.handle_callback(
+                failed_state, code=FAKE_CODE, now=NOW + timedelta(seconds=2)
+            )
         self.assertEqual(failed.code, "exchange_failed")
         self.assertEqual(self.vault.saved, [])
         self._assert_authorization_values_are_absent(failed, captured.output)
@@ -388,14 +436,20 @@ class ReauthorizationEntryTest(unittest.TestCase):
 
     def test_result_and_logs_never_contain_authorization_values(self) -> None:
         state = self._begin()
-        self.exchanger.result = RuntimeError(f"{FAKE_CODE} {FAKE_ACCESS_TOKEN} {FAKE_REFRESH_TOKEN}")
+        self.exchanger.result = RuntimeError(
+            f"{FAKE_CODE} {FAKE_ACCESS_TOKEN} {FAKE_REFRESH_TOKEN}"
+        )
 
-        with self.assertLogs("lingxi.adapters.feishu_reauthorization", level=logging.INFO) as captured:
+        with self.assertLogs(
+            "lingxi.adapters.feishu_reauthorization", level=logging.INFO
+        ) as captured:
             result = self.entry.handle_callback(state, code=FAKE_CODE, now=NOW)
 
         self._assert_authorization_values_are_absent(result, captured.output)
 
-    def _assert_authorization_values_are_absent(self, result: ReauthorizationResult, logs: list[str]) -> None:
+    def _assert_authorization_values_are_absent(
+        self, result: ReauthorizationResult, logs: list[str]
+    ) -> None:
         rendered = repr(result) + "\n".join(logs)
         for secret in (FAKE_CODE, FAKE_ACCESS_TOKEN, FAKE_REFRESH_TOKEN):
             self.assertFalse(secret in rendered, "结果或日志包含授权原值")
@@ -413,7 +467,9 @@ class BootstrapModeTest(unittest.TestCase):
         self.directory = tempfile.TemporaryDirectory()
         self.addCleanup(self.directory.cleanup)
         self.state_path = Path(self.directory.name) / "reauth-state.json"
-        self.state_store = HostFileAuthorizationStateStore(str(self.state_path), "state-integrity-key")
+        self.state_store = HostFileAuthorizationStateStore(
+            str(self.state_path), "state-integrity-key"
+        )
         self.vault = FakeVault(registered_subject=None)
         self.exchanger = FakeExchanger(exchange())
         self.entry = self._entry(MODE_BOOTSTRAP)
@@ -461,7 +517,9 @@ class BootstrapModeTest(unittest.TestCase):
 
         renewal = self._entry("renewal")
         start = renewal.begin(now=NOW + timedelta(seconds=2))  # 不再需要显式主体：登记已可读
-        result = renewal.handle_callback(start.state, code=FAKE_CODE, now=NOW + timedelta(seconds=3))
+        result = renewal.handle_callback(
+            start.state, code=FAKE_CODE, now=NOW + timedelta(seconds=3)
+        )
 
         self.assertTrue(result.ok)
         self.assertEqual(len(self.vault.saved), 2)
@@ -487,7 +545,9 @@ class BootstrapModeTest(unittest.TestCase):
         self.assertEqual(self.vault.saved, [])
         self.assertEqual(self.vault.registered_subject, OTHER_SUBJECT)
 
-    def test_registration_appearing_after_begin_blocks_the_callback_without_changing_it(self) -> None:
+    def test_registration_appearing_after_begin_blocks_the_callback_without_changing_it(
+        self,
+    ) -> None:
         state = self._begin()
         self.vault.registered_subject = OTHER_SUBJECT
 
@@ -497,7 +557,9 @@ class BootstrapModeTest(unittest.TestCase):
         self.assertEqual(result.code, "subject_exists")
         self.assertEqual(self.vault.saved, [])
         self.assertEqual(self.vault.save_conditions, [])
-        self.assertEqual(self.vault.registered_subject, OTHER_SUBJECT, "拒绝时不得覆盖或更新既有登记")
+        self.assertEqual(
+            self.vault.registered_subject, OTHER_SUBJECT, "拒绝时不得覆盖或更新既有登记"
+        )
 
     def test_registration_of_the_same_subject_after_begin_is_also_refused(self) -> None:
         """重复执行首次建立不是"幂等成功"：登记已存在就交给续期语义，不再写入。"""
@@ -513,7 +575,9 @@ class BootstrapModeTest(unittest.TestCase):
 
     def test_registration_appearing_between_read_and_save_is_rejected_by_cas(self) -> None:
         state = self._begin()
-        self.vault.after_registered_subject_read = lambda: setattr(self.vault, "registered_subject", OTHER_SUBJECT)
+        self.vault.after_registered_subject_read = lambda: setattr(
+            self.vault, "registered_subject", OTHER_SUBJECT
+        )
 
         result = self.entry.handle_callback(state, code=FAKE_CODE, now=NOW + timedelta(seconds=1))
 
@@ -535,8 +599,12 @@ class BootstrapModeTest(unittest.TestCase):
     def test_bootstrap_result_and_logs_never_contain_authorization_values(self) -> None:
         state = self._begin()
 
-        with self.assertLogs("lingxi.adapters.feishu_reauthorization", level=logging.INFO) as captured:
-            result = self.entry.handle_callback(state, code=FAKE_CODE, now=NOW + timedelta(seconds=1))
+        with self.assertLogs(
+            "lingxi.adapters.feishu_reauthorization", level=logging.INFO
+        ) as captured:
+            result = self.entry.handle_callback(
+                state, code=FAKE_CODE, now=NOW + timedelta(seconds=1)
+            )
 
         rendered = repr(result) + "\n".join(captured.output)
         for secret in (FAKE_CODE, FAKE_ACCESS_TOKEN, FAKE_REFRESH_TOKEN):

@@ -9,24 +9,24 @@ header），并要求落盘凭据参照 biai-agent 先例做权限纪律：**文
 
 from __future__ import annotations
 
+import errno
 import json
 import logging
-import errno
 import os
 import stat
 import tempfile
 import unittest
-from unittest import mock
 from pathlib import Path
+from unittest import mock
 
 from lingxi.adapters.user_environment import (
     CREDENTIAL_FILE_MODE,
-    TEMPORARY_PREFIX,
-    TEMPORARY_SUFFIX,
     HOME_DIR_MODE,
+    MCP_CONFIG_FILENAME,
     QUERY_MCP_SERVER_NAME,
     ROOT_DIR_MODE,
-    MCP_CONFIG_FILENAME,
+    TEMPORARY_PREFIX,
+    TEMPORARY_SUFFIX,
     LocalUserEnvironment,
     UserEnvironmentError,
     build_mcp_config,
@@ -45,9 +45,7 @@ class ConstructionTests(unittest.TestCase):
 
     def test_a_world_readable_credential_mode_is_refused(self) -> None:
         with self.assertRaises(ValueError):
-            LocalUserEnvironment(
-                root="/tmp/x", mcp_endpoint=ENDPOINT, credential_file_mode=0o444
-            )
+            LocalUserEnvironment(root="/tmp/x", mcp_endpoint=ENDPOINT, credential_file_mode=0o444)
 
     def test_an_empty_root_is_refused(self) -> None:
         with self.assertRaises(ValueError):
@@ -161,9 +159,7 @@ class FileSystemTests(unittest.TestCase):
         real_replace = os.replace
 
         def spy(src, dst, **kwargs):  # type: ignore[no-untyped-def]
-            observed.append(
-                stat.S_IMODE(os.stat(src, dir_fd=kwargs["src_dir_fd"]).st_mode)
-            )
+            observed.append(stat.S_IMODE(os.stat(src, dir_fd=kwargs["src_dir_fd"]).st_mode))
             return real_replace(src, dst, **kwargs)
 
         with mock.patch("lingxi.adapters.user_environment.os.replace", spy):
@@ -231,9 +227,7 @@ class FileSystemTests(unittest.TestCase):
             self.environment.ensure(user_id="usr_01H", mcp_token=TOKEN)
 
         self.assertFalse(leftover.exists(), "带令牌的残留临时文件必须被清掉")
-        self.assertTrue(
-            any("临时文件" in line for line in caught.output), "清扫必须留声，不能静默"
-        )
+        self.assertTrue(any("临时文件" in line for line in caught.output), "清扫必须留声，不能静默")
         self.assertTrue(self._config().exists())
 
     def test_an_unsweepable_directory_refuses_to_take_the_credential(self) -> None:
@@ -387,9 +381,7 @@ class FileSystemTests(unittest.TestCase):
 
         # 原始失败原因不被清理失败盖掉，清理失败本身也留了声。
         self.assertEqual(raised.exception.code, "config_write_EXDEV")
-        self.assertTrue(
-            any("可能残留明文令牌" in line for line in caught.output), caught.output
-        )
+        self.assertTrue(any("可能残留明文令牌" in line for line in caught.output), caught.output)
 
     def _failing_close(self):
         """让**普通文件**那次 close 失败；目录 fd 的 close 属于 dirfd 生命周期，不动它。"""
@@ -408,7 +400,9 @@ class FileSystemTests(unittest.TestCase):
         """`close()` 抛错但数据已 `fsync`、`replace` 成功：如实记一条，操作照常成立。"""
 
         with self._failing_close():
-            with self.assertLogs("lingxi.adapters.user_environment", level=logging.WARNING) as caught:
+            with self.assertLogs(
+                "lingxi.adapters.user_environment", level=logging.WARNING
+            ) as caught:
                 result = self.environment.ensure(user_id="usr_01H", mcp_token=TOKEN)
 
         self.assertTrue(result.created)

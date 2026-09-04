@@ -19,8 +19,10 @@ import dataclasses
 import os
 import time
 import unittest
-from datetime import date, datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
+
+from postgres_schema import psycopg_available, reset_production_rows
 
 from lingxi.adapters.postgres import connect
 from lingxi.adapters.postgres_identity import IdentityStorageIntegrityError
@@ -44,8 +46,6 @@ from lingxi.core.identity.provisioning import (
     ProvisioningRejection,
     ProvisioningRequest,
 )
-
-from postgres_schema import psycopg_available, reset_production_rows
 
 FAKE_TOKEN = "fake-refresh-token-for-tests-only"
 DELEGATED_SUBJECT = "ou_delegated_authorization_subject"
@@ -79,7 +79,9 @@ def member(
     )
 
 
-def batch(members: tuple[SnapshotMember, ...], *, app_keys: frozenset[str] | None = None) -> SnapshotBatch:
+def batch(
+    members: tuple[SnapshotMember, ...], *, app_keys: frozenset[str] | None = None
+) -> SnapshotBatch:
     keys = frozenset(item.member_key for item in members)
     return SnapshotBatch(
         tenants=(TenantScope("tenant_a", True, keys if app_keys is None else app_keys, keys),),
@@ -143,10 +145,18 @@ class DelegatedCredentialTest(IdentityPostgresTestCase):
         self._dir = tempfile.TemporaryDirectory()
         self.addCleanup(self._dir.cleanup)
         self.path = Path(self._dir.name) / "delegated-credential.enc"
-        self.vault = HostFileDelegatedCredentialVault(self._dsn, Fernet.generate_key().decode(), str(self.path))
-        self.issued_at = datetime.now(timezone.utc)
+        self.vault = HostFileDelegatedCredentialVault(
+            self._dsn, Fernet.generate_key().decode(), str(self.path)
+        )
+        self.issued_at = datetime.now(UTC)
 
-    def _save(self, *, seconds: int = 7 * 24 * 3600, token: str = FAKE_TOKEN, issued_at: datetime | None = None) -> None:
+    def _save(
+        self,
+        *,
+        seconds: int = 7 * 24 * 3600,
+        token: str = FAKE_TOKEN,
+        issued_at: datetime | None = None,
+    ) -> None:
         self.vault.save(
             subject_open_id=DELEGATED_SUBJECT,
             grant=AuthorizationGrant(SecretToken(token), seconds, "offline_access"),
@@ -176,7 +186,9 @@ class DelegatedCredentialTest(IdentityPostgresTestCase):
 
         blob = self.path.read_bytes()
         self.assertNotIn(FAKE_TOKEN.encode(), blob)
-        self.assertEqual(self.scalar("SELECT subject_open_id FROM feishu_delegated_subject"), DELEGATED_SUBJECT)
+        self.assertEqual(
+            self.scalar("SELECT subject_open_id FROM feishu_delegated_subject"), DELEGATED_SUBJECT
+        )
         self.assertEqual(oct(self.path.stat().st_mode & 0o777), oct(0o600))
 
     def test_the_registry_table_has_no_credential_column_at_all(self) -> None:
@@ -209,7 +221,10 @@ class DelegatedCredentialTest(IdentityPostgresTestCase):
         )
 
         self.assertEqual(self.scalar("SELECT count(*) FROM feishu_delegated_subject"), 1)
-        self.assertEqual(self.scalar("SELECT subject_open_id FROM feishu_delegated_subject"), "ou_another_subject")
+        self.assertEqual(
+            self.scalar("SELECT subject_open_id FROM feishu_delegated_subject"),
+            "ou_another_subject",
+        )
 
     def test_an_unknown_purpose_is_rejected_by_the_database(self) -> None:
         with self.assertRaises(self._psycopg.errors.CheckViolation):
@@ -223,8 +238,12 @@ class DelegatedCredentialTest(IdentityPostgresTestCase):
         credential = self.vault.load()
 
         assert credential is not None
-        self.assertAlmostEqual((credential.refresh_at - self.issued_at).total_seconds(), 7 * 24 * 3600 * 0.8, delta=2)
-        self.assertAlmostEqual((credential.expires_at - self.issued_at).total_seconds(), 7 * 24 * 3600, delta=2)
+        self.assertAlmostEqual(
+            (credential.refresh_at - self.issued_at).total_seconds(), 7 * 24 * 3600 * 0.8, delta=2
+        )
+        self.assertAlmostEqual(
+            (credential.expires_at - self.issued_at).total_seconds(), 7 * 24 * 3600, delta=2
+        )
 
     def test_load_returns_the_plaintext_only_through_an_explicit_reveal(self) -> None:
         self._save()
@@ -238,7 +257,7 @@ class DelegatedCredentialTest(IdentityPostgresTestCase):
 
     def test_claiming_a_due_credential_succeeds_exactly_once(self) -> None:
         # 一次性凭据不能被同一轮扫描领两次；消费标记就是那道门。
-        self._save(seconds=3600, issued_at=datetime.now(timezone.utc) - timedelta(seconds=3500))
+        self._save(seconds=3600, issued_at=datetime.now(UTC) - timedelta(seconds=3500))
 
         first = self.vault.claim_due()
         second = self.vault.claim_due()
@@ -255,7 +274,7 @@ class DelegatedCredentialTest(IdentityPostgresTestCase):
         """fcntl 排他锁扮演数据库版 SKIP LOCKED 的角色：并发领取恰好一个成功。"""
         import threading as _threading
 
-        self._save(seconds=3600, issued_at=datetime.now(timezone.utc) - timedelta(seconds=3500))
+        self._save(seconds=3600, issued_at=datetime.now(UTC) - timedelta(seconds=3500))
         results: list[object] = []
 
         def worker() -> None:
@@ -362,8 +381,10 @@ class ConsumedCredentialTest(IdentityPostgresTestCase):
         self._dir = tempfile.TemporaryDirectory()
         self.addCleanup(self._dir.cleanup)
         self.path = Path(self._dir.name) / "delegated-credential.enc"
-        self.vault = HostFileDelegatedCredentialVault(self._dsn, Fernet.generate_key().decode(), str(self.path))
-        self.issued_at = datetime.now(timezone.utc) - timedelta(days=6)
+        self.vault = HostFileDelegatedCredentialVault(
+            self._dsn, Fernet.generate_key().decode(), str(self.path)
+        )
+        self.issued_at = datetime.now(UTC) - timedelta(days=6)
         self.vault.save(
             subject_open_id=DELEGATED_SUBJECT,
             grant=AuthorizationGrant(SecretToken(FAKE_TOKEN), 7 * 24 * 3600, "offline_access"),
@@ -378,7 +399,7 @@ class ConsumedCredentialTest(IdentityPostgresTestCase):
         # 现在与任何未来时刻都一样（挡住重放的是消费标记本身）。
         self.assertIsNone(self.vault.load())
         self.assertIsNone(self.vault.claim_due())
-        later = datetime.now(timezone.utc) + timedelta(seconds=3600)
+        later = datetime.now(UTC) + timedelta(seconds=3600)
         self.assertIsNone(self.vault.claim_due(now=later))
         self.assertIsNone(self.vault.load(now=later))
 
@@ -386,7 +407,9 @@ class ConsumedCredentialTest(IdentityPostgresTestCase):
         self.vault.claim_due()
         self.vault.save(
             subject_open_id=DELEGATED_SUBJECT,
-            grant=AuthorizationGrant(SecretToken("fake-next-token"), 7 * 24 * 3600, "offline_access"),
+            grant=AuthorizationGrant(
+                SecretToken("fake-next-token"), 7 * 24 * 3600, "offline_access"
+            ),
         )
 
         self.assertIsNotNone(self.vault.load())
@@ -396,7 +419,9 @@ class ConsumedCredentialTest(IdentityPostgresTestCase):
         self.vault.claim_due()
 
         with self.assertLogs("lingxi.adapters.delegated_credentials", level="ERROR") as captured:
-            cleared = self.vault.revoke_stale_consumed(max_age_seconds=0, now=datetime.now(timezone.utc) + timedelta(seconds=1))
+            cleared = self.vault.revoke_stale_consumed(
+                max_age_seconds=0, now=datetime.now(UTC) + timedelta(seconds=1)
+            )
 
         self.assertTrue(cleared)
         self.assertTrue(any("不可恢复" in line for line in captured.output))
@@ -449,7 +474,7 @@ class OnDemandRefreshCeilingTest(IdentityPostgresTestCase):
             self._dsn, Fernet.generate_key().decode(), str(self.path)
         )
         # 刚发放：轮换点在 5.6 天之后，因此"到期领取"这条路径拿不到它。
-        self.issued_at = datetime.now(timezone.utc)
+        self.issued_at = datetime.now(UTC)
 
     def _save(
         self,
@@ -483,18 +508,18 @@ class OnDemandRefreshCeilingTest(IdentityPostgresTestCase):
         """
 
         self._save()
-        before = datetime.now(timezone.utc)
+        before = datetime.now(UTC)
 
         claimed = self.vault.claim_due(for_supply=True)
 
-        after = datetime.now(timezone.utc)
+        after = datetime.now(UTC)
         self.assertIsNotNone(claimed.consumed_at)
         self.assertGreaterEqual(claimed.consumed_at, before)
         self.assertLessEqual(claimed.consumed_at, after)
         self.assertEqual(claimed.consumed_at.utcoffset(), timedelta(0))
 
     def test_the_moment_is_taken_after_the_lock_is_acquired(self) -> None:
-        """"现在几点"必须在**拿到锁之后**取（收口轮 P2-a）。
+        """ "现在几点"必须在**拿到锁之后**取（收口轮 P2-a）。
 
         锁外先算好、再进去等锁，等锁跨过 UTC 午夜时 D+1 的那次领取会被当成 D，当天
         因此可以再消费一次一次性凭据。这里用真实的锁竞争把它钉住：另一个持有者压住锁
@@ -514,7 +539,7 @@ class OnDemandRefreshCeilingTest(IdentityPostgresTestCase):
                 fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
                 holding.set()
                 time.sleep(0.2)
-                released_at.append(datetime.now(timezone.utc))
+                released_at.append(datetime.now(UTC))
                 fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
 
         holder = threading.Thread(target=hold_the_lock)
@@ -532,7 +557,7 @@ class OnDemandRefreshCeilingTest(IdentityPostgresTestCase):
 
     # 一个远离 UTC 午夜的固定锚点：涉及"同一 UTC 日"的用例用它，避免真的在 CI 跑到
     # 接近午夜时产生偶发的跨日误判（Issue #276 新增用例的确定性要求）。
-    NOON = datetime(2026, 8, 18, 12, 0, 0, tzinfo=timezone.utc)
+    NOON = datetime(2026, 8, 18, 12, 0, 0, tzinfo=UTC)
 
     def test_a_second_claim_within_the_minimum_interval_is_refused(self) -> None:
         """距上一次消费未满最小间隔（默认 5 分钟）：被拒，且不置位消费标记。
@@ -541,11 +566,11 @@ class OnDemandRefreshCeilingTest(IdentityPostgresTestCase):
         必须变红（`self.vault.load()` 会因为凭据被标成"消费中"而变成 ``None``）。
         """
 
-        from lingxi.core.identity.credentials import RefreshMinIntervalNotElapsed
+        from lingxi.core.identity.credentials import RefreshMinIntervalNotElapsedError
 
         self._save(refresh_consumed_at=self.NOON, refresh_consumed_count=1)
 
-        with self.assertRaises(RefreshMinIntervalNotElapsed) as raised:
+        with self.assertRaises(RefreshMinIntervalNotElapsedError) as raised:
             self.vault.claim_due(for_supply=True, now=self.NOON + timedelta(minutes=1))
 
         self.assertNotIn(FAKE_TOKEN, str(raised.exception))
@@ -564,7 +589,9 @@ class OnDemandRefreshCeilingTest(IdentityPostgresTestCase):
 
         self._save(refresh_consumed_at=self.NOON, refresh_consumed_count=1)
 
-        claimed = self.vault.claim_due(for_supply=True, now=self.NOON + timedelta(minutes=5, seconds=1))
+        claimed = self.vault.claim_due(
+            for_supply=True, now=self.NOON + timedelta(minutes=5, seconds=1)
+        )
 
         self.assertIsNotNone(claimed, "同一天、间隔已过，必须能再换一次")
         self.assertEqual(claimed.refresh_consumed_count, 2, "当日计数在上一次的基础上加一")
@@ -596,12 +623,12 @@ class OnDemandRefreshCeilingTest(IdentityPostgresTestCase):
         """0 被拒之后，"几乎没有间隔"的语义由一个**极小的正值**承担——它仍然是一道
         真的检查（同一时刻再领一次照样被挡），只是门槛小到不干扰别的断言。"""
 
-        from lingxi.core.identity.credentials import RefreshMinIntervalNotElapsed
+        from lingxi.core.identity.credentials import RefreshMinIntervalNotElapsedError
 
         tiny = timedelta(microseconds=1)
         self._save(refresh_consumed_at=self.NOON, refresh_consumed_count=1)
 
-        with self.assertRaises(RefreshMinIntervalNotElapsed):
+        with self.assertRaises(RefreshMinIntervalNotElapsedError):
             # 与上一次消费**同一时刻**：间隔为 0，仍然小于 1 微秒，照样被挡。
             self.vault.claim_due(for_supply=True, now=self.NOON, min_interval=tiny)
 
@@ -612,11 +639,11 @@ class OnDemandRefreshCeilingTest(IdentityPostgresTestCase):
         钉住的只是"日上界"这一条判据，不与最小间隔混在一起。
         """
 
-        from lingxi.core.identity.credentials import RefreshDailyLimitReached
+        from lingxi.core.identity.credentials import RefreshDailyLimitReachedError
 
         self._save(refresh_consumed_at=self.NOON, refresh_consumed_count=1)
 
-        with self.assertRaises(RefreshDailyLimitReached) as raised:
+        with self.assertRaises(RefreshDailyLimitReachedError) as raised:
             self.vault.claim_due(for_supply=True, now=self.NOON + timedelta(hours=1), daily_limit=1)
 
         self.assertNotIn(FAKE_TOKEN, str(raised.exception))
@@ -625,14 +652,19 @@ class OnDemandRefreshCeilingTest(IdentityPostgresTestCase):
     def test_the_two_ceilings_are_distinguishable_on_the_same_credential(self) -> None:
         """同一条领取路径下，最小间隔与当日上界必须能被明确区分（约束 2 的直接钉子）。"""
 
-        from lingxi.core.identity.credentials import RefreshDailyLimitReached, RefreshMinIntervalNotElapsed
+        from lingxi.core.identity.credentials import (
+            RefreshDailyLimitReachedError,
+            RefreshMinIntervalNotElapsedError,
+        )
 
         self._save(refresh_consumed_at=self.NOON, refresh_consumed_count=1)
 
-        with self.assertRaises(RefreshMinIntervalNotElapsed):
-            self.vault.claim_due(for_supply=True, now=self.NOON + timedelta(seconds=1), daily_limit=1)
+        with self.assertRaises(RefreshMinIntervalNotElapsedError):
+            self.vault.claim_due(
+                for_supply=True, now=self.NOON + timedelta(seconds=1), daily_limit=1
+            )
 
-        with self.assertRaises(RefreshDailyLimitReached):
+        with self.assertRaises(RefreshDailyLimitReachedError):
             self.vault.claim_due(for_supply=True, now=self.NOON + timedelta(hours=1), daily_limit=1)
 
     def test_the_ceiling_resets_across_utc_midnight_judged_by_the_locks_clock(self) -> None:
@@ -643,14 +675,14 @@ class OnDemandRefreshCeilingTest(IdentityPostgresTestCase):
         证明复位真的是靠"日界"而不是单纯"隔了很久"。
         """
 
-        from lingxi.core.identity.credentials import RefreshDailyLimitReached
+        from lingxi.core.identity.credentials import RefreshDailyLimitReachedError
 
-        near_midnight = datetime(2026, 8, 18, 23, 59, 30, tzinfo=timezone.utc)
+        near_midnight = datetime(2026, 8, 18, 23, 59, 30, tzinfo=UTC)
         self._save(refresh_consumed_at=near_midnight, refresh_consumed_count=1)
 
         # 6 分钟之后（已过最小间隔）、仍是 8-19 的 00:05:30——已经跨过 UTC 午夜，
         # 但故意先验证"跨天之后同一个低上界照常放行"，再验证"没跨天则会被挡住"。
-        with self.assertRaises(RefreshDailyLimitReached):
+        with self.assertRaises(RefreshDailyLimitReachedError):
             # 20 秒之后：还没过最小间隔，也还是同一个 UTC 日，用日上界为 1 的当日
             # 计数（已是 1）钉住"没跨天时会被挡住"这一半。
             # 最小间隔用一个**极小的正值**（不是 0——0 是被拒的哨兵，见
@@ -678,36 +710,42 @@ class OnDemandRefreshCeilingTest(IdentityPostgresTestCase):
         账本副本做不到的事——它只记得"已经用过、用了几次"，认不出这是一条新凭据。
         """
 
-        from lingxi.core.identity.credentials import RefreshDailyLimitReached
+        from lingxi.core.identity.credentials import RefreshDailyLimitReachedError
 
         self._save(refresh_consumed_at=self.NOON, refresh_consumed_count=1)
-        with self.assertRaises(RefreshDailyLimitReached):
+        with self.assertRaises(RefreshDailyLimitReachedError):
             # 用一个紧上界（1）确认"消费过一次"确实卡住了后续领取，不是因为间隔。
             self.vault.claim_due(for_supply=True, now=self.NOON + timedelta(hours=1), daily_limit=1)
 
         # 人工重授权：同一天写入一条全新凭据，**不带**消费时刻与计数。
         self.vault.save(
             subject_open_id=DELEGATED_SUBJECT,
-            grant=AuthorizationGrant(SecretToken("fake-reauthorized-token"), 7 * 24 * 3600, "offline_access"),
+            grant=AuthorizationGrant(
+                SecretToken("fake-reauthorized-token"), 7 * 24 * 3600, "offline_access"
+            ),
         )
 
-        claimed = self.vault.claim_due(for_supply=True, now=self.NOON + timedelta(hours=1), daily_limit=1)
+        claimed = self.vault.claim_due(
+            for_supply=True, now=self.NOON + timedelta(hours=1), daily_limit=1
+        )
         self.assertIsNotNone(claimed, "重授权当天即可恢复供给，即使日上界仍然是 1")
-        self.assertEqual(claimed.refresh_consumed_count, 1, "新凭据的当日计数从 1 开始，不是延续旧账本")
+        self.assertEqual(
+            claimed.refresh_consumed_count, 1, "新凭据的当日计数从 1 开始，不是延续旧账本"
+        )
 
     def test_an_expired_credential_is_revoked_before_the_ceiling_is_consulted(self) -> None:
         """失效优先于一切：一条已经失效的凭据要被清掉并要求重新授权，
         而不是先报一句频率上界的拒绝把真正的问题盖住。"""
 
-        from lingxi.core.identity.credentials import RefreshRateLimited
+        from lingxi.core.identity.credentials import RefreshRateLimitedError
 
-        moment = datetime.now(timezone.utc)
+        moment = datetime.now(UTC)
         self._save(refresh_consumed_at=moment, refresh_consumed_count=1, seconds=3600)
 
         later = moment + timedelta(seconds=3601)
         try:
             claimed = self.vault.claim_due(for_supply=True, now=later)
-        except RefreshRateLimited:  # pragma: no cover - 次序错了才会走到这里
+        except RefreshRateLimitedError:  # pragma: no cover - 次序错了才会走到这里
             self.fail("失效判定必须排在频率上界之前")
 
         self.assertIsNone(claimed)
@@ -721,23 +759,27 @@ class OnDemandRefreshCeilingTest(IdentityPostgresTestCase):
         当日计数会被这次写入悄悄清零，日上界因此形同虚设。
         """
 
-        from lingxi.core.identity.credentials import RefreshDailyLimitReached
+        from lingxi.core.identity.credentials import RefreshDailyLimitReachedError
 
         self._save(refresh_consumed_at=self.NOON, refresh_consumed_count=1)
-        claimed = self.vault.claim_due(for_supply=True, now=self.NOON + timedelta(hours=1), daily_limit=2)
+        claimed = self.vault.claim_due(
+            for_supply=True, now=self.NOON + timedelta(hours=1), daily_limit=2
+        )
         self.assertIsNotNone(claimed)
         self.assertEqual(claimed.refresh_consumed_count, 2)
 
         self.vault.save(
             subject_open_id=DELEGATED_SUBJECT,
-            grant=AuthorizationGrant(SecretToken("fake-next-token"), 7 * 24 * 3600, "offline_access"),
+            grant=AuthorizationGrant(
+                SecretToken("fake-next-token"), 7 * 24 * 3600, "offline_access"
+            ),
             replacing_generation=claimed.generation,
             expected_registered_subject_open_id=DELEGATED_SUBJECT,
             refresh_consumed_at=claimed.consumed_at,
             refresh_consumed_count=claimed.refresh_consumed_count,
         )
 
-        with self.assertRaises(RefreshDailyLimitReached) as raised:
+        with self.assertRaises(RefreshDailyLimitReachedError) as raised:
             # 当日上界仍是 2、已经用掉 2 次：第三次在同一天必须被挡住。
             self.vault.claim_due(for_supply=True, now=self.NOON + timedelta(hours=2), daily_limit=2)
         self.assertEqual(raised.exception.consumed_at, claimed.consumed_at)
@@ -769,7 +811,9 @@ class OnDemandRefreshCeilingTest(IdentityPostgresTestCase):
         # 故意漏传 refresh_consumed_count。
         self.vault.save(
             subject_open_id=DELEGATED_SUBJECT,
-            grant=AuthorizationGrant(SecretToken("fake-next-token"), 7 * 24 * 3600, "offline_access"),
+            grant=AuthorizationGrant(
+                SecretToken("fake-next-token"), 7 * 24 * 3600, "offline_access"
+            ),
             replacing_generation=claimed.generation,
             expected_registered_subject_open_id=DELEGATED_SUBJECT,
             refresh_consumed_at=claimed.consumed_at,
@@ -777,10 +821,14 @@ class OnDemandRefreshCeilingTest(IdentityPostgresTestCase):
 
         # 当日上界是 1、理应已经用满；但计数被上面那次 save() 悄悄清零，因此这里
         # 反而领得到——这正是"字段没串进 save()"这个坑的可观察后果。
-        reclaimed = self.vault.claim_due(for_supply=True, now=claimed.consumed_at + timedelta(hours=1), daily_limit=1)
+        reclaimed = self.vault.claim_due(
+            for_supply=True, now=claimed.consumed_at + timedelta(hours=1), daily_limit=1
+        )
         self.assertIsNotNone(reclaimed, "计数被悄悄清零，紧上界因此形同虚设")
 
-    def test_a_legacy_payload_without_the_count_field_is_treated_as_not_yet_consumed_today(self) -> None:
+    def test_a_legacy_payload_without_the_count_field_is_treated_as_not_yet_consumed_today(
+        self,
+    ) -> None:
         """向后兼容：不含 ``refresh_consumed_count`` 字段的旧凭据文件正常加载，且按
         "当日尚未消费"处理（Issue #276 之前落盘的凭据、以及 ``biai-stage`` 上现存的
         那一份真实凭据都是这个形状）。
@@ -791,7 +839,9 @@ class OnDemandRefreshCeilingTest(IdentityPostgresTestCase):
 
         self._save(refresh_consumed_at=self.NOON, refresh_consumed_count=None)
 
-        claimed = self.vault.claim_due(for_supply=True, now=self.NOON + timedelta(hours=1), daily_limit=1)
+        claimed = self.vault.claim_due(
+            for_supply=True, now=self.NOON + timedelta(hours=1), daily_limit=1
+        )
 
         self.assertIsNotNone(claimed, "缺失的计数字段必须按 0 处理，不能把日上界误判为已达")
         self.assertEqual(claimed.refresh_consumed_count, 1)
@@ -821,11 +871,13 @@ class CredentialGenerationGuardTest(IdentityPostgresTestCase):
         self._dir = tempfile.TemporaryDirectory()
         self.addCleanup(self._dir.cleanup)
         self.path = Path(self._dir.name) / "delegated-credential.enc"
-        self.vault = HostFileDelegatedCredentialVault(self._dsn, Fernet.generate_key().decode(), str(self.path))
+        self.vault = HostFileDelegatedCredentialVault(
+            self._dsn, Fernet.generate_key().decode(), str(self.path)
+        )
         self.vault.save(
             subject_open_id=DELEGATED_SUBJECT,
             grant=AuthorizationGrant(SecretToken(FAKE_TOKEN), 3600, ""),
-            issued_at=datetime.now(timezone.utc) - timedelta(seconds=3500),
+            issued_at=datetime.now(UTC) - timedelta(seconds=3500),
         )
 
     def test_a_reauthorization_between_claim_and_save_wins(self) -> None:
@@ -862,9 +914,7 @@ class CredentialGenerationGuardTest(IdentityPostgresTestCase):
     def test_a_subject_mismatch_between_file_and_registry_fails_closed(self) -> None:
         """终轮 Codex P1：登记指向 B、文件仍是 A 时，A 已在防线之外——
         清除文件并要求重新授权，绝不继续用 A 的凭据。"""
-        self.execute(
-            "UPDATE feishu_delegated_subject SET subject_open_id = 'ou_new_subject_b'"
-        )
+        self.execute("UPDATE feishu_delegated_subject SET subject_open_id = 'ou_new_subject_b'")
 
         with self.assertLogs("lingxi.adapters.delegated_credentials", level="ERROR") as captured:
             credential = self.vault.load()
@@ -888,7 +938,9 @@ class CredentialGenerationGuardTest(IdentityPostgresTestCase):
         )
 
         self.assertFalse(saved)
-        self.assertEqual(self.scalar("SELECT subject_open_id FROM feishu_delegated_subject"), changed_subject)
+        self.assertEqual(
+            self.scalar("SELECT subject_open_id FROM feishu_delegated_subject"), changed_subject
+        )
         self.assertFalse(self.path.exists())
 
 
@@ -915,7 +967,9 @@ class SubjectBootstrapCasTest(IdentityPostgresTestCase):
         self._dir = tempfile.TemporaryDirectory()
         self.addCleanup(self._dir.cleanup)
         self.path = Path(self._dir.name) / "delegated-credential.enc"
-        self.vault = HostFileDelegatedCredentialVault(self._dsn, Fernet.generate_key().decode(), str(self.path))
+        self.vault = HostFileDelegatedCredentialVault(
+            self._dsn, Fernet.generate_key().decode(), str(self.path)
+        )
 
     def _bootstrap(self, subject: str = DELEGATED_SUBJECT, *, token: str = FAKE_TOKEN) -> bool:
         return self.vault.save(
@@ -927,7 +981,9 @@ class SubjectBootstrapCasTest(IdentityPostgresTestCase):
     def test_an_empty_registry_accepts_exactly_one_bootstrap(self) -> None:
         self.assertTrue(self._bootstrap())
 
-        self.assertEqual(self.scalar("SELECT subject_open_id FROM feishu_delegated_subject"), DELEGATED_SUBJECT)
+        self.assertEqual(
+            self.scalar("SELECT subject_open_id FROM feishu_delegated_subject"), DELEGATED_SUBJECT
+        )
         self.assertEqual(self.scalar("SELECT count(*) FROM feishu_delegated_subject"), 1)
         credential = self.vault.load()
         assert credential is not None
@@ -940,11 +996,17 @@ class SubjectBootstrapCasTest(IdentityPostgresTestCase):
         second = self._bootstrap("ou_another_bootstrap_subject", token="fake-second-token")
 
         self.assertFalse(second)
-        self.assertEqual(self.scalar("SELECT subject_open_id FROM feishu_delegated_subject"), DELEGATED_SUBJECT)
-        self.assertEqual(self.scalar("SELECT configured_at FROM feishu_delegated_subject"), configured_at)
+        self.assertEqual(
+            self.scalar("SELECT subject_open_id FROM feishu_delegated_subject"), DELEGATED_SUBJECT
+        )
+        self.assertEqual(
+            self.scalar("SELECT configured_at FROM feishu_delegated_subject"), configured_at
+        )
         credential = self.vault.load()
         assert credential is not None
-        self.assertEqual(credential.grant.refresh_token.reveal(), FAKE_TOKEN, "被拒的首次建立不得改写凭据文件")
+        self.assertEqual(
+            credential.grant.refresh_token.reveal(), FAKE_TOKEN, "被拒的首次建立不得改写凭据文件"
+        )
 
     def test_bootstrapping_the_same_subject_twice_is_still_refused(self) -> None:
         self.assertTrue(self._bootstrap())
@@ -956,7 +1018,9 @@ class SubjectBootstrapCasTest(IdentityPostgresTestCase):
 
         renewed = self.vault.save(
             subject_open_id=DELEGATED_SUBJECT,
-            grant=AuthorizationGrant(SecretToken("fake-renewed-token"), 7 * 24 * 3600, "offline_access"),
+            grant=AuthorizationGrant(
+                SecretToken("fake-renewed-token"), 7 * 24 * 3600, "offline_access"
+            ),
             expected_registered_subject_open_id=DELEGATED_SUBJECT,
         )
 
@@ -1022,7 +1086,10 @@ class TriggerRaceSerializationTest(IdentityPostgresTestCase):
             def registry_writer() -> None:
                 started.set()
                 try:
-                    with connect(self._dsn) as connection_two, connection_two.cursor() as cursor_two:
+                    with (
+                        connect(self._dsn) as connection_two,
+                        connection_two.cursor() as cursor_two,
+                    ):
                         cursor_two.execute(
                             "INSERT INTO feishu_delegated_subject (purpose, subject_open_id) "
                             "VALUES ('org_directory_sync', 'ou_race_subject')"
@@ -1058,15 +1125,21 @@ class SnapshotCommitOrderingTest(IdentityPostgresTestCase):
         """两轮同步重叠时，后提交但**更早启动**的那轮不得取代更新的数据；
         started_at 经 commit_batch 参数按同步真实开始时刻传入。"""
         store = self._store()
-        now = datetime.now(timezone.utc)
+        now = datetime.now(UTC)
         newer = store.commit_batch(batch((member(),)), source_app_id="cli_fake", started_at=now)
 
         older = store.commit_batch(
             batch((member(),)), source_app_id="cli_fake", started_at=now - timedelta(hours=1)
         )
 
-        self.assertEqual(self.scalar("SELECT status FROM feishu_org_sync_run WHERE id = %s", (newer,)), "complete")
-        self.assertEqual(self.scalar("SELECT status FROM feishu_org_sync_run WHERE id = %s", (older,)), "superseded")
+        self.assertEqual(
+            self.scalar("SELECT status FROM feishu_org_sync_run WHERE id = %s", (newer,)),
+            "complete",
+        )
+        self.assertEqual(
+            self.scalar("SELECT status FROM feishu_org_sync_run WHERE id = %s", (older,)),
+            "superseded",
+        )
 
 
 class OrgSnapshotTest(IdentityPostgresTestCase):
@@ -1081,7 +1154,10 @@ class OrgSnapshotTest(IdentityPostgresTestCase):
     def test_a_complete_batch_is_written_in_one_go(self) -> None:
         run_id = self.store.commit_batch(batch((member(),)), source_app_id="cli_fake")
 
-        self.assertEqual(self.scalar("SELECT status FROM feishu_org_sync_run WHERE id = %s", (run_id,)), "complete")
+        self.assertEqual(
+            self.scalar("SELECT status FROM feishu_org_sync_run WHERE id = %s", (run_id,)),
+            "complete",
+        )
         self.assertEqual(self.scalar("SELECT count(*) FROM feishu_org_member_snapshot"), 1)
         self.assertEqual(self.scalar("SELECT count(*) FROM feishu_org_tenant_snapshot"), 1)
         self.assertEqual(self.scalar("SELECT count(*) FROM feishu_org_department_snapshot"), 1)
@@ -1094,7 +1170,9 @@ class OrgSnapshotTest(IdentityPostgresTestCase):
 
         self.assertEqual(self.scalar("SELECT count(*) FROM feishu_org_member_snapshot"), 0)
         self.assertEqual(self.scalar("SELECT count(*) FROM feishu_org_tenant_snapshot"), 0)
-        self.assertEqual(self.scalar("SELECT count(*) FROM feishu_org_sync_run WHERE status = 'complete'"), 0)
+        self.assertEqual(
+            self.scalar("SELECT count(*) FROM feishu_org_sync_run WHERE status = 'complete'"), 0
+        )
         self.assertEqual(self.scalar("SELECT status FROM feishu_org_sync_run"), "failed")
 
     def test_a_failed_batch_never_becomes_the_source_of_a_location(self) -> None:
@@ -1142,9 +1220,7 @@ class OrgSnapshotTest(IdentityPostgresTestCase):
 
         lookup = self.store.lookup_by_user_id("user_zhang")
 
-        self.assertEqual(
-            sorted(m.open_id for m in lookup.members), ["ou_zhang", "ou_zhang_2"]
-        )
+        self.assertEqual(sorted(m.open_id for m in lookup.members), ["ou_zhang", "ou_zhang_2"])
 
     def test_a_failed_batch_is_never_the_source_of_a_user_id_lookup_either(self) -> None:
         with self.assertRaises(SnapshotIntegrityError):
@@ -1179,7 +1255,9 @@ class OrgSnapshotTest(IdentityPostgresTestCase):
         )[0]
         self.assertEqual(expires_at - started_at, timedelta(hours=2160))
 
-        self.execute("UPDATE feishu_org_sync_run SET expires_at = now() + interval '900 days' WHERE id = 'orgsync_expiry'")
+        self.execute(
+            "UPDATE feishu_org_sync_run SET expires_at = now() + interval '900 days' WHERE id = 'orgsync_expiry'"
+        )
         started_at, expires_at = self.query(
             "SELECT started_at, expires_at FROM feishu_org_sync_run WHERE id = 'orgsync_expiry'"
         )[0]
@@ -1196,7 +1274,14 @@ class OrgSnapshotTest(IdentityPostgresTestCase):
             )
         }
 
-        for forbidden in ("status", "is_activated", "is_exited", "is_frozen", "is_resigned", "is_unjoin"):
+        for forbidden in (
+            "status",
+            "is_activated",
+            "is_exited",
+            "is_frozen",
+            "is_resigned",
+            "is_unjoin",
+        ):
             with self.subTest(column=forbidden):
                 self.assertNotIn(forbidden, columns)
 
@@ -1207,14 +1292,24 @@ class OrgSnapshotTest(IdentityPostgresTestCase):
         )
         for column in ("open_id", "user_id", "union_id", "display_name"):
             with self.subTest(column=column):
-                values = {"open_id": "ou_x", "user_id": "user_x", "union_id": "union_x", "display_name": "张一"}
+                values = {
+                    "open_id": "ou_x",
+                    "user_id": "user_x",
+                    "union_id": "union_x",
+                    "display_name": "张一",
+                }
                 values[column] = "   "
                 with self.assertRaises(self._psycopg.errors.CheckViolation):
                     self.execute(
                         "INSERT INTO feishu_org_member_snapshot "
                         "(id, sync_run_id, tenant_key, member_key, open_id, user_id, union_id, display_name) "
                         "VALUES ('member_x', 'orgsync_guard', 'tenant_a', 'ou_x', %s, %s, %s, %s)",
-                        (values["open_id"], values["user_id"], values["union_id"], values["display_name"]),
+                        (
+                            values["open_id"],
+                            values["user_id"],
+                            values["union_id"],
+                            values["display_name"],
+                        ),
                     )
 
     def test_lookup_returns_the_member_of_the_latest_complete_batch_only(self) -> None:
@@ -1232,7 +1327,7 @@ class OrgSnapshotTest(IdentityPostgresTestCase):
         self.store.commit_batch(
             batch((member(),)),
             source_app_id="cli_fake",
-            started_at=datetime.now(timezone.utc) - timedelta(days=91),
+            started_at=datetime.now(UTC) - timedelta(days=91),
         )
 
         lookup = self.store.lookup("ou_zhang")
@@ -1250,7 +1345,7 @@ class OrgSnapshotTest(IdentityPostgresTestCase):
         """F8：当日水位必须能对进程重启保持——真库上验证 ``has_complete_run_on``
         只认 ``started_at`` 落在查询那个 UTC 日历日、且状态是 ``complete`` 的批次。"""
 
-        today = datetime.now(timezone.utc)
+        today = datetime.now(UTC)
         self.assertFalse(self.store.has_complete_run_on(today.date()), "还没提交过任何批次")
 
         self.store.commit_batch(batch((member(),)), source_app_id="cli_fake", started_at=today)
@@ -1266,7 +1361,7 @@ class OrgSnapshotTest(IdentityPostgresTestCase):
             self.store.commit_batch(batch((member(open_id="  "),)), source_app_id="cli_fake")
 
         self.assertFalse(
-            self.store.has_complete_run_on(datetime.now(timezone.utc).date()),
+            self.store.has_complete_run_on(datetime.now(UTC).date()),
             "失败批次不能让水位查询误判成“今天已经成功过一轮”",
         )
 
@@ -1287,7 +1382,13 @@ class AppUserRecordTest(IdentityPostgresTestCase):
         decision = decide_first_contact(
             open_id=candidate.open_id,
             location=located,
-            employment=EmploymentStatus(is_activated=True, is_exited=False, is_frozen=False, is_resigned=False, is_unjoin=False),
+            employment=EmploymentStatus(
+                is_activated=True,
+                is_exited=False,
+                is_frozen=False,
+                is_resigned=False,
+                is_unjoin=False,
+            ),
             directory=DirectoryAvailability.AVAILABLE,
             delegated_subject_open_id=DELEGATED_SUBJECT,
         )
@@ -1321,10 +1422,14 @@ class AppUserRecordTest(IdentityPostgresTestCase):
         written = self.users.record_identity(draft)
         loaded = self.users.get_by_open_id(draft.feishu_open_id)
 
-        self.assertEqual((written.employee_no, written.email), ("00080001", "Roster.User@Example-Corp.invalid"))
+        self.assertEqual(
+            (written.employee_no, written.email), ("00080001", "Roster.User@Example-Corp.invalid")
+        )
         self.assertIsNotNone(loaded)
         assert loaded is not None
-        self.assertEqual((loaded.employee_no, loaded.email), ("00080001", "Roster.User@Example-Corp.invalid"))
+        self.assertEqual(
+            (loaded.employee_no, loaded.email), ("00080001", "Roster.User@Example-Corp.invalid")
+        )
         self.assertEqual(
             self.query(
                 "SELECT column_name FROM information_schema.columns "
@@ -1359,7 +1464,9 @@ class AppUserRecordTest(IdentityPostgresTestCase):
         self.assertIsNotNone(loaded)
         assert loaded is not None
         self.assertEqual(len(baseline), 1)
-        self.assertEqual(stored, [(draft.display_name, "00080002", "baseline.user@example-corp.invalid")])
+        self.assertEqual(
+            stored, [(draft.display_name, "00080002", "baseline.user@example-corp.invalid")]
+        )
         self.assertTrue(all(stored[0]), "日报基线不得把建档工号或邮箱静默读成空值")
         self.assertEqual(
             (baseline[0].display_name, baseline[0].employee_no, baseline[0].email),
@@ -1395,13 +1502,17 @@ class AppUserRecordTest(IdentityPostgresTestCase):
             FOR EACH ROW EXECUTE FUNCTION {function_name}();"""
         )
 
-        draft = dataclasses.replace(self._draft(), employee_no="00080003", email="blank.field@example.invalid")
+        draft = dataclasses.replace(
+            self._draft(), employee_no="00080003", email="blank.field@example.invalid"
+        )
         with self.assertRaises(IdentityStorageIntegrityError) as raised:
             self.users.record_identity(draft)
 
         self.assertIn("employee_no", str(raised.exception))
         self.assertEqual(
-            self.scalar("SELECT count(*) FROM app_user WHERE feishu_open_id = %s", (draft.feishu_open_id,)),
+            self.scalar(
+                "SELECT count(*) FROM app_user WHERE feishu_open_id = %s", (draft.feishu_open_id,)
+            ),
             0,
         )
 
@@ -1433,13 +1544,17 @@ class AppUserRecordTest(IdentityPostgresTestCase):
             FOR EACH ROW EXECUTE FUNCTION {function_name}();"""
         )
 
-        draft = dataclasses.replace(self._draft(), employee_no="00080004", email="Rewrite.Field@Example.invalid")
+        draft = dataclasses.replace(
+            self._draft(), employee_no="00080004", email="Rewrite.Field@Example.invalid"
+        )
         with self.assertRaises(IdentityStorageIntegrityError) as raised:
             self.users.record_identity(draft)
 
         self.assertIn("email", str(raised.exception))
         self.assertEqual(
-            self.scalar("SELECT count(*) FROM app_user WHERE feishu_open_id = %s", (draft.feishu_open_id,)),
+            self.scalar(
+                "SELECT count(*) FROM app_user WHERE feishu_open_id = %s", (draft.feishu_open_id,)
+            ),
             0,
         )
 
@@ -1533,7 +1648,9 @@ class AppUserRecordTest(IdentityPostgresTestCase):
 
     def test_recording_again_never_touches_the_permission_record(self) -> None:
         self.users.record_identity(self._draft())
-        self.execute("UPDATE app_user SET permission_record_id = 'rec_matched', permission_version = 3")
+        self.execute(
+            "UPDATE app_user SET permission_record_id = 'rec_matched', permission_version = 3"
+        )
 
         self.users.record_identity(self._draft())
 
@@ -1580,27 +1697,49 @@ class AppUserRecordTest(IdentityPostgresTestCase):
                     self.execute(
                         "INSERT INTO app_user (id, feishu_open_id, feishu_user_id, feishu_union_id, display_name, tenant_key) "
                         "VALUES ('usr_partial', 'ou_partial', %s, %s, %s, %s)",
-                        (values["feishu_user_id"], values["feishu_union_id"], values["display_name"], values["tenant_key"]),
+                        (
+                            values["feishu_user_id"],
+                            values["feishu_union_id"],
+                            values["display_name"],
+                            values["tenant_key"],
+                        ),
                     )
         self.assertEqual(self.users.count(), 0)
 
     def test_the_user_record_has_no_employment_status_column(self) -> None:
         columns = {
             name
-            for (name,) in self.query("SELECT column_name FROM information_schema.columns WHERE table_name = 'app_user'")
+            for (name,) in self.query(
+                "SELECT column_name FROM information_schema.columns WHERE table_name = 'app_user'"
+            )
         }
 
-        for forbidden in ("status", "is_activated", "is_exited", "is_frozen", "is_resigned", "is_unjoin", "employment_status"):
+        for forbidden in (
+            "status",
+            "is_activated",
+            "is_exited",
+            "is_frozen",
+            "is_resigned",
+            "is_unjoin",
+            "employment_status",
+        ):
             with self.subTest(column=forbidden):
                 self.assertNotIn(forbidden, columns)
 
     def test_the_user_record_has_no_credential_column(self) -> None:
         columns = {
             name
-            for (name,) in self.query("SELECT column_name FROM information_schema.columns WHERE table_name = 'app_user'")
+            for (name,) in self.query(
+                "SELECT column_name FROM information_schema.columns WHERE table_name = 'app_user'"
+            )
         }
 
-        for forbidden in ("refresh_token", "access_token", "encrypted_refresh_token", "authorization_code"):
+        for forbidden in (
+            "refresh_token",
+            "access_token",
+            "encrypted_refresh_token",
+            "authorization_code",
+        ):
             with self.subTest(column=forbidden):
                 self.assertNotIn(forbidden, columns)
 
@@ -1608,7 +1747,13 @@ class AppUserRecordTest(IdentityPostgresTestCase):
         """硬约束 3：姓名不是唯一键。"""
         self.users.record_identity(self._draft(display_name="张三"))
         self.users.record_identity(
-            self._draft(open_id="ou_second", member_key="ou_second", user_id="user_second", union_id="union_second", display_name="张三")
+            self._draft(
+                open_id="ou_second",
+                member_key="ou_second",
+                user_id="user_second",
+                union_id="union_second",
+                display_name="张三",
+            )
         )
 
         self.assertEqual(self.users.count(), 2)
@@ -1616,7 +1761,9 @@ class AppUserRecordTest(IdentityPostgresTestCase):
 
     def test_a_latin_only_name_is_recorded_unchanged(self) -> None:
         """V-开通-08。"""
-        self.users.record_identity(self._draft(display_name="Alice Smith", display_name_locale="en-US"))
+        self.users.record_identity(
+            self._draft(display_name="Alice Smith", display_name_locale="en-US")
+        )
 
         self.assertEqual(self.scalar("SELECT display_name FROM app_user"), "Alice Smith")
         self.assertEqual(self.scalar("SELECT display_name_locale FROM app_user"), "en-US")
@@ -1643,7 +1790,13 @@ class AppUserProvisioningContractTest(IdentityPostgresTestCase):
         decision = decide_first_contact(
             open_id=candidate.open_id,
             location=located,
-            employment=EmploymentStatus(is_activated=True, is_exited=False, is_frozen=False, is_resigned=False, is_unjoin=False),
+            employment=EmploymentStatus(
+                is_activated=True,
+                is_exited=False,
+                is_frozen=False,
+                is_resigned=False,
+                is_unjoin=False,
+            ),
             directory=DirectoryAvailability.AVAILABLE,
             delegated_subject_open_id=DELEGATED_SUBJECT,
         )
@@ -1740,7 +1893,9 @@ class AppUserProvisioningContractTest(IdentityPostgresTestCase):
 
         self.assertIs(again.outcome, ProvisioningOutcome.ALREADY_PROVISIONED)
         self.assertEqual(
-            self.query("SELECT provisioning_state, permission_record_id, permission_version FROM app_user"),
+            self.query(
+                "SELECT provisioning_state, permission_record_id, permission_version FROM app_user"
+            ),
             [("mcp_syncing", "rec_matched", 3)],
         )
 
@@ -1774,16 +1929,22 @@ class AppUserProvisioningContractTest(IdentityPostgresTestCase):
 
         self.assertTrue(result.provisioned)
         assert loaded is not None
-        self.assertEqual((loaded.employee_no, loaded.email), ("00080001", "Roster.User@Example-Corp.invalid"))
         self.assertEqual(
-            self.query("SELECT employee_no, email FROM app_user WHERE id = %s", (result.app_user_id,)),
+            (loaded.employee_no, loaded.email), ("00080001", "Roster.User@Example-Corp.invalid")
+        )
+        self.assertEqual(
+            self.query(
+                "SELECT employee_no, email FROM app_user WHERE id = %s", (result.app_user_id,)
+            ),
             [("00080001", "Roster.User@Example-Corp.invalid")],
         )
 
     def test_provisioning_never_writes_a_permission_record(self) -> None:
         """V-开通-01：匹配确认前不占位再回填。"""
 
-        self.users.provision(ProvisioningRequest.from_roster_row(self._identity(), self._roster_row()))
+        self.users.provision(
+            ProvisioningRequest.from_roster_row(self._identity(), self._roster_row())
+        )
 
         self.assertIsNone(self.scalar("SELECT permission_record_id FROM app_user"))
         self.assertEqual(self.scalar("SELECT permission_version FROM app_user"), 0)
@@ -1791,7 +1952,13 @@ class AppUserProvisioningContractTest(IdentityPostgresTestCase):
     def test_an_incomplete_identity_is_refused_by_the_database_and_leaves_no_row(self) -> None:
         """V-开通-06：残缺资料由数据库的「全有或全无」CHECK 拒绝，写侧不短路它。"""
 
-        for field in ("feishu_user_id", "feishu_union_id", "display_name", "department", "tenant_key"):
+        for field in (
+            "feishu_user_id",
+            "feishu_union_id",
+            "display_name",
+            "department",
+            "tenant_key",
+        ):
             with self.subTest(field=field):
                 request = ProvisioningRequest(
                     dataclasses.replace(self._identity(), **{field: "   "})
@@ -1867,7 +2034,9 @@ class AppUserProvisioningContractTest(IdentityPostgresTestCase):
     def test_a_dropped_roster_field_is_reported_as_a_storage_fault(self) -> None:
         """V-开通-15：库把工号吞了要走内部故障出口，不能显示成「没有银河权限」。"""
 
-        self._breaking_trigger("test_i89_provision_drop_employee_no", "NEW.employee_no := NULL; RETURN NEW;")
+        self._breaking_trigger(
+            "test_i89_provision_drop_employee_no", "NEW.employee_no := NULL; RETURN NEW;"
+        )
         request = ProvisioningRequest.from_roster_row(self._identity(), self._roster_row())
 
         result = self.users.provision(request)
@@ -1927,7 +2096,11 @@ class ProvisioningStateAdvanceTest(IdentityPostgresTestCase):
             open_id=candidate.open_id,
             location=located,
             employment=EmploymentStatus(
-                is_activated=True, is_exited=False, is_frozen=False, is_resigned=False, is_unjoin=False
+                is_activated=True,
+                is_exited=False,
+                is_frozen=False,
+                is_resigned=False,
+                is_unjoin=False,
             ),
             directory=DirectoryAvailability.AVAILABLE,
             delegated_subject_open_id=DELEGATED_SUBJECT,
@@ -2007,7 +2180,9 @@ class ProvisioningStateAdvanceTest(IdentityPostgresTestCase):
         """空写不能留下一个"这次开通从现在开始"的假事实。"""
 
         self.users.advance_provisioning_state(self.user_id, to="active")
-        self.execute("UPDATE app_user SET provisioning_started_at = NULL WHERE id = %s", (self.user_id,))
+        self.execute(
+            "UPDATE app_user SET provisioning_started_at = NULL WHERE id = %s", (self.user_id,)
+        )
 
         self.assertFalse(self.users.advance_provisioning_state(self.user_id, to="provisioning"))
         self.assertIsNone(self._started_at())
@@ -2030,7 +2205,9 @@ class ProvisioningStateAdvanceTest(IdentityPostgresTestCase):
         )
 
     def _open_id(self) -> str:
-        return str(self.scalar("SELECT feishu_open_id FROM app_user WHERE id = %s", (self.user_id,)))
+        return str(
+            self.scalar("SELECT feishu_open_id FROM app_user WHERE id = %s", (self.user_id,))
+        )
 
     def test_the_first_chat_line_is_armed_once(self) -> None:
         self.assertTrue(self.users.mark_preprovision_notice_pending(open_id=self._open_id()))
@@ -2080,7 +2257,11 @@ class StalledProvisioningAbortTest(IdentityPostgresTestCase):
             open_id=candidate.open_id,
             location=located,
             employment=EmploymentStatus(
-                is_activated=True, is_exited=False, is_frozen=False, is_resigned=False, is_unjoin=False
+                is_activated=True,
+                is_exited=False,
+                is_frozen=False,
+                is_resigned=False,
+                is_unjoin=False,
             ),
             directory=DirectoryAvailability.AVAILABLE,
             delegated_subject_open_id=DELEGATED_SUBJECT,
@@ -2252,7 +2433,9 @@ class FirstContactThroughPostgresTest(IdentityPostgresTestCase):
 
     def test_an_employed_member_gets_exactly_one_record_however_many_times_they_write(self) -> None:
         self.snapshots.commit_batch(batch((member(),)), source_app_id="cli_fake")
-        employed = EmploymentStatus(is_activated=True, is_exited=False, is_frozen=False, is_resigned=False, is_unjoin=False)
+        employed = EmploymentStatus(
+            is_activated=True, is_exited=False, is_frozen=False, is_resigned=False, is_unjoin=False
+        )
 
         for _ in range(3):
             decision = self._handle("ou_zhang", employed)
@@ -2262,7 +2445,9 @@ class FirstContactThroughPostgresTest(IdentityPostgresTestCase):
 
     def test_a_frozen_member_is_refused_and_nothing_is_written(self) -> None:
         self.snapshots.commit_batch(batch((member(),)), source_app_id="cli_fake")
-        frozen = EmploymentStatus(is_activated=True, is_exited=False, is_frozen=True, is_resigned=False, is_unjoin=False)
+        frozen = EmploymentStatus(
+            is_activated=True, is_exited=False, is_frozen=True, is_resigned=False, is_unjoin=False
+        )
 
         decision = self._handle("ou_zhang", frozen)
 
@@ -2271,16 +2456,22 @@ class FirstContactThroughPostgresTest(IdentityPostgresTestCase):
 
     def test_an_unlocatable_sender_is_not_authorized_and_nothing_is_written(self) -> None:
         self.snapshots.commit_batch(batch((member(),)), source_app_id="cli_fake")
-        employed = EmploymentStatus(is_activated=True, is_exited=False, is_frozen=False, is_resigned=False, is_unjoin=False)
+        employed = EmploymentStatus(
+            is_activated=True, is_exited=False, is_frozen=False, is_resigned=False, is_unjoin=False
+        )
 
         decision = self._handle("ou_absent", employed)
 
         self.assertIs(decision.outcome, FirstContactOutcome.NOT_AUTHORIZED)
         self.assertEqual(self.users.count(), 0)
 
-    def test_without_any_snapshot_the_sender_gets_a_terminal_state_and_nothing_is_written(self) -> None:
+    def test_without_any_snapshot_the_sender_gets_a_terminal_state_and_nothing_is_written(
+        self,
+    ) -> None:
         """V-身份-04 的库侧一半：专用授权失效 → 没有可用快照 → 不写半条资料。"""
-        employed = EmploymentStatus(is_activated=True, is_exited=False, is_frozen=False, is_resigned=False, is_unjoin=False)
+        employed = EmploymentStatus(
+            is_activated=True, is_exited=False, is_frozen=False, is_resigned=False, is_unjoin=False
+        )
 
         decision = self._handle("ou_zhang", employed)
 
@@ -2288,9 +2479,17 @@ class FirstContactThroughPostgresTest(IdentityPostgresTestCase):
         self.assertEqual(self.users.count(), 0)
 
     def test_the_delegated_subject_never_gets_a_record_even_if_it_is_in_the_snapshot(self) -> None:
-        subject = member(member_key=DELEGATED_SUBJECT, open_id=DELEGATED_SUBJECT, user_id="user_delegated", union_id="union_delegated", display_name="专用授权账号")
+        subject = member(
+            member_key=DELEGATED_SUBJECT,
+            open_id=DELEGATED_SUBJECT,
+            user_id="user_delegated",
+            union_id="union_delegated",
+            display_name="专用授权账号",
+        )
         self.snapshots.commit_batch(batch((member(), subject)), source_app_id="cli_fake")
-        employed = EmploymentStatus(is_activated=True, is_exited=False, is_frozen=False, is_resigned=False, is_unjoin=False)
+        employed = EmploymentStatus(
+            is_activated=True, is_exited=False, is_frozen=False, is_resigned=False, is_unjoin=False
+        )
 
         decision = self._handle(DELEGATED_SUBJECT, employed)
 
@@ -2374,7 +2573,9 @@ class AppUserEmailBindingTest(IdentityPostgresTestCase):
 
         bound = self.bindings.bindings_for_email(self.NORMALIZED)
 
-        self.assertEqual([(item.user_id, item.feishu_open_id) for item in bound], [("usr_first", "ou_first")])
+        self.assertEqual(
+            [(item.user_id, item.feishu_open_id) for item in bound], [("usr_first", "ou_first")]
+        )
         self.assertEqual(self.bindings.bindings_for_email("nobody@example-corp.invalid"), ())
         self.assertEqual(self.bindings.bindings_for_email(""), ())
 
@@ -2395,10 +2596,11 @@ class AppUserEmailBindingTest(IdentityPostgresTestCase):
         零新增行、``publish_outbox`` 零行。
         """
 
+        from test_onboarding_runner import OPEN_ID, ROSTER_ROWS, FakeRoster, run_once
+
         from lingxi.adapters.postgres_email_binding import PostgresEmailBindingSource
         from lingxi.adapters.postgres_identity import PostgresAppUserStore
         from lingxi.adapters.postgres_permission_publish import PostgresPermissionPublishStore
-        from test_onboarding_runner import OPEN_ID, ROSTER_ROWS, FakeRoster, run_once
 
         roster_email = ROSTER_ROWS[0]["email"]
         self._insert("usr_incumbent", "ou_someone_else", roster_email)

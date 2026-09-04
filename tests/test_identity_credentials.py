@@ -16,7 +16,7 @@ import importlib.util
 import logging
 import tempfile
 import unittest
-from datetime import date, datetime, timedelta, timezone
+from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 
 from lingxi.core.identity.credentials import (
@@ -30,7 +30,6 @@ from lingxi.core.identity.credentials import (
     expiry_moment,
     rotation_deadline,
 )
-
 
 FAKE_TOKEN = "fake-refresh-token-for-tests-only"
 
@@ -76,7 +75,7 @@ class RotationDeadlineTest(unittest.TestCase):
     """轮换点跟着飞书返回的有效期走，不写死周期。"""
 
     def setUp(self) -> None:
-        self.issued_at = datetime(2026, 8, 5, 3, 0, tzinfo=timezone.utc)
+        self.issued_at = datetime(2026, 8, 5, 3, 0, tzinfo=UTC)
 
     def test_rotation_is_scheduled_at_eighty_percent_of_the_returned_lifetime(self) -> None:
         seven_days = 7 * 24 * 3600
@@ -109,17 +108,24 @@ class RotationDeadlineTest(unittest.TestCase):
 
 class CredentialStateTest(unittest.TestCase):
     def setUp(self) -> None:
-        self.now = datetime(2026, 8, 5, 3, 0, tzinfo=timezone.utc)
+        self.now = datetime(2026, 8, 5, 3, 0, tzinfo=UTC)
 
     def test_states_are_derived_from_the_two_stored_moments(self) -> None:
         cases = (
             (self.now + timedelta(hours=1), self.now + timedelta(days=7), CredentialState.ACTIVE),
             (self.now - timedelta(seconds=1), self.now + timedelta(days=7), CredentialState.DUE),
-            (self.now - timedelta(days=8), self.now - timedelta(seconds=1), CredentialState.EXPIRED),
+            (
+                self.now - timedelta(days=8),
+                self.now - timedelta(seconds=1),
+                CredentialState.EXPIRED,
+            ),
         )
         for refresh_at, expires_at, expected in cases:
             with self.subTest(expected=expected):
-                self.assertIs(credential_state(refresh_at=refresh_at, expires_at=expires_at, now=self.now), expected)
+                self.assertIs(
+                    credential_state(refresh_at=refresh_at, expires_at=expires_at, now=self.now),
+                    expected,
+                )
 
     def test_expired_wins_over_due_so_a_dead_credential_is_never_replayed(self) -> None:
         state = credential_state(
@@ -146,7 +152,10 @@ class RefreshOutcomeTest(unittest.TestCase):
         # refresh_token 一次性有效：新增一个未处理的结果分支绝不能默认成「保留」。
         for outcome in RefreshOutcome:
             with self.subTest(outcome=outcome):
-                self.assertIn(decide_after_refresh(outcome), (CredentialAction.ROTATE, CredentialAction.REVOKE))
+                self.assertIn(
+                    decide_after_refresh(outcome),
+                    (CredentialAction.ROTATE, CredentialAction.REVOKE),
+                )
 
 
 @unittest.skipUnless(
@@ -233,7 +242,6 @@ class VaultSaveArgumentGuardTest(unittest.TestCase):
         self.assertFalse(path.exists(), "被拒的保存不得写入密文")
         self.assertFalse(path.with_name(path.name + ".lock").exists(), "守卫应在取文件锁之前就拒绝")
 
-
     def test_no_parameter_can_relax_the_due_check_without_the_rate_ceilings(self) -> None:
         """收口轮 P2-a、Issue #276 延伸：``for_supply`` 把三件事**捆死**，没有任何参数
         能把它们拆开。
@@ -294,7 +302,7 @@ class UndecryptableCredentialFileTest(unittest.TestCase):
         return Fernet(key.encode()).encrypt(json.dumps(payload).encode())
 
     def _valid_payload(self) -> dict:
-        moment = datetime.now(timezone.utc)
+        moment = datetime.now(UTC)
         return {
             "generation": "01JCREDENTIALGENERATION0001",
             "subject_open_id": "ou_delegated_authorization_subject",
@@ -325,7 +333,7 @@ class UndecryptableCredentialFileTest(unittest.TestCase):
         self.assertEqual(path.read_bytes(), ciphertext, "密文必须字节不变")
 
     def test_the_right_key_still_reads_the_same_file_afterwards(self) -> None:
-        """"留着"的意义在于可恢复：密钥换回来，同一份文件照常可用。"""
+        """ "留着"的意义在于可恢复：密钥换回来，同一份文件照常可用。"""
 
         from cryptography.fernet import Fernet
 

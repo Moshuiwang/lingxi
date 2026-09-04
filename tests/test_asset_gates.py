@@ -8,9 +8,8 @@ import subprocess
 import sys
 import tempfile
 import unittest
-from unittest import mock
 from pathlib import Path
-
+from unittest import mock
 
 ROOT = Path(__file__).parents[1]
 
@@ -44,16 +43,12 @@ class AssetClassificationTest(unittest.TestCase):
 
         # Issue #520 F2：L1 轻量档已停用，只改内容资产也走完整门禁；l1_changed 仍为真，
         # 完整门禁里的 L1 资产检查照常执行。
-        l1 = CLASSIFIER.classify_detail(
-            ["src/lingxi/config/content.toml", "docs/文案说明.md"]
-        )
+        l1 = CLASSIFIER.classify_detail(["src/lingxi/config/content.toml", "docs/文案说明.md"])
         self.assertEqual((l1.mode, l1.risk_level), ("full", "full"))
         self.assertTrue(l1.docs_changed)
         self.assertTrue(l1.l1_changed)
 
-        l3 = CLASSIFIER.classify_detail(
-            ["src/lingxi/config/company_function_metric_map.toml"]
-        )
+        l3 = CLASSIFIER.classify_detail(["src/lingxi/config/company_function_metric_map.toml"])
         self.assertEqual((l3.mode, l3.risk_level), ("full", "l3"))
         self.assertTrue(l3.l3_changed)
 
@@ -101,9 +96,7 @@ class AssetClassificationTest(unittest.TestCase):
         self.assertTrue(detail.l1_changed)
 
     def test_docs_mixed_with_l1_keeps_l1_flag_and_sets_docs_gate_flag(self) -> None:
-        detail = CLASSIFIER.classify_detail(
-            ["docs/文案说明.md", "src/lingxi/config/content.toml"]
-        )
+        detail = CLASSIFIER.classify_detail(["docs/文案说明.md", "src/lingxi/config/content.toml"])
         # 轻量档停用后走完整门禁；两个事实位都必须仍然为真，否则文档门禁或 L1
         # 资产检查会被静默跳过。
         self.assertEqual((detail.mode, detail.risk_level), ("full", "full"))
@@ -181,6 +174,15 @@ class AssetClassificationTest(unittest.TestCase):
         # scripts/ci/ 的数据文件豁免同样是精确路径：同名文件放在别处不得继承豁免。
         detail = CLASSIFIER.classify_detail(["scripts/ci/nested/size_ratchet_baseline.txt"])
         self.assertEqual((detail.mode, detail.risk_level), ("full", "full"))
+
+        # 两条新棘轮基线同样只精确豁免登记的路径本身。
+        for nested_path in (
+            "scripts/ci/nested/function_size_ratchet_baseline.txt",
+            "scripts/ci/nested/comment_ratchet_baseline.txt",
+        ):
+            with self.subTest(path=nested_path):
+                detail = CLASSIFIER.classify_detail([nested_path])
+                self.assertEqual((detail.mode, detail.risk_level), ("full", "full"))
 
     def test_reserved_l2_extension_is_not_implemented_as_a_light_gate(self) -> None:
         original = CLASSIFIER.L2_FILES
@@ -275,7 +277,10 @@ class L1GateTest(unittest.TestCase):
             '[aliases]\n"别名" = "sub_count"\n',
         )
         failures = self._run(paths)
-        self.assertTrue(any("文案变了" in failure or "整体摘要不符" in failure for failure in failures), failures)
+        self.assertTrue(
+            any("文案变了" in failure or "整体摘要不符" in failure for failure in failures),
+            failures,
+        )
 
     def test_missing_content_key_is_rejected_even_after_version_bump_and_refresh(self) -> None:
         """Issue #520 F1-E1：删一条文案键 + 递增版本 + 刷新锁，此前全绿而运行时会崩。
@@ -334,8 +339,7 @@ class L1GateTest(unittest.TestCase):
         for body, expected in (
             ("REQUIRED_CARD_KEYS = ('main',)\n", "REQUIRED_TEXT_KEYS"),
             (
-                "REQUIRED_TEXT_KEYS = tuple(sorted(_KEYS))\n"
-                "REQUIRED_CARD_KEYS = ('main',)\n",
+                "REQUIRED_TEXT_KEYS = tuple(sorted(_KEYS))\nREQUIRED_CARD_KEYS = ('main',)\n",
                 "REQUIRED_TEXT_KEYS",
             ),
         ):
@@ -413,9 +417,7 @@ class L1GateTest(unittest.TestCase):
                 paths = self._registration_paths()
                 paths[5].write_text(body, encoding="utf-8")
                 failures = self._run(paths)
-                self.assertTrue(
-                    [f for f in failures if "REQUIRED_TEXT_KEYS" in f], failures
-                )
+                self.assertTrue([f for f in failures if "REQUIRED_TEXT_KEYS" in f], failures)
 
     def test_registration_declared_only_inside_a_branch_is_rejected(self) -> None:
         """唯一那次绑定不在模块顶层时，门禁不能把它当成可静态确定的登记表。"""
@@ -430,9 +432,7 @@ class L1GateTest(unittest.TestCase):
         failures = self._run(paths)
         key_failures = [f for f in failures if "REQUIRED_TEXT_KEYS" in f]
         self.assertTrue(key_failures, failures)
-        self.assertTrue(
-            any("不是模块顶层的直接赋值" in f for f in key_failures), key_failures
-        )
+        self.assertTrue(any("不是模块顶层的直接赋值" in f for f in key_failures), key_failures)
 
     def test_l1_gate_does_not_import_the_business_package(self) -> None:
         """键集合检查必须是纯 stdlib 静态读取：门禁不导入 lingxi（Issue #520 F1）。
@@ -443,9 +443,7 @@ class L1GateTest(unittest.TestCase):
 
         import ast as _ast
 
-        tree = _ast.parse(
-            (ROOT / "scripts/ci/check_l1_assets.py").read_text(encoding="utf-8")
-        )
+        tree = _ast.parse((ROOT / "scripts/ci/check_l1_assets.py").read_text(encoding="utf-8"))
         imported: set[str] = set()
         for node in _ast.walk(tree):
             if isinstance(node, _ast.Import):
@@ -566,7 +564,9 @@ class PermissionImpactTest(unittest.TestCase):
                 user_counts={"grant": ["internal-user-1"], "shrink": 0},
             )
 
-    def test_strict_manifest_is_bound_to_candidate_and_contains_only_aggregate_metadata(self) -> None:
+    def test_strict_manifest_is_bound_to_candidate_and_contains_only_aggregate_metadata(
+        self,
+    ) -> None:
         base_digest = "a" * 64
         head_digest = "b" * 64
         base_surface = IMPACT.build_surface(
@@ -667,11 +667,11 @@ class PermissionImpactTest(unittest.TestCase):
             metric_path.write_text('[companies."1"]\n"职能" = ["m1", "m2"]\n', encoding="utf-8")
             facts_head = self._commit(repository, "permission fact change")
 
-            base_roles, base_metrics, base_role_raw, base_metric_raw = IMPACT._load_ref_documents_with_raw(
-                repository, base
+            base_roles, base_metrics, base_role_raw, base_metric_raw = (
+                IMPACT._load_ref_documents_with_raw(repository, base)
             )
-            head_roles, head_metrics, head_role_raw, head_metric_raw = IMPACT._load_ref_documents_with_raw(
-                repository, facts_head
+            head_roles, head_metrics, head_role_raw, head_metric_raw = (
+                IMPACT._load_ref_documents_with_raw(repository, facts_head)
             )
             base_surface = IMPACT.build_surface(
                 IMPACT._role_map(base_roles, "base"), IMPACT._metric_map(base_metrics, "base")
@@ -786,7 +786,9 @@ class PermissionImpactTest(unittest.TestCase):
             )
 
             # 修改 facts 后仍指向同一份 stage registration，必须被事实摘要绑定挡住。
-            metric_path.write_text('[companies."1"]\n"职能" = ["m1", "m2", "m3"]\n', encoding="utf-8")
+            metric_path.write_text(
+                '[companies."1"]\n"职能" = ["m1", "m2", "m3"]\n', encoding="utf-8"
+            )
             changed_facts_head = self._commit(repository, "tamper permission facts")
             with self.assertRaises(PREPARE.IMPACT.CountEvidenceError):
                 PREPARE.prepare(
@@ -828,7 +830,8 @@ class PermissionImpactTest(unittest.TestCase):
             tampered_registration = dict(registration)
             tampered_registration["manifest_sha256"] = "2" * 64
             registration_path.write_text(
-                json.dumps(tampered_registration, ensure_ascii=False, sort_keys=True, indent=2) + "\n",
+                json.dumps(tampered_registration, ensure_ascii=False, sort_keys=True, indent=2)
+                + "\n",
                 encoding="utf-8",
             )
             with self.assertRaises(IMPACT.CountEvidenceError):
@@ -898,13 +901,9 @@ class PermissionImpactTest(unittest.TestCase):
             repository.mkdir()
 
             # 缺席：降级为 None，不抛错。
+            self.assertIsNone(IMPACT.load_optional_provenance(None, repository=repository))
             self.assertIsNone(
-                IMPACT.load_optional_provenance(None, repository=repository)
-            )
-            self.assertIsNone(
-                IMPACT.load_optional_provenance(
-                    root / "never-written.json", repository=repository
-                )
+                IMPACT.load_optional_provenance(root / "never-written.json", repository=repository)
             )
 
             # 仓库内注入：仍然失败关闭。
@@ -952,9 +951,7 @@ class PermissionImpactTest(unittest.TestCase):
 
             # 名字超长：读不出来的另一种形态，同样只能失败关闭。
             with self.assertRaises(IMPACT.CountEvidenceError):
-                IMPACT.load_optional_provenance(
-                    root / ("x" * 4096), repository=repository
-                )
+                IMPACT.load_optional_provenance(root / ("x" * 4096), repository=repository)
 
     def test_count_input_symlink_is_rejected_before_reading_runner_files(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -1062,9 +1059,7 @@ class PermissionImpactTest(unittest.TestCase):
             role_path.parent.mkdir(parents=True, exist_ok=True)
             role_path.write_text('[roles]\n"角色" = "职能"\n', encoding="utf-8")
             metric_path.parent.mkdir(parents=True, exist_ok=True)
-            metric_path.write_text(
-                '[companies."1"]\n"未绑定职能" = ["m1"]\n', encoding="utf-8"
-            )
+            metric_path.write_text('[companies."1"]\n"未绑定职能" = ["m1"]\n', encoding="utf-8")
             subprocess.run(["git", "init", "-q"], cwd=repository, check=True)
             subprocess.run(["git", "add", "."], cwd=repository, check=True)
             subprocess.run(
@@ -1151,7 +1146,11 @@ class PermissionImpactTest(unittest.TestCase):
                 check=True,
             )
             base = subprocess.run(
-                ["git", "rev-parse", "HEAD"], cwd=repository, check=True, capture_output=True, text=True
+                ["git", "rev-parse", "HEAD"],
+                cwd=repository,
+                check=True,
+                capture_output=True,
+                text=True,
             ).stdout.strip()
             metric_path.write_text('[companies."1"]\n"职能" = ["m1", "m2"]\n', encoding="utf-8")
             subprocess.run(["git", "add", "."], cwd=repository, check=True)
@@ -1170,7 +1169,11 @@ class PermissionImpactTest(unittest.TestCase):
                 check=True,
             )
             head = subprocess.run(
-                ["git", "rev-parse", "HEAD"], cwd=repository, check=True, capture_output=True, text=True
+                ["git", "rev-parse", "HEAD"],
+                cwd=repository,
+                check=True,
+                capture_output=True,
+                text=True,
             ).stdout.strip()
             original = EXPORT._read_stage_counts
             EXPORT._read_stage_counts = lambda _dsn, *, grant_roles, shrink_roles: (

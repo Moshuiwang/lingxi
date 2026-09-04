@@ -35,7 +35,7 @@ from lingxi.adapters.query_mcp_probe import (
     default_metrics_reader,
     fetch_metric_catalog,
 )
-from lingxi.core.permission.mcp_readiness import McpProbeError
+from lingxi.core.permission.mcp_readiness_base import McpProbeError
 
 ENDPOINT = "https://mcp.example.invalid/query"
 USER = "usr_A"
@@ -241,9 +241,7 @@ class ClassificationTest(unittest.TestCase):
         """
 
         probe, _ = _probe(
-            _echo(
-                {"result": {"isError": None, "structuredContent": {"metrics": ["日活", "收入"]}}}
-            )
+            _echo({"result": {"isError": None, "structuredContent": {"metrics": ["日活", "收入"]}}})
         )
         with self.assertRaises(McpProbeError) as caught:
             probe.list_metrics(user_id=USER)
@@ -346,7 +344,11 @@ class ResponseIdentityTest(unittest.TestCase):
         probe, transport = _probe(
             McpHttpResponse(
                 200,
-                {"jsonrpc": "2.0", "id": "别人的请求", "result": {"structuredContent": {"metrics": ["m"]}}},
+                {
+                    "jsonrpc": "2.0",
+                    "id": "别人的请求",
+                    "result": {"structuredContent": {"metrics": ["m"]}},
+                },
             )
         )
         with self.assertRaises(McpProbeError) as caught:
@@ -356,7 +358,9 @@ class ResponseIdentityTest(unittest.TestCase):
 
     def test_missing_id_is_rejected(self) -> None:
         probe, _ = _probe(
-            McpHttpResponse(200, {"jsonrpc": "2.0", "result": {"structuredContent": {"metrics": ["m"]}}})
+            McpHttpResponse(
+                200, {"jsonrpc": "2.0", "result": {"structuredContent": {"metrics": ["m"]}}}
+            )
         )
         with self.assertRaises(McpProbeError) as caught:
             probe.list_metrics(user_id=USER)
@@ -410,9 +414,7 @@ class RedirectTest(unittest.TestCase):
         from urllib.request import Request
 
         handler = _no_redirect_opener().handlers
-        redirect_handlers = [
-            item for item in handler if hasattr(item, "redirect_request")
-        ]
+        redirect_handlers = [item for item in handler if hasattr(item, "redirect_request")]
         self.assertTrue(redirect_handlers)
         request = Request(ENDPOINT, method="POST")
         for new_url in (
@@ -513,7 +515,11 @@ class MetricsReaderTest(unittest.TestCase):
 #: 的二次实测记录，不再是首次实测时对 8 条 ``name_en`` 的推测翻译。完整协议记录见
 #: ``docs/参考证据/问数MCP-list_metrics真实响应形状.md``。
 REAL_METRICS = [
-    {"metric_id": "channel_market_sharing", "name": "频道市占率", "name_en": "Channel Market Sharing"},
+    {
+        "metric_id": "channel_market_sharing",
+        "name": "频道市占率",
+        "name_en": "Channel Market Sharing",
+    },
     {"metric_id": "channel_rate", "name": "频道收视率", "name_en": "Channel Viewership Rate"},
     {"metric_id": "exchange_rate", "name": "汇率", "name_en": "Exchange Rate"},
     {"metric_id": "sub_deduction_count", "name": "扣费用户数", "name_en": "Deduction User Count"},
@@ -531,9 +537,7 @@ def _real_list_metrics_result(metrics: list | None = REAL_METRICS) -> dict:
     """
 
     return {
-        "content": [
-            {"type": "text", "text": json.dumps({"metrics": metrics}, ensure_ascii=False)}
-        ],
+        "content": [{"type": "text", "text": json.dumps({"metrics": metrics}, ensure_ascii=False)}],
         "isError": False,
     }
 
@@ -571,11 +575,7 @@ class VerifiedContentTextMetricsReaderTest(unittest.TestCase):
     def test_metrics_not_a_list_is_unrecognized(self) -> None:
         """畸形③：解开后 ``metrics`` 不是列表。"""
 
-        result = {
-            "content": [
-                {"type": "text", "text": json.dumps({"metrics": {"not": "a list"}})}
-            ]
-        }
+        result = {"content": [{"type": "text", "text": json.dumps({"metrics": {"not": "a list"}})}]}
         with self.assertRaises(McpProbeError) as caught:
             content_text_metrics_reader(result)
         self.assertEqual(caught.exception.code, "unrecognized_result_shape")
@@ -584,9 +584,7 @@ class VerifiedContentTextMetricsReaderTest(unittest.TestCase):
     def test_block_type_other_than_text_is_unrecognized(self) -> None:
         """畸形④：块的 ``type`` 不是 ``text``。"""
 
-        result = {
-            "content": [{"type": "image", "text": json.dumps({"metrics": [1, 2, 3]})}]
-        }
+        result = {"content": [{"type": "image", "text": json.dumps({"metrics": [1, 2, 3]})}]}
         with self.assertRaises(McpProbeError) as caught:
             content_text_metrics_reader(result)
         self.assertEqual(caught.exception.code, "unrecognized_result_shape")
@@ -606,9 +604,7 @@ class VerifiedContentTextMetricsReaderTest(unittest.TestCase):
 
         for key in ("items", "data", "result", "list", "warnings"):
             with self.subTest(key=key):
-                result = {
-                    "content": [{"type": "text", "text": json.dumps({key: ["warning"]})}]
-                }
+                result = {"content": [{"type": "text", "text": json.dumps({key: ["warning"]})}]}
                 with self.assertRaises(McpProbeError) as caught:
                     content_text_metrics_reader(result)
                 self.assertEqual(caught.exception.code, "unrecognized_result_shape")
@@ -854,7 +850,11 @@ class FetchMetricCatalogTest(unittest.TestCase):
         transport = RecordingTransport(
             McpHttpResponse(
                 200,
-                {"jsonrpc": "2.0", "id": "some-other-request", "result": _real_list_metrics_result()},
+                {
+                    "jsonrpc": "2.0",
+                    "id": "some-other-request",
+                    "result": _real_list_metrics_result(),
+                },
             )
         )
 

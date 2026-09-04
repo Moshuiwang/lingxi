@@ -22,7 +22,6 @@ from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 
-
 REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
 CONTENT_PATH = REPOSITORY_ROOT / "src" / "lingxi" / "config" / "content.toml"
 LOCK_PATH = REPOSITORY_ROOT / "src" / "lingxi" / "config" / "content.lock.toml"
@@ -97,8 +96,7 @@ def load_aliases(path: Path) -> tuple[dict[str, str] | None, list[str]]:
             continue
         if not isinstance(value, str) or not METRIC_VALUE_PATTERN.fullmatch(value):
             errors.append(
-                f"L1 别名表的 {key!r} 右值必须匹配指标 token 形状 "
-                "[A-Za-z0-9_.@:一-鿿-]{1,128}"
+                f"L1 别名表的 {key!r} 右值必须匹配指标 token 形状 [A-Za-z0-9_.@:一-鿿-]{{1,128}}"
             )
             continue
         valid[key] = value
@@ -119,9 +117,7 @@ def _bound_names(node: ast.AST) -> set[str]:
             if expression is None:
                 continue
             for child in ast.walk(expression):
-                if isinstance(child, ast.Name) and isinstance(
-                    child.ctx, (ast.Store, ast.Del)
-                ):
+                if isinstance(child, ast.Name) and isinstance(child.ctx, (ast.Store, ast.Del)):
                     names.add(child.id)
         return names
 
@@ -164,9 +160,7 @@ def required_content_keys(module_path: Path) -> tuple[dict[str, frozenset[str]] 
     try:
         tree = ast.parse(module_path.read_text(encoding="utf-8"), filename=str(module_path))
     except (OSError, SyntaxError) as error:
-        return None, [
-            f"L1 键集合检查无法解析 {_display(module_path, REPOSITORY_ROOT)}：{error}"
-        ]
+        return None, [f"L1 键集合检查无法解析 {_display(module_path, REPOSITORY_ROOT)}：{error}"]
 
     wanted = {name for _, name, _ in CONTENT_KEY_DECLARATIONS}
     top_level = {id(statement) for statement in tree.body}
@@ -187,9 +181,7 @@ def required_content_keys(module_path: Path) -> tuple[dict[str, frozenset[str]] 
             )
             continue
         if len(nodes) > 1:
-            lines = "、".join(
-                str(getattr(node, "lineno", "?")) for node in nodes
-            )
+            lines = "、".join(str(getattr(node, "lineno", "?")) for node in nodes)
             errors.append(
                 f"{display} 的 {name} 在模块里被绑定了 {len(nodes)} 次（第 {lines} 行）："
                 "增广赋值或重新绑定会让门禁读到的集合与运行时实际生效的集合不一致，"
@@ -213,8 +205,7 @@ def required_content_keys(module_path: Path) -> tuple[dict[str, frozenset[str]] 
             isinstance(item, str) for item in literal
         ):
             errors.append(
-                f"{display} 的 {name} "
-                "必须是模块顶层的字面量字符串元组，否则门禁无法静态确定必需键"
+                f"{display} 的 {name} 必须是模块顶层的字面量字符串元组，否则门禁无法静态确定必需键"
             )
             continue
         found[name] = frozenset(literal)
@@ -238,9 +229,7 @@ def _content_key_failures(
     for table, name, kind in CONTENT_KEY_DECLARATIONS:
         actual = content.get(table)
         if not isinstance(actual, Mapping):
-            failures.append(
-                f"{display} 缺少 [{table}] 表或它不是表；运行时会直接拒绝加载内容目录"
-            )
+            failures.append(f"{display} 缺少 [{table}] 表或它不是表；运行时会直接拒绝加载内容目录")
             continue
         required = declared[name]
         missing = sorted(required - set(actual))
@@ -283,7 +272,11 @@ def _string_literals_without_docstrings(path: Path) -> list[tuple[int, str]]:
 
     literals: list[tuple[int, str]] = []
     for node in ast.walk(tree):
-        if isinstance(node, ast.Constant) and isinstance(node.value, str) and id(node) not in docstring_ids:
+        if (
+            isinstance(node, ast.Constant)
+            and isinstance(node.value, str)
+            and id(node) not in docstring_ids
+        ):
             literals.append((node.lineno, node.value))
     return literals
 

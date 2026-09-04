@@ -93,7 +93,9 @@ def layer_blobs(root: pathlib.Path) -> list[pathlib.Path]:
         manifest = json.loads(blob(manifest_digest).read_text(encoding="utf-8"))
         # 多架构 manifest list：本仓库只构建单架构，取第一个即可，但要能认出来。
         if "manifests" in manifest:
-            manifest = json.loads(blob(manifest["manifests"][0]["digest"]).read_text(encoding="utf-8"))
+            manifest = json.loads(
+                blob(manifest["manifests"][0]["digest"]).read_text(encoding="utf-8")
+            )
         return [blob(layer["digest"]) for layer in manifest["layers"]]
 
     raise SystemExit(f"{root}：既没有 manifest.json 也没有 index.json，认不出这个 save 格式")

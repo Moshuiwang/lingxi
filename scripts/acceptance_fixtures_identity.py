@@ -14,7 +14,7 @@ Epic D/E 联合验收要用到的受控失败旅程列为四类夹具，本模�
 2. **MCP 同步超时夹具——只用于窗口前的纯单测验证，不能注入真实 Stage 进程**
    （2026-08-18 编排者修复包 P2-11 更正；此前的措辞暗示它可以让验收现场跳过
    真实等待，这是错的）。合同节奏由
-   ``lingxi.core.permission.mcp_readiness.ReadinessSchedule`` 承载，最小合法
+   ``lingxi.core.permission.mcp_readiness_base.ReadinessSchedule`` 承载，最小合法
    配置不是本模块另起一套数字，而是该模块文档已经写明、且
    ``tests/test_mcp_readiness_machine.py`` 已在用的
    ``ReadinessSchedule(interval_seconds=1, budget_seconds=1,
@@ -44,8 +44,9 @@ Epic D/E 联合验收要用到的受控失败旅程列为四类夹具，本模�
 
 from __future__ import annotations
 
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
-from typing import Any, Mapping, Sequence
+from typing import Any
 
 # ---------------------------------------------------------------------------
 # 一、确定性无权限身份夹具：零条 / 多条 / 双键冲突 / 资料不完整 / 无支持职能
@@ -67,7 +68,9 @@ def _roster_row(
     }
 
 
-def _galaxy_row(user_id: str, *, user_name: str = "", email: str = "", nick_name: str = "验收夹具测试人员") -> dict[str, str]:
+def _galaxy_row(
+    user_id: str, *, user_name: str = "", email: str = "", nick_name: str = "验收夹具测试人员"
+) -> dict[str, str]:
     return {"user_id": user_id, "user_name": user_name, "email": email, "nick_name": nick_name}
 
 
@@ -105,8 +108,12 @@ MULTIPLE_HIT = NegativeIdentityFixture(
     name="多条：同一人员 ID 花名册存在多行",
     feishu_user_id=_PERSON_ID_PREFIX + "MULTI",
     roster_rows=(
-        _roster_row(_PERSON_ID_PREFIX + "MULTI", employee_no="80101", email="dup1@example-corp.invalid"),
-        _roster_row(_PERSON_ID_PREFIX + "MULTI", employee_no="80101", email="dup1@example-corp.invalid"),
+        _roster_row(
+            _PERSON_ID_PREFIX + "MULTI", employee_no="80101", email="dup1@example-corp.invalid"
+        ),
+        _roster_row(
+            _PERSON_ID_PREFIX + "MULTI", employee_no="80101", email="dup1@example-corp.invalid"
+        ),
     ),
     galaxy_rows=(_galaxy_row("U-DUP", user_name="80101", email="dup1@example-corp.invalid"),),
     expected_state="not_found",
@@ -163,7 +170,9 @@ UNSUPPORTED_FUNCTION = NegativeIdentityFixture(
             email="no-function@example-corp.invalid",
         ),
     ),
-    galaxy_rows=(_galaxy_row("U-NO-FUNCTION", user_name="80103", email="no-function@example-corp.invalid"),),
+    galaxy_rows=(
+        _galaxy_row("U-NO-FUNCTION", user_name="80103", email="no-function@example-corp.invalid"),
+    ),
     expected_state="matched",
     expected_reason="unique_employee_no_match",
     contract_note=(
@@ -185,7 +194,7 @@ NEGATIVE_IDENTITY_FIXTURES: tuple[NegativeIdentityFixture, ...] = (
 # 二、MCP 同步超时夹具：验收窗口用的「最小合法配置」节奏
 # ---------------------------------------------------------------------------
 
-#: 与 ``core.permission.mcp_readiness`` 模块文档「节奏与预算是受控可配置的
+#: 与 ``core.permission.mcp_readiness_base`` 模块文档「节奏与预算是受控可配置的
 #: 合法值」一节记录的配方逐字段相同——本模块不重新决定这三个数字，只给它一个
 #: 稳定、可 import 的名字，避免验收现场从文档散文里手抄参数。
 MCP_READINESS_MINIMUM_LEGAL_SCHEDULE_KWARGS: Mapping[str, int] = {

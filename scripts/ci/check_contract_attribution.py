@@ -163,7 +163,7 @@ GROUNDED_ATTRIBUTIONS: tuple[GroundedAttribution, ...] = (
         # 2026-08-29 维护批（Issue #413）把原独立小段落并入上一段「规则：」正文，
         # 逐字对照同步更新，见代码框架「五、测试资产与正式代码的边界」。
         "docs/技术设计/代码框架.md",
-        '规则：文件头须保留「测试资产 / 不属于正式用户路径」声明；正式实现进入同名领域时先在 Issue 写明替代关系，不允许两套同职责代码长期并存；已验证模式（如加密轮换 `refresh_token`、`open_id` 定位共享范围成员）可作参考输入，但正式代码按合同与技术设计重写，不直接改名上线。',
+        "规则：文件头须保留「测试资产 / 不属于正式用户路径」声明；正式实现进入同名领域时先在 Issue 写明替代关系，不允许两套同职责代码长期并存；已验证模式（如加密轮换 `refresh_token`、`open_id` 定位共享范围成员）可作参考输入，但正式代码按合同与技术设计重写，不直接改名上线。",
         "产品合同与外部边界",
     ),
     GroundedAttribution(
@@ -174,7 +174,7 @@ GROUNDED_ATTRIBUTIONS: tuple[GroundedAttribution, ...] = (
     ),
     GroundedAttribution(
         "src/lingxi/core/execution/input_safety.py",
-        '核对更正，见 Issue #238）；但"不伪装成功"这个动机本身确有合同依据（结果',
+        "个动机本身有合同依据，与 `apps/worker/report.py` 的 ``obtained`` 同一条",
         "交付规则",
     ),
     # docs/参考证据/MVP联合验收执行卡.md 的登记项已随该一次性执行卡退场删除
@@ -368,7 +368,7 @@ GROUNDED_ATTRIBUTIONS: tuple[GroundedAttribution, ...] = (
     ),
     GroundedAttribution(
         "src/lingxi/apps/gateway/log_redaction.py",
-        "凭据不得进日志是产品合同明令（代码框架「三、横切约定」）；第三方 SDK 的这个",
+        "产品合同明令，唯一能做的是在进入任何 handler 之前拦截、改写。",
         "统一用户记录与权限变化",
     ),
     GroundedAttribution(
@@ -383,7 +383,7 @@ GROUNDED_ATTRIBUTIONS: tuple[GroundedAttribution, ...] = (
     ),
     GroundedAttribution(
         "src/lingxi/apps/worker/report.py",
-        '``obtained`` 就是产品合同明令禁止的"伪装成功"。原始的工具调用分类改名保留在',
+        '"用户是否拿到内容"，继续展示 ``obtained`` 就是合同明令禁止的"伪装成功"。',
         "交付规则",
     ),
     GroundedAttribution(
@@ -398,7 +398,7 @@ GROUNDED_ATTRIBUTIONS: tuple[GroundedAttribution, ...] = (
     ),
     GroundedAttribution(
         "src/lingxi/core/execution/audit.py",
-        "# 产品合同要求「不在审计中保存凭据、完整令牌」，这是绝对措辞，靠认键名做不到——",
+        "# 产品合同要求「不在审计中保存凭据、完整令牌」——没有键名上下文的裸令牌永远",
         "管理员处理入口与安全确认",
     ),
     GroundedAttribution(
@@ -417,23 +417,8 @@ GROUNDED_ATTRIBUTIONS: tuple[GroundedAttribution, ...] = (
         "系统与外部依赖边界",
     ),
     GroundedAttribution(
-        "src/lingxi/core/permission/mcp_readiness.py",
+        "src/lingxi/core/permission/mcp_readiness_base.py",
         "产品合同要求「明确确认该用户应有的公司和职能权限已经同步且可以问数后，才宣告开通成功」。",
-        "开通流程",
-    ),
-    GroundedAttribution(
-        "src/lingxi/core/permission/mcp_readiness.py",
-        "``now`` 必然略大于 ``started + 900``，于是合同要求的最后一次探针永远被跳过，",
-        "开通流程",
-    ),
-    GroundedAttribution(
-        "src/lingxi/core/permission/mcp_readiness.py",
-        "``now`` 必然略大于 ``started + 900``，于是合同要求的最后一次探针**永远被跳过**，",
-        "开通流程",
-    ),
-    GroundedAttribution(
-        "src/lingxi/core/permission/mcp_readiness.py",
-        "# 累计到第六次时 ``now`` 必然略过 ``started + 900``，合同要求的最后一次探针",
         "开通流程",
     ),
     GroundedAttribution(
@@ -480,32 +465,32 @@ GROUNDED_ATTRIBUTIONS: tuple[GroundedAttribution, ...] = (
         "首次对话与自动准入",
     ),
     GroundedAttribution(
-        "src/lingxi/apps/gateway/__init__.py",
+        "src/lingxi/apps/gateway/onboarding.py",
         "以及立刻回一条合同要求的「已收到，正在核对」。真正的编排由 scheduler 按",
         "首次对话与自动准入",
     ),
     GroundedAttribution(
         "src/lingxi/apps/gateway/onboarding.py",
-        "2. 立刻回一条合同要求的「已收到，正在核对」。",
+        "以及立刻回一条合同要求的「已收到，正在核对」。",
         "首次对话与自动准入",
     ),
     GroundedAttribution(
         "src/lingxi/apps/scheduler/onboarding.py",
-        "代价是**首次开通要等一个扫描周期**才开始（产品负责人已知情并接受）。合同要求的第一条提示",
+        "合同要求的第一条提示仍由 gateway 即时发出。**前置不齐就不装配**，而不是装",
         "首次对话与自动准入",
     ),
     GroundedAttribution(
         "src/lingxi/core/identity/onboarding_runner.py",
-        "# **合同要求的第二条固定提示**（`V-开通-11`）：权限已经排出去、进入同步等待时，",
+        '"""**合同要求的第二条固定提示**（`V-开通-11`）：权限已经排出去、进入同步等待时，',
         "首次对话与自动准入",
     ),
     GroundedAttribution(
-        "src/lingxi/core/identity/onboarding_runner.py",
+        "src/lingxi/core/identity/onboarding_steps.py",
         '# - 也不能"先建档建环境、发布那步以后再补"：合同要求成功以发布 + 就绪确认',
         "开通流程",
     ),
     GroundedAttribution(
-        "src/lingxi/core/identity/onboarding_runner.py",
+        "src/lingxi/core/identity/onboarding_steps.py",
         "# **只有到这里才写 active**：产品合同要求成功提示在环境创建、权限发布与当前",
         "开通流程",
     ),
@@ -526,8 +511,8 @@ GROUNDED_ATTRIBUTIONS: tuple[GroundedAttribution, ...] = (
 
 REGISTERED_EXCEPTIONS: tuple[RegisteredException, ...] = (
     RegisteredException(
-        "src/lingxi/apps/gateway/__init__.py",
-        '只是"发送"这一步落到日志（Issue #153：合同要求"告警不可用时主流程行为有',
+        "src/lingxi/apps/gateway/alerting.py",
+        '只是"发送"这一步落到日志（合同要求"告警不可用时主流程行为有明确定义"，',
         "Issue #153",
         "2026-08-14",
         "产品负责人",
@@ -537,32 +522,26 @@ REGISTERED_EXCEPTIONS: tuple[RegisteredException, ...] = (
     ),
     RegisteredException(
         "src/lingxi/apps/scheduler/alerting_assembly.py",
-        '没有配置目标群不等于告警关闭（Issue #153：合同要求"告警不可用时主流程行为',
+        '没有配置目标群不等于告警关闭（合同要求"告警不可用时主流程行为有明确定义"，',
         "Issue #153",
         "2026-08-14",
         "产品负责人",
         "同上（gateway/__init__.py 的登记）：出自 Issue #153，合同正文未提及告警行为。"
         "2026-08-19 #237 把这段文字从 apps/scheduler/__init__.py 搬到本文件，"
-        "登记表路径已同步更新——这是本门禁设计上要防的腐烂被真实触发的一次实例。",
+        "登记表路径已同步更新——这是本门禁设计上要防的腐烂被真实触发的一次实例。"
+        "rc25 B-8a（#592）收官批把源码正文里的 Issue 编号改写掉（避免触发注释卫生棘轮），"
+        "编号只保留在本条登记的来源字段里。",
     ),
     RegisteredException(
         "src/lingxi/core/identity/roster_snapshot.py",
-        "**为什么门槛不能写成「rows 非空」**（`V-花名册-41`，PR #208 二级审查钉入的合同条款）：",
+        "**为什么门槛不能写成「rows 非空」**（`V-花名册-41` 钉入的合同条款）：",
         "PR #208",
         "2026-08-17",
         "PR #208 二级独立复核",
         '"合同条款"在这里是转述二级审查的用词，指验收矩阵 V-花名册-41 这条被独立复核'
-        "钉住的判据，不是指产品合同与外部边界正文；该文档没有关于花名册替换判据的具体规定。",
-    ),
-    RegisteredException(
-        "src/lingxi/core/permission/publish_row.py",
-        ":mod:`lingxi.core.permission.role_function`），而合同要求这里放**指标名**。中间缺的",
-        "Issue #155",
-        "2026-08-17",
-        "产品负责人",
-        "「发布表值列表放指标名」出自 Issue #155 产品负责人对三问的答复（留痕见该 "
-        "Issue 评论），是与问数 MCP 消费方的既定数据格式约定，产品合同与外部边界 "
-        "正文没有规定发布表的具体字段格式。",
+        "钉住的判据，不是指产品合同与外部边界正文；该文档没有关于花名册替换判据的具体规定。"
+        "rc25 B-8a（#592）收官批把源码正文里的 PR 编号与审查主体改写掉（避免触发注释卫生"
+        "棘轮），这些信息只保留在本条登记的来源字段里。",
     ),
     RegisteredException(
         "tests/test_roster_snapshot.py",

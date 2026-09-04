@@ -10,11 +10,11 @@
 from __future__ import annotations
 
 import dataclasses
-
+from collections.abc import Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta, timezone
-from typing import Any, Iterator
+from datetime import UTC, datetime, timedelta
+from typing import Any
 
 from lingxi.core.conversation.ports import (
     ConversationRecord,
@@ -115,9 +115,7 @@ class FakeOnboarding:
     def start(
         self, *, event_id: str, open_id: str, trace_id: str, claim_token: Any = None
     ) -> OnboardingResult:
-        self.calls.append(
-            {"event_id": event_id, "open_id": open_id, "trace_id": trace_id}
-        )
+        self.calls.append({"event_id": event_id, "open_id": open_id, "trace_id": trace_id})
         self.claim_tokens.append(claim_token)
         if self._fail_with is not None:
             raise self._fail_with
@@ -146,10 +144,10 @@ class FakeTask:
     status: str = "queued"
 
 
-
 #: 「已平账」的占位代次：与真库的「时间戳非空」同义，但绝不等于任何一次认领代次，
 #: 因此不会被任何 CAS 释放误撤。
 _MARKED = object()
+
 
 @dataclass
 class FakeState:
@@ -239,8 +237,10 @@ class FakeTransaction:
 
     def _maybe_fail(self, step: str) -> None:
         if self._fail_on == step:
-            raise self._fail_error if self._fail_error is not None else RuntimeError(
-                f"注入失败：{step}"
+            raise (
+                self._fail_error
+                if self._fail_error is not None
+                else RuntimeError(f"注入失败：{step}")
             )
 
     def insert_inbound_event(
@@ -350,9 +350,7 @@ class FakeTransaction:
         self.staged_notifies += 1
 
     def consume_delivery_expired_notice(self, *, conversation_id: str) -> bool:
-        self._log.add(
-            "store.consume_delivery_expired_notice", conversation_id=conversation_id
-        )
+        self._log.add("store.consume_delivery_expired_notice", conversation_id=conversation_id)
         if conversation_id not in self._state.pending_delivery_expired_notices:
             return False
         # 与真实实现同语义：命中即原子标记为已提示，直接从暂存状态里摘掉，同一次
@@ -407,7 +405,7 @@ class FakeTransaction:
             memory_type=memory_type,
             memory_key=memory_key,
             memory_value=memory_value,
-            created_at=datetime.now(timezone.utc),
+            created_at=datetime.now(UTC),
         )
         entries.append(new_entry)
         return new_entry.memory_id
@@ -517,18 +515,14 @@ class FakeStore:
         # 并把那个时刻当作**认领代次**返回。假实现必须同样做，否则「没跑成就要放回去」
         # 与「不得撤销别人的认领」两条断言在假实现上都恒真。
         self._state.claim_generation += 1
-        token = datetime(2026, 8, 19, tzinfo=timezone.utc) + timedelta(
-            seconds=self._state.claim_generation
-        )
+        token = datetime(2026, 8, 19, tzinfo=UTC) + timedelta(seconds=self._state.claim_generation)
         self._state.onboarding_dispatched[pending.event_id] = token
         return dataclasses.replace(pending, claim_token=token)
 
     def release_onboarding_claim(self, *, event_id: str, claim_token=None) -> None:
         """把**自己那一次**认领放回去：代次对得上才清，对不上什么都不做。"""
 
-        self._log.add(
-            "store.release_onboarding_claim", event_id=event_id, claim_token=claim_token
-        )
+        self._log.add("store.release_onboarding_claim", event_id=event_id, claim_token=claim_token)
         if self._fail_on == "release_onboarding_claim":
             raise RuntimeError("注入失败：release_onboarding_claim")
         if claim_token is None:

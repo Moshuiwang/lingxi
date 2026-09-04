@@ -29,7 +29,11 @@ class SeverityPromotionTests(unittest.TestCase):
         sink = StructuredLogAuditSink()
 
         with self.assertLogs("lingxi.apps.scheduler", level="INFO") as captured:
-            sink.record("late_readiness_recovery.notice_processing_failed", user="usr_1", error="RuntimeError")
+            sink.record(
+                "late_readiness_recovery.notice_processing_failed",
+                user="usr_1",
+                error="RuntimeError",
+            )
 
         self.assertTrue(captured.output[0].startswith("WARNING:"))
 
@@ -119,7 +123,9 @@ class SeverityPromotionTests(unittest.TestCase):
         sink = StructuredLogAuditSink()
 
         with self.assertLogs("lingxi.apps.scheduler", level="INFO") as captured:
-            sink.record("onboarding.notify_failed", event_id="evt_1", attempt=2, error="RuntimeError")
+            sink.record(
+                "onboarding.notify_failed", event_id="evt_1", attempt=2, error="RuntimeError"
+            )
 
         line = captured.output[0]
         self.assertLess(line.index("attempt="), line.index("error="))

@@ -1,0 +1,5 @@
+# git blame 忽略提交表：仅登记纯格式化改动，不含任何逻辑或内容变化的提交。
+# 用法：git config blame.ignoreRevsFile .git-blame-ignore-revs（本机一次性设置后，
+# 裸 git blame 会自动跳过这里列出的提交；GitHub 网页端 blame 视图原生识别本文件，
+# 无需额外配置）。
+f171b95e5562c0ef35413edb334b5ebc65705a2a

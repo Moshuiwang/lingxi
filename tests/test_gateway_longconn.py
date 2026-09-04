@@ -68,8 +68,7 @@ class ScriptedTransport:
             if last:
                 self.exhausted = True
             raise episode
-        for payload in episode:
-            yield payload
+        yield from episode
         if last:
             self.exhausted = True
 
@@ -131,9 +130,7 @@ class ReconnectTests(unittest.TestCase):
         """固定间隔或零间隔的忙循环必须使本用例变红。"""
 
         failures = [
-            LongConnectionError(
-                HandshakeFailure(source=FailureSource.STREAM, status_code=None)
-            )
+            LongConnectionError(HandshakeFailure(source=FailureSource.STREAM, status_code=None))
             for _ in range(5)
         ]
         transport = ScriptedTransport(failures)
@@ -166,9 +163,7 @@ class TerminalFailureTests(unittest.TestCase):
         transport = ScriptedTransport(
             [
                 LongConnectionError(
-                    HandshakeFailure(
-                        source=FailureSource.WS_HANDSHAKE, status_code=FORBIDDEN
-                    )
+                    HandshakeFailure(source=FailureSource.WS_HANDSHAKE, status_code=FORBIDDEN)
                 )
             ]
         )
@@ -187,9 +182,7 @@ class TerminalFailureTests(unittest.TestCase):
         transport = ScriptedTransport(
             [
                 LongConnectionError(
-                    HandshakeFailure(
-                        source=FailureSource.ENDPOINT_HTTP, status_code=FORBIDDEN
-                    )
+                    HandshakeFailure(source=FailureSource.ENDPOINT_HTTP, status_code=FORBIDDEN)
                 )
             ]
         )
@@ -259,9 +252,7 @@ class HandlerFailureTests(unittest.TestCase):
                 raise RuntimeError("处理这条事件时炸了")
             seen.append(event_id)
 
-        transport = ScriptedTransport(
-            [[event("evt_ok_1"), event("evt_bad"), event("evt_ok_2")]]
-        )
+        transport = ScriptedTransport([[event("evt_ok_1"), event("evt_bad"), event("evt_ok_2")]])
 
         _, reason, _, audit = run(transport, handler)
 
@@ -1303,9 +1294,7 @@ class NoInboundPortTests(unittest.TestCase):
 
         self.assertTrue(probed, "至少要真的探过一个公开可调用项，否则本用例恒真")
         self.assertIn("run", probed, "公开面里的 run 必须被探到")
-        self.assertEqual(
-            received, [], "未经长连接通道的事件不得触发任何处理器"
-        )
+        self.assertEqual(received, [], "未经长连接通道的事件不得触发任何处理器")
 
 
 if __name__ == "__main__":

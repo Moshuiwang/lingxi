@@ -31,7 +31,7 @@ import pathlib
 import tempfile
 import threading
 import unittest
-from datetime import date, datetime, timedelta, timezone
+from datetime import UTC, date, datetime, timedelta
 from unittest import mock
 
 from lingxi.apps.scheduler import (
@@ -114,7 +114,7 @@ class FixedClock:
         self.today = start
 
     def __call__(self) -> datetime:
-        return datetime(self.today.year, self.today.month, self.today.day, 9, 0, tzinfo=timezone.utc)
+        return datetime(self.today.year, self.today.month, self.today.day, 9, 0, tzinfo=UTC)
 
     def advance(self, days: int = 1) -> None:
         self.today = self.today + timedelta(days=days)
@@ -312,9 +312,9 @@ class NoSenderCollaboratorTest(unittest.TestCase):
     def test_the_class_source_never_references_a_sender_or_send_call(self) -> None:
         import ast
 
-        source = (
-            SOURCE_ROOT / "lingxi" / "apps" / "scheduler" / "roster_audit.py"
-        ).read_text(encoding="utf-8")
+        source = (SOURCE_ROOT / "lingxi" / "apps" / "scheduler" / "roster_audit.py").read_text(
+            encoding="utf-8"
+        )
         tree = ast.parse(source)
         duty_class = next(
             node
@@ -370,7 +370,9 @@ class PrerequisiteTests(unittest.TestCase):
         self.assertIsNone(duty)
         self.assertEqual(audit.records[0][1]["variable"], "LINGXI_ROSTER_BITABLE_TABLE_ID")
 
-    def test_missing_token_supply_is_distinguishable_from_missing_environment_variable(self) -> None:
+    def test_missing_token_supply_is_distinguishable_from_missing_environment_variable(
+        self,
+    ) -> None:
         """要求 4：令牌供给为 None ⇒ 维持既有语义（`missing_access_token_supply`），
         与「未配置变量」可分辨。"""
 
@@ -490,8 +492,12 @@ class MutualExclusionTests(unittest.TestCase):
         self.assertNotIn("花名册审计日报", names)
         self.assertNotIn("花名册快照同步", names)
 
-        roster_audit_records = [r for r in audit.records if r[0] == "roster_audit.duty_not_registered"]
-        sync_records = [r for r in audit.records if r[0] == "roster_snapshot_sync.duty_not_registered"]
+        roster_audit_records = [
+            r for r in audit.records if r[0] == "roster_audit.duty_not_registered"
+        ]
+        sync_records = [
+            r for r in audit.records if r[0] == "roster_snapshot_sync.duty_not_registered"
+        ]
         self.assertEqual(len(roster_audit_records), 1)
         self.assertEqual(len(sync_records), 1)
         self.assertEqual(roster_audit_records[0][1]["variable"], "LINGXI_ADMIN_GROUP_CHAT_ID")
@@ -521,7 +527,9 @@ class MutualExclusionTests(unittest.TestCase):
         self.assertNotIn("花名册快照同步", duties_by_name)
         self.assertIsInstance(duties_by_name["花名册审计日报"], RosterAuditDuty)
 
-        roster_records = [r for r in audit.records if r[0].startswith(("roster_audit.", "roster_snapshot_sync."))]
+        roster_records = [
+            r for r in audit.records if r[0].startswith(("roster_audit.", "roster_snapshot_sync."))
+        ]
         self.assertEqual(roster_records, [], "前置齐备时不该有任何『未注册』审计")
 
     def test_a_missing_token_supply_is_distinguishable_at_the_build_loop_level(self) -> None:
@@ -548,7 +556,9 @@ class MutualExclusionTests(unittest.TestCase):
         self.assertIsNone(sync)
         reasons = {action: fields["reason"] for action, fields in audit.records}
         self.assertEqual(reasons["roster_audit.duty_not_registered"], "missing_access_token_supply")
-        self.assertEqual(reasons["roster_snapshot_sync.duty_not_registered"], "missing_access_token_supply")
+        self.assertEqual(
+            reasons["roster_snapshot_sync.duty_not_registered"], "missing_access_token_supply"
+        )
 
 
 # --------------------------------------------------------------------------
@@ -592,12 +602,15 @@ class SingleReaderPerDayTests(unittest.TestCase):
                         **COMPLETE_ENV,
                         "LINGXI_DELEGATED_CREDENTIAL_KEY": Fernet.generate_key().decode(),
                         "LINGXI_DELEGATED_CREDENTIAL_PATH": str(
-                            pathlib.Path(directory.name) / f"delegated-{has_admin_group}-{has_base}.enc"
+                            pathlib.Path(directory.name)
+                            / f"delegated-{has_admin_group}-{has_base}.enc"
                         ),
                         **extra,
                     }
                 )
-                loop = build_loop(config, roster_access_token=lambda: "token", audit=RecordingAudit())
+                loop = build_loop(
+                    config, roster_access_token=lambda: "token", audit=RecordingAudit()
+                )
                 names = {duty.name for duty in loop.duties}
 
                 self.assertFalse(

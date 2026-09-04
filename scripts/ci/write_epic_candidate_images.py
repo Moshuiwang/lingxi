@@ -120,7 +120,11 @@ def manifest_document(
         raise ValueError("repository 必须是 owner/name")
     if pr_number <= 0 or run_id <= 0:
         raise ValueError("pr_number 与 run_id 必须为正整数")
-    for label, value in (("head_sha", head_sha), ("tested_sha", tested_sha), ("tree_sha", tree_sha)):
+    for label, value in (
+        ("head_sha", head_sha),
+        ("tested_sha", tested_sha),
+        ("tree_sha", tree_sha),
+    ):
         if not SHA_RE.fullmatch(value):
             raise ValueError(f"{label} 不是 40 位小写 Git SHA")
     if not BATCH_RE.fullmatch(batch):
@@ -138,9 +142,13 @@ def manifest_document(
             if not image.get(field):
                 raise ValueError(f"镜像条目缺少 {field}：{image}")
         if not IMAGE_DIGEST_RE.fullmatch(str(image["image_digest"])):
-            raise ValueError(f"镜像 {image['service']} 的 image_digest 形状非法：{image['image_digest']}")
+            raise ValueError(
+                f"镜像 {image['service']} 的 image_digest 形状非法：{image['image_digest']}"
+            )
         if not TAR_SHA_RE.fullmatch(str(image["tar_sha256"])):
-            raise ValueError(f"镜像 {image['service']} 的 tar_sha256 形状非法：{image['tar_sha256']}")
+            raise ValueError(
+                f"镜像 {image['service']} 的 tar_sha256 形状非法：{image['tar_sha256']}"
+            )
         size = image.get("tar_size_bytes")
         if not isinstance(size, int) or isinstance(size, bool) or size <= 0:
             raise ValueError(f"镜像 {image['service']} 的 tar_size_bytes 非法：{size!r}")
@@ -160,15 +168,23 @@ def manifest_document(
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser = argparse.ArgumentParser(
+        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
+    )
     parser.add_argument("--repository", required=True)
     parser.add_argument("--pr-number", type=int, required=True)
     parser.add_argument("--head-sha", required=True)
     parser.add_argument("--tested-sha", required=True)
     parser.add_argument("--tree-sha", required=True)
     parser.add_argument("--run-id", type=int, required=True)
-    parser.add_argument("--batch", required=True, help="8 位发布批次日期，与 build_image.sh 的 LINGXI_IMAGE_BATCH 一致")
-    parser.add_argument("--output-dir", type=pathlib.Path, required=True, help="tar 与 manifest.json 的落地目录")
+    parser.add_argument(
+        "--batch",
+        required=True,
+        help="8 位发布批次日期，与 build_image.sh 的 LINGXI_IMAGE_BATCH 一致",
+    )
+    parser.add_argument(
+        "--output-dir", type=pathlib.Path, required=True, help="tar 与 manifest.json 的落地目录"
+    )
     parser.add_argument(
         "--image",
         action="append",
@@ -191,7 +207,9 @@ def main() -> int:
         tar_sha256 = sha256_file(tar_path)
         tar_size_bytes = tar_path.stat().st_size
         digest = read_image_digest(reference)
-        print(f"  tar sha256={tar_sha256[:16]}… ({tar_size_bytes} bytes)  image digest={digest[:19]}…")
+        print(
+            f"  tar sha256={tar_sha256[:16]}… ({tar_size_bytes} bytes)  image digest={digest[:19]}…"
+        )
         images.append(
             {
                 "service": service,
@@ -203,7 +221,7 @@ def main() -> int:
             }
         )
 
-    generated_at = dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    generated_at = dt.datetime.now(dt.UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
     document = manifest_document(
         repository=args.repository,
         pr_number=args.pr_number,
@@ -219,7 +237,9 @@ def main() -> int:
     manifest_path.write_text(
         json.dumps(document, ensure_ascii=False, sort_keys=True, indent=2) + "\n", encoding="utf-8"
     )
-    print(f"候选镜像 manifest：{manifest_path}（{len(images)} 个镜像，PR #{args.pr_number}，tree={args.tree_sha[:12]}）")
+    print(
+        f"候选镜像 manifest：{manifest_path}（{len(images)} 个镜像，PR #{args.pr_number}，tree={args.tree_sha[:12]}）"
+    )
     return 0
 
 

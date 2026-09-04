@@ -11,25 +11,33 @@ import json
 import re
 import threading
 import time
+from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Callable, Protocol
-
+from typing import Protocol
 
 _STATE_PATTERN = re.compile(r"[A-Za-z0-9_-]{32,256}\Z")
 
 
 class OAuthBridgeMessageHandler(Protocol):
-    def process(self, message: "OAuthBridgeMessage") -> None: ...
+    """默认消息处理器的可替换形状：接收一条已解析的 OAuth Bridge 消息。"""
+
+    def process(self, message: OAuthBridgeMessage) -> None:
+        """处理一条未命中 state 专用处理器的授权结果消息。"""
+        ...
 
 
 class OAuthBridgeResultSender(Protocol):
+    """向 Worker 回传授权结果的可替换形状。"""
+
     def send_result(
         self,
         state: str,
         status: str,
         debug_identity: dict[str, str | None] | None = None,
         debug_details: dict[str, object] | None = None,
-    ) -> None: ...
+    ) -> None:
+        """把某个 state 的授权结果（及可选调试信息）回传给 Worker。"""
+        ...
 
 
 @dataclass(frozen=True)
@@ -41,9 +49,13 @@ class OAuthBridgeMessage:
     code: str | None = None
 
     @classmethod
-    def parse(cls, raw: str) -> "OAuthBridgeMessage":
+    def parse(cls, raw: str) -> OAuthBridgeMessage:
+        """把一条原始 JSON 文本解析并校验为一条授权结果消息。"""
         value = json.loads(raw)
-        if not isinstance(value, dict) or value.get("type") not in {"oauth_code", "oauth_cancelled"}:
+        if not isinstance(value, dict) or value.get("type") not in {
+            "oauth_code",
+            "oauth_cancelled",
+        }:
             raise ValueError("未识别的 OAuth 桥接消息")
         state = value.get("state")
         if not isinstance(state, str) or _STATE_PATTERN.fullmatch(state) is None:
@@ -73,6 +85,7 @@ class OAuthBridgeClient:
         processor: OAuthBridgeMessageHandler | None = None,
         sleep: Callable[[float], None] = time.sleep,
     ) -> None:
+        """接入连接地址、鉴权令牌与默认处理器；不建立连接。"""
         self._url = url
         self._token = token
         self._processor = processor
@@ -84,12 +97,10 @@ class OAuthBridgeClient:
 
     def set_processor(self, processor: OAuthBridgeMessageHandler) -> None:
         """设置未注册 state 的默认处理器，保持首次开通兼容路径。"""
-
         self._processor = processor
 
     def register_state_handler(self, state: str, handler: StateHandler) -> None:
         """为当前授权 state 注册一次性业务处理器。"""
-
         if not isinstance(state, str) or _STATE_PATTERN.fullmatch(state) is None:
             raise ValueError("无效的 OAuth 状态")
         if not callable(handler):
@@ -101,7 +112,6 @@ class OAuthBridgeClient:
 
     def handle_message(self, message: OAuthBridgeMessage) -> None:
         """处理一条已完成结构校验的消息；供 WebSocket 与注入测试共用。"""
-
         if not isinstance(message, OAuthBridgeMessage):
             raise TypeError("OAuth Bridge 消息类型无效")
         with self._state_handlers_lock:
@@ -114,16 +124,22 @@ class OAuthBridgeClient:
             processor.process(message)
 
     def start(self) -> threading.Thread:
+        """在后台 daemon 线程里启动 `run_forever`，返回该线程。"""
         thread = threading.Thread(target=self.run_forever, name="lingxi-oauth-bridge", daemon=True)
         thread.start()
         return thread
 
     def run_forever(self) -> None:
+        """保持出站连接、断线重连，直到 `stop` 被调用。"""
         from websockets.sync.client import connect
 
         while not self._stop.is_set():
             try:
-                with connect(self._url, additional_headers={"Authorization": f"Bearer {self._token}"}, open_timeout=10) as socket:
+                with connect(
+                    self._url,
+                    additional_headers={"Authorization": f"Bearer {self._token}"},
+                    open_timeout=10,
+                ) as socket:
                     self._socket = socket
                     for raw in socket:
                         if self._stop.is_set():
@@ -145,6 +161,7 @@ class OAuthBridgeClient:
         debug_identity: dict[str, str | None] | None = None,
         debug_details: dict[str, object] | None = None,
     ) -> None:
+        """把授权结果回传给 Worker；连接未就绪时静默丢弃。"""
         socket = self._socket
         if socket is None:
             return
@@ -156,6 +173,7 @@ class OAuthBridgeClient:
         socket.send(json.dumps(payload))
 
     def stop(self) -> None:
+        """请求停止重连循环并关闭当前连接（若有）。"""
         self._stop.set()
         socket = self._socket
         if socket is not None:

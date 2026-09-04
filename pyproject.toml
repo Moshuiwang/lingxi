@@ -116,3 +116,71 @@ migrate = ["alembic>=1.19,<1.20", "psycopg[binary]>=3.2,<4"]
 
 [tool.unittest]
 start-directory = "tests"
+
+# ruff 锁精确版本 0.16.4，装法见 scripts/dev/gate_spec.py 与 scripts/dev/README.md；
+# 本机与 CI 用同一个版本，避免规则集随 ruff 升级静默改变判定结果。不写
+# target-version：解释器下限已经在 [project] 的 requires-python 里声明一次，
+# 两处各写一份迟早漂移，ruff 能从 requires-python 自动推断。
+[tool.ruff]
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E", "W", "F", "I", "UP", "T10", "N", "D", "PLR0913"]
+# E203/E501：与 black/ruff format 的空格与行长判定天然冲突，交给 format 处理。
+# UP031/UP042/UP046：分别是 %-格式化改 f-string、Enum 改 StrEnum、PEP 695 泛型
+# 语法——前者改动面过大且非本批目标，后两者存量各自只有个位数处、且 StrEnum
+# 会改变 str() 结果（37 处需逐处评估，登记不做）。
+# D400/D415：摘要行必须以句号/问号/叹号结尾——本仓库大量中文文档字符串以
+# 「）」「：」等中文标点或代码引用收尾，强制英文标点收尾的规则与既有写作习惯
+# 冲突，不采纳（决策清单登记不做：不接受 Google 的这条硬性标点约束）。
+ignore = ["E203", "E501", "UP031", "UP042", "UP040", "UP046", "D400", "D415"]
+
+[tool.ruff.lint.pydocstyle]
+convention = "google"
+
+[tool.ruff.lint.pylint]
+max-args = 10
+
+# 逐文件豁免表，只许变短：D 强制范围 = src/lingxi/（tests/migrations/scripts 三条目录 glob
+# 整体豁免 D，见决策清单 D-21）；src/lingxi/ 下只剩 PLR0913 存量（合同 §3 登记不做）与
+# 有意保留的 N818。任何新增条目都会被 tests/test_ruff_config.py 判红。集成者收口。
+[tool.ruff.lint.per-file-ignores]
+"migrations/**" = ["D"]
+"migrations/alembic/env.py" = ["I001"]
+"scripts/**" = ["D"]
+"scripts/ops/import_local_permission_override.py" = ["F401"]
+"scripts/probe_drive_folder_permissions.py" = ["N818"]
+"src/lingxi/adapters/claude_agent_session.py" = ["PLR0913"]
+"src/lingxi/adapters/postgres_conversation/_queue_outbox.py" = ["PLR0913"]
+"src/lingxi/adapters/postgres_local_permission.py" = ["PLR0913"]
+"src/lingxi/adapters/postgres_management_card_context.py" = ["PLR0913"]
+"src/lingxi/adapters/postgres_pending_action.py" = ["PLR0913"]
+"src/lingxi/apps/gateway/delivery.py" = ["PLR0913"]
+"src/lingxi/apps/scheduler/late_readiness_recovery.py" = ["PLR0913"]
+"src/lingxi/apps/scheduler/permission_publish.py" = ["PLR0913"]
+"src/lingxi/apps/scheduler/stalled_provisioning.py" = ["PLR0913"]
+"src/lingxi/apps/worker/report.py" = ["PLR0913"]
+"src/lingxi/core/admin/card_callback.py" = ["PLR0913"]
+"src/lingxi/core/admin/card_callback_management.py" = ["PLR0913"]
+"src/lingxi/core/admin/card_dispatch.py" = ["PLR0913"]
+# AdminCardDeliveryRejected 有意保留旧名：审计字段写的是类名，改名会让既有审计断言失效，理由见该文件类定义处。
+"src/lingxi/core/admin/notification.py" = ["N818"]
+"src/lingxi/core/execution/card_stream.py" = ["PLR0913"]
+"src/lingxi/core/permission/targeted_recompute.py" = ["PLR0913"]
+"tests/**" = ["D"]
+"tests/test_claude_agent_session_adapter.py" = ["PLR0913"]
+"tests/test_document_delivery.py" = ["PLR0913"]
+"tests/test_gateway_transport.py" = ["N818"]
+"tests/test_management_card.py" = ["N802"]
+"tests/test_metric_map_single_source.py" = ["N818"]
+"tests/test_permission_publish_duty.py" = ["PLR0913"]
+"tests/test_permission_publish_postgres.py" = ["N818"]
+"tests/test_permission_publish_row.py" = ["N802"]
+"tests/test_permission_refresh_duty.py" = ["PLR0913"]
+"tests/test_roster_access_token_supply.py" = ["PLR0913", "N818"]
+"tests/test_targeted_permission_recompute.py" = ["PLR0913"]
+"tests/test_worker_entry.py" = ["PLR0913"]
+
+# 全仓每个 .py 都参与格式化；本清单为空并由 tests/test_ruff_config.py 钉住，新增排除项即红。
+[tool.ruff.format]
+exclude = []

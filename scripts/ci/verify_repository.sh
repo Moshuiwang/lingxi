@@ -6,7 +6,7 @@ script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 repository_root=$(cd -- "${script_dir}/../.." && pwd)
 cd "${repository_root}"
 
-for required_command in git python3 shellcheck; do
+for required_command in git python3 shellcheck ruff; do
   command -v "${required_command}" >/dev/null || {
     printf '缺少 CI 命令：%s\n' "${required_command}" >&2
     exit 1
@@ -48,16 +48,89 @@ shellcheck --severity=warning "${tracked_scripts[@]}"
 #   python3 -m pip install 'shellcheck-py==0.11.0.1'
 printf 'ShellCheck：通过（%s）\n' "$(shellcheck --version | sed -n 's/^version: //p')"
 
+# ruff 锁精确版本 0.16.4：本机与 CI 装了不同版本会静默改变判定结果，同
+# ShellCheck 那条纪律。规则集本身在 pyproject.toml [tool.ruff.lint]，本脚本
+# 不重复声明一份规则清单。
+actual_ruff_version=$(ruff --version | awk '{print $2}')
+printf 'ruff 版本：%s\n' "${actual_ruff_version}"
+# 只打印版本不校验 == 没校验：PATH 上排在前面的可能是另一个 ruff（例如用户
+# 自己装的最新版）。用 gate_spec.py 现读的、工作流真正锁定的版本做期望值
+# 交叉核对——本机 check.sh 已经把装了正确版本的 venv/bin 放进 PATH 最前面，
+# CI 由安装 step 保证版本，这一步防的是两者之外的第三种情况：PATH 上还有一个
+# 未预期的 ruff 抢先命中。
+expected_ruff_version=$(python3 scripts/dev/gate_spec.py gate | sed -n 's/^RUFF_VERSION=//p')
+if [[ -z "${expected_ruff_version}" ]]; then
+  printf '从 scripts/dev/gate_spec.py 读不到 RUFF_VERSION，无法核对 ruff 版本。\n' >&2
+  exit 1
+fi
+if [[ "${actual_ruff_version}" != "${expected_ruff_version}" ]]; then
+  printf 'ruff 版本不一致：PATH 上实际是 %s，工作流锁定的是 %s——PATH 上可能还有另一个 ruff。\n' \
+    "${actual_ruff_version}" "${expected_ruff_version}" >&2
+  exit 1
+fi
+
+# git ls-files -z + mapfile -d ''：NUL 分隔，文件名里出现空格或换行也不会被
+# 拆散成多个数组元素（独立审查 P2-2）。
+mapfile -d '' -t tracked_python_files < <(git ls-files -z '*.py')
+if ((${#tracked_python_files[@]} == 0)); then
+  printf '没有找到受版本控制的 Python 文件。\n' >&2
+  exit 1
+fi
+# --config pyproject.toml：显式指定配置文件来源，防止仓库里另外放一份
+# ruff.toml/.ruff.toml 抢先生效（ruff 的配置发现顺序是就近优先，不显式指定时
+# 一个写着 `select = []` 的旁路配置文件能让检查整体放行——独立审查实测坐实）。
+# tests/test_ruff_config.py 另有断言禁止这两种文件名进入版本控制，两道防线。
+ruff check --config pyproject.toml --no-cache "${tracked_python_files[@]}"
+printf 'ruff check：通过\n'
+
+# --force-exclude：exclude 只在 ruff 自己遍历目录时生效，显式传入的文件路径默认会被
+# 无视——带上它，[tool.ruff.format].exclude 里的条目（收官后为空）才对显式路径生效。
+ruff format --config pyproject.toml --check --force-exclude "${tracked_python_files[@]}"
+printf 'ruff format --check：通过\n'
+
+# src/lingxi/ 不允许任何抑制注释，唯一合法入口是 pyproject.toml 的
+# per-file-ignores。大小写不敏感、`#` 后有无空格都要命中；除 noqa/fmt/ruff 的
+# 裸/限定形态外，还要命中 ruff 实际认得的其他生成器抑制指令——独立审查实测
+# 坐实 `# flake8: noqa`、`# ruff : noqa`（冒号前带空格）、
+# `# isort: skip_file/off/skip/split`、`# yapf: disable` 都能让 ruff 真的放行
+# 对应检查，而旧正则一条都不命中。
+#
+# 字符串字面量里恰好出现 "noqa" 等词会被一并命中——这是刻意接受的误伤：
+# 失败关闭的方向是"该判红的一条都不能漏"，不是"一个字都不多判"；真的遇到这种
+# 误伤，走 per-file-ignores 或改写那行字面量，不放宽这条 grep。
+suppression_pattern='#\s*(noqa|fmt\s*:\s*(off|skip)|(ruff|flake8)\s*:\s*noqa|isort\s*:\s*(skip_file|skip|off|split)|yapf\s*:\s*disable)'
+set +e
+suppression_comments=$(git grep -rniE "${suppression_pattern}" -- 'src/lingxi/*.py')
+suppression_grep_exit=$?
+set -e
+# git grep 退出码：0=有命中、1=无命中、>=2=grep 自身出错（例如正则写坏了）。
+# 此前的 `|| true` 把这三种情况全部压成"当作没命中"，一条命中的抑制注释和
+# 一次 grep 崩溃在门禁眼里长得一模一样——独立审查发现的问题。
+if ((suppression_grep_exit == 0)); then
+  printf 'src/lingxi/ 内发现门禁抑制注释，不允许（合法入口是 pyproject.toml 的 per-file-ignores）：\n%s\n' \
+    "${suppression_comments}" >&2
+  exit 1
+elif ((suppression_grep_exit > 1)); then
+  printf 'noqa/fmt 抑制注释扫描本身失败（git grep 退出码 %s），无法确认仓库是否干净。\n' \
+    "${suppression_grep_exit}" >&2
+  exit 1
+fi
+printf 'noqa/fmt 抑制注释扫描：通过\n'
+
 python3 scripts/ci/check_markdown_links.py
 python3 scripts/ci/check_project_skills.py
 # 验收矩阵的三态状态列与合同条款覆盖清单。这两样此前只是散文约定：
 # 断言可以没人认领、合同可以新增一节而没有任何断言，门禁照样全绿。
 python3 scripts/ci/check_acceptance_matrix.py
-# 代码框架第一节「文件体量棘轮」（Issue #238）：已超过阈值（1500 行）的文件登记在
+# 代码框架第一节「文件体量棘轮」（Issue #238）：已超过阈值（1000 行）的文件登记在
 # scripts/ci/size_ratchet_baseline.txt 里，只许变小、不许变大；未超阈值的文件不得
 # 新超过阈值。基线由 --refresh 生成，拒绝被手工调大——见该脚本头注释。
 python3 scripts/ci/check_size_ratchet.py
 python3 scripts/ci/check_matrix_row_size_ratchet.py
+# 函数体量与注释卫生两条棘轮，与文件体量棘轮同一纪律（只许收紧）：前者挡
+# src/lingxi/ 下单个函数继续变长，后者挡三类"来历腐烂"信号继续变多。
+python3 scripts/ci/check_function_size_ratchet.py
+python3 scripts/ci/check_comment_ratchet.py
 # 代码框架「二、三层之间的 import 规则」第一条（Issue #238）：core/ 不得 import
 # adapters/、apps/ 或任何外部 SDK。用 ast 遍历整棵树，含函数内延迟导入。
 python3 scripts/ci/check_core_layering.py

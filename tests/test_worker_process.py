@@ -301,21 +301,15 @@ class QueueModeSigtermWithInFlightTaskTest(unittest.TestCase):
         self,
     ) -> None:
         assert DSN is not None
-        fake_sdk_dir = Path(
-            __import__("tempfile").mkdtemp(prefix="lingxi-review173fix-fakesdk-")
-        )
-        self.addCleanup(
-            lambda: __import__("shutil").rmtree(fake_sdk_dir, ignore_errors=True)
-        )
+        fake_sdk_dir = Path(__import__("tempfile").mkdtemp(prefix="lingxi-review173fix-fakesdk-"))
+        self.addCleanup(lambda: __import__("shutil").rmtree(fake_sdk_dir, ignore_errors=True))
         _write_hanging_agent_sdk(fake_sdk_dir)
 
         shutdown_timeout_seconds = 4.0
         environment = {
             **os.environ,
             # 假 SDK 目录必须排在 src 前面才能真的把 import 挡住。
-            "PYTHONPATH": os.pathsep.join(
-                [str(fake_sdk_dir), str(REPOSITORY_ROOT / "src")]
-            ),
+            "PYTHONPATH": os.pathsep.join([str(fake_sdk_dir), str(REPOSITORY_ROOT / "src")]),
             "PYTHONUNBUFFERED": "1",
             "LINGXI_WORKER_MODE": "queue",
             "LINGXI_WORKER_READONLY_TOOLS": "mcp__query__noop",
@@ -331,9 +325,7 @@ class QueueModeSigtermWithInFlightTaskTest(unittest.TestCase):
             # .mcp.json 那一步（Epic D 闸⑥）——种子文件必须存在，否则任务会在
             # 碰到假 SDK 之前就被判定 user_mcp_config_unavailable 而失败关闭，
             # 测不到本用例真正要验证的"挂起会话下的停机预算"这件事。
-            "LINGXI_USER_ENV_ROOT": _make_user_env_root(
-                self, seed_user_id="usr-sigterm-inflight"
-            ),
+            "LINGXI_USER_ENV_ROOT": _make_user_env_root(self, seed_user_id="usr-sigterm-inflight"),
         }
         process = subprocess.Popen(
             [sys.executable, "-m", "lingxi.apps.worker"],
@@ -375,8 +367,7 @@ class QueueModeSigtermWithInFlightTaskTest(unittest.TestCase):
         self.assertIn(
             "worker.queue.shutdown_budget_exhausted",
             stderr,
-            "假 SDK 永不响应中断、永不产出终止消息，进程必须走到"
-            "「预算耗尽、不再等待」这条分支",
+            "假 SDK 永不响应中断、永不产出终止消息，进程必须走到「预算耗尽、不再等待」这条分支",
         )
         # 核心分辨力：假 SDK 完全不响应中断，若停机路径被替换成"立即 cancel
         # 不等待"，进程会在远小于 shutdown_timeout_seconds 的时间内退出——

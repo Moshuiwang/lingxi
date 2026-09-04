@@ -29,7 +29,7 @@ CHECK = _load_script()
 class _TempSourceTree:
     """搭一棵 ``<root>/lingxi/core/...`` 目录，把 ``find_violations`` 指向它。"""
 
-    def __enter__(self) -> "_TempSourceTree":
+    def __enter__(self) -> _TempSourceTree:
         self._tmp = tempfile.TemporaryDirectory()
         self.source_root = Path(self._tmp.name) / "lingxi"
         self.core_root = self.source_root / "core"
@@ -176,10 +176,7 @@ class TransitiveClosureTest(unittest.TestCase):
             )
             tree.write(
                 "conversation/pipeline.py",
-                "from lingxi.config.content import helper\n"
-                "\n"
-                "def use():\n"
-                "    return helper()\n",
+                "from lingxi.config.content import helper\n\ndef use():\n    return helper()\n",
             )
             (tree.core_root / "conversation" / "__init__.py").write_text("", encoding="utf-8")
             (tree.core_root / "__init__.py").write_text("", encoding="utf-8")
@@ -187,9 +184,7 @@ class TransitiveClosureTest(unittest.TestCase):
             violations = CHECK.find_transitive_violations(tree.source_root)
 
         self.assertTrue(violations, "间接触达 adapters 的链路应当被抓到")
-        self.assertTrue(
-            any("pipeline.py" in v and "adapters" in v for v in violations), violations
-        )
+        self.assertTrue(any("pipeline.py" in v and "adapters" in v for v in violations), violations)
         # 链条本身要可读，能看出是经由 config.content 触达的，不能只说"违反了"。
         self.assertTrue(any("lingxi.config.content" in v for v in violations), violations)
 

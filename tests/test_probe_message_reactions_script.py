@@ -58,7 +58,7 @@ def _install_fake_lark_sdk(testcase: unittest.TestCase) -> None:
 
     class ListMessageReactionRequest:
         @staticmethod
-        def builder() -> "_Builder":
+        def builder() -> _Builder:
             return _Builder()
 
     saved = {name: sys.modules.get(name) for name in _LARK_MODULE_NAMES}

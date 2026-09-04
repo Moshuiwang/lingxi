@@ -44,7 +44,7 @@ from __future__ import annotations
 
 import threading
 import unittest
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from types import SimpleNamespace
 
 from lingxi.apps.scheduler.late_readiness_recovery import (
@@ -52,10 +52,9 @@ from lingxi.apps.scheduler.late_readiness_recovery import (
     DEFAULT_RECOVERY_INTERVAL_SECONDS,
     DEFAULT_RECOVERY_LIMIT,
     LateReadinessRecoveryDuty,
-    LateReadinessRecoveryReport,
 )
 from lingxi.core.identity.onboarding_runner import FIRST_ONBOARDING_REASON, KEY_COMPLETED
-from lingxi.core.permission.mcp_readiness import (
+from lingxi.core.permission.mcp_readiness_base import (
     ReadinessAttempt,
     ReadinessBinding,
     ReadinessOutcome,
@@ -66,11 +65,14 @@ USER_B = "usr_01JQZX3M5N7P9R1T3V5W7Y9A0C"
 OPEN_ID = "ou_fake_open_id_for_tests"
 PERMISSIONS = '{"1011":["日活"]}'
 VERSION = 3
-MOMENT = datetime(2026, 8, 20, 3, 0, tzinfo=timezone.utc)
+MOMENT = datetime(2026, 8, 20, 3, 0, tzinfo=UTC)
 
 
 def _candidate(
-    *, user_id: str = USER_A, version: int = VERSION, next_attempt_no: int = 8,
+    *,
+    user_id: str = USER_A,
+    version: int = VERSION,
+    next_attempt_no: int = 8,
     system_triggered: bool = False,
 ) -> SimpleNamespace:
     """真实 ``LateOnboardingCandidate`` 的最小形状。**刻意不含 ``already_ready``**
@@ -117,9 +119,7 @@ class FakeCandidates:
     def late_onboarding_recovery_candidates(
         self, *, reason: str, recovery_interval_seconds: int, limit: int = 50
     ):
-        self.calls.append(
-            {"reason": reason, "interval": recovery_interval_seconds, "limit": limit}
-        )
+        self.calls.append({"reason": reason, "interval": recovery_interval_seconds, "limit": limit})
         if self._consumed:
             return ()
         self._consumed = True
@@ -489,9 +489,7 @@ class NotReadyCandidateTest(unittest.TestCase):
         self.assertEqual(seams["notifier"].calls, [], "未就绪绝不能发送任何消息")
 
     def test_technical_failure_does_not_activate_or_enqueue_a_notice(self) -> None:
-        duty, seams = build_duty(
-            ticker=FakeTicker({USER_A: ReadinessOutcome.TECHNICAL_FAILURE})
-        )
+        duty, seams = build_duty(ticker=FakeTicker({USER_A: ReadinessOutcome.TECHNICAL_FAILURE}))
 
         report = duty.run_once()
 
@@ -611,7 +609,9 @@ class ActiveButNeverNotifiedIsImpossibleTest(unittest.TestCase):
         self.assertEqual(store.notice_count(USER_A), 1, "自始至终只有一条通知")
         # 用户最终恰好收到一次成功送达。
         delivered_sends = sum(
-            1 for call in notifier.calls if call["dedupe_key"] == f"onboarding:recovery:{USER_A}:{VERSION}"
+            1
+            for call in notifier.calls
+            if call["dedupe_key"] == f"onboarding:recovery:{USER_A}:{VERSION}"
         )
         self.assertEqual(delivered_sends, 3, "两次失败尝试 + 一次成功，但只有一次真正送达")
 
@@ -807,9 +807,7 @@ class RoundBehaviourTest(unittest.TestCase):
 
         self.assertEqual(report.activated, 1)
         self.assertEqual(report.failed, 1)
-        self.assertIn(
-            "late_readiness_recovery.notice_processing_failed", seams["audit"].actions()
-        )
+        self.assertIn("late_readiness_recovery.notice_processing_failed", seams["audit"].actions())
 
     def test_the_round_is_scoped_to_the_declared_reason(self) -> None:
         duty, seams = build_duty()

@@ -31,6 +31,7 @@ _STEP_NAME = re.compile(r"^(\s*)- name:\s*(.+?)\s*$")
 _RUN_LINE = re.compile(r"^(\s*)run:\s*(.*)$")
 _PIP_INSTALL_EXTRAS = re.compile(r"install\s+'\.\[([^\]]+)\]'")
 _SHELLCHECK_PIN = re.compile(r"'shellcheck-py==([0-9][0-9A-Za-z.\-]*)'")
+_RUFF_PIN = re.compile(r"'ruff==([0-9][0-9A-Za-z.\-]*)'")
 _PYTHON_VERSION = re.compile(r"python-version:\s*'([0-9]+\.[0-9]+)'")
 _POSTGRES_IMAGE = re.compile(r"image:\s*(postgres:\S+)")
 _POSTGRES_AUTH = re.compile(r"POSTGRES_HOST_AUTH_METHOD:\s*(\S+)")
@@ -103,7 +104,14 @@ def _run_command_lines(step_text: str) -> list[str]:
             later_indent = len(later) - len(later.lstrip(" "))
             if later_indent <= base_indent:
                 break
-            block.append(later.strip())
+            stripped = later.strip()
+            # 跳过 shell 注释行：`run: |` 块里一行注释掉的旧安装命令（例如
+            # `# python3 -m pip install '.[old]' 'shellcheck-py==0.9.0'`）
+            # 不应该被当成"这一步真正要执行的命令"去解析版本号——独立审查
+            # 实测坐实过这个误判（取到了注释里的旧版本，不是真正生效的那行）。
+            if stripped.startswith("#"):
+                continue
+            block.append(stripped)
         if not block:
             raise GateSpecError("`run:` 块写法下没有找到任何命令行")
         return block
@@ -119,6 +127,11 @@ def _pip_install_extras(command: str) -> list[str]:
 
 def _shellcheck_pin(command: str) -> str | None:
     match = _SHELLCHECK_PIN.search(command)
+    return match.group(1) if match else None
+
+
+def _ruff_pin(command: str) -> str | None:
+    match = _RUFF_PIN.search(command)
     return match.group(1) if match else None
 
 
@@ -149,11 +162,13 @@ class GateSpec:
         *,
         extras: list[str],
         shellcheck_version: str,
+        ruff_version: str,
         python_version: str,
         postgres: dict[str, str],
     ) -> None:
         self.extras = extras
         self.shellcheck_version = shellcheck_version
+        self.ruff_version = ruff_version
         self.python_version = python_version
         self.postgres = postgres
 
@@ -161,9 +176,17 @@ class GateSpec:
 class FastSpec:
     """`Story Fast / fast`（story.yml）的环境配方——无真库、无镜像。"""
 
-    def __init__(self, *, extras: list[str], shellcheck_version: str, python_version: str) -> None:
+    def __init__(
+        self,
+        *,
+        extras: list[str],
+        shellcheck_version: str,
+        ruff_version: str,
+        python_version: str,
+    ) -> None:
         self.extras = extras
         self.shellcheck_version = shellcheck_version
+        self.ruff_version = ruff_version
         self.python_version = python_version
 
 
@@ -182,6 +205,9 @@ def parse_gate_spec(ci_yml_text: str) -> GateSpec:
     shellcheck_version = _shellcheck_pin(install_cmd)
     if shellcheck_version is None:
         raise GateSpecError(f"安装依赖这一步没有锁定 shellcheck-py 版本：{install_cmd!r}")
+    ruff_version = _ruff_pin(install_cmd)
+    if ruff_version is None:
+        raise GateSpecError(f"安装依赖这一步没有锁定 ruff 版本：{install_cmd!r}")
 
     smoke_step = _step_block(job, "真实 Agent SDK 冒烟（不调模型、不用凭据）")
     smoke_lines = _run_command_lines(smoke_step)
@@ -193,6 +219,7 @@ def parse_gate_spec(ci_yml_text: str) -> GateSpec:
     return GateSpec(
         extras=extras,
         shellcheck_version=shellcheck_version,
+        ruff_version=ruff_version,
         python_version=_python_version(job),
         postgres=_postgres_service(job),
     )
@@ -206,9 +233,13 @@ def parse_fast_spec(story_yml_text: str) -> FastSpec:
     shellcheck_version = _shellcheck_pin(install_cmd)
     if shellcheck_version is None:
         raise GateSpecError(f"安装依赖这一步没有锁定 shellcheck-py 版本：{install_cmd!r}")
+    ruff_version = _ruff_pin(install_cmd)
+    if ruff_version is None:
+        raise GateSpecError(f"安装依赖这一步没有锁定 ruff 版本：{install_cmd!r}")
     return FastSpec(
         extras=extras,
         shellcheck_version=shellcheck_version,
+        ruff_version=ruff_version,
         python_version=_python_version(job),
     )
 
@@ -234,6 +265,7 @@ def _main() -> int:
             spec = load_gate_spec()
             print(f"EXTRAS={','.join(spec.extras)}")
             print(f"SHELLCHECK_VERSION={spec.shellcheck_version}")
+            print(f"RUFF_VERSION={spec.ruff_version}")
             print(f"PYTHON_VERSION={spec.python_version}")
             print(f"POSTGRES_IMAGE={spec.postgres['image']}")
             print(f"POSTGRES_AUTH_METHOD={spec.postgres['auth_method']}")
@@ -242,6 +274,7 @@ def _main() -> int:
             spec = load_fast_spec()
             print(f"EXTRAS={','.join(spec.extras)}")
             print(f"SHELLCHECK_VERSION={spec.shellcheck_version}")
+            print(f"RUFF_VERSION={spec.ruff_version}")
             print(f"PYTHON_VERSION={spec.python_version}")
     except GateSpecError as error:
         print(f"gate_spec：解析 {args.job} 的环境配方失败：{error}", file=sys.stderr)

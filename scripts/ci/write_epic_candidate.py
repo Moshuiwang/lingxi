@@ -8,7 +8,6 @@ import json
 import re
 from pathlib import Path
 
-
 SHA = re.compile(r"^[0-9a-f]{40}$")
 
 
@@ -19,7 +18,11 @@ def candidate_document(
         raise ValueError("repository 必须是 owner/name")
     if pr_number <= 0 or run_id <= 0:
         raise ValueError("pr_number 与 run_id 必须为正整数")
-    for label, value in (("head_sha", head_sha), ("tested_sha", tested_sha), ("tree_sha", tree_sha)):
+    for label, value in (
+        ("head_sha", head_sha),
+        ("tested_sha", tested_sha),
+        ("tree_sha", tree_sha),
+    ):
         if not SHA.fullmatch(value):
             raise ValueError(f"{label} 不是 40 位小写 Git SHA")
     return {
@@ -53,7 +56,9 @@ def main() -> int:
         run_id=args.run_id,
     )
     args.output.parent.mkdir(parents=True, exist_ok=True)
-    args.output.write_text(json.dumps(document, ensure_ascii=False, sort_keys=True) + "\n", encoding="utf-8")
+    args.output.write_text(
+        json.dumps(document, ensure_ascii=False, sort_keys=True) + "\n", encoding="utf-8"
+    )
     print(f"Epic 候选证明：PR #{args.pr_number}，tree={args.tree_sha[:12]}")
     return 0
 

@@ -1,70 +1,26 @@
 """读取「公司 + 职能 → 指标名」翻译映射配置文件（标准库 tomllib，无新增依赖）。
 
-文件 I/O 放在 adapters：``core.permission.metric_translation`` 只接收已解析的文档，
-保证映射规则本身可以在无文件系统的单测里被完整证伪。形状照
-:mod:`lingxi.adapters.role_function_map_file`（同一份三层分工：配置文件随包发布 →
-本模块解析 → ``core`` 校验并使用）。
-
-## 外置路径（Issue #320）
-
-产品负责人 2026-08-26 就 Issue #320 裁定：指标映射表的维护人（产品负责人本人）应当
-能够直接编辑这份文件，不必为一行映射改动走一次完整镜像构建发布——挂载方式与
-系统提示词文件同一模式（见 ``apps/worker/service.py`` 的
-``_load_task_system_prompt``）。**但生效时机不同**：系统提示词文件是 worker 每个
-任务开始时现读，编辑后下一条消息即生效；本模块的读取点
-``apps/scheduler/assembly.py`` 的 ``_build_permission_refresh_duty`` 在 scheduler
-进程启动时只被 ``build_loop`` 调用**一次**（防止两处读文件互相漂移的刻意设计），
-因此编辑外置文件后需要重启 scheduler 容器
-（``docker compose --env-file deploy/.env.stage -f deploy/compose.yaml -f
-deploy/compose.stage.yaml restart scheduler``，prod 同构换成
-``.env.prod``/``compose.prod.yaml``；不需重建镜像）才会被读到新内容——不能用
-``docker compose up -d`` 重启 scheduler：compose 配置本身未变时它判定 up-to-date 不会
-重启，而这里改的是外置文件、不是 compose 配置，正是此情形；下方「加载成功时记录
-内容 digest 到日志」一节的 digest 行是重启后核对"读到了哪一版"的手段。例外：
-`apps/scheduler/daily_report.py`
-的每日通报「未覆新指标」日检段每次现读，不受此限、无需重启。因此
-:func:`load_company_function_metric_map` 从
-``apps/scheduler/assembly.py`` 接收的 ``path`` 参数不再总是包内默认路径：装配层会先读
-``LINGXI_COMPANY_FUNCTION_METRIC_MAP_PATH``（``apps/scheduler/config.py`` 的
-``SchedulerConfig.company_function_metric_map_path``），配了就把它转成 ``Path`` 传进来，
-本函数因此**优先**读那份外置文件；未配置时装配层传 ``None``，本函数落回包内默认，
-逐字节保持此前行为。
-
-**外置文件缺失或格式非法：响亮失败，不静默回落包内默认**——这是本函数一直以来的既有
-语义（见下方文档字符串「空映射合法／读不出来不合法」），外置路径注入没有新开一条更
-宽容的路径：调用方（`apps/scheduler/assembly.py` 的 ``_build_permission_refresh_duty``）
-既有的 ``except (OSError, ValueError)`` 分支原样覆盖这条外置路径，`metric_translation_
-map_unavailable` 审计记录里因此既可能是包内文件损坏，也可能是外置路径配错，两者都不
-静默——运维用 `deploy/验收前部署配置清单.md` 登记的挂载方式核对即可，不需要新分支。
-
-## 两条路径同一个来源（Trace #544 S-2c）
-
-外置路径起初只有 scheduler 侧接线，gateway 侧三个调用点
-（``adapters/postgres_permission_recompute_trigger.py`` 的定向重算、
-``adapters/postgres_pending_action.py`` 的职位展开、``adapters/feishu_admin_card.py``
-的管理卡目录）一直硬读随包默认文件——外置文件一旦启用，同一份映射在两条路径上给出
-不同答案：管理员确认一个本地动作，gateway 按**旧的内置表**立即发布一个更宽的范围，
-次日日批再按外置表翻回来（对抗审查 P-1）。现在三处都由各自的装配层把
-:func:`parse_metric_map_path` 的结果注入进来（构造参数 ``metric_map_path``，
-**没有默认值**——新调用点不可能"忘了传"而悄悄退回随包默认）。
-
-**运维前提**：这个变量要么两个进程（scheduler 与 gateway）都配、指向同一份文件，
-要么两个都不配。只配一边＝两条路径又各读各的，正是本节要消灭的分叉。
-
-**加载成功时记录内容 digest 到日志**（沿用系统提示词的先例：`hashlib.sha256(...).
-hexdigest()[:12]`，短摘要足以判断"内容变没变"，不需要可逆）——digest 取的是**文件原始
-字节**，不是解析后的 Python 结构，这样同一份文件不论换行符、键序如何书写，只要字节
-完全相同就得到相同 digest，反之亦然；产品负责人编辑外置文件、重启 scheduler 容器后
-可以直接对照这一行日志确认"这次改动确实被 scheduler 读到了"，不需要额外核对手段。
+文件 I/O 放在 adapters：``core.permission.metric_translation`` 只接收已解析
+文档，可在无文件系统的单测里完整证伪。三层分工同
+:mod:`lingxi.adapters.role_function_map_file`：随包发布 → 本模块解析 →
+``core`` 校验并使用。
+外置路径：产品负责人可直接编辑此文件生效，无需重建镜像；但本模块只在
+scheduler 启动时读一次，编辑后需显式 restart（``up -d`` 不触发）scheduler
+容器才生效，`daily_report.py` 例外、每日现读。缺失或格式非法一律响亮失败，
+不静默回落包内默认。
+两条路径必须同源：scheduler 与三个 gateway 调用点都经
+:func:`parse_metric_map_path` 注入路径（无默认值），要么都配同一份文件、
+要么都不配，否则两条路径各读各的、给出不同答案。加载成功记录内容 digest
+（文件原始字节 sha256 前 12 位）到日志，供重启后核对是否读到新内容。
 """
 
 from __future__ import annotations
 
 import hashlib
 import logging
+import tomllib
 from collections.abc import Mapping
 from pathlib import Path
-import tomllib
 
 from lingxi.core.permission.metric_translation import build_company_function_metric_map
 
@@ -75,7 +31,6 @@ _CONFIG_FILE_NAME = "company_function_metric_map.toml"
 
 def default_company_function_metric_map_path() -> Path:
     """随包发布的配置文件路径。"""
-
     return Path(__file__).resolve().parents[1] / "config" / _CONFIG_FILE_NAME
 
 
@@ -88,23 +43,12 @@ METRIC_MAP_PATH_ENV = "LINGXI_COMPANY_FUNCTION_METRIC_MAP_PATH"
 def parse_metric_map_path(raw: str | None) -> Path | None:
     """把 :data:`METRIC_MAP_PATH_ENV` 的取值解释成"这台机器该读哪一份映射"。
 
-    **唯一一处**做这件事的函数（Trace #544 S-2c，对抗审查 P-1）：此前 scheduler
-    读外置文件、gateway 侧三个调用点硬读随包默认文件，同一份「公司 × 职能 → 指标」
-    在两条路径上因此可以给出不同答案——管理动作经 gateway 立即发布的范围，与次日
-    日批经 scheduler 重算的范围会分叉，而且每次翻转都真的写用户可见的权限。两个
-    进程的配置对象现在都经过本函数，不再各写一套解释逻辑等着慢慢漂移。
-
-    未配置/空白 → ``None``：调用方落回随包默认文件，与外置能力交付前逐字节一致。
-    **"不配置"始终是合法状态**（生产刻意不配这个变量，见 ``deploy/.env.example``
-    该条目），不是一种要在启动期拒绝的缺失。配了但含空白字符 → ``ValueError``：
-    错配不是未配，与 ``apps/scheduler/config.py`` 其余标识类变量同一条纪律；只报
-    变量名，不回显取到的值。
-
-    **文件是否存在、内容是否合法不在这里判定**——那是
-    :func:`load_company_function_metric_map` 读取时的事（配了却读不到一律响亮失败，
-    见下方函数文档）。两处各判一次，判据迟早漂移。
+    唯一一处做这件事的函数：两个进程都经它解释同一个环境变量，不再各写一套
+    解释逻辑（模块文档「两条路径必须同源」）。未配置/空白 → ``None``，落回
+    随包默认文件——"不配置"始终合法。配了但含空白字符 → ``ValueError``，只报
+    变量名、不回显取到的值。文件是否存在、内容是否合法不在这里判定，那是
+    :func:`load_company_function_metric_map` 的事。
     """
-
     value = (raw or "").strip()
     if not value:
         return None
@@ -118,19 +62,14 @@ def load_company_function_metric_map(
 ) -> Mapping[str, Mapping[str, tuple[str, ...]]]:
     """解析并校验配置文件；文件缺失或格式错误一律抛错，不静默退化为空映射。
 
-    **空映射本身是合法内容**（``[companies]`` 表存在但没有任何条目——产品负责人尚未
-    填入映射时的正常状态，见配置文件与 ``core.permission.metric_translation`` 的模块
-    文档），这里不拒绝它。这里拒绝的是"文件读不出来"或"文件里的东西形状不对"：那两种
-    是配置错误，不该被悄悄当成"暂时没有内容"处理——否则一次文件损坏会和"产品负责人还
-    没填"表现成同一个空映射，运维无法分辨。
+    空映射本身是合法内容（产品负责人尚未填入映射时的正常状态），这里不拒绝
+    它；拒绝的是"文件读不出来"或"形状不对"——那是配置错误，悄悄当空内容处理
+    会让文件损坏和"还没填"表现成同一种状态，运维无法分辨。
 
-    ``path`` 为 ``None`` 时落回包内默认路径（此前唯一的行为）；调用方传入的显式路径
-    ——不论指向包内默认还是运行时外置文件——都按**同一套**规则处理，没有专门为外置
-    路径放宽的分支（模块文档「外置路径」一节）。加载成功后向日志记一行内容 digest，
-    见模块文档；加载失败（本函数向上抛出之前）不记这一行——digest 只描述"读到了什么"，
-    不该在没读到任何东西时也输出一个看似有效的值。
+    ``path`` 为 ``None`` 时落回包内默认路径；显式路径不论指向包内还是外置
+    文件都按同一套规则处理，没有专门放宽的分支。加载成功后记一行内容
+    digest（模块文档），加载失败不记——digest 只描述"读到了什么"。
     """
-
     config_path = path or default_company_function_metric_map_path()
     with config_path.open("rb") as config_file:
         raw = config_file.read()

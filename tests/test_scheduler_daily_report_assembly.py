@@ -61,7 +61,9 @@ class BuilderFunctionTests(unittest.TestCase):
 
     def test_a_configured_chat_id_registers_the_duty(self) -> None:
         audit = RecordingAudit()
-        config = SchedulerConfig.from_env({**COMPLETE_ENV, "LINGXI_ADMIN_GROUP_CHAT_ID": FAKE_CHAT_ID})
+        config = SchedulerConfig.from_env(
+            {**COMPLETE_ENV, "LINGXI_ADMIN_GROUP_CHAT_ID": FAKE_CHAT_ID}
+        )
 
         duty = _build_daily_report_duty(config, stop=threading.Event(), audit=audit)
 
@@ -81,7 +83,9 @@ class BuilderFunctionTests(unittest.TestCase):
         """
 
         audit = RecordingAudit()
-        config = SchedulerConfig.from_env({**COMPLETE_ENV, "LINGXI_ADMIN_GROUP_CHAT_ID": FAKE_CHAT_ID})
+        config = SchedulerConfig.from_env(
+            {**COMPLETE_ENV, "LINGXI_ADMIN_GROUP_CHAT_ID": FAKE_CHAT_ID}
+        )
 
         duty = _build_daily_report_duty(config, stop=threading.Event(), audit=audit)
 
@@ -123,7 +127,9 @@ class BuilderFunctionTests(unittest.TestCase):
         不能在装配这一层悄悄丢掉——否则「送达失败不静默」只是一句空话。"""
 
         audit = RecordingAudit()
-        config = SchedulerConfig.from_env({**COMPLETE_ENV, "LINGXI_ADMIN_GROUP_CHAT_ID": FAKE_CHAT_ID})
+        config = SchedulerConfig.from_env(
+            {**COMPLETE_ENV, "LINGXI_ADMIN_GROUP_CHAT_ID": FAKE_CHAT_ID}
+        )
         observed: list[tuple[str, bool]] = []
 
         def on_send_outcome(operation: str, succeeded: bool) -> None:
@@ -157,10 +163,14 @@ class BuilderFunctionTests(unittest.TestCase):
 
         self.assertNotEqual(DAILY_REPORT_UUID_PREFIX, DELIVERY_UUID_PREFIX)
 
-        value = delivery_uuid(FAKE_CHAT_ID, "daily-report:2026-08-24", prefix=DAILY_REPORT_UUID_PREFIX)
+        value = delivery_uuid(
+            FAKE_CHAT_ID, "daily-report:2026-08-24", prefix=DAILY_REPORT_UUID_PREFIX
+        )
         self.assertLessEqual(len(value), 50, "投递去重 ID 不得超过飞书 uuid 字段的 50 字符上限")
 
-        config = SchedulerConfig.from_env({**COMPLETE_ENV, "LINGXI_ADMIN_GROUP_CHAT_ID": FAKE_CHAT_ID})
+        config = SchedulerConfig.from_env(
+            {**COMPLETE_ENV, "LINGXI_ADMIN_GROUP_CHAT_ID": FAKE_CHAT_ID}
+        )
         duty = _build_daily_report_duty(config, stop=threading.Event(), audit=RecordingAudit())
         assert duty is not None
         self.assertEqual(duty._sender._uuid_prefix, DAILY_REPORT_UUID_PREFIX)  # noqa: SLF001
@@ -236,7 +246,9 @@ class FullAssemblyTests(unittest.TestCase):
             {
                 **COMPLETE_ENV,
                 "LINGXI_DELEGATED_CREDENTIAL_KEY": Fernet.generate_key().decode(),
-                "LINGXI_DELEGATED_CREDENTIAL_PATH": str(pathlib.Path(directory.name) / "delegated.enc"),
+                "LINGXI_DELEGATED_CREDENTIAL_PATH": str(
+                    pathlib.Path(directory.name) / "delegated.enc"
+                ),
                 **extra,
             }
         )

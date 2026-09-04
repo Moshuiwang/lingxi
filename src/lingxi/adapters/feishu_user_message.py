@@ -1,37 +1,25 @@
-"""向**用户本人**主动发一条纯文本消息（权限变化通知的出站面）。
+"""向用户本人主动发一条纯文本消息（权限变化通知的出站面）。
 
-[Issue #156](https://github.com/Moshuiwang/lingxi/issues/156) 的 S-C-03b。什么时候发、
-发什么字，见 :mod:`lingxi.core.permission.notification`；本模块只把协议细节做对。
+什么时候发、发什么字，见 :mod:`lingxi.core.permission.notification`；本模块
+只把协议细节做对。与 :mod:`lingxi.adapters.feishu_group_message` 同一个飞书
+接口（``im/v1/messages``），只是 ``receive_id_type`` 从 ``chat_id`` 换成
+``open_id``，沿用同一套姿态：urllib、零新增依赖、去重 ``uuid`` 由同一个
+:func:`~lingxi.adapters.feishu_group_message.delivery_uuid` 算。
 
-**与 :mod:`lingxi.adapters.feishu_group_message` 的关系**：同一个飞书接口
-（``im/v1/messages``），只是 ``receive_id_type`` 从 ``chat_id`` 换成 ``open_id``。
-沿用同一套姿态——urllib、**零新增依赖**、构造函数只存参数不建 client、去重 ``uuid``
-由同一个 :func:`~lingxi.adapters.feishu_group_message.delivery_uuid` 算（前缀不同，
-理由见那个函数的文档）。
-
-**为什么不把两者合成一个类**：两条链的**收件人语义**完全不同，而这正是最不该被一个
-参数悄悄切换的东西。管理群那条有一条硬约束——正文里不得有任何可执行入口
-（`V-花名册-24`），且收件人是一个受控群；这条的收件人是**具体的自然人**，正文里带着
-他自己的权限范围。合成一个类之后，"发错对象"退化成一次传参错误：把用户 open_id 传给
-日报、或者把群 ID 传给权限通知，两次都能发出去。分成两个类之后，两边各自在入口校验
-自己的收件人形状（``ou_`` / ``oc_``），传错在**发出去之前**就失败。
-
-**本模块的真实调用未验证（证据等级 1）**，与 ``feishu_group_message.py`` 同一姿态：
-全部断言跑在注入的假传输层上。「重试携带同一个 ``uuid``」是**代码事实**；「飞书因此
-一定不会重复投递」是**平台行为**，未验证，属 L4a。同样未验证的还有：应用能不能主动
-向一个从未与它对话过的用户发起私聊（真实私聊行为）。这两条沿用既有登记，不在本切片
-声称。
-
-凭据边界：``app_secret`` 只出现在**请求体**里，不进 URL、不进日志、不进异常消息；
-``open_id`` 是外部标识，不进错误消息与日志正文；通知正文一个字都不进日志。
+为什么不合成一个类：两条链的收件人语义完全不同——群那条收件人是受控群、
+正文不得有可执行入口；这条收件人是具体自然人、正文带着他自己的权限范围。
+合成一个类后"发错对象"退化成一次传参错误；分开后各自在入口校验自己的
+收件人形状（``ou_`` / ``oc_``），传错在发出去之前就失败。
+真实调用未验证：断言跑在注入的假传输层上。凭据边界：``app_secret`` 只
+出现在请求体里，不进 URL/日志/异常消息；``open_id`` 与通知正文都不进日志。
 """
 
 from __future__ import annotations
 
 import json
 import logging
-from collections.abc import Mapping
-from typing import Any, Callable
+from collections.abc import Callable, Mapping
+from typing import Any
 
 from lingxi.adapters.feishu_group_message import delivery_uuid
 
@@ -60,6 +48,7 @@ class FeishuUserMessageError(RuntimeError):
     """
 
     def __init__(self, code: str, *, definite: bool | None = None) -> None:
+        """记录错误码，并按 `definite` 或错误码前缀判定是否为飞书明确拒绝。"""
         super().__init__(f"飞书用户消息发送失败：{code}")
         self.code = code
         self.definite = definite if definite is not None else code.startswith("feishu_code_")
@@ -72,7 +61,6 @@ def validate_user_open_id(value: str, *, label: str = "用户 open_id") -> str:
     群 ``chat_id`` 以 ``oc_`` 开头，用户 ``open_id`` 以 ``ou_`` 开头，两者在类型上
     都是字符串，混用不会有任何报错——只会把一个人的权限范围发进一个群。
     """
-
     text = (value or "").strip()
     if not text.startswith(USER_OPEN_ID_PREFIX) or len(text) <= len(USER_OPEN_ID_PREFIX):
         raise ValueError(
@@ -90,22 +78,18 @@ def _require_https(base_url: str) -> str:
 
 
 def _no_redirect_opener() -> Any:
-    """构造一个**不跟随重定向**的 opener（与 ``query_mcp_probe`` 同一条理由）。
+    """构造一个不跟随重定向的 opener。
 
-    ``urllib`` 默认会自动跟随 3xx，并且**把 ``Authorization`` 请求头一起转发到新地址**。
-    本模块的请求头里带的是应用身份令牌（``tenant_access_token``），一个被劫持或误配的
-    ``302`` 就能把它送到另一个主机、甚至从 https 降级到 http 明文——而调用方只会看到一次
-    "成功"。:func:`_require_https` 只管得住我们**主动**填的那个地址，管不住服务端让我们
-    再去哪里。
-
-    做法是让 ``redirect_request`` 返回 ``None``：``urllib`` 于是把 3xx 当成
+    ``urllib`` 默认会自动跟随 3xx 并把 ``Authorization`` 请求头一起转发到新
+    地址——本模块请求头里带的是应用身份令牌，一个被劫持或误配的 302 就能把
+    它送到另一个主机甚至降级到 http 明文，而调用方只会看到一次"成功"。做法
+    是让 ``redirect_request`` 返回 ``None``，``urllib`` 于是把 3xx 当成
     :class:`HTTPError` 抛出，落进下面的错误分类。
     """
-
     from urllib.request import HTTPRedirectHandler, build_opener
 
     class _NoRedirect(HTTPRedirectHandler):
-        def redirect_request(self, req, fp, code, msg, headers, newurl):  # noqa: D102 - 见外层文档
+        def redirect_request(self, req, fp, code, msg, headers, newurl):  # 见外层文档
             return None
 
     return build_opener(_NoRedirect())
@@ -125,7 +109,6 @@ def no_redirect_transport(
     改默认行为属于本 Story 之外的回归面；这里只让**新增的**这条出站链路从一开始就没有
     转发凭据的路径（同 ``query_mcp_probe`` 的 F4 型处置）。
     """
-
     from urllib.error import HTTPError, URLError
     from urllib.request import Request
 
@@ -135,7 +118,7 @@ def no_redirect_transport(
         headers["Authorization"] = f"Bearer {token}"
     request = Request(url, data=payload, headers=headers, method=method)
     try:
-        with _no_redirect_opener().open(  # noqa: S310 - 地址来自受控配置且已校验 https
+        with _no_redirect_opener().open(  # 地址来自受控配置且已校验 https
             request, timeout=REQUEST_TIMEOUT_SECONDS
         ) as response:
             return json.loads(response.read())
@@ -143,7 +126,7 @@ def no_redirect_transport(
         # 3xx 也走这里（opener 不跟随），与其它非 2xx 一样按响应体分类。
         try:
             return json.loads(error.read())
-        except Exception as parse_error:  # noqa: BLE001 - 读不出响应体就只剩状态码
+        except Exception as parse_error:  # 读不出响应体就只剩状态码
             raise FeishuUserMessageError(f"http_{error.code}") from parse_error
     except (URLError, OSError, TimeoutError) as error:
         raise FeishuUserMessageError("transport_error") from error
@@ -168,6 +151,7 @@ class FeishuUserMessages:
         transport: Callable[..., Any] | None = None,
         uuid_prefix: str = NOTICE_UUID_PREFIX,
     ) -> None:
+        """接入用户消息发送所需的凭据、传输层与去重前缀；不建 client、不发请求。"""
         self._base_url = _require_https(base_url)
         self._app_id = app_id
         self._app_secret = app_secret
@@ -185,7 +169,6 @@ class FeishuUserMessages:
         翻译一次，改动面反而落到一个已经交付并验收过的模块上。重复的是 12 行协议细节，
         不是任何判定；两边的行为各自由自己的用例钉住。
         """
-
         response = self._transport(
             "POST",
             f"{self._base_url}/auth/v3/tenant_access_token/internal",
@@ -202,20 +185,14 @@ class FeishuUserMessages:
         return token
 
     def send_text(self, *, open_id: str, text: str, dedupe_key: str) -> None:
-        """向 ``open_id`` 这个人发一条**纯文本**消息。
+        """向 ``open_id`` 这个人发一条纯文本消息。
 
-        刻意只支持文本、不支持卡片：权限变化通知是一条告知，**没有任何可操作入口**——
-        用户要做的事（发起一次查询、联系管理员）都在正文里说清楚了，加按钮只会制造一个
-        我们还没有定义过语义的回调面。
-
-        ``dedupe_key`` 标识"这是同一次逻辑通知"。同一次变化的首发与全部重试必须传同一个
-        值（调用方用 ``(用户, 权限版本)``），由 :func:`~lingxi.adapters.
-        feishu_group_message.delivery_uuid` 折成飞书的 ``uuid`` 交服务端去重。做成
-        **必填参数**而不是可选：忘了传就等于回到"结果不明时必然重复投递"。
-
-        取令牌那一步没有 ``uuid``：它是幂等的读操作，重复取令牌不产生任何用户可见后果。
+        刻意只支持文本、不支持卡片：权限变化通知是一条告知，没有任何可操作
+        入口——用户要做的事都在正文里说清楚了，加按钮只会制造一个还没定义
+        过语义的回调面。``dedupe_key`` 标识"这是同一次逻辑通知"，同一次变化
+        的首发与全部重试必须传同一个值，做成必填参数而不是可选：忘了传就
+        等于回到"结果不明时必然重复投递"。
         """
-
         receiver = validate_user_open_id(open_id)
         if not isinstance(text, str) or not text.strip():
             # 空正文发出去就是一条噪声消息，而且它一定来自渲染侧的缺陷。

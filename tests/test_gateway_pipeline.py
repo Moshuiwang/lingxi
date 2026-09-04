@@ -23,7 +23,7 @@ from __future__ import annotations
 
 import unittest
 import unittest.mock
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 
 from gateway_fakes import (
     CallLog,
@@ -37,6 +37,7 @@ from gateway_fakes import (
     FakeTask,
     provisioned_user,
 )
+
 from lingxi.adapters.feishu_events import (
     EventParseError,
     NonPrivateChatError,
@@ -46,22 +47,26 @@ from lingxi.config.content import (
     KEY_PREPROVISIONED_FIRST_CHAT,
     ContentCatalog,
     ContentRenderError,
-    RenderedContent,
     default_content_catalog,
 )
 from lingxi.core.conversation import (
     BUSY_HINT_TEXT,
+    DispatchGates,
     EventPipeline,
     InboundMessage,
     UserRecord,
     UserState,
 )
-from lingxi.core.user_memory import UserMemoryEntry
-from lingxi.core.conversation.ports import HandledAs
-from lingxi.core.conversation.ports import OnboardingMessage, OnboardingResult, OnboardingState
+from lingxi.core.conversation.ports import (
+    HandledAs,
+    OnboardingMessage,
+    OnboardingResult,
+    OnboardingState,
+)
 from lingxi.core.conversation.session_window import should_resume_session
+from lingxi.core.user_memory import UserMemoryEntry
 
-NOW = datetime(2026, 8, 6, 12, 0, tzinfo=timezone.utc)
+NOW = datetime(2026, 8, 6, 12, 0, tzinfo=UTC)
 # 产品负责人 2026-08-16 定稿的 `/new` 成功文字确认（Issue #175 评论 5306860379），
 # 逐字比对；下方 ``test_new_session_text_matches_the_pm_final_copy`` 另外断言内容
 # 目录里的实际值与这个定稿一致，两头都不能漂移。
@@ -72,7 +77,9 @@ NEW_SESSION_TEXT = "已开启新会话，可以开始提问。"
 SESSION_ROTATED_TEXT = "已开启新会话（距上次对话已超过两小时），本次提问不携带此前上下文。"
 # Trace #304 批次 5 直修：以 / 开头但不被认识的业务消息的固定拒绝文案。同上，下方
 # ``SlashCommandRejectionTests`` 另有一条用例断言内容目录里的实际值与这里一致。
-SLASH_REJECTED_TEXT = "以 / 开头的内容会被识别为系统命令，暂不支持。请去掉开头的斜杠，用自然语言重新描述你的问题。"
+SLASH_REJECTED_TEXT = (
+    "以 / 开头的内容会被识别为系统命令，暂不支持。请去掉开头的斜杠，用自然语言重新描述你的问题。"
+)
 
 
 def message(
@@ -130,9 +137,11 @@ class PipelineTestCase(unittest.TestCase):
             audit=FakeAudit(self.log),
             onboarding=onboarding,
             should_stop=should_stop,
-            admin_router=admin_router,
-            innertest_roster_gate=innertest_roster_gate,
-            delegated_subject_open_id=delegated_subject_open_id,
+            gates=DispatchGates(
+                admin_router=admin_router,
+                innertest_roster_gate=innertest_roster_gate,
+                delegated_subject_open_id=delegated_subject_open_id,
+            ),
         )
 
 
@@ -381,7 +390,8 @@ class PreprovisionFirstChatNoticeTests(PipelineTestCase):
             self.log.count("audit.onboarding.preprovision_notice_scope_unavailable"), 1
         )
         self.assertEqual(
-            self.log.count("store.consume_preprovision_notice"), 0,
+            self.log.count("store.consume_preprovision_notice"),
+            0,
             "渲染失败绝不消费一次性标志",
         )
         self.assertIn("usr_1", self.state.pending_preprovision_notices)
@@ -402,11 +412,10 @@ class PreprovisionFirstChatNoticeTests(PipelineTestCase):
 
         outcome = self.build().handle_message(message("e1"), now=NOW)
         self.assertEqual(outcome.handled_as, HandledAs.TASK_QUEUED)
+        self.assertEqual(self.log.count("audit.onboarding.preprovision_notice_content_missing"), 1)
         self.assertEqual(
-            self.log.count("audit.onboarding.preprovision_notice_content_missing"), 1
-        )
-        self.assertEqual(
-            self.log.count("store.consume_preprovision_notice"), 0,
+            self.log.count("store.consume_preprovision_notice"),
+            0,
             "渲染失败绝不消费一次性标志",
         )
         self.assertIn("usr_1", self.state.pending_preprovision_notices)
@@ -448,7 +457,11 @@ class TaskOwnershipTests(unittest.TestCase):
         self.assertEqual(parsed.sender_open_id, "ou_real_sender")
         # InboundMessage 根本没有第二个用户标识字段——这是结构性的，不是靠自觉
         self.assertFalse(
-            [name for name in vars(parsed) if name.endswith("open_id") and name != "sender_open_id"],
+            [
+                name
+                for name in vars(parsed)
+                if name.endswith("open_id") and name != "sender_open_id"
+            ],
             "InboundMessage 不得出现第二个用户标识字段",
         )
 
@@ -499,8 +512,7 @@ class TaskClaimNonBlockingGuardTest(unittest.TestCase):
         self.assertIn(
             "status = 'queued'",
             source,
-            "没有在 claim() 里找到领取 queued 任务的查询——本守卫的落点可能已经"
-            "漂移，需要重新核对",
+            "没有在 claim() 里找到领取 queued 任务的查询——本守卫的落点可能已经漂移，需要重新核对",
         )
         self.assertIn(
             "FOR UPDATE SKIP LOCKED",
@@ -738,9 +750,7 @@ class GroupMentionHintTests(unittest.TestCase):
     def test_a_second_mention_within_the_hour_is_throttled_to_silence(self) -> None:
         log = CallLog()
         clock = [0.0]
-        handler = self._handler(
-            bot_open_id=self.BOT_OPEN_ID, log=log, clock=lambda: clock[0]
-        )
+        handler = self._handler(bot_open_id=self.BOT_OPEN_ID, log=log, clock=lambda: clock[0])
         mentions = [{"id": {"open_id": self.BOT_OPEN_ID}}]
 
         handler(_payload("group", mentions=mentions))
@@ -778,7 +788,8 @@ class GroupMentionHintTests(unittest.TestCase):
         self.assertEqual(log.count("audit.event.group_mention_hint_sent"), 0, "发送没有成功")
         self.assertEqual(log.count("audit.event.group_mention_hint_failed"), 1)
         self.assertEqual(
-            log.fields("audit.event.group_mention_hint_failed")[0]["error"], "RuntimeError",
+            log.fields("audit.event.group_mention_hint_failed")[0]["error"],
+            "RuntimeError",
             "只留异常类名，不带正文",
         )
 
@@ -809,9 +820,7 @@ class UnsupportedMessageTypeTests(PipelineTestCase):
     """非文本消息：加表情、记审计、**不入队**、不发明回复文案。"""
 
     def test_an_image_message_is_acknowledged_but_not_queued(self) -> None:
-        outcome = self.build().handle_message(
-            message(text="", message_type="image"), now=NOW
-        )
+        outcome = self.build().handle_message(message(text="", message_type="image"), now=NOW)
 
         self.assertEqual(outcome.handled_as, HandledAs.DROPPED)
         self.assertEqual(len(self.state.tasks), 0, "非文本消息不得入队")
@@ -1028,9 +1037,7 @@ class SessionRotationNoticeTests(PipelineTestCase):
         outcome = self.build().handle_message(message(), now=NOW)
 
         self.assertFalse(outcome.resumed_session, "首次提问本来就不续用")
-        self.assertIsNone(
-            self.state.conversations[("usr_1", "oc_1", "")].last_task_ended_at
-        )
+        self.assertIsNone(self.state.conversations[("usr_1", "oc_1", "")].last_task_ended_at)
         self.assertEqual(self.texts(), [], "首次提问不得出现新会话告知")
 
     def test_session_without_a_finished_task_gets_no_notice(self) -> None:
@@ -1049,9 +1056,7 @@ class SessionRotationNoticeTests(PipelineTestCase):
         outcome = self.build().handle_message(message(), now=NOW)
 
         self.assertFalse(outcome.resumed_session)
-        self.assertEqual(
-            self.texts(), [], "没有上一次结束时间时不得声称「距上次对话」"
-        )
+        self.assertEqual(self.texts(), [], "没有上一次结束时间时不得声称「距上次对话」")
 
     def test_question_right_after_new_command_gets_no_notice(self) -> None:
         """`/new` 之后的第一问：``agent_session_id`` 已被清空，而 `V-会话-05` 要求
@@ -1084,9 +1089,7 @@ class SessionRotationNoticeTests(PipelineTestCase):
         outcome = pipeline.handle_message(message("evt_dup"), now=NOW)
 
         self.assertTrue(outcome.duplicate)
-        self.assertEqual(
-            self.texts(), [SESSION_ROTATED_TEXT], "重复投递不得发出第二条告知"
-        )
+        self.assertEqual(self.texts(), [SESSION_ROTATED_TEXT], "重复投递不得发出第二条告知")
         self.assertEqual(len(self.state.tasks), 1, "重复投递不得产生第二个任务")
 
     def test_session_rotated_text_matches_the_pm_final_copy(self) -> None:
@@ -1127,9 +1130,7 @@ class StaleSessionDiscardTests(PipelineTestCase):
 
         self.assertEqual(outcome.handled_as, HandledAs.TASK_QUEUED)
         self.assertEqual(len(self.discard_calls()), 1)
-        self.assertIsNone(
-            conversation.agent_session_id, "轮换判废的旧会话 id 必须随入队事务置空"
-        )
+        self.assertIsNone(conversation.agent_session_id, "轮换判废的旧会话 id 必须随入队事务置空")
         self.assertEqual(len(self.state.tasks), 1, "判废不改变入队本身")
 
     def test_a_failed_rotated_task_cannot_leak_the_stale_session_to_the_next_message(self) -> None:
@@ -1380,9 +1381,7 @@ class SlashCommandRejectionTests(PipelineTestCase):
 
                 outcome = self.build().handle_message(message(text=text), now=NOW)
 
-                self.assertEqual(
-                    outcome.handled_as, HandledAs.TASK_QUEUED, f"{text!r} 不应被拦截"
-                )
+                self.assertEqual(outcome.handled_as, HandledAs.TASK_QUEUED, f"{text!r} 不应被拦截")
                 self.assertEqual(len(self.state.tasks), 1)
 
     def test_known_commands_still_work(self) -> None:
@@ -1421,9 +1420,7 @@ class SlashCommandRejectionTests(PipelineTestCase):
         onboarding = FakeOnboarding()
         pipeline = self.build(onboarding=onboarding, innertest_roster_gate=lambda open_id: False)
 
-        outcome = pipeline.handle_message(
-            message(open_id="ou_not_listed", text="/config"), now=NOW
-        )
+        outcome = pipeline.handle_message(message(open_id="ou_not_listed", text="/config"), now=NOW)
 
         self.assertEqual(outcome.handled_as, HandledAs.DROPPED)
         replies = self.log.fields("reply.send_text")
@@ -1488,9 +1485,7 @@ class EnqueueFailureTests(PipelineTestCase):
     def test_claim_failure_rolls_back_the_claim(self) -> None:
         """`V-队列-02` 的可注入面：抢占成功但入队失败，话题不得永久忙碌。"""
 
-        self.state.conversations[("usr_1", "oc_1", "")] = FakeConversation(
-            conversation_id="cnv_1"
-        )
+        self.state.conversations[("usr_1", "oc_1", "")] = FakeConversation(conversation_id="cnv_1")
         pipeline = self.build(fail_on="insert_task")
 
         outcome = pipeline.handle_message(message("evt_fail"), now=NOW)
@@ -1507,9 +1502,7 @@ class UnprovisionedUserTests(PipelineTestCase):
 
     def test_content_is_neither_stored_nor_echoed(self) -> None:
         secret = "我的工号是 12345，帮我查工资"
-        outcome = self.build().handle_message(
-            message(open_id="ou_stranger", text=secret), now=NOW
-        )
+        outcome = self.build().handle_message(message(open_id="ou_stranger", text=secret), now=NOW)
 
         self.assertEqual(outcome.handled_as, HandledAs.NOT_PROVISIONED)
         self.assertEqual(len(self.state.tasks), 0, "未开通用户的消息不得产生任务")
@@ -1561,9 +1554,7 @@ class AutomaticOnboardingTests(PipelineTestCase):
             self.assertNotIn(secret, repr(fields))
 
     def test_duplicate_delivery_does_not_restart_onboarding_or_reply(self) -> None:
-        runner = FakeOnboarding(
-            result=OnboardingResult(state=OnboardingState.NOT_AUTHORIZED)
-        )
+        runner = FakeOnboarding(result=OnboardingResult(state=OnboardingState.NOT_AUTHORIZED))
         pipeline = self.build(onboarding=runner)
 
         pipeline.handle_message(message(event_id="evt_onboard_dup", open_id="ou_new"), now=NOW)
@@ -1632,9 +1623,7 @@ class InnertestRosterGateTests(PipelineTestCase):
         self,
     ) -> None:
         runner = FakeOnboarding()
-        pipeline = self.build(
-            onboarding=runner, innertest_roster_gate=lambda open_id: False
-        )
+        pipeline = self.build(onboarding=runner, innertest_roster_gate=lambda open_id: False)
 
         outcome = pipeline.handle_message(
             message(event_id="evt_roster_out", open_id="ou_stranger"), now=NOW
@@ -1649,22 +1638,23 @@ class InnertestRosterGateTests(PipelineTestCase):
         # 恰好一条回复，且就是内测未开放的固定文案键——不是两条，不是
         # `onboarding.checking` 打头。
         sent = self.log.fields("audit.reply.sent")
-        self.assertEqual([fields["content_key"] for fields in sent], ["onboarding.innertest_not_open"])
+        self.assertEqual(
+            [fields["content_key"] for fields in sent], ["onboarding.innertest_not_open"]
+        )
         # 拒绝审计只带 event_id/trace_id，不带 open_id（含脱敏形式）——与
         # scheduler 侧 `onboarding.innertest_roster_rejected` 同一条纪律
         # （`V-花名册-34`）。
         rejections = self.log.fields("audit.onboarding.innertest_roster_rejected")
         self.assertEqual(len(rejections), 1)
         self.assertEqual(
-            set(rejections[0]), {"event_id", "trace_id"},
+            set(rejections[0]),
+            {"event_id", "trace_id"},
             "拒绝审计只能带 event_id/trace_id，不能带 open_id",
         )
 
     def test_roster_included_sender_is_unaffected(self) -> None:
         runner = FakeOnboarding(result=OnboardingResult(state=OnboardingState.STARTED))
-        pipeline = self.build(
-            onboarding=runner, innertest_roster_gate=lambda open_id: True
-        )
+        pipeline = self.build(onboarding=runner, innertest_roster_gate=lambda open_id: True)
 
         outcome = pipeline.handle_message(
             message(event_id="evt_roster_in", open_id="ou_allowed"), now=NOW
@@ -1863,9 +1853,7 @@ class OnboardingTerminalRenderingTests(PipelineTestCase):
             message(event_id="evt_completed_bare", open_id="ou_new"), now=NOW
         )
 
-        self.assertEqual(
-            self._reply_keys(), ["onboarding.checking", "onboarding.internal_error"]
-        )
+        self.assertEqual(self._reply_keys(), ["onboarding.checking", "onboarding.internal_error"])
         self.assertNotIn(
             "onboarding.completed",
             self._reply_keys(),
@@ -1894,9 +1882,7 @@ class OnboardingTerminalRenderingTests(PipelineTestCase):
             message(event_id="evt_only_checking", open_id="ou_new"), now=NOW
         )
 
-        self.assertEqual(
-            self._reply_keys(), ["onboarding.checking", "onboarding.internal_error"]
-        )
+        self.assertEqual(self._reply_keys(), ["onboarding.checking", "onboarding.internal_error"])
 
     def test_started_without_messages_is_silent_by_design(self) -> None:
         """``started`` 是唯一允许没有下文的状态：checking 就是这一轮的完整交代。"""
@@ -1945,7 +1931,9 @@ class OnboardingTerminalRenderingTests(PipelineTestCase):
                 self.build(onboarding=runner).handle_message(
                     message(event_id=f"evt_default_{state.value}", open_id="ou_new"), now=NOW
                 )
-                self.assertIn(f"trc_evt_default_{state.value}", self.log.fields("reply.send_text")[-1]["text"])
+                self.assertIn(
+                    f"trc_evt_default_{state.value}", self.log.fields("reply.send_text")[-1]["text"]
+                )
 
 
 class BlackHoleOutboundTests(PipelineTestCase):
@@ -2009,12 +1997,8 @@ class ShutdownSkipsBestEffortRepliesTests(PipelineTestCase):
         outcome = pipeline.handle_message(message(), now=NOW)
 
         self.assertEqual(outcome.handled_as, HandledAs.BUSY_HINT)
-        self.assertEqual(
-            self.state.events.get("evt_1"), "busy_hint", "停机不得回滚已提交的结论"
-        )
-        self.assertEqual(
-            self.log.count("reply.send_text"), 0, "停机中不得再发出站 HTTP"
-        )
+        self.assertEqual(self.state.events.get("evt_1"), "busy_hint", "停机不得回滚已提交的结论")
+        self.assertEqual(self.log.count("reply.send_text"), 0, "停机中不得再发出站 HTTP")
         self.assertEqual(self.log.count("audit.reply.skipped_while_stopping"), 1)
 
     def test_replies_are_sent_when_not_stopping(self) -> None:
@@ -2085,11 +2069,7 @@ class MemoryCommandDispatchTests(PipelineTestCase):
         self.assertEqual(len(replies), 1)
         self.assertIn("还没有登记任何记忆", replies[0]["text"])
         self.assertEqual(
-            [
-                action
-                for action in self.log.names()
-                if action.startswith("audit.command.memory_")
-            ],
+            [action for action in self.log.names() if action.startswith("audit.command.memory_")],
             [],
             "list 是只读操作，不产生三个写审计事件之一",
         )
@@ -2178,7 +2158,9 @@ class MemoryCommandDispatchTests(PipelineTestCase):
             message(text="/memory remember term_mapping 大尼日 => 尼日利亚"), now=NOW
         )
 
-        outcome = self.build().handle_message(message(event_id="evt_2", text="/memory list"), now=NOW)
+        outcome = self.build().handle_message(
+            message(event_id="evt_2", text="/memory list"), now=NOW
+        )
 
         self.assertEqual(outcome.handled_as, HandledAs.COMMAND)
         replies = self.log.fields("reply.send_text")
@@ -2192,20 +2174,18 @@ class MemoryCommandDispatchTests(PipelineTestCase):
         修复后 ``/memory list`` 的回执里不应再出现 ``mem_`` 前缀——用户只看到
         短序号。"""
 
-        self.build().handle_message(
-            message(text="/memory remember term_mapping k => v"), now=NOW
-        )
+        self.build().handle_message(message(text="/memory remember term_mapping k => v"), now=NOW)
 
-        outcome = self.build().handle_message(message(event_id="evt_2", text="/memory list"), now=NOW)
+        outcome = self.build().handle_message(
+            message(event_id="evt_2", text="/memory list"), now=NOW
+        )
 
         self.assertEqual(outcome.handled_as, HandledAs.COMMAND)
         listed = self.log.fields("reply.send_text")[-1]["text"]
         self.assertNotIn("mem_", listed)
 
     def test_forget_an_existing_entry_deletes_it_and_records_audit(self) -> None:
-        self.build().handle_message(
-            message(text="/memory remember term_mapping k => v"), now=NOW
-        )
+        self.build().handle_message(message(text="/memory remember term_mapping k => v"), now=NOW)
         memory_id = self.state.user_memory["usr_1"][0].memory_id
 
         outcome = self.build().handle_message(
@@ -2239,9 +2219,7 @@ class MemoryCommandDispatchTests(PipelineTestCase):
         list`` 展示的序号对应同一条记忆——两条命令共用同一个 ``list_user_
         memory`` 排序键，见 ``pipeline._resolve_forget_target_id`` 文档。"""
 
-        self.build().handle_message(
-            message(text="/memory remember term_mapping k1 => v1"), now=NOW
-        )
+        self.build().handle_message(message(text="/memory remember term_mapping k1 => v1"), now=NOW)
         self.build().handle_message(
             message(event_id="evt_2", text="/memory remember calibration_preference k2 => v2"),
             now=NOW,
@@ -2266,9 +2244,7 @@ class MemoryCommandDispatchTests(PipelineTestCase):
         """否定断言：越界序号（超出当前记忆条数）不解析成任何一条记忆——不猜测
         用户想删哪一条，也不因为"数字合法"就误删排在最后的条目。"""
 
-        self.build().handle_message(
-            message(text="/memory remember term_mapping k => v"), now=NOW
-        )
+        self.build().handle_message(message(text="/memory remember term_mapping k => v"), now=NOW)
 
         outcome = self.build().handle_message(
             message(event_id="evt_2", text="/memory forget 2"), now=NOW
@@ -2290,7 +2266,9 @@ class MemoryCommandDispatchTests(PipelineTestCase):
 
         self.state.users["ou_2"] = provisioned_user(open_id="ou_2", user_id="usr_2")
         self.build().handle_message(
-            message(event_id="evt_b1", open_id="ou_2", text="/memory remember term_mapping bk => bv"),
+            message(
+                event_id="evt_b1", open_id="ou_2", text="/memory remember term_mapping bk => bv"
+            ),
             now=NOW,
         )
         self.build().handle_message(
@@ -2313,15 +2291,15 @@ class MemoryCommandDispatchTests(PipelineTestCase):
         self.assertIn("没有找到", replies[-1]["text"])
 
     def test_clear_removes_all_entries_and_records_the_cleared_count(self) -> None:
-        self.build().handle_message(
-            message(text="/memory remember term_mapping k1 => v1"), now=NOW
-        )
+        self.build().handle_message(message(text="/memory remember term_mapping k1 => v1"), now=NOW)
         self.build().handle_message(
             message(event_id="evt_2", text="/memory remember calibration_preference k2 => v2"),
             now=NOW,
         )
 
-        outcome = self.build().handle_message(message(event_id="evt_3", text="/memory clear"), now=NOW)
+        outcome = self.build().handle_message(
+            message(event_id="evt_3", text="/memory clear"), now=NOW
+        )
 
         self.assertEqual(outcome.handled_as, HandledAs.COMMAND)
         self.assertEqual(self.state.user_memory.get("usr_1", []), [])
@@ -2339,9 +2317,7 @@ class MemoryCommandDispatchTests(PipelineTestCase):
         会从「零删除 + usage_help」变红成「两条记忆被清空」。
         """
 
-        self.build().handle_message(
-            message(text="/memory remember term_mapping k1 => v1"), now=NOW
-        )
+        self.build().handle_message(message(text="/memory remember term_mapping k1 => v1"), now=NOW)
         self.build().handle_message(
             message(event_id="evt_2", text="/memory remember calibration_preference k2 => v2"),
             now=NOW,
@@ -2367,7 +2343,10 @@ class MemoryCommandDispatchTests(PipelineTestCase):
 
         for index in range(MAX_MEMORY_ENTRIES_PER_USER):
             outcome = self.build().handle_message(
-                message(event_id=f"evt_fill_{index}", text=f"/memory remember term_mapping k{index} => v{index}"),
+                message(
+                    event_id=f"evt_fill_{index}",
+                    text=f"/memory remember term_mapping k{index} => v{index}",
+                ),
                 now=NOW,
             )
             self.assertEqual(outcome.handled_as, HandledAs.COMMAND)
@@ -2397,11 +2376,7 @@ class MemoryCommandDispatchTests(PipelineTestCase):
         replies = self.log.fields("reply.send_text")
         self.assertIn("支持的记忆命令", replies[0]["text"])
         self.assertEqual(
-            [
-                action
-                for action in self.log.names()
-                if action.startswith("audit.command.memory_")
-            ],
+            [action for action in self.log.names() if action.startswith("audit.command.memory_")],
             [],
         )
 
@@ -2498,9 +2473,7 @@ class MemoryCommandBypassesBusyTests(PipelineTestCase):
         self.assertEqual(outcome.handled_as, HandledAs.COMMAND)
         replies = self.log.fields("reply.send_text")
         self.assertEqual(len(replies), 1)
-        self.assertNotEqual(
-            replies[0]["text"], BUSY_HINT_TEXT, "/memory 不受忙碌判定拦截"
-        )
+        self.assertNotEqual(replies[0]["text"], BUSY_HINT_TEXT, "/memory 不受忙碌判定拦截")
 
     def test_memory_remember_during_busy_still_writes(self) -> None:
         outcome = self.build().handle_message(
@@ -2586,11 +2559,11 @@ class ResponseCoverageTests(PipelineTestCase):
     抢占（``claim_conversation``）、``/memory remember`` 写路径
     （``remember_user_memory``）。三者分别代表"事务最前端"、"业务分支中段"、
     "命令面写路径"三类不同位置，共同证明这道兜底不是只补了某一个具体调用点，
-    而是整个方法级别的安全网（`QueueInsertFailure`/``insert_task`` 那条已识别
+    而是整个方法级别的安全网（`QueueInsertError`/``insert_task`` 那条已识别
     的失败路径见 ``EnqueueFailureTests``，不在本组重复覆盖）。
 
     **变异验红**（验证与门禁第八节）：临时把 ``EventPipeline.handle_message``
-    的 ``except Exception`` 缩窄成 ``except QueueInsertFailure``（去掉本条
+    的 ``except Exception`` 缩窄成 ``except QueueInsertError``（去掉本条
     兜底分支）后，本组用例全部由绿转红（异常原样穿出 ``handle_message``）；
     恢复后复绿。红/绿证据见交付报告，不在本文件重复记录。
 
@@ -2613,9 +2586,9 @@ class ResponseCoverageTests(PipelineTestCase):
         self.assertEqual(len(replies), 1)
         self.assertEqual(
             replies[0]["text"],
-            default_content_catalog().text(
-                "gateway.unexpected_error", reference="trc_evt_boom"
-            ).text,
+            default_content_catalog()
+            .text("gateway.unexpected_error", reference="trc_evt_boom")
+            .text,
         )
 
     def test_memory_remember_write_failure_gets_an_honest_fallback_reply(self) -> None:
@@ -2628,9 +2601,9 @@ class ResponseCoverageTests(PipelineTestCase):
         self.assertEqual(len(replies), 1)
         self.assertEqual(
             replies[0]["text"],
-            default_content_catalog().text(
-                "gateway.unexpected_error", reference="trc_evt_boom"
-            ).text,
+            default_content_catalog()
+            .text("gateway.unexpected_error", reference="trc_evt_boom")
+            .text,
         )
 
     def test_fallback_reply_is_skipped_while_stopping_not_forced(self) -> None:
@@ -2643,9 +2616,9 @@ class ResponseCoverageTests(PipelineTestCase):
         ``RetryableInsertFailureTests``），混在这里会让这条用例同时断言两件
         不相关的事——本用例只关心"停机中是否跳过发送"这一件事。"""
 
-        outcome = self.build(
-            fail_on="claim_conversation", should_stop=lambda: True
-        ).handle_message(message("evt_boom"), now=NOW)
+        outcome = self.build(fail_on="claim_conversation", should_stop=lambda: True).handle_message(
+            message("evt_boom"), now=NOW
+        )
 
         self.assertIsNone(outcome.handled_as)
         self.assertEqual(self.log.count("reply.send_text"), 0)

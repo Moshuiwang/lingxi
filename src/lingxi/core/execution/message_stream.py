@@ -1,6 +1,6 @@
 """把 Agent SDK 消息流里的事实汇入**同一个**回合审计。
 
-Issue #29 的结论是审计链必须自己合成，来源有三个：hook 判定、hook 回调、以及
+审计链必须自己合成，来源有三个：hook 判定、hook 回调、以及
 **消息流**。前两个由 :class:`~lingxi.core.execution.hooks.ToolGateway` 接住，第三个
 在这里——被 MCP 包成 ``isError=false`` 的业务失败不触发任何 hook，只能从工具回执
 里读出来；最终正文同样只在消息流里。
@@ -15,7 +15,8 @@ Issue #29 的结论是审计链必须自己合成，来源有三个：hook 判�
 
 from __future__ import annotations
 
-from typing import Any, Mapping
+from collections.abc import Mapping
+from typing import Any
 
 from .audit import TurnAudit
 
@@ -39,6 +40,7 @@ class TurnStreamRecorder:
     """
 
     def __init__(self, audit: TurnAudit) -> None:
+        """绑定要汇入的审计对象，初始化本回合的空记账状态。"""
         self._audit = audit
         self._result_message_count = 0
         self._result_is_error: bool | None = None
@@ -62,17 +64,16 @@ class TurnStreamRecorder:
         审计只保留字节数（正文是模型可控文本，不该原样落审计），但执行器要把它交给
         调用方，因此这里留一份。出口脱敏由 ``apps`` 层的报告投影负责。
         """
-
         return self._final_text
 
     @property
     def result_message_count(self) -> int:
         """消息流里出现了几次 ``ResultMessage``（与审计的终止结果计数各记各的）。"""
-
         return self._result_message_count
 
     @property
     def result_is_error(self) -> bool | None:
+        """SDK 终止消息报告的错误标记；没有终止消息时保持 ``None``。"""
         return self._result_is_error
 
     @property
@@ -80,42 +81,42 @@ class TurnStreamRecorder:
         """SDK 终止消息的子类型（如 ``success`` / ``error_max_turns``）。
 
         只保存受控投影：非字符串一律记 ``None``，超长截断——它是模型/SDK 侧
-        文本，进报告前仍会再过一次出口脱敏。"""
+        文本，进报告前仍会再过一次出口脱敏。
+        """
         return self._result_subtype
 
     @property
     def terminal_reason(self) -> str | None:
         """SDK 回报的终止原因，只保留有限长度的枚举样字符串。"""
-
         return self._terminal_reason
 
     @property
     def result_error(self) -> str | None:
+        """SDK 终止消息携带的错误文本，已按长度截断。"""
         return self._result_error
 
     @property
     def tool_result_count(self) -> int:
+        """消息流里出现了几次工具回执。"""
         return self._tool_result_count
 
     @property
     def usage_summary(self) -> dict[str, Any]:
         """外部 SDK usage 的安全摘要；未知必须显式存在，不能用 0 填洞。"""
-
         return dict(self._usage_summary)
 
     @property
     def agent_turns(self) -> int | None:
         """SDK 终止消息提供的实际 Agent 轮数；没有该字段时保持未知。"""
-
         return self._agent_turns
 
     @property
     def session_id(self) -> str | None:
         """SDK 终止消息报告的会话标识；没有可靠标识时保持 None。"""
-
         return self._session_id
 
     def handle(self, event: Mapping[str, Any]) -> None:
+        """消费一条规范化事件，按 ``kind`` 更新对应的记账字段。"""
         kind = event.get("kind")
         if kind == "assistant_message":
             # 后一条覆盖前一条：模型常先说"我查一下"再给结论，最终正文是最后那条。
@@ -137,7 +138,9 @@ class TurnStreamRecorder:
             subtype = event.get("subtype")
             self._result_subtype = subtype[:64] if isinstance(subtype, str) else None
             terminal_reason = event.get("terminal_reason")
-            self._terminal_reason = terminal_reason[:64] if isinstance(terminal_reason, str) else None
+            self._terminal_reason = (
+                terminal_reason[:64] if isinstance(terminal_reason, str) else None
+            )
             self._agent_turns = _non_negative_int(event.get("num_turns"))
             self._usage_summary = _usage_summary(
                 event.get("usage"),
@@ -158,7 +161,6 @@ def _non_negative_int(value: Any) -> int | None:
 
 def _usage_summary(value: Any, *, source: Any) -> dict[str, Any]:
     """只保留已知 token 计数字段，拒绝把任意 SDK payload 当成 usage。"""
-
     safe_source = source if isinstance(source, str) and source in {"sdk", "mock"} else "unknown"
     if not isinstance(value, Mapping):
         return {

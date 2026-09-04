@@ -337,9 +337,7 @@ class NeverConnectedTests(_StubSDKTestCase):
         finally:
             stream.close()
 
-        self.assertTrue(
-            all(item is None for item in produced), "建连期间不该产出任何真实事件"
-        )
+        self.assertTrue(all(item is None for item in produced), "建连期间不该产出任何真实事件")
         self.assertEqual(
             transport.last_close_reason,
             "handshake_timeout",
@@ -368,9 +366,7 @@ class NeverConnectedTests(_StubSDKTestCase):
             stream.close()
 
         self.assertEqual(beats, [None] * 5)
-        self.assertIsNone(
-            transport.last_close_reason, "截止时间未到时不应判定为建连失败"
-        )
+        self.assertIsNone(transport.last_close_reason, "截止时间未到时不应判定为建连失败")
 
 
 class HeartbeatTests(_StubSDKTestCase):

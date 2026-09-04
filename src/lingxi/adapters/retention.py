@@ -70,21 +70,21 @@ class RetentionReport:
 
     @property
     def deleted(self) -> int:
+        """本轮跨所有表删除的行数合计。"""
         return sum(result.deleted for result in self.tables)
 
     @property
     def blocked_tables(self) -> tuple[str, ...]:
         """本轮因锁等待超时而未能清理的表。非空即这一轮没做完。"""
-
         return tuple(result.table for result in self.tables if result.blocked)
 
     def summary(self) -> str:
         """写进日志的一行摘要。只有表名与计数，永远不取行内容。"""
-
         if not self.tables:
             return "保留清理：本轮无目标表"
         parts = [
-            f"{result.table} 删除 {result.deleted} 行" + ("（锁等待超时，本轮让路）" if result.blocked else "")
+            f"{result.table} 删除 {result.deleted} 行"
+            + ("（锁等待超时，本轮让路）" if result.blocked else "")
             for result in self.tables
         ]
         return "保留清理：" + "；".join(parts)
@@ -100,6 +100,7 @@ class PostgresRetentionCleaner:
         batch_limit: int = DEFAULT_BATCH_LIMIT,
         timeouts: PostgresTimeouts = RETENTION_CLEANUP_TIMEOUTS,
     ) -> None:
+        """校验批量上限并接入连接串与超时配置；不建连接。"""
         if batch_limit <= 0:
             raise ValueError("保留清理的批量必须是正整数")
         self._dsn = dsn
@@ -108,6 +109,7 @@ class PostgresRetentionCleaner:
 
     @property
     def batch_limit(self) -> int:
+        """每次清理调用允许删除的最大行数。"""
         return self._batch_limit
 
     def run_once(self) -> RetentionReport:
@@ -118,8 +120,10 @@ class PostgresRetentionCleaner:
         变成偶发失败。整个调用是一个事务，中途被信号打断只会整体回滚，不会留下
         删了父行没删子行的半删状态（断言 V-保留-17）。
         """
-
-        with connect(self._dsn, timeouts=self._timeouts) as connection, connection.cursor() as cursor:
+        with (
+            connect(self._dsn, timeouts=self._timeouts) as connection,
+            connection.cursor() as cursor,
+        ):
             cursor.execute(
                 "SELECT target_table, deleted_rows, oldest_expires_at, newest_expires_at, blocked "
                 f"FROM {CLEANUP_FUNCTION}(now(), %s)",

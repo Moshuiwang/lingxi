@@ -75,14 +75,27 @@ def _galaxy_tables() -> dict[str, list[dict[str, str]]]:
         "user_role": [
             {"user_id": "G-20001", "role_id": "R-甲", "user_name": "导入目标", "role_name": "A运营"}
         ],
-        "role_menu": [{"role_id": "R-甲", "menu_id": "M1", "role_name": "A运营", "menu_name": "报表"}],
+        "role_menu": [
+            {"role_id": "R-甲", "menu_id": "M1", "role_name": "A运营", "menu_name": "报表"}
+        ],
         "sys_user_datacountry": [
-            {"USER_ID": "G-20001", "DATACOUNTRY_ID": "101", "USER_NAME": "导入目标", "DATACOUNTRY_NAME": "甲国"}
+            {
+                "USER_ID": "G-20001",
+                "DATACOUNTRY_ID": "101",
+                "USER_NAME": "导入目标",
+                "DATACOUNTRY_NAME": "甲国",
+            }
         ],
         "sys_country": [
             {
-                "id": "7", "country_key": "101", "name": "ALPHA", "code": "AL",
-                "name_cn": "甲国", "region_key": "1", "region_name": "甲区", "boss_company_id": "BC-甲",
+                "id": "7",
+                "country_key": "101",
+                "name": "ALPHA",
+                "code": "AL",
+                "name_cn": "甲国",
+                "region_key": "1",
+                "region_name": "甲区",
+                "boss_company_id": "BC-甲",
             }
         ],
     }
@@ -100,7 +113,9 @@ class ImportLocalPermissionOverridePostgresTest(unittest.TestCase):
         # rc25 S-2d（对抗审查 P-8）：``--initiated-by`` 必须是一位生效的已登记管理员，
         # 否则整次运行在读导出之前就被拒（退出码 2、零写入）。真库用例因此要先把这个
         # 责任人登记进 ``admin_registry``——用产品自己的种子函数，不手拼 INSERT。
-        seed_admin_registry_entry(self._dsn, feishu_open_id=INITIATED_BY, label="导入责任人（测试）")
+        seed_admin_registry_entry(
+            self._dsn, feishu_open_id=INITIATED_BY, label="导入责任人（测试）"
+        )
         with connect(self._dsn) as connection, connection.cursor() as cursor:
             cursor.execute(
                 """INSERT INTO app_user
@@ -109,12 +124,21 @@ class ImportLocalPermissionOverridePostgresTest(unittest.TestCase):
                       provisioning_state, account_state)
                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, 'active', 'enabled')""",
                 (
-                    USER_ID, FEISHU_OPEN_ID, "on_import_target", "un_import_target", "导入目标",
-                    "测试部门", "tenant-fake", EMPLOYEE_NO, EMAIL,
+                    USER_ID,
+                    FEISHU_OPEN_ID,
+                    "on_import_target",
+                    "un_import_target",
+                    "导入目标",
+                    "测试部门",
+                    "tenant-fake",
+                    EMPLOYEE_NO,
+                    EMAIL,
                 ),
             )
         PostgresGalaxyImportStore(self._dsn).import_export(
-            source_label="合成导出（测试）", source_digest="digest-import-tool", tables=_galaxy_tables()
+            source_label="合成导出（测试）",
+            source_digest="digest-import-tool",
+            tables=_galaxy_tables(),
         )
         self._legacy_csv = self._write_legacy_csv(
             f'{{"BC-甲": ["{GALAXY_METRIC}", "{LEGACY_ONLY_METRIC}"]}}'
@@ -124,10 +148,10 @@ class ImportLocalPermissionOverridePostgresTest(unittest.TestCase):
         # 与"银河没给"混在一起分不清。用 `--role-function-map`/`--metric-translation-map`
         # 显式指向这两份测试夹具专用的最小配置文件。
         self._role_function_map_path = self._write_toml(
-            'role_function_map', '[roles]\n"A运营" = "运营"\n'
+            "role_function_map", '[roles]\n"A运营" = "运营"\n'
         )
         self._metric_translation_map_path = self._write_toml(
-            'metric_translation_map', f'[companies."BC-甲"]\n"运营" = ["{GALAXY_METRIC}"]\n'
+            "metric_translation_map", f'[companies."BC-甲"]\n"运营" = ["{GALAXY_METRIC}"]\n'
         )
 
     def _write_legacy_csv(self, permissions_json: str) -> Path:
@@ -161,9 +185,15 @@ class ImportLocalPermissionOverridePostgresTest(unittest.TestCase):
         with redirect_stdout(buffer):
             code = TOOL.main(
                 [
-                    str(self._legacy_csv), "--initiated-by", INITIATED_BY, "--dsn", self._dsn,
-                    "--role-function-map", str(self._role_function_map_path),
-                    "--metric-translation-map", str(self._metric_translation_map_path),
+                    str(self._legacy_csv),
+                    "--initiated-by",
+                    INITIATED_BY,
+                    "--dsn",
+                    self._dsn,
+                    "--role-function-map",
+                    str(self._role_function_map_path),
+                    "--metric-translation-map",
+                    str(self._metric_translation_map_path),
                     *extra_args,
                 ]
             )
@@ -204,7 +234,9 @@ class ImportLocalPermissionOverridePostgresTest(unittest.TestCase):
                 (USER_ID,),
             )
             row = cursor.fetchone()
-        self.assertIsNotNone(row, "local_permission_override 的 pending_action_id 必须指向一条真实存在的行")
+        self.assertIsNotNone(
+            row, "local_permission_override 的 pending_action_id 必须指向一条真实存在的行"
+        )
         action_type, status, card_delivered, initiated_by, decided_by, target_open_id, payload = row
         self.assertEqual(action_type, TOOL.ACTION_TYPE_GRANT)
         self.assertEqual(status, "executed")
@@ -268,7 +300,10 @@ class ImportLocalPermissionOverridePostgresTest(unittest.TestCase):
         self.assertEqual(third_count, first_count, "重跑不得产生重复行")
 
         with connect(self._dsn) as connection, connection.cursor() as cursor:
-            cursor.execute("SELECT COUNT(*) FROM pending_action WHERE action_type = %s", (TOOL.ACTION_TYPE_GRANT,))
+            cursor.execute(
+                "SELECT COUNT(*) FROM pending_action WHERE action_type = %s",
+                (TOOL.ACTION_TYPE_GRANT,),
+            )
             pending_action_count = int(cursor.fetchone()[0])
         self.assertEqual(
             pending_action_count, 1, "已存在的授权不得为每次重跑各自留下一条孤儿 pending_action"

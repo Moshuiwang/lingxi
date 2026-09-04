@@ -3,22 +3,19 @@
 只有类型与纯函数，没有 I/O——真实读写住在 ``adapters/postgres_pending_action.py``；
 与 ``core/admin/registry.py`` 同一层次划分：判定逻辑在这里，判定需要的外部数据（登记表
 条目、目标当前状态、时钟）由调用方（adapter）读取后作为参数传入（代码框架第二节）。
+字段与迁移 ``0068_pending_action`` 一一对应；机制性质的"为什么"写在那个迁移文件的
+头部，不在此重复。
 
-字段与迁移 ``0068_pending_action`` 一一对应；机制性质的"为什么"（为何不需要分布式锁、
-为何是状态快照而不是版本号、为何不做后台过期扫描）写在那个迁移文件的头部，不在此重复。
-
-## 为什么 prepare/confirm/cancel 是三个自由函数而不是一个大状态机类
-
-三个决策点各自需要的输入形状不同（prepare 只看当前目标状态；confirm 需要登记表条目 +
-目标当前状态 + 时钟；cancel 只需要发起人核对 + 时钟），合成一个类需要一个大分支把三种
-调用都装进同一个接口，反而让每种调用要传的"用不上的字段"变多。三个自由函数各自持有
-恰好需要的参数，调用方（adapter）按需组合。
+prepare/confirm/cancel 是三个自由函数而不是一个大状态机类：三个决策点各自需要的输入
+形状不同（prepare 只看当前目标状态；confirm 需要登记表条目 + 目标当前状态 + 时钟；
+cancel 只需要发起人核对 + 时钟），合成一个类需要一个大分支把三种调用都装进同一个
+接口，反而让每种调用要传的"用不上的字段"变多。
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from enum import Enum
 
 from lingxi.core.admin.registry import AdminRegistryEntry, AdminRole, is_authorized_admin
@@ -31,15 +28,10 @@ PENDING_ACTION_TTL_SECONDS = 600
 
 
 class PendingActionType(str, Enum):
-    """待确认操作支持的写动作。取值即数据库 ``action_type`` 列，两处一致靠约定
-    （与 ``AdminRole`` 相同的取舍，见 ``core/admin/registry.py``）。
+    """待确认操作支持的写动作。
 
-    后三个成员（本地权限授权/抑制/收回）由迁移 ``0073``（#319 S-P-1b 设计卡，
-    2026-08-27）扩容进 ``pending_action_action_type_check``——迁移 ``0068``
-    最初只登记了前两个 MVP 写动作。卡 A 交付了授权（grant）与抑制（suppress）
-    两条全链路；``LOCAL_PERMISSION_REVOKE`` 由卡 B（2026-08-27）补全
-    ``VALID_SOURCE_STATES``/``REQUIRED_ROLE`` 登记与 ``core/admin/commands.py``/
-    ``core/admin/router.py`` 的解析、派发——与 grant/suppress 共用同一套
+    取值即数据库 ``action_type`` 列，两处一致靠约定（与 ``AdminRole`` 相同的
+    取舍）。后三个成员（本地权限授权/抑制/收回）与前两个 MVP 写动作共用同一套
     prepare/confirm 骨架，差异见 ``adapters/postgres_pending_action.py`` 模块
     文档「本地权限收回（revoke）如何复用同一套机制」。
     """
@@ -51,12 +43,9 @@ class PendingActionType(str, Enum):
     LOCAL_PERMISSION_REVOKE = "local_permission_revoke"
 
 
-#: 本地权限动作类型的集合（授权/抑制/收回三者），供 ``core/admin/router.py`` 的
-#: 自我目标防呆（禁止管理员对自己发起本地权限动作）与
-#: ``adapters/postgres_pending_action.py`` 的 payload 分支复用——两处都需要
-#: "这是不是一个本地权限动作" 这个判断，集中成一个集合，不在两处各自枚举三个
-#: 字面量（枚举三个字面量的写法一旦未来再新增第四个本地权限动作类型，两处都要
-#: 记得同步维护，容易漏掉其中一处）。
+#: 本地权限动作类型的集合（授权/抑制/收回三者），供多处"这是不是一个本地权限
+#: 动作"的判断复用，不在各处各自枚举三个字面量——未来新增第四个本地权限动作
+#: 类型时只需要改这一处。
 LOCAL_PERMISSION_ACTION_TYPES: frozenset[PendingActionType] = frozenset(
     {
         PendingActionType.LOCAL_PERMISSION_GRANT,
@@ -67,6 +56,8 @@ LOCAL_PERMISSION_ACTION_TYPES: frozenset[PendingActionType] = frozenset(
 
 
 class PendingActionStatus(str, Enum):
+    """待确认操作的状态机取值，与迁移 ``0068`` 的 CHECK 一致。"""
+
     PENDING = "pending"
     EXECUTED = "executed"
     CANCELLED = "cancelled"
@@ -84,16 +75,11 @@ TERMINAL_STATUSES = frozenset(
     }
 )
 
-#: 每种写动作要求的角色。MVP 登记表三类角色合并授予，这条映射此刻恒真，但独立写出
-#: 而不是直接判 ``is_authorized_admin``——一旦未来出现"只授予部分角色"的真实管理员
-#: （见 2026-08-24 决策记录「复审或替代条件」：真实管理员达到两人以上时重估角色模型），
-#: 本模块不需要改一行就能表达"停用/恢复只需要权限管理员角色"这条本来就存在的合同
-#: 要求（产品合同「权限管理员可以……准备停用、恢复」）。
-#: 本地权限授权/抑制/收回三条同样要求 ``permission_admin`` 角色（对照现有取值
-#: 惯例，与 suspend/resume 同一角色而不是新开一个角色维度——MVP 仍是三类角色
-#: 合并授予给唯一管理员的阶段，见上面 ``SUSPEND_USER``/``RESUME_USER`` 两条的
-#: 注释）。``LOCAL_PERMISSION_REVOKE`` 由卡 B 登记，见 ``PendingActionType``
-#: 文档。
+#: 每种写动作要求的角色。MVP 登记表三类角色合并授予，这条映射此刻恒真，但独立
+#: 写出而不是直接判 ``is_authorized_admin``——一旦未来出现"只授予部分角色"的
+#: 真实管理员，本模块不需要改一行就能表达"停用/恢复只需要权限管理员角色"这条
+#: 本来就存在的合同
+#: 要求。本地权限授权/抑制/收回三条同样要求 ``permission_admin`` 角色。
 REQUIRED_ROLE: dict[PendingActionType, AdminRole] = {
     PendingActionType.SUSPEND_USER: AdminRole.PERMISSION_ADMIN,
     PendingActionType.RESUME_USER: AdminRole.PERMISSION_ADMIN,
@@ -102,21 +88,10 @@ REQUIRED_ROLE: dict[PendingActionType, AdminRole] = {
     PendingActionType.LOCAL_PERMISSION_REVOKE: AdminRole.PERMISSION_ADMIN,
 }
 
-#: 账号状态五取值中，允许发起对应动作的当前状态。合同没有独立的"终止开通"动作
-#: （停用即终止且防重触发，见 2026-08-24 决策记录），因此 suspend 对 ``enabled``
-#: 有效——不区分开通中还是已开通完成，停用同样能挡住后续问数与开通；resume 只对
-#: ``suspended`` 有效。``deleting``/``deleted`` 不接受任何一种（删除编排是另一条
-#: 独立机制，未来批次，本 Story 明确不做）。
-#: 本地权限授权/抑制的基线语义：该 ``(user, direction, company, metric)`` 键
-#: 当前必须"无生效行"（``absent``）才允许发起——与 suspend/resume 的
-#: ``account_state`` 字符串不同维度，这里的"当前状态"由
-#: ``adapters/postgres_pending_action.py`` 按 payload 键查询迁移 ``0072`` 的表
-#: 是否已有 ``entry_status='active'`` 行得出，只有两个取值
-#: ``"absent"``/``"present"``。``LOCAL_PERMISSION_REVOKE``（卡 B）复用同一列，
-#: 但基线语义相反——按 override_id 查到的那一条覆盖行当前的 ``entry_status``
-#: （"active"/"revoked"）本身就是取值域，要求当前必须"active"才允许发起收回；
-#: 行不存在时 ``adapters/postgres_pending_action.py`` 与 grant/suppress 同一
-#: 姿态地喂入 ``None``，落进下面 ``decide_prepare`` 的"未找到"分支。
+#: 账号状态五取值中，允许发起对应动作的当前状态。suspend 对 ``enabled`` 有效；
+#: resume 只对 ``suspended`` 有效；``deleting``/``deleted`` 都不接受。本地权限
+#: 授权/抑制要求该键当前"无生效行"（``absent``）；``LOCAL_PERMISSION_REVOKE``
+#: 复用同一列但语义相反，要求当前必须"active"才允许发起收回。
 VALID_SOURCE_STATES: dict[PendingActionType, frozenset[str]] = {
     PendingActionType.SUSPEND_USER: frozenset({"enabled"}),
     PendingActionType.RESUME_USER: frozenset({"suspended"}),
@@ -168,16 +143,18 @@ class PendingAction:
     #: 这条对应关系，见该迁移文件头部）。默认值 ``None`` 保持既有构造点（本卡之前
     #: 写下的全部 ``PendingAction(...)`` 调用点）不需要改一行。
     payload: str | None = None
-    #: 管理卡上下文反向链接（#493）。确认卡由管理卡提交产生时保存原管理卡
+    #: 管理卡上下文反向链接。确认卡由管理卡提交产生时保存原管理卡
     #: ``message_id``，这样确认/取消/后台重算都能在原卡上恢复状态；旧文本命令
     #: 与历史行保持 ``None``。
     origin_card_message_id: str | None = None
 
     @property
     def is_terminal(self) -> bool:
+        """当前状态是否已经是四个终态之一。"""
         return self.status in TERMINAL_STATUSES
 
     def is_expired(self, *, now: datetime) -> bool:
+        """相对于给定时刻，这条待确认操作是否已过确认截止时间。"""
         return self.confirm_deadline_at <= now
 
 
@@ -190,10 +167,8 @@ class PrepareDecision:
     message: str = ""
 
 
-#: ``not_found`` 分支的文案，按动作类型分化（Trace #328 opus 审查升级的 P2：此前
-#: 收回也会落到一句"未找到该用户记录"，而收回场景下 ``current_account_state is
-#: None`` 说的是"没查到这一条本地权限登记"——``target_open_id`` 形参此刻装的是
-#: override_id，不是任何人的身份标识，"用户记录"这个词本身就说错了对象）。
+#: ``not_found`` 分支的文案，按动作类型分化：收回场景下 ``current_account_state
+#: is None`` 说的是"没查到这一条本地权限登记"，不是"用户记录"，两者用词不同。
 _NOT_FOUND_MESSAGE: dict[PendingActionType, str] = {
     PendingActionType.SUSPEND_USER: "未找到该用户记录。",
     PendingActionType.RESUME_USER: "未找到该用户记录。",
@@ -202,15 +177,11 @@ _NOT_FOUND_MESSAGE: dict[PendingActionType, str] = {
     PendingActionType.LOCAL_PERMISSION_REVOKE: "未找到该条本地权限登记。",
 }
 
-#: ``target_state_changed`` 分支的文案，按动作类型分化（Trace #328 opus 审查升级
-#: 的 P2：此前本地权限三类动作全部落进"suspend 之外都当 resume 处理"的 ``else``
-#: 分支，字面导向"请去 /admin resume"——对一个补充授权/屏蔽指标/撤销命令毫无意义，
-#: 是一条真实的误导面）。
-#:
-#: 文案里的动词用「撤销」而不是退役的「收回」（Trace #469 S-1 遗漏，收尾批 L4a
-#: 实测发现）：与 ``core/admin/notification._ACTION_LABEL`` 的
-#: ``LOCAL_PERMISSION_REVOKE`` 项逐字一致——管理员在管理卡上点的按钮、确认卡上
-#: 看到的标题都是「撤销」，这句拒绝提示不能再让他去找一个不存在的「收回」入口。
+#: ``target_state_changed`` 分支的文案，按动作类型分化——三类本地权限动作各有
+#: 专属措辞，不落进"当 resume 处理"的通用分支（对补充授权/屏蔽指标/撤销命令
+#: 毫无意义）。文案里的动词用「撤销」而不是退役的「收回」，与
+#: ``core/admin/notification._ACTION_LABEL`` 的取值逐字一致——管理卡上点的
+#: 按钮、确认卡上的标题都是「撤销」，拒绝提示不能让管理员去找一个不存在的入口。
 _TARGET_STATE_CHANGED_MESSAGE: dict[PendingActionType, str] = {
     PendingActionType.SUSPEND_USER: "该用户当前不是启用状态，无需停用（或当前状态不支持停用）。",
     PendingActionType.RESUME_USER: "该用户当前不是停用状态，无需恢复（或当前状态不支持恢复）。",
@@ -228,11 +199,8 @@ def decide_prepare(
     不检查发起人角色——那一步已经由 ``AdminCommandRouter.route()`` 在解析到这条
     命令之前完成（未通过默认拒绝判定不会走到这里，见 ``core/admin/router.py``）。
     """
-
     if current_account_state is None:
-        return PrepareDecision(
-            ok=False, code="not_found", message=_NOT_FOUND_MESSAGE[action_type]
-        )
+        return PrepareDecision(ok=False, code="not_found", message=_NOT_FOUND_MESSAGE[action_type])
     valid_states = VALID_SOURCE_STATES[action_type]
     if current_account_state not in valid_states:
         return PrepareDecision(
@@ -243,24 +211,11 @@ def decide_prepare(
     return PrepareDecision(ok=True)
 
 
-#: 拦截文案里"这是哪一类动作"的中文展示名（Trace #445 #437 拦截文案改进）——
-#: 不直接展示 ``PendingActionType.value``（英文字面量），管理员看不懂
-#: ``local_permission_grant`` 这类内部取值。
-#:
-#: 术语统一（Trace #469 S-1 遗漏，收尾批 L4a 实测复现的第四张词表）：本地权限
-#: 三类动作的展示名**逐字取自** ``core/admin/notification._ACTION_LABEL``
-#: （「补充授权」/「屏蔽指标」/「撤销」），不再用退役的「本地权限授权 / 本地权限
-#: 抑制 / 本地权限收回」。这条拦截提示的全部价值就是让管理员**认出并找到**那张
-#: 还在途的旧确认卡（#437 真实运维事故），而那张卡的标题正是
-#: ``待确认：{_ACTION_LABEL[...]}用户``——两处用词必须能对得上，否则提示越详细
-#: 越误导。``SUSPEND_USER``/``RESUME_USER`` 两项与 #439 的权限术语裁定无关，
-#: 保持原样不动。
-#:
-#: 不 ``import`` ``notification._ACTION_LABEL`` 复用同一份对象：依赖方向是
-#: ``notification`` → ``pending_action``（前者已经 ``from ... pending_action
-#: import PendingActionType``），反向引用会造成循环导入。与 ``core/admin/
-#: router._OVERRIDE_DIRECTION_LABEL``、``core/admin/management_card.
-#: _DIRECTION_LABEL`` 同一取舍：展示文案就地各维护一份、靠用例锁死取值一致。
+#: 拦截文案里"这是哪一类动作"的中文展示名——不直接展示英文字面量，管理员看
+#: 不懂内部取值。本地权限三类动作的展示名逐字取自
+#: ``core/admin/notification._ACTION_LABEL``，与那张卡片标题的用词必须对得
+#: 上。不 import 复用同一份对象：依赖方向是 notification → pending_action，
+#: 反向引用会造成循环导入，展示文案就地各维护一份、靠用例锁死取值一致。
 _ACTION_TYPE_DISPLAY_NAME: dict[PendingActionType, str] = {
     PendingActionType.SUSPEND_USER: "停用用户",
     PendingActionType.RESUME_USER: "恢复用户",
@@ -278,35 +233,16 @@ _DISPLAY_TIMEZONE_OFFSET = timedelta(hours=8)
 
 
 def format_in_flight_conflict_message(*, blocking: PendingAction) -> str:
-    """``prepare()`` 撞上"同一目标已有一条在途 pending 行"时的拦截文案
-    （Trace #445 #437）。
+    """``prepare()`` 撞上"同一目标已有一条在途 pending 行"时的拦截文案。
 
-    修复 2026-08-30 真实运维事故（Issue #437 TO PM）：拦截提示原本只说"该用户
-    当前已有一条待确认操作在途"，不带任何自助解法——管理员既不知道是哪一条、
-    多久前发起、是否已经过期，旧确认卡又可能已经淹没在飞书历史消息里，
-    上一次只能靠编排者查库手工处理才解锁。本函数把 ``blocking``（调用方已经
-    查到、结构上确认仍是 ``status='pending'`` 的那一行——是否已经过期由调用方
-    在拿到这一行时就地判定并优先原地翻转放行，见 ``adapters/
-    postgres_pending_action.py`` 的 ``prepare()`` 懒清扫兜底；走到这个函数说明
-    那一行确认仍然是真在途、未过期）的动作类型/发起时间/截止时间摘要，连同
-    "已过期会自动释放、未过期请先处理旧卡"这条自助指引一起渲染成一段文案。
-
-    纯函数、不做任何 I/O 或时钟读取——``blocking`` 的两个时间戳都是调用方已经
-    从数据库读到的既有字段，不重新取 ``now()``。
-
-    **先归一到 UTC，再加 8 小时展示**（opus 审查坐实并修复：与
-    ``core/daily_report.py`` 既有先例 ``utc_start = window_start.astimezone(
-    timezone.utc)`` 同一姿态）——本方法此前直接在 ``blocking`` 的两个字段上加
-    ``_DISPLAY_TIMEZONE_OFFSET``，如果这两个字段本身已经是非 UTC 的 aware
-    ``datetime``（例如已经是 ``+08:00`` 的墙钟值），会把它在墙钟层面再加一次
-    8 小时，读者看到的是一个被二次偏移过的错误时刻。数据库列当前恒为 UTC，
-    这条修复此刻不改变任何真实用户可见的输出，但不应该让"当前恒为 UTC"这个
-    调用方事实由本函数自己悄悄假设——``astimezone()`` 对已经是 UTC 的输入是
-    恒等操作，加这一步没有代价。
+    带自助解法而不只是一句"已有操作在途"：把 ``blocking``（已确认结构上仍是
+    ``status='pending'`` 的那一行）的动作类型/发起时间/截止时间摘要，连同
+    "已过期会自动释放、未过期请先处理旧卡"这条指引一起渲染成一段文案。纯
+    函数、不做任何 I/O 或时钟读取，先归一到 UTC 再加 8 小时展示，避免传入
+    字段本身非 UTC 时被二次偏移。
     """
-
-    started = blocking.created_at.astimezone(timezone.utc) + _DISPLAY_TIMEZONE_OFFSET
-    deadline = blocking.confirm_deadline_at.astimezone(timezone.utc) + _DISPLAY_TIMEZONE_OFFSET
+    started = blocking.created_at.astimezone(UTC) + _DISPLAY_TIMEZONE_OFFSET
+    deadline = blocking.confirm_deadline_at.astimezone(UTC) + _DISPLAY_TIMEZONE_OFFSET
     action_name = _ACTION_TYPE_DISPLAY_NAME[blocking.action_type]
     return (
         "该用户当前已有一条待确认操作在途："
@@ -352,6 +288,8 @@ ERROR_CODE: dict[ConfirmResultKind, str] = {
 
 @dataclass(frozen=True)
 class ConfirmDecision:
+    """``decide_confirm`` 的纯逻辑结论。"""
+
     kind: ConfirmResultKind
     message: str
     #: 仅 ``EXECUTE`` 时非空：adapter 应当把目标 ``account_state`` 改成这个值。
@@ -365,11 +303,91 @@ class ConfirmDecision:
 
     @property
     def ok(self) -> bool:
+        """这次确认是否成功执行。"""
         return self.kind is ConfirmResultKind.EXECUTE
 
     @property
     def code(self) -> str:
+        """接口设计统一错误码；成功分支为空字符串。"""
         return "" if self.ok else ERROR_CODE[self.kind]
+
+
+def _confirm_not_found(pending: PendingAction | None) -> ConfirmDecision | None:
+    """找不到，或从未真正送达（``card_delivered=False``，两者在调用方眼里刻意不可区分）。"""
+    if pending is None or not pending.card_delivered:
+        return ConfirmDecision(kind=ConfirmResultKind.NOT_FOUND, message="未找到该待确认操作。")
+    return None
+
+
+def _confirm_already_terminal(pending: PendingAction) -> ConfirmDecision | None:
+    """早已是终态：幂等返回既有结果，不当作新的确认处理（重复点击/回调/重试只返回既有结果）。"""
+    if pending.status is not PendingActionStatus.PENDING:
+        return ConfirmDecision(
+            kind=ConfirmResultKind.ALREADY_TERMINAL,
+            message=_terminal_message(pending.status),
+        )
+    return None
+
+
+def _confirm_not_initiator(pending: PendingAction, clicker_open_id: str) -> ConfirmDecision | None:
+    """点击人不是发起人：不改变任何字段，且必须排在过期判定之前。
+
+    确认卡可以被转发，因此"非发起人点了一张已经过期的卡"是真实可达的：若过期
+    判定排在前面，会把这条记录转成 ``EXPIRED`` 并把点击者错记成决定人、发出
+    本不该给他的终态卡与群通知。排在这里之后，非发起人无论卡片是否已过期都
+    只得到同一句话、不触发任何写入。
+    """
+    if pending.initiated_by_open_id != clicker_open_id:
+        return ConfirmDecision(
+            kind=ConfirmResultKind.NOT_INITIATOR,
+            message="只有发起该操作的管理员本人可以确认。",
+        )
+    return None
+
+
+def _confirm_expired(pending: PendingAction, now: datetime) -> ConfirmDecision | None:
+    """已过期：首次发现过期时才转出 ``EXPIRE``（再次点击会先在终态检查被拦住）。"""
+    if pending.is_expired(now=now):
+        return ConfirmDecision(
+            kind=ConfirmResultKind.EXPIRE,
+            message="该待确认操作已过期，请重新查询后再发起。",
+            terminal_status=PendingActionStatus.EXPIRED,
+            reason="expired",
+        )
+    return None
+
+
+def _confirm_role_revoked(
+    pending: PendingAction, registry_entry: AdminRegistryEntry | None
+) -> ConfirmDecision | None:
+    """发起人当前角色已经不满足这个动作类型所需角色（含条目被撤销、条目不存在）。"""
+    required_role = REQUIRED_ROLE[pending.action_type]
+    if (
+        registry_entry is None
+        or not is_authorized_admin(registry_entry)
+        or not registry_entry.has_role(required_role)
+    ):
+        return ConfirmDecision(
+            kind=ConfirmResultKind.ROLE_REVOKED,
+            message="当前角色已无权执行该操作，请重新查询后再发起。",
+            terminal_status=PendingActionStatus.FAILED,
+            reason="role_revoked",
+        )
+    return None
+
+
+def _confirm_target_drifted(
+    pending: PendingAction, current_account_state: str | None
+) -> ConfirmDecision | None:
+    """目标当前状态与 prepare 时刻的快照不一致。"""
+    if current_account_state != pending.target_state_snapshot:
+        return ConfirmDecision(
+            kind=ConfirmResultKind.TARGET_DRIFTED,
+            message="目标用户状态已经变化，请重新查询后再发起。",
+            terminal_status=PendingActionStatus.FAILED,
+            reason="target_drifted",
+        )
+    return None
 
 
 def decide_confirm(
@@ -382,74 +400,24 @@ def decide_confirm(
 ) -> ConfirmDecision:
     """确认卡片点击"确认执行"按钮时的完整核对链，纯函数、不做任何写入。
 
-    调用顺序即核对顺序，任一步不通过立即返回，不再往后判断（合同："任一核对失败都
-    不执行"，越早失败的分支越不依赖越晚才能取得的数据）：
-
-    1. 找不到，或从未真正送达（``card_delivered=False``，两者在调用方眼里刻意
-       不可区分——见迁移 0068 文件头部）；
-    2. 早已是终态：幂等返回既有结果，不当作新的确认处理（"重复点击/重复回调/重试
-       只能返回已有结果"）；
-    3. 点击人不是发起人：**不改变** ``pending_action`` 的任何字段——真正的发起人
-       仍然可能随后点对，不能因为一次错误点击（含伪造回调）就烧掉这次机会；
-       **这一步必须排在过期判定之前**（Trace #544 A-3）：过期判定会把这条记录
-       改写成 ``EXPIRED`` 终态并落 ``decided_by_open_id=点击者``、发群通知、把
-       终态卡回给点击者。确认卡可以被转发（卡片 config 未禁转发），因此"非发起
-       人点了一张已经过期的卡"是真实可达的：判定顺序反过来时，一个与本次操作
-       毫无关系的人会被记成这条操作的决定人，并收到本不该给他的终态卡。放在前
-       面之后，非发起人无论卡片是否已过期都只得到同一句话、不触发任何写入；
-    4. 已过期：**首次**发现过期时才由这里转出 ``EXPIRE``（同一动作 ID 再次点击会
-       先在第 2 步被拦住，因为这一步已经把它变成终态）；
-    5. 发起人当前角色已经不满足这个动作类型所需角色（含条目被撤销、条目不存在）：
-       转 ``FAILED``，要求管理员重新查询发起；
-    6. 目标当前状态与 prepare 时刻的快照不一致：转 ``FAILED``，要求管理员重新查询；
-    7. 全部通过：``EXECUTE``，把 ``new_account_state`` 与
-       ``terminal_status=EXECUTED`` 一起交给 adapter——adapter 还要在同一事务里
-       先成功写审计才能真正提交这一步（审计失败时整个事务回滚，``pending_action``
-       保持 ``pending`` 不变，不经过这个函数第二次判断，直接是 adapter 那一层的
-       事务边界职责，见 ``adapters/postgres_pending_action.py``）。
+    调用顺序即核对顺序，任一步不通过立即返回：找不到/未送达 → 早已是终态 →
+    点击人不是发起人 → 已过期 → 角色已不满足 → 目标状态已漂移 → 全部通过则
+    ``EXECUTE``（连同 ``terminal_status=EXECUTED`` 交给 adapter，adapter 还要
+    在同一事务里先成功写审计才能真正提交）。各步判据见对应辅助函数 docstring。
     """
-
-    if pending is None or not pending.card_delivered:
-        return ConfirmDecision(kind=ConfirmResultKind.NOT_FOUND, message="未找到该待确认操作。")
-
-    if pending.status is not PendingActionStatus.PENDING:
-        return ConfirmDecision(
-            kind=ConfirmResultKind.ALREADY_TERMINAL,
-            message=_terminal_message(pending.status),
-        )
-
-    if pending.initiated_by_open_id != clicker_open_id:
-        return ConfirmDecision(
-            kind=ConfirmResultKind.NOT_INITIATOR,
-            message="只有发起该操作的管理员本人可以确认。",
-        )
-
-    if pending.is_expired(now=now):
-        return ConfirmDecision(
-            kind=ConfirmResultKind.EXPIRE,
-            message="该待确认操作已过期，请重新查询后再发起。",
-            terminal_status=PendingActionStatus.EXPIRED,
-            reason="expired",
-        )
-
-    required_role = REQUIRED_ROLE[pending.action_type]
-    if registry_entry is None or not is_authorized_admin(registry_entry) or not registry_entry.has_role(
-        required_role
-    ):
-        return ConfirmDecision(
-            kind=ConfirmResultKind.ROLE_REVOKED,
-            message="当前角色已无权执行该操作，请重新查询后再发起。",
-            terminal_status=PendingActionStatus.FAILED,
-            reason="role_revoked",
-        )
-
-    if current_account_state != pending.target_state_snapshot:
-        return ConfirmDecision(
-            kind=ConfirmResultKind.TARGET_DRIFTED,
-            message="目标用户状态已经变化，请重新查询后再发起。",
-            terminal_status=PendingActionStatus.FAILED,
-            reason="target_drifted",
-        )
+    if (blocked := _confirm_not_found(pending)) is not None:
+        return blocked
+    assert pending is not None
+    if (blocked := _confirm_already_terminal(pending)) is not None:
+        return blocked
+    if (blocked := _confirm_not_initiator(pending, clicker_open_id)) is not None:
+        return blocked
+    if (blocked := _confirm_expired(pending, now)) is not None:
+        return blocked
+    if (blocked := _confirm_role_revoked(pending, registry_entry)) is not None:
+        return blocked
+    if (blocked := _confirm_target_drifted(pending, current_account_state)) is not None:
+        return blocked
 
     return ConfirmDecision(
         kind=ConfirmResultKind.EXECUTE,
@@ -460,6 +428,8 @@ def decide_confirm(
 
 
 class CancelResultKind(str, Enum):
+    """``decide_cancel`` 的分支判定。"""
+
     CANCEL = "cancel"
     ALREADY_TERMINAL = "already_terminal"
     NOT_FOUND = "not_found"
@@ -478,6 +448,8 @@ CANCEL_ERROR_CODE: dict[CancelResultKind, str] = {
 
 @dataclass(frozen=True)
 class CancelDecision:
+    """``decide_cancel`` 的纯逻辑结论。"""
+
     kind: CancelResultKind
     message: str
     terminal_status: PendingActionStatus | None = None
@@ -485,24 +457,25 @@ class CancelDecision:
 
     @property
     def ok(self) -> bool:
+        """这次取消是否成功执行。"""
         return self.kind is CancelResultKind.CANCEL
 
     @property
     def code(self) -> str:
+        """接口设计统一错误码；成功分支为空字符串。"""
         return "" if self.ok else CANCEL_ERROR_CODE[self.kind]
 
 
 def decide_cancel(
     *, pending: PendingAction | None, clicker_open_id: str, now: datetime
 ) -> CancelDecision:
-    """"取消"按钮的核对链，比确认短：取消不执行任何业务变更，因此不需要重新核对
-    角色或目标状态漂移——放弃一个即将过期的操作，即使角色已经变化也应当总是安全。
+    """「取消」按钮的核对链，比确认短。
 
-    判定顺序与 :func:`decide_confirm` 逐条对齐：**发起人判定排在过期判定之前**
-    （Trace #544 A-3），非发起人点一张已过期的卡不得把它翻成 ``EXPIRED``、不得
-    被记成决定人、不得触发群通知。
+    取消不执行任何业务变更，因此不需要重新核对角色或目标状态漂移——放弃一个
+    即将过期的操作，即使角色已经变化也应当总是安全。判定顺序与
+    :func:`decide_confirm` 逐条对齐：发起人判定排在过期判定之前，非发起人点
+    一张已过期的卡不得把它翻成 ``EXPIRED``、不得被记成决定人、不得触发群通知。
     """
-
     if pending is None or not pending.card_delivered:
         return CancelDecision(kind=CancelResultKind.NOT_FOUND, message="未找到该待确认操作。")
 
@@ -532,45 +505,29 @@ def decide_cancel(
     )
 
 
-class PendingActionAuditWriteFailed(RuntimeError):
-    """审计写入失败，事务已整体回滚：``pending_action`` 与目标 ``app_user`` 均未
-    发生任何变化（接口设计错误码 ``audit_write_failed``，"调用方可重试"）。
+class PendingActionAuditWriteFailedError(RuntimeError):
+    """审计写入失败，事务已整体回滚，可安全重试（接口设计错误码 ``audit_write_failed``）。
 
-    定义在这个纯类型模块而不是 ``adapters/postgres_pending_action.py``，是为了让
-    ``core/admin/card_callback.py`` 能在**不引入 psycopg 依赖链**的情况下拿到这个
-    类型去写 ``except``——与 ``AdminRegistrySeedConflict`` 放在 ``core/admin/
-    registry.py`` 而不是 ``adapters/admin_registry.py`` 同一取舍（见该类的文档）。
-    真正抛出它的地方是 adapter 的 ``confirm()``/``cancel()``（审计调用失败时）。
+    ``pending_action`` 与目标 ``app_user`` 均未发生任何变化。定义在这个纯类型
+    模块而不是 adapter 模块，是为了让调用方能在不引入 psycopg
+    依赖链的情况下拿到这个类型去写 ``except``。真正抛出它的地方是 adapter 的
+    ``confirm()``/``cancel()``（审计调用失败时）。
     """
 
 
-class PendingActionTransientFailure(RuntimeError):
-    """确认/取消操作命中数据库瞬时故障（死锁、锁等待超时，或其他操作性错误）：
+class PendingActionTransientFailureError(RuntimeError):
+    """确认/取消操作命中数据库瞬时故障（死锁、锁等待超时，或其他操作性错误）。
+
     事务已整体回滚，``pending_action`` 与目标 ``app_user`` 均未发生任何变化，
-    调用方可以安全重试（批次 4 F1，Issue #304，opus 审查真库三次复现）。
-
-    两类真实触发场景：① ``清理路径锁序修复``——``adapters/postgres_conversation/
-    _transaction.py`` 的 ``clear_delivered_content_for_user`` 此前先 UPDATE
-    ``task_delivery_event`` 再对 ``conversation`` FOR UPDATE，与 ``/new``、空闲
-    扫描既有的"先 conversation 后 tde"顺序相反，两个事务交叉持有对方需要的下一把
-    锁时被 Postgres 判定为死锁（``DeadlockDetected``，已随本批次修复对齐顺序）；
-    ② 非死锁的锁等待超时变体——``confirm()`` 对目标用户全部会话 FOR UPDATE 时，
-    若其中任一会话恰好被 gateway 入站事务持锁超过 ``lock_timeout``（2 秒，见
-    ``adapters/postgres.py`` 的 ``PostgresTimeouts``），命中 ``LockNotAvailable``；
-    「停用一个正在聊天的用户」最容易撞见这一种。
-
-    定义在这个纯类型模块而不是 ``adapters/postgres_pending_action.py``，与
-    ``PendingActionAuditWriteFailed`` 同一取舍（见其文档）：让
-    ``core/admin/card_callback.py`` 能在不引入 psycopg 依赖链的情况下拿到这个
-    类型去写 ``except``。真正抛出它的地方是 adapter 的 ``confirm()``/
-    ``cancel()``——按 SQLSTATE 分类捕获 psycopg 的 ``OperationalError``（其子类
-    覆盖 ``DeadlockDetected``/``LockNotAvailable`` 等具体操作性故障，见该方法
-    文档"为什么选这一层基类"）。``classification`` 只是抛出方 psycopg 异常的类名
-    （例如 ``"DeadlockDetected"``/``"LockNotAvailable"``），仅用于审计记录，不
-    参与、也不应该参与控制流判断——调用方对所有子类一视同仁地提示"稍后重试"。
+    调用方可以安全重试；「停用一个正在聊天的用户」最容易撞见锁等待超时。定义
+    在这个纯类型模块而不是 adapter 模块，与 :class:`PendingActionAuditWriteFailedError`
+    同一取舍，让调用方能在不引入 psycopg 依赖链的情况下拿到这个类型去写
+    ``except``。``classification`` 只是抛出方 psycopg 异常的类名，仅用于审计
+    记录，不参与控制流判断。
     """
 
     def __init__(self, classification: str) -> None:
+        """记录数据库瞬时故障的分类，供审计记录。"""
         super().__init__(f"数据库瞬时故障，事务已回滚，可重试：{classification}")
         self.classification = classification
 

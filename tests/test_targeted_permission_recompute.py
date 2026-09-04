@@ -20,23 +20,7 @@ from __future__ import annotations
 
 import json
 import unittest
-from datetime import datetime, timezone
-
-from lingxi.core.identity.roster_audit import ArchivedIdentity
-from lingxi.core.permission.local_override import LocalPermissionOverrideEntry, OverrideDirection
-from lingxi.core.permission.targeted_recompute import (
-    RecomputeKind,
-    SKIP_ACCOUNT_NOT_ENABLED,
-    SKIP_ARCHIVED_IDENTITY_INCOMPLETE,
-    SKIP_MATCH_FAILED,
-    SKIP_METRIC_TRANSLATION_UNAVAILABLE,
-    SKIP_MISSING_PERSONNEL_ID,
-    SKIP_MISSING_ROSTER_SNAPSHOT,
-    SKIP_NO_GALAXY_BATCH,
-    SKIP_NO_PUBLISHED_ROW,
-    SKIP_USER_NOT_ACTIVE,
-    TargetedPermissionRecompute,
-)
+from datetime import UTC, datetime
 
 from test_permission_refresh_duty import (
     COMPANY_ID,
@@ -60,7 +44,23 @@ from test_permission_refresh_duty import (
     roster_row,
 )
 
-NOW = datetime(2026, 8, 30, 12, 0, tzinfo=timezone.utc)
+from lingxi.core.identity.roster_audit import ArchivedIdentity
+from lingxi.core.permission.local_override import LocalPermissionOverrideEntry, OverrideDirection
+from lingxi.core.permission.targeted_recompute import (
+    SKIP_ACCOUNT_NOT_ENABLED,
+    SKIP_ARCHIVED_IDENTITY_INCOMPLETE,
+    SKIP_MATCH_FAILED,
+    SKIP_METRIC_TRANSLATION_UNAVAILABLE,
+    SKIP_MISSING_PERSONNEL_ID,
+    SKIP_MISSING_ROSTER_SNAPSHOT,
+    SKIP_NO_GALAXY_BATCH,
+    SKIP_NO_PUBLISHED_ROW,
+    SKIP_USER_NOT_ACTIVE,
+    RecomputeKind,
+    TargetedPermissionRecompute,
+)
+
+NOW = datetime(2026, 8, 30, 12, 0, tzinfo=UTC)
 
 
 class FakeIdentities:
@@ -164,9 +164,7 @@ class ForceRevokeTests(unittest.TestCase):
         self.assertEqual(outcome.reason, SKIP_USER_NOT_ACTIVE)
 
     def test_skips_an_incomplete_archive(self) -> None:
-        recompute, _ = build_recompute(
-            identities=(identity(email=""),), published_users={USER_ONE}
-        )
+        recompute, _ = build_recompute(identities=(identity(email=""),), published_users={USER_ONE})
 
         outcome = recompute.force_revoke(user_id=USER_ONE)
 
@@ -205,9 +203,7 @@ class RecomputeAndPublishSkipTests(unittest.TestCase):
         self.assertEqual(decisions.calls, [])
 
     def test_skips_when_metric_translation_is_entirely_unavailable(self) -> None:
-        recompute, parts = build_recompute(
-            identities=(identity(),), metric_translation_map={}
-        )
+        recompute, parts = build_recompute(identities=(identity(),), metric_translation_map={})
 
         outcome = recompute.recompute_and_publish(user_id=USER_ONE)
 
@@ -229,9 +225,7 @@ class RecomputeAndPublishSkipTests(unittest.TestCase):
         self.assertEqual(outcome.reason, SKIP_MISSING_PERSONNEL_ID)
 
     def test_skips_when_matching_fails_and_does_not_touch_the_publish_row(self) -> None:
-        recompute, parts = build_recompute(
-            identities=(identity(personnel_id="ou_unknown_person"),)
-        )
+        recompute, parts = build_recompute(identities=(identity(personnel_id="ou_unknown_person"),))
 
         outcome = recompute.recompute_and_publish(user_id=USER_ONE)
 
@@ -310,7 +304,9 @@ class RecomputeAndPublishGrantTests(unittest.TestCase):
         self.assertEqual(outcome.kind, RecomputeKind.ENQUEUED)
         [call] = parts["decisions"].calls
         self.assertNotIn("不会生效的指标", call["row"].permissions)
-        skip_fields = parts["audit"].fields_for("permission_targeted_recompute.local_override_skipped")
+        skip_fields = parts["audit"].fields_for(
+            "permission_targeted_recompute.local_override_skipped"
+        )
         self.assertTrue(skip_fields)
 
     def test_limited_metric_wildcard_grant_is_unioned_into_the_published_metrics(self) -> None:
@@ -421,7 +417,10 @@ class LegacyAllScopeRecomputeTests(unittest.TestCase):
         overrides = FakeLocalOverrides({USER_ONE: (_all_scope_entry(metric_name=METRIC_NAME),)})
         expander = FakeLegacyAllScope(overrides=overrides)
         recompute, parts = build_recompute(
-            identities=(identity(),), published_users={USER_ONE}, local_overrides=overrides, legacy_all_scope=expander
+            identities=(identity(),),
+            published_users={USER_ONE},
+            local_overrides=overrides,
+            legacy_all_scope=expander,
         )
 
         outcome = recompute.recompute_and_publish(user_id=USER_ONE)
@@ -433,7 +432,9 @@ class LegacyAllScopeRecomputeTests(unittest.TestCase):
             [{"user": USER_ONE, "added": 1}],
         )
         [call] = parts["decisions"].calls
-        self.assertEqual(json.loads(call["row"].permissions), {"*": sorted({METRIC_NAME, METRIC_NAME_TWO})})
+        self.assertEqual(
+            json.loads(call["row"].permissions), {"*": sorted({METRIC_NAME, METRIC_NAME_TWO})}
+        )
 
     def test_unrepresentable_suppression_skips_without_publishing_or_revoking(self) -> None:
         overrides = FakeLocalOverrides(
@@ -453,7 +454,9 @@ class LegacyAllScopeRecomputeTests(unittest.TestCase):
                 )
             }
         )
-        recompute, parts = build_recompute(identities=(identity(),), published_users={USER_ONE}, local_overrides=overrides)
+        recompute, parts = build_recompute(
+            identities=(identity(),), published_users={USER_ONE}, local_overrides=overrides
+        )
 
         outcome = recompute.recompute_and_publish(user_id=USER_ONE)
 
@@ -471,7 +474,8 @@ class PublishNeedsCipherAuditTests(unittest.TestCase):
 
     def test_a_first_time_publish_flags_the_missing_cipher_corner(self) -> None:
         recompute, parts = build_recompute(
-            identities=(identity(),), published_users=set()  # 显式：从未有过足迹
+            identities=(identity(),),
+            published_users=set(),  # 显式：从未有过足迹
         )
 
         outcome = recompute.recompute_and_publish(user_id=USER_ONE)
@@ -482,9 +486,7 @@ class PublishNeedsCipherAuditTests(unittest.TestCase):
         self.assertEqual(fields[0]["user"], USER_ONE)
 
     def test_a_publish_with_an_existing_footprint_does_not_flag_the_corner(self) -> None:
-        recompute, parts = build_recompute(
-            identities=(identity(),), published_users={USER_ONE}
-        )
+        recompute, parts = build_recompute(identities=(identity(),), published_users={USER_ONE})
 
         outcome = recompute.recompute_and_publish(user_id=USER_ONE)
 

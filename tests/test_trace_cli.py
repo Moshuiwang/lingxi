@@ -11,7 +11,7 @@ import ast
 import io
 import os
 import unittest
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 from postgres_schema import ensure_production_schema, psycopg_available, reset_production_rows
@@ -126,7 +126,15 @@ class TraceLookupRealDatabaseTests(unittest.TestCase):
                      (id, feishu_open_id, feishu_user_id, feishu_union_id, display_name,
                       department, tenant_key, provisioning_state, permission_version)
                    VALUES (%s, %s, %s, %s, %s, %s, %s, 'mcp_syncing', 1)""",
-                ("usr_trace_1", "ou_trace_1", "fs_trace_1", "on_trace_1", "化名甲", "测试部门", "tenant-fake"),
+                (
+                    "usr_trace_1",
+                    "ou_trace_1",
+                    "fs_trace_1",
+                    "on_trace_1",
+                    "化名甲",
+                    "测试部门",
+                    "tenant-fake",
+                ),
             )
             cursor.execute(
                 """INSERT INTO inbound_event
@@ -135,11 +143,11 @@ class TraceLookupRealDatabaseTests(unittest.TestCase):
                    VALUES (%s, %s, %s, %s, 'auto_provisioning', %s, %s)""",
                 (
                     "evt_trace_1",
-                    datetime.now(timezone.utc) - timedelta(minutes=5),
+                    datetime.now(UTC) - timedelta(minutes=5),
                     "im.message.receive_v1",
                     "ou_trace_1",
                     "trc_lookup_1",
-                    datetime.now(timezone.utc) - timedelta(minutes=5),
+                    datetime.now(UTC) - timedelta(minutes=5),
                 ),
             )
 

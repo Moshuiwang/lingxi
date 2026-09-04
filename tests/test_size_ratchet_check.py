@@ -81,12 +81,16 @@ class EvaluateTest(unittest.TestCase):
         current = {"src/lingxi/core/small_module.py": 42}
         self.assertEqual(CHECK.evaluate(baseline, current), [])
 
-    def test_deleted_file_leaving_baseline_is_not_a_failure(self) -> None:
-        """文件已经不在扫描范围内：棘轮的目的已经达成，不强制立即刷新。"""
+    def test_deleted_file_leaving_baseline_now_fails_and_prompts_refresh(self) -> None:
+        """独立审核实测坐实：文件已删/改名/移出 src/lingxi/ 后基线登记必须判红
+        并提示 --refresh，不能静默保留陈旧登记（此前的行为是静默放行）。"""
 
         baseline = {"src/lingxi/apps/scheduler/__init__.py": 2048}
         current: dict[str, int] = {}
-        self.assertEqual(CHECK.evaluate(baseline, current), [])
+        failures = CHECK.evaluate(baseline, current)
+        self.assertTrue(
+            any("已经找不到这个文件" in f and "--refresh" in f for f in failures), failures
+        )
 
     def test_manually_inflating_the_baseline_without_touching_the_file_is_rejected(self) -> None:
         """自证：试图把基线调大 ⇒ 红。文件实际还是 2048 行，基线被手工改成 9999。"""
@@ -193,20 +197,26 @@ class RealBaselineIsHonestTest(unittest.TestCase):
         注释）。这是完成标准 2（断线不重启进程）的必要改动，在 main 上用
         pg_terminate_backend 实测复现进程退出。结构性拆分不塞进热修窗口，作为
         后续技术债登记在 #593。
+        `onboarding_runner.py`（1502 行）复核：一次批量 lint 自动修复曾把该文件里
+        五个仅供跨模块 re-export 的导入名（`EnvironmentResult`、
+        `KEY_INTERNAL_ERROR`、`KEY_NOT_AUTHORIZED`、`KEY_STALLED`、
+        `_KEYS_REQUIRING_REFERENCE`）连同各自的说明注释一并误删——这些名字本文件
+        自身确实不用，但外部消费方按名字从这里取用，删掉即触发导入报错；跑一次
+        全量 `unittest discover` 才暴露。逐字恢复原始导入与注释后，行数精确回到
+        1502，与该批开工前的登记值相同：该文件在当前 lint 规则集下没有可安全
+        移除的死代码，1502 继续保留为封顶，不下调，也不再登记新增理由。
+        2026-09-04 #592 B-1 拆分后两条全部移除（`service.py` 634 行、`onboarding_runner.py`
+        798 行），基线首次回到空文件；此后新增登记只能走「人工加行＋理由」路径。
         """
-
         self.assertEqual(
             CHECK.load_baseline(CHECK.BASELINE_PATH),
-            {
-                "src/lingxi/core/identity/onboarding_runner.py": 1502,
-                "src/lingxi/apps/worker/service.py": 1533,
-            },
+            {},
         )
 
 
 class EmptyBaselineIsLegalTest(unittest.TestCase):
     """空基线是合法终态，不是异常：当两个大文件都被拆分完、``src/lingxi/``
-    下不再有任何文件超过阈值时，棘轮退化成"不许新文件跨过 1500 行"，那仍是
+    下不再有任何文件超过阈值时，棘轮退化成"不许新文件跨过 1000 行"，那仍是
     它的主要价值——不能把"基线空"和"扫描坏了"混为一谈（补充复查要求，
     2026-08-19，与 A6"目录存在但零个 .py 文件"是两回事：那种是扫描本身失败，
     这里是扫描正常、只是没有文件超阈值）。
@@ -259,7 +269,9 @@ class RunRefreshClassificationTest(unittest.TestCase):
 
     def test_refresh_lowers_a_shrunk_entry(self) -> None:
         self._write_module("big.py", 1600)
-        self.baseline_path.write_text(CHECK.render_baseline({"src/lingxi/big.py": 2000}), encoding="utf-8")
+        self.baseline_path.write_text(
+            CHECK.render_baseline({"src/lingxi/big.py": 2000}), encoding="utf-8"
+        )
         exit_code = CHECK.run_refresh()
         self.assertEqual(exit_code, 0)
         self.assertEqual(CHECK.load_baseline(self.baseline_path), {"src/lingxi/big.py": 1600})
@@ -297,6 +309,25 @@ class RunRefreshClassificationTest(unittest.TestCase):
         exit_code = CHECK.run_refresh()
         self.assertEqual(exit_code, 1)
         self.assertEqual(CHECK.load_baseline(self.baseline_path), {"src/lingxi/grown.py": 2000})
+
+    def test_refresh_removes_an_entry_for_a_file_that_no_longer_exists(self) -> None:
+        """文件已删/改名/移出 src/lingxi/：evaluate() 现在会判红，--refresh
+        负责移除这类陈旧条目（该键在 current 里找不到，构造 new_baseline 时
+        被滤掉，与"缩到阈值以下"走同一处理路径）。"""
+
+        self._write_module("registered.py", 100)  # 仍存在，且已缩小
+        self.baseline_path.write_text(
+            CHECK.render_baseline(
+                {
+                    "src/lingxi/registered.py": 2000,
+                    "src/lingxi/gone.py": 2000,
+                }
+            ),
+            encoding="utf-8",
+        )
+        exit_code = CHECK.run_refresh()
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(CHECK.load_baseline(self.baseline_path), {})
 
 
 if __name__ == "__main__":

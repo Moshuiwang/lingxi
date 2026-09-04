@@ -178,9 +178,7 @@ class QueueModeWorkspacePrecheckThroughMainTests(unittest.TestCase):
             self.assertFalse(target.exists())
             stdout, stderr = io.StringIO(), io.StringIO()
 
-            with mock.patch(
-                "lingxi.apps.worker.cli._run_queue_worker", _stub_run_queue_worker
-            ):
+            with mock.patch("lingxi.apps.worker.cli._run_queue_worker", _stub_run_queue_worker):
                 code = main(
                     env=_worker_queue_env(LINGXI_WORKER_WORKSPACE=str(target)),
                     stdout=stdout,

@@ -21,16 +21,16 @@
 from __future__ import annotations
 
 import unittest
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 
 from lingxi.core.permission.table_access_token_supply import (
     TABLE_TOKEN_SUPPLY_FAILURE_REASONS,
     PermissionTableAccessTokenProvider,
-    PermissionTableAccessTokenUnavailable,
+    PermissionTableAccessTokenUnavailableError,
 )
 
 FAKE_TOKEN = "fake-permission-table-token-for-tests-only"
-DAY = datetime(2026, 8, 18, 9, 0, tzinfo=timezone.utc)
+DAY = datetime(2026, 8, 18, 9, 0, tzinfo=UTC)
 
 
 class MovableClock:
@@ -90,11 +90,11 @@ class FailureReasonVocabularyTest(unittest.TestCase):
         for smuggled in (f"fetch_error token={FAKE_TOKEN}", FAKE_TOKEN, "", "fetch_error "):
             with self.subTest(reason=smuggled[:16]):
                 with self.assertRaises(ValueError) as raised:
-                    PermissionTableAccessTokenUnavailable(smuggled)
+                    PermissionTableAccessTokenUnavailableError(smuggled)
                 self.assertNotIn(FAKE_TOKEN, str(raised.exception))
 
     def test_the_exception_text_is_exactly_the_classification(self) -> None:
-        error = PermissionTableAccessTokenUnavailable("fetch_unavailable")
+        error = PermissionTableAccessTokenUnavailableError("fetch_unavailable")
 
         self.assertEqual(str(error), "fetch_unavailable")
         self.assertEqual(error.reason, "fetch_unavailable")
@@ -133,10 +133,10 @@ class FailClosedTest(unittest.TestCase):
 
     def test_a_declared_unavailable_failure_propagates_and_is_audited(self) -> None:
         provider, _fetch, _clock, audit = build_provider(
-            outcomes=[PermissionTableAccessTokenUnavailable("fetch_unavailable")]
+            outcomes=[PermissionTableAccessTokenUnavailableError("fetch_unavailable")]
         )
 
-        with self.assertRaises(PermissionTableAccessTokenUnavailable) as raised:
+        with self.assertRaises(PermissionTableAccessTokenUnavailableError) as raised:
             provider()
 
         self.assertEqual(raised.exception.reason, "fetch_unavailable")
@@ -151,7 +151,7 @@ class FailClosedTest(unittest.TestCase):
             outcomes=[RuntimeError(f"boom token={FAKE_TOKEN}")]
         )
 
-        with self.assertRaises(PermissionTableAccessTokenUnavailable) as raised:
+        with self.assertRaises(PermissionTableAccessTokenUnavailableError) as raised:
             provider()
 
         self.assertEqual(raised.exception.reason, "fetch_error")
@@ -163,7 +163,7 @@ class FailClosedTest(unittest.TestCase):
 
         provider, _fetch, _clock, audit = build_provider(outcomes=[""])
 
-        with self.assertRaises(PermissionTableAccessTokenUnavailable) as raised:
+        with self.assertRaises(PermissionTableAccessTokenUnavailableError) as raised:
             provider()
 
         self.assertEqual(raised.exception.reason, "token_empty")
@@ -175,10 +175,10 @@ class FailClosedTest(unittest.TestCase):
         因此不依赖任何额外判断就能分辨——这正是 #226 要求的可分辨性。"""
 
         provider, _fetch, _clock, audit = build_provider(
-            outcomes=[PermissionTableAccessTokenUnavailable("fetch_unavailable")]
+            outcomes=[PermissionTableAccessTokenUnavailableError("fetch_unavailable")]
         )
 
-        with self.assertRaises(PermissionTableAccessTokenUnavailable):
+        with self.assertRaises(PermissionTableAccessTokenUnavailableError):
             provider()
 
         self.assertNotIn("permission_table_access_token_unwired", audit.actions())
@@ -191,14 +191,14 @@ class AuditDeduplicationTest(unittest.TestCase):
     def test_repeated_failures_the_same_day_are_recorded_once(self) -> None:
         provider, _fetch, _clock, audit = build_provider(
             outcomes=[
-                PermissionTableAccessTokenUnavailable("fetch_unavailable"),
-                PermissionTableAccessTokenUnavailable("fetch_unavailable"),
-                PermissionTableAccessTokenUnavailable("fetch_unavailable"),
+                PermissionTableAccessTokenUnavailableError("fetch_unavailable"),
+                PermissionTableAccessTokenUnavailableError("fetch_unavailable"),
+                PermissionTableAccessTokenUnavailableError("fetch_unavailable"),
             ]
         )
 
         for _ in range(3):
-            with self.assertRaises(PermissionTableAccessTokenUnavailable):
+            with self.assertRaises(PermissionTableAccessTokenUnavailableError):
                 provider()
 
         self.assertEqual(audit.actions(), ["permission_table_access_token.unavailable"])
@@ -206,14 +206,14 @@ class AuditDeduplicationTest(unittest.TestCase):
     def test_a_different_reason_the_same_day_is_recorded_separately(self) -> None:
         provider, _fetch, _clock, audit = build_provider(
             outcomes=[
-                PermissionTableAccessTokenUnavailable("fetch_unavailable"),
+                PermissionTableAccessTokenUnavailableError("fetch_unavailable"),
                 "",
             ]
         )
 
-        with self.assertRaises(PermissionTableAccessTokenUnavailable):
+        with self.assertRaises(PermissionTableAccessTokenUnavailableError):
             provider()
-        with self.assertRaises(PermissionTableAccessTokenUnavailable):
+        with self.assertRaises(PermissionTableAccessTokenUnavailableError):
             provider()
 
         self.assertEqual(
@@ -224,15 +224,15 @@ class AuditDeduplicationTest(unittest.TestCase):
     def test_the_next_day_records_again(self) -> None:
         provider, fetch, clock, audit = build_provider(
             outcomes=[
-                PermissionTableAccessTokenUnavailable("fetch_unavailable"),
-                PermissionTableAccessTokenUnavailable("fetch_unavailable"),
+                PermissionTableAccessTokenUnavailableError("fetch_unavailable"),
+                PermissionTableAccessTokenUnavailableError("fetch_unavailable"),
             ]
         )
 
-        with self.assertRaises(PermissionTableAccessTokenUnavailable):
+        with self.assertRaises(PermissionTableAccessTokenUnavailableError):
             provider()
         clock.advance(timedelta(days=1))
-        with self.assertRaises(PermissionTableAccessTokenUnavailable):
+        with self.assertRaises(PermissionTableAccessTokenUnavailableError):
             provider()
 
         self.assertEqual(
@@ -245,16 +245,16 @@ class AuditDeduplicationTest(unittest.TestCase):
 
         provider, _fetch, _clock, audit = build_provider(
             outcomes=[
-                PermissionTableAccessTokenUnavailable("fetch_unavailable"),
+                PermissionTableAccessTokenUnavailableError("fetch_unavailable"),
                 FAKE_TOKEN,
-                PermissionTableAccessTokenUnavailable("fetch_unavailable"),
+                PermissionTableAccessTokenUnavailableError("fetch_unavailable"),
             ]
         )
 
-        with self.assertRaises(PermissionTableAccessTokenUnavailable):
+        with self.assertRaises(PermissionTableAccessTokenUnavailableError):
             provider()
         self.assertEqual(provider(), FAKE_TOKEN)
-        with self.assertRaises(PermissionTableAccessTokenUnavailable):
+        with self.assertRaises(PermissionTableAccessTokenUnavailableError):
             provider()
 
         self.assertEqual(audit.actions(), ["permission_table_access_token.unavailable"])
@@ -262,10 +262,12 @@ class AuditDeduplicationTest(unittest.TestCase):
 
 class NoAuditSinkTest(unittest.TestCase):
     def test_without_an_audit_sink_the_failure_still_propagates(self) -> None:
-        fetch = _ScriptedFetch(outcomes=[PermissionTableAccessTokenUnavailable("fetch_unavailable")])
+        fetch = _ScriptedFetch(
+            outcomes=[PermissionTableAccessTokenUnavailableError("fetch_unavailable")]
+        )
         provider = PermissionTableAccessTokenProvider(fetch=fetch)
 
-        with self.assertRaises(PermissionTableAccessTokenUnavailable):
+        with self.assertRaises(PermissionTableAccessTokenUnavailableError):
             provider()
 
 

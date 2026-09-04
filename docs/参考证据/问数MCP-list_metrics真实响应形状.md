@@ -3,7 +3,7 @@
 > 最后核对：2026-08-19，来源为编排者在受控环境对真实问数 MCP 发起的真实调用（只读、使用测试 MCP 令牌）。当天先完成第一次真实调用（确认响应形状与前 8 条中文名/`metric_id`），随后完成**二次实测**，逐字取回全部 9 条记录的 `name_en`——首次实测时只有 `sub_new_count` 一条的 `name_en` 逐字可见，其余 8 条曾被标注为「合理翻译、非逐字实测」；二次实测已把这条登记更正为全部 9 条逐字实测，见下方「实测到的指标全集」。
 >
 > 本文回答一个长期问题：**真实问数 MCP 对 `list_metrics` 的返回，逐字长什么样，能不能从中数出指标条数。** 适用范围：`list_metrics` 一个工具的成功路径与无效令牌下的拒绝路径。
-> 不适用范围：本文**不**证明 `query_metric` 与 `search_dimension` 的返回形状——这两个工具本次一次都没有调用过，未测就是未测，不得据此推断它们的形状与 `list_metrics` 相同。就绪探针的判定语义（`ready`/`waiting`/`technical_failure` 怎么分流）不在本文，见[技术设计/接口设计](../技术设计/接口设计.md#五问数-mcp消费方)与 `src/lingxi/core/permission/mcp_readiness.py`。
+> 不适用范围：本文**不**证明 `query_metric` 与 `search_dimension` 的返回形状——这两个工具本次一次都没有调用过，未测就是未测，不得据此推断它们的形状与 `list_metrics` 相同。就绪探针的判定语义（`ready`/`waiting`/`technical_failure` 怎么分流）不在本文，见[技术设计/接口设计](../技术设计/接口设计.md#五问数-mcp消费方)与 `src/lingxi/core/permission/mcp_readiness_base.py`。
 
 ## 服务端事实
 

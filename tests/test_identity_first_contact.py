@@ -26,7 +26,6 @@ from lingxi.core.identity.first_contact import (
 from lingxi.core.identity.identifiers import redact_identifier
 from lingxi.core.identity.org_snapshot import DirectoryAvailability, SnapshotMember
 
-
 DELEGATED_SUBJECT = "ou_delegated_authorization_subject"
 
 
@@ -54,7 +53,9 @@ def member(
 
 
 def employed() -> EmploymentStatus:
-    return EmploymentStatus(is_activated=True, is_exited=False, is_frozen=False, is_resigned=False, is_unjoin=False)
+    return EmploymentStatus(
+        is_activated=True, is_exited=False, is_frozen=False, is_resigned=False, is_unjoin=False
+    )
 
 
 def decide(**overrides: object):
@@ -71,7 +72,19 @@ def decide(**overrides: object):
 
 class LocateTest(unittest.TestCase):
     def test_an_exact_open_id_match_locates_the_member(self) -> None:
-        result = locate_by_open_id("ou_zhang", (member(), member(member_key="ou_li", open_id="ou_li", user_id="user_li", union_id="union_li", display_name="李四")))
+        result = locate_by_open_id(
+            "ou_zhang",
+            (
+                member(),
+                member(
+                    member_key="ou_li",
+                    open_id="ou_li",
+                    user_id="user_li",
+                    union_id="union_li",
+                    display_name="李四",
+                ),
+            ),
+        )
 
         self.assertIs(result.outcome, LocationOutcome.LOCATED)
         self.assertIsNotNone(result.member)
@@ -86,8 +99,12 @@ class LocateTest(unittest.TestCase):
         self.assertIsNone(result.member)
         self.assertEqual(result.candidate_count, 0)
 
-    def test_two_members_sharing_one_open_id_are_ambiguous_rather_than_arbitrarily_picked(self) -> None:
-        duplicate = member(member_key="ou_zhang_second", user_id="user_other", union_id="union_other")
+    def test_two_members_sharing_one_open_id_are_ambiguous_rather_than_arbitrarily_picked(
+        self,
+    ) -> None:
+        duplicate = member(
+            member_key="ou_zhang_second", user_id="user_other", union_id="union_other"
+        )
 
         result = locate_by_open_id("ou_zhang", (member(), duplicate))
 
@@ -138,12 +155,20 @@ class EmploymentStatusTest(unittest.TestCase):
                 self.assertFalse(status.employed)
 
     def test_a_member_that_is_not_activated_is_not_employed(self) -> None:
-        status = EmploymentStatus(is_activated=False, is_exited=False, is_frozen=False, is_resigned=False, is_unjoin=False)
+        status = EmploymentStatus(
+            is_activated=False, is_exited=False, is_frozen=False, is_resigned=False, is_unjoin=False
+        )
 
         self.assertFalse(status.employed)
 
     def test_a_payload_missing_any_flag_is_undecidable_rather_than_assumed_employed(self) -> None:
-        full = {"is_activated": True, "is_exited": False, "is_frozen": False, "is_resigned": False, "is_unjoin": False}
+        full = {
+            "is_activated": True,
+            "is_exited": False,
+            "is_frozen": False,
+            "is_resigned": False,
+            "is_unjoin": False,
+        }
 
         self.assertIsNotNone(EmploymentStatus.from_feishu(full))
         for missing in full:
@@ -152,7 +177,13 @@ class EmploymentStatusTest(unittest.TestCase):
                 self.assertIsNone(EmploymentStatus.from_feishu(payload))
 
     def test_non_boolean_flags_are_undecidable(self) -> None:
-        payload = {"is_activated": "true", "is_exited": False, "is_frozen": False, "is_resigned": False, "is_unjoin": False}
+        payload = {
+            "is_activated": "true",
+            "is_exited": False,
+            "is_frozen": False,
+            "is_resigned": False,
+            "is_unjoin": False,
+        }
 
         self.assertIsNone(EmploymentStatus.from_feishu(payload))
 
@@ -185,12 +216,22 @@ class DecideFirstContactTest(unittest.TestCase):
         assert decision.draft is not None
 
         names = tuple(vars(decision.draft))
-        for forbidden in ("status", "is_activated", "is_exited", "is_frozen", "is_resigned", "is_unjoin", "employment"):
+        for forbidden in (
+            "status",
+            "is_activated",
+            "is_exited",
+            "is_frozen",
+            "is_resigned",
+            "is_unjoin",
+            "employment",
+        ):
             with self.subTest(field=forbidden):
                 self.assertNotIn(forbidden, names)
 
     def test_a_member_that_is_not_employed_is_refused_without_any_draft(self) -> None:
-        not_employed = EmploymentStatus(is_activated=True, is_exited=False, is_frozen=True, is_resigned=False, is_unjoin=False)
+        not_employed = EmploymentStatus(
+            is_activated=True, is_exited=False, is_frozen=True, is_resigned=False, is_unjoin=False
+        )
 
         decision = decide(employment=not_employed)
 
@@ -222,7 +263,9 @@ class DecideFirstContactTest(unittest.TestCase):
         self.assertIsNone(decision.draft)
 
     def test_an_ambiguous_match_is_not_authorized_without_picking_a_candidate(self) -> None:
-        duplicate = member(member_key="ou_zhang_second", user_id="user_other", union_id="union_other")
+        duplicate = member(
+            member_key="ou_zhang_second", user_id="user_other", union_id="union_other"
+        )
 
         decision = decide(location=locate_by_open_id("ou_zhang", (member(), duplicate)))
 
@@ -244,7 +287,9 @@ class DecideFirstContactTest(unittest.TestCase):
     def test_identity_failure_reasons_share_one_user_visible_terminal_message(self) -> None:
         """V-开通-17：内部原因可区分，但用户侧提示必须逐字节一致。"""
 
-        duplicate = member(member_key="ou_zhang_second", user_id="user_other", union_id="union_other")
+        duplicate = member(
+            member_key="ou_zhang_second", user_id="user_other", union_id="union_other"
+        )
         cases = (
             decide(open_id="ou_absent", location=locate_by_open_id("ou_absent", (member(),))),
             decide(location=locate_by_open_id("ou_zhang", (member(), duplicate))),
@@ -261,7 +306,9 @@ class DecideFirstContactTest(unittest.TestCase):
             ),
         )
 
-        self.assertEqual({decision.outcome for decision in cases}, {FirstContactOutcome.NOT_AUTHORIZED})
+        self.assertEqual(
+            {decision.outcome for decision in cases}, {FirstContactOutcome.NOT_AUTHORIZED}
+        )
         self.assertEqual(len({decision.failure_reason for decision in cases}), len(cases))
         self.assertEqual(len({decision.message for decision in cases}), 1)
         self.assertEqual(len({decision.content_key for decision in cases}), 1)
@@ -271,16 +318,29 @@ class DecideFirstContactTest(unittest.TestCase):
 
     def test_the_delegated_authorization_subject_is_never_recorded_as_a_user(self) -> None:
         """V-身份-02。"""
-        subject = member(member_key=DELEGATED_SUBJECT, open_id=DELEGATED_SUBJECT, user_id="user_delegated", union_id="union_delegated", display_name="专用授权账号")
+        subject = member(
+            member_key=DELEGATED_SUBJECT,
+            open_id=DELEGATED_SUBJECT,
+            user_id="user_delegated",
+            union_id="union_delegated",
+            display_name="专用授权账号",
+        )
 
-        decision = decide(open_id=DELEGATED_SUBJECT, location=locate_by_open_id(DELEGATED_SUBJECT, (subject,)))
+        decision = decide(
+            open_id=DELEGATED_SUBJECT, location=locate_by_open_id(DELEGATED_SUBJECT, (subject,))
+        )
 
         self.assertIs(decision.outcome, FirstContactOutcome.DELEGATED_SUBJECT_IGNORED)
         self.assertIsNone(decision.draft)
         self.assertFalse(decision.creates_record)
 
     def test_the_delegated_subject_is_refused_even_when_everything_else_would_pass(self) -> None:
-        subject = member(member_key=DELEGATED_SUBJECT, open_id=DELEGATED_SUBJECT, user_id="user_delegated", union_id="union_delegated")
+        subject = member(
+            member_key=DELEGATED_SUBJECT,
+            open_id=DELEGATED_SUBJECT,
+            user_id="user_delegated",
+            union_id="union_delegated",
+        )
 
         decision = decide(
             open_id=f"  {DELEGATED_SUBJECT}  ",
@@ -291,9 +351,14 @@ class DecideFirstContactTest(unittest.TestCase):
 
     def test_a_lookalike_of_the_delegated_subject_is_still_an_ordinary_employee(self) -> None:
         # 前缀不用于比对：只有完全相同的 open_id 才是专用授权账号本身。
-        lookalike = member(member_key="ou_delegated_authorization_subject_2", open_id="ou_delegated_authorization_subject_2")
+        lookalike = member(
+            member_key="ou_delegated_authorization_subject_2",
+            open_id="ou_delegated_authorization_subject_2",
+        )
 
-        decision = decide(open_id=lookalike.open_id, location=locate_by_open_id(lookalike.open_id, (lookalike,)))
+        decision = decide(
+            open_id=lookalike.open_id, location=locate_by_open_id(lookalike.open_id, (lookalike,))
+        )
 
         self.assertIs(decision.outcome, FirstContactOutcome.RECORD_READY)
 
@@ -336,7 +401,11 @@ class DecideFirstContactTest(unittest.TestCase):
         self.assertIs(decision.outcome, FirstContactOutcome.DIRECTORY_UNAVAILABLE)
 
     def test_the_delegated_subject_is_refused_even_when_the_directory_is_unavailable(self) -> None:
-        decision = decide(open_id=DELEGATED_SUBJECT, directory=DirectoryAvailability.UNAVAILABLE, location=locate_by_open_id(DELEGATED_SUBJECT, ()))
+        decision = decide(
+            open_id=DELEGATED_SUBJECT,
+            directory=DirectoryAvailability.UNAVAILABLE,
+            location=locate_by_open_id(DELEGATED_SUBJECT, ()),
+        )
 
         self.assertIs(decision.outcome, FirstContactOutcome.DELEGATED_SUBJECT_IGNORED)
 
@@ -344,7 +413,12 @@ class DecideFirstContactTest(unittest.TestCase):
 class NameAndOptionalFieldTest(unittest.TestCase):
     def test_latin_and_mixed_names_are_recorded_exactly_as_returned(self) -> None:
         """硬约束 3 / V-开通-08：姓名不假定中文。"""
-        cases = (("Alice Smith", "en-US"), ("Anna 李", "zh-CN"), ("O'Brien-Núñez", None), ("张三", "zh-CN"))
+        cases = (
+            ("Alice Smith", "en-US"),
+            ("Anna 李", "zh-CN"),
+            ("O'Brien-Núñez", None),
+            ("张三", "zh-CN"),
+        )
         for name, locale in cases:
             with self.subTest(name=name):
                 located = member(display_name=name, display_name_locale=locale)
@@ -357,10 +431,24 @@ class NameAndOptionalFieldTest(unittest.TestCase):
 
     def test_two_members_with_the_same_name_are_told_apart_by_open_id(self) -> None:
         """硬约束 3：姓名不是唯一键；710 人实测含 1 对重名。"""
-        first = member(member_key="ou_first", open_id="ou_first", user_id="user_first", union_id="union_first", display_name="张三")
-        second = member(member_key="ou_second", open_id="ou_second", user_id="user_second", union_id="union_second", display_name="张三")
+        first = member(
+            member_key="ou_first",
+            open_id="ou_first",
+            user_id="user_first",
+            union_id="union_first",
+            display_name="张三",
+        )
+        second = member(
+            member_key="ou_second",
+            open_id="ou_second",
+            user_id="user_second",
+            union_id="union_second",
+            display_name="张三",
+        )
 
-        decision = decide(open_id="ou_second", location=locate_by_open_id("ou_second", (first, second)))
+        decision = decide(
+            open_id="ou_second", location=locate_by_open_id("ou_second", (first, second))
+        )
 
         assert decision.draft is not None
         self.assertEqual(decision.draft.feishu_user_id, "user_second")
@@ -428,9 +516,18 @@ class UserFacingMessageTest(unittest.TestCase):
     """错误信封约定：面向用户的文案不含内部标识、堆栈或表名。"""
 
     def _all_decisions(self):
-        duplicate = member(member_key="ou_zhang_second", user_id="user_other", union_id="union_other")
-        frozen = EmploymentStatus(is_activated=True, is_exited=False, is_frozen=True, is_resigned=False, is_unjoin=False)
-        subject = member(member_key=DELEGATED_SUBJECT, open_id=DELEGATED_SUBJECT, user_id="user_delegated", union_id="union_delegated")
+        duplicate = member(
+            member_key="ou_zhang_second", user_id="user_other", union_id="union_other"
+        )
+        frozen = EmploymentStatus(
+            is_activated=True, is_exited=False, is_frozen=True, is_resigned=False, is_unjoin=False
+        )
+        subject = member(
+            member_key=DELEGATED_SUBJECT,
+            open_id=DELEGATED_SUBJECT,
+            user_id="user_delegated",
+            union_id="union_delegated",
+        )
         return (
             decide(),
             decide(employment=frozen),
@@ -438,7 +535,9 @@ class UserFacingMessageTest(unittest.TestCase):
             decide(open_id="ou_absent", location=locate_by_open_id("ou_absent", (member(),))),
             decide(location=locate_by_open_id("ou_zhang", (member(), duplicate))),
             decide(location=locate_by_open_id("ou_zhang", (member(user_id="  "),))),
-            decide(open_id=DELEGATED_SUBJECT, location=locate_by_open_id(DELEGATED_SUBJECT, (subject,))),
+            decide(
+                open_id=DELEGATED_SUBJECT, location=locate_by_open_id(DELEGATED_SUBJECT, (subject,))
+            ),
             decide(directory=DirectoryAvailability.UNAVAILABLE),
         )
 
@@ -506,7 +605,16 @@ class UserFacingMessageTest(unittest.TestCase):
         self.assertEqual(seen, set(FirstContactOutcome))
 
     def test_no_message_leaks_an_internal_identifier_or_table_name(self) -> None:
-        leaks = ("ou_zhang", "user_zhang", "union_zhang", "tenant_a", DELEGATED_SUBJECT, "app_user", "feishu_org_member_snapshot", "Traceback")
+        leaks = (
+            "ou_zhang",
+            "user_zhang",
+            "union_zhang",
+            "tenant_a",
+            DELEGATED_SUBJECT,
+            "app_user",
+            "feishu_org_member_snapshot",
+            "Traceback",
+        )
         for decision in self._all_decisions():
             for leak in leaks:
                 with self.subTest(outcome=decision.outcome, leak=leak):

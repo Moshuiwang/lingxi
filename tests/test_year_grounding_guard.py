@@ -10,8 +10,9 @@
 from __future__ import annotations
 
 import unittest
+from collections.abc import Mapping
 from dataclasses import dataclass
-from typing import Any, Mapping
+from typing import Any
 
 from lingxi.core.year_grounding_guard import (
     QUERY_METRIC_TOOL_NAME,
@@ -77,7 +78,7 @@ class RelativeTimeTermDetectionTests(unittest.TestCase):
         self.assertEqual(find_relative_time_terms("上周对比上个月"), ("上周", "上个月"))
 
     def test_matches_variable_patterns_not_covered_by_the_literal_list(self) -> None:
-        """"近N天""N月之后"这类 N 是变量的表述，字面量列表覆盖不到，靠正则补。"""
+        """ "近N天""N月之后"这类 N 是变量的表述，字面量列表覆盖不到，靠正则补。"""
 
         self.assertEqual(find_relative_time_terms("近7天的充值趋势"), ("近7天",))
         self.assertEqual(find_relative_time_terms("尤其是7月之后下滑明显"), ("7月之后",))
@@ -174,7 +175,12 @@ class QueryYearExtractionTests(unittest.TestCase):
         """正例：Issue #326 L4a 追评记录的真实捕获形状——``filters`` 嵌套 **且**
         紧凑 ``YYYYMMDD`` 日期同时出现，两处修复合起来才能让本用例通过。"""
 
-        calls = [_FakeToolCall(tool_name=QUERY_METRIC_TOOL_NAME, tool_input=_real_captured_tool_input(start_date="20260819", end_date="20260826"))]
+        calls = [
+            _FakeToolCall(
+                tool_name=QUERY_METRIC_TOOL_NAME,
+                tool_input=_real_captured_tool_input(start_date="20260819", end_date="20260826"),
+            )
+        ]
         self.assertEqual(extract_query_years(calls), (2026,))
 
     def test_collects_years_from_both_top_level_and_nested_filters_when_both_present(self) -> None:

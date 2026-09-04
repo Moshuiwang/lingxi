@@ -11,9 +11,9 @@
 from __future__ import annotations
 
 import csv
+import hashlib
 from collections.abc import Mapping
 from dataclasses import dataclass
-import hashlib
 from pathlib import Path
 
 from lingxi.core.permission.galaxy_export import SOURCE_TABLES
@@ -38,20 +38,21 @@ def read_csv_table(path: Path) -> list[dict[str, str]]:
 
     未转义逗号或损坏导出会让 `DictReader` 把溢出值挂在 `None` 键下；静默丢弃
     意味着该行的邮箱/姓名/公司字段可能已整体错位，却仍能通过校验并取代有效
-    批次（Codex 复查发现）。错误信息只报行号，不回显内容。
+    批次。错误信息只报行号，不回显内容。
     """
-
     # utf-8-sig：Excel 导出的 CSV 常带 BOM，不去掉会让首列列名对不上。
     with path.open("r", encoding="utf-8-sig", newline="") as csv_file:
-        # strict 方言：引号错误抛 csv.Error 而不是把文件余下内容吞进当前字段
-        # （终轮 Codex：未闭合引号的错位行可能带着关键 ID 通过校验）。
+        # strict 方言：引号错误抛 csv.Error 而不是把文件余下内容吞进当前字段——
+        # 未闭合引号的错位行可能带着关键 ID 通过校验。
         reader = csv.DictReader(csv_file, strict=True)
         rows: list[dict[str, str]] = []
         overflow_rows: list[int] = []
         try:
             enumerated = list(enumerate(reader, start=1))
         except csv.Error as error:
-            raise ValueError(f"{path.name} 不是可靠的 CSV（解析错误，疑似未闭合引号），整文件拒绝") from error
+            raise ValueError(
+                f"{path.name} 不是可靠的 CSV（解析错误，疑似未闭合引号），整文件拒绝"
+            ) from error
         for row_number, raw_row in enumerated:
             if None in raw_row and raw_row.get(None):
                 overflow_rows.append(row_number)
@@ -73,11 +74,16 @@ def read_csv_table(path: Path) -> list[dict[str, str]]:
 
 def load_export_directory(directory: Path) -> ExportBundle:
     """读取目录下的五个 CSV；缺文件立即失败并列出缺哪几个。"""
-
     directory = Path(directory)
-    missing = [file_name for file_name in EXPORT_FILE_NAMES.values() if not (directory / file_name).is_file()]
+    missing = [
+        file_name
+        for file_name in EXPORT_FILE_NAMES.values()
+        if not (directory / file_name).is_file()
+    ]
     if missing:
-        raise FileNotFoundError(f"导出目录缺少以下文件：{'、'.join(sorted(missing))}（目录：{directory}）")
+        raise FileNotFoundError(
+            f"导出目录缺少以下文件：{'、'.join(sorted(missing))}（目录：{directory}）"
+        )
 
     tables: dict[str, list[dict[str, str]]] = {}
     digest = hashlib.sha256()

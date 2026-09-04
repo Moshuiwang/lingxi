@@ -12,11 +12,10 @@ import re
 import subprocess
 import sys
 import unicodedata
-from functools import lru_cache
+from collections.abc import Iterator
+from functools import cache
 from pathlib import Path
-from typing import Iterator
 from urllib.parse import unquote, urlsplit
-
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
 MARKDOWN_LINK = re.compile(r"!?\[[^\]]*]\(([^)\s]+)(?:\s+[^)]*)?\)")
@@ -90,7 +89,7 @@ def slugify(heading_text: str) -> str:
     return "".join(kept_chars).replace(" ", "-")
 
 
-@lru_cache(maxsize=None)
+@cache
 def heading_anchors(markdown_file: Path) -> frozenset[str]:
     """目标文件中全部标题按顺序生成的锚点集合（含重复标题的去重后缀）。
 
@@ -150,7 +149,9 @@ def check_file(markdown_file: Path) -> list[str]:
                 if cleaned_link.startswith("#"):
                     # 形如 `(#)` 的占位链接，不指向任何标题，不视为坏锚点。
                     continue
-                errors.append(f"{markdown_file.relative_to(REPOSITORY_ROOT)}:{line_number}: 本地链接缺少路径")
+                errors.append(
+                    f"{markdown_file.relative_to(REPOSITORY_ROOT)}:{line_number}: 本地链接缺少路径"
+                )
                 continue
 
             if target_path:

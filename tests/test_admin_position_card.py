@@ -3,8 +3,9 @@
 from __future__ import annotations
 
 import unittest
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 
+from lingxi.config.content import default_content_catalog
 from lingxi.core.admin.card_dispatch import (
     MANAGEMENT_CARD_CONTEXT_DEFAULT_TTL_SECONDS,
     MANAGEMENT_CARD_CONTEXT_MAX_TTL_SECONDS,
@@ -17,10 +18,9 @@ from lingxi.core.admin.management_card import (
     ADMIN_ACTION_GRANT,
     render_management_card,
 )
-from lingxi.core.admin.router import AdminRouteOutcome
 from lingxi.core.admin.pending_action import PendingAction, PendingActionStatus, PendingActionType
+from lingxi.core.admin.router import AdminRouteOutcome
 from lingxi.core.admin.views import AdminUserStatusView, LocalPermissionOverrideView
-from lingxi.config.content import default_content_catalog
 from lingxi.core.permission.position_override import expand_position_scope
 from lingxi.core.permission.targeted_recompute import (
     SKIP_ACCOUNT_NOT_ENABLED,
@@ -28,8 +28,7 @@ from lingxi.core.permission.targeted_recompute import (
     TargetedRecomputeOutcome,
 )
 
-
-NOW = datetime(2026, 8, 31, 12, 0, tzinfo=timezone.utc)
+NOW = datetime(2026, 8, 31, 12, 0, tzinfo=UTC)
 
 
 class _PositionCatalog:
@@ -151,7 +150,9 @@ class PositionManagementCardTests(unittest.TestCase):
         self.assertTrue(fields["company_scope"]["required"])
         self.assertTrue(fields["reason"]["required"])
         scope = fields["company_scope"]
-        self.assertIn("全部（3 家公司）", [option["text"]["content"] for option in scope["options"]])
+        self.assertIn(
+            "全部（3 家公司）", [option["text"]["content"] for option in scope["options"]]
+        )
 
         buttons = [element for element in elements if element.get("tag") == "button"]
         actions = [button["behaviors"][0]["value"].get("admin_action") for button in buttons]
@@ -180,7 +181,7 @@ class PositionManagementCardTests(unittest.TestCase):
     def test_terminal_refresh_restores_form_after_async_result(self) -> None:
         """异步下发终态只更新状态，不能把原管理卡永久锁成只读。"""
 
-        from lingxi.apps.gateway import _GatewayManagementCardRefresher
+        from lingxi.apps.gateway.management_cards import ManagementCardRefresher
 
         class _Transport:
             def __init__(self) -> None:
@@ -195,7 +196,7 @@ class PositionManagementCardTests(unittest.TestCase):
                 return 3
 
         transport = _Transport()
-        refresher = _GatewayManagementCardRefresher(
+        refresher = ManagementCardRefresher(
             transport=transport,
             catalog=_PositionCatalog(),
             display_names=_DisplayNames(),
@@ -212,12 +213,17 @@ class PositionManagementCardTests(unittest.TestCase):
         self.assertEqual(len(transport.updated), 1)
         elements = list(_walk(transport.updated[0]["card"]["body"]["elements"]))
         self.assertTrue([element for element in elements if element.get("tag") == "form"])
-        self.assertIn("已生效", "\n".join(
-            element.get("content", "") for element in elements if element.get("tag") == "markdown"
-        ))
+        self.assertIn(
+            "已生效",
+            "\n".join(
+                element.get("content", "")
+                for element in elements
+                if element.get("tag") == "markdown"
+            ),
+        )
 
     def test_cardkit_failure_does_not_advance_visual_watermark_before_success(self) -> None:
-        from lingxi.apps.gateway import _GatewayManagementCardRefresher
+        from lingxi.apps.gateway.management_cards import ManagementCardRefresher
 
         class _Transport:
             def __init__(self) -> None:
@@ -241,7 +247,7 @@ class PositionManagementCardTests(unittest.TestCase):
             message_id="om_cardkit_failure", state="effective", dispatch_status="effective"
         )
         transport = _Transport()
-        refresher = _GatewayManagementCardRefresher(
+        refresher = ManagementCardRefresher(
             transport=transport,
             catalog=_PositionCatalog(),
             display_names=_DisplayNames(),
@@ -259,7 +265,7 @@ class PositionManagementCardTests(unittest.TestCase):
         self.assertEqual(store.list_needing_refresh(), ())
 
     def test_visual_update_failure_keeps_persistent_refresh_watermark_for_retry(self) -> None:
-        from lingxi.apps.gateway import _ManagementCardRecoveryScanner
+        from lingxi.apps.gateway.management_cards import ManagementCardRecoveryScanner
 
         store = ManagementCardContextStore()
         store.remember(
@@ -287,7 +293,7 @@ class PositionManagementCardTests(unittest.TestCase):
                 sequence = store.next_card_sequence(message_id=context.message_id)
                 store.mark_visual_refreshed(message_id=context.message_id, sequence=sequence)
 
-        scanner = _ManagementCardRecoveryScanner(
+        scanner = ManagementCardRecoveryScanner(
             context_store=store,
             refresher=_Refresher(),
             status_lookup=lambda _identifier: _status(),
@@ -297,7 +303,7 @@ class PositionManagementCardTests(unittest.TestCase):
         self.assertEqual(len(store.list_needing_refresh()), 1)
         # 用新的 scanner 实例模拟 gateway 在瞬时 CardKit 失败后重启；重试依据是
         # store 中的持久水位，而不是上一进程的 observer/内存状态。
-        restarted_scanner = _ManagementCardRecoveryScanner(
+        restarted_scanner = ManagementCardRecoveryScanner(
             context_store=store,
             refresher=_Refresher(),
             status_lookup=lambda _identifier: _status(),
@@ -309,7 +315,10 @@ class PositionManagementCardTests(unittest.TestCase):
     def test_recovery_scanner_drops_old_visual_when_state_changes_after_snapshot(self) -> None:
         """scanner 读旧行后，状态推进必须让旧视觉在取号 CAS 处放弃。"""
 
-        from lingxi.apps.gateway import _GatewayManagementCardRefresher, _ManagementCardRecoveryScanner
+        from lingxi.apps.gateway import (
+            ManagementCardRecoveryScanner,
+            ManagementCardRefresher,
+        )
 
         class _Transport:
             def __init__(self) -> None:
@@ -335,7 +344,7 @@ class PositionManagementCardTests(unittest.TestCase):
             message_id="om_recovery_cas", state="effective", dispatch_status="effective"
         )
         transport = _Transport()
-        refresher = _GatewayManagementCardRefresher(
+        refresher = ManagementCardRefresher(
             transport=transport,
             catalog=_PositionCatalog(),
             display_names=_DisplayNames(),
@@ -353,7 +362,7 @@ class PositionManagementCardTests(unittest.TestCase):
             )
             return _status()
 
-        scanner = _ManagementCardRecoveryScanner(
+        scanner = ManagementCardRecoveryScanner(
             context_store=store,
             refresher=refresher,
             status_lookup=status_lookup,
@@ -373,7 +382,7 @@ class PositionManagementCardTests(unittest.TestCase):
 
         # A fresh scanner can now render and deliver the current state after the
         # old snapshot has been rejected, which also exercises restart recovery.
-        restarted = _ManagementCardRecoveryScanner(
+        restarted = ManagementCardRecoveryScanner(
             context_store=store,
             refresher=refresher,
             status_lookup=lambda _identifier: _status(),
@@ -401,13 +410,9 @@ class PositionManagementCardTests(unittest.TestCase):
         assert updated is not None
         self.assertEqual(updated.card_sequence, 3)
         self.assertTrue(updated.needs_refresh)
-        self.assertFalse(
-            store.mark_visual_refreshed(message_id="om_visual_generation", sequence=1)
-        )
+        self.assertFalse(store.mark_visual_refreshed(message_id="om_visual_generation", sequence=1))
         self.assertEqual(len(store.list_needing_refresh()), 1)
-        self.assertTrue(
-            store.mark_visual_refreshed(message_id="om_visual_generation", sequence=3)
-        )
+        self.assertTrue(store.mark_visual_refreshed(message_id="om_visual_generation", sequence=3))
         self.assertEqual(store.list_needing_refresh(), ())
 
     def test_closed_card_has_no_form_or_cancel_action(self) -> None:
@@ -509,9 +514,7 @@ class PositionManagementCardTests(unittest.TestCase):
         self.assertEqual(value.get("permission_group_id"), "lpg_01M1C90YDGMTY567GDTZZJ4C5E")
         self.assertNotIn("override_id", value)
         visible = "\n".join(
-            element.get("content", "")
-            for element in elements
-            if element.get("tag") == "markdown"
+            element.get("content", "") for element in elements if element.get("tag") == "markdown"
         )
         self.assertIn("覆盖 387 项权限", visible)
 
@@ -551,9 +554,11 @@ class TerminalOutcomeTextTests(unittest.TestCase):
 
 
 class ContextSequenceTests(unittest.TestCase):
-    def test_default_context_ttl_is_forty_minutes_and_explicit_deadline_is_hard_capped_at_24h(self) -> None:
+    def test_default_context_ttl_is_forty_minutes_and_explicit_deadline_is_hard_capped_at_24h(
+        self,
+    ) -> None:
         store = ManagementCardContextStore()
-        before = datetime.now(timezone.utc)
+        before = datetime.now(UTC)
         store.remember(
             message_id="om_ttl",
             identifier="u@example.com",
@@ -596,16 +601,12 @@ class ContextSequenceTests(unittest.TestCase):
         fixed_now = NOW
         before_24h = fixed_now + timedelta(hours=24) - timedelta(seconds=1)
         self.assertEqual(
-            bounded_management_card_deadline(
-                now=fixed_now, requested=before_24h, ttl_seconds=1800
-            ),
+            bounded_management_card_deadline(now=fixed_now, requested=before_24h, ttl_seconds=1800),
             before_24h,
         )
         exact_24h = fixed_now + timedelta(hours=24)
         self.assertEqual(
-            bounded_management_card_deadline(
-                now=fixed_now, requested=exact_24h, ttl_seconds=1800
-            ),
+            bounded_management_card_deadline(now=fixed_now, requested=exact_24h, ttl_seconds=1800),
             exact_24h,
         )
         self.assertEqual(
@@ -615,7 +616,9 @@ class ContextSequenceTests(unittest.TestCase):
             exact_24h,
         )
 
-    def test_context_sequence_is_monotonic_and_expired_context_is_still_recoverable_for_lazy_close(self) -> None:
+    def test_context_sequence_is_monotonic_and_expired_context_is_still_recoverable_for_lazy_close(
+        self,
+    ) -> None:
         clock = [0.0]
         store = ManagementCardContextStore(ttl_seconds=1.0, clock=lambda: clock[0])
         store.remember(
@@ -625,7 +628,7 @@ class ContextSequenceTests(unittest.TestCase):
             chat_id="oc_1",
             initiated_by_open_id="ou_admin",
             snapshot_fingerprint="fp",
-            context_deadline_at=datetime.now(timezone.utc) + timedelta(hours=1),
+            context_deadline_at=datetime.now(UTC) + timedelta(hours=1),
             card_sequence=2,
         )
         self.assertEqual(store.next_card_sequence(message_id="om_1"), 3)
@@ -723,7 +726,7 @@ class ManagementCardCallbackSecurityTests(unittest.TestCase):
             chat_id="oc_1",
             initiated_by_open_id="ou_admin",
             snapshot_fingerprint=management_card_fingerprint(status),
-            context_deadline_at=datetime.now(timezone.utc) + timedelta(hours=1),
+            context_deadline_at=datetime.now(UTC) + timedelta(hours=1),
         )
         return store
 
@@ -757,7 +760,9 @@ class ManagementCardCallbackSecurityTests(unittest.TestCase):
         route = _Route()
         store = self._store(status)
         refresh = _Refresh()
-        handler = self._handler(status=status, route=route, store=store, refresh=refresh, audit=_Audit())
+        handler = self._handler(
+            status=status, route=route, store=store, refresh=refresh, audit=_Audit()
+        )
         response = self._submit(handler)
 
         self.assertEqual(response["toast"]["type"], "success")
@@ -767,11 +772,16 @@ class ManagementCardCallbackSecurityTests(unittest.TestCase):
 
     def test_non_initiator_or_tampered_identifier_cannot_route_write(self) -> None:
         status = _status()
-        for operator, identifier in (("ou_other", "u@example.com"), ("ou_admin", "other@example.com")):
+        for operator, identifier in (
+            ("ou_other", "u@example.com"),
+            ("ou_admin", "other@example.com"),
+        ):
             route = _Route()
             store = self._store(status)
             audit = _Audit()
-            handler = self._handler(status=status, route=route, store=store, refresh=_Refresh(), audit=audit)
+            handler = self._handler(
+                status=status, route=route, store=store, refresh=_Refresh(), audit=audit
+            )
             response = self._submit(handler, operator=operator, identifier=identifier)
             self.assertEqual(response["toast"]["type"], "error")
             self.assertEqual(route.calls, [])
@@ -864,7 +874,9 @@ class ManagementCardCallbackSecurityTests(unittest.TestCase):
         route = _Route()
         store = self._store(original)
         refresh = _Refresh()
-        handler = self._handler(status=changed, route=route, store=store, refresh=refresh, audit=_Audit())
+        handler = self._handler(
+            status=changed, route=route, store=store, refresh=refresh, audit=_Audit()
+        )
         response = self._submit(handler)
 
         self.assertEqual(response["toast"]["type"], "error")
@@ -1025,7 +1037,9 @@ class PositionCommandShiftReproductionTests(unittest.TestCase):
 
         parsed = parse_admin_command(shifted)
 
-        self.assertEqual(parsed.kind, AdminCommandKind.GRANT_POSITION_PERMISSION, "左移后仍然形状合法")
+        self.assertEqual(
+            parsed.kind, AdminCommandKind.GRANT_POSITION_PERMISSION, "左移后仍然形状合法"
+        )
         self.assertEqual(parsed.position_name, "c1", "管理员选的公司范围被当成了职位")
         self.assertEqual(parsed.company_scope, "c2", "公司范围换成了原因里的第一个词")
         self.assertEqual(parsed.reason, "补充授权")
@@ -1039,11 +1053,11 @@ class PositionCommandShiftReproductionTests(unittest.TestCase):
 
         parsed = parse_admin_command(shifted)
 
-        self.assertEqual(parsed.kind, AdminCommandKind.GRANT_POSITION_PERMISSION, "左移后仍然形状合法")
-        self.assertEqual(parsed.position_name, "A运营")
         self.assertEqual(
-            parsed.company_scope, "c2", "授权范围变成了管理员从没选过的公司"
+            parsed.kind, AdminCommandKind.GRANT_POSITION_PERMISSION, "左移后仍然形状合法"
         )
+        self.assertEqual(parsed.position_name, "A运营")
+        self.assertEqual(parsed.company_scope, "c2", "授权范围变成了管理员从没选过的公司")
         self.assertEqual(parsed.reason, "补充授权")
 
 
@@ -1082,10 +1096,10 @@ def _rendered_status(transport: _RefresherTransport) -> str:
 
 
 def _render_incomplete(*, account_state: str, dispatch_status: str | None) -> str:
-    from lingxi.apps.gateway import _GatewayManagementCardRefresher
+    from lingxi.apps.gateway.management_cards import ManagementCardRefresher
 
     transport = _RefresherTransport()
-    refresher = _GatewayManagementCardRefresher(
+    refresher = ManagementCardRefresher(
         transport=transport,
         catalog=_PositionCatalog(),
         display_names=_DisplayNames(),
@@ -1140,9 +1154,7 @@ class SuspendedUserGetsTheTruthNotADailyBatchPromiseTests(unittest.TestCase):
         )
 
         message = skipped_recompute_status_message(
-            TargetedRecomputeOutcome(
-                kind=RecomputeKind.SKIPPED, reason=SKIP_ACCOUNT_NOT_ENABLED
-            )
+            TargetedRecomputeOutcome(kind=RecomputeKind.SKIPPED, reason=SKIP_ACCOUNT_NOT_ENABLED)
         )
         self.assertIsNotNone(message)
         assert message is not None
@@ -1161,9 +1173,7 @@ class SuspendedUserGetsTheTruthNotADailyBatchPromiseTests(unittest.TestCase):
         )
 
         message = skipped_recompute_status_message(
-            TargetedRecomputeOutcome(
-                kind=RecomputeKind.SKIPPED, reason=SKIP_ACCOUNT_NOT_ENABLED
-            )
+            TargetedRecomputeOutcome(kind=RecomputeKind.SKIPPED, reason=SKIP_ACCOUNT_NOT_ENABLED)
         )
         self._assert_is_the_truth(
             _render_incomplete(account_state="suspended", dispatch_status=message)
@@ -1279,9 +1289,7 @@ class SuspendedUserTransientTextTests(unittest.TestCase):
         """反向对照二：只改写「正在下发」这一句——「已生效」「已取消」各有自己的判据，
         不在这里顺手一起改写。"""
 
-        self.assertEqual(
-            self._rendered(account_state="suspended", state="effective"), "已生效"
-        )
+        self.assertEqual(self._rendered(account_state="suspended", state="effective"), "已生效")
         self.assertEqual(self._rendered(account_state="suspended", state="closed"), "已取消")
 
     def test_a_status_view_without_account_state_keeps_the_old_wording(self) -> None:

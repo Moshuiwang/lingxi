@@ -29,7 +29,6 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-
 REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
 DSN_ENV = "LINGXI_POSTGRES_DSN"
 
@@ -48,7 +47,9 @@ def _load_impact_module():
 IMPACT = _load_impact_module()
 
 
-def _facts(repository: Path, ref: str) -> tuple[dict[str, str], dict[str, dict[str, tuple[str, ...]]], bytes, bytes]:
+def _facts(
+    repository: Path, ref: str
+) -> tuple[dict[str, str], dict[str, dict[str, tuple[str, ...]]], bytes, bytes]:
     roles, metrics, role_raw, metric_raw = IMPACT._load_ref_documents_with_raw(repository, ref)
     return (
         IMPACT._role_map(roles, f"{ref} 角色映射"),

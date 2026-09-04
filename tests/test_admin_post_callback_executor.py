@@ -98,9 +98,7 @@ class BackgroundPostCallbackExecutorTests(unittest.TestCase):
         executor.submit(done.set)
 
         self.assertTrue(done.wait(timeout=5), "前一个任务抛异常不得带走 worker")
-        self.assertIn(
-            POST_CALLBACK_TASK_FAILED_ACTION, [action for action, _ in audit.records]
-        )
+        self.assertIn(POST_CALLBACK_TASK_FAILED_ACTION, [action for action, _ in audit.records])
 
     def test_a_failing_audit_sink_does_not_kill_the_worker_either(self) -> None:
         class ExplodingAudit:

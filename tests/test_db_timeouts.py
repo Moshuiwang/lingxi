@@ -19,6 +19,8 @@ from lingxi.adapters.postgres import (
 )
 from lingxi.adapters.postgres_conversation import (
     DEFAULT_CONNECT_TIMEOUT_SECONDS as GATEWAY_DEFAULT_CONNECT_TIMEOUT_SECONDS,
+)
+from lingxi.adapters.postgres_conversation import (
     PostgresGatewayStore,
 )
 from lingxi.adapters.retention import (
@@ -29,7 +31,6 @@ from lingxi.adapters.retention import (
     RETENTION_FUNCTION_LOCK_WAIT_COUNT,
     PostgresRetentionCleaner,
 )
-
 
 REPOSITORY_ROOT = Path(__file__).parents[1]
 CHECK_PATH = REPOSITORY_ROOT / "scripts" / "ci" / "check_db_timeouts.py"
@@ -72,7 +73,11 @@ class PostgresTimeoutConfigTest(unittest.TestCase):
             }
         )
         self.assertEqual(
-            (config.connect_timeout_seconds, config.statement_timeout_seconds, config.lock_timeout_seconds),
+            (
+                config.connect_timeout_seconds,
+                config.statement_timeout_seconds,
+                config.lock_timeout_seconds,
+            ),
             (MAX_TIMEOUT_SECONDS, MAX_TIMEOUT_SECONDS, MAX_TIMEOUT_SECONDS),
         )
 
@@ -84,14 +89,14 @@ class PostgresTimeoutConfigTest(unittest.TestCase):
         for raw in ("0", "-1", str(MAX_TIMEOUT_SECONDS + 1), "not-a-number"):
             with self.subTest(raw=raw):
                 with self.assertRaises(PostgresTimeoutConfigError):
-                    PostgresTimeouts.from_env(
-                        {"LINGXI_POSTGRES_STATEMENT_TIMEOUT_SECONDS": raw}
-                    )
+                    PostgresTimeouts.from_env({"LINGXI_POSTGRES_STATEMENT_TIMEOUT_SECONDS": raw})
 
     def test_retention_adapter_statement_timeout_exceeds_function_lock_wait_budget(self) -> None:
         """清理函数的两次 2s 锁等待必须先于适配器级 statement_timeout 返回。"""
 
-        lock_wait_budget = RETENTION_FUNCTION_LOCK_WAIT_COUNT * RETENTION_FUNCTION_LOCK_TIMEOUT_SECONDS
+        lock_wait_budget = (
+            RETENTION_FUNCTION_LOCK_WAIT_COUNT * RETENTION_FUNCTION_LOCK_TIMEOUT_SECONDS
+        )
         self.assertEqual(
             RETENTION_CLEANUP_STATEMENT_TIMEOUT_SECONDS,
             lock_wait_budget + RETENTION_DELETE_BATCH_MARGIN_SECONDS,
@@ -165,9 +170,7 @@ class DbTimeoutGateTest(unittest.TestCase):
             (source / "adapters" / "postgres.py").write_text("# 工厂占位\n", encoding="utf-8")
             bad = source / "adapters" / "bad_store.py"
             bad.write_text(
-                "import psycopg\n\n"
-                "def open_store(dsn):\n"
-                "    return psycopg.connect(dsn)\n",
+                "import psycopg\n\ndef open_store(dsn):\n    return psycopg.connect(dsn)\n",
                 encoding="utf-8",
             )
 
@@ -214,8 +217,18 @@ class DbTimeoutGateTest(unittest.TestCase):
             failures = CHECK.check_runtime_connections(source)
 
         self.assertTrue(failures)
-        self.assertTrue(any("bad_store.py:1" in failure and "直接从 psycopg 导入" in failure for failure in failures))
-        self.assertTrue(any("bad_store.py:4" in failure and "裸 PostgreSQL 连接" in failure for failure in failures))
+        self.assertTrue(
+            any(
+                "bad_store.py:1" in failure and "直接从 psycopg 导入" in failure
+                for failure in failures
+            )
+        )
+        self.assertTrue(
+            any(
+                "bad_store.py:4" in failure and "裸 PostgreSQL 连接" in failure
+                for failure in failures
+            )
+        )
 
     def test_import_psycopg_connection_submodule_and_connect_is_rejected(self) -> None:
         """`import psycopg.connection` 的 `name` 是 `psycopg.connection`，非字面量
@@ -237,8 +250,18 @@ class DbTimeoutGateTest(unittest.TestCase):
             failures = CHECK.check_runtime_connections(source)
 
         self.assertTrue(failures)
-        self.assertTrue(any("bad_store.py:1" in failure and "直接导入 psycopg" in failure for failure in failures))
-        self.assertTrue(any("bad_store.py:4" in failure and "裸 PostgreSQL 连接" in failure for failure in failures))
+        self.assertTrue(
+            any(
+                "bad_store.py:1" in failure and "直接导入 psycopg" in failure
+                for failure in failures
+            )
+        )
+        self.assertTrue(
+            any(
+                "bad_store.py:4" in failure and "裸 PostgreSQL 连接" in failure
+                for failure in failures
+            )
+        )
 
     def test_unrelated_psycopg_submodule_import_is_not_flagged(self) -> None:
         """`psycopg.types.json` 等与建连无关的子模块不应被这条门禁误杀——
@@ -251,9 +274,7 @@ class DbTimeoutGateTest(unittest.TestCase):
             (source / "adapters" / "postgres.py").write_text("# 工厂占位\n", encoding="utf-8")
             fine = source / "adapters" / "fine_store.py"
             fine.write_text(
-                "from psycopg.types.json import Json\n\n"
-                "def wrap(value):\n"
-                "    return Json(value)\n",
+                "from psycopg.types.json import Json\n\ndef wrap(value):\n    return Json(value)\n",
                 encoding="utf-8",
             )
 

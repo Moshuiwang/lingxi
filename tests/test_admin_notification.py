@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import pathlib
 import unittest
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 
 import lingxi.core.admin.notification as notification_module
 from lingxi.core.admin.notification import (
@@ -20,7 +20,7 @@ from lingxi.core.admin.notification import (
 )
 from lingxi.core.admin.pending_action import PendingAction, PendingActionStatus, PendingActionType
 
-NOW = datetime(2026, 8, 24, 12, 0, 0, tzinfo=timezone.utc)
+NOW = datetime(2026, 8, 24, 12, 0, 0, tzinfo=UTC)
 TARGET_OPEN_ID = "ou_target_user_masked"
 
 
@@ -191,7 +191,9 @@ class LocalPermissionRenderingTests(unittest.TestCase):
         self.assertIn("授权", notice)
 
     def test_group_notice_has_no_scope_suffix_for_suspend(self) -> None:
-        pending = _pending(action_type=PendingActionType.SUSPEND_USER, status=PendingActionStatus.EXECUTED)
+        pending = _pending(
+            action_type=PendingActionType.SUSPEND_USER, status=PendingActionStatus.EXECUTED
+        )
         notice = render_group_notice(pending, target_label="张三（zhang@example.com）")
 
         self.assertNotIn("公司", notice)
@@ -434,9 +436,7 @@ class AdminSurfaceTerminologySweepTests(unittest.TestCase):
         import ast
 
         admin_package = pathlib.Path(notification_module.__file__).parent
-        scanned = sorted(admin_package.glob("*.py")) + [
-            admin_package.parent / "daily_report.py"
-        ]
+        scanned = sorted(admin_package.glob("*.py")) + [admin_package.parent / "daily_report.py"]
         offenders: list[str] = []
         for path in scanned:
             source = path.read_text(encoding="utf-8")

@@ -11,11 +11,10 @@ from __future__ import annotations
 
 import os
 import unittest
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 
 from postgres_schema import ensure_production_schema, psycopg_available, reset_production_rows
 
-from lingxi.adapters.postgres import connect
 from lingxi.adapters.postgres_daily_report import PostgresDailyReportSource
 
 SKIP_REASON = (
@@ -138,7 +137,13 @@ class DailyReportPostgresTestCase(unittest.TestCase):
             VALUES (%s, %s, %s, 'terminal', 'success', 'worker-1', %s,
                     {created_at_sql}, {received_sql}, %s)
             """,
-            (f"tde-{task_id}-{sequence}", task_id, sequence, f"{task_id}:terminal:{sequence}", platform_message_kind),
+            (
+                f"tde-{task_id}-{sequence}",
+                task_id,
+                sequence,
+                f"{task_id}:terminal:{sequence}",
+                platform_message_kind,
+            ),
         )
 
 
@@ -148,9 +153,11 @@ class ActiveUserTaskCountsTests(DailyReportPostgresTestCase):
         self.seed_task(task_id="t2", user_id="usr-1")
         self.seed_task(task_id="t3", user_id="usr-2")
 
-        window_start = datetime.now(timezone.utc) - timedelta(hours=1)
-        window_end = datetime.now(timezone.utc) + timedelta(hours=1)
-        counts = self.source.active_user_task_counts(window_start=window_start, window_end=window_end)
+        window_start = datetime.now(UTC) - timedelta(hours=1)
+        window_end = datetime.now(UTC) + timedelta(hours=1)
+        counts = self.source.active_user_task_counts(
+            window_start=window_start, window_end=window_end
+        )
 
         self.assertEqual(sorted(counts), [1, 2])
         # 返回类型只可能是整数元组——`user_id` 字面上没有出现在返回值里，
@@ -158,11 +165,11 @@ class ActiveUserTaskCountsTests(DailyReportPostgresTestCase):
         self.assertTrue(all(isinstance(count, int) for count in counts))
 
     def test_the_window_end_is_exclusive(self) -> None:
-        far_future_start = datetime.now(timezone.utc) + timedelta(days=365)
+        far_future_start = datetime.now(UTC) + timedelta(days=365)
         self.seed_task(task_id="t-boundary", created_at_sql="now()")
 
         counts = self.source.active_user_task_counts(
-            window_start=datetime.now(timezone.utc) - timedelta(hours=1), window_end=far_future_start
+            window_start=datetime.now(UTC) - timedelta(hours=1), window_end=far_future_start
         )
         self.assertEqual(len(counts), 1)
 
@@ -174,9 +181,11 @@ class ActiveUserTaskCountsTests(DailyReportPostgresTestCase):
     def test_tasks_outside_the_window_are_excluded(self) -> None:
         self.seed_task(task_id="t-old", created_at_sql="now() - interval '10 days'")
 
-        window_start = datetime.now(timezone.utc) - timedelta(hours=1)
-        window_end = datetime.now(timezone.utc) + timedelta(hours=1)
-        counts = self.source.active_user_task_counts(window_start=window_start, window_end=window_end)
+        window_start = datetime.now(UTC) - timedelta(hours=1)
+        window_end = datetime.now(UTC) + timedelta(hours=1)
+        counts = self.source.active_user_task_counts(
+            window_start=window_start, window_end=window_end
+        )
         self.assertEqual(counts, ())
 
 
@@ -187,8 +196,8 @@ class TaskOutcomesTests(DailyReportPostgresTestCase):
         self.seed_task(task_id="t3", status="failed", error_kind="session_failed")
         self.seed_task(task_id="t4", status="stopped", error_kind="stopped")
 
-        window_start = datetime.now(timezone.utc) - timedelta(hours=1)
-        window_end = datetime.now(timezone.utc) + timedelta(hours=1)
+        window_start = datetime.now(UTC) - timedelta(hours=1)
+        window_end = datetime.now(UTC) + timedelta(hours=1)
         rows = self.source.task_outcomes(window_start=window_start, window_end=window_end)
 
         self.assertIn(("succeeded", None, 1), rows)
@@ -204,11 +213,15 @@ class TaskDurationsTests(DailyReportPostgresTestCase):
             ended_at_sql="now()",
         )
         self.seed_task(task_id="t-still-running", started_at_sql="now()", ended_at_sql=None)
-        self.seed_task(task_id="t-never-started", started_at_sql=None, ended_at_sql=None, status="queued")
+        self.seed_task(
+            task_id="t-never-started", started_at_sql=None, ended_at_sql=None, status="queued"
+        )
 
-        window_start = datetime.now(timezone.utc) - timedelta(hours=1)
-        window_end = datetime.now(timezone.utc) + timedelta(hours=1)
-        durations = self.source.task_durations_seconds(window_start=window_start, window_end=window_end)
+        window_start = datetime.now(UTC) - timedelta(hours=1)
+        window_end = datetime.now(UTC) + timedelta(hours=1)
+        durations = self.source.task_durations_seconds(
+            window_start=window_start, window_end=window_end
+        )
 
         self.assertEqual(len(durations), 1)
         self.assertAlmostEqual(durations[0], 300.0, delta=2.0)
@@ -217,14 +230,18 @@ class TaskDurationsTests(DailyReportPostgresTestCase):
 class DeliveryOutcomesTests(DailyReportPostgresTestCase):
     def test_delivered_card_delivered_text_and_pending_are_distinguished(self) -> None:
         self.seed_task(task_id="t-card")
-        self.seed_delivery_event(task_id="t-card", platform_message_kind="card", platform_received=True)
+        self.seed_delivery_event(
+            task_id="t-card", platform_message_kind="card", platform_received=True
+        )
         self.seed_task(task_id="t-text")
-        self.seed_delivery_event(task_id="t-text", platform_message_kind="text", platform_received=True)
+        self.seed_delivery_event(
+            task_id="t-text", platform_message_kind="text", platform_received=True
+        )
         self.seed_task(task_id="t-pending")
         self.seed_delivery_event(task_id="t-pending", platform_received=False)
 
-        window_start = datetime.now(timezone.utc) - timedelta(hours=1)
-        window_end = datetime.now(timezone.utc) + timedelta(hours=1)
+        window_start = datetime.now(UTC) - timedelta(hours=1)
+        window_end = datetime.now(UTC) + timedelta(hours=1)
         rows = self.source.delivery_outcomes(window_start=window_start, window_end=window_end)
 
         self.assertIn(("card", True, False, 1), rows)
@@ -234,13 +251,15 @@ class DeliveryOutcomesTests(DailyReportPostgresTestCase):
     def test_an_undelivered_row_past_its_twenty_four_hour_expiry_is_expired(self) -> None:
         self.seed_task(task_id="t-expired", created_at_sql="now() - interval '25 hours'")
         self.seed_delivery_event(
-            task_id="t-expired", created_at_sql="now() - interval '25 hours'", platform_received=False
+            task_id="t-expired",
+            created_at_sql="now() - interval '25 hours'",
+            platform_received=False,
         )
 
         # 窗口覆盖那一轮插入的时刻，不覆盖真实「现在」——`expires_at` 由触发器固定为
         # `created_at + 24 小时`，25 小时前插入的行此刻必然已经过期，与窗口边界无关。
-        window_start = datetime.now(timezone.utc) - timedelta(hours=26)
-        window_end = datetime.now(timezone.utc) - timedelta(hours=24)
+        window_start = datetime.now(UTC) - timedelta(hours=26)
+        window_end = datetime.now(UTC) - timedelta(hours=24)
         rows = self.source.delivery_outcomes(window_start=window_start, window_end=window_end)
 
         self.assertIn((None, False, True, 1), rows)
@@ -253,8 +272,8 @@ class GuardDeniedCountStatsTests(DailyReportPostgresTestCase):
 
     def _window(self) -> tuple[datetime, datetime]:
         return (
-            datetime.now(timezone.utc) - timedelta(hours=1),
-            datetime.now(timezone.utc) + timedelta(hours=1),
+            datetime.now(UTC) - timedelta(hours=1),
+            datetime.now(UTC) + timedelta(hours=1),
         )
 
     def test_covered_and_uncovered_tasks_are_counted_separately_and_null_is_not_summed_as_zero(
@@ -272,7 +291,7 @@ class GuardDeniedCountStatsTests(DailyReportPostgresTestCase):
         self.assertEqual((covered, uncovered, total), (2, 1, 3))
 
     def test_no_tasks_in_window_is_a_real_zero_not_an_error(self) -> None:
-        far_future_start = datetime.now(timezone.utc) + timedelta(days=365)
+        far_future_start = datetime.now(UTC) + timedelta(days=365)
         covered, uncovered, total = self.source.guard_denied_count_stats(
             window_start=far_future_start, window_end=far_future_start + timedelta(hours=1)
         )
@@ -297,8 +316,8 @@ class TokenUsageStatsTests(DailyReportPostgresTestCase):
 
     def _window(self) -> tuple[datetime, datetime]:
         return (
-            datetime.now(timezone.utc) - timedelta(hours=1),
-            datetime.now(timezone.utc) + timedelta(hours=1),
+            datetime.now(UTC) - timedelta(hours=1),
+            datetime.now(UTC) + timedelta(hours=1),
         )
 
     def test_four_fields_are_summed_independently_across_covered_tasks(self) -> None:
@@ -330,7 +349,7 @@ class TokenUsageStatsTests(DailyReportPostgresTestCase):
         self.assertEqual(cache_read, 1)
 
     def test_no_tasks_in_window_is_a_real_zero_not_an_error(self) -> None:
-        far_future_start = datetime.now(timezone.utc) + timedelta(days=365)
+        far_future_start = datetime.now(UTC) + timedelta(days=365)
         result = self.source.token_usage_stats(
             window_start=far_future_start, window_end=far_future_start + timedelta(hours=1)
         )

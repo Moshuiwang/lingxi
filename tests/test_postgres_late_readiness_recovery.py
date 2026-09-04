@@ -27,7 +27,7 @@ from __future__ import annotations
 
 import os
 import unittest
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 
 from postgres_schema import ensure_production_schema, psycopg_available, reset_production_rows
 
@@ -36,12 +36,12 @@ from lingxi.adapters.postgres import connect
 from lingxi.adapters.postgres_late_readiness_recovery import PostgresLateReadinessStore
 from lingxi.adapters.postgres_mcp_token import PostgresMcpTokenStore
 from lingxi.adapters.postgres_permission_publish import PostgresPermissionPublishStore
-from lingxi.core.permission.mcp_readiness import (
+from lingxi.core.permission.mcp_readiness_base import (
     ReadinessAttempt,
     ReadinessBinding,
     ReadinessOutcome,
 )
-from lingxi.core.permission.publish import PublishAttempt, PublishOutcome, STATUS_PUBLISHED
+from lingxi.core.permission.publish import STATUS_PUBLISHED, PublishAttempt, PublishOutcome
 from lingxi.core.permission.publish_row import PublishRow
 
 SPEC_MASTER_KEY = "MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY="
@@ -52,7 +52,7 @@ SKIP_REASON = (
     else "跳过：LINGXI_POSTGRES_DSN 已设置但未安装 psycopg 驱动，迟到就绪恢复的真库断言未验证"
 )
 
-NOW = datetime(2026, 8, 20, 3, 0, tzinfo=timezone.utc)
+NOW = datetime(2026, 8, 20, 3, 0, tzinfo=UTC)
 REASON = "first_onboarding"
 USER_A = "usr_late_recovery_a"
 USER_B = "usr_late_recovery_b"
@@ -127,12 +127,17 @@ class LateReadinessRecoveryPostgresTestCase(unittest.TestCase):
 
         decision = self.publish_store.record_decision(
             require_enabled_account=True,
-            user_id=user_id, row=row or _row(), reason=reason, decided_at=NOW
+            user_id=user_id,
+            row=row or _row(),
+            reason=reason,
+            decided_at=NOW,
         )
         claimed = self.publish_store.claim_next()
         assert claimed is not None
         self.publish_store.complete(
-            _publish_attempt(claimed.outbox_id, version=claimed.permission_version, user_id=user_id),
+            _publish_attempt(
+                claimed.outbox_id, version=claimed.permission_version, user_id=user_id
+            ),
             status=STATUS_PUBLISHED,
         )
         return int(decision.permission_version)
@@ -150,7 +155,7 @@ class LateReadinessRecoveryPostgresTestCase(unittest.TestCase):
         # 比较的是真库的 ``now()``，固定常量一旦落在真实墙钟之后就会让"已经超时一小时"
         # 变成一句假话，候选查询因此正确地把它判成"还没到期"——这是测试夹具的时间基准
         # 错误，不是候选查询的缺陷。
-        moment = at or (datetime.now(timezone.utc) - timedelta(hours=1))
+        moment = at or (datetime.now(UTC) - timedelta(hours=1))
         PostgresMcpTokenStore(self._dsn, cipher=McpTokenCipher(SPEC_MASTER_KEY)).record_attempt(
             ReadinessAttempt(
                 binding=ReadinessBinding(user_id, version),
@@ -212,7 +217,7 @@ class CandidateQueryTest(LateReadinessRecoveryPostgresTestCase):
 
         version = self._publish()
         self._stuck()
-        old = datetime.now(timezone.utc) - timedelta(hours=1)
+        old = datetime.now(UTC) - timedelta(hours=1)
         self._record_timed_out(USER_A, version, at=old)
         PostgresMcpTokenStore(self._dsn, cipher=McpTokenCipher(SPEC_MASTER_KEY)).record_attempt(
             ReadinessAttempt(
@@ -229,7 +234,9 @@ class CandidateQueryTest(LateReadinessRecoveryPostgresTestCase):
 
         self.assertEqual(len(candidates), 1)
         self.assertFalse(hasattr(candidates[0], "already_ready"))
-        self.assertEqual(candidates[0].next_attempt_no, 3, "两条历史判定 + 1，不因为曾经 ready 而特殊处理")
+        self.assertEqual(
+            candidates[0].next_attempt_no, 3, "两条历史判定 + 1，不因为曾经 ready 而特殊处理"
+        )
 
     def test_a_suspended_account_is_not_a_candidate(self) -> None:
         version = self._publish()
@@ -239,10 +246,13 @@ class CandidateQueryTest(LateReadinessRecoveryPostgresTestCase):
         self.assertEqual(self._candidates(), ())
 
     def test_an_intent_owned_by_another_orchestrator_is_not_a_candidate(self) -> None:
-        version = self.publish_store.record_decision(
+        self.publish_store.record_decision(
             require_enabled_account=True,
-            user_id=USER_A, row=_row(), reason="daily_permission_refresh", decided_at=NOW
-        ).permission_version
+            user_id=USER_A,
+            row=_row(),
+            reason="daily_permission_refresh",
+            decided_at=NOW,
+        )
         self.publish_store.claim_next()
         self._stuck()
 
@@ -374,9 +384,7 @@ class ActivationTest(LateReadinessRecoveryPostgresTestCase):
         )
 
         self.assertFalse(activated)
-        self.assertEqual(
-            self._provisioning_state(), "mcp_syncing", "CAS 失败绝不能推进状态"
-        )
+        self.assertEqual(self._provisioning_state(), "mcp_syncing", "CAS 失败绝不能推进状态")
         self.assertEqual(self._notice_count(), 0, "CAS 失败绝不能排出任何通知")
 
     def test_a_suspended_account_is_refused_and_creates_no_notice(self) -> None:
@@ -480,7 +488,9 @@ class NoticeOutboxTest(LateReadinessRecoveryPostgresTestCase):
     """通知 outbox 的 claim / complete / purge（F1 的持久重试半边）。"""
 
     def _activate(self, *, user_id: str = USER_A, version: int | None = None) -> int:
-        v = version or self._publish(user_id=user_id, row=_row(EMAIL_A if user_id == USER_A else EMAIL_B))
+        v = version or self._publish(
+            user_id=user_id, row=_row(EMAIL_A if user_id == USER_A else EMAIL_B)
+        )
         self._stuck(user_id)
         ok = self.store.activate_after_late_readiness(
             user_id=user_id,
@@ -585,11 +595,13 @@ class NoticeOutboxTest(LateReadinessRecoveryPostgresTestCase):
         # 墙钟走。固定常量一旦落在真实墙钟 40 小时之后（NOW + 2160h < 写入时刻 + 2160h），
         # ``far_future`` 就会小于 ``content_expires_at``，purge 判它"还没到期"而删 0 行，
         # 这是测试夹具的时间基准错误，不是 purge 的缺陷（日界翻转型 flaky）。
-        far_future = datetime.now(timezone.utc) + timedelta(hours=2200)  # 远超过 2160 小时的到期上限
+        far_future = datetime.now(UTC) + timedelta(hours=2200)  # 远超过 2160 小时的到期上限
         purged = self.store.purge_expired_notices(now=far_future)
 
         self.assertEqual(purged, 1, "只删已送达且过期的那一条")
-        self.assertEqual(self._notice_count(USER_A), 1, "pending 的那一条绝不会被删——它还在等待送达")
+        self.assertEqual(
+            self._notice_count(USER_A), 1, "pending 的那一条绝不会被删——它还在等待送达"
+        )
         self.assertEqual(self._notice_count(USER_B), 0)
 
     def test_purge_requires_a_timezone_aware_moment(self) -> None:

@@ -1,20 +1,17 @@
 """银河导出五张表的落库前校验与列名规范化（纯函数）。
 
-导入流程是「校验 → 检查已有数据 → 写入 → 回读确认」，本模块是第一步：
-它把源导出（Excel 各 sheet 导出的 CSV 行）规范化成可写入的行，并给出可判定的
-错误与告警。**校验不通过时调用方不得写入任何一行**，半批数据比没有数据更危险。
+导入流程是「校验 → 检查已有数据 → 写入 → 回读确认」，本模块是第一步：把源导出
+（Excel 各 sheet 导出的 CSV 行）规范化成可写入的行，给出可判定的错误与告警。
+校验不通过时调用方不得写入任何一行，半批数据比没有数据更危险。
 
 三处与源结构有关的处理，理由见 docs/参考证据/银河用户权限数据结构.md：
+`sys_user_datacountry` 的源列名是大写、`user` 等表是小写，列名一律按去空白 +
+转小写归一；`user_role.user_name` 的值实测几乎全是中文姓名而非登录账号，落库
+列名改为 `source_user_name`，让「按它连接」在代码里说不出口；`sys_country` 的
+`boss_company_id` 保留，是未来向 MCP 申请权限时的公司字段。
 
-- `sys_user_datacountry` 的源列名是大写，`user` 等表是小写。列名一律按去空白 +
-  转小写归一，落库列名唯一；导入器因此同时接受两种源样式。
-- `user_role.user_name` 的值实测几乎全是中文姓名而非登录账号。落库列名改为
-  `source_user_name`，让「按它连接」在代码里说不出口。
-- `sys_country` 的 `boss_company_id` 保留：产品负责人 2026-08-05 决策 3 指出
-  它是未来向 MCP 申请权限时的公司字段。
-
-**脱敏纪律**：校验信息只写表名、列名、行号与计数，绝不回显姓名、邮箱、账号等
-人员数据值——这些信息会进日志与 Issue。
+脱敏纪律：校验信息只写表名、列名、行号与计数，绝不回显姓名、邮箱、账号等人员
+数据值——这些信息会进日志与运维工单。
 """
 
 from __future__ import annotations
@@ -56,12 +53,16 @@ class ColumnSpec:
 
 @dataclass(frozen=True)
 class TableSpec:
+    """一张目标表的列定义与主键。"""
+
     name: str
     columns: tuple[ColumnSpec, ...]
     primary_key: tuple[str, ...]
 
 
-def _column(canonical: str, *sources: str, required: bool = False, non_empty: bool = False) -> ColumnSpec:
+def _column(
+    canonical: str, *sources: str, required: bool = False, non_empty: bool = False
+) -> ColumnSpec:
     return ColumnSpec(canonical, sources or (canonical,), required=required, non_empty=non_empty)
 
 
@@ -71,7 +72,7 @@ TABLE_SPECS: Mapping[str, TableSpec] = {
         (
             _column("user_id", required=True, non_empty=True),
             _column("dept_id"),
-            # 表头必需（值可空）：漏列/拼错列名会整列破坏账号匹配（终轮 Codex）。
+            # 表头必需（值可空）：漏列/拼错列名会整列破坏账号匹配。
             _column("user_name", required=True),
             _column("nick_name", required=True),
             _column("email", required=True),
@@ -139,6 +140,8 @@ class Issue:
 
 @dataclass(frozen=True)
 class ValidationReport:
+    """一次完整校验的结果：是否可写入、全部错误告警，以及规范化后的行。"""
+
     ok: bool
     errors: tuple[Issue, ...]
     warnings: tuple[Issue, ...]
@@ -148,7 +151,6 @@ class ValidationReport:
 
 def normalize_column_name(name: str) -> str:
     """源列名归一：去 BOM、去首尾空白、转小写。"""
-
     return name.replace("﻿", "").strip().lower()
 
 
@@ -173,17 +175,17 @@ SOURCE_ROW_KEY = "_source_row_number"
 """
 
 
-def _normalize_table(
-    spec: TableSpec, raw_rows: Sequence[Mapping[str, Any]]
-) -> tuple[list[dict[str, str | None]], list[Issue], list[Issue]]:
-    errors: list[Issue] = []
-    warnings: list[Issue] = []
-
+def _column_map(spec: TableSpec) -> dict[str, str]:
     source_to_canonical: dict[str, str] = {}
     for column in spec.columns:
         for source in column.sources:
             source_to_canonical[normalize_column_name(source)] = column.canonical
+    return source_to_canonical
 
+
+def _scan_header(
+    raw_rows: Sequence[Mapping[str, Any]], source_to_canonical: Mapping[str, str]
+) -> tuple[set[str], set[str]]:
     present: set[str] = set()
     ignored: set[str] = set()
     for raw_row in raw_rows:
@@ -193,23 +195,37 @@ def _normalize_table(
                 present.add(source_to_canonical[normalized])
             elif normalized:
                 ignored.add(normalized)
+    return present, ignored
 
+
+def _header_issues(
+    spec: TableSpec, present: set[str], ignored: set[str]
+) -> tuple[list[Issue], list[Issue]]:
+    errors: list[Issue] = []
+    warnings: list[Issue] = []
     for column in spec.columns:
         if column.required and column.canonical not in present:
             errors.append(
-                Issue(spec.name, "missing_column", f"缺少必需列：{column.canonical}（可接受的源列名：{'/'.join(column.sources)}）")
+                Issue(
+                    spec.name,
+                    "missing_column",
+                    f"缺少必需列：{column.canonical}（可接受的源列名：{'/'.join(column.sources)}）",
+                )
             )
-
     if ignored:
         # 只报数量不回显列名：损坏的 CSV 会把数据值当表头，原文拼进告警等于
-        # 把邮箱/账号写进批次 metadata 与运维输出（V-银河-13；Codex 复查发现）。
+        # 把邮箱/账号写进批次 metadata 与运维输出（V-银河-13）。
         warnings.append(
             Issue(spec.name, "ignored_column", f"源表含 {len(ignored)} 个未落库的列（列名不回显）")
         )
+    return errors, warnings
 
-    if errors:
-        return [], errors, warnings
 
+def _build_rows(
+    spec: TableSpec,
+    raw_rows: Sequence[Mapping[str, Any]],
+    source_to_canonical: Mapping[str, str],
+) -> tuple[list[dict[str, str | None]], list[Issue]]:
     rows: list[dict[str, str | None]] = []
     empty_key_rows: list[int] = []
     for row_number, raw_row in enumerate(raw_rows, start=1):
@@ -226,6 +242,7 @@ def _normalize_table(
         normalized_row[SOURCE_ROW_KEY] = row_number
         rows.append(normalized_row)
 
+    errors: list[Issue] = []
     if empty_key_rows:
         errors.append(
             Issue(
@@ -235,13 +252,25 @@ def _normalize_table(
                 _rows_hint(empty_key_rows),
             )
         )
+    return rows, errors
 
+
+def _normalize_table(
+    spec: TableSpec, raw_rows: Sequence[Mapping[str, Any]]
+) -> tuple[list[dict[str, str | None]], list[Issue], list[Issue]]:
+    source_to_canonical = _column_map(spec)
+    present, ignored = _scan_header(raw_rows, source_to_canonical)
+    errors, warnings = _header_issues(spec, present, ignored)
+    if errors:
+        return [], errors, warnings
+
+    rows, row_errors = _build_rows(spec, raw_rows, source_to_canonical)
+    errors.extend(row_errors)
     return rows, errors, warnings
 
 
 def _payload(row) -> dict:
     """比较与落库都不含内部行号字段。"""
-
     return {key: value for key, value in dict(row).items() if key != SOURCE_ROW_KEY}
 
 
@@ -294,21 +323,13 @@ def _deduplicate(
     return list(kept.values()), errors, warnings
 
 
-def _check_references(
-    tables: Mapping[str, Sequence[Mapping[str, str | None]]]
-) -> tuple[list[Issue], list[Issue]]:
+def _check_dangling_user_ids(
+    tables: Mapping[str, Sequence[Mapping[str, str | None]]], known_users: set[str | None]
+) -> list[Issue]:
     errors: list[Issue] = []
-    warnings: list[Issue] = []
-
-    known_users = {row["user_id"] for row in tables["user"]}
-    known_country_keys = {row["country_key"] for row in tables["sys_country"] if row["country_key"]}
-    menu_roles = {row["role_id"] for row in tables["role_menu"]}
-
     for source_table in ("user_role", "sys_user_datacountry"):
         dangling = [
-            row[SOURCE_ROW_KEY]
-            for row in tables[source_table]
-            if row["user_id"] not in known_users
+            row[SOURCE_ROW_KEY] for row in tables[source_table] if row["user_id"] not in known_users
         ]
         if dangling:
             errors.append(
@@ -319,34 +340,56 @@ def _check_references(
                     _rows_hint(dangling),
                 )
             )
+    return errors
 
+
+def _check_dangling_country(
+    tables: Mapping[str, Sequence[Mapping[str, str | None]]], known_country_keys: set[str | None]
+) -> list[Issue]:
     dangling_country = [
         row[SOURCE_ROW_KEY]
         for row in tables["sys_user_datacountry"]
         if row["datacountry_id"] not in known_country_keys
     ]
-    if dangling_country:
-        errors.append(
-            Issue(
-                "sys_user_datacountry",
-                "dangling_country_key",
-                f"{len(dangling_country)} 行的 datacountry_id 连不到 sys_country.country_key"
-                "（注意：连接键不是主键 id）",
-                _rows_hint(dangling_country),
-            )
+    if not dangling_country:
+        return []
+    return [
+        Issue(
+            "sys_user_datacountry",
+            "dangling_country_key",
+            f"{len(dangling_country)} 行的 datacountry_id 连不到 sys_country.country_key"
+            "（注意：连接键不是主键 id）",
+            _rows_hint(dangling_country),
         )
+    ]
 
+
+def _check_roles_without_menu(
+    tables: Mapping[str, Sequence[Mapping[str, str | None]]], menu_roles: set[str | None]
+) -> list[Issue]:
     roles_without_menu = sorted(
-        {row["role_id"] for row in tables["user_role"] if row["role_id"] not in menu_roles and row["role_id"]}
+        {
+            row["role_id"]
+            for row in tables["user_role"]
+            if row["role_id"] not in menu_roles and row["role_id"]
+        }
     )
-    if roles_without_menu:
-        warnings.append(
-            Issue(
-                "user_role",
-                "role_without_menu",
-                f"{len(roles_without_menu)} 个被分配的角色在 role_menu 中没有任何菜单",
-            )
+    if not roles_without_menu:
+        return []
+    return [
+        Issue(
+            "user_role",
+            "role_without_menu",
+            f"{len(roles_without_menu)} 个被分配的角色在 role_menu 中没有任何菜单",
         )
+    ]
+
+
+def _check_country_key_integrity(
+    tables: Mapping[str, Sequence[Mapping[str, str | None]]],
+) -> tuple[list[Issue], list[Issue]]:
+    errors: list[Issue] = []
+    warnings: list[Issue] = []
 
     duplicated_country_keys = sorted(
         key
@@ -356,8 +399,8 @@ def _check_references(
         if count > 1
     )
     if duplicated_country_keys:
-        # 同键多行携带不同公司数据时，任何「取第一行」都会静默少给公司
-        # （终轮 Codex）；冲突数据整批拒绝，宁失败不写错范围。
+        # 同键多行携带不同公司数据时，任何「取第一行」都会静默少给公司；
+        # 冲突数据整批拒绝，宁失败不写错范围。
         errors.append(
             Issue(
                 "sys_country",
@@ -367,9 +410,7 @@ def _check_references(
         )
 
     countries_without_key = [
-        row[SOURCE_ROW_KEY]
-        for row in tables["sys_country"]
-        if not row["country_key"]
+        row[SOURCE_ROW_KEY] for row in tables["sys_country"] if not row["country_key"]
     ]
     if countries_without_key:
         warnings.append(
@@ -384,25 +425,47 @@ def _check_references(
     return errors, warnings
 
 
-def validate_export(raw_tables: Mapping[str, Sequence[Mapping[str, Any]]]) -> ValidationReport:
-    """校验一份完整导出，返回可写入的规范化行与全部错误、告警。
+def _check_references(
+    tables: Mapping[str, Sequence[Mapping[str, str | None]]],
+) -> tuple[list[Issue], list[Issue]]:
+    known_users = {row["user_id"] for row in tables["user"]}
+    known_country_keys = {row["country_key"] for row in tables["sys_country"] if row["country_key"]}
+    menu_roles = {row["role_id"] for row in tables["role_menu"]}
 
-    `ok` 为假时调用方必须整批放弃，不得写入任何一行。
-    """
+    errors = _check_dangling_user_ids(tables, known_users)
+    errors += _check_dangling_country(tables, known_country_keys)
+    warnings = _check_roles_without_menu(tables, menu_roles)
+    key_errors, key_warnings = _check_country_key_integrity(tables)
+    errors += key_errors
+    warnings += key_warnings
+    return errors, warnings
 
+
+def _check_table_presence(
+    raw_tables: Mapping[str, Sequence[Mapping[str, Any]]],
+) -> tuple[list[str], list[Issue], list[Issue]]:
+    """返回缺失表名列表，以及缺表/多余表两类校验结论。"""
+    missing = [name for name in SOURCE_TABLES if name not in raw_tables]
+    errors = [Issue(name, "missing_table", "导出缺少该表") for name in missing]
+    unknown = [name for name in raw_tables if name not in TABLE_SPECS]
+    warnings: list[Issue] = []
+    if unknown:
+        warnings.append(
+            Issue(
+                "-",
+                "ignored_table",
+                f"导出含 {len(unknown)} 张未落库的表：{'、'.join(sorted(unknown))}",
+            )
+        )
+    return missing, errors, warnings
+
+
+def _normalize_all_tables(
+    raw_tables: Mapping[str, Sequence[Mapping[str, Any]]],
+) -> tuple[dict[str, list[Mapping[str, str | None]]], list[Issue], list[Issue], bool]:
+    normalized: dict[str, list[Mapping[str, str | None]]] = {}
     errors: list[Issue] = []
     warnings: list[Issue] = []
-
-    missing = [name for name in SOURCE_TABLES if name not in raw_tables]
-    for name in missing:
-        errors.append(Issue(name, "missing_table", "导出缺少该表"))
-    unknown = [name for name in raw_tables if name not in TABLE_SPECS]
-    if unknown:
-        warnings.append(Issue("-", "ignored_table", f"导出含 {len(unknown)} 张未落库的表：{'、'.join(sorted(unknown))}"))
-    if missing:
-        return ValidationReport(False, tuple(errors), tuple(warnings), {}, {})
-
-    normalized: dict[str, list[Mapping[str, str | None]]] = {}
     structural_failure = False
     for name in SOURCE_TABLES:
         spec = TABLE_SPECS[name]
@@ -426,6 +489,21 @@ def validate_export(raw_tables: Mapping[str, Sequence[Mapping[str, Any]]]) -> Va
         errors.extend(dedupe_errors)
         warnings.extend(dedupe_warnings)
         normalized[name] = rows
+    return normalized, errors, warnings, structural_failure
+
+
+def validate_export(raw_tables: Mapping[str, Sequence[Mapping[str, Any]]]) -> ValidationReport:
+    """校验一份完整导出，返回可写入的规范化行与全部错误、告警。
+
+    `ok` 为假时调用方必须整批放弃，不得写入任何一行。
+    """
+    missing, errors, warnings = _check_table_presence(raw_tables)
+    if missing:
+        return ValidationReport(False, tuple(errors), tuple(warnings), {}, {})
+
+    normalized, table_errors, table_warnings, structural_failure = _normalize_all_tables(raw_tables)
+    errors.extend(table_errors)
+    warnings.extend(table_warnings)
 
     if not structural_failure:
         reference_errors, reference_warnings = _check_references(normalized)

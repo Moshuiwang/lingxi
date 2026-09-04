@@ -176,7 +176,9 @@ class _SpyDocx:
         if callable(self._one_shot_result):
             return self._one_shot_result()
         self.create_calls.append(title)
-        document_id = self._create_result() if callable(self._create_result) else self._create_result
+        document_id = (
+            self._create_result() if callable(self._create_result) else self._create_result
+        )
         self.write_calls.append((document_id, [markdown]))
         return self._one_shot_result or CreatedDocument(document_id=document_id)
 
@@ -397,7 +399,12 @@ class DocumentDeliveryTransportTestCase(unittest.TestCase):
                     """INSERT INTO conversation
                        (id,user_id,feishu_chat_id,feishu_thread_id,running_task_id)
                        VALUES (%s,'usr-doc',%s,%s,%s)""",
-                    (conversation_id, f"chat-{conversation_id}", f"topic-{conversation_id}", task_id),
+                    (
+                        conversation_id,
+                        f"chat-{conversation_id}",
+                        f"topic-{conversation_id}",
+                        task_id,
+                    ),
                 )
                 connection.execute(
                     """INSERT INTO task
@@ -409,12 +416,20 @@ class DocumentDeliveryTransportTestCase(unittest.TestCase):
 
         request = {"title": "标题", "paragraphs": ["段落一"]}
         first = queue.write_terminal_event(
-            task_id=task_id, worker_id="worker-1", terminal_kind="success",
-            error_kind=None, content="答案", document_request=request,
+            task_id=task_id,
+            worker_id="worker-1",
+            terminal_kind="success",
+            error_kind=None,
+            content="答案",
+            document_request=request,
         )
         second = queue.write_terminal_event(
-            task_id=task_id, worker_id="worker-1", terminal_kind="success",
-            error_kind=None, content="答案", document_request=request,
+            task_id=task_id,
+            worker_id="worker-1",
+            terminal_kind="success",
+            error_kind=None,
+            content="答案",
+            document_request=request,
         )
         self.assertFalse(first.duplicate)
         self.assertTrue(second.duplicate)
@@ -456,7 +471,12 @@ class DocumentDeliveryTransportTestCase(unittest.TestCase):
                     """INSERT INTO conversation
                        (id,user_id,feishu_chat_id,feishu_thread_id,running_task_id)
                        VALUES (%s,'usr-null-open-id',%s,%s,%s)""",
-                    (conversation_id, f"chat-{conversation_id}", f"topic-{conversation_id}", task_id),
+                    (
+                        conversation_id,
+                        f"chat-{conversation_id}",
+                        f"topic-{conversation_id}",
+                        task_id,
+                    ),
                 )
                 connection.execute(
                     """INSERT INTO task
@@ -521,7 +541,12 @@ class DocumentDeliveryTransportTestCase(unittest.TestCase):
                     """INSERT INTO conversation
                        (id,user_id,feishu_chat_id,feishu_thread_id,running_task_id)
                        VALUES (%s,'usr-doc',%s,%s,%s)""",
-                    (conversation_id, f"chat-{conversation_id}", f"topic-{conversation_id}", task_id),
+                    (
+                        conversation_id,
+                        f"chat-{conversation_id}",
+                        f"topic-{conversation_id}",
+                        task_id,
+                    ),
                 )
                 connection.execute(
                     """INSERT INTO task
@@ -571,7 +596,13 @@ class DocumentDeliveryTransportTestCase(unittest.TestCase):
         self._seed_pending_request(request_id="tdd-checkpoint")
         docx = _SpyDocx(
             create_result="doc-checkpoint-1",
-            members=[{"member_type": "openid", "member_id": self.REQUESTER_OPEN_ID, "perm": "full_access"}],
+            members=[
+                {
+                    "member_type": "openid",
+                    "member_id": self.REQUESTER_OPEN_ID,
+                    "perm": "full_access",
+                }
+            ],
         )
         notifier = _SpyNotifier()
 
@@ -611,16 +642,21 @@ class DocumentDeliveryTransportTestCase(unittest.TestCase):
         all_written_paragraphs = [text for _, paragraphs in docx.write_calls for text in paragraphs]
         self.assertEqual(all_written_paragraphs, ["段落一", "段落二"])
         self.assertEqual(
-            self.scalar("SELECT status FROM task_document_delivery_request WHERE id = %s", (claim.id,)),
+            self.scalar(
+                "SELECT status FROM task_document_delivery_request WHERE id = %s", (claim.id,)
+            ),
             "succeeded",
         )
         self.assertEqual(
-            self.scalar("SELECT document_id FROM task_document_delivery_request WHERE id = %s", (claim.id,)),
+            self.scalar(
+                "SELECT document_id FROM task_document_delivery_request WHERE id = %s", (claim.id,)
+            ),
             "doc-checkpoint-1",
         )
         self.assertIsNotNone(
             self.scalar(
-                "SELECT permission_confirmed_at FROM task_document_delivery_request WHERE id = %s", (claim.id,)
+                "SELECT permission_confirmed_at FROM task_document_delivery_request WHERE id = %s",
+                (claim.id,),
             )
         )
         self.assertEqual(len(notifier.sent), 1)
@@ -649,7 +685,13 @@ class DocumentDeliveryTransportTestCase(unittest.TestCase):
         self._seed_pending_request(request_id="tdd-crash-window")
         docx = _SpyDocx(
             create_result="doc-crash-window-1",
-            members=[{"member_type": "openid", "member_id": self.REQUESTER_OPEN_ID, "perm": "full_access"}],
+            members=[
+                {
+                    "member_type": "openid",
+                    "member_id": self.REQUESTER_OPEN_ID,
+                    "perm": "full_access",
+                }
+            ],
         )
         notifier = _SpyNotifier()
 
@@ -685,11 +727,15 @@ class DocumentDeliveryTransportTestCase(unittest.TestCase):
         self.assertEqual(len(docx.grant_calls), 1)
         self.assertEqual(len(docx.read_calls), 1)
         self.assertEqual(
-            self.scalar("SELECT status FROM task_document_delivery_request WHERE id = %s", (claim.id,)),
+            self.scalar(
+                "SELECT status FROM task_document_delivery_request WHERE id = %s", (claim.id,)
+            ),
             "succeeded",
         )
         self.assertEqual(
-            self.scalar("SELECT document_id FROM task_document_delivery_request WHERE id = %s", (claim.id,)),
+            self.scalar(
+                "SELECT document_id FROM task_document_delivery_request WHERE id = %s", (claim.id,)
+            ),
             "doc-crash-window-1",
         )
         self.assertEqual(len(notifier.sent), 1)
@@ -704,7 +750,13 @@ class DocumentDeliveryTransportTestCase(unittest.TestCase):
         self._seed_pending_request(request_id="tdd-first-time")
         docx = _SpyDocx(
             create_result="doc-first-time-1",
-            members=[{"member_type": "openid", "member_id": self.REQUESTER_OPEN_ID, "perm": "full_access"}],
+            members=[
+                {
+                    "member_type": "openid",
+                    "member_id": self.REQUESTER_OPEN_ID,
+                    "perm": "full_access",
+                }
+            ],
         )
         notifier = _SpyNotifier()
         consumer = DocumentDeliveryConsumer(store=self.store, docx=docx, notifier=notifier)
@@ -716,7 +768,9 @@ class DocumentDeliveryTransportTestCase(unittest.TestCase):
         self.assertEqual(docx.read_body_children_calls, [], "首次路径不得多做这次读回")
         self.assertEqual(len(docx.write_calls), 1)
         self.assertEqual(
-            self.scalar("SELECT status FROM task_document_delivery_request WHERE id = 'tdd-first-time'"),
+            self.scalar(
+                "SELECT status FROM task_document_delivery_request WHERE id = 'tdd-first-time'"
+            ),
             "succeeded",
         )
 
@@ -737,11 +791,15 @@ class DocumentDeliveryTransportTestCase(unittest.TestCase):
 
         self.assertEqual(processed, 1)
         self.assertEqual(
-            self.scalar("SELECT status FROM task_document_delivery_request WHERE id = 'tdd-no-member'"),
+            self.scalar(
+                "SELECT status FROM task_document_delivery_request WHERE id = 'tdd-no-member'"
+            ),
             "uncertain",
         )
         self.assertEqual(
-            self.scalar("SELECT last_error FROM task_document_delivery_request WHERE id = 'tdd-no-member'"),
+            self.scalar(
+                "SELECT last_error FROM task_document_delivery_request WHERE id = 'tdd-no-member'"
+            ),
             "permission_not_confirmed",
         )
 
@@ -751,14 +809,18 @@ class DocumentDeliveryTransportTestCase(unittest.TestCase):
         self._seed_pending_request(request_id="tdd-wrong-perm")
         docx = _SpyDocx(
             create_result="doc-3",
-            members=[{"member_type": "openid", "member_id": self.REQUESTER_OPEN_ID, "perm": "view"}],
+            members=[
+                {"member_type": "openid", "member_id": self.REQUESTER_OPEN_ID, "perm": "view"}
+            ],
         )
         consumer = DocumentDeliveryConsumer(store=self.store, docx=docx, notifier=_SpyNotifier())
 
         consumer.run_once()
 
         self.assertEqual(
-            self.scalar("SELECT status FROM task_document_delivery_request WHERE id = 'tdd-wrong-perm'"),
+            self.scalar(
+                "SELECT status FROM task_document_delivery_request WHERE id = 'tdd-wrong-perm'"
+            ),
             "uncertain",
         )
 
@@ -781,17 +843,24 @@ class DocumentDeliveryTransportTestCase(unittest.TestCase):
         notifier = _SpyNotifier()
         alerts: list[tuple[str, str]] = []
         consumer = DocumentDeliveryConsumer(
-            store=self.store, docx=docx, notifier=notifier, on_alert=lambda kind, task_id: alerts.append((kind, task_id))
+            store=self.store,
+            docx=docx,
+            notifier=notifier,
+            on_alert=lambda kind, task_id: alerts.append((kind, task_id)),
         )
 
         consumer.run_once()
 
         self.assertEqual(
-            self.scalar("SELECT status FROM task_document_delivery_request WHERE id = 'tdd-definite'"),
+            self.scalar(
+                "SELECT status FROM task_document_delivery_request WHERE id = 'tdd-definite'"
+            ),
             "failed",
         )
         self.assertEqual(
-            self.scalar("SELECT last_error FROM task_document_delivery_request WHERE id = 'tdd-definite'"),
+            self.scalar(
+                "SELECT last_error FROM task_document_delivery_request WHERE id = 'tdd-definite'"
+            ),
             "feishu_code_99999",
         )
         # 明确失败不重试：attempts 已经因认领而 = 1，状态不会再被 claim_pending 选中。
@@ -806,7 +875,9 @@ class DocumentDeliveryTransportTestCase(unittest.TestCase):
         self.assertEqual(len(notifier.sent), 1)
         open_id, text, dedupe_key = notifier.sent[0]
         self.assertEqual(open_id, self.REQUESTER_OPEN_ID)
-        self.assertEqual(text, "抱歉，你要的文档生成失败了。你可以重新发起问数再试一次；问题已记录。")
+        self.assertEqual(
+            text, "抱歉，你要的文档生成失败了。你可以重新发起问数再试一次；问题已记录。"
+        )
         self.assertEqual(dedupe_key, "document-failed:tdd-definite")
 
     def test_indefinite_error_is_uncertain_not_failed(self) -> None:
@@ -829,7 +900,9 @@ class DocumentDeliveryTransportTestCase(unittest.TestCase):
         consumer.run_once()
 
         self.assertEqual(
-            self.scalar("SELECT status FROM task_document_delivery_request WHERE id = 'tdd-indefinite'"),
+            self.scalar(
+                "SELECT status FROM task_document_delivery_request WHERE id = 'tdd-indefinite'"
+            ),
             "uncertain",
         )
         self.assertEqual(len(notifier.sent), 1)
@@ -866,7 +939,9 @@ class DocumentDeliveryTransportTestCase(unittest.TestCase):
         consumer.run_once()
 
         self.assertEqual(
-            self.scalar("SELECT status FROM task_document_delivery_request WHERE id = 'tdd-bad-openid'"),
+            self.scalar(
+                "SELECT status FROM task_document_delivery_request WHERE id = 'tdd-bad-openid'"
+            ),
             "failed",
         )
         self.assertEqual(
@@ -877,7 +952,10 @@ class DocumentDeliveryTransportTestCase(unittest.TestCase):
         )
         self.assertIn(("document_delivery_failed", "tsk-doc-1"), alerts)
         self.assertEqual(len(notifier.sent), 1)
-        self.assertEqual(notifier.sent[0][1], "抱歉，你要的文档生成失败了。你可以重新发起问数再试一次；问题已记录。")
+        self.assertEqual(
+            notifier.sent[0][1],
+            "抱歉，你要的文档生成失败了。你可以重新发起问数再试一次；问题已记录。",
+        )
 
     # -- ⑦ P1-2：回收后慢消费者全程 no-op --------------------------------------
 
@@ -943,7 +1021,9 @@ class DocumentDeliveryTransportTestCase(unittest.TestCase):
             "succeeded",
         )
         self.assertEqual(
-            self.scalar("SELECT document_id FROM task_document_delivery_request WHERE id = 'tdd-slow'"),
+            self.scalar(
+                "SELECT document_id FROM task_document_delivery_request WHERE id = 'tdd-slow'"
+            ),
             "doc-fast",
         )
 
@@ -968,7 +1048,9 @@ class DocumentDeliveryTransportTestCase(unittest.TestCase):
 
         self.assertEqual(converted, 1)
         self.assertEqual(
-            self.scalar("SELECT status FROM task_document_delivery_request WHERE id = 'tdd-dead-letter'"),
+            self.scalar(
+                "SELECT status FROM task_document_delivery_request WHERE id = 'tdd-dead-letter'"
+            ),
             "failed",
         )
         self.assertEqual(
@@ -1019,7 +1101,9 @@ class DocumentDeliveryTransportTestCase(unittest.TestCase):
         self.assertIsNone(row[6])
         # 未到期的行一个字都不动。
         self.assertEqual(
-            self.scalar("SELECT title FROM task_document_delivery_request WHERE id = 'tdd-content-fresh'"),
+            self.scalar(
+                "SELECT title FROM task_document_delivery_request WHERE id = 'tdd-content-fresh'"
+            ),
             "标题",
         )
         # 已经擦过的行不会被同一次调用重复计数（谓词是 title <> ''）。
@@ -1081,7 +1165,9 @@ class DocumentDeliveryTransportTestCase(unittest.TestCase):
         self._seed_pending_request(request_id="tdd-docx-markdown", markdown="# 标题\n\n正文")
 
         self.assertEqual(
-            self.scalar("SELECT markdown FROM task_document_delivery_request WHERE id = 'tdd-docx-markdown'"),
+            self.scalar(
+                "SELECT markdown FROM task_document_delivery_request WHERE id = 'tdd-docx-markdown'"
+            ),
             "# 标题\n\n正文",
         )
 
@@ -1094,7 +1180,13 @@ class DocumentDeliveryTransportTestCase(unittest.TestCase):
         self._seed_pending_request(request_id="tdd-notify-ok")
         docx = _SpyDocx(
             create_result="doc-notify-ok",
-            members=[{"member_type": "openid", "member_id": self.REQUESTER_OPEN_ID, "perm": "full_access"}],
+            members=[
+                {
+                    "member_type": "openid",
+                    "member_id": self.REQUESTER_OPEN_ID,
+                    "perm": "full_access",
+                }
+            ],
         )
         notifier = _SpyNotifier()
         consumer = DocumentDeliveryConsumer(store=self.store, docx=docx, notifier=notifier)
@@ -1312,7 +1404,12 @@ class WorkerDocumentRequestInsertionTestCase(unittest.TestCase):
                     """INSERT INTO conversation
                        (id,user_id,feishu_chat_id,feishu_thread_id,running_task_id)
                        VALUES (%s,%s,%s,%s,NULL)""",
-                    (conversation_id, self.USER_ID, f"chat-{conversation_id}", f"topic-{conversation_id}"),
+                    (
+                        conversation_id,
+                        self.USER_ID,
+                        f"chat-{conversation_id}",
+                        f"topic-{conversation_id}",
+                    ),
                 )
                 connection.execute(
                     """INSERT INTO task
@@ -1470,9 +1567,9 @@ class WorkerDocumentRequestInsertionTestCase(unittest.TestCase):
         self.assertEqual(self._document_request_rows(task_id), [])
         with connect(DSN) as connection:
             self.assertEqual(
-                connection.execute(
-                    "SELECT status FROM task WHERE id = %s", (task_id,)
-                ).fetchone()[0],
+                connection.execute("SELECT status FROM task WHERE id = %s", (task_id,)).fetchone()[
+                    0
+                ],
                 "awaiting_delivery",
             )
 
@@ -1519,7 +1616,12 @@ class _RecordingUserMessageTransport:
 def _real_shape_tenant_token_response() -> dict[str, Any]:
     """``/auth/v3/tenant_access_token/internal`` 的真实响应形状。"""
 
-    return {"code": 0, "msg": "ok", "tenant_access_token": "t-fake-tenant-access-token", "expire": 7200}
+    return {
+        "code": 0,
+        "msg": "ok",
+        "tenant_access_token": "t-fake-tenant-access-token",
+        "expire": 7200,
+    }
 
 
 def _real_shape_send_message_response() -> dict[str, Any]:
@@ -1539,7 +1641,12 @@ def _real_shape_send_message_response() -> dict[str, Any]:
             "deleted": False,
             "updated": False,
             "chat_id": "oc_fake_chat_id",
-            "sender": {"id": "cli_fake_app", "id_type": "app_id", "sender_type": "app", "tenant_key": "tk_fake"},
+            "sender": {
+                "id": "cli_fake_app",
+                "id_type": "app_id",
+                "sender_type": "app",
+                "tenant_key": "tk_fake",
+            },
         },
     }
 
@@ -1800,8 +1907,12 @@ class DocxOneShotCreateGatewayWiringTest(unittest.TestCase):
         )
 
     def _claim(
-        self, *, markdown: str | None, document_id: str | None = None,
-        body_degraded_reason: str | None = None, title: str = "标题",
+        self,
+        *,
+        markdown: str | None,
+        document_id: str | None = None,
+        body_degraded_reason: str | None = None,
+        title: str = "标题",
     ) -> DocumentDeliveryClaim:
         return DocumentDeliveryClaim(
             id="tdd-wire-1",
@@ -1818,7 +1929,9 @@ class DocxOneShotCreateGatewayWiringTest(unittest.TestCase):
     def _create_document_response(self) -> dict[str, Any]:
         return {
             "code": 0,
-            "data": {"document": {"document_id": self.DOCUMENT_ID, "revision_id": 1, "title": "标题"}},
+            "data": {
+                "document": {"document_id": self.DOCUMENT_ID, "revision_id": 1, "title": "标题"}
+            },
         }
 
     def _one_shot_response(self, **data: Any) -> dict[str, Any]:
@@ -1840,7 +1953,11 @@ class DocxOneShotCreateGatewayWiringTest(unittest.TestCase):
     def _read_members_response(self) -> dict[str, Any]:
         return {
             "code": 0,
-            "data": {"items": [{"member_type": "openid", "member_id": self.OPEN_ID, "perm": "full_access"}]},
+            "data": {
+                "items": [
+                    {"member_type": "openid", "member_id": self.OPEN_ID, "perm": "full_access"}
+                ]
+            },
         }
 
     def _read_body_children_response(self, *, empty: bool) -> dict[str, Any]:
@@ -1924,7 +2041,9 @@ class DocxOneShotCreateGatewayWiringTest(unittest.TestCase):
         self.assertNotIn("已按纯文本段落交付", notifier.sent[0][1])
         self.assertIn("个别不支持的结构可能没有呈现出来", notifier.sent[0][1])
 
-    def test_an_over_long_body_degrades_before_the_one_shot_call_and_takes_the_paragraph_path(self) -> None:
+    def test_an_over_long_body_degrades_before_the_one_shot_call_and_takes_the_paragraph_path(
+        self,
+    ) -> None:
         """**长度前置守卫**：正文超过 ``MAX_MARKDOWN_CHARS`` 时**一次建档调用
         一次都不发**，改走两步段落路径并明示降级。
 
@@ -1960,7 +2079,9 @@ class DocxOneShotCreateGatewayWiringTest(unittest.TestCase):
         store = _OrderedStore()
         notifier = _SpyNotifier()
         consumer = DocumentDeliveryConsumer(
-            store=store, docx=self._docx(transport, markdown_convert_enabled=True), notifier=notifier
+            store=store,
+            docx=self._docx(transport, markdown_convert_enabled=True),
+            notifier=notifier,
         )
         claim = self._claim(markdown="正" * (MAX_MARKDOWN_CHARS + 1))
 
@@ -1975,7 +2096,9 @@ class DocxOneShotCreateGatewayWiringTest(unittest.TestCase):
             f"{self.BASE_URL}/docx/v1/documents/{self.DOCUMENT_ID}/blocks/{self.DOCUMENT_ID}/children",
         )
         self.assertEqual(store.body_degraded, [("tdd-wire-1", "body_too_long")])
-        self.assertEqual(events, ["degrade_checkpoint", "write_paragraphs"], "降级检查点必须在写正文之前提交")
+        self.assertEqual(
+            events, ["degrade_checkpoint", "write_paragraphs"], "降级检查点必须在写正文之前提交"
+        )
         self.assertEqual(store.succeeded, ["tdd-wire-1"])
         self.assertIn("格式做了简化", notifier.sent[0][1])
         # rc25 修复包 F4：这一路的真实原因是**长度**，不是"回答里有暂时无法排版
@@ -2037,16 +2160,22 @@ class DocxOneShotCreateGatewayWiringTest(unittest.TestCase):
 
         store, notifier = self._consume(transport, claim)
 
-        self.assertEqual(len(transport.calls), 1, "超时之后不得再发起任何调用——第二次建档就是第二篇文档")
+        self.assertEqual(
+            len(transport.calls), 1, "超时之后不得再发起任何调用——第二次建档就是第二篇文档"
+        )
         self.assertEqual(transport.calls[0][1], f"{self.BASE_URL}/docs_ai/v1/documents")
         self.assertEqual(store.uncertain, [("tdd-wire-1", "http_504")])
         self.assertEqual(store.failed, [], "504 不证明请求没有生效，不能记成确定性失败")
         self.assertEqual(store.succeeded, [])
         self.assertEqual(store.document_created, [], "没拿到 document_id 就没有检查点可落")
         self.assertEqual(store.body_degraded, [])
-        self.assertEqual([text for _, text, _ in notifier.sent], ["文档生成结果暂无法确认，已转人工核对。"])
+        self.assertEqual(
+            [text for _, text, _ in notifier.sent], ["文档生成结果暂无法确认，已转人工核对。"]
+        )
 
-    def test_a_definite_rejection_of_the_one_shot_call_fails_closed_without_a_paragraph_retry(self) -> None:
+    def test_a_definite_rejection_of_the_one_shot_call_fails_closed_without_a_paragraph_retry(
+        self,
+    ) -> None:
         """一次建档被飞书确定性拒绝：沿用既有 definite 分类判 ``failed``，
         **不**静默退回段落路径（那会把一次真实故障吞成"交付成功"）。"""
 
@@ -2059,7 +2188,9 @@ class DocxOneShotCreateGatewayWiringTest(unittest.TestCase):
         self.assertEqual(store.failed, [("tdd-wire-1", "feishu_code_1770001")])
         self.assertEqual(store.succeeded, [])
 
-    def test_switch_off_with_markdown_present_takes_the_paragraph_path_and_is_not_a_degrade(self) -> None:
+    def test_switch_off_with_markdown_present_takes_the_paragraph_path_and_is_not_a_degrade(
+        self,
+    ) -> None:
         """止损闸关：即使这一行带着 markdown 原文，也必须走两步段落路径，而且
         **不报降级**——那是这套部署本来就要求的排版，不是降级。"""
 
@@ -2080,11 +2211,17 @@ class DocxOneShotCreateGatewayWiringTest(unittest.TestCase):
             self.assertNotIn("docs_ai", url)
         _, write_url, write_body, _ = transport.calls[1]
         self.assertEqual(
-            write_url, f"{self.BASE_URL}/docx/v1/documents/{self.DOCUMENT_ID}/blocks/{self.DOCUMENT_ID}/children"
+            write_url,
+            f"{self.BASE_URL}/docx/v1/documents/{self.DOCUMENT_ID}/blocks/{self.DOCUMENT_ID}/children",
         )
         self.assertEqual(
             write_body,
-            {"children": [{"block_type": 2, "text": {"elements": [{"text_run": {"content": "正文段落"}}]}}], "index": 0},
+            {
+                "children": [
+                    {"block_type": 2, "text": {"elements": [{"text_run": {"content": "正文段落"}}]}}
+                ],
+                "index": 0,
+            },
         )
         self.assertEqual(store.body_degraded, [])
         self.assertEqual(store.succeeded, ["tdd-wire-1"])

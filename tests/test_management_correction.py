@@ -18,7 +18,7 @@ class _Audit:
 
 
 class _Store:
-    instances: list["_Store"] = []
+    instances: list[_Store] = []
 
     def __init__(self, *args, **kwargs) -> None:
         del args, kwargs
@@ -40,7 +40,7 @@ class _Store:
 
 
 class _Sender:
-    instances: list["_Sender"] = []
+    instances: list[_Sender] = []
     fail = False
 
     def __init__(self, **kwargs) -> None:
@@ -72,15 +72,14 @@ class ManagementCorrectionCallbackTests(unittest.TestCase):
         _Sender.fail = False
 
     def _callback(self, *, chat_id: str | None, audit: _Audit):
-        with mock.patch(
-            "lingxi.adapters.postgres_management_card_context.PostgresManagementCardContextStore",
-            _Store,
-        ), mock.patch(
-            "lingxi.adapters.feishu_group_message.FeishuGroupMessages", _Sender
+        with (
+            mock.patch(
+                "lingxi.adapters.postgres_management_card_context.PostgresManagementCardContextStore",
+                _Store,
+            ),
+            mock.patch("lingxi.adapters.feishu_group_message.FeishuGroupMessages", _Sender),
         ):
-            callback = _build_management_correction_callback(
-                _config(chat_id=chat_id), audit=audit
-            )
+            callback = _build_management_correction_callback(_config(chat_id=chat_id), audit=audit)
         return callback, _Store.instances[0]
 
     def test_success_marks_exact_batch_and_uses_stable_distinct_delivery_prefix(self) -> None:
@@ -98,7 +97,9 @@ class ManagementCorrectionCallbackTests(unittest.TestCase):
         self.assertIn("补齐 2 条", str(call["text"]))
         self.assertTrue(str(call["dedupe_key"]).startswith("management-correction:2026-"))
         self.assertEqual(sender.kwargs["uuid_prefix"], "lingxi-perm-fix-")
-        self.assertEqual(audit.records[-1], ("admin.management_correction_summary_sent", {"count": 2}))
+        self.assertEqual(
+            audit.records[-1], ("admin.management_correction_summary_sent", {"count": 2})
+        )
         self.assertNotIn("om_card", repr(audit.records))
 
     def test_send_failure_keeps_watermark_for_retry_with_same_batch(self) -> None:
@@ -110,10 +111,13 @@ class ManagementCorrectionCallbackTests(unittest.TestCase):
         callback()
         first_key = sender.calls[-1]["dedupe_key"]
         self.assertEqual(store.marked, [])
-        self.assertEqual(audit.records[-1], (
-            "admin.management_correction_summary_failed",
-            {"count": 2, "error": "RuntimeError"},
-        ))
+        self.assertEqual(
+            audit.records[-1],
+            (
+                "admin.management_correction_summary_failed",
+                {"count": 2, "error": "RuntimeError"},
+            ),
+        )
 
         _Sender.fail = False
         callback()

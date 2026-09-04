@@ -26,12 +26,22 @@ from __future__ import annotations
 
 import unittest
 
-from gateway_fakes import CallLog, FakeAudit, FakeOnboarding, FakeReactions, FakeReplies, FakeState, FakeStore, provisioned_user
+from gateway_fakes import (
+    CallLog,
+    FakeAudit,
+    FakeOnboarding,
+    FakeReactions,
+    FakeReplies,
+    FakeState,
+    FakeStore,
+    provisioned_user,
+)
+from test_gateway_pipeline import message
+
 from lingxi.apps.gateway import make_event_handler
 from lingxi.core.admin.router import AdminRouteOutcome
-from lingxi.core.conversation import EventPipeline
+from lingxi.core.conversation import DispatchGates, EventPipeline
 from lingxi.core.conversation.ports import HandledAs, OnboardingResult, OnboardingState
-from test_gateway_pipeline import message
 
 
 class FakeAdminRouter:
@@ -91,9 +101,11 @@ class AdminRoutingPipelineTests(unittest.TestCase):
             replies=FakeReplies(self.log),
             audit=FakeAudit(self.log),
             onboarding=onboarding,
-            admin_router=admin_router,
-            innertest_roster_gate=innertest_roster_gate,
-            delegated_subject_open_id=delegated_subject_open_id,
+            gates=DispatchGates(
+                admin_router=admin_router,
+                innertest_roster_gate=innertest_roster_gate,
+                delegated_subject_open_id=delegated_subject_open_id,
+            ),
         )
 
     def test_active_admin_short_circuits_before_auto_provisioning(self) -> None:
@@ -136,9 +148,7 @@ class AdminRoutingPipelineTests(unittest.TestCase):
         的直接证据。"""
 
         router = FakeAdminRouter()  # 空表：任何 open_id 都得到默认的 handled=False
-        onboarding = FakeOnboarding(
-            result=OnboardingResult(state=OnboardingState.STARTED)
-        )
+        onboarding = FakeOnboarding(result=OnboardingResult(state=OnboardingState.STARTED))
         pipeline = self._pipeline(admin_router=router, onboarding=onboarding)
 
         outcome = pipeline.handle_message(message(open_id="ou_unknown", text="随便问点什么"))
@@ -171,9 +181,7 @@ class AdminRoutingPipelineTests(unittest.TestCase):
         onboarding = FakeOnboarding()
         pipeline = self._pipeline(admin_router=router, onboarding=onboarding)
 
-        outcome = pipeline.handle_message(
-            message(open_id="ou_admin", message_type="image")
-        )
+        outcome = pipeline.handle_message(message(open_id="ou_admin", message_type="image"))
 
         self.assertEqual(router.calls, [])
         # 非文本 + 未开通：仍旧走既有的 AUTO_PROVISIONING 记事件路径（gateway 对
@@ -243,7 +251,7 @@ class WriteCommandContextThreadingTests(unittest.TestCase):
             reactions=FakeReactions(self.log),
             replies=FakeReplies(self.log),
             audit=FakeAudit(self.log),
-            admin_router=router,
+            gates=DispatchGates(admin_router=router),
         )
 
         pipeline.handle_message(
@@ -262,15 +270,13 @@ class WriteCommandContextThreadingTests(unittest.TestCase):
         self.assertEqual(call["message_id"], "om_evt_suspend_1")
 
     def test_main_window_message_passes_thread_id_none(self) -> None:
-        router = FakeAdminRouter(
-            {"ou_admin": AdminRouteOutcome(handled=True, reply_text="ok")}
-        )
+        router = FakeAdminRouter({"ou_admin": AdminRouteOutcome(handled=True, reply_text="ok")})
         pipeline = EventPipeline(
             store=FakeStore(self.state, self.log),
             reactions=FakeReactions(self.log),
             replies=FakeReplies(self.log),
             audit=FakeAudit(self.log),
-            admin_router=router,
+            gates=DispatchGates(admin_router=router),
         )
 
         pipeline.handle_message(
@@ -308,9 +314,11 @@ class DelegatedSubjectStructuralExitTests(unittest.TestCase):
             replies=FakeReplies(self.log),
             audit=FakeAudit(self.log),
             onboarding=onboarding,
-            admin_router=admin_router,
-            innertest_roster_gate=innertest_roster_gate,
-            delegated_subject_open_id=delegated_subject_open_id,
+            gates=DispatchGates(
+                admin_router=admin_router,
+                innertest_roster_gate=innertest_roster_gate,
+                delegated_subject_open_id=delegated_subject_open_id,
+            ),
         )
 
     def test_drifted_app_user_row_still_reaches_the_admin_face_not_the_business_queue(
@@ -339,9 +347,7 @@ class DelegatedSubjectStructuralExitTests(unittest.TestCase):
         )
         pipeline = self._pipeline(admin_router=router)
 
-        outcome = pipeline.handle_message(
-            message(open_id="ou_delegated", text="/admin help")
-        )
+        outcome = pipeline.handle_message(message(open_id="ou_delegated", text="/admin help"))
 
         self.assertEqual(outcome.handled_as, HandledAs.COMMAND)
         self.assertEqual(len(router.calls), 1)
@@ -470,7 +476,7 @@ class NonPrivateChatNeverReachesAdminRoutingTests(unittest.TestCase):
             reactions=FakeReactions(log),
             replies=FakeReplies(log),
             audit=FakeAudit(log),
-            admin_router=router,
+            gates=DispatchGates(admin_router=router),
         )
         handler = make_event_handler(pipeline, audit=FakeAudit(log))
 

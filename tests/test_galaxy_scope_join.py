@@ -54,15 +54,30 @@ class GalaxyUserIdJoinTest(unittest.TestCase):
 
     def test_user_id_join_ignores_rows_of_other_accounts(self) -> None:
         rows = _user_role_rows() + [
-            {"user_id": "U3", "role_id": "R-丙", "source_user_name": "化名甲", "role_name": "临时角色"},
+            {
+                "user_id": "U3",
+                "role_id": "R-丙",
+                "source_user_name": "化名甲",
+                "role_name": "临时角色",
+            },
         ]
 
         self.assertEqual(role_ids_for_user("U1", rows), ("R-甲",))
 
     def test_country_rows_are_joined_by_user_id_not_by_name(self) -> None:
         rows = [
-            {"user_id": "U1", "datacountry_id": "101", "source_user_name": "化名乙", "datacountry_name": "甲国"},
-            {"user_id": "U2", "datacountry_id": "202", "source_user_name": "化名甲", "datacountry_name": "乙国"},
+            {
+                "user_id": "U1",
+                "datacountry_id": "101",
+                "source_user_name": "化名乙",
+                "datacountry_name": "甲国",
+            },
+            {
+                "user_id": "U2",
+                "datacountry_id": "202",
+                "source_user_name": "化名甲",
+                "datacountry_name": "乙国",
+            },
         ]
 
         self.assertEqual(country_keys_for_user("U1", rows), ("101",))
@@ -207,7 +222,9 @@ class GalaxyAllAfricaSentinelTest(unittest.TestCase):
             [{"country_key": "0", "name": "NOT_ALL", "name_cn": "全非", "boss_company_id": "B0"}],
             [{"country_key": "0", "name": "ALL", "name_cn": "别的", "boss_company_id": "B0"}],
         )
-        base = [{"country_key": "11", "name": "Kenya", "name_cn": "肯尼亚", "boss_company_id": "B11"}]
+        base = [
+            {"country_key": "11", "name": "Kenya", "name_cn": "肯尼亚", "boss_company_id": "B11"}
+        ]
         for sentinel_rows in malformed_sets:
             with self.subTest(sentinel_rows=sentinel_rows):
                 scope = resolve_company_scope(["0"], sentinel_rows + base)
@@ -298,7 +315,9 @@ class GalaxyAllAfricaSentinelTest(unittest.TestCase):
     def test_wildcard_covers_boss_company_ids_of_all_countries(self) -> None:
         scope = resolve_company_scope((SENTINEL_COUNTRY_KEY,), self._country_rows())
 
-        self.assertEqual([country.boss_company_id for country in scope.countries], ["BC-甲", "BC-乙", "BC-丙"])
+        self.assertEqual(
+            [country.boss_company_id for country in scope.countries], ["BC-甲", "BC-乙", "BC-丙"]
+        )
 
 
 if __name__ == "__main__":

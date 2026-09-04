@@ -9,7 +9,7 @@
 from __future__ import annotations
 
 import unittest
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 
 from lingxi.core.user_memory import (
     MEMORY_TYPES,
@@ -35,7 +35,7 @@ def _entry(
     memory_type: str = "term_mapping",
     memory_key: str = "大尼日",
     memory_value: str = "尼日利亚",
-    created_at: datetime = datetime(2026, 8, 20, tzinfo=timezone.utc),
+    created_at: datetime = datetime(2026, 8, 20, tzinfo=UTC),
 ) -> UserMemoryEntry:
     return UserMemoryEntry(
         memory_id=memory_id,
@@ -50,9 +50,10 @@ class RenderEmptyTests(unittest.TestCase):
     def test_no_entries_renders_empty_text(self) -> None:
         result = render_user_memory_prompt((), type_label=_label)
 
-        self.assertEqual(result, RenderedUserMemoryPrompt(
-            text="", truncated=False, total_entries=0, kept_entries=0
-        ))
+        self.assertEqual(
+            result,
+            RenderedUserMemoryPrompt(text="", truncated=False, total_entries=0, kept_entries=0),
+        )
 
 
 class RenderContentTests(unittest.TestCase):
@@ -69,12 +70,12 @@ class RenderContentTests(unittest.TestCase):
         newer = _entry(
             memory_id="mem_new",
             memory_key="新条目",
-            created_at=datetime(2026, 8, 25, tzinfo=timezone.utc),
+            created_at=datetime(2026, 8, 25, tzinfo=UTC),
         )
         older = _entry(
             memory_id="mem_old",
             memory_key="老条目",
-            created_at=datetime(2026, 8, 10, tzinfo=timezone.utc),
+            created_at=datetime(2026, 8, 10, tzinfo=UTC),
         )
 
         result = render_user_memory_prompt((newer, older), type_label=_label)
@@ -83,8 +84,7 @@ class RenderContentTests(unittest.TestCase):
 
     def test_all_three_memory_types_use_their_own_label(self) -> None:
         entries = tuple(
-            _entry(memory_id=f"mem_{t}", memory_type=t, memory_key=t)
-            for t in MEMORY_TYPES
+            _entry(memory_id=f"mem_{t}", memory_type=t, memory_key=t) for t in MEMORY_TYPES
         )
 
         result = render_user_memory_prompt(entries, type_label=_label)
@@ -95,9 +95,7 @@ class RenderContentTests(unittest.TestCase):
 
 class TruncationTests(unittest.TestCase):
     def test_stays_under_the_limit_drops_nothing(self) -> None:
-        entries = tuple(
-            _entry(memory_id=f"mem_{i}", memory_key=f"key{i}") for i in range(3)
-        )
+        entries = tuple(_entry(memory_id=f"mem_{i}", memory_key=f"key{i}") for i in range(3))
 
         result = render_user_memory_prompt(entries, type_label=_label, max_chars=100_000)
 
@@ -105,7 +103,7 @@ class TruncationTests(unittest.TestCase):
         self.assertEqual(result.kept_entries, 3)
 
     def test_over_the_limit_drops_the_oldest_entries_first(self) -> None:
-        base = datetime(2026, 8, 1, tzinfo=timezone.utc)
+        base = datetime(2026, 8, 1, tzinfo=UTC)
         entries = tuple(
             _entry(
                 memory_id=f"mem_{i}",

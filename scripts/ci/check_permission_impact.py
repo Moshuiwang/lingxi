@@ -38,7 +38,6 @@ from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Any
 
-
 REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
 ROLE_MAP_PATH = "src/lingxi/config/galaxy_role_function_map.toml"
 METRIC_MAP_PATH = "src/lingxi/config/company_function_metric_map.toml"
@@ -51,9 +50,7 @@ STAGE_COUNT_CLAIM_SOURCE = "biai-stage-read-only-aggregate-claim"
 # 旧的 Python 调用方可继续引用该名字，但值已降级为 claim，避免旧代码误称可信来源。
 STAGE_COUNT_SOURCE = STAGE_COUNT_CLAIM_SOURCE
 STAGE_PROVENANCE_SOURCE = "out-of-band-biai-stage-hash-registration"
-COUNT_SOURCE_KEYS = frozenset(
-    {"kind", "environment", "dataset", "query_version", "captured_at"}
-)
+COUNT_SOURCE_KEYS = frozenset({"kind", "environment", "dataset", "query_version", "captured_at"})
 COUNT_MANIFEST_KEYS = frozenset(
     {
         "schema",
@@ -134,9 +131,7 @@ def _role_map(document: Mapping[str, Any], label: str) -> dict[str, str]:
     return result
 
 
-def _metric_map(
-    document: Mapping[str, Any], label: str
-) -> dict[str, dict[str, tuple[str, ...]]]:
+def _metric_map(document: Mapping[str, Any], label: str) -> dict[str, dict[str, tuple[str, ...]]]:
     companies = document.get("companies")
     if not isinstance(companies, Mapping):
         raise ConfigShapeError(f"{label} 缺少 [companies] 表")
@@ -159,9 +154,7 @@ def _metric_map(
                     f"{label} 公司 {company} 下存在归一化后重复的职能标签：{function}"
                 )
             if not isinstance(raw_metrics, (list, tuple)) or not raw_metrics:
-                raise ConfigShapeError(
-                    f"{label} 公司 {company} 职能 {function} 的指标列表必须非空"
-                )
+                raise ConfigShapeError(f"{label} 公司 {company} 职能 {function} 的指标列表必须非空")
             metrics: list[str] = []
             for metric in raw_metrics:
                 if not isinstance(metric, str) or not metric:
@@ -248,18 +241,16 @@ def _facts_digest(role_raw: bytes, metric_raw: bytes) -> str:
 def _surface_digest(entries: set[SurfaceEntry]) -> str:
     """为一个 grant/shrink 集合计算稳定摘要，不把用户事实带进报告。"""
 
-    encoded = json.dumps(
-        sorted(entries), ensure_ascii=False, separators=(",", ":")
-    ).encode("utf-8")
+    encoded = json.dumps(sorted(entries), ensure_ascii=False, separators=(",", ":")).encode("utf-8")
     return hashlib.sha256(encoded).hexdigest()
 
 
 def _canonical_json_bytes(document: Mapping[str, Any]) -> bytes:
     """为跨进程 hash registration 生成不受缩进/键序影响的 JSON 表示。"""
 
-    return json.dumps(
-        document, ensure_ascii=False, sort_keys=True, separators=(",", ":")
-    ).encode("utf-8")
+    return json.dumps(document, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode(
+        "utf-8"
+    )
 
 
 def _document_digest(document: Mapping[str, Any]) -> str:
@@ -270,9 +261,7 @@ def _document_digest(document: Mapping[str, Any]) -> str:
 
 def _validate_count_value(value: Any, key: str) -> int:
     if isinstance(value, bool) or not isinstance(value, int) or value < 0:
-        raise CountEvidenceError(
-            f"用户数量 {key} 必须是非负整数；不接受用户 ID 或其他明细"
-        )
+        raise CountEvidenceError(f"用户数量 {key} 必须是非负整数；不接受用户 ID 或其他明细")
     return value
 
 
@@ -282,9 +271,7 @@ def _validate_timestamp(value: Any) -> str:
     try:
         parsed = dt.datetime.fromisoformat(value.replace("Z", "+00:00"))
     except ValueError as error:
-        raise CountEvidenceError(
-            "计数来源 captured_at 必须是带时区的 ISO-8601 时间"
-        ) from error
+        raise CountEvidenceError("计数来源 captured_at 必须是带时区的 ISO-8601 时间") from error
     if parsed.tzinfo is None:
         raise CountEvidenceError("计数来源 captured_at 不得省略时区")
     return value
@@ -308,9 +295,7 @@ def _validate_count_manifest(
     del expected_base_ref, expected_head_ref
 
     if set(manifest) != COUNT_MANIFEST_KEYS:
-        raise CountEvidenceError(
-            "用户数量证明字段不完整或含未知字段；只接受绑定候选的纯计数清单"
-        )
+        raise CountEvidenceError("用户数量证明字段不完整或含未知字段；只接受绑定候选的纯计数清单")
     if manifest.get("schema") != COUNT_SCHEMA:
         raise CountEvidenceError(f"用户数量证明 schema 必须是 {COUNT_SCHEMA}")
     for key, expected in (
@@ -336,9 +321,7 @@ def _validate_count_manifest(
 
     source = manifest.get("source")
     if not isinstance(source, Mapping) or set(source) != COUNT_SOURCE_KEYS:
-        raise CountEvidenceError(
-            "用户数量证明 source 字段不完整或含未知字段；不得携带行级资料"
-        )
+        raise CountEvidenceError("用户数量证明 source 字段不完整或含未知字段；不得携带行级资料")
     kind = source.get("kind")
     environment = source.get("environment")
     dataset = source.get("dataset")
@@ -366,11 +349,7 @@ def _validate_count_manifest(
     return {
         "grant": normalized_counts["grant"],
         "shrink": normalized_counts["shrink"],
-        "status": (
-            "unverified-claim"
-            if kind == STAGE_COUNT_CLAIM_SOURCE
-            else "derived"
-        ),
+        "status": ("unverified-claim" if kind == STAGE_COUNT_CLAIM_SOURCE else "derived"),
         "source": {
             "kind": kind,
             "environment": environment,
@@ -404,13 +383,10 @@ def _validate_stage_provenance(
 
     if set(provenance) != PROVENANCE_KEYS:
         raise CountEvidenceError(
-            "stage provenance registration 字段不完整或含未知字段；"
-            "不能把 PR 自报升级为可信证据"
+            "stage provenance registration 字段不完整或含未知字段；不能把 PR 自报升级为可信证据"
         )
     if provenance.get("schema") != PROVENANCE_SCHEMA:
-        raise CountEvidenceError(
-            f"stage provenance registration schema 必须是 {PROVENANCE_SCHEMA}"
-        )
+        raise CountEvidenceError(f"stage provenance registration schema 必须是 {PROVENANCE_SCHEMA}")
 
     expected_bindings = {
         "manifest_sha256": _document_digest(manifest),
@@ -436,9 +412,7 @@ def _validate_stage_provenance(
 
     source = provenance.get("source")
     if not isinstance(source, Mapping) or set(source) != COUNT_SOURCE_KEYS:
-        raise CountEvidenceError(
-            "stage provenance registration source 字段不完整或含未知字段"
-        )
+        raise CountEvidenceError("stage provenance registration source 字段不完整或含未知字段")
     if source.get("kind") != STAGE_PROVENANCE_SOURCE:
         raise CountEvidenceError(
             "stage provenance registration source.kind 必须是仓库外 hash registration"
@@ -451,9 +425,7 @@ def _validate_stage_provenance(
         "captured_at": manifest_source.get("captured_at"),
     }
     if dict(source) != expected_source:
-        raise CountEvidenceError(
-            "stage provenance registration 来源元数据与 stage 聚合声明不一致"
-        )
+        raise CountEvidenceError("stage provenance registration 来源元数据与 stage 聚合声明不一致")
     registered_at = _validate_timestamp(provenance.get("registered_at"))
 
     return {
@@ -496,7 +468,7 @@ def _validate_user_counts(
                 "environment": "repository",
                 "dataset": "permission-facts",
                 "query_version": "static-diff/v1",
-                "captured_at": dt.datetime.now(dt.timezone.utc).isoformat(),
+                "captured_at": dt.datetime.now(dt.UTC).isoformat(),
             },
         }
 
@@ -507,9 +479,7 @@ def _validate_user_counts(
     # 不接受没有来源/时间/候选绑定的裸 grant/shrink 数字。
     if set(user_counts) == COUNT_KEYS:
         if strict_manifest:
-            raise CountEvidenceError(
-                "CI 不接受未绑定来源/时间/候选的裸 grant/shrink 数字"
-            )
+            raise CountEvidenceError("CI 不接受未绑定来源/时间/候选的裸 grant/shrink 数字")
         return {
             "grant": _validate_count_value(user_counts["grant"], "grant"),
             "shrink": _validate_count_value(user_counts["shrink"], "shrink"),
@@ -519,14 +489,12 @@ def _validate_user_counts(
                 "environment": "test",
                 "dataset": "pure-counts",
                 "query_version": "test/v1",
-                "captured_at": dt.datetime.now(dt.timezone.utc).isoformat(),
+                "captured_at": dt.datetime.now(dt.UTC).isoformat(),
             },
         }
 
     if not strict_manifest:
-        raise CountEvidenceError(
-            "用户数量输入必须是 grant/shrink 纯计数，或完整的候选绑定证明"
-        )
+        raise CountEvidenceError("用户数量输入必须是 grant/shrink 纯计数，或完整的候选绑定证明")
     # Ref 参数保留给旧的纯函数调用方，但不再是严格证明的绑定项；把它们写入
     # 随 PR 提交的 manifest 会重新引入 head 自引用。事实内容和 surface digest
     # 才是 manifest 与候选之间的稳定绑定。
@@ -844,9 +812,7 @@ def run_check(
     if provenance is not None:
         report["affected_user_counts"]["status"] = "provided-registered"
         report["affected_user_counts"]["source"]["provenance"] = provenance["status"]
-        report["affected_user_counts"]["source"]["registered_at"] = provenance[
-            "registered_at"
-        ]
+        report["affected_user_counts"]["source"]["registered_at"] = provenance["registered_at"]
     # 登记状态与影响面报告一起进制品：审查者与产品负责人据此知道这次的数量是否经过
     # 仓库外绑定，而不必去猜一个不存在的文件为什么没出现。
     report["count_registration"] = {"status": registration_status}
@@ -854,7 +820,10 @@ def run_check(
         report["count_registration"]["note"] = registration_note
     if output is not None:
         output.parent.mkdir(parents=True, exist_ok=True)
-        output.write_text(json.dumps(report, ensure_ascii=False, sort_keys=True, indent=2) + "\n", encoding="utf-8")
+        output.write_text(
+            json.dumps(report, ensure_ascii=False, sort_keys=True, indent=2) + "\n",
+            encoding="utf-8",
+        )
     print(render_report(report))
     return 0
 

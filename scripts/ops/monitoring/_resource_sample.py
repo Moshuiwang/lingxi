@@ -31,9 +31,10 @@ import os
 import shutil
 import socket
 import sys
-from datetime import datetime, timezone
+from collections.abc import Mapping
+from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any, Mapping
+from typing import Any
 
 # docker stats 的人类可读尺寸后缀（先按后缀长度降序匹配，避免 "B" 提前命中
 # "KiB"/"MiB" 的结尾）。同时兼容十进制（kB/MB/GB，docker 早期版本偶见）与
@@ -229,7 +230,9 @@ def save_state(path: Path, state: Mapping[str, Any]) -> None:
     os.replace(tmp_path, path)
 
 
-def compute_rate(current: float | None, previous: float | None, prev_ts: float | None, now_ts: float) -> float | None:
+def compute_rate(
+    current: float | None, previous: float | None, prev_ts: float | None, now_ts: float
+) -> float | None:
     """`(当前值 - 上一轮值) / 经过秒数`；任何一端缺失（首次采样、状态文件损坏、
     磁盘/网卡本轮读取失败）都返回 ``None``——增速在这种情况下"取不到"是精确
     语义，不编造成 0（与 `task_report_metrics` 迁移同一条"NULL 是精确语义"纪律）。
@@ -263,9 +266,7 @@ def build_sample(
 
     now_ts = now.timestamp()
     prev_ts = prev_state.get("ts")
-    prev_disks = {
-        d.get("mount"): d for d in prev_state.get("disks", []) if isinstance(d, dict)
-    }
+    prev_disks = {d.get("mount"): d for d in prev_state.get("disks", []) if isinstance(d, dict)}
     prev_net = prev_state.get("net", {}) if isinstance(prev_state.get("net"), dict) else {}
 
     for disk in disks:
@@ -279,8 +280,12 @@ def build_sample(
 
     net_with_rate = {
         **net,
-        "rx_bytes_per_sec": compute_rate(net.get("rx_bytes"), prev_net.get("rx_bytes"), prev_ts, now_ts),
-        "tx_bytes_per_sec": compute_rate(net.get("tx_bytes"), prev_net.get("tx_bytes"), prev_ts, now_ts),
+        "rx_bytes_per_sec": compute_rate(
+            net.get("rx_bytes"), prev_net.get("rx_bytes"), prev_ts, now_ts
+        ),
+        "tx_bytes_per_sec": compute_rate(
+            net.get("tx_bytes"), prev_net.get("tx_bytes"), prev_ts, now_ts
+        ),
     }
 
     sample = {
@@ -323,13 +328,19 @@ def main(argv: list[str] | None = None) -> int:
     args = build_arg_parser().parse_args(argv)
     disk_mounts = args.disk_mounts or ["/"]
 
-    docker_stats_text = args.docker_stats_file.read_text(encoding="utf-8") if args.docker_stats_file.is_file() else ""
-    missing_text = args.missing_file.read_text(encoding="utf-8") if args.missing_file.is_file() else ""
+    docker_stats_text = (
+        args.docker_stats_file.read_text(encoding="utf-8")
+        if args.docker_stats_file.is_file()
+        else ""
+    )
+    missing_text = (
+        args.missing_file.read_text(encoding="utf-8") if args.missing_file.is_file() else ""
+    )
 
     state_path = args.state_dir / "resource_prev.json"
     prev_state = load_prev_state(state_path)
 
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
     sample, next_state = build_sample(
         docker_stats_text=docker_stats_text,
         missing_text=missing_text,

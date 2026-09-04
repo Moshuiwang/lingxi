@@ -30,44 +30,45 @@ import tempfile
 import threading
 import time
 import unittest
-from datetime import datetime, timedelta, timezone
+from collections.abc import Mapping
+from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Mapping
+from typing import Any
 
-from gateway_fakes import FakeAudit, FakeReactions, FakeReplies, CallLog
+from gateway_fakes import CallLog, FakeAudit, FakeReactions, FakeReplies
+from postgres_schema import ensure_production_schema, psycopg_available, reset_production_rows
+
 from lingxi.adapters.postgres import connect
 from lingxi.adapters.postgres_conversation import (
     ClaimedTask,
     PostgresGatewayStore,
     PostgresTaskQueue,
     PostgresTaskQueueListener,
-    TerminalTask,
     _Transaction,
 )
 from lingxi.apps.worker.config import WorkerConfig
 from lingxi.apps.worker.service import WorkerService
+from lingxi.apps.worker.service_ports import SessionCleanupSettings, WorkerObservers
 from lingxi.config.content import default_content_catalog
-from lingxi.core.innertest_content_capture import CapturedToolCall, ContentCaptureRecord
-from lingxi.core.year_grounding_guard import QUERY_METRIC_TOOL_NAME
 from lingxi.core.conversation import EventPipeline, InboundMessage
+from lingxi.core.delivery.ports import PROGRESS_CONTENT_MAX_LENGTH
 from lingxi.core.execution.card_stream import (
     CARD_AUTO_CLOSE_HANDOFF_SECONDS,
-    CardCreated,
-    CardRateLimiter,
-    CardStream,
-    DeliveryRejected,
     KNOWN_QUERY_STEPS,
     PROGRESS_ACTION_COMPOSING,
     PROGRESS_ACTION_PROCESSING,
     PROGRESS_ACTION_QUERYING,
     PROGRESS_ACTION_WORKING,
+    CardCreated,
+    CardRateLimiter,
+    CardStream,
+    DeliveryRejectedError,
     ProgressStepSnapshot,
     decode_progress_action,
     encode_progress_action,
 )
-from lingxi.core.delivery.ports import PROGRESS_CONTENT_MAX_LENGTH
-from postgres_schema import ensure_production_schema, psycopg_available, reset_production_rows
-
+from lingxi.core.innertest_content_capture import CapturedToolCall, ContentCaptureRecord
+from lingxi.core.year_grounding_guard import QUERY_METRIC_TOOL_NAME
 
 DSN = os.environ.get("LINGXI_POSTGRES_DSN")
 SKIP_DB = (
@@ -133,13 +134,13 @@ def worker_config(**overrides: object) -> WorkerConfig:
 
 
 class RecordingCards:
-    """``error`` 默认 ``DeliveryRejected``（明确失败，独立审核 R-1 白名单）；传入
+    """``error`` 默认 ``DeliveryRejectedError``（明确失败，独立审核 R-1 白名单）；传入
     ``TimeoutError`` 等其它任何异常类型模拟"结果不明"，见
     ``core.execution.card_stream`` 模块说明。
     """
 
     def __init__(
-        self, *, fail: str | None = None, error: type[BaseException] = DeliveryRejected
+        self, *, fail: str | None = None, error: type[BaseException] = DeliveryRejectedError
     ) -> None:
         self.fail = fail
         self._error = error
@@ -167,7 +168,9 @@ class RecordingCards:
 
 
 class RecordingText:
-    def __init__(self, *, fail: bool = False, error: type[BaseException] = DeliveryRejected) -> None:
+    def __init__(
+        self, *, fail: bool = False, error: type[BaseException] = DeliveryRejectedError
+    ) -> None:
         self.texts: list[str] = []
         self.calls: list[dict[str, object]] = []
         self.fail = fail
@@ -379,7 +382,10 @@ class CardStreamTests(unittest.TestCase):
         for index, step in enumerate(steps, start=1):
             now[0] = float(index)
             stream.update(
-                elapsed_seconds=1, action=PROGRESS_ACTION_QUERYING, query_count=index, query_step=step
+                elapsed_seconds=1,
+                action=PROGRESS_ACTION_QUERYING,
+                query_count=index,
+                query_step=step,
             )
             with self.subTest(step=step):
                 expected_lines = expected_done[: index - 1] + [expected_current[index - 1]]
@@ -437,13 +443,19 @@ class CardStreamTests(unittest.TestCase):
         stream.start()
         now[0] = 1.0
         stream.update(
-            elapsed_seconds=2, action=PROGRESS_ACTION_QUERYING, query_count=1, query_step="list_metrics"
+            elapsed_seconds=2,
+            action=PROGRESS_ACTION_QUERYING,
+            query_count=1,
+            query_step="list_metrics",
         )
         now[0] = 2.0
         # 同一身份第二次出现，累计过了 20 秒（22-2）——超过旧阈值（12 秒）但
         # 仍在新阈值（24 秒）之内。
         stream.update(
-            elapsed_seconds=22, action=PROGRESS_ACTION_QUERYING, query_count=1, query_step="list_metrics"
+            elapsed_seconds=22,
+            action=PROGRESS_ACTION_QUERYING,
+            query_count=1,
+            query_step="list_metrics",
         )
 
         self.assertEqual(cards.bodies[-1], "正在第 1 次查询可用指标列表 · 22 秒")
@@ -478,12 +490,18 @@ class CardStreamTests(unittest.TestCase):
         stream.start()
         now[0] = 1.0
         stream.update(
-            elapsed_seconds=2, action=PROGRESS_ACTION_QUERYING, query_count=1, query_step="list_metrics"
+            elapsed_seconds=2,
+            action=PROGRESS_ACTION_QUERYING,
+            query_count=1,
+            query_step="list_metrics",
         )
         now[0] = 3.0
         # 同一身份再次出现，累计已经过了 25 秒（27-2），跨过 24 秒阈值。
         stream.update(
-            elapsed_seconds=27, action=PROGRESS_ACTION_QUERYING, query_count=1, query_step="list_metrics"
+            elapsed_seconds=27,
+            action=PROGRESS_ACTION_QUERYING,
+            query_count=1,
+            query_step="list_metrics",
         )
 
         self.assertEqual(
@@ -524,7 +542,9 @@ class CardStreamTests(unittest.TestCase):
         self.assertEqual(first_stalled_body, "正在处理其它步骤（已 25 秒无新进展）")
         self.assertEqual(second_stalled_body, "正在处理其它步骤（已 49 秒无新进展）")
         self.assertNotEqual(
-            first_stalled_body, second_stalled_body, "停滞期间文字必须继续变化，不能停在同一句话不动"
+            first_stalled_body,
+            second_stalled_body,
+            "停滞期间文字必须继续变化，不能停在同一句话不动",
         )
 
     def test_a_fresh_signal_after_a_stall_resumes_normal_wording_and_keeps_history(
@@ -556,11 +576,17 @@ class CardStreamTests(unittest.TestCase):
         stream.start()
         now[0] = 1.0
         stream.update(
-            elapsed_seconds=2, action=PROGRESS_ACTION_QUERYING, query_count=1, query_step="list_metrics"
+            elapsed_seconds=2,
+            action=PROGRESS_ACTION_QUERYING,
+            query_count=1,
+            query_step="list_metrics",
         )
         now[0] = 2.0
         stream.update(
-            elapsed_seconds=27, action=PROGRESS_ACTION_QUERYING, query_count=1, query_step="list_metrics"
+            elapsed_seconds=27,
+            action=PROGRESS_ACTION_QUERYING,
+            query_count=1,
+            query_step="list_metrics",
         )
         self.assertIn("无新进展", cards.bodies[-1])
         now[0] = 3.0
@@ -646,13 +672,19 @@ class CardStreamTests(unittest.TestCase):
         # t=3：发出查询工具调用。
         now[0] = 1.0
         stream.update(
-            elapsed_seconds=3, action=PROGRESS_ACTION_QUERYING, query_count=1, query_step="query_metric"
+            elapsed_seconds=3,
+            action=PROGRESS_ACTION_QUERYING,
+            query_count=1,
+            query_step="query_metric",
         )
         # t=15：期间一次兜底刷新（距上次 12 秒），身份未变——累计 12 秒，
         # 远没跨过 24 秒新阈值。
         now[0] = 2.0
         stream.update(
-            elapsed_seconds=15, action=PROGRESS_ACTION_QUERYING, query_count=1, query_step="query_metric"
+            elapsed_seconds=15,
+            action=PROGRESS_ACTION_QUERYING,
+            query_count=1,
+            query_step="query_metric",
         )
         # t=18：工具结果返回，rc21 新增信号把身份切到 composing——停滞计时
         # 的锚点随之清零。
@@ -669,7 +701,9 @@ class CardStreamTests(unittest.TestCase):
 
         # 6 = start() 建卡的初始占位帧 + 5 次 update()；逐一确认没有一帧被
         # 节流吞掉，也确认全部 6 帧里没有任何一帧出现停滞措辞。
-        self.assertEqual(len(cards.bodies), 6, "建卡 + 五次 update 都必须真正写库，没有一次被节流吞掉")
+        self.assertEqual(
+            len(cards.bodies), 6, "建卡 + 五次 update 都必须真正写库，没有一次被节流吞掉"
+        )
         for body in cards.bodies:
             self.assertNotIn("无新进展", body, f"正常任务全程不应出现停滞措辞，实际：{body!r}")
 
@@ -753,7 +787,9 @@ class CardStreamTests(unittest.TestCase):
             elapsed_seconds=int(CARD_AUTO_CLOSE_HANDOFF_SECONDS + 30),
             action=PROGRESS_ACTION_COMPOSING,
         )
-        self.assertEqual(len(cards.calls), update_calls_after_handoff, "降级后不应再调用卡片 update")
+        self.assertEqual(
+            len(cards.calls), update_calls_after_handoff, "降级后不应再调用卡片 update"
+        )
 
         # 终态改走既有文本兜底通道，不再尝试卡片 finish。
         stream.finish(result="最终答案", elapsed_seconds=600)
@@ -882,15 +918,18 @@ class CardStreamTests(unittest.TestCase):
     def test_create_timeout_is_not_swallowed_into_a_fallback_downgrade(self) -> None:
         """独立审核 B-1/R-1：``TimeoutError``（真实 adapter 走 ``requests``，其网络
         异常全部是内置 ``OSError`` 的子类）不是"明确失败"——``start()`` 必须原样把
-        它抛出去，不能像 ``DeliveryRejected`` 那样吞掉并置位 ``fallback_needed``
+        它抛出去，不能像 ``DeliveryRejectedError`` 那样吞掉并置位 ``fallback_needed``
         （那会让调用方误以为已经拿到"应该改走文本通道"这个明确结论）。
         """
 
         cards = RecordingCards(fail="create", error=TimeoutError)
         text = RecordingText()
         stream = CardStream(
-            chat_id="chat-a", thread_id="topic-a", reply_to_message_id="msg-a",
-            transport=cards, fallback=text,
+            chat_id="chat-a",
+            thread_id="topic-a",
+            reply_to_message_id="msg-a",
+            transport=cards,
+            fallback=text,
         )
 
         with self.assertRaises(TimeoutError):
@@ -907,8 +946,11 @@ class CardStreamTests(unittest.TestCase):
         cards = RecordingCards(fail="update", error=TimeoutError)
         text = RecordingText()
         stream = CardStream(
-            chat_id="chat-a", thread_id="topic-a", reply_to_message_id="msg-a",
-            transport=cards, fallback=text,
+            chat_id="chat-a",
+            thread_id="topic-a",
+            reply_to_message_id="msg-a",
+            transport=cards,
+            fallback=text,
         )
         stream.start()
 
@@ -923,15 +965,18 @@ class CardStreamTests(unittest.TestCase):
     def test_close_timeout_still_does_not_fall_back_like_any_other_close_failure(self) -> None:
         """``close()`` 步骤的异常分类不延伸到这里（见 ``card_stream.py`` 注释）：
         无论关闭失败是明确拒绝还是网络类异常，都不改变"更新已经成功、答案已对
-        用户可见"这个结论，``TimeoutError`` 与 ``DeliveryRejected`` 在这一步行为
+        用户可见"这个结论，``TimeoutError`` 与 ``DeliveryRejectedError`` 在这一步行为
         一致。
         """
 
         cards = RecordingCards(fail="close", error=TimeoutError)
         text = RecordingText()
         stream = CardStream(
-            chat_id="chat-a", thread_id="topic-a", reply_to_message_id="msg-a",
-            transport=cards, fallback=text,
+            chat_id="chat-a",
+            thread_id="topic-a",
+            reply_to_message_id="msg-a",
+            transport=cards,
+            fallback=text,
         )
         stream.start()
         stream.finish(result="已产生的答案", elapsed_seconds=1)  # 不应该抛出
@@ -947,8 +992,11 @@ class CardStreamTests(unittest.TestCase):
         cards = RecordingCards(fail="create")  # 明确失败，走文本通道
         text = RecordingText(fail=True, error=TimeoutError)
         stream = CardStream(
-            chat_id="chat-a", thread_id="topic-a", reply_to_message_id="msg-a",
-            transport=cards, fallback=text,
+            chat_id="chat-a",
+            thread_id="topic-a",
+            reply_to_message_id="msg-a",
+            transport=cards,
+            fallback=text,
         )
         stream.start()
         self.assertTrue(stream.fallback_needed)
@@ -1094,7 +1142,7 @@ class DroppingNotifyListener:
         self.wait_started = threading.Event()
         self.wait_calls: list[float] = []
 
-    def __enter__(self) -> "DroppingNotifyListener":
+    def __enter__(self) -> DroppingNotifyListener:
         return self
 
     def wait(self, *, timeout_seconds: float) -> bool:
@@ -1247,7 +1295,7 @@ class WorkerServiceTests(unittest.TestCase):
                 config=worker_config(user_env_root=empty_root),
                 queue=queue,
                 executor_factory=lambda config, marker: Executor(),
-                on_terminal_outcome=sink,
+                observers=WorkerObservers(on_terminal_outcome=sink),
             )
             asyncio.run(service.process_once())
 
@@ -1298,7 +1346,9 @@ class WorkerServiceTests(unittest.TestCase):
             (False, "result_too_large", "failed", "result_too_large", "worker.result_too_large"),
             (False, "mcp_bad_gateway", "failed", "mcp_bad_gateway", "worker.mcp_bad_gateway"),
         ):
-            with self.subTest(expected_terminal_kind=expected_terminal_kind, failure_code=failure_code):
+            with self.subTest(
+                expected_terminal_kind=expected_terminal_kind, failure_code=failure_code
+            ):
                 queue = FakeWorkerQueue(stopped=stopped)
 
                 class Executor:
@@ -1339,7 +1389,7 @@ class WorkerServiceTests(unittest.TestCase):
             config=worker_config(),
             queue=queue,
             executor_factory=lambda config, marker: Executor(),
-            on_terminal_outcome=sink,
+            observers=WorkerObservers(on_terminal_outcome=sink),
         )
 
         asyncio.run(service.process_once())
@@ -1356,7 +1406,9 @@ class WorkerServiceTests(unittest.TestCase):
             terminal["content"], default_content_catalog().text("worker.mcp_bad_gateway").text
         )
         self.assertEqual(len(sink.calls), 1)
-        self.assertEqual(len([event for event in queue.events if event["event_type"] == "terminal"]), 0)
+        self.assertEqual(
+            len([event for event in queue.events if event["event_type"] == "terminal"]), 0
+        )
 
     def test_withheld_output_writes_redacted_withheld_terminal_not_success(self) -> None:
         """#141/#149：整段正文因安全策略被拒发时，即使 closed=True 也不得写成
@@ -1373,7 +1425,11 @@ class WorkerServiceTests(unittest.TestCase):
                         "closed": True,
                         "final_text": "本次结果涉及需要保护的内容，已被安全策略拦截，未能提供结果。",
                         "session_id": "new-session",
-                        "output_safety": {"blocked": True, "withheld": True, "reasons": ("forbidden_value",)},
+                        "output_safety": {
+                            "blocked": True,
+                            "withheld": True,
+                            "reasons": ("forbidden_value",),
+                        },
                         "user_result": "redacted_withheld",
                     },
                     "failure": None,
@@ -1447,7 +1503,7 @@ class WorkerServiceTests(unittest.TestCase):
         queue = FakeWorkerQueue()
         leaked_text = (
             "好的，我将为你查询。【内部能力已隐藏】【内部标识已隐藏】"
-            "{\"metric\": \"日活\", \"value\": 1024}"
+            '{"metric": "日活", "value": 1024}'
         )
 
         class Executor:
@@ -1473,7 +1529,7 @@ class WorkerServiceTests(unittest.TestCase):
             config=worker_config(),
             queue=queue,
             executor_factory=lambda config, marker: Executor(),
-            on_terminal_outcome=sink,
+            observers=WorkerObservers(on_terminal_outcome=sink),
         )
         asyncio.run(service.process_once())
 
@@ -1551,7 +1607,7 @@ class WorkerServiceTests(unittest.TestCase):
             config=worker_config(),
             queue=queue,
             executor_factory=lambda config, marker: Executor(),
-            on_terminal_outcome=sink,
+            observers=WorkerObservers(on_terminal_outcome=sink),
         )
         asyncio.run(service.process_once())
 
@@ -1586,7 +1642,7 @@ class WorkerServiceTests(unittest.TestCase):
             config=worker_config(),
             queue=queue,
             executor_factory=lambda config, marker: Executor(),
-            on_terminal_outcome=sink,
+            observers=WorkerObservers(on_terminal_outcome=sink),
         )
         asyncio.run(service.process_once())
 
@@ -1621,7 +1677,7 @@ class WorkerServiceTests(unittest.TestCase):
             config=worker_config(),
             queue=queue,
             executor_factory=lambda config, marker: Executor(),
-            on_terminal_outcome=sink,
+            observers=WorkerObservers(on_terminal_outcome=sink),
         )
         asyncio.run(service.process_once())
 
@@ -1649,7 +1705,7 @@ class WorkerServiceTests(unittest.TestCase):
             config=worker_config(),
             queue=queue,
             executor_factory=lambda config, marker: Executor(),
-            on_terminal_outcome=sink,
+            observers=WorkerObservers(on_terminal_outcome=sink),
         )
         asyncio.run(service.process_once())
 
@@ -1916,9 +1972,7 @@ class WorkerServiceTests(unittest.TestCase):
                     terminal["content"],
                     default_content_catalog().text("worker.redacted_withheld").text,
                 )
-                self.assertNotIn(
-                    withheld_text, str(terminal["content"]), "被拒发的正文不得交付"
-                )
+                self.assertNotIn(withheld_text, str(terminal["content"]), "被拒发的正文不得交付")
 
     def test_a_genuinely_interrupted_turn_keeps_the_stopped_terminal(self) -> None:
         """Issue #195：纯 stop 的语义不变——执行层确认这一轮真被中断
@@ -1931,7 +1985,10 @@ class WorkerServiceTests(unittest.TestCase):
 
         catalog = default_content_catalog()
         for partial_text, expected_content in (
-            ("已产出的半截结果", catalog.text("worker.stopped_result", result="已产出的半截结果").text),
+            (
+                "已产出的半截结果",
+                catalog.text("worker.stopped_result", result="已产出的半截结果").text,
+            ),
             ("", catalog.text("worker.stopped").text),
         ):
             with self.subTest(partial_text=bool(partial_text)):
@@ -1940,8 +1997,15 @@ class WorkerServiceTests(unittest.TestCase):
                 class Executor:
                     async def run_turn(self, prompt: str, **kwargs: object) -> dict:
                         return {
-                            "turn": {"closed": False, "final_text": partial_text, "session_id": None},
-                            "failure": {"code": "interrupted", "message": "AgentSessionInterrupted"},
+                            "turn": {
+                                "closed": False,
+                                "final_text": partial_text,
+                                "session_id": None,
+                            },
+                            "failure": {
+                                "code": "interrupted",
+                                "message": "AgentSessionInterrupted",
+                            },
                         }
 
                 service = WorkerService(
@@ -2029,7 +2093,7 @@ class WorkerServiceTests(unittest.TestCase):
             config=worker_config(),
             queue=queue,
             executor_factory=lambda config, marker: Executor(),
-            on_terminal_outcome=sink,
+            observers=WorkerObservers(on_terminal_outcome=sink),
         )
         asyncio.run(service.process_once())
 
@@ -2099,7 +2163,7 @@ class WorkerServiceTests(unittest.TestCase):
             config=worker_config(),
             queue=queue,
             executor_factory=lambda config, marker: Executor(),
-            on_terminal_outcome=sink,
+            observers=WorkerObservers(on_terminal_outcome=sink),
         )
         asyncio.run(service.process_once())
 
@@ -2129,7 +2193,7 @@ class WorkerServiceTests(unittest.TestCase):
             config=worker_config(),
             queue=queue,
             executor_factory=lambda config, marker: Executor(),
-            on_terminal_outcome=sink,
+            observers=WorkerObservers(on_terminal_outcome=sink),
         )
         asyncio.run(service.process_once())
 
@@ -2156,7 +2220,11 @@ class WorkerServiceTests(unittest.TestCase):
                         "session_id": "s",
                         "output_safety": {"blocked": False, "withheld": False, "reasons": ()},
                     },
-                    "audit": {"denied_count": 2, "denied": [], "usage": {"status": "known", "fields": {}}},
+                    "audit": {
+                        "denied_count": 2,
+                        "denied": [],
+                        "usage": {"status": "known", "fields": {}},
+                    },
                     "resources": {
                         "usage": {
                             "status": "known",
@@ -2207,7 +2275,9 @@ class WorkerServiceTests(unittest.TestCase):
 
         self.assertEqual(len(queue.terminals), 1)
         terminal = queue.terminals[0]
-        self.assertIsNone(terminal["guard_denied_count"], "负数必须按结构性不可信处理，不能原样落库")
+        self.assertIsNone(
+            terminal["guard_denied_count"], "负数必须按结构性不可信处理，不能原样落库"
+        )
 
     def test_write_terminal_event_gets_none_not_zero_when_the_turn_never_really_ran(self) -> None:
         """早退分支（这里用执行器抛未预期异常模拟）从未真正跑过一次回合，
@@ -2263,7 +2333,7 @@ class WorkerServiceTests(unittest.TestCase):
             config=worker_config(),
             queue=queue,
             executor_factory=lambda config, marker: Executor(),
-            on_terminal_outcome=sink,
+            observers=WorkerObservers(on_terminal_outcome=sink),
         )
         asyncio.run(service.process_once())
 
@@ -2345,7 +2415,7 @@ class WorkerServiceTests(unittest.TestCase):
         状态，不依赖真实操作系统信号的时序抖动。
 
         **Trace #544 S-2b 之后的口径变化（不是放宽断言，是如实说明）**：巡检
-        已改走 ``await asyncio.to_thread(self._housekeep)``（见
+        已改走 ``await asyncio.to_thread(self._housekeeper.run)``（见
         ``apps/worker/service.py`` 的 ``process_once``），因此这个替身跑在**工作
         线程**上，拿不到 running loop，改用
         预先捕获的循环 + ``call_soon_threadsafe`` 排队。同一个原因也让
@@ -2385,14 +2455,14 @@ class WorkerServiceTests(unittest.TestCase):
             # 精确模拟"SIGTERM 的自管道回调已经在事件循环就绪队列里排队、
             # 但还没被处理"：这次同步的 `_housekeep()` 调用期间，操作系统
             # 送达了信号，`loop.call_soon` 把 `stop.set` 排进了就绪队列。
-            original_housekeep = service._housekeep
+            original_housekeep = service._housekeeper.run
             loop = asyncio.get_running_loop()
 
             def housekeeping_that_races_with_sigterm() -> list[object]:
                 loop.call_soon_threadsafe(stop.set)
                 return original_housekeep()
 
-            service._housekeep = housekeeping_that_races_with_sigterm  # type: ignore[method-assign]
+            service._housekeeper.run = housekeeping_that_races_with_sigterm  # type: ignore[method-assign]
 
             run_task = asyncio.ensure_future(service.run(stop_event=stop))
             await asyncio.wait_for(run_task, timeout=2.0)
@@ -2449,7 +2519,9 @@ class WorkerServiceTests(unittest.TestCase):
                 config=worker_config(stop_poll_interval_seconds=0.02),
                 queue=queue,
                 executor_factory=lambda config, marker: SlowExecutor(),
-                heartbeat=lambda: touch_liveness("worker", directory=directory),
+                observers=WorkerObservers(
+                    heartbeat=lambda: touch_liveness("worker", directory=directory)
+                ),
             )
 
             async def poll_liveness_during_the_turn() -> None:
@@ -2534,7 +2606,7 @@ class WorkerServiceTests(unittest.TestCase):
             executor_factory=lambda config, marker: Executor(),
         )
 
-        original_housekeep = service._housekeep
+        original_housekeep = service._housekeeper.run
         signal_sent = False
 
         def housekeeping_that_sends_a_real_sigterm() -> list[object]:
@@ -2550,7 +2622,7 @@ class WorkerServiceTests(unittest.TestCase):
                 os.kill(os.getpid(), signal.SIGTERM)
             return result
 
-        service._housekeep = housekeeping_that_sends_a_real_sigterm  # type: ignore[method-assign]
+        service._housekeeper.run = housekeeping_that_sends_a_real_sigterm  # type: ignore[method-assign]
 
         err = io.StringIO()
 
@@ -2873,7 +2945,7 @@ class WorkerServiceTests(unittest.TestCase):
             config=worker_config(max_concurrency=4, poll_interval_seconds=0.02),
             queue=queue,
             executor_factory=lambda config, marker: Executor(),
-            on_alert_tick=on_alert_tick,
+            observers=WorkerObservers(on_alert_tick=on_alert_tick),
         )
 
         async def scenario() -> None:
@@ -2900,8 +2972,7 @@ class WorkerServiceTests(unittest.TestCase):
         self.assertGreaterEqual(
             alert_ticks[0],
             2,
-            "同一节拍下 _tick_alerts() 也必须继续被调用，不能随 _housekeep() "
-            "一起停摆",
+            "同一节拍下 _tick_alerts() 也必须继续被调用，不能随 _housekeep() 一起停摆",
         )
         self.assertEqual(len(queue.terminals), 1)
         self.assertEqual(queue.terminals[0]["terminal_kind"], "success")
@@ -2920,12 +2991,12 @@ class WorkerServiceTests(unittest.TestCase):
 
         **断言的牙齿在哪**：``answered_while_blocked``——那次假的数据库往返**还没
         返回**的时候，钩子就必须已经应答过。产品口径的 30 秒预算
-        （``_HOOK_ANSWER_BUDGET_SECONDS``）同时断言，但它不是这条用例的牙齿：把
+        （``hook_answer_budget_seconds``）同时断言，但它不是这条用例的牙齿：把
         阻塞时长做到真的超过 30 秒会让 fast 层多花半分钟，因此阻塞只留
-        ``_BLOCKED_DB_GRACE_SECONDS`` 秒的兜底（同时也保证退化时用例不会挂死）。
+        ``blocked_db_grace_seconds`` 秒的兜底（同时也保证退化时用例不会挂死）。
 
         变异验红：把 ``process_once()`` 里的
-        ``await asyncio.to_thread(self._housekeep)`` 改回裸调 ``self._housekeep()``，
+        ``await asyncio.to_thread(self._housekeeper.run)`` 改回裸调 ``self._housekeeper.run()``，
         ``answered_while_blocked`` 变成 ``False``（钩子要等那次数据库往返自己超时
         返回才轮得上应答）。
 
@@ -2937,8 +3008,8 @@ class WorkerServiceTests(unittest.TestCase):
         **为什么选线程池而不是异步化**：队列适配器
         （``adapters/postgres_conversation/*``）是同步 psycopg 实现，没有 async
         变体。异步化要么整包重写、要么引入第二套数据库驱动，两者都远超本项范围
-        且不可逆。线程池是最小、可回滚的形态——``_housekeep()`` 本身一个字节都
-        不用改，既有白盒调用方（直接调 ``service._housekeep()`` 的用例）逐字节
+        且不可逆。线程池是最小、可回滚的形态——``QueueHousekeeper.run()`` 本身一个字节都
+        不用改，既有白盒调用方（直接调 ``service._housekeeper.run()`` 的用例）逐字节
         不变，回滚只需把两个调用点的 ``await asyncio.to_thread(...)`` 改回裸调。
 
         **为什么这样搬是线程安全的**（逐条核对，不是"看起来没问题"）：
@@ -2973,8 +3044,8 @@ class WorkerServiceTests(unittest.TestCase):
         from lingxi.core.execution.hooks import ToolGateway
         from lingxi.core.execution.tool_policy import ToolPolicy
 
-        _HOOK_ANSWER_BUDGET_SECONDS = 30.0
-        _BLOCKED_DB_GRACE_SECONDS = 5.0
+        hook_answer_budget_seconds = 30.0
+        blocked_db_grace_seconds = 5.0
 
         entered_database_call = threading.Event()
         hook_answered = threading.Event()
@@ -2986,7 +3057,7 @@ class WorkerServiceTests(unittest.TestCase):
             def reclaim_queued(self, *, max_wait: object) -> list:
                 entered_database_call.set()
                 observed["answered_while_blocked"] = hook_answered.wait(
-                    timeout=_BLOCKED_DB_GRACE_SECONDS
+                    timeout=blocked_db_grace_seconds
                 )
                 return []
 
@@ -3003,14 +3074,12 @@ class WorkerServiceTests(unittest.TestCase):
             queue=queue,
             executor_factory=lambda config, marker: Executor(),
         )
-        gateway = ToolGateway(
-            policy=ToolPolicy(allowed_tools=("mcp__q__read",)), audit=TurnAudit()
-        )
+        gateway = ToolGateway(policy=ToolPolicy(allowed_tools=("mcp__q__read",)), audit=TurnAudit())
 
         async def scenario() -> None:
             housekeeping = asyncio.ensure_future(service.process_once())
             # 等巡检真的走进那次卡住的数据库往返，再发钩子——不用 sleep 猜时序。
-            await asyncio.to_thread(entered_database_call.wait, _BLOCKED_DB_GRACE_SECONDS)
+            await asyncio.to_thread(entered_database_call.wait, blocked_db_grace_seconds)
             started_at = time.monotonic()
             decision = await gateway.on_hook_event(
                 {
@@ -3023,7 +3092,7 @@ class WorkerServiceTests(unittest.TestCase):
             observed["latency"] = time.monotonic() - started_at
             observed["decision"] = decision
             hook_answered.set()
-            await asyncio.wait_for(housekeeping, timeout=_BLOCKED_DB_GRACE_SECONDS * 4)
+            await asyncio.wait_for(housekeeping, timeout=blocked_db_grace_seconds * 4)
 
         asyncio.run(scenario())
 
@@ -3037,7 +3106,7 @@ class WorkerServiceTests(unittest.TestCase):
         self.assertIsNotNone(observed.get("decision"), "钩子必须真的返回了一个判定")
         self.assertLess(
             float(observed["latency"]),  # type: ignore[arg-type]
-            _HOOK_ANSWER_BUDGET_SECONDS,
+            hook_answer_budget_seconds,
             "钩子应答必须落在 30 秒预算之内",
         )
 
@@ -3134,6 +3203,30 @@ class WorkerServiceTests(unittest.TestCase):
                 ".exception()/.result()），否则 asyncio 会在垃圾回收时打一条 "
                 "'Task exception was never retrieved' 噪音日志",
             )
+
+    def test_run_closes_idle_connections_once_after_the_claim_loop_exits(self) -> None:
+        """D-17（#593 元守护审核 P2-b）：``run()`` 的领取循环彻底退出之后必须显式
+        调用一次 ``lingxi.adapters.postgres.close_idle_connections``，不能只靠
+        进程退出时的 ``atexit``。停机信号在 ``run()`` 入口前就已置位，模拟"领取
+        循环一轮都没跑就直接收口"的边界，只把这段收尾接线暴露成断言。
+
+        变异验红：把 ``WorkerService.run()`` 里包住领取循环的 ``try``/``finally``
+        去掉（或删掉 ``finally`` 里那次 ``close_idle_connections`` 调用）重跑本
+        用例，``close_mock.assert_called_once_with()`` 会因为从未被调用而失败。
+        """
+        from unittest.mock import patch
+
+        service = WorkerService(config=worker_config(), queue=FakeWorkerQueue())
+
+        async def scenario() -> None:
+            stop = asyncio.Event()
+            stop.set()
+            await service.run(stop_event=stop)
+
+        with patch("lingxi.apps.worker.service.close_idle_connections") as close_mock:
+            asyncio.run(scenario())
+
+        close_mock.assert_called_once_with()
 
 
 class SemanticProgressTests(unittest.TestCase):
@@ -3551,9 +3644,7 @@ class SemanticProgressTests(unittest.TestCase):
         self.assertIsNone(terminal["error_kind"])
         self.assertEqual(terminal["content"], "结果")
         progress_events = [e for e in queue.events if e["event_type"] == "progress"]
-        self.assertEqual(
-            progress_events, [], "没有任何工具调用/文本事件时不应凭空产生进度更新"
-        )
+        self.assertEqual(progress_events, [], "没有任何工具调用/文本事件时不应凭空产生进度更新")
 
 
 @unittest.skipUnless(POSTGRES_READY, SKIP_DB)
@@ -3729,9 +3820,7 @@ class RealQueueTerminalTests(unittest.TestCase):
         terminal_kind, error_kind, content = self._terminal_event("tsk-c")
         self.assertEqual(terminal_kind, "failed")
         self.assertEqual(error_kind, "worker_version_unavailable")
-        self.assertEqual(
-            content, default_content_catalog().text("worker.version_unavailable").text
-        )
+        self.assertEqual(content, default_content_catalog().text("worker.version_unavailable").text)
         # 没被判定不可用的 canary 版本本身不该凭空出现终态事件。
         self.assertIsNone(self._terminal_event("tsk-s"))
 
@@ -3741,9 +3830,7 @@ class RealQueueTerminalTests(unittest.TestCase):
         self._insert_old_task(
             task_id="tsk-r", conversation_id="cnv-r", status="running", attempts=1
         )
-        self.assertEqual(
-            self.queue.reclaim_stale(older_than=timedelta(seconds=90)), ["tsk-r"]
-        )
+        self.assertEqual(self.queue.reclaim_stale(older_than=timedelta(seconds=90)), ["tsk-r"])
         # 安全重试的第一轮回到 queued，不写终态事件——不是这条路径要收口的对象。
         self.assertIsNone(self._terminal_event("tsk-r"))
         claimed = self.queue.claim(worker_id="worker-2", target_worker_version="stable")
@@ -4013,9 +4100,7 @@ class RealQueueTerminalTests(unittest.TestCase):
             "SELECT content FROM task_delivery_event WHERE event_type='terminal'"
         )
         self.assertIn("/new", terminal)
-        self.assertEqual(
-            self._scalar("SELECT error_kind FROM task"), "context_too_long"
-        )
+        self.assertEqual(self._scalar("SELECT error_kind FROM task"), "context_too_long")
         self.assertEqual(
             self._scalar(
                 "SELECT agent_session_id FROM conversation WHERE id=%s", (conversation_id,)
@@ -4048,9 +4133,7 @@ class RealQueueTerminalTests(unittest.TestCase):
         )
         claimed = self.queue.claim(worker_id="worker-session", target_worker_version="stable")
         self.assertEqual(claimed[0].task_id, outcome.task_id)
-        context = self.queue.task_context(
-            task_id=claimed[0].task_id, worker_id="worker-session"
-        )
+        context = self.queue.task_context(task_id=claimed[0].task_id, worker_id="worker-session")
         assert context is not None
         self.assertEqual(context.reply_to_message_id, "msg-session")
         self.assertTrue(
@@ -4194,7 +4277,7 @@ class SessionTranscriptReclamationTests(unittest.TestCase):
         return WorkerService(
             config=worker_config(**values),
             queue=self._IdleQueue(),
-            session_root=root,
+            session_cleanup=SessionCleanupSettings(root=root),
         )
 
     @staticmethod
@@ -4274,8 +4357,8 @@ class SessionTranscriptReclamationTests(unittest.TestCase):
                     session_reclaim_min_age_seconds=60.0,
                 ),
                 queue=self._IdleQueue(),
-                session_root=root,
                 monotonic=lambda: now,
+                session_cleanup=SessionCleanupSettings(root=root),
             )
             for index in range(4):
                 self._write_transcript(root, index, 1024)
@@ -4303,7 +4386,7 @@ class SessionTranscriptReclamationTests(unittest.TestCase):
         service = WorkerService(
             config=worker_config(session_disk_budget_bytes=1),
             queue=self._IdleQueue(),
-            session_root=None,
+            session_cleanup=SessionCleanupSettings(root=None),
         )
 
         asyncio.run(service.process_once())  # 不抛异常即通过
@@ -4314,7 +4397,7 @@ class SessionCleanupPipelineIntegrationTests(unittest.TestCase):
     """Issue #153：从"数据库里排了一条待清理"到"物理文件真的被删、行被标记完成"
     的完整链路——真库 + 真实临时目录，不在任何一段打桩。三个触发点各自排队的
     正确性已在 ``tests/test_delivery_outbox.py`` 的 ``AgentSessionCleanupQueueTests``
-    覆盖，本文件只覆盖 ``WorkerService._cleanup_agent_sessions`` 这一段消费。
+    覆盖，本文件只覆盖 ``QueueHousekeeper._cleanup_agent_sessions``（经 ``WorkerService._housekeeper``）这一段消费。
     """
 
     @classmethod
@@ -4335,7 +4418,9 @@ class SessionCleanupPipelineIntegrationTests(unittest.TestCase):
                        VALUES ('usr-90','ou-90','u-90','un-90','张三','数据部','tk-90','active')"""
                 )
 
-    def _queue_cleanup(self, *, cleanup_id: str, agent_session_id: str, reason: str = "new_command") -> None:
+    def _queue_cleanup(
+        self, *, cleanup_id: str, agent_session_id: str, reason: str = "new_command"
+    ) -> None:
         with connect(DSN) as connection:
             with connection.transaction():
                 connection.execute(
@@ -4349,14 +4434,16 @@ class SessionCleanupPipelineIntegrationTests(unittest.TestCase):
             session_root = Path(tmp)
             jsonl = session_root / "01J00000000000000000000SESS.jsonl"
             jsonl.write_text("{}", encoding="utf-8")
-            self._queue_cleanup(cleanup_id="asc-int-1", agent_session_id="01J00000000000000000000SESS")
+            self._queue_cleanup(
+                cleanup_id="asc-int-1", agent_session_id="01J00000000000000000000SESS"
+            )
 
             service = WorkerService(
                 config=worker_config(),
                 queue=self.queue,
-                session_root=session_root,
+                session_cleanup=SessionCleanupSettings(root=session_root),
             )
-            service._cleanup_agent_sessions()
+            service._housekeeper._cleanup_agent_sessions()
 
             self.assertFalse(jsonl.exists())
             with connect(DSN) as connection:
@@ -4370,14 +4457,16 @@ class SessionCleanupPipelineIntegrationTests(unittest.TestCase):
         标记完成，不能让一条永远匹配不到文件的记录卡住队列。"""
 
         with tempfile.TemporaryDirectory() as tmp:
-            self._queue_cleanup(cleanup_id="asc-int-2", agent_session_id="01J00000000000000000NEVER")
+            self._queue_cleanup(
+                cleanup_id="asc-int-2", agent_session_id="01J00000000000000000NEVER"
+            )
 
             service = WorkerService(
                 config=worker_config(),
                 queue=self.queue,
-                session_root=Path(tmp),
+                session_cleanup=SessionCleanupSettings(root=Path(tmp)),
             )
-            service._cleanup_agent_sessions()
+            service._housekeeper._cleanup_agent_sessions()
 
             with connect(DSN) as connection:
                 done = connection.execute(
@@ -4390,8 +4479,12 @@ class SessionCleanupPipelineIntegrationTests(unittest.TestCase):
 
         self._queue_cleanup(cleanup_id="asc-int-3", agent_session_id="01J00000000000000000SKIP")
 
-        service = WorkerService(config=worker_config(), queue=self.queue, session_root=None)
-        service._cleanup_agent_sessions()
+        service = WorkerService(
+            config=worker_config(),
+            queue=self.queue,
+            session_cleanup=SessionCleanupSettings(root=None),
+        )
+        service._housekeeper._cleanup_agent_sessions()
 
         with connect(DSN) as connection:
             row = connection.execute(
@@ -4417,17 +4510,17 @@ class SessionCleanupPipelineIntegrationTests(unittest.TestCase):
             self.assertFalse(missing_root.exists())
 
             service = WorkerService(
-                config=worker_config(), queue=self.queue, session_root=missing_root
+                config=worker_config(),
+                queue=self.queue,
+                session_cleanup=SessionCleanupSettings(root=missing_root),
             )
-            service._cleanup_agent_sessions()
+            service._housekeeper._cleanup_agent_sessions()
 
         with connect(DSN) as connection:
             row = connection.execute(
                 "SELECT claimed_at, done_at FROM agent_session_cleanup WHERE id='asc-int-5'"
             ).fetchone()
-        self.assertIsNotNone(
-            row[0], "这一条应该已经被认领——不该半途放弃到连 claimed_at 都不写"
-        )
+        self.assertIsNotNone(row[0], "这一条应该已经被认领——不该半途放弃到连 claimed_at 都不写")
         self.assertIsNone(
             row[1],
             "根目录不存在时不能标记完成：事后把配置改对也补不回一条已经被"
@@ -4442,12 +4535,14 @@ class SessionCleanupPipelineIntegrationTests(unittest.TestCase):
             session_root = Path(tmp)
             jsonl = session_root / "01J00000000000000000PROCE.jsonl"
             jsonl.write_text("{}", encoding="utf-8")
-            self._queue_cleanup(cleanup_id="asc-int-4", agent_session_id="01J00000000000000000PROCE")
+            self._queue_cleanup(
+                cleanup_id="asc-int-4", agent_session_id="01J00000000000000000PROCE"
+            )
 
             service = WorkerService(
                 config=worker_config(),
                 queue=self.queue,
-                session_root=session_root,
+                session_cleanup=SessionCleanupSettings(root=session_root),
             )
             asyncio.run(service.process_once())
 
@@ -4478,7 +4573,7 @@ class SystemPromptFileTests(unittest.TestCase):
             config=worker_config(system_prompt_file=prompt_path),
             queue=queue,
             executor_factory=lambda config, marker: Executor(config),
-            on_terminal_outcome=sink,
+            observers=WorkerObservers(on_terminal_outcome=sink),
         )
         return service, queue, captured
 
@@ -4607,7 +4702,7 @@ class SystemPromptFileTests(unittest.TestCase):
                 config=worker_config(system_prompt_file=path),
                 queue=queue,
                 executor_factory=lambda config, marker: FailingExecutor(config),
-                on_terminal_outcome=sink,
+                observers=WorkerObservers(on_terminal_outcome=sink),
             )
             asyncio.run(service.process_once())
 
@@ -4656,7 +4751,9 @@ class ContentCaptureWiringTests(unittest.TestCase):
     touches_the_executor_capture_hook` 就是 V-采集-01/02 的变异验红锚点）。
     """
 
-    def _sample_record(self, *, task_id: str = "tsk-1", worker_id: str = "worker-test") -> ContentCaptureRecord:
+    def _sample_record(
+        self, *, task_id: str = "tsk-1", worker_id: str = "worker-test"
+    ) -> ContentCaptureRecord:
         return ContentCaptureRecord(
             task_id=task_id,
             worker_id=worker_id,
@@ -4720,7 +4817,7 @@ class ContentCaptureWiringTests(unittest.TestCase):
             config=worker_config(),
             queue=queue,
             executor_factory=lambda config, marker: Executor(),
-            content_capture_writer=received.append,
+            observers=WorkerObservers(content_capture_writer=received.append),
         )
         asyncio.run(service.process_once())
 
@@ -4755,7 +4852,7 @@ class ContentCaptureWiringTests(unittest.TestCase):
             config=worker_config(),
             queue=queue,
             executor_factory=lambda config, marker: Executor(),
-            content_capture_writer=received.append,
+            observers=WorkerObservers(content_capture_writer=received.append),
         )
         asyncio.run(service.process_once())
 
@@ -4785,7 +4882,7 @@ class ContentCaptureWiringTests(unittest.TestCase):
             config=worker_config(),
             queue=queue,
             executor_factory=lambda config, marker: Executor(),
-            content_capture_writer=failing_writer,
+            observers=WorkerObservers(content_capture_writer=failing_writer),
         )
         asyncio.run(service.process_once())  # 不得向上抛出 RuntimeError
 
@@ -4813,7 +4910,7 @@ class ContentCaptureWiringTests(unittest.TestCase):
             config=worker_config(),
             queue=queue,
             executor_factory=lambda config, marker: FailingExecutor(),
-            content_capture_writer=received.append,
+            observers=WorkerObservers(content_capture_writer=received.append),
         )
         asyncio.run(service.process_once())
 
@@ -4849,7 +4946,7 @@ class ContentCaptureWiringTests(unittest.TestCase):
                 config=worker_config(user_env_root=empty_root),
                 queue=queue,
                 executor_factory=lambda config, marker: Executor(),
-                content_capture_writer=received.append,
+                observers=WorkerObservers(content_capture_writer=received.append),
             )
             asyncio.run(service.process_once())
 
@@ -4909,7 +5006,7 @@ class YearGroundingSuspectAlertTests(unittest.TestCase):
         *,
         on_year_grounding_suspect: Any = None,
         content_capture_writer: Any = None,
-    ) -> "FakeWorkerQueue":
+    ) -> FakeWorkerQueue:
         queue = FakeWorkerQueue()
 
         class Executor:
@@ -4926,10 +5023,12 @@ class YearGroundingSuspectAlertTests(unittest.TestCase):
             config=worker_config(),
             queue=queue,
             executor_factory=lambda config, marker: Executor(),
-            content_capture_writer=(
-                content_capture_writer if content_capture_writer is not None else (lambda _r: None)
+            observers=WorkerObservers(
+                content_capture_writer=content_capture_writer
+                if content_capture_writer is not None
+                else (lambda _r: None),
+                on_year_grounding_suspect=on_year_grounding_suspect,
             ),
-            on_year_grounding_suspect=on_year_grounding_suspect,
         )
         asyncio.run(service.process_once())
         return queue
@@ -5013,7 +5112,9 @@ class YearGroundingSuspectAlertTests(unittest.TestCase):
             start_date="2025-01-01",
             end_date="2025-08-25",
         )
-        with patch("lingxi.apps.worker.service.detect_year_grounding_suspect") as mock_detect:
+        with patch(
+            "lingxi.apps.worker.content_capture.detect_year_grounding_suspect"
+        ) as mock_detect:
             queue = self._run_with_record(record)  # 不传 on_year_grounding_suspect
 
         mock_detect.assert_not_called()
@@ -5060,7 +5161,7 @@ class YearGroundingSuspectAlertTests(unittest.TestCase):
         )
         received: list[Mapping[str, object]] = []
         with patch(
-            "lingxi.apps.worker.service.detect_year_grounding_suspect",
+            "lingxi.apps.worker.content_capture.detect_year_grounding_suspect",
             side_effect=RuntimeError("模拟纯判定函数异常"),
         ):
             queue = self._run_with_record(record, on_year_grounding_suspect=received.append)
@@ -5123,7 +5224,7 @@ class TerminalFailureSignatureTests(unittest.TestCase):
             config=worker_config(),
             queue=queue,
             executor_factory=lambda config, marker: executor_class(),
-            on_terminal_outcome=sink,
+            observers=WorkerObservers(on_terminal_outcome=sink),
         )
         asyncio.run(service.process_once())
         return queue, sink
@@ -5167,9 +5268,7 @@ class TerminalFailureSignatureTests(unittest.TestCase):
                 )
                 signatures.append(signature)
 
-        self.assertEqual(
-            len(set(signatures)), 3, f"三种底层异常必须互相可区分，实际={signatures}"
-        )
+        self.assertEqual(len(set(signatures)), 3, f"三种底层异常必须互相可区分，实际={signatures}")
 
     def test_the_signature_is_a_stable_digest_not_a_bare_class_name(self) -> None:
         """签名必须是固定类别加不可逆摘要，而不是裸类名或模块限定名；后者
@@ -5302,7 +5401,7 @@ class TerminalFailureSignatureTests(unittest.TestCase):
             config=worker_config(),
             queue=queue,
             executor_factory=lambda config, marker: NeverRuns(),
-            on_terminal_outcome=sink,
+            observers=WorkerObservers(on_terminal_outcome=sink),
         )
         asyncio.run(service.process_once())
         self.assertEqual(sink.calls[0]["terminal_kind"], "stopped")
@@ -5314,7 +5413,11 @@ class TerminalFailureSignatureTests(unittest.TestCase):
                     "closed": True,
                     "final_text": "被拦下的正文",
                     "session_id": "s",
-                    "output_safety": {"blocked": True, "withheld": True, "reasons": ("forbidden_value",)},
+                    "output_safety": {
+                        "blocked": True,
+                        "withheld": True,
+                        "reasons": ("forbidden_value",),
+                    },
                     "user_result": "redacted_withheld",
                 },
                 "failure": None,
@@ -5399,9 +5502,7 @@ class TerminalFailureSignatureTests(unittest.TestCase):
         self.assertEqual(sanitize_failure_signature("A" * 300), UNKNOWN_FAILURE_SIGNATURE)
         self.assertEqual(sanitize_failure_signature("中文异常"), UNKNOWN_FAILURE_SIGNATURE)
         self.assertEqual(sanitize_failure_signature(""), UNKNOWN_FAILURE_SIGNATURE)
-        self.assertEqual(
-            sanitize_failure_signature("mcp.query.http_502"), "mcp.query.http_502"
-        )
+        self.assertEqual(sanitize_failure_signature("mcp.query.http_502"), "mcp.query.http_502")
 
     def test_a_dynamic_type_name_never_reaches_the_terminal_signature(self) -> None:
         """审核复现：SDK 动态造出的 ``ou_secret_user`` 类名不能原样进入
@@ -5424,7 +5525,9 @@ class TerminalFailureSignatureTests(unittest.TestCase):
         self.assertNotIn("lpo_", signature)
         self.assertNotIn("pac_", signature)
         self.assertNotIn("@", signature)
-        self.assertRegex(signature, r"^exception\.(builtin|database|http|sdk|runtime|external)\.[0-9a-f]{40}$")
+        self.assertRegex(
+            signature, r"^exception\.(builtin|database|http|sdk|runtime|external)\.[0-9a-f]{40}$"
+        )
         self.assertEqual(signature, exception_failure_signature(dynamic_type("different text")))
 
         queue, sink = self._run(self._raising_executor(error))
@@ -5455,7 +5558,8 @@ class TerminalFailureSignatureTests(unittest.TestCase):
             "from lingxi.apps.worker.report_extraction import exception_failure_signature; "
             "E = type('RuntimeDatabaseError', (Exception,), "
             "{'__module__': 'psycopg.errors'}); "
-            "print(exception_failure_signature(E('ou_secret_user=ou_x')))")
+            "print(exception_failure_signature(E('ou_secret_user=ou_x')))"
+        )
         env = os.environ.copy()
         env["PYTHONPATH"] = str(Path(__file__).resolve().parents[1] / "src")
         result = subprocess.run(

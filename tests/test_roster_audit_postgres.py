@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import os
 import unittest
-from datetime import date, datetime, timezone
+from datetime import UTC, date, datetime
 
 from postgres_schema import ensure_production_schema, psycopg_available
 
@@ -44,7 +44,14 @@ UNPROVISIONED_NAME = "未开通的人"
 UNPROVISIONED_EMPLOYEE_NO = "E7777"
 UNPROVISIONED_EMAIL = "not.provisioned@example.com"
 
-OTHER_PROVISIONING_STATES = ("guest", "matching", "manual_review", "provisioning", "mcp_syncing", "aborted")
+OTHER_PROVISIONING_STATES = (
+    "guest",
+    "matching",
+    "manual_review",
+    "provisioning",
+    "mcp_syncing",
+    "aborted",
+)
 EXCLUDED_ACCOUNT_STATES = ("deleting", "deleted")
 
 
@@ -159,7 +166,9 @@ class RosterAuditPostgresTestCase(unittest.TestCase):
         """全部 app_user 行的存档三字段快照，用于逐字段对比。"""
 
         with connect(self._dsn) as connection, connection.cursor() as cursor:
-            cursor.execute(f"SELECT id, {', '.join(ARCHIVED_FIELDS_SQL)}, updated_at FROM app_user ORDER BY id")
+            cursor.execute(
+                f"SELECT id, {', '.join(ARCHIVED_FIELDS_SQL)}, updated_at FROM app_user ORDER BY id"
+            )
             return {str(row[0]): tuple(row[1:]) for row in cursor.fetchall()}
 
     def every_text_value_in_the_database(self) -> str:
@@ -198,7 +207,7 @@ class RosterAuditPostgresTestCase(unittest.TestCase):
             audit=audit,
             chat_id="oc_fake_admin_group_for_tests",
             clock=lambda: datetime(
-                report_date.year, report_date.month, report_date.day, 9, 0, tzinfo=timezone.utc
+                report_date.year, report_date.month, report_date.day, 9, 0, tzinfo=UTC
             ),
         )
         return duty.run_once(), sender, audit
@@ -225,7 +234,9 @@ class ComparisonSetIsActiveOnlyTest(RosterAuditPostgresTestCase):
         baseline = PostgresRosterBaselineReader(self._dsn).load_active_baseline()
 
         self.assertEqual([person.app_user_id for person in baseline], [active])
-        self.assertEqual(len(baseline), 1, f"六种非 active 状态都不得进比对集：{OTHER_PROVISIONING_STATES}")
+        self.assertEqual(
+            len(baseline), 1, f"六种非 active 状态都不得进比对集：{OTHER_PROVISIONING_STATES}"
+        )
 
     def test_an_unprovisioned_person_never_reaches_the_report_audit_or_logs(self) -> None:
         """V-花名册-12：未开通人员的任何字段值都不出现在输出、日报、审计与日志里。
@@ -234,7 +245,9 @@ class ComparisonSetIsActiveOnlyTest(RosterAuditPostgresTestCase):
         行数照样是对的。
         """
 
-        self.insert_user(app_user_id="usr_active", personnel_id="ou_p_active", display_name="存档姓名")
+        self.insert_user(
+            app_user_id="usr_active", personnel_id="ou_p_active", display_name="存档姓名"
+        )
         self.insert_user(
             app_user_id="usr_guest",
             personnel_id="ou_p_guest",
@@ -244,7 +257,12 @@ class ComparisonSetIsActiveOnlyTest(RosterAuditPostgresTestCase):
             provisioning_state="guest",
         )
         rows = [
-            {"personnel_id": "ou_p_active", "name": "改过的姓名", "employee_no": "E0000", "email": "archived@example.com"},
+            {
+                "personnel_id": "ou_p_active",
+                "name": "改过的姓名",
+                "employee_no": "E0000",
+                "email": "archived@example.com",
+            },
             # 花名册里也有那位 guest，且资料与库里不同——比对集里没有他，所以不该被发现。
             {
                 "personnel_id": "ou_p_guest",
@@ -296,7 +314,9 @@ class DeletedAccountsAreExcludedTest(RosterAuditPostgresTestCase):
         )
         # `deleted`＝删除编排完成后的 tombstone：飞书标识、姓名、部门、租户全部清空
         # （数据库设计 :144），只剩下一个映射不回人的内部 ID。
-        self.insert_user(app_user_id="usr_deleted", personnel_id="", account_state="deleted", tombstone=True)
+        self.insert_user(
+            app_user_id="usr_deleted", personnel_id="", account_state="deleted", tombstone=True
+        )
 
         baseline = PostgresRosterBaselineReader(self._dsn).load_active_baseline()
         report, sender, _audit = self.run_full_round(
@@ -317,7 +337,9 @@ class DeletedAccountsAreExcludedTest(RosterAuditPostgresTestCase):
     def test_a_suspended_but_not_deleted_user_stays_in_the_comparison_set(self) -> None:
         """`suspended` 不在排除之列：停用不是删除，他的资料仍然该被盯着。"""
 
-        self.insert_user(app_user_id="usr_suspended", personnel_id="ou_p_s", account_state="suspended")
+        self.insert_user(
+            app_user_id="usr_suspended", personnel_id="ou_p_s", account_state="suspended"
+        )
 
         baseline = PostgresRosterBaselineReader(self._dsn).load_active_baseline()
 
@@ -331,7 +353,9 @@ class ArchiveIsNeverWrittenBackTest(RosterAuditPostgresTestCase):
     下一次匹配时改变匹配结果，而日报存在的意义恰恰是让人来判断这次变化该不该被接受。
     """
 
-    def test_a_full_round_with_all_three_fields_changed_leaves_app_user_byte_identical(self) -> None:
+    def test_a_full_round_with_all_three_fields_changed_leaves_app_user_byte_identical(
+        self,
+    ) -> None:
         self.insert_user(
             app_user_id="usr_all_changed",
             personnel_id="ou_p_all",
@@ -374,7 +398,13 @@ class ArchiveIsNeverWrittenBackTest(RosterAuditPostgresTestCase):
         import ast
         import pathlib
 
-        path = pathlib.Path(__file__).parents[1] / "src" / "lingxi" / "adapters" / "postgres_roster_audit.py"
+        path = (
+            pathlib.Path(__file__).parents[1]
+            / "src"
+            / "lingxi"
+            / "adapters"
+            / "postgres_roster_audit.py"
+        )
         tree = ast.parse(path.read_text(encoding="utf-8"))
 
         docstrings = {
@@ -389,7 +419,9 @@ class ArchiveIsNeverWrittenBackTest(RosterAuditPostgresTestCase):
         literals = [
             node.value.upper()
             for node in ast.walk(tree)
-            if isinstance(node, ast.Constant) and isinstance(node.value, str) and id(node) not in docstrings
+            if isinstance(node, ast.Constant)
+            and isinstance(node.value, str)
+            and id(node) not in docstrings
         ]
 
         # 反向自检：确实扫到了那条 SELECT，不是因为一个常量都没收集到才绿的。
@@ -409,7 +441,9 @@ class AccountStateIsNeverPersistedTest(RosterAuditPostgresTestCase):
     整轮跑完之后库里也找不到。
     """
 
-    def test_a_sentinel_account_state_carried_on_a_roster_row_never_reaches_the_database(self) -> None:
+    def test_a_sentinel_account_state_carried_on_a_roster_row_never_reaches_the_database(
+        self,
+    ) -> None:
         self.insert_user(app_user_id="usr_sentinel", personnel_id="ou_p_sentinel")
         rows = [
             {
@@ -440,7 +474,9 @@ class AccountStateIsNeverPersistedTest(RosterAuditPostgresTestCase):
     def test_the_sentinel_scan_can_actually_see_database_content(self) -> None:
         """反向自检：扫描函数真的能看见库里的文本，不是恒返回空串才绿的。"""
 
-        self.insert_user(app_user_id="usr_visible", personnel_id="ou_p_visible", display_name="可见的存档姓名")
+        self.insert_user(
+            app_user_id="usr_visible", personnel_id="ou_p_visible", display_name="可见的存档姓名"
+        )
 
         self.assertIn("可见的存档姓名", self.every_text_value_in_the_database())
 
@@ -540,13 +576,43 @@ class SyntheticEndToEndTest(RosterAuditPostgresTestCase):
 
     def _rows(self) -> list[dict[str, object]]:
         return [
-            {"personnel_id": "ou_p_1", "name": "花名册改名", "employee_no": "E1001", "email": "changed.name@example.com"},
-            {"personnel_id": "ou_p_2", "name": "改邮箱者存档姓名", "employee_no": "E1002", "email": "roster.changed@example.com"},
-            {"personnel_id": "ou_p_3", "name": "转交新人", "employee_no": "E1003", "email": "handover.new@example.com"},
+            {
+                "personnel_id": "ou_p_1",
+                "name": "花名册改名",
+                "employee_no": "E1001",
+                "email": "changed.name@example.com",
+            },
+            {
+                "personnel_id": "ou_p_2",
+                "name": "改邮箱者存档姓名",
+                "employee_no": "E1002",
+                "email": "roster.changed@example.com",
+            },
+            {
+                "personnel_id": "ou_p_3",
+                "name": "转交新人",
+                "employee_no": "E1003",
+                "email": "handover.new@example.com",
+            },
             # ou_p_4 在花名册里查无此人。
-            {"personnel_id": "ou_p_5", "name": "缺邮箱者存档姓名", "employee_no": "E1005", "email": "roster.has.email@example.com"},
-            {"personnel_id": "ou_p_6", "name": "无变化者存档姓名", "employee_no": "E1006", "email": "unchanged@example.com"},
-            {"personnel_id": "ou_p_7", "name": "花名册里的未开通者", "employee_no": "E9999", "email": "guest.roster@example.com"},
+            {
+                "personnel_id": "ou_p_5",
+                "name": "缺邮箱者存档姓名",
+                "employee_no": "E1005",
+                "email": "roster.has.email@example.com",
+            },
+            {
+                "personnel_id": "ou_p_6",
+                "name": "无变化者存档姓名",
+                "employee_no": "E1006",
+                "email": "unchanged@example.com",
+            },
+            {
+                "personnel_id": "ou_p_7",
+                "name": "花名册里的未开通者",
+                "employee_no": "E9999",
+                "email": "guest.roster@example.com",
+            },
         ]
 
     def test_the_full_round_reports_exactly_the_four_expected_entries(self) -> None:
@@ -558,7 +624,10 @@ class SyntheticEndToEndTest(RosterAuditPostgresTestCase):
         # ---- 条目构成 ----
         self.assertEqual(len(report.entries), 4, "日报恰含 4 条")
         by_user = {entry.app_user_id: entry for entry in report.entries}
-        self.assertEqual(set(by_user), {"usr_e2e_1_name", "usr_e2e_2_mail", "usr_e2e_3_handover", "usr_e2e_4_vanished"})
+        self.assertEqual(
+            set(by_user),
+            {"usr_e2e_1_name", "usr_e2e_2_mail", "usr_e2e_3_handover", "usr_e2e_4_vanished"},
+        )
         self.assertEqual(by_user["usr_e2e_1_name"].changed_fields, ("display_name",))
         self.assertEqual(by_user["usr_e2e_2_mail"].changed_fields, ("email",))
         self.assertEqual(report.handover_count, 1, "转交恰 1")
@@ -612,7 +681,14 @@ class SyntheticEndToEndTest(RosterAuditPostgresTestCase):
         self.insert_user(app_user_id="usr_same", personnel_id="ou_p_same")
 
         report, sender, audit = self.run_full_round(
-            [{"personnel_id": "ou_p_same", "name": "存档姓名", "employee_no": "E0000", "email": "archived@example.com"}]
+            [
+                {
+                    "personnel_id": "ou_p_same",
+                    "name": "存档姓名",
+                    "employee_no": "E0000",
+                    "email": "archived@example.com",
+                }
+            ]
         )
 
         self.assertTrue(report.is_empty)

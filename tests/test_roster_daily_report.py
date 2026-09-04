@@ -15,9 +15,8 @@ V-花名册-48。
 from __future__ import annotations
 
 import unittest
-from datetime import date, datetime, timezone
+from datetime import UTC, date, datetime
 
-from lingxi.core.ids import is_ulid
 from lingxi.core.identity.identifiers import redact_identifier
 from lingxi.core.identity.roster_audit import ArchivedIdentity, RosterAuditReport, compare_roster
 from lingxi.core.identity.roster_report import HANDOVER_MARK, render_daily_report
@@ -25,6 +24,7 @@ from lingxi.core.identity.roster_snapshot import (
     DEFAULT_SNAPSHOT_STALE_AFTER,
     RosterSnapshotStatus,
 )
+from lingxi.core.ids import is_ulid
 
 REPORT_DATE = date(2026, 8, 6)
 
@@ -113,7 +113,7 @@ def baseline() -> list[ArchivedIdentity]:
 
 
 STALE_AFTER_SECONDS = DEFAULT_SNAPSHOT_STALE_AFTER.total_seconds()
-SNAPSHOT_MOMENT = datetime(2026, 8, 6, 1, 30, tzinfo=timezone.utc)
+SNAPSHOT_MOMENT = datetime(2026, 8, 6, 1, 30, tzinfo=UTC)
 
 
 def fresh_snapshot() -> RosterSnapshotStatus:
@@ -193,12 +193,16 @@ class ReportShapeTest(unittest.TestCase):
         self.assertIn("工号 E1003", removed_line)
         self.assertNotIn("变化字段", removed_line)
 
-    def test_an_archived_field_that_was_never_filled_in_renders_as_an_explicit_placeholder(self) -> None:
+    def test_an_archived_field_that_was_never_filled_in_renders_as_an_explicit_placeholder(
+        self,
+    ) -> None:
         """建档时就没留工号的用户确实存在。空白渲染成占位符而不是空——一行
         `姓名 张三｜工号 ` 会被读成渲染坏了，而"存档为空"本身是要看到的事实。"""
 
         index = identities()
-        index[FIRST_USER] = ArchivedIdentity(FIRST_USER, FIRST_PERSON, "张三", "", "zhangsan@example.com")
+        index[FIRST_USER] = ArchivedIdentity(
+            FIRST_USER, FIRST_PERSON, "张三", "", "zhangsan@example.com"
+        )
 
         body = render(identities=index)
 
@@ -280,7 +284,9 @@ class IdentifierIsActionableTest(unittest.TestCase):
         """用例前提自检。"""
 
         for identifier in (FIRST_USER, SECOND_USER, THIRD_USER):
-            self.assertTrue(is_ulid(identifier.removeprefix("usr_")), f"{identifier} 必须是合法 ULID")
+            self.assertTrue(
+                is_ulid(identifier.removeprefix("usr_")), f"{identifier} 必须是合法 ULID"
+            )
         self.assertEqual(FIRST_PERSON[:6], SECOND_PERSON[:6])
         self.assertNotEqual(FIRST_PERSON, SECOND_PERSON)
 

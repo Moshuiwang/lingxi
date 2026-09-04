@@ -1,4 +1,4 @@
-"""投递事件的数据形状与终态解析规则（Issue #151）。
+"""投递事件的数据形状与终态解析规则。
 
 数据库设计[「问数结果投递事件与会话保留 Outbox」]
 (../../../../docs/技术设计/数据库设计.md#问数结果投递事件与会话保留-outbox) 冻结的语义在
@@ -22,21 +22,10 @@ class DeliveryEventType(str, Enum):
 
 
 #: 只有这几类事件允许携带正文；其余事件类型的 ``content`` 必须是 ``None``
-#: （由迁移 0059/0075 的 CHECK 在数据库层再确认一次，这里的常量供调用方在写入前
-#: 自查——真正调用它自查的写入方见 ``adapters/postgres_conversation/
-#: _queue_outbox.py::append_delivery_event`` 与 ``apps/worker/service.py::
-#: WorkerService._append_event``；Issue #328 opus 审查 R1 之前这个常量定义了但
-#: 零调用方，写入方从未真正用它自查过）。
-#:
-#: ``PROGRESS``（迁移 0075 新增；Issue #407 增粒度）：语义化进度动作码
-#: （Issue #321 方向 C）——``"querying:N"``、``"querying:N:<已知子步骤>"``、
-#: ``"composing"``、``"working"`` 这几种固定形状之一，是 worker 侧内部生成的
-#: 短令牌，绝不是用户输入或模型输出的自由文本，因此可以在这里放行、同时受
-#: ``PROGRESS_CONTENT_MAX_LENGTH`` 这条长度契约约束（迁移 0075 的 CHECK
-#: ``char_length(content) <= 32`` 是同一条契约的数据库层落地）。子步骤名只
-#: 来自 ``card_stream.KNOWN_QUERY_STEPS`` 这份白名单（最长
-#: ``"search_dimension"`` 16 字节），`"querying:" + 计数 + ":" + 子步骤名` 的
-#: 最坏长度在计数达到 6 位数之前都不会触顶——远超任何真实任务的问数调用次数。
+#: （数据库层的 CHECK 再确认一次，这里的常量供调用方写入前自查）。``PROGRESS``
+#: 携带的是语义化进度动作码（worker 内部生成的短令牌，不是用户输入或模型
+#: 输出的自由文本），同时受 ``PROGRESS_CONTENT_MAX_LENGTH`` 长度契约约束；
+#: 子步骤名只来自 ``card_stream.KNOWN_QUERY_STEPS`` 这份白名单。
 CONTENT_BEARING_EVENT_TYPES = frozenset(
     {
         DeliveryEventType.PROGRESS,
@@ -45,14 +34,11 @@ CONTENT_BEARING_EVENT_TYPES = frozenset(
     }
 )
 
-#: ``progress`` 事件 ``content`` 的长度上限（迁移 0075 的 CHECK 同步约束）。
-#: 已知形状（`card_stream.encode_progress_action` 的输出）：``"composing"``
-#: （9 字节）、``"working"``（7 字节）、``"querying:" + 计数``、
-#: ``"querying:" + 计数 + ":" + 已知子步骤名``（Issue #407，最长子步骤名
-#: ``"search_dimension"`` 16 字节，实测两位数计数时 28 字节）。32 留了充裕
-#: 余量，不是精确贴着已知最长值算出来的。只约束 ``PROGRESS``——
-#: ``SAFELY_RELEASABLE_ANSWER``/``TERMINAL`` 携带的是用户可见的问数结果正文，
-#: 篇幅由业务内容决定，不适用这条上限。
+#: ``progress`` 事件 ``content`` 的长度上限（数据库层的 CHECK 同步约束）。
+#: 已知形状（`card_stream.encode_progress_action` 的输出）最长约 28 字节，
+#: 32 留了充裕余量，不是精确贴着已知最长值算出来的。只约束 ``PROGRESS``——
+#: ``SAFELY_RELEASABLE_ANSWER``/``TERMINAL`` 携带的是用户可见的问数结果
+#: 正文，篇幅由业务内容决定，不适用这条上限。
 PROGRESS_CONTENT_MAX_LENGTH = 32
 
 
@@ -63,12 +49,9 @@ def assert_content_allowed(event_type: DeliveryEventType, content: str | None) -
     是最终防线（写入方即使跳过这个函数，数据库仍会用 ``CheckViolation`` 拒绝
     违规写入），这里让调用方在真正写库前就能拿到一个可读的 ``ValueError``，
     不必等 CheckViolation 从数据库连接弹回来才发现，也不会被调用方常见的
-    "写库失败只记日志、不中断任务"这类宽泛 ``except Exception`` 悄悄吞掉却查
-    不出具体是哪条规则触发（Issue #328 opus 审查 R1 的真实事故：progress 事件
-    的 content 撞了当时还没放宽的 CHECK，100% 失败，但只留下一条看不出根因的
-    ``logger.error``，真实环境卡片完全不动）。
+    "写库失败只记日志、不中断任务"这类宽泛 ``except Exception`` 悄悄吞掉却
+    查不出具体是哪条规则触发。
     """
-
     if content is None:
         return
     if event_type not in CONTENT_BEARING_EVENT_TYPES:
@@ -111,7 +94,9 @@ _TERMINAL_TO_OUTCOME: dict[TerminalKind, ResolvedOutcome] = {
     TerminalKind.SUCCESS: ResolvedOutcome(status="succeeded", error_kind=None),
     TerminalKind.FAILED: ResolvedOutcome(status="failed", error_kind="session_failed"),
     TerminalKind.STOPPED: ResolvedOutcome(status="stopped", error_kind="stopped"),
-    TerminalKind.REDACTED_WITHHELD: ResolvedOutcome(status="failed", error_kind="redacted_withheld"),
+    TerminalKind.REDACTED_WITHHELD: ResolvedOutcome(
+        status="failed", error_kind="redacted_withheld"
+    ),
     TerminalKind.TIMEOUT: ResolvedOutcome(status="failed", error_kind="running_timeout"),
 }
 
@@ -128,7 +113,6 @@ def resolve_delivered_outcome(*, terminal_kind: str, error_kind: str | None) -> 
     ``terminal_kind`` 的默认分类。业务结论完全来自写终态事件那一刻的记录，
     投递是否成功、多久之后才确认，都不改变这里算出的结果（`V-投递-04`）。
     """
-
     try:
         kind = TerminalKind(terminal_kind)
     except ValueError as error:

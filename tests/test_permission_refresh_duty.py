@@ -25,11 +25,11 @@ from __future__ import annotations
 
 import ast
 import importlib.util
-import pathlib
 import json
+import pathlib
 import threading
 import unittest
-from datetime import date, datetime, timedelta, timezone
+from datetime import UTC, date, datetime, timedelta, timezone
 
 from lingxi.adapters.postgres_galaxy_snapshot import GalaxyPermissionSnapshot
 from lingxi.adapters.postgres_permission_publish import PERMISSION_REFRESH_BASELINE_SQL
@@ -53,8 +53,8 @@ from lingxi.apps.scheduler.permission_refresh import (
     SKIP_NO_GALAXY_BATCH,
     SKIP_NO_PUBLISHED_ROW,
     SKIP_STALE_SNAPSHOT,
-    TRIGGER_GRANT,
     TRIGGER_REVOKE,
+    PermissionRefreshSources,
 )
 from lingxi.core.identity.roster_audit import ArchivedIdentity
 from lingxi.core.identity.roster_snapshot import StoredSnapshotFacts
@@ -64,7 +64,7 @@ from lingxi.core.permission.merge_sources import (
     REASON_LOCAL_OVERRIDE_READ_FAILED,
     REASON_SUPPRESS_INAPPLICABLE_WILDCARD,
 )
-from lingxi.core.permission.publish import PermissionGrantBlockedByAccountState
+from lingxi.core.permission.publish import PermissionGrantBlockedByAccountStateError
 from lingxi.core.permission.publish_row import (
     ADMIN_FULL_ACCESS_FUNCTION,
     REVOKED_PERMISSIONS_TEXT,
@@ -108,7 +108,7 @@ def duty_code() -> str:
     return code_without_docstrings(DUTY_SOURCE)
 
 
-TODAY = datetime(2026, 8, 17, 3, 0, tzinfo=timezone.utc)
+TODAY = datetime(2026, 8, 17, 3, 0, tzinfo=UTC)
 
 # 资料值：报告、审计与日志里一个都不许出现。
 NAME_ONE = "化名甲"
@@ -264,19 +264,24 @@ class FakeLegacyAllScope:
     """「全部」组补行口的假实现（rc25 S-1 方案 E）：记录调用；``overrides`` 给定时把补的
     行同步写进假本地覆盖源，模拟"落库后重读能看到"。"""
 
-    def __init__(self, *, overrides: "FakeLocalOverrides | None" = None, error: Exception | None = None) -> None:
+    def __init__(
+        self, *, overrides: FakeLocalOverrides | None = None, error: Exception | None = None
+    ) -> None:
         self._overrides = overrides
         self._error = error
         self.calls: list[dict[str, object]] = []
 
     def expand_all_scope_group(self, *, user_id: str, group_id: str, metrics, now) -> int:
-        self.calls.append({"user_id": user_id, "group_id": group_id, "metrics": tuple(metrics), "now": now})
+        self.calls.append(
+            {"user_id": user_id, "group_id": group_id, "metrics": tuple(metrics), "now": now}
+        )
         if self._error is not None:
             raise self._error
         if self._overrides is not None:
             existing = self._overrides._entries.get(user_id, ())
             self._overrides._entries[user_id] = existing + tuple(
-                _all_scope_entry(user_id=user_id, metric_name=metric, group_id=group_id) for metric in metrics
+                _all_scope_entry(user_id=user_id, metric_name=metric, group_id=group_id)
+                for metric in metrics
             )
         return len(tuple(metrics))
 
@@ -331,7 +336,7 @@ class FakeDecisions:
         self._failing = failing_users or set()
         self._cleared_events_by_user = cleared_events_by_user or {}
         # Issue #483：``require_enabled_account=True`` 的调用命中这些用户时，照真实
-        # 实现抛 ``PermissionGrantBlockedByAccountState``——真库里那把行锁的复检在
+        # 实现抛 ``PermissionGrantBlockedByAccountStateError``——真库里那把行锁的复检在
         # 假 store 上替不了，但"调用方被挡之后怎么收口"是纯职责层行为，可以在这里钉。
         self._blocked = blocked_users or set()
 
@@ -353,7 +358,7 @@ class FakeDecisions:
                 "声明不要求账号有效的权限决定只能排撤权行"
             )
         if require_enabled_account and user_id in self._blocked:
-            raise PermissionGrantBlockedByAccountState("suspended")
+            raise PermissionGrantBlockedByAccountStateError("suspended")
         if user_id in self._failing:
             raise RuntimeError("注入的落库失败")
         self.calls.append(
@@ -367,7 +372,11 @@ class FakeDecisions:
             }
         )
         enqueued = user_id not in self._unchanged
-        cleared = self._cleared_events_by_user.get(user_id, 0) if clear_delivered_content and enqueued else 0
+        cleared = (
+            self._cleared_events_by_user.get(user_id, 0)
+            if clear_delivered_content and enqueued
+            else 0
+        )
         return _FakeDecision(enqueued, cleared_events=cleared)
 
 
@@ -477,21 +486,23 @@ def build_duty(
     )
     galaxy_reader = FakeGalaxy(galaxy_snapshot() if galaxy is None else galaxy)
     duty = PermissionRefreshDuty(
-        baseline_reader=FakeBaseline(*identities),
-        roster_snapshot=snapshot_store,
-        galaxy=galaxy_reader,
-        decisions=decisions,
-        publish_history=history,
-        token_ciphers=tokens,
-        role_function_map=ROLE_FUNCTION_MAP if role_function_map is None else role_function_map,
-        metric_translation_map=(
-            METRIC_TRANSLATION_MAP if metric_translation_map is None else metric_translation_map
+        sources=PermissionRefreshSources(
+            baseline_reader=FakeBaseline(*identities),
+            roster_snapshot=snapshot_store,
+            galaxy=galaxy_reader,
+            decisions=decisions,
+            publish_history=history,
+            token_ciphers=tokens,
+            local_overrides=local_overrides,
+            legacy_all_scope=legacy_all_scope,
         ),
+        role_function_map=ROLE_FUNCTION_MAP if role_function_map is None else role_function_map,
+        metric_translation_map=METRIC_TRANSLATION_MAP
+        if metric_translation_map is None
+        else metric_translation_map,
         audit=audit,
         clock=clock or FixedClock(TODAY),
         stop=stop,
-        local_overrides=local_overrides,
-        legacy_all_scope=legacy_all_scope,
     )
     return duty, {
         "audit": audit,
@@ -656,7 +667,7 @@ class UtcDayBoundaryTest(unittest.TestCase):
 
         duty, parts = build_duty(
             identities=(identity(),),
-            roster_captured_at=datetime(2026, 8, 16, 20, 0, tzinfo=timezone.utc),
+            roster_captured_at=datetime(2026, 8, 16, 20, 0, tzinfo=UTC),
             clock=FixedClock(self.LOCAL_MIDNIGHT),
         )
 
@@ -674,7 +685,7 @@ class UtcDayBoundaryTest(unittest.TestCase):
 
         duty, parts = build_duty(
             identities=(identity(),),
-            roster_captured_at=datetime(2026, 8, 17, 1, 0, tzinfo=timezone.utc),
+            roster_captured_at=datetime(2026, 8, 17, 1, 0, tzinfo=UTC),
             clock=FixedClock(self.LOCAL_MIDNIGHT),
         )
 
@@ -848,10 +859,21 @@ class RoundLevelTranslationGateTest(unittest.TestCase):
         现在由整轮判据而不是逐用户判据兑现。"""
 
         duty, parts = build_duty(
-            identities=(identity(), identity(USER_TWO, personnel_id="ou_person_0002", email=EMAIL_TWO, display_name=NAME_TWO, employee_no=EMPLOYEE_TWO)),
+            identities=(
+                identity(),
+                identity(
+                    USER_TWO,
+                    personnel_id="ou_person_0002",
+                    email=EMAIL_TWO,
+                    display_name=NAME_TWO,
+                    employee_no=EMPLOYEE_TWO,
+                ),
+            ),
             roster_rows=(
                 roster_row(),
-                roster_row("ou_person_0002", employee_no=EMPLOYEE_TWO, email=EMAIL_TWO, name=NAME_TWO),
+                roster_row(
+                    "ou_person_0002", employee_no=EMPLOYEE_TWO, email=EMAIL_TWO, name=NAME_TWO
+                ),
             ),
             galaxy=galaxy_snapshot(
                 accounts=(
@@ -891,9 +913,7 @@ class RoundLevelTranslationGateTest(unittest.TestCase):
         self.assertEqual(
             parts["decisions"].calls, [], "翻译层不可用时，撤权意图同样不得排入 outbox"
         )
-        self.assertEqual(
-            parts["history"].calls, [], "遍历根本没开始，连『是否有发布足迹』都没查过"
-        )
+        self.assertEqual(parts["history"].calls, [], "遍历根本没开始，连『是否有发布足迹』都没查过")
 
     def test_a_single_audit_entry_is_distinguishable_from_uncovered(self) -> None:
         """整轮跳过恰一条审计，动作名与逐用户「未覆盖」判据不同——运维一眼能分辨
@@ -999,7 +1019,9 @@ class MetricTranslationGateTest(unittest.TestCase):
         duty, parts = build_duty(
             identities=(identity(),),
             galaxy=galaxy,
-            metric_translation_map={COMPANY_ID: {FUNCTION_LABEL: (METRIC_NAME,)}},  # 缺 COMPANY_ID_TWO
+            metric_translation_map={
+                COMPANY_ID: {FUNCTION_LABEL: (METRIC_NAME,)}
+            },  # 缺 COMPANY_ID_TWO
         )
 
         duty.run_once()
@@ -1086,14 +1108,21 @@ class LegacyAllScopeRefreshTest(unittest.TestCase):
     def test_a_new_mapped_metric_is_appended_to_the_group_and_published(self) -> None:
         overrides = FakeLocalOverrides({USER_ONE: (_all_scope_entry(metric_name=METRIC_NAME),)})
         expander = FakeLegacyAllScope(overrides=overrides)
-        duty, parts = build_duty(identities=(identity(),), local_overrides=overrides, legacy_all_scope=expander)
+        duty, parts = build_duty(
+            identities=(identity(),), local_overrides=overrides, legacy_all_scope=expander
+        )
 
         duty.run_once()
 
         self.assertEqual(len(expander.calls), 1)
         self.assertEqual(expander.calls[0]["group_id"], "lpg_legacy_all")
-        self.assertEqual(expander.calls[0]["metrics"], (METRIC_NAME_TWO,), "映射有、组里没有的那一个")
-        self.assertEqual(parts["audit"].fields_for("permission_refresh.legacy_all_scope_refreshed"), [{"user": USER_ONE, "added": 1}])
+        self.assertEqual(
+            expander.calls[0]["metrics"], (METRIC_NAME_TWO,), "映射有、组里没有的那一个"
+        )
+        self.assertEqual(
+            parts["audit"].fields_for("permission_refresh.legacy_all_scope_refreshed"),
+            [{"user": USER_ONE, "added": 1}],
+        )
         row = parts["decisions"].calls[0]["row"]
         self.assertEqual(
             json.loads(row.permissions),
@@ -1108,10 +1137,18 @@ class LegacyAllScopeRefreshTest(unittest.TestCase):
         from lingxi.core.permission.legacy_diff import ALL_SCOPE_EXPLICIT_POSITION_NAME
 
         overrides = FakeLocalOverrides(
-            {USER_ONE: (_all_scope_entry(metric_name=METRIC_NAME_TWO, position_name=ALL_SCOPE_EXPLICIT_POSITION_NAME),)}
+            {
+                USER_ONE: (
+                    _all_scope_entry(
+                        metric_name=METRIC_NAME_TWO, position_name=ALL_SCOPE_EXPLICIT_POSITION_NAME
+                    ),
+                )
+            }
         )
         expander = FakeLegacyAllScope(overrides=overrides)
-        duty, parts = build_duty(identities=(identity(),), local_overrides=overrides, legacy_all_scope=expander)
+        duty, parts = build_duty(
+            identities=(identity(),), local_overrides=overrides, legacy_all_scope=expander
+        )
 
         duty.run_once()
 
@@ -1124,15 +1161,25 @@ class LegacyAllScopeRefreshTest(unittest.TestCase):
 
     def test_a_complete_group_does_not_call_the_expander(self) -> None:
         overrides = FakeLocalOverrides(
-            {USER_ONE: (_all_scope_entry(metric_name=METRIC_NAME), _all_scope_entry(metric_name=METRIC_NAME_TWO))}
+            {
+                USER_ONE: (
+                    _all_scope_entry(metric_name=METRIC_NAME),
+                    _all_scope_entry(metric_name=METRIC_NAME_TWO),
+                )
+            }
         )
         expander = FakeLegacyAllScope(overrides=overrides)
-        duty, parts = build_duty(identities=(identity(),), local_overrides=overrides, legacy_all_scope=expander)
+        duty, parts = build_duty(
+            identities=(identity(),), local_overrides=overrides, legacy_all_scope=expander
+        )
 
         duty.run_once()
 
         self.assertEqual(expander.calls, [])
-        self.assertNotIn("permission_refresh.legacy_all_scope_refreshed", [name for name, _ in parts["audit"].records])
+        self.assertNotIn(
+            "permission_refresh.legacy_all_scope_refreshed",
+            [name for name, _ in parts["audit"].records],
+        )
 
     def test_no_expander_wired_keeps_todays_behaviour(self) -> None:
         overrides = FakeLocalOverrides({USER_ONE: (_all_scope_entry(metric_name=METRIC_NAME),)})
@@ -1146,7 +1193,9 @@ class LegacyAllScopeRefreshTest(unittest.TestCase):
     def test_expander_failure_is_audited_and_the_round_continues_with_existing_rows(self) -> None:
         overrides = FakeLocalOverrides({USER_ONE: (_all_scope_entry(metric_name=METRIC_NAME),)})
         expander = FakeLegacyAllScope(error=RuntimeError("库抖动"))
-        duty, parts = build_duty(identities=(identity(),), local_overrides=overrides, legacy_all_scope=expander)
+        duty, parts = build_duty(
+            identities=(identity(),), local_overrides=overrides, legacy_all_scope=expander
+        )
 
         duty.run_once()
 
@@ -1160,7 +1209,10 @@ class LegacyAllScopeRefreshTest(unittest.TestCase):
         overrides = FakeLocalOverrides({USER_ONE: (_all_scope_entry(metric_name=METRIC_NAME),)})
         expander = FakeLegacyAllScope(overrides=overrides)
         duty, parts = build_duty(
-            identities=(identity(),), role_function_map={}, local_overrides=overrides, legacy_all_scope=expander
+            identities=(identity(),),
+            role_function_map={},
+            local_overrides=overrides,
+            legacy_all_scope=expander,
         )
 
         duty.run_once()
@@ -1168,12 +1220,18 @@ class LegacyAllScopeRefreshTest(unittest.TestCase):
         row = parts["decisions"].calls[0]["row"]
         self.assertEqual(json.loads(row.permissions), {"*": sorted({METRIC_NAME, METRIC_NAME_TWO})})
 
-    def test_suppressing_a_whole_company_under_the_group_is_unrepresentable_and_skipped(self) -> None:
+    def test_suppressing_a_whole_company_under_the_group_is_unrepresentable_and_skipped(
+        self,
+    ) -> None:
         overrides = FakeLocalOverrides(
             {
                 USER_ONE: (
                     _all_scope_entry(metric_name=METRIC_NAME),
-                    _override_entry(direction=OverrideDirection.SUPPRESS, company_id=COMPANY_ID, metric_name=METRIC_NAME),
+                    _override_entry(
+                        direction=OverrideDirection.SUPPRESS,
+                        company_id=COMPANY_ID,
+                        metric_name=METRIC_NAME,
+                    ),
                 )
             }
         )
@@ -1232,7 +1290,11 @@ class LocalOverrideMergeTest(unittest.TestCase):
             ),
         )
         overrides = FakeLocalOverrides(
-            {USER_ONE: (_override_entry(direction=OverrideDirection.SUPPRESS, metric_name=METRIC_NAME),)}
+            {
+                USER_ONE: (
+                    _override_entry(direction=OverrideDirection.SUPPRESS, metric_name=METRIC_NAME),
+                )
+            }
         )
         duty, parts = build_duty(identities=(identity(),), galaxy=galaxy, local_overrides=overrides)
 
@@ -1305,7 +1367,11 @@ class LocalOverrideMergeTest(unittest.TestCase):
             ),
         )
         overrides = FakeLocalOverrides(
-            {USER_ONE: (_override_entry(direction=OverrideDirection.GRANT, metric_name="额外授权"),)}
+            {
+                USER_ONE: (
+                    _override_entry(direction=OverrideDirection.GRANT, metric_name="额外授权"),
+                )
+            }
         )
         duty, parts = build_duty(identities=(identity(),), galaxy=galaxy, local_overrides=overrides)
 
@@ -1450,9 +1516,7 @@ class RevocationPublishTest(unittest.TestCase):
     """`V-权限-08` 刷新侧的「发」那一半：保行、清空 permissions、不碰密文。"""
 
     def _run(self, **kwargs):
-        duty, parts = build_duty(
-            identities=(identity(),), published_users={USER_ONE}, **kwargs
-        )
+        duty, parts = build_duty(identities=(identity(),), published_users={USER_ONE}, **kwargs)
         return duty.run_once(), parts
 
     def test_a_revoked_user_with_a_published_row_gets_an_empty_permissions_update(self) -> None:
@@ -1572,10 +1636,16 @@ class FullSuppressionRevocationTest(unittest.TestCase):
         # 默认夹具的 identity 只持有一个公司（COMPANY_ID）一个指标（METRIC_NAME）——
         # 抑制它就是把合并结果压到空字典，不是"这个公司没了、别的公司还在"。
         return FakeLocalOverrides(
-            {USER_ONE: (_override_entry(direction=OverrideDirection.SUPPRESS, metric_name=METRIC_NAME),)}
+            {
+                USER_ONE: (
+                    _override_entry(direction=OverrideDirection.SUPPRESS, metric_name=METRIC_NAME),
+                )
+            }
         )
 
-    def test_a_fully_suppressed_grant_with_a_publish_footprint_gets_an_empty_revocation(self) -> None:
+    def test_a_fully_suppressed_grant_with_a_publish_footprint_gets_an_empty_revocation(
+        self,
+    ) -> None:
         """否定用例（Trace #328 opus 审查）：抑掉用户全部指标 → 发布 ``{}`` 撤权行 +
         专属审计，不是 ``ValueError`` 冒泡成通用失败。"""
 
@@ -1596,7 +1666,8 @@ class FullSuppressionRevocationTest(unittest.TestCase):
         revoked = parts["audit"].fields_for("permission_refresh.user_revoked")
         self.assertEqual(len(revoked), 1)
         self.assertEqual(
-            revoked[0]["reason"], REASON_FULLY_SUPPRESSED,
+            revoked[0]["reason"],
+            REASON_FULLY_SUPPRESSED,
             "原因码必须可分辨——不是银河本来就没给他权限，是本地抑制清空的",
         )
         cleared = parts["audit"].fields_for("permission_refresh.delivered_content_cleared")
@@ -1701,7 +1772,7 @@ class ZeroGalaxyLocalGrantTest(unittest.TestCase):
             local_overrides=overrides,
         )
 
-        report = duty.run_once()
+        duty.run_once()
 
         self.assertEqual(len(parts["decisions"].calls), 1)
         call = parts["decisions"].calls[0]
@@ -1808,7 +1879,9 @@ class DeliveredContentPurgeTest(unittest.TestCase):
         self.assertEqual(len(parts["decisions"].calls), 1)
         self.assertTrue(parts["decisions"].calls[0]["clear_delivered_content"])
 
-    def test_a_granted_change_that_actually_clears_something_is_audited_with_the_count(self) -> None:
+    def test_a_granted_change_that_actually_clears_something_is_audited_with_the_count(
+        self,
+    ) -> None:
         decisions = FakeDecisions(cleared_events_by_user={USER_ONE: 3})
         duty, parts = build_duty(identities=(identity(),), decisions=decisions)
 
@@ -1840,7 +1913,9 @@ class DeliveredContentPurgeTest(unittest.TestCase):
         report = duty.run_once()
 
         self.assertEqual(report.unchanged, 1)
-        self.assertEqual(parts["audit"].fields_for("permission_refresh.delivered_content_cleared"), [])
+        self.assertEqual(
+            parts["audit"].fields_for("permission_refresh.delivered_content_cleared"), []
+        )
 
     def test_a_revocation_that_actually_clears_something_is_audited_with_the_count(self) -> None:
         decisions = FakeDecisions(cleared_events_by_user={USER_ONE: 2})
@@ -1868,9 +1943,13 @@ class DeliveredContentPurgeTest(unittest.TestCase):
         report = duty.run_once()
 
         self.assertEqual(report.unchanged, 1)
-        self.assertEqual(parts["audit"].fields_for("permission_refresh.delivered_content_cleared"), [])
+        self.assertEqual(
+            parts["audit"].fields_for("permission_refresh.delivered_content_cleared"), []
+        )
 
-    def test_a_skipped_revocation_without_any_published_row_never_reaches_record_decision(self) -> None:
+    def test_a_skipped_revocation_without_any_published_row_never_reaches_record_decision(
+        self,
+    ) -> None:
         """从无发布行的撤权用户零发布意图（既有断言）：连 ``record_decision`` 都没被
         调用，自然也不会有任何清理或清理审计——不是"清了 0 条"，是"这一步压根没发生"。
         """
@@ -1880,7 +1959,9 @@ class DeliveredContentPurgeTest(unittest.TestCase):
         duty.run_once()
 
         self.assertEqual(parts["decisions"].calls, [])
-        self.assertEqual(parts["audit"].fields_for("permission_refresh.delivered_content_cleared"), [])
+        self.assertEqual(
+            parts["audit"].fields_for("permission_refresh.delivered_content_cleared"), []
+        )
 
 
 class IncompleteInputTest(unittest.TestCase):
@@ -2151,9 +2232,7 @@ class WatermarkAndStopTest(unittest.TestCase):
 
         self.assertTrue(report.interrupted)
         self.assertEqual(len(decisions.calls), 1, "停止后不再为后面的人排意图")
-        self.assertEqual(
-            report.examined, 1, "被停止挡在外面的人从来没有被看过一眼，不算已检查"
-        )
+        self.assertEqual(report.examined, 1, "被停止挡在外面的人从来没有被看过一眼，不算已检查")
         self.assertIsNone(duty.completed_on, "没走完的一轮不置水位")
         self.assertIn("permission_refresh.interrupted", parts["audit"].actions())
         self.assertNotIn("permission_refresh.completed", parts["audit"].actions())
@@ -2403,7 +2482,9 @@ class DutyRegistrationTest(unittest.TestCase):
             {
                 **COMPLETE_ENV,
                 "LINGXI_DELEGATED_CREDENTIAL_KEY": Fernet.generate_key().decode(),
-                "LINGXI_DELEGATED_CREDENTIAL_PATH": str(pathlib.Path(directory.name) / "delegated.enc"),
+                "LINGXI_DELEGATED_CREDENTIAL_PATH": str(
+                    pathlib.Path(directory.name) / "delegated.enc"
+                ),
                 **extra,
             }
         )
@@ -2455,9 +2536,7 @@ class DutyRegistrationTest(unittest.TestCase):
         )
         # 发布消费职责随主密钥一起装配（它的通知面用同一把密钥），排在重算之后。
         self.assertIn("权限发布与就绪确认", names)
-        self.assertGreater(
-            names.index("权限发布与就绪确认"), names.index("每日权限重算")
-        )
+        self.assertGreater(names.index("权限发布与就绪确认"), names.index("每日权限重算"))
         # 组织快照同步（Issue #250）两个令牌供给默认总能建出来，因此总会真实注册，
         # 排在权限发布消费之后（本文件不是这条位置断言的权威归属，只需不被带崩）。
         self.assertIn("组织快照同步", names)
@@ -2493,9 +2572,7 @@ class DutyRegistrationTest(unittest.TestCase):
     # ------------------------------------------------------------------
 
     def test_the_external_metric_map_path_variable_is_registered(self) -> None:
-        self.assertIn(
-            "LINGXI_COMPANY_FUNCTION_METRIC_MAP_PATH", SchedulerConfig.ENVIRONMENT_KEYS
-        )
+        self.assertIn("LINGXI_COMPANY_FUNCTION_METRIC_MAP_PATH", SchedulerConfig.ENVIRONMENT_KEYS)
 
     def test_an_invalid_external_metric_map_path_is_not_registered(self) -> None:
         """配了但指向的文件不存在：**必须**响亮失败——如果装配层没有真的把这个变量

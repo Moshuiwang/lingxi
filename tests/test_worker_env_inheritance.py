@@ -216,9 +216,11 @@ class MainDoesNotMutateProcessEnvironmentTest(unittest.TestCase):
     def test_running_the_queue_branch_leaves_os_environ_untouched(self) -> None:
         previous = os.environ.get(DSN_VAR)
         self.addCleanup(
-            lambda: os.environ.__setitem__(DSN_VAR, previous)
-            if previous is not None
-            else os.environ.pop(DSN_VAR, None)
+            lambda: (
+                os.environ.__setitem__(DSN_VAR, previous)
+                if previous is not None
+                else os.environ.pop(DSN_VAR, None)
+            )
         )
         os.environ[DSN_VAR] = FAKE_DSN
         before = dict(os.environ)
@@ -236,9 +238,7 @@ class MainDoesNotMutateProcessEnvironmentTest(unittest.TestCase):
             stderr=io.StringIO(),
         )
 
-        self.assertEqual(
-            dict(os.environ), before, "main() 不得改动进程环境——它不是进程入口"
-        )
+        self.assertEqual(dict(os.environ), before, "main() 不得改动进程环境——它不是进程入口")
         self.assertEqual(os.environ[DSN_VAR], FAKE_DSN)
 
     def test_the_real_entry_still_reads_the_dsn_after_detaching(self) -> None:
@@ -269,9 +269,7 @@ class MainDoesNotMutateProcessEnvironmentTest(unittest.TestCase):
 
         combined = result.stdout + result.stderr
         self.assertIn("LINGXI_USER_ENV_ROOT", combined, combined[-800:])
-        self.assertNotIn(
-            "缺少 LINGXI_POSTGRES_DSN", combined, "入口摘完之后 main 必须仍读得到 DSN"
-        )
+        self.assertNotIn("缺少 LINGXI_POSTGRES_DSN", combined, "入口摘完之后 main 必须仍读得到 DSN")
         self.assertIn("env_detached", combined, "摘除必须在启动日志里留痕")
         self.assertNotIn("hunter2", combined, "启动日志不得回显连接串取值")
 

@@ -17,15 +17,15 @@ from __future__ import annotations
 import importlib.util
 import threading
 import unittest
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
+from lingxi.adapters.stock_token_bitable import DecryptingStockTokenSource
 from lingxi.apps.scheduler import (
     SchedulerConfig,
     _build_onboarding_duty,
     _build_stalled_provisioning_duty,
 )
-from lingxi.adapters.stock_token_bitable import DecryptingStockTokenSource
 from lingxi.apps.scheduler.onboarding import (
     DISPATCH_AFTER,
     ONBOARDING_SHUTDOWN_JOIN_TIMEOUT_SECONDS,
@@ -41,7 +41,7 @@ from lingxi.apps.scheduler.onboarding import (
 )
 from lingxi.apps.scheduler.stalled_provisioning import DEFAULT_STALLED_LEASE_SECONDS
 from lingxi.core.conversation.onboarding_recovery import OnboardingReconciler
-from lingxi.core.permission.mcp_readiness import McpProbeError, ReadinessSchedule
+from lingxi.core.permission.mcp_readiness_base import McpProbeError, ReadinessSchedule
 
 # 32 字节 base64 主密钥（非生产值，只为过形状校验）。
 MASTER_KEY = "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8="
@@ -179,7 +179,11 @@ class PrerequisiteTests(unittest.TestCase):
 
         self.assertIsInstance(duty, OnboardingReconciler)
         client = duty._onboarding._employment._client
-        self.assertEqual(client._sleep, stop.wait, "节流/退避的 sleeper 必须绑定这一份 stop，不是默认的 time.sleep")
+        self.assertEqual(
+            client._sleep,
+            stop.wait,
+            "节流/退避的 sleeper 必须绑定这一份 stop，不是默认的 time.sleep",
+        )
 
 
 class StockTokenSourceWiringTests(unittest.TestCase):
@@ -316,7 +320,9 @@ class StockTokenSourceWiringTests(unittest.TestCase):
             permission_publish=_WIRED_PERMISSION_PUBLISH,
             stock_tokens=object(),
         )
-        self.assertIsInstance(duty._onboarding._legacy_importer, PostgresLocalPermissionOverrideStore)
+        self.assertIsInstance(
+            duty._onboarding._legacy_importer, PostgresLocalPermissionOverrideStore
+        )
         # 端口契约：开通链按 ``LegacyPermissionImporter.import_plan`` 调用——stage 首次真实
         # 用例坐实过一次「有实现、没这个名字」的漏接（AttributeError fail-closed）。
         self.assertTrue(callable(getattr(duty._onboarding._legacy_importer, "import_plan", None)))
@@ -365,9 +371,7 @@ class AssemblyInvariantTests(unittest.TestCase):
 
         self.assertIsNone(duty)
         self.assertEqual(audit.actions(), ["onboarding.duty_not_registered"])
-        self.assertEqual(
-            audit.records[0][1], {"reason": "permission_publish_not_assembled"}
-        )
+        self.assertEqual(audit.records[0][1], {"reason": "permission_publish_not_assembled"})
 
     def test_a_none_permission_publish_stops_onboarding_even_when_everything_else_is_wired(
         self,
@@ -429,8 +433,7 @@ class AssemblyInvariantTests(unittest.TestCase):
         self.assertEqual(
             audit.records[0][1],
             {"reason": "permission_publish_not_wired"},
-            "两种拒绝的原因码必须可分辨：这一条要去补权限表 Base 坐标，"
-            "而不是 MCP 那一组配置",
+            "两种拒绝的原因码必须可分辨：这一条要去补权限表 Base 坐标，而不是 MCP 那一组配置",
         )
 
 
@@ -505,9 +508,7 @@ class ClaimCapacityTests(unittest.TestCase):
 
     def test_an_unbound_claim_limit_fails_the_assembly(self) -> None:
         executor = OnboardingExecutor(workers=2)
-        duty = OnboardingReconciler(
-            store=object(), onboarding=object(), audit=RecordingAudit()
-        )
+        duty = OnboardingReconciler(store=object(), onboarding=object(), audit=RecordingAudit())
         with self.assertRaises(RuntimeError):
             assert_claim_limit_follows_capacity(duty, executor)
 
@@ -641,7 +642,7 @@ class HandoffAssertionTests(unittest.TestCase):
         second = clock()
         self.assertIsNotNone(first.tzinfo)
         self.assertGreaterEqual(second, first)
-        self.assertLess(abs(second - datetime.now(timezone.utc)), timedelta(seconds=5))
+        self.assertLess(abs(second - datetime.now(UTC)), timedelta(seconds=5))
 
     def test_the_watchdog_margin_is_above_the_transport_timeout(self) -> None:
         """看门狗只该在传输层**根本不遵守**超时时动手，不该抢在它前面。"""
@@ -939,9 +940,7 @@ class MainExitJoinsOnboardingExecutorsTests(unittest.TestCase):
 
         with (
             mock.patch("lingxi.apps.scheduler.SchedulerConfig") as config_cls,
-            mock.patch(
-                "lingxi.apps.scheduler.build_alerting_duty", return_value=mock.MagicMock()
-            ),
+            mock.patch("lingxi.apps.scheduler.build_alerting_duty", return_value=mock.MagicMock()),
             mock.patch(
                 "lingxi.apps.scheduler.build_loop", return_value=stub_loop
             ) as build_loop_mock,
@@ -958,6 +957,52 @@ class MainExitJoinsOnboardingExecutorsTests(unittest.TestCase):
         install_mock.assert_called_once_with(stub_loop)
         build_loop_mock.assert_called_once()
         join_mock.assert_called_once_with(sentinel_duties)
+
+
+class MainExitClosesIdleConnectionsTests(unittest.TestCase):
+    """D-17（#593 元守护审核 P2-b）：``main()`` 停机路径必须在
+    ``join_onboarding_executors`` 之后显式调用一次
+    ``lingxi.adapters.postgres.close_idle_connections``，不能只靠进程退出时的
+    ``atexit``。同上一组用例的姿态：轻量桩顶掉真实装配，只把这一段接线暴露成
+    断言，不真的连数据库。
+
+    变异验红：把 ``lingxi/apps/scheduler/__init__.py`` 里
+    ``close_idle_connections()`` 那一行删掉重跑本用例，
+    ``close_mock.assert_called_once_with()`` 会因为从未被调用而失败。
+    """
+
+    def test_main_calls_close_idle_connections_once_after_shutdown(self) -> None:
+        import types
+        from unittest import mock
+
+        class _StubLoop:
+            duties = ()
+
+            def run_forever(self) -> None:
+                return None
+
+            def request_stop(self) -> None:
+                return None
+
+        stub_loop = _StubLoop()
+        stub_config = types.SimpleNamespace(interval_seconds=5)
+
+        with (
+            mock.patch("lingxi.apps.scheduler.SchedulerConfig") as config_cls,
+            mock.patch("lingxi.apps.scheduler.build_alerting_duty", return_value=mock.MagicMock()),
+            mock.patch("lingxi.apps.scheduler.build_loop", return_value=stub_loop),
+            mock.patch("lingxi.apps.scheduler.install_signal_handlers"),
+            mock.patch("lingxi.apps.scheduler.join_onboarding_executors"),
+            mock.patch("lingxi.apps.scheduler.close_idle_connections") as close_mock,
+        ):
+            config_cls.from_env.return_value = stub_config
+
+            from lingxi.apps.scheduler import main
+
+            code = main([])
+
+        self.assertEqual(code, 0)
+        close_mock.assert_called_once_with()
 
 
 class MainExceptionExitStillJoinsOnboardingExecutorsTests(unittest.TestCase):
@@ -996,9 +1041,7 @@ class MainExceptionExitStillJoinsOnboardingExecutorsTests(unittest.TestCase):
 
         with (
             mock.patch("lingxi.apps.scheduler.SchedulerConfig") as config_cls,
-            mock.patch(
-                "lingxi.apps.scheduler.build_alerting_duty", return_value=mock.MagicMock()
-            ),
+            mock.patch("lingxi.apps.scheduler.build_alerting_duty", return_value=mock.MagicMock()),
             mock.patch(
                 "lingxi.apps.scheduler.build_loop", return_value=stub_loop
             ) as build_loop_mock,
@@ -1043,9 +1086,7 @@ class MainExceptionExitStillJoinsOnboardingExecutorsTests(unittest.TestCase):
 
         with (
             mock.patch("lingxi.apps.scheduler.SchedulerConfig") as config_cls,
-            mock.patch(
-                "lingxi.apps.scheduler.build_alerting_duty", return_value=mock.MagicMock()
-            ),
+            mock.patch("lingxi.apps.scheduler.build_alerting_duty", return_value=mock.MagicMock()),
             mock.patch("lingxi.apps.scheduler.build_loop", return_value=stub_loop),
             mock.patch("lingxi.apps.scheduler.install_signal_handlers"),
             mock.patch(
@@ -1060,9 +1101,7 @@ class MainExceptionExitStillJoinsOnboardingExecutorsTests(unittest.TestCase):
             with self.assertRaises(RuntimeError) as ctx:
                 main([])
 
-        self.assertIs(
-            ctx.exception, original_error, "收尾失败不得覆盖 run_forever() 的原始异常"
-        )
+        self.assertIs(ctx.exception, original_error, "收尾失败不得覆盖 run_forever() 的原始异常")
 
 
 class StopSentinelRaceTests(unittest.TestCase):
@@ -1077,7 +1116,7 @@ class StopSentinelRaceTests(unittest.TestCase):
     """
 
     def test_stop_silently_drops_sentinels_when_the_queue_is_completely_full(self) -> None:
-        """"队列满"：``stop()`` 尝试放的每一个哨兵都因为 ``queue.Full`` 被丢弃，
+        """ "队列满"：``stop()`` 尝试放的每一个哨兵都因为 ``queue.Full`` 被丢弃，
         且不得因此清空或顶掉已经排队的任务（``stop()`` 的既有产品语义）。"""
 
         executor = OnboardingExecutor(workers=2, backlog=2)
@@ -1098,7 +1137,7 @@ class StopSentinelRaceTests(unittest.TestCase):
     def test_stop_fills_only_the_available_slots_when_the_queue_is_partially_full(
         self,
     ) -> None:
-        """"只剩部分槽位"：三条线程只有一个空位，``stop()`` 只能放进恰好一个哨兵，
+        """ "只剩部分槽位"：三条线程只有一个空位，``stop()`` 只能放进恰好一个哨兵，
         另外两次因队列满被丢弃；已排队的两个任务同样必须原样保留。"""
 
         executor = OnboardingExecutor(workers=3, backlog=3)

@@ -41,6 +41,7 @@ production_schema``/``reset_production_rows``），只新增表格分支特有�
 from __future__ import annotations
 
 import json
+import os
 import unittest
 from typing import Any
 
@@ -54,9 +55,6 @@ from lingxi.adapters.postgres_document_delivery import (
     PostgresDocumentDeliveryStore,
 )
 from lingxi.apps.gateway.document_delivery import DocumentDeliveryConsumer
-from lingxi.apps.worker.config import WorkerConfig
-
-import os
 
 DSN = os.environ.get("LINGXI_POSTGRES_DSN")
 SKIP_REASON = (
@@ -72,7 +70,12 @@ class _SpySheets:
     ``test_document_delivery_transport.py::_SpyDocx`` 的形状。
     """
 
-    def __init__(self, *, create_result: Any = ("sheet-token-1", "https://example.feishu.cn/sheets/sheet-token-1"), members: Any = ()) -> None:
+    def __init__(
+        self,
+        *,
+        create_result: Any = ("sheet-token-1", "https://example.feishu.cn/sheets/sheet-token-1"),
+        members: Any = (),
+    ) -> None:
         self.create_calls: list[str] = []
         self.get_sheet_id_calls: list[str] = []
         self.write_calls: list[tuple[str, str, list[list[str]]]] = []
@@ -167,7 +170,11 @@ class SheetDeliveryTransportTestCase(unittest.TestCase):
         return row[0] if row is not None else None
 
     def _seed_pending_sheet_request(
-        self, *, request_id: str = "tds-1", document_id: str | None = None, resource_url: str | None = None
+        self,
+        *,
+        request_id: str = "tds-1",
+        document_id: str | None = None,
+        resource_url: str | None = None,
     ) -> None:
         self.execute(
             """INSERT INTO task_document_delivery_request
@@ -187,7 +194,11 @@ class SheetDeliveryTransportTestCase(unittest.TestCase):
     # -- 装配层：claim 正确带出 delivery_type/resource_url --------------------
 
     def test_claim_pending_carries_delivery_type_and_resource_url(self) -> None:
-        self._seed_pending_sheet_request(request_id="tds-claim", document_id="sheet-existing", resource_url="https://example.feishu.cn/sheets/sheet-existing")
+        self._seed_pending_sheet_request(
+            request_id="tds-claim",
+            document_id="sheet-existing",
+            resource_url="https://example.feishu.cn/sheets/sheet-existing",
+        )
 
         claims = self.store.claim_pending(limit=1)
 
@@ -203,10 +214,18 @@ class SheetDeliveryTransportTestCase(unittest.TestCase):
         self._seed_pending_sheet_request(request_id="tds-success")
         sheets = _SpySheets(
             create_result=("sheet-token-x", "https://example.feishu.cn/sheets/sheet-token-x"),
-            members=[{"member_type": "openid", "member_id": self.REQUESTER_OPEN_ID, "perm": "full_access"}],
+            members=[
+                {
+                    "member_type": "openid",
+                    "member_id": self.REQUESTER_OPEN_ID,
+                    "perm": "full_access",
+                }
+            ],
         )
         notifier = _SpyNotifier()
-        consumer = DocumentDeliveryConsumer(store=self.store, docx=object(), sheets=sheets, notifier=notifier)
+        consumer = DocumentDeliveryConsumer(
+            store=self.store, docx=object(), sheets=sheets, notifier=notifier
+        )
 
         processed = consumer.run_once()
 
@@ -217,30 +236,43 @@ class SheetDeliveryTransportTestCase(unittest.TestCase):
         self.assertEqual(sheets.write_calls[0][2], [["月份", "销售额"], ["1月", "100"]])
         self.assertEqual(sheets.grant_calls, [("sheet-token-x", self.REQUESTER_OPEN_ID)])
         self.assertEqual(
-            self.scalar("SELECT status FROM task_document_delivery_request WHERE id = 'tds-success'"),
+            self.scalar(
+                "SELECT status FROM task_document_delivery_request WHERE id = 'tds-success'"
+            ),
             "succeeded",
         )
         self.assertEqual(
-            self.scalar("SELECT document_id FROM task_document_delivery_request WHERE id = 'tds-success'"),
+            self.scalar(
+                "SELECT document_id FROM task_document_delivery_request WHERE id = 'tds-success'"
+            ),
             "sheet-token-x",
         )
         self.assertEqual(
-            self.scalar("SELECT resource_url FROM task_document_delivery_request WHERE id = 'tds-success'"),
+            self.scalar(
+                "SELECT resource_url FROM task_document_delivery_request WHERE id = 'tds-success'"
+            ),
             "https://example.feishu.cn/sheets/sheet-token-x",
         )
         self.assertEqual(
-            self.scalar("SELECT delivery_type FROM task_document_delivery_request WHERE id = 'tds-success'"),
+            self.scalar(
+                "SELECT delivery_type FROM task_document_delivery_request WHERE id = 'tds-success'"
+            ),
             "sheet",
         )
         self.assertEqual(len(notifier.sent), 1)
         open_id, text, dedupe_key = notifier.sent[0]
         self.assertEqual(open_id, self.REQUESTER_OPEN_ID)
-        self.assertEqual(text, "你要的表格已生成：https://example.feishu.cn/sheets/sheet-token-x（你已获得可管理权限）")
+        self.assertEqual(
+            text,
+            "你要的表格已生成：https://example.feishu.cn/sheets/sheet-token-x（你已获得可管理权限）",
+        )
         self.assertEqual(dedupe_key, "sheet-ready:tds-success")
 
     # -- ① 写值失败：不当作成功（不发送产物链接）、落 uncertain -----------------
 
-    def test_write_failure_does_not_send_the_ready_link_and_is_uncertain_not_succeeded(self) -> None:
+    def test_write_failure_does_not_send_the_ready_link_and_is_uncertain_not_succeeded(
+        self,
+    ) -> None:
         """变异锚点①（上半）：把成功判据从"``_has_confirmed_full_access`` 确认"
         改成"没抛异常就成功"，本用例应变红（uncertain 状态会变成 succeeded）。
 
@@ -262,19 +294,25 @@ class SheetDeliveryTransportTestCase(unittest.TestCase):
 
         sheets = FlakyWriteSheets()
         notifier = _SpyNotifier()
-        consumer = DocumentDeliveryConsumer(store=self.store, docx=object(), sheets=sheets, notifier=notifier)
+        consumer = DocumentDeliveryConsumer(
+            store=self.store, docx=object(), sheets=sheets, notifier=notifier
+        )
 
         consumer.run_once()
 
         self.assertEqual(
-            self.scalar("SELECT status FROM task_document_delivery_request WHERE id = 'tds-write-fail'"),
+            self.scalar(
+                "SELECT status FROM task_document_delivery_request WHERE id = 'tds-write-fail'"
+            ),
             "uncertain",
         )
         self.assertEqual(sheets.create_calls, ["标题"], "建表检查点已落盘，不因写值失败而重复建表")
         # uncertain 终态发的是独立措辞的"结果暂无法确认"通知，不是产物就绪链接
         # ——两者用不同的 content.toml 键与去重前缀，不会互相冒充。
         self.assertEqual(len(notifier.sent), 1)
-        self.assertEqual(notifier.sent[0][1], "表格生成结果暂无法确认，已转人工核对。追溯号：tsk-sheet-1。")
+        self.assertEqual(
+            notifier.sent[0][1], "表格生成结果暂无法确认，已转人工核对。追溯号：tsk-sheet-1。"
+        )
         self.assertEqual(notifier.sent[0][2], "sheet-uncertain:tds-write-fail")
         # claim_pending 的查询谓词只认 pending：uncertain 行不会被再次认领。
         self.assertEqual(self.store.claim_pending(limit=10), [])
@@ -295,7 +333,13 @@ class SheetDeliveryTransportTestCase(unittest.TestCase):
         self._seed_pending_sheet_request(request_id="tds-crash-recover")
         sheets = _SpySheets(
             create_result=("sheet-crash-1", "https://example.feishu.cn/sheets/sheet-crash-1"),
-            members=[{"member_type": "openid", "member_id": self.REQUESTER_OPEN_ID, "perm": "full_access"}],
+            members=[
+                {
+                    "member_type": "openid",
+                    "member_id": self.REQUESTER_OPEN_ID,
+                    "perm": "full_access",
+                }
+            ],
         )
         notifier = _SpyNotifier()
 
@@ -304,7 +348,9 @@ class SheetDeliveryTransportTestCase(unittest.TestCase):
         self.assertEqual(len(claims), 1)
         claim = claims[0]
         spreadsheet_token, url = sheets.create_spreadsheet(claim.title)
-        self.store.mark_document_created(request_id=claim.id, document_id=spreadsheet_token, resource_url=url)
+        self.store.mark_document_created(
+            request_id=claim.id, document_id=spreadsheet_token, resource_url=url
+        )
         self.assertEqual(sheets.create_calls, ["标题"])
 
         # 崩溃后这一行停在 processing、document_id/resource_url 已经非空。回拨
@@ -316,7 +362,9 @@ class SheetDeliveryTransportTestCase(unittest.TestCase):
 
         # 阶段二：全新消费者续做——spreadsheet_token/resource_url 已经检查点
         # 持久化，流程从 get_default_sheet_id/write_values 起步。
-        consumer = DocumentDeliveryConsumer(store=self.store, docx=object(), sheets=sheets, notifier=notifier)
+        consumer = DocumentDeliveryConsumer(
+            store=self.store, docx=object(), sheets=sheets, notifier=notifier
+        )
         processed = consumer.run_once()
 
         self.assertEqual(processed, 1)
@@ -324,15 +372,21 @@ class SheetDeliveryTransportTestCase(unittest.TestCase):
         self.assertEqual(len(sheets.write_calls), 1)
         self.assertEqual(len(sheets.grant_calls), 1)
         self.assertEqual(
-            self.scalar("SELECT status FROM task_document_delivery_request WHERE id = %s", (claim.id,)),
+            self.scalar(
+                "SELECT status FROM task_document_delivery_request WHERE id = %s", (claim.id,)
+            ),
             "succeeded",
         )
         self.assertEqual(
-            self.scalar("SELECT document_id FROM task_document_delivery_request WHERE id = %s", (claim.id,)),
+            self.scalar(
+                "SELECT document_id FROM task_document_delivery_request WHERE id = %s", (claim.id,)
+            ),
             "sheet-crash-1",
         )
         self.assertEqual(
-            self.scalar("SELECT resource_url FROM task_document_delivery_request WHERE id = %s", (claim.id,)),
+            self.scalar(
+                "SELECT resource_url FROM task_document_delivery_request WHERE id = %s", (claim.id,)
+            ),
             "https://example.feishu.cn/sheets/sheet-crash-1",
         )
         self.assertEqual(len(notifier.sent), 1)
@@ -350,32 +404,44 @@ class SheetDeliveryTransportTestCase(unittest.TestCase):
             members=[{"member_type": "openid", "member_id": self.REQUESTER_OPEN_ID, "perm": "view"}]
         )
         notifier = _SpyNotifier()
-        consumer = DocumentDeliveryConsumer(store=self.store, docx=object(), sheets=sheets, notifier=notifier)
+        consumer = DocumentDeliveryConsumer(
+            store=self.store, docx=object(), sheets=sheets, notifier=notifier
+        )
 
         consumer.run_once()
 
         self.assertEqual(
-            self.scalar("SELECT status FROM task_document_delivery_request WHERE id = 'tds-downgrade'"),
+            self.scalar(
+                "SELECT status FROM task_document_delivery_request WHERE id = 'tds-downgrade'"
+            ),
             "uncertain",
         )
         self.assertEqual(
-            self.scalar("SELECT last_error FROM task_document_delivery_request WHERE id = 'tds-downgrade'"),
+            self.scalar(
+                "SELECT last_error FROM task_document_delivery_request WHERE id = 'tds-downgrade'"
+            ),
             "permission_not_confirmed",
         )
         # uncertain 终态仍然会给用户发一条对应措辞的追加消息（R-1 第 3 条，同
         # docx 分支既有姿态）——"不判 succeeded"不等于"不通知用户"。
         self.assertEqual(len(notifier.sent), 1)
-        self.assertEqual(notifier.sent[0][1], "表格生成结果暂无法确认，已转人工核对。追溯号：tsk-sheet-1。")
+        self.assertEqual(
+            notifier.sent[0][1], "表格生成结果暂无法确认，已转人工核对。追溯号：tsk-sheet-1。"
+        )
 
     def test_missing_target_in_read_members_is_uncertain_not_succeeded(self) -> None:
         self._seed_pending_sheet_request(request_id="tds-no-member")
         sheets = _SpySheets(members=[])
-        consumer = DocumentDeliveryConsumer(store=self.store, docx=object(), sheets=sheets, notifier=_SpyNotifier())
+        consumer = DocumentDeliveryConsumer(
+            store=self.store, docx=object(), sheets=sheets, notifier=_SpyNotifier()
+        )
 
         consumer.run_once()
 
         self.assertEqual(
-            self.scalar("SELECT status FROM task_document_delivery_request WHERE id = 'tds-no-member'"),
+            self.scalar(
+                "SELECT status FROM task_document_delivery_request WHERE id = 'tds-no-member'"
+            ),
             "uncertain",
         )
 
@@ -397,25 +463,35 @@ class SheetDeliveryTransportTestCase(unittest.TestCase):
         notifier = _SpyNotifier()
         alerts: list[tuple[str, str]] = []
         consumer = DocumentDeliveryConsumer(
-            store=self.store, docx=object(), sheets=sheets, notifier=notifier,
+            store=self.store,
+            docx=object(),
+            sheets=sheets,
+            notifier=notifier,
             on_alert=lambda kind, task_id: alerts.append((kind, task_id)),
         )
 
         consumer.run_once()
 
         self.assertEqual(
-            self.scalar("SELECT status FROM task_document_delivery_request WHERE id = 'tds-definite'"),
+            self.scalar(
+                "SELECT status FROM task_document_delivery_request WHERE id = 'tds-definite'"
+            ),
             "failed",
         )
         self.assertEqual(
-            self.scalar("SELECT last_error FROM task_document_delivery_request WHERE id = 'tds-definite'"),
+            self.scalar(
+                "SELECT last_error FROM task_document_delivery_request WHERE id = 'tds-definite'"
+            ),
             "feishu_code_99999",
         )
         self.assertIn(("document_delivery_failed", self.TASK_ID), alerts)
         self.assertEqual(len(notifier.sent), 1)
         open_id, text, dedupe_key = notifier.sent[0]
         self.assertEqual(open_id, self.REQUESTER_OPEN_ID)
-        self.assertEqual(text, "抱歉，你要的表格生成失败了。你可以重新发起问数再试一次；问题已记录。追溯号：tsk-sheet-1。")
+        self.assertEqual(
+            text,
+            "抱歉，你要的表格生成失败了。你可以重新发起问数再试一次；问题已记录。追溯号：tsk-sheet-1。",
+        )
         self.assertEqual(dedupe_key, "sheet-failed:tds-definite")
         # 明确失败不重试。
         self.assertEqual(self.store.claim_pending(limit=10), [])
@@ -430,16 +506,22 @@ class SheetDeliveryTransportTestCase(unittest.TestCase):
 
         sheets = FlakySheets()
         notifier = _SpyNotifier()
-        consumer = DocumentDeliveryConsumer(store=self.store, docx=object(), sheets=sheets, notifier=notifier)
+        consumer = DocumentDeliveryConsumer(
+            store=self.store, docx=object(), sheets=sheets, notifier=notifier
+        )
 
         consumer.run_once()
 
         self.assertEqual(
-            self.scalar("SELECT status FROM task_document_delivery_request WHERE id = 'tds-indefinite'"),
+            self.scalar(
+                "SELECT status FROM task_document_delivery_request WHERE id = 'tds-indefinite'"
+            ),
             "uncertain",
         )
         self.assertEqual(len(notifier.sent), 1)
-        self.assertEqual(notifier.sent[0][1], "表格生成结果暂无法确认，已转人工核对。追溯号：tsk-sheet-1。")
+        self.assertEqual(
+            notifier.sent[0][1], "表格生成结果暂无法确认，已转人工核对。追溯号：tsk-sheet-1。"
+        )
         self.assertEqual(notifier.sent[0][2], "sheet-uncertain:tds-indefinite")
 
     # -- ⑤ 确定性入参校验错误：failed 不是 uncertain -----------------------------
@@ -458,23 +540,31 @@ class SheetDeliveryTransportTestCase(unittest.TestCase):
 
         sheets = BadInputSheets()
         notifier = _SpyNotifier()
-        consumer = DocumentDeliveryConsumer(store=self.store, docx=object(), sheets=sheets, notifier=notifier)
+        consumer = DocumentDeliveryConsumer(
+            store=self.store, docx=object(), sheets=sheets, notifier=notifier
+        )
 
         consumer.run_once()
 
         self.assertEqual(
-            self.scalar("SELECT status FROM task_document_delivery_request WHERE id = 'tds-bad-input'"),
+            self.scalar(
+                "SELECT status FROM task_document_delivery_request WHERE id = 'tds-bad-input'"
+            ),
             "failed",
         )
         self.assertEqual(
-            self.scalar("SELECT last_error FROM task_document_delivery_request WHERE id = 'tds-bad-input'"),
+            self.scalar(
+                "SELECT last_error FROM task_document_delivery_request WHERE id = 'tds-bad-input'"
+            ),
             "ValueError",
         )
         self.assertEqual(len(notifier.sent), 1)
 
     # -- ③ 发送失败：检查点保留、succeeded 不回滚、可补发 -------------------------
 
-    def test_notify_failure_does_not_roll_back_succeeded_state_and_is_resent_next_round(self) -> None:
+    def test_notify_failure_does_not_roll_back_succeeded_state_and_is_resent_next_round(
+        self,
+    ) -> None:
         """变异锚点③：把 ``mark_notified`` 提到通知发送之前，本用例应变红
         （通知失败但 ``notified_at`` 被错误置位，下一轮不再补发）。
         """
@@ -482,12 +572,21 @@ class SheetDeliveryTransportTestCase(unittest.TestCase):
         self._seed_pending_sheet_request(request_id="tds-notify-fail")
         sheets = _SpySheets(
             create_result=("sheet-notify-1", "https://example.feishu.cn/sheets/sheet-notify-1"),
-            members=[{"member_type": "openid", "member_id": self.REQUESTER_OPEN_ID, "perm": "full_access"}],
+            members=[
+                {
+                    "member_type": "openid",
+                    "member_id": self.REQUESTER_OPEN_ID,
+                    "perm": "full_access",
+                }
+            ],
         )
         failing_notifier = _FailingNotifier()
         alerts: list[tuple[str, str]] = []
         consumer = DocumentDeliveryConsumer(
-            store=self.store, docx=object(), sheets=sheets, notifier=failing_notifier,
+            store=self.store,
+            docx=object(),
+            sheets=sheets,
+            notifier=failing_notifier,
             on_alert=lambda kind, task_id: alerts.append((kind, task_id)),
         )
 
@@ -495,11 +594,15 @@ class SheetDeliveryTransportTestCase(unittest.TestCase):
 
         # 四步已经全部跑完并落终态 succeeded，只是通知没能真正送达。
         self.assertEqual(
-            self.scalar("SELECT status FROM task_document_delivery_request WHERE id = 'tds-notify-fail'"),
+            self.scalar(
+                "SELECT status FROM task_document_delivery_request WHERE id = 'tds-notify-fail'"
+            ),
             "succeeded",
         )
         self.assertIsNone(
-            self.scalar("SELECT notified_at FROM task_document_delivery_request WHERE id = 'tds-notify-fail'")
+            self.scalar(
+                "SELECT notified_at FROM task_document_delivery_request WHERE id = 'tds-notify-fail'"
+            )
         )
         self.assertIn(("document_delivery_notice_failed", self.TASK_ID), alerts)
         self.assertEqual(sheets.create_calls, ["标题"])
@@ -510,29 +613,40 @@ class SheetDeliveryTransportTestCase(unittest.TestCase):
             "UPDATE task_document_delivery_request SET updated_at = now() - interval '20 minutes' WHERE id = 'tds-notify-fail'"
         )
         good_notifier = _SpyNotifier()
-        resend_consumer = DocumentDeliveryConsumer(store=self.store, docx=object(), sheets=sheets, notifier=good_notifier)
+        resend_consumer = DocumentDeliveryConsumer(
+            store=self.store, docx=object(), sheets=sheets, notifier=good_notifier
+        )
         resend_consumer.run_once()
 
         self.assertEqual(sheets.create_calls, ["标题"], "补发通知不得重新建表")
         self.assertEqual(len(good_notifier.sent), 1)
         self.assertIsNotNone(
-            self.scalar("SELECT notified_at FROM task_document_delivery_request WHERE id = 'tds-notify-fail'")
+            self.scalar(
+                "SELECT notified_at FROM task_document_delivery_request WHERE id = 'tds-notify-fail'"
+            )
         )
 
-    def test_missing_resource_url_at_notify_time_fails_the_notice_not_the_terminal_state(self) -> None:
+    def test_missing_resource_url_at_notify_time_fails_the_notice_not_the_terminal_state(
+        self,
+    ) -> None:
         """防御性用例：``_send_ready_notice`` 收到 sheet 类型但 ``resource_url``
         为空（结构性不应发生，但不假设它一定不发生）时必须响亮记通知失败，不
         猜测/拼一个链接，也不影响已经落库的 succeeded 终态。
         """
 
-        self._seed_pending_sheet_request(request_id="tds-no-url", document_id="sheet-existing", resource_url=None)
+        self._seed_pending_sheet_request(
+            request_id="tds-no-url", document_id="sheet-existing", resource_url=None
+        )
         # 直接调用底层方法验证防御分支，不依赖能产出这个反常状态的完整流程。
         from lingxi.apps.gateway.document_delivery import DocumentDeliveryConsumer as _Consumer
 
         notifier = _SpyNotifier()
         alerts: list[tuple[str, str]] = []
         consumer = _Consumer(
-            store=self.store, docx=object(), sheets=_SpySheets(), notifier=notifier,
+            store=self.store,
+            docx=object(),
+            sheets=_SpySheets(),
+            notifier=notifier,
             on_alert=lambda kind, task_id: alerts.append((kind, task_id)),
         )
 

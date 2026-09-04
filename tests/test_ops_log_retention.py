@@ -25,7 +25,7 @@ import subprocess
 import tempfile
 import time
 import unittest
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 
 ROOT = Path(__file__).parents[1]
@@ -175,7 +175,7 @@ class MonitoringSampleRetentionTest(unittest.TestCase):
             )
             self.assertTrue(unrelated.exists(), "不匹配文件名的东西一个都不许动")
 
-            today = datetime.now(timezone.utc).strftime("%Y%m%d")
+            today = datetime.now(UTC).strftime("%Y%m%d")
             self.assertTrue((output_dir / f"resource-{today}.log").exists(), "本轮样本要写出来")
 
     def test_the_retention_window_is_configurable_and_can_be_disabled(self) -> None:
@@ -193,18 +193,14 @@ class MonitoringSampleRetentionTest(unittest.TestCase):
             self.assertTrue(old.exists())
 
             # 收紧到 5 天就该被清掉。
-            self._run_resource_sample(
-                output_dir, workspace, LINGXI_MONITORING_RETENTION_DAYS="5"
-            )
+            self._run_resource_sample(output_dir, workspace, LINGXI_MONITORING_RETENTION_DAYS="5")
             self.assertFalse(old.exists())
 
             # 0 表示关掉这条清理（不是"全删"）。
             revived = output_dir / "resource-20260102.log"
             revived.write_text("{}\n", encoding="utf-8")
             os.utime(revived, (now - 400 * 86400, now - 400 * 86400))
-            self._run_resource_sample(
-                output_dir, workspace, LINGXI_MONITORING_RETENTION_DAYS="0"
-            )
+            self._run_resource_sample(output_dir, workspace, LINGXI_MONITORING_RETENTION_DAYS="0")
             self.assertTrue(revived.exists(), "0 是关掉清理，不是无条件删除")
 
 

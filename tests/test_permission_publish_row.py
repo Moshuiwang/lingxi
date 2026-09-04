@@ -24,7 +24,7 @@ import base64
 import json
 import secrets
 import unittest
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta, timezone
 
 from lingxi.core.permission.publish_row import (
     ALL_COMPANIES_KEY,
@@ -59,7 +59,7 @@ TOKEN_CIPHER = "RklYRURJVjEyMzQ1Njc4OX5gpf2vKqJiLgzu2n4kug1V1rz6DDt1OCgAZVpg1pL+
 FAKE_GALAXY_USER = "9001"
 FAKE_EMAIL = "jiaming.jia@example.invalid"
 FAKE_NAME = "化名甲"
-DECIDED_AT = datetime(2026, 8, 17, 3, 0, tzinfo=timezone.utc)
+DECIDED_AT = datetime(2026, 8, 17, 3, 0, tzinfo=UTC)
 
 # 只登记两个受支持角色：`APP产品运营` / `A海外本地员工营业厅` 刻意不在映射里
 # （Issue #17 明确它们不映射），用例据此证明未映射角色不产生职能。
@@ -102,7 +102,9 @@ def _aggregate(
 
 class AggregateTest(unittest.TestCase):
     def test_supported_role_and_country_yield_company_and_function(self) -> None:
-        aggregate = _aggregate(roles=_roles("A商务", "A运营（OTT）"), countries=_countries("11", "12"))
+        aggregate = _aggregate(
+            roles=_roles("A商务", "A运营（OTT）"), countries=_countries("11", "12")
+        )
         self.assertTrue(aggregate.granted)
         # 公司用 boss_company_id（产品负责人 2026-08-05 决策 3），不是 country_key、
         # 也不是展示用的 name_cn。
@@ -156,8 +158,12 @@ class AggregateTest(unittest.TestCase):
         读。因此两条次序都要在这里各自成立，不能靠下游那一次排序兜底。
         """
 
-        forward = _aggregate(roles=_roles("A商务", "A运营（OTT）"), countries=_countries("11", "12"))
-        backward = _aggregate(roles=_roles("A运营（OTT）", "A商务"), countries=_countries("12", "11"))
+        forward = _aggregate(
+            roles=_roles("A商务", "A运营（OTT）"), countries=_countries("11", "12")
+        )
+        backward = _aggregate(
+            roles=_roles("A运营（OTT）", "A商务"), countries=_countries("12", "11")
+        )
         self.assertEqual(forward.companies, ("1011", "1012"))
         self.assertEqual(backward.companies, ("1011", "1012"))
         self.assertEqual(forward.functions, ("OTT", "商务"))
@@ -193,7 +199,9 @@ class AggregateTest(unittest.TestCase):
         self.assertNotIn(FAKE_GALAXY_USER, rendered)
 
     def test_audit_facts_reports_the_actual_company_count_when_not_wildcard(self) -> None:
-        aggregate = _aggregate(roles=_roles("A商务", "A运营（OTT）"), countries=_countries("11", "12"))
+        aggregate = _aggregate(
+            roles=_roles("A商务", "A运营（OTT）"), countries=_countries("11", "12")
+        )
         facts = aggregate.audit_facts()
         self.assertEqual(facts["companies"], 2)
         self.assertFalse(facts["all_companies"])
@@ -207,7 +215,9 @@ class AggregateTest(unittest.TestCase):
 
         aggregate = _aggregate(countries=_countries("0"))  # 银河「全非」通配
         self.assertTrue(aggregate.all_companies)
-        self.assertEqual(aggregate.companies, ("1011", "1012", "1013"), "companies 字段本身不受影响")
+        self.assertEqual(
+            aggregate.companies, ("1011", "1012", "1013"), "companies 字段本身不受影响"
+        )
 
         facts = aggregate.audit_facts()
 
@@ -223,7 +233,9 @@ class SerializationTest(unittest.TestCase):
     """
 
     def test_permissions_maps_company_id_to_function_list(self) -> None:
-        aggregate = _aggregate(roles=_roles("A运营（OTT）", "A商务"), countries=_countries("12", "11"))
+        aggregate = _aggregate(
+            roles=_roles("A运营（OTT）", "A商务"), countries=_countries("12", "11")
+        )
         text = serialize_permissions(aggregate)
         self.assertEqual(text, '{"1011":["OTT","商务"],"1012":["OTT","商务"]}')
         self.assertNotIn("\n", text)
@@ -244,7 +256,9 @@ class SerializationTest(unittest.TestCase):
         否则一次没有任何变化的重发会被读回比对判成不一致。
         """
 
-        forward = _aggregate(roles=_roles("A商务", "A运营（OTT）"), countries=_countries("11", "12"))
+        forward = _aggregate(
+            roles=_roles("A商务", "A运营（OTT）"), countries=_countries("11", "12")
+        )
         reversed_input = _aggregate(
             roles=_roles("A运营（OTT）", "A商务"), countries=_countries("12", "11")
         )
@@ -451,7 +465,7 @@ class TranslatedPublishRowTest(unittest.TestCase):
             company_metrics={"1011": ["日活", "收入"]},
             email=" Jia.Ming@Example.INVALID ",
             display_name="化名甲",
-            decided_at=datetime(2026, 8, 17, 3, 0, tzinfo=timezone.utc),
+            decided_at=datetime(2026, 8, 17, 3, 0, tzinfo=UTC),
             token_cipher=token_cipher,
         )
 
@@ -472,7 +486,7 @@ class TranslatedPublishRowTest(unittest.TestCase):
                 company_metrics={"1011": ["日活"]},
                 email="   ",
                 display_name="化名甲",
-                decided_at=datetime(2026, 8, 17, 3, 0, tzinfo=timezone.utc),
+                decided_at=datetime(2026, 8, 17, 3, 0, tzinfo=UTC),
             )
 
     def test_missing_display_name_is_rejected(self) -> None:
@@ -481,7 +495,7 @@ class TranslatedPublishRowTest(unittest.TestCase):
                 company_metrics={"1011": ["日活"]},
                 email="jia.ming@example.invalid",
                 display_name="  ",
-                decided_at=datetime(2026, 8, 17, 3, 0, tzinfo=timezone.utc),
+                decided_at=datetime(2026, 8, 17, 3, 0, tzinfo=UTC),
             )
 
     def test_uncovered_translation_input_cannot_produce_a_row(self) -> None:
@@ -493,7 +507,7 @@ class TranslatedPublishRowTest(unittest.TestCase):
                 company_metrics={},
                 email="jia.ming@example.invalid",
                 display_name="化名甲",
-                decided_at=datetime(2026, 8, 17, 3, 0, tzinfo=timezone.utc),
+                decided_at=datetime(2026, 8, 17, 3, 0, tzinfo=UTC),
             )
 
     def test_token_cipher_is_optional_like_the_untranslated_path(self) -> None:
@@ -545,7 +559,9 @@ class PublishRowTest(unittest.TestCase):
         self.assertEqual(
             set(self._row(token_cipher=TOKEN_CIPHER).snapshot_fields), set(CREATED_FIELD_NAMES)
         )
-        self.assertEqual(set(self._row(token_cipher=None).snapshot_fields), set(PUBLISHED_FIELD_NAMES))
+        self.assertEqual(
+            set(self._row(token_cipher=None).snapshot_fields), set(PUBLISHED_FIELD_NAMES)
+        )
 
     def test_plaintext_token_can_never_be_stored_as_a_cipher(self) -> None:
         """明文当密文传进来必须在 ``core`` 就被拦住（拿不到主密钥的地方也要拦得住）。
@@ -571,9 +587,7 @@ class PublishRowTest(unittest.TestCase):
 
     def test_content_fields_drop_only_the_timestamp(self) -> None:
         row = self._row()
-        self.assertEqual(
-            set(row.content_fields), set(PUBLISHED_FIELD_NAMES) - {"updated_at"}
-        )
+        self.assertEqual(set(row.content_fields), set(PUBLISHED_FIELD_NAMES) - {"updated_at"})
 
     def test_denied_user_cannot_produce_a_row(self) -> None:
         with self.assertRaises(ValueError):
@@ -667,7 +681,9 @@ class PermissionFallbackTest(unittest.TestCase):
                     parse_permissions(text)
 
     def test_round_trip_with_the_writer(self) -> None:
-        aggregate = _aggregate(roles=_roles("A商务", "A运营（OTT）"), countries=_countries("11", "12"))
+        aggregate = _aggregate(
+            roles=_roles("A商务", "A运营（OTT）"), countries=_countries("11", "12")
+        )
         document = parse_permissions(serialize_permissions(aggregate))
         self.assertEqual(lookup_metrics(document, "1011"), ("OTT", "商务"))
         self.assertEqual(lookup_metrics(document, "9999"), ())

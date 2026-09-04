@@ -251,7 +251,7 @@ jobs:
       # scripts/ci/check_migration_chain.sh（两条链建库对比）。不装它，这两步会
       # 明确失败而不是跳过，所以这一行就是 alembic 在 CI 里的安装点。
       - name: 安装测试依赖与锁定版本的 shellcheck
-        run: python3 -m pip install '.[scheduler,migrate]' 'shellcheck-py==0.11.0.1'
+        run: python3 -m pip install '.[scheduler,migrate]' 'shellcheck-py==0.11.0.1' 'ruff==0.16.4'
 
       # 测试跑 PYTHONPATH=src，部署跑 pip 装出来的制品；新增子目录会让两者分叉，
       # 而分叉只在部署时才暴露。必须在仓库目录之外跑，否则只是又测了一遍源码树。

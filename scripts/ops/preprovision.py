@@ -222,9 +222,7 @@ class PreprovisionReport:
     @property
     def grant_not_applied(self) -> int:
         return sum(
-            1
-            for item in self.outcomes
-            if item.outcome == OUTCOME_ALREADY_ACTIVE_GRANT_NOT_APPLIED
+            1 for item in self.outcomes if item.outcome == OUTCOME_ALREADY_ACTIVE_GRANT_NOT_APPLIED
         )
 
 
@@ -253,7 +251,9 @@ def load_roster(path: Path) -> tuple[RosterRow, ...]:
             if not raw or all(not cell.strip() for cell in raw):
                 continue
             if len(raw) != len(ROSTER_COLUMNS):
-                raise RosterError(f"第 {number} 行有 {len(raw)} 个字段，应为 {len(ROSTER_COLUMNS)} 个")
+                raise RosterError(
+                    f"第 {number} 行有 {len(raw)} 个字段，应为 {len(ROSTER_COLUMNS)} 个"
+                )
             email, position_name, company_scope = (cell.strip() for cell in raw)
             if not email or not position_name or not company_scope:
                 raise RosterError(f"第 {number} 行有空白字段：三列都必须填")
@@ -267,7 +267,9 @@ def load_roster(path: Path) -> tuple[RosterRow, ...]:
                 )
             seen[normalized] = number
             rows.append(
-                RosterRow(email=normalized, position_name=position_name, company_scope=company_scope)
+                RosterRow(
+                    email=normalized, position_name=position_name, company_scope=company_scope
+                )
             )
     if not rows:
         raise RosterError("名单没有任何数据行")
@@ -300,9 +302,7 @@ def plan_preprovision(
                 company_scope=row.company_scope,
                 role_function_map=role_function_map,
                 company_function_metric_map=company_function_metric_map,
-                available_companies=tuple(
-                    key for key in company_function_metric_map if key != "*"
-                ),
+                available_companies=tuple(key for key in company_function_metric_map if key != "*"),
             )
             plan = build_preprovision_grant_plan(expansion)
         except (ValueError, TypeError, KeyError) as error:
@@ -552,9 +552,14 @@ def main(argv: list[str] | None = None) -> int:
         help="兼容别名：与不传 --apply 时的默认行为等价，只出清单、零写入"
         "（与 --apply 同时给出时，按更保守的 --dry-run 处理）",
     )
-    parser.add_argument("--role-function-map", type=Path, default=None, help="覆盖随包发布的角色→职能映射文件")
     parser.add_argument(
-        "--company-function-metric-map", type=Path, default=None, help="覆盖随包发布的公司+职能→指标名映射文件"
+        "--role-function-map", type=Path, default=None, help="覆盖随包发布的角色→职能映射文件"
+    )
+    parser.add_argument(
+        "--company-function-metric-map",
+        type=Path,
+        default=None,
+        help="覆盖随包发布的公司+职能→指标名映射文件",
     )
     arguments = parser.parse_args(argv)
 
@@ -597,7 +602,9 @@ def main(argv: list[str] | None = None) -> int:
             arguments.company_function_metric_map
         )
     except (OSError, ValueError) as error:
-        print(f"公司+职能→指标名映射配置不可用，未做任何操作：{type(error).__name__}", file=sys.stderr)
+        print(
+            f"公司+职能→指标名映射配置不可用，未做任何操作：{type(error).__name__}", file=sys.stderr
+        )
         return 2
 
     try:
@@ -612,7 +619,9 @@ def main(argv: list[str] | None = None) -> int:
         return 2
 
     print_plan(items)
-    print(f"每一笔预授权都会合成一条终态 pending_action（reason={PREPROVISION_PENDING_ACTION_REASON}）。")
+    print(
+        f"每一笔预授权都会合成一条终态 pending_action（reason={PREPROVISION_PENDING_ACTION_REASON}）。"
+    )
 
     if arguments.apply and arguments.dry_run:
         print("同时给出 --apply 与 --dry-run：按更保守的 --dry-run 处理，未执行任何一人。")

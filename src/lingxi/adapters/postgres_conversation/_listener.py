@@ -1,6 +1,6 @@
-"""``task_queued`` 通道的 LISTEN 适配器（Issue #239 从 ``postgres_conversation.py``
-拆分而来）。兜底轮询仍是必需的，见 ``_transaction.py`` 里 ``TASK_QUEUED_CHANNEL``
-的说明。
+"""``task_queued`` 通道的 LISTEN 适配器。
+
+兜底轮询仍是必需的，见 ``_transaction.py`` 里 ``TASK_QUEUED_CHANNEL`` 的说明。
 """
 
 from __future__ import annotations
@@ -16,12 +16,15 @@ class PostgresTaskQueueListener:
     """短生命周期 LISTEN 适配器；服务仍需配合轮询，不能只信 NOTIFY。"""
 
     def __init__(self, dsn: str, *, timeouts: PostgresTimeouts = DEFAULT_POSTGRES_TIMEOUTS) -> None:
+        """记下 DSN 与超时配置；不在构造时连接数据库。"""
         self._dsn = dsn
         self._timeouts = timeouts
         self._connection: Any | None = None
 
-    def __enter__(self) -> "PostgresTaskQueueListener":
-        self._connection = connect(self._dsn, timeouts=self._timeouts, autocommit=True, dedicated=True)
+    def __enter__(self) -> PostgresTaskQueueListener:
+        self._connection = connect(
+            self._dsn, timeouts=self._timeouts, autocommit=True, dedicated=True
+        )
         self._connection.execute(f"LISTEN {TASK_QUEUED_CHANNEL}")
         return self
 

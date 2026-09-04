@@ -56,7 +56,9 @@ FAKE_DOC_TOKEN = "doxcnProbeDocumentDoNotPrint0001"
 
 
 def _load_script():
-    spec = importlib.util.spec_from_file_location("probe_drive_folder_permissions_under_test", SCRIPT)
+    spec = importlib.util.spec_from_file_location(
+        "probe_drive_folder_permissions_under_test", SCRIPT
+    )
     module = importlib.util.module_from_spec(spec)
     assert spec.loader is not None
     # 模块用了 @dataclass(frozen=True)；dataclasses 内部按 cls.__module__ 去
@@ -112,7 +114,14 @@ class FakeTransport:
         self.calls.append(
             (
                 "add_collaborator",
-                {"token": token, "obj_type": obj_type, "member_type": member_type, "member_id": member_id, "perm": perm, "notify": notify},
+                {
+                    "token": token,
+                    "obj_type": obj_type,
+                    "member_type": member_type,
+                    "member_id": member_id,
+                    "perm": perm,
+                    "notify": notify,
+                },
             )
         )
         return self._result("add_collaborator", default={})
@@ -172,7 +181,9 @@ class ProbeTestCase(unittest.TestCase):
 
         return FakeTransport(
             {
-                "get_root_folder_meta": [MODULE.ApiResult(True, 0, data={"token": FAKE_ROOT_TOKEN})],
+                "get_root_folder_meta": [
+                    MODULE.ApiResult(True, 0, data={"token": FAKE_ROOT_TOKEN})
+                ],
                 "create_folder": [MODULE.ApiResult(True, 0, data={"token": FAKE_FOLDER_TOKEN})],
             }
         )
@@ -184,19 +195,37 @@ class ProbeTestCase(unittest.TestCase):
 
         return FakeTransport(
             {
-                "get_root_folder_meta": [MODULE.ApiResult(True, 0, data={"token": FAKE_ROOT_TOKEN})],
+                "get_root_folder_meta": [
+                    MODULE.ApiResult(True, 0, data={"token": FAKE_ROOT_TOKEN})
+                ],
                 "create_folder": [MODULE.ApiResult(True, 0, data={"token": FAKE_FOLDER_TOKEN})],
                 "list_collaborators": [
                     MODULE.ApiResult(True, 0, data={"members": []}),  # 步骤 3：基线为空
-                    MODULE.ApiResult(True, 0, data={"members": [_member(FAKE_MEMBER_CROSS)]}),  # 步骤 4 读回
-                    MODULE.ApiResult(True, 0, data={"members": [_member(FAKE_MEMBER_CROSS), _member(FAKE_MEMBER_SAME)]}),  # 步骤 5 读回
-                    MODULE.ApiResult(True, 0, data={"members": [_member(FAKE_MEMBER_CROSS), _member(FAKE_MEMBER_SAME)]}),  # 步骤 6 目录重新读回
-                    MODULE.ApiResult(True, 0, data={"members": [_member(FAKE_MEMBER_CROSS), _member(FAKE_MEMBER_SAME)]}),  # 步骤 6 文档协作者
+                    MODULE.ApiResult(
+                        True, 0, data={"members": [_member(FAKE_MEMBER_CROSS)]}
+                    ),  # 步骤 4 读回
+                    MODULE.ApiResult(
+                        True,
+                        0,
+                        data={"members": [_member(FAKE_MEMBER_CROSS), _member(FAKE_MEMBER_SAME)]},
+                    ),  # 步骤 5 读回
+                    MODULE.ApiResult(
+                        True,
+                        0,
+                        data={"members": [_member(FAKE_MEMBER_CROSS), _member(FAKE_MEMBER_SAME)]},
+                    ),  # 步骤 6 目录重新读回
+                    MODULE.ApiResult(
+                        True,
+                        0,
+                        data={"members": [_member(FAKE_MEMBER_CROSS), _member(FAKE_MEMBER_SAME)]},
+                    ),  # 步骤 6 文档协作者
                 ],
             }
         )
 
-    def run_steps_individually(self, transport: FakeTransport, upto: int, *, extra_argv: list[str] | None = None):
+    def run_steps_individually(
+        self, transport: FakeTransport, upto: int, *, extra_argv: list[str] | None = None
+    ):
         """依次以独立调用跑完 1..upto（模拟真实分步操作），返回每步的
         ``(code, out, err)`` 列表。"""
 
@@ -245,7 +274,9 @@ class HardStopTests(ProbeTestCase):
         transport._responses["list_collaborators"] = [
             MODULE.ApiResult(True, 0, data={"members": [_member("ou_surprise")]})
         ]
-        code, out, _ = self.run_main(["--from-step", "1", "--execute", "--t-neg-01-result", "denied"], transport)
+        code, out, _ = self.run_main(
+            ["--from-step", "1", "--execute", "--t-neg-01-result", "denied"], transport
+        )
         self.assertEqual(code, 3, "命中硬停止的退出码必须是 3，不是 0 也不是 1")
         payload = json.loads(out)
         self.assertEqual(payload["halted_at_step"], 3)
@@ -258,9 +289,13 @@ class HardStopTests(ProbeTestCase):
         transport = self.granted_folder_transport()
         transport._responses["list_collaborators"] = [
             MODULE.ApiResult(True, 0, data={"members": []}),  # 步骤 3 初始读回：空，正常
-            MODULE.ApiResult(True, 0, data={"members": []}),  # 步骤 4 授权后读回：仍然是空 —— 不符合预期
+            MODULE.ApiResult(
+                True, 0, data={"members": []}
+            ),  # 步骤 4 授权后读回：仍然是空 —— 不符合预期
         ]
-        code, out, _ = self.run_main(["--from-step", "1", "--execute", "--t-neg-01-result", "denied"], transport)
+        code, out, _ = self.run_main(
+            ["--from-step", "1", "--execute", "--t-neg-01-result", "denied"], transport
+        )
         self.assertEqual(code, 3)
         payload = json.loads(out)
         self.assertEqual(payload["halted_at_step"], 4)
@@ -274,7 +309,9 @@ class HardStopTests(ProbeTestCase):
             # 步骤 5 授权后读回：还是只有 1 个协作者，T-Same-01 没有真的加进去
             MODULE.ApiResult(True, 0, data={"members": [_member(FAKE_MEMBER_CROSS)]}),
         ]
-        code, out, _ = self.run_main(["--from-step", "1", "--execute", "--t-neg-01-result", "denied"], transport)
+        code, out, _ = self.run_main(
+            ["--from-step", "1", "--execute", "--t-neg-01-result", "denied"], transport
+        )
         self.assertEqual(code, 3)
         payload = json.loads(out)
         self.assertEqual(payload["halted_at_step"], 5)
@@ -284,13 +321,19 @@ class HardStopTests(ProbeTestCase):
         transport._responses["list_collaborators"] = [
             MODULE.ApiResult(True, 0, data={"members": []}),
             MODULE.ApiResult(True, 0, data={"members": [_member(FAKE_MEMBER_CROSS)]}),
-            MODULE.ApiResult(True, 0, data={"members": [_member(FAKE_MEMBER_CROSS), _member(FAKE_MEMBER_SAME)]}),
+            MODULE.ApiResult(
+                True, 0, data={"members": [_member(FAKE_MEMBER_CROSS), _member(FAKE_MEMBER_SAME)]}
+            ),
             # 步骤 6 先重新读一次目录当前协作者（与上一行一致，两人）
-            MODULE.ApiResult(True, 0, data={"members": [_member(FAKE_MEMBER_CROSS), _member(FAKE_MEMBER_SAME)]}),
+            MODULE.ApiResult(
+                True, 0, data={"members": [_member(FAKE_MEMBER_CROSS), _member(FAKE_MEMBER_SAME)]}
+            ),
             # 文档协作者只继承了一个人，另一人没继承
             MODULE.ApiResult(True, 0, data={"members": [_member(FAKE_MEMBER_CROSS)]}),
         ]
-        code, out, _ = self.run_main(["--from-step", "1", "--execute", "--t-neg-01-result", "denied"], transport)
+        code, out, _ = self.run_main(
+            ["--from-step", "1", "--execute", "--t-neg-01-result", "denied"], transport
+        )
         self.assertEqual(code, 3)
         payload = json.loads(out)
         self.assertEqual(payload["halted_at_step"], 6)
@@ -305,20 +348,32 @@ class HardStopTests(ProbeTestCase):
         class _FolderVsDocumentTransport(FakeTransport):
             def list_collaborators(self, *, token, obj_type):
                 if obj_type == "docx":
-                    self.calls.append(("list_collaborators", {"token": token, "obj_type": obj_type}))
+                    self.calls.append(
+                        ("list_collaborators", {"token": token, "obj_type": obj_type})
+                    )
                     return MODULE.ApiResult(
-                        True, 0, data={"members": [_member(FAKE_MEMBER_CROSS), _member(FAKE_MEMBER_SAME)]}
+                        True,
+                        0,
+                        data={"members": [_member(FAKE_MEMBER_CROSS), _member(FAKE_MEMBER_SAME)]},
                     )
                 return super().list_collaborators(token=token, obj_type=obj_type)
 
         transport = _FolderVsDocumentTransport(
             {
-                "get_root_folder_meta": [MODULE.ApiResult(True, 0, data={"token": FAKE_ROOT_TOKEN})],
+                "get_root_folder_meta": [
+                    MODULE.ApiResult(True, 0, data={"token": FAKE_ROOT_TOKEN})
+                ],
                 "create_folder": [MODULE.ApiResult(True, 0, data={"token": FAKE_FOLDER_TOKEN})],
                 "list_collaborators": [
                     MODULE.ApiResult(True, 0, data={"members": []}),  # 步骤 3
-                    MODULE.ApiResult(True, 0, data={"members": [_member(FAKE_MEMBER_CROSS)]}),  # 步骤 4
-                    MODULE.ApiResult(True, 0, data={"members": [_member(FAKE_MEMBER_CROSS), _member(FAKE_MEMBER_SAME)]}),  # 步骤 5
+                    MODULE.ApiResult(
+                        True, 0, data={"members": [_member(FAKE_MEMBER_CROSS)]}
+                    ),  # 步骤 4
+                    MODULE.ApiResult(
+                        True,
+                        0,
+                        data={"members": [_member(FAKE_MEMBER_CROSS), _member(FAKE_MEMBER_SAME)]},
+                    ),  # 步骤 5
                     # 步骤 6 的"重新读回"：目录实际已经多了一个意外协作者
                     MODULE.ApiResult(
                         True,
@@ -334,7 +389,9 @@ class HardStopTests(ProbeTestCase):
                 ],
             }
         )
-        code, out, _ = self.run_main(["--from-step", "1", "--execute", "--t-neg-01-result", "denied"], transport)
+        code, out, _ = self.run_main(
+            ["--from-step", "1", "--execute", "--t-neg-01-result", "denied"], transport
+        )
         self.assertEqual(code, 3)
         payload = json.loads(out)
         self.assertEqual(payload["halted_at_step"], 6)
@@ -349,9 +406,15 @@ class HardStopTests(ProbeTestCase):
             MODULE.ApiResult(True, 0, data={"members": []}),  # 步骤 3
             MODULE.ApiResult(True, 0, data={"members": [_member(FAKE_MEMBER_CROSS)]}),  # 步骤 4
             # 步骤 5 读回：T-Same-01 确实在，但另一个不是 T-Cross-01，是意外成员
-            MODULE.ApiResult(True, 0, data={"members": [_member(FAKE_MEMBER_SAME), _member("ou_unexpected_extra")]}),
+            MODULE.ApiResult(
+                True,
+                0,
+                data={"members": [_member(FAKE_MEMBER_SAME), _member("ou_unexpected_extra")]},
+            ),
         ]
-        code, out, _ = self.run_main(["--from-step", "1", "--execute", "--t-neg-01-result", "denied"], transport)
+        code, out, _ = self.run_main(
+            ["--from-step", "1", "--execute", "--t-neg-01-result", "denied"], transport
+        )
         self.assertEqual(code, 3)
         payload = json.loads(out)
         self.assertEqual(payload["halted_at_step"], 5)
@@ -365,9 +428,13 @@ class HardStopTests(ProbeTestCase):
         transport._responses["list_collaborators"] = [
             MODULE.ApiResult(True, 0, data={"members": []}),  # 步骤 3
             # 步骤 4 读回：member_id/perm 都对，但类型是 email 不是 openid
-            MODULE.ApiResult(True, 0, data={"members": [_member(FAKE_MEMBER_CROSS, member_type="email")]}),
+            MODULE.ApiResult(
+                True, 0, data={"members": [_member(FAKE_MEMBER_CROSS, member_type="email")]}
+            ),
         ]
-        code, out, _ = self.run_main(["--from-step", "1", "--execute", "--t-neg-01-result", "denied"], transport)
+        code, out, _ = self.run_main(
+            ["--from-step", "1", "--execute", "--t-neg-01-result", "denied"], transport
+        )
         self.assertEqual(code, 3)
         payload = json.loads(out)
         self.assertEqual(payload["halted_at_step"], 4)
@@ -380,9 +447,13 @@ class HardStopTests(ProbeTestCase):
         transport._responses["list_collaborators"] = [
             MODULE.ApiResult(True, 0, data={"members": []}),  # 步骤 3
             # 步骤 4 读回：T-Cross-01 出现了两次（重复条目）
-            MODULE.ApiResult(True, 0, data={"members": [_member(FAKE_MEMBER_CROSS), _member(FAKE_MEMBER_CROSS)]}),
+            MODULE.ApiResult(
+                True, 0, data={"members": [_member(FAKE_MEMBER_CROSS), _member(FAKE_MEMBER_CROSS)]}
+            ),
         ]
-        code, out, _ = self.run_main(["--from-step", "1", "--execute", "--t-neg-01-result", "denied"], transport)
+        code, out, _ = self.run_main(
+            ["--from-step", "1", "--execute", "--t-neg-01-result", "denied"], transport
+        )
         self.assertEqual(code, 3)
         payload = json.loads(out)
         self.assertEqual(payload["halted_at_step"], 4)
@@ -390,7 +461,9 @@ class HardStopTests(ProbeTestCase):
 
     def test_step_8_halts_when_t_neg_01_can_unexpectedly_access(self) -> None:
         transport = FakeTransport()
-        code, out, _ = self.run_main(["--step", "8", "--execute", "--t-neg-01-result", "allowed"], transport)
+        code, out, _ = self.run_main(
+            ["--step", "8", "--execute", "--t-neg-01-result", "allowed"], transport
+        )
         self.assertEqual(code, 3)
         payload = json.loads(out)
         self.assertEqual(payload["halted_at_step"], 8)
@@ -398,7 +471,9 @@ class HardStopTests(ProbeTestCase):
 
     def test_step_8_does_not_halt_when_access_is_denied(self) -> None:
         transport = FakeTransport()
-        code, _, _ = self.run_main(["--step", "8", "--execute", "--t-neg-01-result", "denied"], transport)
+        code, _, _ = self.run_main(
+            ["--step", "8", "--execute", "--t-neg-01-result", "denied"], transport
+        )
         self.assertEqual(code, 0)
 
     def test_halt_automatically_triggers_cleanup_in_the_same_invocation(self) -> None:
@@ -406,11 +481,15 @@ class HardStopTests(ProbeTestCase):
         transport._responses["list_collaborators"] = [
             MODULE.ApiResult(True, 0, data={"members": [_member("ou_surprise")]})
         ]
-        code, out, _ = self.run_main(["--from-step", "1", "--execute", "--t-neg-01-result", "denied"], transport)
+        code, out, _ = self.run_main(
+            ["--from-step", "1", "--execute", "--t-neg-01-result", "denied"], transport
+        )
         self.assertEqual(code, 3)
         payload = json.loads(out)
         step_numbers = [s["step"] for s in payload["steps"]]
-        self.assertIn(9, step_numbers, "命中硬停止后必须在同一次调用里自动进入清理，不能留给操作者手动补跑")
+        self.assertIn(
+            9, step_numbers, "命中硬停止后必须在同一次调用里自动进入清理，不能留给操作者手动补跑"
+        )
         self.assertTrue(any(name == "delete_file" for name, _ in transport.calls))
 
     def test_no_flag_exists_to_bypass_or_retry_past_a_halt(self) -> None:
@@ -419,7 +498,15 @@ class HardStopTests(ProbeTestCase):
 
         parser = MODULE.build_arg_parser()
         option_strings = {opt for action in parser._actions for opt in action.option_strings}
-        forbidden_fragments = ("force", "retry", "override", "bypass", "expand", "ignore-halt", "skip")
+        forbidden_fragments = (
+            "force",
+            "retry",
+            "override",
+            "bypass",
+            "expand",
+            "ignore-halt",
+            "skip",
+        )
         for option in option_strings:
             for fragment in forbidden_fragments:
                 self.assertNotIn(fragment, option.lower(), f"{option} 看起来像一个绕过硬停止的开关")
@@ -429,7 +516,9 @@ class HardStopTests(ProbeTestCase):
         transport._responses["list_collaborators"] = [
             MODULE.ApiResult(True, 0, data={"members": [_member("ou_surprise")]})
         ]
-        code, _, _ = self.run_main(["--from-step", "1", "--execute", "--t-neg-01-result", "denied"], transport)
+        code, _, _ = self.run_main(
+            ["--from-step", "1", "--execute", "--t-neg-01-result", "denied"], transport
+        )
         self.assertEqual(code, 3)
 
         blocked_transport = FakeTransport()
@@ -439,7 +528,9 @@ class HardStopTests(ProbeTestCase):
         self.assertIn("硬停止", err)
 
         blocked_transport_2 = FakeTransport()
-        code2, _, _ = self.run_main(["--from-step", "1", "--execute", "--t-neg-01-result", "denied"], blocked_transport_2)
+        code2, _, _ = self.run_main(
+            ["--from-step", "1", "--execute", "--t-neg-01-result", "denied"], blocked_transport_2
+        )
         self.assertEqual(code2, 3)
         self.assertEqual(blocked_transport_2.calls, [])
 
@@ -472,8 +563,14 @@ class BaselineAlignmentTests(ProbeTestCase):
         transport = self.granted_folder_transport()
         transport._responses["list_collaborators"] = [
             MODULE.ApiResult(True, 0, data={"members": [creator]}),  # 步骤 3
-            MODULE.ApiResult(True, 0, data={"members": [creator, _member(FAKE_MEMBER_CROSS)]}),  # 步骤 4
-            MODULE.ApiResult(True, 0, data={"members": [creator, _member(FAKE_MEMBER_CROSS), _member(FAKE_MEMBER_SAME)]}),  # 步骤 5
+            MODULE.ApiResult(
+                True, 0, data={"members": [creator, _member(FAKE_MEMBER_CROSS)]}
+            ),  # 步骤 4
+            MODULE.ApiResult(
+                True,
+                0,
+                data={"members": [creator, _member(FAKE_MEMBER_CROSS), _member(FAKE_MEMBER_SAME)]},
+            ),  # 步骤 5
         ]
         results = self.run_steps_individually(transport, 5)
         codes = [code for code, _, _ in results]
@@ -487,7 +584,9 @@ class BaselineAlignmentTests(ProbeTestCase):
 
 
 class Step8UpfrontGuardTests(ProbeTestCase):
-    def test_all_execute_without_t_neg_01_result_makes_no_real_calls_and_no_state_file(self) -> None:
+    def test_all_execute_without_t_neg_01_result_makes_no_real_calls_and_no_state_file(
+        self,
+    ) -> None:
         """独立审查 M1 的核心场景：文档给的示例就是 `--all --execute`（不带该
         参数）；如果没有这条前置检查，步骤 1-7 会先都真的跑完，才在步骤 8 因为
         用法错误退出——那时真实对象已经建好，却既不保存状态也不清理。"""
@@ -496,7 +595,9 @@ class Step8UpfrontGuardTests(ProbeTestCase):
         code, _, err = self.run_main(["--all", "--execute"], transport)
         self.assertEqual(code, 2)
         self.assertEqual(transport.calls, [], "缺 --t-neg-01-result 时不应该发起任何一次真实调用")
-        self.assertFalse(self.state_file_path().exists(), "在发出任何请求之前拒绝，不应该创建状态文件")
+        self.assertFalse(
+            self.state_file_path().exists(), "在发出任何请求之前拒绝，不应该创建状态文件"
+        )
         self.assertIn("t-neg-01-result", err)
 
     def test_from_step_covering_step_8_without_result_is_also_rejected_upfront(self) -> None:
@@ -556,7 +657,9 @@ class Step7PrerequisiteTests(ProbeTestCase):
         code, _, err = self.run_main(["--step", "7", "--execute"], transport)
         self.assertEqual(code, 2, "缺前置步骤是用法错误（退出码 2），不是硬停止（退出码 3）")
         self.assertIn("step_7_requires_steps_3_through_6", err)
-        self.assertEqual(transport.calls, [], "被拒绝的这次调用不应该碰传输层——不能先写了才发现前置条件不满足")
+        self.assertEqual(
+            transport.calls, [], "被拒绝的这次调用不应该碰传输层——不能先写了才发现前置条件不满足"
+        )
 
     def test_step_7_succeeds_once_steps_3_through_6_are_actually_done(self) -> None:
         transport = self.happy_path_transport()
@@ -575,7 +678,9 @@ class Step7ExtraTokenCleanupTests(ProbeTestCase):
     def test_step_7_records_a_different_repeat_token_for_cleanup(self) -> None:
         transport = self.happy_path_transport()
         self.run_steps_individually(transport, 6)
-        transport._responses["create_folder"] = [MODULE.ApiResult(True, 0, data={"token": FAKE_EXTRA_FOLDER_TOKEN})]
+        transport._responses["create_folder"] = [
+            MODULE.ApiResult(True, 0, data={"token": FAKE_EXTRA_FOLDER_TOKEN})
+        ]
         code, _, _ = self.run_main(["--step", "7", "--execute"], transport)
         self.assertEqual(code, 0)
         state = self.read_state()
@@ -587,7 +692,9 @@ class Step7ExtraTokenCleanupTests(ProbeTestCase):
 
         transport = self.happy_path_transport()
         self.run_steps_individually(transport, 6)
-        transport._responses["create_folder"] = [MODULE.ApiResult(True, 0, data={"token": FAKE_EXTRA_FOLDER_TOKEN})]
+        transport._responses["create_folder"] = [
+            MODULE.ApiResult(True, 0, data={"token": FAKE_EXTRA_FOLDER_TOKEN})
+        ]
         self.run_main(["--step", "7", "--execute"], transport)
 
         code, out, _ = self.run_main(["--cleanup-only", "--execute"], transport)
@@ -596,7 +703,9 @@ class Step7ExtraTokenCleanupTests(ProbeTestCase):
         self.assertEqual(payload["extra_folders_deleted_count"], 1)
         self.assertEqual(payload["extra_folders_pending_count"], 0)
         self.assertTrue(payload["complete"])
-        deleted_tokens = {call_args["token"] for name, call_args in transport.calls if name == "delete_file"}
+        deleted_tokens = {
+            call_args["token"] for name, call_args in transport.calls if name == "delete_file"
+        }
         self.assertIn(FAKE_FOLDER_TOKEN, deleted_tokens)
         self.assertIn(FAKE_EXTRA_FOLDER_TOKEN, deleted_tokens)
         state = self.read_state()
@@ -627,15 +736,21 @@ class CollaboratorClaimHonestyTests(ProbeTestCase):
 
     def test_not_established_when_halted(self) -> None:
         transport = self.granted_folder_transport()
-        transport._responses["list_collaborators"] = [MODULE.ApiResult(True, 0, data={"members": [_member("ou_surprise")]})]
-        code, out, _ = self.run_main(["--from-step", "1", "--execute", "--t-neg-01-result", "denied"], transport)
+        transport._responses["list_collaborators"] = [
+            MODULE.ApiResult(True, 0, data={"members": [_member("ou_surprise")]})
+        ]
+        code, out, _ = self.run_main(
+            ["--from-step", "1", "--execute", "--t-neg-01-result", "denied"], transport
+        )
         self.assertEqual(code, 3)
         self.assertEqual(json.loads(out)["collaborator_claim"], "not_established")
 
     def test_established_only_after_steps_3_through_6_all_complete(self) -> None:
         transport = self.happy_path_transport()
         results = self.run_steps_individually(transport, 6)
-        codes_and_claims = [(code, json.loads(out)["collaborator_claim"]) for code, out, _ in results]
+        codes_and_claims = [
+            (code, json.loads(out)["collaborator_claim"]) for code, out, _ in results
+        ]
         # 前 5 步（1、2、3、4、5）都还没有把 3/4/5/6 全部跑完，必须是 not_established；
         # 第 6 步跑完之后（索引 5，对应"步骤 6"）才允许转正。
         for index, (code, claim) in enumerate(codes_and_claims[:5], start=1):
@@ -660,7 +775,13 @@ class RedactionTests(ProbeTestCase):
             _, step_out, _ = self.run_main(["--step", str(step), "--execute"], transport)
             combined_out += step_out
 
-        for secret in (FAKE_MEMBER_CROSS, FAKE_MEMBER_SAME, FAKE_ROOT_TOKEN, FAKE_FOLDER_TOKEN, "fake_secret_do_not_print"):
+        for secret in (
+            FAKE_MEMBER_CROSS,
+            FAKE_MEMBER_SAME,
+            FAKE_ROOT_TOKEN,
+            FAKE_FOLDER_TOKEN,
+            "fake_secret_do_not_print",
+        ):
             self.assertNotIn(secret, combined_out, f"{secret!r} 完整出现在了 stdout 里")
 
     def test_redact_id_never_returns_the_full_value(self) -> None:
@@ -736,7 +857,9 @@ class PathRedactionTests(ProbeTestCase):
         self.assertIn("drive_folder_probe_state.json", err)
 
     def test_redact_path_only_keeps_the_filename(self) -> None:
-        redacted = MODULE.redact_path(Path("/home/wangzhipeng/secret/drive_folder_probe_state.json"))
+        redacted = MODULE.redact_path(
+            Path("/home/wangzhipeng/secret/drive_folder_probe_state.json")
+        )
         self.assertNotIn("wangzhipeng", redacted)
         self.assertNotIn("secret", redacted)
         self.assertTrue(redacted.endswith("drive_folder_probe_state.json"))
@@ -757,8 +880,12 @@ class NoStateFileOverrideTests(ProbeTestCase):
 class GlobalHaltSentinelTests(ProbeTestCase):
     def test_switching_state_dir_after_a_halt_is_still_blocked(self) -> None:
         transport = self.granted_folder_transport()
-        transport._responses["list_collaborators"] = [MODULE.ApiResult(True, 0, data={"members": [_member("ou_surprise")]})]
-        code, _, _ = self.run_main(["--from-step", "1", "--execute", "--t-neg-01-result", "denied"], transport)
+        transport._responses["list_collaborators"] = [
+            MODULE.ApiResult(True, 0, data={"members": [_member("ou_surprise")]})
+        ]
+        code, _, _ = self.run_main(
+            ["--from-step", "1", "--execute", "--t-neg-01-result", "denied"], transport
+        )
         self.assertEqual(code, 3)
 
         fresh_dir = self.state_dir / "brand-new-unrelated-directory"
@@ -774,15 +901,23 @@ class GlobalHaltSentinelTests(ProbeTestCase):
 
     def test_sentinel_does_not_block_cleanup_only(self) -> None:
         transport = self.granted_folder_transport()
-        transport._responses["list_collaborators"] = [MODULE.ApiResult(True, 0, data={"members": [_member("ou_surprise")]})]
-        code, _, _ = self.run_main(["--from-step", "1", "--execute", "--t-neg-01-result", "denied"], transport)
+        transport._responses["list_collaborators"] = [
+            MODULE.ApiResult(True, 0, data={"members": [_member("ou_surprise")]})
+        ]
+        code, _, _ = self.run_main(
+            ["--from-step", "1", "--execute", "--t-neg-01-result", "denied"], transport
+        )
         self.assertEqual(code, 3)
         code_cleanup, _, _ = self.run_main(["--cleanup-only", "--execute"], transport)
-        self.assertEqual(code_cleanup, 0, "--cleanup-only 必须始终放行，否则命中硬停止后连清理都做不了")
+        self.assertEqual(
+            code_cleanup, 0, "--cleanup-only 必须始终放行，否则命中硬停止后连清理都做不了"
+        )
 
     def test_sentinel_is_written_with_only_redacted_state_dir(self) -> None:
         transport = self.granted_folder_transport()
-        transport._responses["list_collaborators"] = [MODULE.ApiResult(True, 0, data={"members": [_member("ou_surprise")]})]
+        transport._responses["list_collaborators"] = [
+            MODULE.ApiResult(True, 0, data={"members": [_member("ou_surprise")]})
+        ]
         self.run_main(["--from-step", "1", "--execute", "--t-neg-01-result", "denied"], transport)
         payload = json.loads(self.halt_sentinel_path.read_text(encoding="utf-8"))
         self.assertEqual(payload["step"], 3)
@@ -790,8 +925,12 @@ class GlobalHaltSentinelTests(ProbeTestCase):
 
     def test_step_9_is_treated_the_same_as_cleanup_only_by_both_gates(self) -> None:
         transport = self.granted_folder_transport()
-        transport._responses["list_collaborators"] = [MODULE.ApiResult(True, 0, data={"members": [_member("ou_surprise")]})]
-        code, _, _ = self.run_main(["--from-step", "1", "--execute", "--t-neg-01-result", "denied"], transport)
+        transport._responses["list_collaborators"] = [
+            MODULE.ApiResult(True, 0, data={"members": [_member("ou_surprise")]})
+        ]
+        code, _, _ = self.run_main(
+            ["--from-step", "1", "--execute", "--t-neg-01-result", "denied"], transport
+        )
         self.assertEqual(code, 3)
         code_step9, _, _ = self.run_main(["--step", "9", "--execute"], transport)
         self.assertEqual(code_step9, 0, "--step 9 应该和 --cleanup-only 一样被放行")
@@ -814,9 +953,13 @@ class GlobalHaltSentinelTests(ProbeTestCase):
             calls_order.append("lock_exit")
 
         transport = self.granted_folder_transport()
-        transport._responses["list_collaborators"] = [MODULE.ApiResult(True, 0, data={"members": [_member("ou_surprise")]})]
+        transport._responses["list_collaborators"] = [
+            MODULE.ApiResult(True, 0, data={"members": [_member("ou_surprise")]})
+        ]
         with patch.object(MODULE, "_locked_sentinel", _tracking_locked_sentinel):
-            code, _, _ = self.run_main(["--from-step", "1", "--execute", "--t-neg-01-result", "denied"], transport)
+            code, _, _ = self.run_main(
+                ["--from-step", "1", "--execute", "--t-neg-01-result", "denied"], transport
+            )
         self.assertEqual(code, 3)
         # 至少两次进出：一次是启动时的哨兵检查，一次是命中硬停止后的哨兵写入。
         self.assertGreaterEqual(calls_order.count("lock_enter"), 2)
@@ -833,7 +976,10 @@ class MissingEnvironmentTests(ProbeTestCase):
         out, err = io.StringIO(), io.StringIO()
         with redirect_stdout(out), redirect_stderr(err):
             code = MODULE.main(
-                ["--all"], transport=FakeTransport(), env={}, halt_sentinel_path=self.halt_sentinel_path
+                ["--all"],
+                transport=FakeTransport(),
+                env={},
+                halt_sentinel_path=self.halt_sentinel_path,
             )
         self.assertEqual(code, 2)
         self.assertIn("LINGXI_DRIVE_PROBE_APP_ID", err.getvalue())
@@ -851,8 +997,12 @@ class IdempotencyObservationTests(ProbeTestCase):
     def test_step_7_never_halts_regardless_of_repeat_outcome(self) -> None:
         transport = self.happy_path_transport()
         self.run_steps_individually(transport, 6)
-        transport._responses["create_folder"] = [MODULE.ApiResult(False, 1062507, msg="folder already exists")]
-        transport._responses["add_collaborator"] = [MODULE.ApiResult(False, 99991672, msg="duplicate member")]
+        transport._responses["create_folder"] = [
+            MODULE.ApiResult(False, 1062507, msg="folder already exists")
+        ]
+        transport._responses["add_collaborator"] = [
+            MODULE.ApiResult(False, 99991672, msg="duplicate member")
+        ]
         code, out, _ = self.run_main(["--step", "7", "--execute"], transport)
         self.assertEqual(code, 0, "重复调用无论成败都不算失败")
         payload = json.loads(out)
@@ -896,7 +1046,9 @@ class CleanupReentrancyTests(ProbeTestCase):
         self.assertTrue(json.loads(first_out)["steps"][0]["complete"])
 
         second_transport = FakeTransport()
-        second_code, second_out, _ = self.run_main(["--cleanup-only", "--execute"], second_transport)
+        second_code, second_out, _ = self.run_main(
+            ["--cleanup-only", "--execute"], second_transport
+        )
         self.assertEqual(second_code, 0)
         self.assertEqual(second_transport.calls, [], "已经清空的状态不应该再触发任何真实调用")
 
@@ -908,7 +1060,9 @@ class CleanupReentrancyTests(ProbeTestCase):
         ]
         self.run_steps_individually(transport, 4)
 
-        transport._responses["remove_collaborator"] = [MODULE.ApiResult(False, 99991672, msg="remove failed")]
+        transport._responses["remove_collaborator"] = [
+            MODULE.ApiResult(False, 99991672, msg="remove failed")
+        ]
         code, out, _ = self.run_main(["--cleanup-only", "--execute"], transport)
         self.assertEqual(code, 3, "清理不完整不能返回成功退出码")
         payload = json.loads(out)["steps"][0]
@@ -951,7 +1105,9 @@ class AbbreviationTests(ProbeTestCase):
                             halt_sentinel_path=self.halt_sentinel_path,
                         )
                 self.assertEqual(raised.exception.code, 2)
-                self.assertEqual(transport.calls, [], f"{abbreviation} 不应该发起任何一次传输层调用")
+                self.assertEqual(
+                    transport.calls, [], f"{abbreviation} 不应该发起任何一次传输层调用"
+                )
 
 
 class CliSurfaceAuditTests(ProbeTestCase):
@@ -983,11 +1139,15 @@ class CliSurfaceAuditTests(ProbeTestCase):
 class OnlyOwnerAccessibleClaimTests(ProbeTestCase):
     def test_stays_unknown_even_when_every_step_succeeds(self) -> None:
         transport = self.happy_path_transport()
-        code, out, _ = self.run_main(["--from-step", "1", "--execute", "--t-neg-01-result", "denied"], transport)
+        code, out, _ = self.run_main(
+            ["--from-step", "1", "--execute", "--t-neg-01-result", "denied"], transport
+        )
         self.assertEqual(code, 0)
         payload = json.loads(out)
         self.assertEqual(payload["collaborator_claim"], "collaborator_list_matches_expected")
-        self.assertEqual(payload["only_owner_accessible"], "unknown", "全部步骤成功也不能把这个字段写成 ok")
+        self.assertEqual(
+            payload["only_owner_accessible"], "unknown", "全部步骤成功也不能把这个字段写成 ok"
+        )
 
     def test_stays_unknown_in_dry_run_too(self) -> None:
         code, out, _ = self.run_main(["--all"], FakeTransport())
@@ -1062,18 +1222,34 @@ class HaltCleanupCrashTests(ProbeTestCase):
 
         transport = _CrashingTransport(
             {
-                "get_root_folder_meta": [MODULE.ApiResult(True, 0, data={"token": FAKE_ROOT_TOKEN})],
+                "get_root_folder_meta": [
+                    MODULE.ApiResult(True, 0, data={"token": FAKE_ROOT_TOKEN})
+                ],
                 "create_folder": [MODULE.ApiResult(True, 0, data={"token": FAKE_FOLDER_TOKEN})],
                 "list_collaborators": [
                     MODULE.ApiResult(True, 0, data={"members": []}),  # 步骤 3
-                    MODULE.ApiResult(True, 0, data={"members": [_member(FAKE_MEMBER_CROSS)]}),  # 步骤 4
-                    MODULE.ApiResult(True, 0, data={"members": [_member(FAKE_MEMBER_CROSS), _member(FAKE_MEMBER_SAME)]}),  # 步骤 5
-                    MODULE.ApiResult(True, 0, data={"members": [_member(FAKE_MEMBER_CROSS), _member(FAKE_MEMBER_SAME)]}),  # 步骤 6 folder 重新读回
-                    MODULE.ApiResult(True, 0, data={"members": [_member(FAKE_MEMBER_CROSS)]}),  # 步骤 6 文档协作者：不一致，触发硬停止
+                    MODULE.ApiResult(
+                        True, 0, data={"members": [_member(FAKE_MEMBER_CROSS)]}
+                    ),  # 步骤 4
+                    MODULE.ApiResult(
+                        True,
+                        0,
+                        data={"members": [_member(FAKE_MEMBER_CROSS), _member(FAKE_MEMBER_SAME)]},
+                    ),  # 步骤 5
+                    MODULE.ApiResult(
+                        True,
+                        0,
+                        data={"members": [_member(FAKE_MEMBER_CROSS), _member(FAKE_MEMBER_SAME)]},
+                    ),  # 步骤 6 folder 重新读回
+                    MODULE.ApiResult(
+                        True, 0, data={"members": [_member(FAKE_MEMBER_CROSS)]}
+                    ),  # 步骤 6 文档协作者：不一致，触发硬停止
                 ],
             }
         )
-        code, out, err = self.run_main(["--from-step", "1", "--execute", "--t-neg-01-result", "denied"], transport)
+        code, out, err = self.run_main(
+            ["--from-step", "1", "--execute", "--t-neg-01-result", "denied"], transport
+        )
         self.assertEqual(code, 3)
         self.assertIn("ConnectionError", err)
 
@@ -1097,9 +1273,13 @@ class PersistenceFailureTests(ProbeTestCase):
 
     def test_sentinel_write_failure_is_reported_and_exits_nonzero(self) -> None:
         transport = self.granted_folder_transport()
-        transport._responses["list_collaborators"] = [MODULE.ApiResult(True, 0, data={"members": [_member("ou_surprise")]})]
+        transport._responses["list_collaborators"] = [
+            MODULE.ApiResult(True, 0, data={"members": [_member("ou_surprise")]})
+        ]
         with patch.object(MODULE, "_write_halt_sentinel", side_effect=OSError("simulated")):
-            code, _, err = self.run_main(["--from-step", "1", "--execute", "--t-neg-01-result", "denied"], transport)
+            code, _, err = self.run_main(
+                ["--from-step", "1", "--execute", "--t-neg-01-result", "denied"], transport
+            )
         self.assertEqual(code, 1)
         self.assertIn("写入全局硬停止哨兵失败", err)
         self.assertIn("全局哨兵未能生效", err)

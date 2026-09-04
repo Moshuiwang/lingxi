@@ -8,6 +8,8 @@
 __pycache__/
 *.py[cod]
 .venv/
+# ruff 的运行期缓存，随时可删重建，不是事实源。
+.ruff_cache/
 # scripts/dev/check.sh 按需建出的一次性虚拟环境缓存（Issue #236），运行时产物，
 # 不是事实源——事实源是 .github/workflows/{ci,story}.yml，本目录随时可删重建。
 .dev-check/

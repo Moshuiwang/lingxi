@@ -25,7 +25,9 @@ from lingxi.core.execution.tool_policy import (
 class WrappedQueryCallIsRedirectedToTheNativeToolTest(unittest.TestCase):
     """①：Bash 被拒且白名单含查询工具——必须导回原生查询工具，不得宣称查询不可用。"""
 
-    def test_denied_wrapper_call_is_redirected_when_a_native_query_tool_is_whitelisted(self) -> None:
+    def test_denied_wrapper_call_is_redirected_when_a_native_query_tool_is_whitelisted(
+        self,
+    ) -> None:
         policy = ToolPolicy(allowed_tools=("mcp__query__query_metric",))
 
         verdict = policy.decide("Bash", {"command": "claude mcp call query query_metric"})
@@ -53,7 +55,9 @@ class WrappedQueryCallIsRedirectedToTheNativeToolTest(unittest.TestCase):
 class NoQueryToolAvailableKeepsTheOldTemplateTest(unittest.TestCase):
     """②哨兵：白名单里没有任何查询工具时，不得许诺一个不存在的替代路径。"""
 
-    def test_denied_call_keeps_the_original_template_when_no_query_tool_is_whitelisted(self) -> None:
+    def test_denied_call_keeps_the_original_template_when_no_query_tool_is_whitelisted(
+        self,
+    ) -> None:
         policy = ToolPolicy(allowed_tools=("mcp__bi-metric__list_metrics",))
 
         verdict = policy.decide("Bash", {})

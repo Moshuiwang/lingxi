@@ -36,21 +36,23 @@ def _tmp_file(content: str):
     import tempfile
 
     class _Ctx:
-        def __enter__(self_inner):
-            self_inner.dir = tempfile.TemporaryDirectory()
-            path = Path(self_inner.dir.name) / "sample.py"
+        def __enter__(self):
+            self.dir = tempfile.TemporaryDirectory()
+            path = Path(self.dir.name) / "sample.py"
             path.write_text(content, encoding="utf-8")
             return path
 
-        def __exit__(self_inner, *exc_info):
-            self_inner.dir.cleanup()
+        def __exit__(self, *exc_info):
+            self.dir.cleanup()
 
     return _Ctx()
 
 
 class ContractSectionsTest(unittest.TestCase):
     def test_parses_level_two_and_three_headings(self) -> None:
-        text = "# 产品合同与外部边界\n\n## 甲\n正文。\n\n### 乙\n正文。\n\n#### 丙\n忽略四级标题。\n"
+        text = (
+            "# 产品合同与外部边界\n\n## 甲\n正文。\n\n### 乙\n正文。\n\n#### 丙\n忽略四级标题。\n"
+        )
         self.assertEqual(CHECK.contract_sections(text), {"产品合同与外部边界", "甲", "乙"})
 
     def test_skips_fenced_code_blocks(self) -> None:
@@ -81,7 +83,7 @@ class TriggeredLinesTest(unittest.TestCase):
             self.assertEqual(CHECK.find_triggered_lines(path), [])
 
     def test_coverage_checklist_meta_vocabulary_is_excluded(self) -> None:
-        """"合同条款覆盖清单"是验收矩阵自己的机制名字，不是归属声明。"""
+        """ "合同条款覆盖清单"是验收矩阵自己的机制名字，不是归属声明。"""
 
         content = (
             "### 10.3 合同条款覆盖清单\n"
@@ -121,14 +123,18 @@ class EvaluateSelfConsistencyTest(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as tmp:
             extra = Path(tmp) / "self_test_injected.py"
-            extra.write_text("# 自测：这句话是产品合同明令，但从未在合同正文出现过\n", encoding="utf-8")
+            extra.write_text(
+                "# 自测：这句话是产品合同明令，但从未在合同正文出现过\n", encoding="utf-8"
+            )
             original = CHECK.tracked_files
             CHECK.tracked_files = self._patched_tracked_files(extra)
             try:
                 failures, _exceptions, _summary = CHECK.evaluate()
             finally:
                 CHECK.tracked_files = original
-        self.assertTrue(any("self_test_injected.py" in f and "未登记" in f for f in failures), failures)
+        self.assertTrue(
+            any("self_test_injected.py" in f and "未登记" in f for f in failures), failures
+        )
 
     def test_without_the_injected_file_the_gate_is_green(self) -> None:
         original = CHECK.tracked_files
@@ -179,7 +185,9 @@ class ExactLineMatchingClosesBypassesTest(unittest.TestCase):
         finally:
             CHECK.GROUNDED_ATTRIBUTIONS = original_grounded
         self.assertTrue(
-            any("这是一句全新的、从未核对过的合同要求断言" in f and "未登记" in f for f in failures),
+            any(
+                "这是一句全新的、从未核对过的合同要求断言" in f and "未登记" in f for f in failures
+            ),
             failures,
         )
 
@@ -207,9 +215,7 @@ class ExactLineMatchingClosesBypassesTest(unittest.TestCase):
                     CHECK.tracked_files = original_tracked
         finally:
             CHECK.GROUNDED_ATTRIBUTIONS = original_grounded
-        self.assertTrue(
-            any("未登记" in f and "密钥每日轮换" in f for f in failures), failures
-        )
+        self.assertTrue(any("未登记" in f and "密钥每日轮换" in f for f in failures), failures)
 
     def _self_test_dir(self):
         import tempfile
@@ -308,9 +314,9 @@ class RealRepositoryTest(unittest.TestCase):
         self.assertEqual(failures, [], failures)
         self.assertIn("归属核对：扫描到", summary)
 
-    def test_real_repository_has_the_five_known_exceptions(self) -> None:
+    def test_real_repository_has_the_four_known_exceptions(self) -> None:
         _failures, exceptions, _summary = CHECK.evaluate()
-        self.assertEqual(len(exceptions), 5, exceptions)
+        self.assertEqual(len(exceptions), 4, exceptions)
 
 
 class MetaExclusionDoesNotSwallowRealAssertionsTest(unittest.TestCase):
@@ -343,7 +349,9 @@ class HtmlCommentsAreSkippedTest(unittest.TestCase):
         self.assertIn("另一节", sections)
         self.assertNotIn("已删除的旧章节", sections)
 
-    def test_a_single_line_self_contained_comment_does_not_hide_a_real_heading_before_it(self) -> None:
+    def test_a_single_line_self_contained_comment_does_not_hide_a_real_heading_before_it(
+        self,
+    ) -> None:
         text = "## 真标题 <!-- 备注 -->\n"
         self.assertEqual(CHECK.contract_sections(text), {"真标题"})
 
@@ -404,7 +412,9 @@ class ExceptionFieldContentValidationTest(unittest.TestCase):
             failures, _exceptions, _summary = CHECK.evaluate()
         finally:
             CHECK.REGISTERED_EXCEPTIONS = original
-        self.assertTrue(any("不是" in f and ("Issue" in f or "PR" in f) for f in failures), failures)
+        self.assertTrue(
+            any("不是" in f and ("Issue" in f or "PR" in f) for f in failures), failures
+        )
         self.assertTrue(any("日期" in f for f in failures), failures)
         self.assertTrue(any("reason" in f and "空字符串" in f for f in failures), failures)
 
@@ -426,7 +436,9 @@ class ExceptionFieldContentValidationTest(unittest.TestCase):
         # 字段格式本身合法；唯一还会报的失败应该是"摘录在源文件里找不到"
         # （这条夹具文本本来就不存在于 ids.py），证明字段校验没有误伤合法输入。
         format_failures = [
-            f for f in failures if "不是" in f or ("日期" in f and "不合法" not in f) or "空字符串" in f
+            f
+            for f in failures
+            if "不是" in f or ("日期" in f and "不合法" not in f) or "空字符串" in f
         ]
         self.assertEqual(format_failures, [], failures)
 

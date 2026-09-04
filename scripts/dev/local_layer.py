@@ -58,9 +58,7 @@ def changed_paths_against(
         args.append("HEAD")
     result = subprocess.run(args, check=True, capture_output=True, cwd=repository)
     paths = [
-        raw.decode("utf-8", errors="surrogateescape")
-        for raw in result.stdout.split(b"\0")
-        if raw
+        raw.decode("utf-8", errors="surrogateescape") for raw in result.stdout.split(b"\0") if raw
     ]
 
     if include_worktree:
@@ -125,9 +123,7 @@ def _main() -> int:
     args = parser.parse_args()
 
     try:
-        classification = classify_local_detail(
-            args.base, include_worktree=not args.committed_only
-        )
+        classification = classify_local_detail(args.base, include_worktree=not args.committed_only)
     except subprocess.CalledProcessError as error:
         print(f"local_layer：git diff 失败（{error}）", file=sys.stderr)
         return 1

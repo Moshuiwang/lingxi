@@ -57,8 +57,18 @@ def _tables() -> dict[str, list[dict[str, str]]]:
             {"role_id": "R-乙", "menu_id": "M2", "role_name": "A销售", "menu_name": "报表"},
         ],
         "sys_user_datacountry": [
-            {"USER_ID": "U1", "DATACOUNTRY_ID": "101", "USER_NAME": "化名甲", "DATACOUNTRY_NAME": "甲国"},
-            {"USER_ID": "U2", "DATACOUNTRY_ID": "0", "USER_NAME": "化名乙", "DATACOUNTRY_NAME": "全非"},
+            {
+                "USER_ID": "U1",
+                "DATACOUNTRY_ID": "101",
+                "USER_NAME": "化名甲",
+                "DATACOUNTRY_NAME": "甲国",
+            },
+            {
+                "USER_ID": "U2",
+                "DATACOUNTRY_ID": "0",
+                "USER_NAME": "化名乙",
+                "DATACOUNTRY_NAME": "全非",
+            },
         ],
         "sys_country": [
             {
@@ -121,7 +131,9 @@ class GalaxyImportPostgresTest(unittest.TestCase):
             row = cursor.fetchone()
         return None if row is None else row[0]
 
-    def _import(self, tables: dict[str, list[dict[str, str]]] | None = None, *, digest: str = "digest-1"):
+    def _import(
+        self, tables: dict[str, list[dict[str, str]]] | None = None, *, digest: str = "digest-1"
+    ):
         return self.store.import_export(
             source_label="合成导出（测试）",
             source_digest=digest,
@@ -137,9 +149,16 @@ class GalaxyImportPostgresTest(unittest.TestCase):
         self.assertEqual(self._count("galaxy_role_menu"), 2)
         self.assertEqual(self._count("galaxy_user_datacountry"), 2)
         self.assertEqual(self._count("galaxy_country"), 2)
-        self.assertEqual(self._scalar("SELECT status FROM galaxy_import_batch WHERE id = %s", (result.batch_id,)), "complete")
         self.assertEqual(
-            self._scalar("SELECT user_row_count FROM galaxy_import_batch WHERE id = %s", (result.batch_id,)),
+            self._scalar(
+                "SELECT status FROM galaxy_import_batch WHERE id = %s", (result.batch_id,)
+            ),
+            "complete",
+        )
+        self.assertEqual(
+            self._scalar(
+                "SELECT user_row_count FROM galaxy_import_batch WHERE id = %s", (result.batch_id,)
+            ),
             2,
         )
         self.assertEqual(result.row_counts["user"], 2)
@@ -170,7 +189,9 @@ class GalaxyImportPostgresTest(unittest.TestCase):
             self._scalar("SELECT name_cn FROM galaxy_country WHERE country_key = '0'"),
             "全非",
         )
-        self.assertEqual(self._scalar("SELECT name FROM galaxy_country WHERE country_key = '0'"), "ALL")
+        self.assertEqual(
+            self._scalar("SELECT name FROM galaxy_country WHERE country_key = '0'"), "ALL"
+        )
         self.assertEqual(self._count("galaxy_user_datacountry", "WHERE datacountry_id = '0'"), 1)
 
     def test_misleading_user_name_column_is_stored_under_its_own_name(self) -> None:
@@ -181,7 +202,9 @@ class GalaxyImportPostgresTest(unittest.TestCase):
             self._scalar("SELECT source_user_name FROM galaxy_user_role WHERE user_id = 'U1'"),
             "化名乙",
         )
-        self.assertEqual(self._scalar("SELECT user_name FROM galaxy_user WHERE user_id = 'U1'"), "10001")
+        self.assertEqual(
+            self._scalar("SELECT user_name FROM galaxy_user WHERE user_id = 'U1'"), "10001"
+        )
         self.assertEqual(
             self._scalar(
                 "SELECT count(*) FROM information_schema.columns "
@@ -221,7 +244,9 @@ class GalaxyImportPostgresTest(unittest.TestCase):
         """V-银河-05：校验不通过时一行都不写。"""
 
         tables = _tables()
-        tables["user_role"].append({"user_id": "U-未知", "role_id": "R-甲", "user_name": "化名丁", "role_name": "A运营"})
+        tables["user_role"].append(
+            {"user_id": "U-未知", "role_id": "R-甲", "user_name": "化名丁", "role_name": "A运营"}
+        )
 
         result = self._import(tables)
 
@@ -245,7 +270,9 @@ class GalaxyImportPostgresTest(unittest.TestCase):
         store = _FailingStore(self._dsn)
 
         with self.assertRaises(RuntimeError):
-            store.import_export(source_label="合成导出（测试）", source_digest="digest-fail", tables=_tables())
+            store.import_export(
+                source_label="合成导出（测试）", source_digest="digest-fail", tables=_tables()
+            )
 
         for table in _GALAXY_TABLES:
             self.assertEqual(self._count(table), 0, table)
@@ -253,7 +280,10 @@ class GalaxyImportPostgresTest(unittest.TestCase):
     def test_readback_mismatch_aborts_the_batch(self) -> None:
         """V-银河-07：回读计数对不上即整批回滚，批次不得标记完成。"""
 
-        from lingxi.adapters.galaxy_import import GalaxyImportVerificationError, PostgresGalaxyImportStore
+        from lingxi.adapters.galaxy_import import (
+            GalaxyImportVerificationError,
+            PostgresGalaxyImportStore,
+        )
 
         class _LosingStore(PostgresGalaxyImportStore):
             def _insert_rows(self, cursor, source_table, rows):  # type: ignore[no-untyped-def]
@@ -265,7 +295,9 @@ class GalaxyImportPostgresTest(unittest.TestCase):
         store = _LosingStore(self._dsn)
 
         with self.assertRaises(GalaxyImportVerificationError):
-            store.import_export(source_label="合成导出（测试）", source_digest="digest-lost", tables=_tables())
+            store.import_export(
+                source_label="合成导出（测试）", source_digest="digest-lost", tables=_tables()
+            )
 
         for table in _GALAXY_TABLES:
             self.assertEqual(self._count(table), 0, table)
@@ -287,8 +319,16 @@ class GalaxyImportPostgresTest(unittest.TestCase):
 
         self.assertEqual(second.outcome, "imported")
         self.assertNotEqual(second.batch_id, first.batch_id)
-        self.assertEqual(self._scalar("SELECT status FROM galaxy_import_batch WHERE id = %s", (first.batch_id,)), "superseded")
-        self.assertEqual(self._scalar("SELECT status FROM galaxy_import_batch WHERE id = %s", (second.batch_id,)), "complete")
+        self.assertEqual(
+            self._scalar("SELECT status FROM galaxy_import_batch WHERE id = %s", (first.batch_id,)),
+            "superseded",
+        )
+        self.assertEqual(
+            self._scalar(
+                "SELECT status FROM galaxy_import_batch WHERE id = %s", (second.batch_id,)
+            ),
+            "complete",
+        )
         self.assertEqual(self.store.current_batch_id(), second.batch_id)
 
     def test_a_superseded_digest_is_still_idempotent_and_never_rolls_back(self) -> None:
@@ -302,7 +342,12 @@ class GalaxyImportPostgresTest(unittest.TestCase):
         self.assertEqual(replay.outcome, "already_imported")
         self.assertEqual(replay.batch_id, first.batch_id)
         self.assertEqual(self._scalar("SELECT count(*) FROM galaxy_import_batch"), 2)
-        self.assertEqual(self._scalar("SELECT status FROM galaxy_import_batch WHERE id = %s", (second.batch_id,)), "complete")
+        self.assertEqual(
+            self._scalar(
+                "SELECT status FROM galaxy_import_batch WHERE id = %s", (second.batch_id,)
+            ),
+            "complete",
+        )
         self.assertEqual(self.store.current_batch_id(), second.batch_id)
 
     def test_a_confirmed_unchanged_export_becomes_a_fresh_current_batch(self) -> None:
@@ -358,7 +403,9 @@ class GalaxyImportPostgresTest(unittest.TestCase):
         result = self._import()
 
         self.assertIsNotNone(
-            self._scalar("SELECT expires_at FROM galaxy_import_batch WHERE id = %s", (result.batch_id,))
+            self._scalar(
+                "SELECT expires_at FROM galaxy_import_batch WHERE id = %s", (result.batch_id,)
+            )
         )
 
     def test_the_normal_import_path_is_not_broken_by_the_expiry_trigger(self) -> None:
@@ -372,7 +419,9 @@ class GalaxyImportPostgresTest(unittest.TestCase):
 
         self.assertEqual(result.outcome, "imported")
         self.assertEqual(
-            self._scalar("SELECT status FROM galaxy_import_batch WHERE id = %s", (result.batch_id,)),
+            self._scalar(
+                "SELECT status FROM galaxy_import_batch WHERE id = %s", (result.batch_id,)
+            ),
             "complete",
         )
         self.assertTrue(

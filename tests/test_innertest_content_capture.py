@@ -16,9 +16,9 @@ import unittest
 from lingxi.core.execution.audit import TurnAudit, redact_free_text, redact_free_text_with_count
 from lingxi.core.execution.tool_policy import ToolPolicy
 from lingxi.core.innertest_content_capture import (
+    MAX_TOOL_RESULT_SUMMARY_BYTES,
     CapturedToolCall,
     ContentCaptureRecord,
-    MAX_TOOL_RESULT_SUMMARY_BYTES,
     RawTurnCapture,
 )
 
@@ -66,7 +66,9 @@ class RawTurnCaptureBuildRecordTests(unittest.TestCase):
         audit = TurnAudit()
 
         record = capture.build_record(
-            task_id="tsk-1", worker_id="worker-1", question="上周新增用户数是多少",
+            task_id="tsk-1",
+            worker_id="worker-1",
+            question="上周新增用户数是多少",
             summary=audit.summary(),
         )
 
@@ -86,13 +88,20 @@ class RawTurnCaptureBuildRecordTests(unittest.TestCase):
         audit = TurnAudit()  # 默认字段白名单为空——用来对照"审计侧确实会省略"
         verdict = _policy().decide("mcp__q__list_metrics", {"metric": "new_users", "country": "CN"})
         audit.record_decision(
-            tool_name=verdict.tool_name, tool_input={"metric": "new_users", "country": "CN"},
-            tool_use_id="t1", verdict=verdict,
+            tool_name=verdict.tool_name,
+            tool_input={"metric": "new_users", "country": "CN"},
+            tool_use_id="t1",
+            verdict=verdict,
         )
         audit.record_executed(tool_name="mcp__q__list_metrics", tool_use_id="t1")
         audit.record_tool_result(tool_use_id="t1", content='{"metrics": [{"id": "m1"}]}')
         capture.on_stream_event(
-            {"kind": "tool_result", "tool_use_id": "t1", "content": '{"metrics": [{"id": "m1"}]}', "is_error": False}
+            {
+                "kind": "tool_result",
+                "tool_use_id": "t1",
+                "content": '{"metrics": [{"id": "m1"}]}',
+                "is_error": False,
+            }
         )
 
         record = capture.build_record(
@@ -154,8 +163,10 @@ class RawTurnCaptureBuildRecordTests(unittest.TestCase):
             "mcp__q__other", {"reckless": "true"}
         )
         audit.record_decision(
-            tool_name=verdict.tool_name, tool_input={"reckless": "true"},
-            tool_use_id="t1", verdict=verdict,
+            tool_name=verdict.tool_name,
+            tool_input={"reckless": "true"},
+            tool_use_id="t1",
+            verdict=verdict,
         )
 
         record = capture.build_record(
@@ -183,7 +194,7 @@ class RawTurnCaptureBuildRecordTests(unittest.TestCase):
         self.assertEqual(record.tool_calls[0].tool_input, {"captured": False})
 
     def test_tool_result_content_is_truncated_but_not_silently(self) -> None:
-        """"结果摘要"是摘要，不是全文——超过字节上限时截断，且显式标注
+        """ "结果摘要"是摘要，不是全文——超过字节上限时截断，且显式标注
         truncated=True，不假装截断后的内容是完整的。
 
         用中文重复句子构造超长正文，**不用**单一字符重复（例如 ``"x" * N``）：
@@ -203,7 +214,9 @@ class RawTurnCaptureBuildRecordTests(unittest.TestCase):
         )
         audit = TurnAudit()
         verdict = _policy().decide("mcp__q__list_metrics", {})
-        audit.record_decision(tool_name=verdict.tool_name, tool_input={}, tool_use_id="t1", verdict=verdict)
+        audit.record_decision(
+            tool_name=verdict.tool_name, tool_input={}, tool_use_id="t1", verdict=verdict
+        )
         audit.record_tool_result(tool_use_id="t1", content=huge_result, is_error=False)
 
         record = capture.build_record(
@@ -229,7 +242,9 @@ class RawTurnCaptureBuildRecordTests(unittest.TestCase):
         )
 
         self.assertEqual(record.answer_content, long_answer)
-        self.assertGreater(len(record.answer_content.encode("utf-8")), MAX_TOOL_RESULT_SUMMARY_BYTES)
+        self.assertGreater(
+            len(record.answer_content.encode("utf-8")), MAX_TOOL_RESULT_SUMMARY_BYTES
+        )
 
 
 class RedactFreeTextWithCountTests(unittest.TestCase):

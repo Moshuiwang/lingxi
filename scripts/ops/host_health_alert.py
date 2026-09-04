@@ -113,10 +113,10 @@ import subprocess
 import sys
 import urllib.error
 import urllib.request
+from collections.abc import Iterator, Mapping, Sequence
 from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import Iterator, Mapping, Sequence
 
 # ---------------------------------------------------------------------------
 # 常量
@@ -515,8 +515,7 @@ def save_state(path: Path, states: Mapping[str, ContainerState]) -> None:
     """原子落盘（写临时文件后 `os.replace`），避免并发/崩溃留下半截 JSON。"""
 
     payload = {
-        name: {"alerting": state.alerting, "reason": state.reason}
-        for name, state in states.items()
+        name: {"alerting": state.alerting, "reason": state.reason} for name, state in states.items()
     }
     try:
         path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -545,7 +544,9 @@ def load_threshold_state(path: Path) -> dict[str, ThresholdState]:
         consecutive = value.get("consecutive", 0)
         result[str(name)] = ThresholdState(
             alerting=bool(value.get("alerting", False)),
-            consecutive=consecutive if isinstance(consecutive, int) and not isinstance(consecutive, bool) else 0,
+            consecutive=consecutive
+            if isinstance(consecutive, int) and not isinstance(consecutive, bool)
+            else 0,
         )
     return result
 
@@ -563,7 +564,9 @@ def save_threshold_state(path: Path, states: Mapping[str, ThresholdState]) -> No
         tmp_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
         os.replace(tmp_path, path)
     except OSError as error:
-        raise HostMonitorError(f"threshold_state_file_write_failed:{type(error).__name__}") from error
+        raise HostMonitorError(
+            f"threshold_state_file_write_failed:{type(error).__name__}"
+        ) from error
 
 
 def read_disk_usage_percent(mount: str) -> float:
@@ -585,7 +588,9 @@ def read_load_per_cpu() -> tuple[float, int]:
     return load1, cpu_count
 
 
-def read_sample_age_seconds(monitoring_dir: Path, file_prefix: str, *, now: datetime) -> float | None:
+def read_sample_age_seconds(
+    monitoring_dir: Path, file_prefix: str, *, now: datetime
+) -> float | None:
     """采样文件停更判定：取"今天"与"昨天"两个按 UTC 日期切分的候选文件（对应
     `scripts/ops/monitoring/resource_sample.sh` / `db_business_sample.sh` 的按日
     切分约定）里较新的 mtime，返回它与 `now` 的差值（秒）。
@@ -652,7 +657,9 @@ def feishu_send_text(
     文档「为什么是宿主脚本而不是仓库包的一部分」。
     """
 
-    token = _feishu_tenant_access_token(base_url, app_id, app_secret, timeout_seconds=timeout_seconds)
+    token = _feishu_tenant_access_token(
+        base_url, app_id, app_secret, timeout_seconds=timeout_seconds
+    )
     body = json.dumps(
         {
             "receive_id": chat_id,
@@ -714,7 +721,7 @@ def single_instance_lock(path: Path) -> Iterator[bool]:
 
 
 def _now_iso() -> str:
-    return datetime.now(timezone.utc).astimezone().isoformat(timespec="seconds")
+    return datetime.now(UTC).astimezone().isoformat(timespec="seconds")
 
 
 def _configure_logger(log_file: str) -> logging.Logger:
@@ -848,7 +855,9 @@ def run(argv: Sequence[str] | None = None) -> int:
                     name, docker_bin=args.docker_bin, timeout_seconds=args.timeout_seconds
                 )
             except HostMonitorError as error:
-                logger.error("docker inspect 执行失败，本轮跳过该容器 container=%s error=%s", name, error)
+                logger.error(
+                    "docker inspect 执行失败，本轮跳过该容器 container=%s error=%s", name, error
+                )
                 fatal = True
                 continue
 
@@ -930,7 +939,9 @@ def _run_threshold_checks(
     threshold_state_path = Path(args.threshold_state_file)
     threshold_states = load_threshold_state(threshold_state_path)
 
-    checks: list[tuple[str, str, bool, str, int]] = []  # (key, label, breached, detail, consecutive_required)
+    checks: list[
+        tuple[str, str, bool, str, int]
+    ] = []  # (key, label, breached, detail, consecutive_required)
 
     try:
         disk_percent = read_disk_usage_percent(args.disk_mount)
@@ -962,7 +973,7 @@ def _run_threshold_checks(
         logger.warning("负载阈值检查跳过 error=%s", error)
 
     monitoring_dir = Path(args.monitoring_dir)
-    now_dt = datetime.now(timezone.utc)
+    now_dt = datetime.now(UTC)
     for key, prefix, label in (
         (THRESHOLD_STALE_RESOURCE, "resource", "资源采样文件停更"),
         (THRESHOLD_STALE_DB_BUSINESS, "db_business", "数据库/业务采样文件停更"),
@@ -981,7 +992,9 @@ def _run_threshold_checks(
     threshold_changed = False
     for key, label, breached, detail, consecutive_required in checks:
         prior = threshold_states.get(key, ThresholdState())
-        action, next_state = classify_threshold(breached, prior, consecutive_required=consecutive_required)
+        action, next_state = classify_threshold(
+            breached, prior, consecutive_required=consecutive_required
+        )
 
         if action == ACTION_NONE:
             if not args.dry_run and next_state != prior:
@@ -989,7 +1002,9 @@ def _run_threshold_checks(
                 threshold_changed = True
             continue
 
-        text = render_threshold_message(action, label=label, detail=detail, host=host, now=_now_iso())
+        text = render_threshold_message(
+            action, label=label, detail=detail, host=host, now=_now_iso()
+        )
 
         if args.dry_run:
             logger.info("dry-run，未真实发送 threshold=%s action=%s detail=%s", key, action, detail)
@@ -1007,7 +1022,9 @@ def _run_threshold_checks(
         except Exception as error:  # noqa: BLE001 - 与容器告警发送路径同一条纪律
             # 发送失败：保留旧的 `alerting` 记忆（下一轮达标时会重新尝试发送），
             # 但连续计数本身是纯观测事实，不因为通知没发出去而回退到 0。
-            threshold_states[key] = ThresholdState(alerting=prior.alerting, consecutive=next_state.consecutive)
+            threshold_states[key] = ThresholdState(
+                alerting=prior.alerting, consecutive=next_state.consecutive
+            )
             threshold_changed = True
             logger.error(
                 "阈值告警发送失败，告警记忆未推进，下一轮达标会重试 threshold=%s action=%s error=%s",

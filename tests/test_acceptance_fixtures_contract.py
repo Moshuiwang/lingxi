@@ -31,6 +31,12 @@ import sys
 import unittest
 from pathlib import Path
 
+# 两个生产配置加载器与本文件同套断言复用同一份解析逻辑，不是重新实现一遍。
+from lingxi.apps.gateway.config import GatewayConfigError
+from lingxi.apps.gateway.config import load_config as load_gateway_config
+from lingxi.apps.worker.config import WorkerConfigError
+from lingxi.apps.worker.config import load_config as load_worker_config
+
 REPOSITORY_ROOT = Path(__file__).parents[1]
 SCRIPT = REPOSITORY_ROOT / "scripts" / "acceptance_fixtures.py"
 
@@ -46,10 +52,6 @@ def _load_script():
     spec.loader.exec_module(module)
     return module
 
-
-# 两个生产配置加载器与本文件同套断言复用同一份解析逻辑，不是重新实现一遍。
-from lingxi.apps.gateway.config import GatewayConfigError, load_config as load_gateway_config
-from lingxi.apps.worker.config import WorkerConfigError, load_config as load_worker_config
 
 # 最小合法基线环境：字段取值只用于让 load_config 通过必填项校验，不是真实凭据。
 GATEWAY_BASE_ENV = {
@@ -269,8 +271,9 @@ class CheckFilesFixtureDetectionTests(unittest.TestCase):
         import io
         import unittest.mock as mock
 
-        with mock.patch("sys.stderr", new=io.StringIO()) as captured_err, mock.patch(
-            "sys.stdout", new=io.StringIO()
+        with (
+            mock.patch("sys.stderr", new=io.StringIO()) as captured_err,
+            mock.patch("sys.stdout", new=io.StringIO()),
         ):
             self.assertEqual(self.module.main(["--check-files", "/no/such/file"]), 0)
         self.assertIn("跳过", captured_err.getvalue())
@@ -280,9 +283,10 @@ class CheckFilesFixtureDetectionTests(unittest.TestCase):
         import unittest.mock as mock
 
         stdin_text = "LINGXI_GATEWAY_CARD_FAILURE_INJECT=close\n"
-        with mock.patch("sys.stdin", new=io.StringIO(stdin_text)), mock.patch(
-            "sys.stderr", new=io.StringIO()
-        ) as captured_err:
+        with (
+            mock.patch("sys.stdin", new=io.StringIO(stdin_text)),
+            mock.patch("sys.stderr", new=io.StringIO()) as captured_err,
+        ):
             self.assertEqual(self.module.main(["--check-files", "-"]), 1)
         self.assertIn("<stdin>", captured_err.getvalue())
         self.assertNotIn("close", captured_err.getvalue())
@@ -306,8 +310,7 @@ class ScannerKnownBlindSpotTests(unittest.TestCase):
             package_dir = src_root / "fake_pkg"
             package_dir.mkdir()
             (package_dir / "blind_spot.py").write_text(
-                "import os\n"
-                'value = os.environ.get("LINGXI_SCHEDULER_SOMETHING_INJECT")\n',
+                'import os\nvalue = os.environ.get("LINGXI_SCHEDULER_SOMETHING_INJECT")\n',
                 encoding="utf-8",
             )
             discovered = self.module.discover_fixture_env_vars_in_source(src_root)

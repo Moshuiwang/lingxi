@@ -1,7 +1,7 @@
 """飞书出站：加表情与发文本。
 
-按 2026-08-06 决策走官方 ``lark-oapi``。``lark_oapi`` 在**函数内延迟导入**，与仓库既有
-惯例一致（``adapters/feishu_onboarding.py``）：不碰这两个类的测试无需装 SDK。
+走官方 ``lark-oapi``。``lark_oapi`` 在**函数内延迟导入**，与仓库既有惯例一致
+（``adapters/feishu_onboarding.py``）：不碰这两个类的测试无需装 SDK。
 
 出站约束以[接口设计「四、飞书出站」](../../../docs/技术设计/接口设计.md)为准：
 加表情失败不阻断后续处理（本模块只负责**抛出**，不阻断的语义由管线的
@@ -35,15 +35,10 @@ def build_client(*, app_id: str, app_secret: str, timeout_seconds: float) -> Any
     加表情或回复就能让停机超出承诺，而这两个调用都在主线程上、不可取消。让调用方
     从停机预算里分配，比在这里再写一个可能与预算冲突的默认值安全。
     """
-
     import lark_oapi as lark
 
     return (
-        lark.Client.builder()
-        .app_id(app_id)
-        .app_secret(app_secret)
-        .timeout(timeout_seconds)
-        .build()
+        lark.Client.builder().app_id(app_id).app_secret(app_secret).timeout(timeout_seconds).build()
     )
 
 
@@ -51,10 +46,12 @@ class LarkReactions:
     """加表情。实现 ``core.conversation.ports.Reactions``。"""
 
     def __init__(self, client: Any, *, emoji_type: str = RECEIPT_EMOJI) -> None:
+        """接入已构造的 SDK 客户端与要添加的表情类型。"""
         self._client = client
         self._emoji_type = emoji_type
 
     def add(self, *, message_id: str) -> None:
+        """给 `message_id` 对应的消息加一个表情；飞书拒绝时抛出。"""
         from lark_oapi.api.im.v1 import (
             CreateMessageReactionRequest,
             CreateMessageReactionRequestBody,
@@ -82,6 +79,7 @@ class LarkReplies:
     """发文本。实现 ``core.conversation.ports.Replies``。"""
 
     def __init__(self, client: Any) -> None:
+        """接入已构造的 SDK 客户端。"""
         self._client = client
 
     def send_text(
@@ -94,7 +92,6 @@ class LarkReplies:
         的消息就是普通回复。``chat_id`` 保留在签名里供实现选择与记录，本实现不需要它
         ——回复的目标由被回复的消息决定，这比自己拼 chat_id 少一次出错机会。
         """
-
         from lark_oapi.api.im.v1 import ReplyMessageRequest, ReplyMessageRequestBody
 
         # content 是一段 **JSON 字符串**（飞书如此定义），不是对象。
@@ -107,10 +104,7 @@ class LarkReplies:
             .build()
         )
         request = (
-            ReplyMessageRequest.builder()
-            .message_id(reply_to_message_id)
-            .request_body(body)
-            .build()
+            ReplyMessageRequest.builder().message_id(reply_to_message_id).request_body(body).build()
         )
         response = self._client.im.v1.message.reply(request)
         if not response.success():

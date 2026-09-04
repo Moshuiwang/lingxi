@@ -20,10 +20,11 @@ from __future__ import annotations
 import os
 import threading
 import unittest
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 
 from gateway_fakes import CallLog, FakeAudit, FakeOnboarding, FakeReactions, FakeReplies
 from postgres_schema import ensure_production_schema, psycopg_available, reset_production_rows
+
 from lingxi.adapters.postgres_conversation import (
     TASK_QUEUED_CHANNEL,
     PostgresGatewayStore,
@@ -38,7 +39,7 @@ SKIP_REASON = (
     if not os.environ.get("LINGXI_POSTGRES_DSN")
     else "跳过：LINGXI_POSTGRES_DSN 已设置但未安装 psycopg 驱动，数据库约束类断言未验证"
 )
-NOW = datetime(2026, 8, 6, 12, 0, tzinfo=timezone.utc)
+NOW = datetime(2026, 8, 6, 12, 0, tzinfo=UTC)
 
 
 def inbound(
@@ -92,7 +93,9 @@ class GatewayPostgresTestCase(unittest.TestCase):
 
     # -- 小工具 ---------------------------------------------------------
 
-    def add_user(self, *, user_id: str = "usr_1", open_id: str = "ou_1", state: str = "active") -> str:
+    def add_user(
+        self, *, user_id: str = "usr_1", open_id: str = "ou_1", state: str = "active"
+    ) -> str:
         self.execute(
             """
             INSERT INTO app_user
@@ -197,9 +200,7 @@ class TaskOwnershipTests(GatewayPostgresTestCase):
 
         owner = self.scalar("SELECT user_id FROM task")
         self.assertEqual(owner, "usr_sender", "任务不得挂到他人名下")
-        self.assertEqual(
-            self.scalar("SELECT count(*) FROM task WHERE user_id = 'usr_victim'"), 0
-        )
+        self.assertEqual(self.scalar("SELECT count(*) FROM task WHERE user_id = 'usr_victim'"), 0)
 
 
 class TransactionBoundaryTests(GatewayPostgresTestCase):
@@ -338,9 +339,7 @@ class TransactionBoundaryTests(GatewayPostgresTestCase):
         )
         second.handle_message(inbound("evt_fail"), now=NOW)
 
-        self.assertEqual(
-            self.log.count("reply.send_text"), 1, "重启后同一事件不得再发一次提示"
-        )
+        self.assertEqual(self.log.count("reply.send_text"), 1, "重启后同一事件不得再发一次提示")
 
 
 class _FailingTransaction:
@@ -435,9 +434,7 @@ class TopicSerialisationTests(GatewayPostgresTestCase):
             thread.join(timeout=20)
 
         self.assertEqual(errors, [])
-        self.assertEqual(
-            sorted(outcomes), ["busy_hint", "task_queued"], "恰好一个抢占成功"
-        )
+        self.assertEqual(sorted(outcomes), ["busy_hint", "task_queued"], "恰好一个抢占成功")
         self.assertEqual(self.task_count(), 1)
 
     def test_release_only_by_the_holder(self) -> None:
@@ -491,9 +488,7 @@ class ReplyAfterCommitTests(GatewayPostgresTestCase):
 
         self.assertEqual(outcome.handled_as, HandledAs.BUSY_HINT)
         self.assertEqual(
-            self.scalar(
-                "SELECT handled_as FROM inbound_event WHERE feishu_event_id = 'evt_2'"
-            ),
+            self.scalar("SELECT handled_as FROM inbound_event WHERE feishu_event_id = 'evt_2'"),
             "busy_hint",
             "回复失败不得回滚已确定的处理结论",
         )
@@ -541,13 +536,9 @@ class ReplyAfterCommitTests(GatewayPostgresTestCase):
 
         self.assertEqual(
             self.log.fields("reply.send_text")[0]["text"],
-            default_content_catalog()
-            .text("gateway.unexpected_error", reference="trc_evt_1")
-            .text,
+            default_content_catalog().text("gateway.unexpected_error", reference="trc_evt_1").text,
         )
-        self.assertEqual(
-            self.scalar("SELECT count(*) FROM inbound_event"), 0, "事件行应随事务回滚"
-        )
+        self.assertEqual(self.scalar("SELECT count(*) FROM inbound_event"), 0, "事件行应随事务回滚")
 
 
 class _FailingCommitStore:
@@ -797,7 +788,10 @@ class ZombieWorkerTests(GatewayPostgresTestCase):
         task_id = self.scalar("SELECT id FROM task")
 
         self.assertEqual(
-            [task.task_id for task in self.queue.claim(worker_id="w1", target_worker_version="stable")],
+            [
+                task.task_id
+                for task in self.queue.claim(worker_id="w1", target_worker_version="stable")
+            ],
             [task_id],
         )
         self.execute(
@@ -805,7 +799,10 @@ class ZombieWorkerTests(GatewayPostgresTestCase):
         )
         self.assertEqual(self.queue.reclaim_stale(older_than=timedelta(minutes=5)), [task_id])
         self.assertEqual(
-            [task.task_id for task in self.queue.claim(worker_id="w2", target_worker_version="stable")],
+            [
+                task.task_id
+                for task in self.queue.claim(worker_id="w2", target_worker_version="stable")
+            ],
             [task_id],
         )
 
@@ -895,9 +892,7 @@ class CommandIsolationTests(GatewayPostgresTestCase):
         pipeline = self.pipeline()
         pipeline.handle_message(inbound("evt_a", thread_id="omt_A"), now=NOW)
         pipeline.handle_message(inbound("evt_b", thread_id="omt_B"), now=NOW)
-        rows = self.query(
-            "SELECT feishu_thread_id, id FROM conversation ORDER BY feishu_thread_id"
-        )
+        rows = self.query("SELECT feishu_thread_id, id FROM conversation ORDER BY feishu_thread_id")
         return rows[0][1], rows[1][1]
 
     def test_new_clears_only_its_own_topic(self) -> None:
@@ -909,9 +904,7 @@ class CommandIsolationTests(GatewayPostgresTestCase):
             (ended,),
         )
 
-        self.pipeline().handle_message(
-            inbound("evt_new", thread_id="omt_A", text="/new"), now=NOW
-        )
+        self.pipeline().handle_message(inbound("evt_new", thread_id="omt_A", text="/new"), now=NOW)
 
         self.assertIsNone(
             self.scalar("SELECT agent_session_id FROM conversation WHERE id = %s", (topic_a,))
@@ -1074,9 +1067,7 @@ class StaleSessionDiscardPostgresTests(GatewayPostgresTestCase):
                 (conversation_id,),
             )
         )
-        self.assertEqual(
-            self.scalar("SELECT count(*) FROM agent_session_cleanup"), 1
-        )
+        self.assertEqual(self.scalar("SELECT count(*) FROM agent_session_cleanup"), 1)
 
     def test_discard_rolls_back_with_the_failed_enqueue(self) -> None:
         """外部独立审查 2026-08-23 P2-3：判废与入队同事务——``insert_task`` 失败
@@ -1151,9 +1142,7 @@ class StaleSessionDiscardPostgresTests(GatewayPostgresTestCase):
             "修复前这里是 True：失败任务刷新了结束时间，旧 id 又没清",
         )
         self.assertFalse(
-            self.scalar(
-                "SELECT resumed_session FROM task WHERE id = %s", (followup.task_id,)
-            )
+            self.scalar("SELECT resumed_session FROM task WHERE id = %s", (followup.task_id,))
         )
 
 
@@ -1212,9 +1201,7 @@ class QueueClaimTests(GatewayPostgresTestCase):
         everything = claimed["w1"] + claimed["w2"]
         self.assertEqual(len(everything), 20, "每个任务都要被领到，不得饿死")
         self.assertEqual(len(set(everything)), 20, "同一任务不得被两个 worker 领到")
-        self.assertEqual(
-            self.scalar("SELECT count(*) FROM task WHERE status = 'running'"), 20
-        )
+        self.assertEqual(self.scalar("SELECT count(*) FROM task WHERE status = 'running'"), 20)
         # 断「每个任务的 worker_id 与实际领到它的那个 worker 一致」，而不是
         # 「一共出现过两个 worker」——后者在两个 worker 互相覆盖对方的任务时也成立。
         recorded = dict(self.query("SELECT id, worker_id FROM task"))
@@ -1254,7 +1241,7 @@ class QueueClaimTests(GatewayPostgresTestCase):
 
     def test_notify_is_not_emitted_when_the_transaction_rolls_back(self) -> None:
         """Issue #465：这里注入的异常发生在 ``notify_task_queued`` 之后、提交
-        之前，不经过 `QueueInsertFailure` 那条已识别路径——`EventPipeline.
+        之前，不经过 `QueueInsertError` 那条已识别路径——`EventPipeline.
         handle_message` 现在是全函数，不再让它穿出去，而是换成一条诚实的
         兜底提示（`gateway.unexpected_error`）；本用例仍然只锁 NOTIFY 本身
         随事务回滚这一件事。"""
@@ -1387,9 +1374,7 @@ class WorkerVersionTests(GatewayPostgresTestCase):
     def test_claim_is_filtered_by_version(self) -> None:
         """声明 stable 的 worker 领不到 canary 任务，反之亦然。"""
 
-        canary_pipeline = self.pipeline(
-            resolve_version=lambda *, user_id, now: "canary"
-        )
+        canary_pipeline = self.pipeline(resolve_version=lambda *, user_id, now: "canary")
         canary_pipeline.handle_message(inbound("evt_canary", thread_id="omt_c"), now=NOW)
         self.pipeline().handle_message(inbound("evt_stable", thread_id="omt_s"), now=NOW)
 
@@ -1406,9 +1391,7 @@ class WorkerVersionTests(GatewayPostgresTestCase):
         claimed = self.queue.claim(worker_id="w_stable", target_worker_version="stable")
 
         self.assertEqual(claimed, [])
-        status, worker_id, attempts = self.query(
-            "SELECT status, worker_id, attempts FROM task"
-        )[0]
+        status, worker_id, attempts = self.query("SELECT status, worker_id, attempts FROM task")[0]
         self.assertEqual(status, "queued", "不匹配的任务必须保持 queued")
         self.assertIsNone(worker_id)
         self.assertEqual(attempts, 0, "不匹配的任务不得被误改状态")
@@ -1455,9 +1438,7 @@ class UnprovisionedUserTests(GatewayPostgresTestCase):
         self.assertEqual(outcome.handled_as, HandledAs.NOT_PROVISIONED)
         self.assertEqual(self.task_count(), 0, "未开通用户的消息不得产生任务")
         self.assertEqual(self.scalar("SELECT count(*) FROM conversation"), 0)
-        self.assertEqual(
-            self.scalar("SELECT handled_as FROM inbound_event"), "not_provisioned"
-        )
+        self.assertEqual(self.scalar("SELECT handled_as FROM inbound_event"), "not_provisioned")
         # inbound_event 只记录收到过一个事件及处理方式，不含消息正文
         columns = [
             row[0]
@@ -1482,15 +1463,18 @@ class UnprovisionedUserTests(GatewayPostgresTestCase):
 
         self.assertEqual(first.handled_as, HandledAs.AUTO_PROVISIONING)
         self.assertTrue(second.duplicate)
-        self.assertEqual(runner.calls, [{
-            "event_id": "evt_auto",
-            "open_id": "ou_stranger",
-            "trace_id": "trc_evt_auto",
-        }])
-        self.assertEqual(self.scalar("SELECT count(*) FROM inbound_event"), 1)
         self.assertEqual(
-            self.scalar("SELECT handled_as FROM inbound_event"), "auto_provisioning"
+            runner.calls,
+            [
+                {
+                    "event_id": "evt_auto",
+                    "open_id": "ou_stranger",
+                    "trace_id": "trc_evt_auto",
+                }
+            ],
         )
+        self.assertEqual(self.scalar("SELECT count(*) FROM inbound_event"), 1)
+        self.assertEqual(self.scalar("SELECT handled_as FROM inbound_event"), "auto_provisioning")
         self.assertEqual(self.task_count(), 0)
         self.assertEqual(self.scalar("SELECT count(*) FROM conversation"), 0)
         self.assertEqual(
@@ -1594,9 +1578,7 @@ class OnboardingDispatchLedgerTests(GatewayPostgresTestCase):
     def test_other_handled_as_values_are_never_claimed(self) -> None:
         self.add_user()
         self.pipeline().handle_message(inbound("evt_queued"), now=NOW)
-        self.pipeline().handle_message(
-            inbound("evt_plain", open_id="ou_stranger"), now=NOW
-        )
+        self.pipeline().handle_message(inbound("evt_plain", open_id="ou_stranger"), now=NOW)
 
         self.assertEqual(
             sorted(row[0] for row in self.query("SELECT handled_as FROM inbound_event")),
@@ -1664,9 +1646,7 @@ class OnboardingDispatchLedgerTests(GatewayPostgresTestCase):
         self.assertIsNotNone(claimed)
         self.assertIsNotNone(self.dispatched_at(), "认领即记账")
 
-        self.store.release_onboarding_claim(
-            event_id="evt_auto", claim_token=claimed.claim_token
-        )
+        self.store.release_onboarding_claim(event_id="evt_auto", claim_token=claimed.claim_token)
 
         self.assertIsNone(self.dispatched_at(), "放回之后账本必须重新为空")
         again = self.store.claim_stale_onboarding(older_than=self.ZERO)
@@ -1698,21 +1678,15 @@ class OnboardingDispatchLedgerTests(GatewayPostgresTestCase):
         )
         first = self.store.claim_stale_onboarding(older_than=self.ZERO)
         assert first is not None
-        self.store.release_onboarding_claim(
-            event_id="evt_auto", claim_token=first.claim_token
-        )
+        self.store.release_onboarding_claim(event_id="evt_auto", claim_token=first.claim_token)
         second = self.store.claim_stale_onboarding(older_than=self.ZERO)
         assert second is not None
         self.assertNotEqual(second.claim_token, first.claim_token, "两次认领必须是不同代次")
 
         # A 的重试：拿旧代次再释放一次。
-        self.store.release_onboarding_claim(
-            event_id="evt_auto", claim_token=first.claim_token
-        )
+        self.store.release_onboarding_claim(event_id="evt_auto", claim_token=first.claim_token)
 
-        self.assertEqual(
-            self.dispatched_at(), second.claim_token, "陈旧的释放不得撤销别人的认领"
-        )
+        self.assertEqual(self.dispatched_at(), second.claim_token, "陈旧的释放不得撤销别人的认领")
 
     def test_releasing_an_unknown_event_changes_nothing(self) -> None:
         self.pipeline(onboarding=FakeOnboarding(), should_stop=lambda: True).handle_message(
@@ -1726,9 +1700,7 @@ class OnboardingDispatchLedgerTests(GatewayPostgresTestCase):
         )
 
         self.assertIsNotNone(self.dispatched_at())
-        self.assertEqual(
-            self.scalar("SELECT count(*) FROM inbound_event"), 1, "不得凭空造行"
-        )
+        self.assertEqual(self.scalar("SELECT count(*) FROM inbound_event"), 1, "不得凭空造行")
 
     def test_settling_the_ledger_twice_does_not_move_the_timestamp(self) -> None:
         self.pipeline(onboarding=FakeOnboarding(), should_stop=lambda: True).handle_message(
@@ -1756,9 +1728,7 @@ class RetentionTests(GatewayPostgresTestCase):
     def test_writer_cannot_postpone_expiry(self) -> None:
         self.add_user()
         self.pipeline().handle_message(inbound("evt_1"), now=NOW)
-        self.execute(
-            "UPDATE inbound_event SET expires_at = now() + interval '10 years'"
-        )
+        self.execute("UPDATE inbound_event SET expires_at = now() + interval '10 years'")
 
         delta = self.scalar("SELECT expires_at - received_at FROM inbound_event")
         self.assertEqual(delta, timedelta(days=90), "保留期不得被写入方悄悄延长")

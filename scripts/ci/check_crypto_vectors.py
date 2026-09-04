@@ -74,7 +74,9 @@ def main() -> int:
     result = unittest.TextTestRunner(stream=sys.stderr, verbosity=0).run(suite)
     failures: list[str] = []
     if not result.wasSuccessful():
-        failures.append(f"加密互操作用例未全部通过：失败 {len(result.failures)}，错误 {len(result.errors)}")
+        failures.append(
+            f"加密互操作用例未全部通过：失败 {len(result.failures)}，错误 {len(result.errors)}"
+        )
     if result.skipped:
         # 关键的一条：**跳过也算不通过**。缺依赖时上面已经失败了，走到这里还有跳过，
         # 说明有人给这几组加了别的跳过条件——那等于把断言悄悄关掉。

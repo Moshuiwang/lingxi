@@ -54,9 +54,9 @@ import argparse
 import os
 import re
 import sys
+from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Mapping
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
 SRC_ROOT = REPOSITORY_ROOT / "src" / "lingxi"
@@ -306,9 +306,7 @@ def main(argv: list[str] | None = None) -> int:
         )
     )
     group = parser.add_mutually_exclusive_group(required=True)
-    group.add_argument(
-        "--list", action="store_true", help="列出全部已登记夹具及一句话说明"
-    )
+    group.add_argument("--list", action="store_true", help="列出全部已登记夹具及一句话说明")
     group.add_argument(
         "--check-clear",
         action="store_true",

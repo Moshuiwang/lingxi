@@ -56,9 +56,7 @@ class RegisteredDelegatedSubjectOpenIdTests(unittest.TestCase):
             (DELEGATED_PURPOSE, "ou_registered_subject"),
         )
 
-        self.assertEqual(
-            registered_delegated_subject_open_id(self._dsn), "ou_registered_subject"
-        )
+        self.assertEqual(registered_delegated_subject_open_id(self._dsn), "ou_registered_subject")
 
     def test_a_different_purpose_is_rejected_by_the_table_check(self) -> None:
         """诚实记录：`WHERE purpose = %s` 这个过滤条件今天在真库上测不出"读到了别的

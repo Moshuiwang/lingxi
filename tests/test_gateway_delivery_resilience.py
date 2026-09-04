@@ -27,7 +27,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from lingxi.apps.gateway import (
-    _combined_heartbeat,
+    combined_heartbeat,
     delivery_thread_watchdog,
     run_delivery_loop,
 )
@@ -289,7 +289,7 @@ class LoopFailureAlertingTests(unittest.TestCase):
         )
 
     def test_a_still_broken_loop_reports_again_after_the_throttle_window(self) -> None:
-        """"还在坏"必须持续可见：节流窗口过去之后要再报一次，不是只响一声。"""
+        """ "还在坏"必须持续可见：节流窗口过去之后要再报一次，不是只响一声。"""
 
         queue = _FakeQueue(always_fail_pending=True)
         alerts = _RecordingAlerts()
@@ -441,9 +441,7 @@ class DeliveryThreadWatchdogTests(unittest.TestCase):
         stop = threading.Event()
         stop.set()
         causes: list[str] = []
-        watchdog = delivery_thread_watchdog(
-            self._dead_thread(), stop=stop, on_dead=causes.append
-        )
+        watchdog = delivery_thread_watchdog(self._dead_thread(), stop=stop, on_dead=causes.append)
 
         watchdog()
 
@@ -456,9 +454,7 @@ class DeliveryThreadWatchdogTests(unittest.TestCase):
         self.addCleanup(thread.join)
         self.addCleanup(release.set)
         causes: list[str] = []
-        watchdog = delivery_thread_watchdog(
-            thread, stop=threading.Event(), on_dead=causes.append
-        )
+        watchdog = delivery_thread_watchdog(thread, stop=threading.Event(), on_dead=causes.append)
 
         watchdog()
 
@@ -487,7 +483,7 @@ class LongConnectionHeartbeatRunsTheWatchdogTests(unittest.TestCase):
         checks: list[int] = []
         with tempfile.TemporaryDirectory(prefix="issue191-liveness-") as directory:
             with patch.dict(os.environ, {"LINGXI_LIVENESS_DIR": directory}):
-                heartbeat = _combined_heartbeat(
+                heartbeat = combined_heartbeat(
                     duty, "gateway-longconn", watchdog=lambda: checks.append(1)
                 )
                 heartbeat()
@@ -503,11 +499,9 @@ class LongConnectionHeartbeatRunsTheWatchdogTests(unittest.TestCase):
         duty = self._FakeDuty()
         with tempfile.TemporaryDirectory(prefix="issue191-liveness-") as directory:
             with patch.dict(os.environ, {"LINGXI_LIVENESS_DIR": directory}):
-                _combined_heartbeat(duty, "gateway-delivery")()
+                combined_heartbeat(duty, "gateway-delivery")()
 
-                self.assertTrue(
-                    (Path(directory) / "lingxi-gateway-delivery-liveness").exists()
-                )
+                self.assertTrue((Path(directory) / "lingxi-gateway-delivery-liveness").exists())
         self.assertEqual(duty.beats, 1)
 
 

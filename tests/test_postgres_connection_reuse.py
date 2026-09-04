@@ -161,9 +161,7 @@ class ConnectionReuseTests(unittest.TestCase):
             default_pid = _backend_pid(default_connection)
         with connect(DSN, timeouts=other) as other_connection:
             self.assertNotEqual(_backend_pid(other_connection), default_pid)
-            self.assertEqual(
-                other_connection.execute("SHOW statement_timeout").fetchone()[0], "4s"
-            )
+            self.assertEqual(other_connection.execute("SHOW statement_timeout").fetchone()[0], "4s")
         self.assertEqual(idle_connection_count(), 2)
 
     def test_close_idle_connections_really_closes_them(self) -> None:
@@ -176,7 +174,6 @@ class ConnectionReuseTests(unittest.TestCase):
                 "SELECT count(*) FROM pg_stat_activity WHERE pid = %s", (pid,)
             ).fetchone()[0]
         self.assertEqual(alive, 0)
-
 
     def test_close_is_idempotent_and_the_object_enters_the_idle_stack_once(self) -> None:
         """审核 P1-1：重复 close() 不得把同一对象压栈两次（否则两位借用者共用一条连接）。"""
@@ -275,13 +272,67 @@ class ConnectionReuseTests(unittest.TestCase):
             self.assertIsNone(connection.prepare_threshold)
             for _ in range(7):
                 connection.execute("SELECT 42").fetchone()
-            prepared = connection.execute("SELECT count(*) FROM pg_prepared_statements").fetchone()[0]
+            prepared = connection.execute("SELECT count(*) FROM pg_prepared_statements").fetchone()[
+                0
+            ]
             self.assertEqual(prepared, 0)
         with connect(DSN, dedicated=True) as dedicated:
             self.assertEqual(dedicated.info.get_parameters().get("keepalives_idle"), "30")
             self.assertEqual(dedicated.prepare_threshold, 5, "独占连接保持驱动默认")
         with self.assertRaises(TypeError):
             connect(DSN, keepalives_idle=1)
+
+
+class IdleConnectionPoolDiscardsClosedConnectionsTests(unittest.TestCase):
+    """#593 P2-a：弹出已物理关闭的空闲连接时必须显式 ``discard()``，不能只是跳过
+    （否则底层 PGconn 要等 GC 才释放）。假连接对象，不需要真库。"""
+
+    def test_acquire_discards_a_closed_connection_popped_from_the_stack(self) -> None:
+        class _FakeConnection:
+            def __init__(self) -> None:
+                self.closed = True
+                self.discard_calls = 0
+                self._lingxi_idle = True
+
+            def discard(self) -> None:
+                self.discard_calls += 1
+
+        pool = postgres._IdleConnectionPool()
+        key = ("postgresql://test/db", PostgresTimeouts())
+        stale = _FakeConnection()
+        pool._idle[key] = [(stale, 0.0)]
+
+        result = pool.acquire(key)
+
+        self.assertIsNone(result, "栈里只有一条已关闭的连接，弹出丢弃后应无可用连接")
+        self.assertEqual(
+            stale.discard_calls, 1, "已关闭的连接必须被显式 discard()，不能只是 continue"
+        )
+
+    def test_close_all_keeps_closing_after_one_discard_fails(self) -> None:
+        """停机清理必须逐连接隔离异常：一条 discard() 抛错不得让其余连接漏关。"""
+
+        class _FakeConnection:
+            def __init__(self, *, explode: bool) -> None:
+                self.explode = explode
+                self.discard_calls = 0
+                self._lingxi_idle = True
+
+            def discard(self) -> None:
+                self.discard_calls += 1
+                if self.explode:
+                    raise RuntimeError("boom")
+
+        pool = postgres._IdleConnectionPool()
+        key = ("postgresql://test/db", PostgresTimeouts())
+        bad, good = _FakeConnection(explode=True), _FakeConnection(explode=False)
+        pool._idle[key] = [(bad, 0.0), (good, 0.0)]
+
+        closed = pool.close_all()
+
+        self.assertEqual((bad.discard_calls, good.discard_calls), (1, 1))
+        self.assertEqual(closed, 1, "只统计真正关闭成功的连接数")
+        self.assertEqual(pool._idle, {}, "清理后空闲栈必须为空")
 
 
 class DedicatedCallSiteWiringTests(unittest.TestCase):
@@ -306,9 +357,7 @@ class DedicatedCallSiteWiringTests(unittest.TestCase):
             return _Connection()
 
         queue = _TaskQueueBase("postgresql://test/db", reuse_polling_connection=True)
-        with mock.patch(
-            "lingxi.adapters.postgres_conversation._queue_base.connect", fake_connect
-        ):
+        with mock.patch("lingxi.adapters.postgres_conversation._queue_base.connect", fake_connect):
             queue._run_polling_operation(lambda connection: None)
         self.assertEqual(len(calls), 1)
         self.assertIs(calls[0].get("dedicated"), True)
@@ -329,9 +378,7 @@ class DedicatedCallSiteWiringTests(unittest.TestCase):
             calls.append(kwargs)
             return _Connection()
 
-        with mock.patch(
-            "lingxi.adapters.postgres_conversation._listener.connect", fake_connect
-        ):
+        with mock.patch("lingxi.adapters.postgres_conversation._listener.connect", fake_connect):
             with PostgresTaskQueueListener("postgresql://test/db"):
                 pass
         self.assertEqual(len(calls), 1)

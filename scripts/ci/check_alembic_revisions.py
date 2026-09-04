@@ -262,7 +262,9 @@ def main() -> int:
             "多 head 时 `alembic upgrade head` 会报错，而孤儿 revision 只是安静地不被执行。"
         )
     if len(bases) != 1:
-        failures.append(f"revision 链有 {len(bases)} 个 base（{'、'.join(bases) or '无'}），必须恰好 1 个。")
+        failures.append(
+            f"revision 链有 {len(bases)} 个 base（{'、'.join(bases) or '无'}），必须恰好 1 个。"
+        )
 
     all_revisions = list(script.walk_revisions())
     for revision in all_revisions:

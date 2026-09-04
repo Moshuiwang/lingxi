@@ -8,7 +8,7 @@ import os
 import pathlib
 import subprocess
 import unittest
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 
 from lingxi.adapters.feishu_group_message import FeishuGroupMessages
 from lingxi.adapters.feishu_longconn import LongConnectionSupervisor, TerminationReason
@@ -21,12 +21,12 @@ from lingxi.apps.scheduler import (
 )
 from lingxi.apps.worker.config import WorkerConfig
 from lingxi.apps.worker.service import WorkerService
-from lingxi.core.alerting import AlertManager, AlertPolicy
-from lingxi.core.execution.card_stream import CardCreated, CardStream, DeliveryRejected
+from lingxi.apps.worker.service_ports import WorkerObservers
 from lingxi.config.content import default_content_catalog
+from lingxi.core.alerting import AlertManager, AlertPolicy
+from lingxi.core.execution.card_stream import CardCreated, CardStream, DeliveryRejectedError
 
-
-UTC = timezone.utc
+UTC = UTC
 START = datetime(2026, 8, 8, 0, 0, tzinfo=UTC)
 
 
@@ -176,9 +176,7 @@ class AdapterOutcomeTests(unittest.TestCase):
             app_id="cli_fake",
             app_secret="secret_fake",
             transport=transport,
-            on_send_outcome=lambda operation, succeeded: outcomes.append(
-                (operation, succeeded)
-            ),
+            on_send_outcome=lambda operation, succeeded: outcomes.append((operation, succeeded)),
         )
 
         sender.send_text(chat_id="oc_fake", text="摘要", dedupe_key="d-1")
@@ -193,10 +191,10 @@ class AdapterOutcomeTests(unittest.TestCase):
 
         class Cards:
             def create(self, **_kwargs: object) -> str:
-                # 明确失败（白名单，独立审核 R-1）：只有 `DeliveryRejected` 会被
+                # 明确失败（白名单，独立审核 R-1）：只有 `DeliveryRejectedError` 会被
                 # `CardStream.start()` 吞掉并置位 `fallback_needed`，其它任何异常
                 # 类型都会原样抛出（结果不明），不再走到下面的文本兜底断言。
-                raise DeliveryRejected("card unavailable")
+                raise DeliveryRejectedError("card unavailable")
 
             def update(self, **_kwargs: object) -> None:
                 return None
@@ -214,9 +212,7 @@ class AdapterOutcomeTests(unittest.TestCase):
             reply_to_message_id="message",
             transport=Cards(),
             fallback=Text(),
-            on_send_outcome=lambda operation, succeeded: outcomes.append(
-                (operation, succeeded)
-            ),
+            on_send_outcome=lambda operation, succeeded: outcomes.append((operation, succeeded)),
         )
 
         stream.start()
@@ -339,7 +335,9 @@ class HeartbeatAndWorkerEntryPointTests(unittest.TestCase):
         self.assertGreaterEqual(len(heartbeat_calls), 2)
         self.assertTrue(any(action == "longconn.heartbeat_failed" for action, _ in audit))
 
-    def test_worker_reports_three_stuck_categories_and_keeps_claiming_when_alert_fails(self) -> None:
+    def test_worker_reports_three_stuck_categories_and_keeps_claiming_when_alert_fails(
+        self,
+    ) -> None:
         events: list[tuple[str, int]] = []
 
         class Queue:
@@ -376,9 +374,12 @@ class HeartbeatAndWorkerEntryPointTests(unittest.TestCase):
             return await WorkerService(
                 config=config,
                 queue=queue,
-                heartbeat=lambda: events.append(("heartbeat", 1)),
-                on_task_stuck=lambda kind, count: events.append((kind, count)) or (_ for _ in ()).throw(
-                    RuntimeError("alert observer")
+                observers=WorkerObservers(
+                    heartbeat=lambda: events.append(("heartbeat", 1)),
+                    on_task_stuck=lambda kind, count: (
+                        events.append((kind, count))
+                        or (_ for _ in ()).throw(RuntimeError("alert observer"))
+                    ),
                 ),
             ).process_once()
 
@@ -454,11 +455,14 @@ print([notice.event_type for notice in manager.tick(at=now + timedelta(seconds=3
 
         self.assertEqual(outputs[0], outputs[1])
         self.assertEqual(outputs[1], outputs[2])
-        self.assertEqual(outputs[0], [
-            "alpha.feishu_send_failed",
-            "middle.feishu_send_failed",
-            "zeta.feishu_send_failed",
-        ])
+        self.assertEqual(
+            outputs[0],
+            [
+                "alpha.feishu_send_failed",
+                "middle.feishu_send_failed",
+                "zeta.feishu_send_failed",
+            ],
+        )
 
 
 class DeliveryAlertCallbackTests(unittest.TestCase):
@@ -537,9 +541,7 @@ class DeliveryAlertCallbackTests(unittest.TestCase):
         callback("progress_persist_failed:RuntimeError", "01J00000000000000000000TAS2")
         duty.dispatcher.run_once(at=clock.value)
 
-        self.assertEqual(
-            len(sender.calls), 2, "两类不同的投递失败必须各自独立限流，不能互相压制"
-        )
+        self.assertEqual(len(sender.calls), 2, "两类不同的投递失败必须各自独立限流，不能互相压制")
 
     def test_a_single_uncertain_report_alerts_immediately_under_production_defaults(
         self,
@@ -603,9 +605,7 @@ class DeliveryAlertCallbackTests(unittest.TestCase):
         callback("dispatch_uncertain:card_finish", "01J00000000000000000000TASK")
         duty.dispatcher.run_once(at=clock.value)
 
-        self.assertEqual(
-            len(sender.calls), 1, "同一 uncertain 任务在去重窗口内重复上报不应刷屏"
-        )
+        self.assertEqual(len(sender.calls), 1, "同一 uncertain 任务在去重窗口内重复上报不应刷屏")
 
     def test_a_fallback_send_rejection_alerts_immediately_under_production_defaults(
         self,

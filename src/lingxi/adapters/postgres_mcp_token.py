@@ -1,50 +1,32 @@
-"""MCP 访问令牌与就绪确认记录的 PostgreSQL 存取（Issue #156 / S-C-02）。
+"""MCP 访问令牌与就绪确认记录的 PostgreSQL 存取。
 
-表结构与逐条理由以迁移 ``0065_mcp_token_and_sync_check`` 为准，本模块不复述。这里只
-落实四件在**代码里**才成立的事：
+表结构与逐条理由以迁移 ``0065_mcp_token_and_sync_check`` 为准，这里只落实四件在
+代码里才成立的事：签发幂等且绝不覆盖（``ON CONFLICT DO NOTHING`` 再回读，反复
+签发只得到同一份）；明文只在内存里（签发时生成即加密，没有一条路径把明文写向
+数据库/日志/异常）；解密失败不放行（:meth:`~PostgresMcpTokenStore.read_token`
+原样上抛，不折成"没有令牌"，否则主密钥配错会表现成安静重新签发一批）；每次
+探针尝试独立成行（``attempt_no`` 由数据库取号，不由调用方传）。
 
-1. **签发幂等，且绝不覆盖**：``INSERT ... ON CONFLICT DO NOTHING`` 再回读。同一个用户
-   反复签发只会得到**同一份**令牌。
-2. **明文只在内存里**：签发时生成 → 立即加密 → 只把密文交给 ``INSERT``。表里没有任何
-   列能放明文（迁移 ``0065``），本模块也没有任何一条把明文写向数据库、日志或异常的路径。
-   :class:`IssuedToken` 的 ``repr`` 里同样没有它。
-3. **解密失败不放行**：:meth:`~PostgresMcpTokenStore.read_token` 让
-   :class:`lingxi.adapters.mcp_token_cipher.McpTokenCipherError` 原样上抛，**不**折成
-   "这个人没有令牌"。折了之后，一次主密钥配错会表现成"所有人忽然都没令牌"，
-   而系统会安静地给他们重新签发一批——把一个可恢复的配置错误变成不可逆的数据破坏。
-4. **每次探针尝试独立成行**：:meth:`~PostgresMcpTokenStore.record_attempt` 的
-   ``attempt_no`` 由**数据库**取号，不由调用方传（理由见迁移文件头部）。
-
-## 为什么不提供轮换
-
-Lingxi 只在**新建**发布行时写 ``token_cipher``，更新既有行时不清空也不覆盖
-（`V-权限-11`）。因此轮换一个已经发布出去的令牌在当前发布语义下**送不到消费方**：
-库里换了新密文，外部表里还是旧的，用户侧表现为"某天开始问数忽然没有权限"。
-要支持轮换，必须先由产品负责人决定 Lingxi 是否可以覆盖既有行的那一列；在那之前，
-提供一个"能改库但送不出去"的轮换接口比没有轮换更危险。本模块因此**没有** ``rotate``。
-
-产品负责人 2026-08-18 裁定 6（留痕见 [#203](https://github.com/Moshuiwang/lingxi/issues/203)
-的决策评论）已经就**存量令牌**给出方向：既有 26 行由 lingxi 在**硬切窗口**统一重签、
-覆写发布行密文，并经 Epic D 的用户环境链重投。**这不等于本模块该有 ``rotate``**——那是
-一次有窗口、有重投编排的迁移动作，落点在那条硬切链上；一个随时可调的轮换接口仍然会把
-新密文写进库里而送不到消费方。等硬切编排落地时，由它连同触发器一起决定改法。
+**为什么不提供轮换**：Lingxi 只在新建发布行时写 ``token_cipher``，更新既有行不
+覆盖（`V-权限-11`），轮换已发布的令牌因此送不到消费方；"能改库但送不出去"的
+轮换接口比没有轮换更危险，本模块没有 ``rotate``。
 """
 
 from __future__ import annotations
 
 import logging
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from typing import Any
 
 from lingxi.adapters.mcp_token_cipher import McpTokenCipher, new_token
 from lingxi.adapters.postgres import DEFAULT_POSTGRES_TIMEOUTS, PostgresTimeouts, connect
 from lingxi.core.ids import new_id
-from lingxi.core.permission.mcp_readiness import ReadinessAttempt
+from lingxi.core.permission.mcp_readiness_base import ReadinessAttempt
 
 logger = logging.getLogger(__name__)
 
-_UTC = timezone.utc
+_UTC = UTC
 
 
 @dataclass(frozen=True)
@@ -64,7 +46,6 @@ class IssuedToken:
 
     def reveal(self) -> str:
         """取出明文。调用点应当尽快用完并丢弃，不要存进任何长期对象。"""
-
         return self.secret
 
 
@@ -93,8 +74,9 @@ class PostgresMcpTokenStore:
         cipher: McpTokenCipher,
         timeouts: PostgresTimeouts = DEFAULT_POSTGRES_TIMEOUTS,
     ) -> None:
+        """记下 DSN、加解密器与超时配置；不在构造时连接数据库。"""
         if not isinstance(cipher, McpTokenCipher):
-            # 只接受**已经校验过主密钥**的加解密对象：允许传一个裸字符串密钥进来，
+            # 只接受已经校验过主密钥的加解密对象：允许传一个裸字符串密钥进来，
             # 等于给每个调用点各开一次绕过长度校验的口子。
             raise TypeError("令牌存储必须注入已校验主密钥的 McpTokenCipher")
         self._dsn = dsn
@@ -113,35 +95,20 @@ class PostgresMcpTokenStore:
         ``token_cipher``（`V-权限-11`），新值永远送不出去——用户侧表现为"某天开始问数
         忽然没有权限"。
         """
-
         if not isinstance(user_id, str) or not user_id.strip():
             raise ValueError("签发令牌必须指明用户")
         return self._insert_new_token(user_id, new_token(), verb="签发")
 
     def adopt_token(self, user_id: str, secret: str) -> IssuedToken:
-        """采纳一份**已经解密**的存量令牌明文（Issue #281 改道，产品负责人 2026-08-25）。
+        """采纳一份**已经解密**的存量令牌明文。
 
-        语义与 :meth:`issue_token` 完全相同——**已存在即返回既有那一份，绝不覆盖**：
-        库里已经有这个用户的令牌行时，以库内既有那份为准，本次传入的候选明文被丢弃，
-        不做比对也不做覆盖。区别只在候选明文的来源：不是本模块新生成的
-        ``secrets.token_urlsafe``，而是调用方从正式表存量令牌解密出来的那一份。
-
-        **本方法自己只校验非空，但迁移 ``0065`` 的 ``token_cipher`` CHECK 依然生效**
-        （``^[A-Za-z0-9+/]{86}==$``，见该迁移文件头部）：PKCS7 把明文补到 16 字节的
-        整数倍再加密，因此这条 CHECK 实际接受的是 **UTF-8 字节数落在 32–47 之间**的
-        候选明文（都补到 48 字节密文 → 64 字节信封 → 88 字符 base64），不是字面意义
-        "必须恰好 43 字符"——只是 :func:`~lingxi.adapters.mcp_token_cipher.new_token`
-        产出的 43 字节明文恰好落在这个区间里。候选明文的字节数落在区间外时，
-        ``INSERT`` 会被数据库拒绝、原样向上抛 ``psycopg`` 异常（不吞不折——采纳失败与
-        签发失败同一条纪律，调用方按"本侧故障"收口）。**这不是本方法新引入的限制**：
-        #281 改道评论的实测（2026-08-21，解密真实存量令牌）证实旧系统 biai-agent 的
-        签发同样是 ``secrets.token_urlsafe(32)``（43 字节，落在区间内），只是与
-        :meth:`issue_token` 共用同一列、同一条 CHECK 的自然结果，如实登记不隐瞒
-        ——``tests/test_mcp_token_postgres.py`` 的
-        ``test_adopting_a_secret_with_a_different_shape_is_rejected_by_the_database``
-        真实撞过一次并钉住这条边界。
+        语义与 :meth:`issue_token` 完全相同——已存在即返回既有那一份、绝不覆盖，
+        区别只在候选明文的来源：不是新生成的，而是调用方从正式表存量令牌解密出来
+        的那一份。本方法自己只校验非空，但迁移 ``0065`` 的 ``token_cipher`` CHECK
+        依然生效（接受 UTF-8 字节数落在 32–47 之间的候选明文）；不满足时
+        ``INSERT`` 被数据库拒绝、原样上抛，与签发失败同一条纪律，不吞不折（见
+        ``tests/test_mcp_token_postgres.py`` 对应用例）。
         """
-
         if not isinstance(user_id, str) or not user_id.strip():
             raise ValueError("采纳令牌必须指明用户")
         if not isinstance(secret, str) or not secret:
@@ -149,14 +116,17 @@ class PostgresMcpTokenStore:
         return self._insert_new_token(user_id, secret, verb="采纳存量")
 
     def _insert_new_token(self, user_id: str, candidate: str, *, verb: str) -> IssuedToken:
-        """``issue_token``/``adopt_token`` 共用的写入与回读：先无条件加密候选明文再
-        ``ON CONFLICT DO NOTHING``，多花一次加密换来"判断与写入在同一条语句里"，两个
-        并发的首次写入只会有一个胜出，另一个回读到胜出者的那一份。**先查后写**会在
-        两次调用之间留一个窗口，两边各自认为自己是第一个。
-        """
+        """``issue_token``/``adopt_token`` 共用的写入与回读。
 
+        先无条件加密候选明文再 ``ON CONFLICT DO NOTHING``，多花一次加密换来
+        "判断与写入在同一条语句里"，两个并发的首次写入只会有一个胜出，另一个
+        回读到胜出者的那一份；先查后写会在两次调用之间留一个窗口。
+        """
         candidate_cipher = self._cipher.encrypt(candidate)
-        with connect(self._dsn, timeouts=self._timeouts) as connection, connection.cursor() as cursor:
+        with (
+            connect(self._dsn, timeouts=self._timeouts) as connection,
+            connection.cursor() as cursor,
+        ):
             cursor.execute(
                 """INSERT INTO mcp_access_token (user_id, token_cipher)
                         VALUES (%s, %s)
@@ -181,8 +151,10 @@ class PostgresMcpTokenStore:
 
     def token_cipher(self, user_id: str) -> str | None:
         """只取密文，**不解密**。构造发布行时用它——那条链路不需要明文。"""
-
-        with connect(self._dsn, timeouts=self._timeouts) as connection, connection.cursor() as cursor:
+        with (
+            connect(self._dsn, timeouts=self._timeouts) as connection,
+            connection.cursor() as cursor,
+        ):
             cursor.execute(
                 "SELECT token_cipher FROM mcp_access_token WHERE user_id = %s", (user_id,)
             )
@@ -195,29 +167,22 @@ class PostgresMcpTokenStore:
         两种"取不到"必须可分辨：没登记过是"还没轮到这一步"，解不开是"密钥或数据坏了"。
         把后者也折成 ``None``，会让一次主密钥配错表现成"所有人都还没签发"。
         """
-
         cipher = self.token_cipher(user_id)
         return None if cipher is None else self._cipher.decrypt(cipher)
 
     def any_token_holder(self) -> str | None:
-        """取**签发时间最新**的一个已签发令牌的 ``user_id``（Issue #320 并入项：
-        每日「MCP 指标目录 vs 映射表覆盖面」日检）。没有任何人签发过令牌时返回
-        ``None``。
+        """取签发时间最新的一个已签发令牌的 ``user_id``；没有任何人签发过令牌返回 ``None``。
 
-        **不针对特定身份**：调用方（每日指标覆盖面日检）要问的是"MCP 现在报告的
-        指标目录里有哪些 ID"，不是"这个具体的人能看见哪些指标"——`list_metrics`
-        是否按调用者的已同步权限过滤尚未被真实验证（见 ``adapters/query_mcp_probe.py``
-        模块文档「诚实边界」），本方法因此不承诺"拿到的是全局完整目录"，只承诺
-        "拿到的是当前某一个真实、有效的令牌"，日检据此得到的是**这个人视角下**的
-        指标目录——这个已知边界写在调用方的装配文档里，不在这里重复。
-
-        按 ``issued_at`` 取最新一条（迁移 ``0065`` 的 ``mcp_access_token`` 定义），
-        只是为了让"同一天多次运行日检"倾向于稳定选中同一个人（新令牌不会在两次
-        运行之间频繁产生），不是因为"更新的令牌更可信"这类判断——任意一个真实
-        存在的令牌都足以满足调用方的需要。
+        **不针对特定身份**：调用方要问的是"MCP 现在报告的指标目录里有哪些
+        ID"，不是"这个具体的人能看见哪些指标"，因此本方法不承诺"全局完整
+        目录"，只承诺"当前某一个真实、有效的令牌"。按 ``issued_at`` 取最新
+        一条只是为了让同一天多次运行倾向于稳定选中同一个人，不是"更新的
+        令牌更可信"这类判断。
         """
-
-        with connect(self._dsn, timeouts=self._timeouts) as connection, connection.cursor() as cursor:
+        with (
+            connect(self._dsn, timeouts=self._timeouts) as connection,
+            connection.cursor() as cursor,
+        ):
             cursor.execute("SELECT user_id FROM mcp_access_token ORDER BY issued_at DESC LIMIT 1")
             row = cursor.fetchone()
         return None if row is None else str(row[0])
@@ -235,23 +200,19 @@ class PostgresMcpTokenStore:
         权限一共判定过几次"，跨轮次连续才有意义——这张表存在的理由正是事后回答
         "十五分钟是不是一个现实的上限"。
         """
-
         if not isinstance(attempt, ReadinessAttempt):
             raise TypeError("就绪记录必须是 ReadinessAttempt：取值域与不变式由它保证")
         check_id = new_id("syn")
         lock_key = f"mcp_sync_check:{attempt.binding.user_id}:{attempt.binding.permission_version}"
         with connect(self._dsn, timeouts=self._timeouts) as connection:
             with connection.transaction(), connection.cursor() as cursor:
-                # **取号必须串行化**。``COALESCE(MAX(attempt_no), 0) + 1`` 在
-                # ``READ COMMITTED`` 下会让两个并发记账读到同一个 MAX，各自算出同一个
-                # N+1，于是一个撞上 ``UNIQUE`` 中止——而它对应的那次探针**已经真的发出去
-                # 了**，却没有留下任何记录。这张表存在的理由正是"事后判断十五分钟是不是
-                # 现实的上限"，丢样本等于丢掉它唯一的用处。
-                #
-                # 用事务级 advisory lock 而不是 ``SELECT ... FOR UPDATE``：后者要有一行
-                # 可锁，而"这个人还没签发令牌"是合法状态（那时 mcp_access_token 里没有
-                # 行，锁不住任何东西，串行化就悄悄失效了）。advisory lock 不依赖任何行
-                # 是否存在，且随事务结束自动释放，不需要显式解锁路径。
+                # 取号必须串行化：READ COMMITTED 下两个并发记账会读到同一个 MAX、
+                # 算出同一个 N+1，一个撞上 UNIQUE 中止——而它对应的探针已经真的发出
+                # 去了，却没有留下任何记录，丢样本等于丢掉这张表唯一的用处。
+
+                # 用事务级 advisory lock 而不是 SELECT ... FOR UPDATE：后者要有一行
+                # 可锁，而"这个人还没签发令牌"是合法状态（锁不住任何东西）；advisory
+                # lock 不依赖任何行是否存在，随事务结束自动释放。
                 cursor.execute("SELECT pg_advisory_xact_lock(hashtext(%s))", (lock_key,))
                 cursor.execute(
                     """INSERT INTO mcp_sync_check
@@ -281,8 +242,10 @@ class PostgresMcpTokenStore:
 
     def load_checks(self, user_id: str, permission_version: int) -> tuple[StoredCheck, ...]:
         """回读某个用户某一版权限的全部判定，按次序。给运维排查与用例断言用。"""
-
-        with connect(self._dsn, timeouts=self._timeouts) as connection, connection.cursor() as cursor:
+        with (
+            connect(self._dsn, timeouts=self._timeouts) as connection,
+            connection.cursor() as cursor,
+        ):
             cursor.execute(
                 """SELECT id, user_id, permission_version, attempt_no, result, error_code,
                           metric_count, started_at, finished_at
@@ -314,13 +277,15 @@ class PostgresMcpTokenStore:
         因此到期处理是**删整行**而不是擦某一列——没有列可擦。行本身还有一条已经存在的
         删除路径：``user_id`` 上的 ``ON DELETE CASCADE``。
         """
-
         moment = now or datetime.now(_UTC)
         if moment.tzinfo is None or moment.utcoffset() is None:
             raise ValueError("到期判定时间必须带时区")
         if isinstance(limit, bool) or not isinstance(limit, int) or limit < 1:
             raise ValueError("limit 必须是正整数")
-        with connect(self._dsn, timeouts=self._timeouts) as connection, connection.cursor() as cursor:
+        with (
+            connect(self._dsn, timeouts=self._timeouts) as connection,
+            connection.cursor() as cursor,
+        ):
             cursor.execute(
                 """DELETE FROM mcp_sync_check
                     WHERE id IN (
@@ -338,13 +303,11 @@ class PostgresMcpTokenStore:
 
 
 def token_cipher_provider(store: PostgresMcpTokenStore) -> Any:
-    """把令牌存储适配成 :class:`lingxi.adapters.query_mcp_probe.QueryMcpProbe` 的
-    ``token_provider``（按 ``user_id`` 返回**明文**）。
+    """把令牌存储适配成 ``QueryMcpProbe`` 的 ``token_provider``。
 
-    单独给它一个名字，是为了让"哪里会解密令牌"在仓库里可被搜索到，而不是散落成一堆
-    等价的 lambda。
+    单独给它一个名字，是为了让"哪里会解密令牌"在仓库里可被搜索到，而不是
+    散落成一堆等价的 lambda。
     """
-
     return store.read_token
 
 

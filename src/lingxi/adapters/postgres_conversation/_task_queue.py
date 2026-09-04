@@ -1,8 +1,9 @@
-"""``PostgresTaskQueue`` 的组合定义（Issue #239）：把 ``_queue_base.py``/
-``_queue_lifecycle.py``/``_queue_outbox.py``/``_queue_session_cleanup.py``/
-``_queue_gateway_delivery.py`` 五个按读写边界拆开的基类与 mixin 组合成对外唯一
-可见的类名。拆分只搬动方法定义的物理位置，不改变任何方法体、调用顺序或 MRO
-以外的行为——各 mixin 互不重名，`self.<method>` 的解析结果与拆分前完全一致。
+"""``PostgresTaskQueue`` 的组合定义。
+
+把 ``_queue_base.py``/``_queue_lifecycle.py``/``_queue_outbox.py``/
+``_queue_session_cleanup.py``/``_queue_gateway_delivery.py`` 五个按读写边界拆开
+的基类与 mixin 组合成对外唯一可见的类名；各 mixin 互不重名，
+``self.<method>`` 的解析结果由 MRO 唯一确定。
 """
 
 from __future__ import annotations

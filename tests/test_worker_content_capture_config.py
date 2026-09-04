@@ -18,9 +18,9 @@ from lingxi.apps.worker.config import (
     PRODUCTION_ENVIRONMENT_VALUES,
     WorkerConfig,
     WorkerConfigError,
+    _innertest_content_capture,
     declares_production,
     load_config,
-    _innertest_content_capture,
 )
 
 _READ_ONLY_TOOL = "mcp__query__list_metrics"
@@ -242,7 +242,9 @@ class ProductionDeclarationLivesInComposeTest(unittest.TestCase):
             if line.strip().startswith(f"{DEPLOY_ENVIRONMENT_VAR}:")
         ]
 
-        self.assertEqual(len(declarations), 2, f"worker 与 worker-queue 各一条，实际 {declarations}")
+        self.assertEqual(
+            len(declarations), 2, f"worker 与 worker-queue 各一条，实际 {declarations}"
+        )
         for line in declarations:
             value = line.split(":", 1)[1].strip().strip('"')
             self.assertIn(value.casefold(), PRODUCTION_ENVIRONMENT_VALUES)

@@ -27,7 +27,6 @@ def new_ulid(*, now_ms: int | None = None, randomness: bytes | None = None) -> s
     ``now_ms`` 与 ``randomness`` 只为测试可重复而开放；正常调用不传。越界输入直接
     抛错，不静默截断——一个被悄悄截断的标识会在排序和唯一性上同时说谎。
     """
-
     timestamp = int(time.time() * 1000) if now_ms is None else int(now_ms)
     if not 0 <= timestamp < (1 << _TIME_BITS):
         raise ValueError(f"时间戳超出 ULID 的 48 位范围：{timestamp}")
@@ -42,13 +41,12 @@ def new_ulid(*, now_ms: int | None = None, randomness: bytes | None = None) -> s
     )
 
 
-
 def new_id(prefix: str, *, now_ms: int | None = None) -> str:
     """按接口设计的前缀约定生成内部标识，例如 ``usr_01HXYZ...``。"""
-
     if not prefix or not prefix.isascii() or not prefix.replace("_", "").isalnum():
         raise ValueError("标识前缀必须是 ASCII 字母数字")
     return f"{prefix}_{new_ulid(now_ms=now_ms)}"
+
 
 _CROCKFORD = frozenset("0123456789ABCDEFGHJKMNPQRSTVWXYZ")
 
@@ -57,13 +55,13 @@ def is_ulid(value: object) -> bool:
     """26 位 Crockford Base32 的形状校验（大小写不敏感）。
 
     外部传入的 trace_id 必须过这道：任意字符串直通会破坏全仓库的 ULID 排序
-    约定，误接的令牌还会随错误输出原样外泄（Codex 复查发现）。"""
-
+    约定，误接的令牌还会随错误输出原样外泄。
+    """
     if not isinstance(value, str) or len(value) != 26:
         return False
     upper = value.upper()
     # 128 位上界：首字符只能是 0-7，否则最高两个填充位非零，
-    # 不是合法的 48 位时间戳 + 80 位随机数（终轮 Codex 复查发现）。
+    # 不是合法的 48 位时间戳 + 80 位随机数。
     if upper[0] not in "01234567":
         return False
     return all(ch in _CROCKFORD for ch in upper)

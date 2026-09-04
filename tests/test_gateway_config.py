@@ -23,13 +23,14 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from lingxi.apps.gateway.onboarding import assert_gateway_onboarding_is_inert
+from gateway_fakes import FakeOnboarding
+
 from lingxi.apps.gateway import (
     build_supervisor,
     main,
 )
 from lingxi.apps.gateway.config import ENV_PREFIX, GatewayConfigError, load_config
-from gateway_fakes import FakeOnboarding
+from lingxi.apps.gateway.onboarding import assert_gateway_onboarding_is_inert
 from lingxi.core.conversation.ports import OnboardingState
 
 REPOSITORY_ROOT = Path(__file__).parents[1]
@@ -153,7 +154,6 @@ class RequiredConfigTests(unittest.TestCase):
         self.assertIn(f"{ENV_PREFIX}CARD_FAILURE_INJECT", message)
         self.assertNotIn("createx", message, "报错不得回显收到的值")
 
-
     def test_non_finite_numbers_are_rejected(self) -> None:
         """``nan`` / ``inf`` 是合法的 float 字面量，会一路通过后面所有比较。
 
@@ -172,7 +172,6 @@ class RequiredConfigTests(unittest.TestCase):
                 with self.subTest(raw=raw, name=name):
                     with self.assertRaises(GatewayConfigError):
                         load_config(dict(VALID_ENV, **{name: raw}))
-
 
     def test_non_positive_numbers_are_rejected(self) -> None:
         """本组数值全是时长或倍数，0 与负数没有一个有意义。
@@ -234,9 +233,7 @@ class InnertestRosterConfigTests(unittest.TestCase):
         `repr(config)`。"""
 
         legal_member = "ou_rostermembera00000000000"
-        config = load_config(
-            {**VALID_ENV, "LINGXI_INNERTEST_ROSTER_OPEN_IDS": legal_member}
-        )
+        config = load_config({**VALID_ENV, "LINGXI_INNERTEST_ROSTER_OPEN_IDS": legal_member})
 
         self.assertEqual(config.innertest_roster_open_ids, frozenset({legal_member}))
         self.assertNotIn(legal_member, repr(config))
@@ -256,9 +253,7 @@ class InnertestRosterConfigTests(unittest.TestCase):
 
     def test_an_invalid_innertest_roster_error_does_not_echo_the_raw_value(self) -> None:
         with self.assertRaises(GatewayConfigError) as raised:
-            load_config(
-                {**VALID_ENV, "LINGXI_INNERTEST_ROSTER_OPEN_IDS": "totally-not-an-open-id"}
-            )
+            load_config({**VALID_ENV, "LINGXI_INNERTEST_ROSTER_OPEN_IDS": "totally-not-an-open-id"})
         self.assertNotIn("totally-not-an-open-id", str(raised.exception))
 
     def test_the_variable_name_is_not_prefixed_with_lingxi_gateway(self) -> None:
@@ -298,9 +293,7 @@ class BotOpenIdConfigTests(unittest.TestCase):
     def test_the_variable_name_is_not_prefixed_with_lingxi_gateway(self) -> None:
         env = {**VALID_ENV, f"{ENV_PREFIX}BOT_OPEN_ID": "ou_should_be_ignored"}
         config = load_config(env)
-        self.assertIsNone(
-            config.bot_open_id, "带 LINGXI_GATEWAY_ 前缀的同名变量不应该被读取"
-        )
+        self.assertIsNone(config.bot_open_id, "带 LINGXI_GATEWAY_ 前缀的同名变量不应该被读取")
 
 
 class BuildSupervisorTests(unittest.TestCase):
@@ -332,9 +325,11 @@ class BuildSupervisorTests(unittest.TestCase):
         saved = sys.modules.get("lark_oapi")
         sys.modules["lark_oapi"] = module
         self.addCleanup(
-            lambda: sys.modules.__setitem__("lark_oapi", saved)
-            if saved is not None
-            else sys.modules.pop("lark_oapi", None)
+            lambda: (
+                sys.modules.__setitem__("lark_oapi", saved)
+                if saved is not None
+                else sys.modules.pop("lark_oapi", None)
+            )
         )
 
     def test_poll_interval_is_derived_from_the_shutdown_timeout(self) -> None:
@@ -347,9 +342,7 @@ class BuildSupervisorTests(unittest.TestCase):
             5.0,
             "空闲轮询间隔必须由停机超时推导，否则配置里的超时是一句没实现的承诺",
         )
-        self.assertEqual(
-            transport._ack_timeout_seconds, 20.0, "单条事件的 ack 上限取停机超时"
-        )
+        self.assertEqual(transport._ack_timeout_seconds, 20.0, "单条事件的 ack 上限取停机超时")
         self.assertEqual(
             transport._handshake_timeout_seconds,
             20.0,
@@ -358,8 +351,7 @@ class BuildSupervisorTests(unittest.TestCase):
         self.assertEqual(
             self.captured["timeout"],
             5.0,
-            "出站 HTTP 超时必须从停机预算里分配，不能用 SDK 的 30 秒默认值"
-            "——它比停机预算还长",
+            "出站 HTTP 超时必须从停机预算里分配，不能用 SDK 的 30 秒默认值——它比停机预算还长",
         )
         self.assertLess(
             self.captured["timeout"],
@@ -404,7 +396,7 @@ class BuildSupervisorTests(unittest.TestCase):
         config = load_config(VALID_ENV)
         runner = FakeOnboarding()
 
-        with patch("lingxi.apps.gateway.EventPipeline") as pipeline_class:
+        with patch("lingxi.apps.gateway.assembly.EventPipeline") as pipeline_class:
             build_supervisor(config, transport=object(), onboarding=runner)
 
         self.assertIs(
@@ -423,7 +415,7 @@ class BuildSupervisorTests(unittest.TestCase):
 
         config = load_config(VALID_ENV)
 
-        with patch("lingxi.apps.gateway.EventPipeline") as pipeline_class:
+        with patch("lingxi.apps.gateway.assembly.EventPipeline") as pipeline_class:
             build_supervisor(config, transport=object())
 
         fallback = pipeline_class.call_args.kwargs["onboarding"]
@@ -467,15 +459,17 @@ class GatewayOnboardingIsInertTests(unittest.TestCase):
         saved = sys.modules.get("lark_oapi")
         sys.modules["lark_oapi"] = module
         self.addCleanup(
-            lambda: sys.modules.__setitem__("lark_oapi", saved)
-            if saved is not None
-            else sys.modules.pop("lark_oapi", None)
+            lambda: (
+                sys.modules.__setitem__("lark_oapi", saved)
+                if saved is not None
+                else sys.modules.pop("lark_oapi", None)
+            )
         )
 
     def test_the_default_onboarding_only_records(self) -> None:
         config = load_config(VALID_ENV)
 
-        with patch("lingxi.apps.gateway.EventPipeline") as pipeline_class:
+        with patch("lingxi.apps.gateway.assembly.EventPipeline") as pipeline_class:
             build_supervisor(config, transport=object())
 
         fallback = pipeline_class.call_args.kwargs["onboarding"]
@@ -490,9 +484,7 @@ class GatewayOnboardingIsInertTests(unittest.TestCase):
         config = load_config(VALID_ENV)
         reported: list[object] = []
 
-        build_supervisor(
-            config, transport=object(), on_onboarding_assembled=reported.append
-        )
+        build_supervisor(config, transport=object(), on_onboarding_assembled=reported.append)
 
         self.assertEqual(len(reported), 1)
         assert_gateway_onboarding_is_inert(*reported)
@@ -548,9 +540,11 @@ class AssembleDeliveryConsumerCardInjectionTests(unittest.TestCase):
         saved = sys.modules.get("lark_oapi")
         sys.modules["lark_oapi"] = module
         self.addCleanup(
-            lambda: sys.modules.__setitem__("lark_oapi", saved)
-            if saved is not None
-            else sys.modules.pop("lark_oapi", None)
+            lambda: (
+                sys.modules.__setitem__("lark_oapi", saved)
+                if saved is not None
+                else sys.modules.pop("lark_oapi", None)
+            )
         )
 
     def test_default_configuration_passes_no_injected_transport(self) -> None:
@@ -580,7 +574,8 @@ class AssembleDeliveryConsumerCardInjectionTests(unittest.TestCase):
         self.assertEqual(builder.call_args.kwargs["queue_delay_hint_seconds"], 15.0)
 
     def test_injected_configuration_wires_the_rejecting_transport(self) -> None:
-        from lingxi.apps.gateway import _RejectingCards, assemble_delivery_consumer
+        from lingxi.apps.gateway import assemble_delivery_consumer
+        from lingxi.apps.gateway.delivery_assembly import RejectingCards
 
         env = dict(VALID_ENV, **{f"{ENV_PREFIX}CARD_FAILURE_INJECT": "close"})
         config = load_config(env)
@@ -588,7 +583,7 @@ class AssembleDeliveryConsumerCardInjectionTests(unittest.TestCase):
             assemble_delivery_consumer(config, queue=object())
 
         cards = builder.call_args.kwargs["cards"]
-        self.assertIsInstance(cards, _RejectingCards)
+        self.assertIsInstance(cards, RejectingCards)
         self.assertEqual(cards._inject, "close")
 
     def test_injected_configuration_logs_a_visible_startup_warning(self) -> None:
@@ -618,10 +613,10 @@ class LoggingAuditLevelTests(unittest.TestCase):
     """
 
     def test_failed_actions_log_at_warning(self) -> None:
-        from lingxi.apps.gateway import _LoggingAudit
+        from lingxi.apps.gateway.audit_log import LoggingAudit
 
         with self.assertLogs("lingxi.apps.gateway", level="WARNING") as captured:
-            _LoggingAudit().record("reaction.failed", error="RuntimeError: 加表情失败")
+            LoggingAudit().record("reaction.failed", error="RuntimeError: 加表情失败")
         self.assertTrue(captured.output[0].startswith("WARNING"))
         self.assertIn("reaction.failed", captured.output[0])
 
@@ -630,10 +625,10 @@ class LoggingAuditLevelTests(unittest.TestCase):
         "用户发了消息却什么都没发生"的唯一入站侧证据（r19 首轮误判正是这一类），
         必须进 WARNING 显式名单。"""
 
-        from lingxi.apps.gateway import _LoggingAudit
+        from lingxi.apps.gateway.audit_log import LoggingAudit
 
         with self.assertLogs("lingxi.apps.gateway", level="WARNING") as captured:
-            _LoggingAudit().record("message.unsupported_type")
+            LoggingAudit().record("message.unsupported_type")
         self.assertTrue(captured.output[0].startswith("WARNING"))
 
     def test_the_new_onboarding_diagnostics_land_at_warning(self) -> None:
@@ -645,7 +640,7 @@ class LoggingAuditLevelTests(unittest.TestCase):
         后缀，靠既有后缀规则升级，不再往显式名单里加条目。
         """
 
-        from lingxi.apps.gateway import _LoggingAudit
+        from lingxi.apps.gateway.audit_log import LoggingAudit
 
         for action in (
             "onboarding.dispatch_record_failed",
@@ -655,24 +650,24 @@ class LoggingAuditLevelTests(unittest.TestCase):
         ):
             with self.subTest(action=action):
                 with self.assertLogs("lingxi.apps.gateway", level="WARNING") as captured:
-                    _LoggingAudit().record(action)
+                    LoggingAudit().record(action)
                 self.assertTrue(captured.output[0].startswith("WARNING"))
 
     def test_a_deferred_onboarding_stays_at_info(self) -> None:
         """停机中推迟触发开通属正常停机路径（与 ``reply.skipped_while_stopping``
         同类），不是诊断缺口，维持 INFO。"""
 
-        from lingxi.apps.gateway import _LoggingAudit
+        from lingxi.apps.gateway.audit_log import LoggingAudit
 
         with self.assertLogs("lingxi.apps.gateway", level="INFO") as captured:
-            _LoggingAudit().record("onboarding.deferred_while_stopping")
+            LoggingAudit().record("onboarding.deferred_while_stopping")
         self.assertTrue(captured.output[0].startswith("INFO"))
 
     def test_normal_actions_stay_at_info(self) -> None:
-        from lingxi.apps.gateway import _LoggingAudit
+        from lingxi.apps.gateway.audit_log import LoggingAudit
 
         with self.assertLogs("lingxi.apps.gateway", level="INFO") as captured:
-            _LoggingAudit().record("reply.sent")
+            LoggingAudit().record("reply.sent")
         self.assertTrue(captured.output[0].startswith("INFO"))
 
     def test_group_chat_rejection_stays_at_info(self) -> None:
@@ -681,11 +676,59 @@ class LoggingAuditLevelTests(unittest.TestCase):
         是产品选择而不是诊断缺口，因此维持 INFO。WARNING 名单只收"用户本应得到
         回应却什么都没发生"的动作。"""
 
-        from lingxi.apps.gateway import _LoggingAudit
+        from lingxi.apps.gateway.audit_log import LoggingAudit
 
         with self.assertLogs("lingxi.apps.gateway", level="INFO") as captured:
-            _LoggingAudit().record("event.rejected_non_private_chat", chat_type="group")
+            LoggingAudit().record("event.rejected_non_private_chat", chat_type="group")
         self.assertTrue(captured.output[0].startswith("INFO"))
+
+
+class RunShutdownClosesIdleConnectionsTests(unittest.TestCase):
+    """D-17（#593 元守护审核 P2-b）：``_run()`` 停机路径必须在两条后台线程
+    join 之后显式调用一次 ``lingxi.adapters.postgres.close_idle_connections``，
+    不能只靠进程退出时的 ``atexit``。用轻量桩顶掉真实装配（后台循环、supervisor、
+    告警职责、信号安装），只把这一段接线暴露成断言，不真的建长连接或后台线程。
+
+    变异验红：把 ``lingxi/apps/gateway/__init__.py`` 里 ``close_idle_connections()``
+    那一行删掉重跑本用例，``close_mock.assert_called_once_with()`` 会因为从未被
+    调用而失败。
+    """
+
+    def test_run_calls_close_idle_connections_once_after_shutdown(self) -> None:
+        from unittest import mock
+
+        config = load_config(VALID_ENV)
+
+        class _StubLoops:
+            watchdogs: list = []
+
+            def start(self) -> None:
+                return None
+
+            def join_within(self, clock: object, budget_seconds: float) -> None:
+                del clock, budget_seconds
+
+        class _StubSupervisor:
+            def run(self, *, should_stop: object) -> object:
+                del should_stop
+                from lingxi.adapters.feishu_longconn import TerminationReason
+
+                return TerminationReason.STOPPED
+
+        with (
+            mock.patch("lingxi.apps.gateway.install_signal_handlers"),
+            mock.patch("lingxi.apps.gateway.build_alerting_duty", return_value=mock.MagicMock()),
+            mock.patch("lingxi.apps.gateway._start_background_loops", return_value=_StubLoops()),
+            mock.patch("lingxi.apps.gateway.build_supervisor", return_value=_StubSupervisor()),
+            mock.patch("lingxi.apps.gateway.assert_gateway_onboarding_is_inert"),
+            mock.patch("lingxi.apps.gateway.close_idle_connections") as close_mock,
+        ):
+            from lingxi.apps.gateway import _run
+
+            code = _run(config)
+
+        self.assertEqual(code, 0)
+        close_mock.assert_called_once_with()
 
 
 class EntryPointTests(unittest.TestCase):

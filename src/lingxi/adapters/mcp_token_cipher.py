@@ -1,42 +1,17 @@
-"""问数 MCP 访问令牌的加解密（Issue #156 / S-C-02）。
+"""问数 MCP 访问令牌的加解密。
 
-这是一份**互操作实现**，不是我们自选的加密方案：当前权限多维表格的 ``token_cipher``
-列由旧系统 biai-agent 写入并由问数 MCP 消费，格式在 biai-agent 的
-``docs/mcp/mcp-encryption-spec.md`` v1 里定稿（已签署的交接协议）。MCP 逐行解密后与
-请求 ``Bearer`` 明文**等值匹配**，解密失败即不放行。因此本模块逐字执行那份规格，
-**不允许"等价改进"**——换填充、换分组模式、换编码顺序，任何一项都会让我们写出去的行
-在消费方那里解不开，而失败形态是"这个人的权限静默不生效"。
+互操作实现，不是自选的加密方案：当前权限多维表格的 ``token_cipher`` 列由
+旧系统写入、问数 MCP 消费，格式已由双方签署的加密规格定稿——MCP 逐行解密
+后与请求 ``Bearer`` 明文等值匹配，解密失败即不放行。因此本模块逐字执行
+那份规格，不允许"等价改进"：换填充、换分组模式、换编码顺序，任何一项都
+会让写出去的行在消费方那里解不开，失败形态是"这个人的权限静默不生效"。
 
-## 规格（逐条对应实现）
-
-| 规格 | 实现 |
-|---|---|
-| AES-256-CBC，PKCS7 填充（块 16B） | :func:`McpTokenCipher.encrypt` / :func:`~McpTokenCipher.decrypt` |
-| 主密钥 32B，以 base64 字符串存环境变量 | :func:`load_master_key`，**长度必须恰好 32B** |
-| 每次加密随机生成 16B IV，不复用 | ``os.urandom(16)``，每次调用各取一次 |
-| 输出 ``base64(IV(16B) ‖ 密文)`` | :func:`McpTokenCipher.encrypt` 的返回值 |
-| 明文 UTF-8 编解码 | ``encode("utf-8")`` / ``decode("utf-8")``，严格模式 |
-| 解密失败视为记录无效，不得回退放行 | 一律抛 :class:`McpTokenCipherError`，**没有任何返回 ``None`` 的分支** |
-
-## 明文的生命周期
-
-令牌明文由 :func:`new_token` 生成（``secrets.token_urlsafe(32)``，256 位熵）。它
-**只在三个瞬间存在于内存**：签发、就绪探针取用、将来写入用户环境。它不落库（表结构里
-没有列能放它，见迁移 ``0065``）、不进日志、不进 outbox、不进异常消息。
-
-本模块的两条纪律支撑最后一点：
-
-- **异常消息只有错误码**，从不包含明文、密文、密钥或它们的长度以外的任何片段。
-  ``str(exception)`` 是凭据最常见的泄露路径——一次 ``logger.exception`` 就够。
-- :class:`McpTokenCipher` 覆盖 ``__repr__``，密钥不出现在对象的字符串形态里。默认的
-  ``dataclass``/对象 repr 会在调试器、日志与 ``assert`` 失败信息里把 ``self._key``
-  原样打印出来。
-
-## 为什么在 ``adapters/``
-
-``cryptography`` 是第三方库，而 ``core/`` 不 import 适配器或第三方库（代码框架第二节）。
-``import`` 写在函数体内：``src/lingxi/`` 里没有任何模块级第三方 import，一个空环境也要
-能 import 本模块（代码框架第六节）。
+规格：AES-256-CBC，PKCS7 填充（块 16B）；32B 主密钥以 base64 存环境变量；
+每次加密随机取 16B IV、不复用；输出 ``base64(IV ‖ 密文)``；解密失败一律
+抛 :class:`McpTokenCipherError`，没有回退放行的分支。明文只在签发、就绪
+探针取用、写入用户环境三个瞬间存在于内存，不落库、不进日志、不进异常
+消息：异常消息只保留错误码，:class:`McpTokenCipher` 覆盖 ``__repr__``
+让密钥不出现在对象字符串形态里。``cryptography`` 延迟导入。
 """
 
 from __future__ import annotations
@@ -69,6 +44,7 @@ class McpTokenCipherError(RuntimeError):
     """
 
     def __init__(self, code: str) -> None:
+        """记录失败分类码，消息体不含明文、密文与密钥。"""
         super().__init__(f"MCP 令牌加解密失败：{code}")
         self.code = code
 
@@ -80,24 +56,18 @@ def new_token() -> str:
     用 ``secrets`` 而不是 ``random``：后者是可预测的伪随机数发生器，用它签发凭据等于
     让任何知道种子的人算出别人的令牌。
     """
-
     return secrets.token_urlsafe(TOKEN_ENTROPY_BYTES)
 
 
 def load_master_key(value: object) -> bytes:
-    """把环境变量里的 base64 主密钥解成 32 字节，**任何偏差都拒绝**。
+    """把环境变量里的 base64 主密钥解成 32 字节，任何偏差都拒绝。
 
-    三道校验缺一不可，且都是"拒绝启动"式的失败而不是降级：
-
-    1. 必须是非空字符串——``None``（变量没配）在这里就要停，不能一路带到第一次加密；
-    2. 必须是合法 base64（``validate=True``，非字母表字符不被静默忽略）；
-    3. 解出来必须**恰好** 32 字节。短了不是 AES-256，长了说明配错了变量；
-       ``cryptography`` 自己也会拒绝，但那时错误信息指向的是库内部，而不是"配置错了"。
-
-    **不回显收到的值**，长度也只在越界时以数字形式出现：主密钥是全系统最敏感的一个值，
-    它一旦进了异常消息，就会被日志、CI 输出和工单一路复制出去。
+    三道校验缺一不可、都是拒绝启动式的失败而非降级：非空字符串、合法
+    base64（非字母表字符不被静默忽略）、解出来恰好 32 字节（短了不是
+    AES-256，长了说明配错变量）。不回显收到的值，长度也只在越界时以数字
+    形式出现——主密钥是全系统最敏感的一个值，一旦进了异常消息就会被日志、
+    CI 输出和工单一路复制出去。
     """
-
     if not isinstance(value, str) or not value.strip():
         raise ValueError(
             f"MCP 令牌主密钥必须由配置注入（环境变量 {MASTER_KEY_ENV}），不得为空（不回显收到的值）"
@@ -117,11 +87,11 @@ class McpTokenCipher:
     """AES-256-CBC 的加解密面。构造即校验主密钥，不做任何 I/O。"""
 
     def __init__(self, master_key: str) -> None:
+        """校验并解出主密钥；不做任何 I/O。"""
         self._key = load_master_key(master_key)
 
     def __repr__(self) -> str:
         """密钥不进对象的字符串形态（模块文档「明文的生命周期」）。"""
-
         return "McpTokenCipher(master_key=<已隐去>)"
 
     def encrypt(self, plaintext: str) -> str:
@@ -131,7 +101,6 @@ class McpTokenCipher:
         直接暴露"两份明文的前缀相同"。这一条由 ``tests/test_mcp_token_cipher.py`` 的
         ``IvRandomnessTest`` 钉着——同一明文连加两次必须得到不同的密文。
         """
-
         from cryptography.hazmat.primitives import padding
         from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 
@@ -152,7 +121,6 @@ class McpTokenCipher:
         放在解密之前：``cryptography`` 对畸形长度抛的是库内部异常，而我们要的是一个
         **可分类**的错误码，否则运维分不清"这行数据坏了"和"我们的实现坏了"。
         """
-
         from cryptography.hazmat.primitives import padding
         from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 
@@ -170,7 +138,7 @@ class McpTokenCipher:
             padded = decryptor.update(ciphertext) + decryptor.finalize()
             unpadder = padding.PKCS7(BLOCK_BYTES * 8).unpadder()
             plaintext = unpadder.update(padded) + unpadder.finalize()
-        except Exception:  # noqa: BLE001 - 失败形态由 cryptography 决定
+        except Exception:  # 失败形态由 cryptography 决定
             # 只保留错误码：异常正文可能带上密文片段或填充细节（填充预言的经典入口）。
             raise McpTokenCipherError("decrypt_failed") from None
         try:
@@ -192,7 +160,6 @@ def looks_like_cipher(value: object) -> bool:
     :mod:`lingxi.core.permission.publish_row` 用同一套判据（那里只用标准库重写，
     因为 ``core`` 不 import ``adapters``）。两处形状判据必须一致，改动时一起改。
     """
-
     if not isinstance(value, str) or not value or value.strip() != value:
         return False
     try:

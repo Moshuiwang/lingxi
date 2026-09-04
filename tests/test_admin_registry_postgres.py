@@ -38,7 +38,7 @@ from __future__ import annotations
 
 import os
 import unittest
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 
 from postgres_schema import ensure_production_schema, psycopg_available, reset_production_rows
 
@@ -50,7 +50,7 @@ from lingxi.adapters.admin_registry import (
 from lingxi.adapters.postgres import connect
 from lingxi.adapters.postgres_local_permission import PostgresLocalPermissionOverrideStore
 from lingxi.adapters.postgres_onboarding_failure import PostgresFailureReasonRecorder
-from lingxi.core.admin.registry import ALL_ADMIN_ROLES, AdminRegistrySeedConflict
+from lingxi.core.admin.registry import ALL_ADMIN_ROLES, AdminRegistrySeedConflictError
 from lingxi.core.ids import new_id
 from lingxi.core.permission.local_override import OverrideDirection
 
@@ -258,7 +258,7 @@ class SeedConflictDetectionTests(AdminRegistryPostgresTestCase):
     def test_an_existing_row_with_a_different_label_raises_a_conflict(self) -> None:
         seed_admin_registry_entry(self._dsn, feishu_open_id="ou_relabeled", label="original-label")
 
-        with self.assertRaises(AdminRegistrySeedConflict) as raised:
+        with self.assertRaises(AdminRegistrySeedConflictError) as raised:
             seed_admin_registry_entry(
                 self._dsn, feishu_open_id="ou_relabeled", label="a-different-label"
             )
@@ -281,8 +281,7 @@ class SeedConflictDetectionTests(AdminRegistryPostgresTestCase):
 
         with self.assertRaises(Exception):
             self.execute(
-                "UPDATE admin_registry SET ops_admin_granted = FALSE"
-                " WHERE feishu_open_id = %s",
+                "UPDATE admin_registry SET ops_admin_granted = FALSE WHERE feishu_open_id = %s",
                 ("ou_role_drift",),
             )
 
@@ -438,9 +437,9 @@ class MergedRoleGrantCheckConstraintTests(AdminRegistryPostgresTestCase):
             " VALUES ('adm_revoked_no_roles', 'ou_revoked_no_roles', 'x', 'revoked', now())"
         )
 
-        count = self.query(
-            "SELECT count(*) FROM admin_registry WHERE id = 'adm_revoked_no_roles'"
-        )[0][0]
+        count = self.query("SELECT count(*) FROM admin_registry WHERE id = 'adm_revoked_no_roles'")[
+            0
+        ][0]
         self.assertEqual(count, 1)
 
 
@@ -451,9 +450,7 @@ class RealTimeLookupTests(AdminRegistryPostgresTestCase):
         self.assertIsNone(lookup.active_entry(open_id="ou_never_seen_anywhere"))
 
     def test_seeded_identity_reads_back_with_all_roles(self) -> None:
-        seed_admin_registry_entry(
-            self._dsn, feishu_open_id="ou_seeded", label="delegated_subject"
-        )
+        seed_admin_registry_entry(self._dsn, feishu_open_id="ou_seeded", label="delegated_subject")
         lookup = PostgresAdminRegistryLookup(self._dsn)
 
         entry = lookup.active_entry(open_id="ou_seeded")
@@ -511,7 +508,7 @@ class AdminQueriesTests(AdminRegistryPostgresTestCase):
         ``tests/test_pending_action_postgres.py`` 的
         ``add_bystander_pending_action`` 同一手法。"""
 
-        now = datetime.now(timezone.utc)
+        now = datetime.now(UTC)
         self.execute(
             """INSERT INTO pending_action
                    (id, action_type, target_open_id, target_state_snapshot,
@@ -594,9 +591,12 @@ class AdminQueriesTests(AdminRegistryPostgresTestCase):
         self.assertTrue(override_view.created_at)
 
     def test_recent_events_scoped_by_identifier_and_window(self) -> None:
-        now = datetime.now(timezone.utc)
+        now = datetime.now(UTC)
         self.add_event(
-            event_id="evt_in_window", open_id="ou_a", received_at=now - timedelta(hours=1), trace_id="trc_in"
+            event_id="evt_in_window",
+            open_id="ou_a",
+            received_at=now - timedelta(hours=1),
+            trace_id="trc_in",
         )
         self.add_event(
             event_id="evt_out_of_window",
@@ -605,7 +605,10 @@ class AdminQueriesTests(AdminRegistryPostgresTestCase):
             trace_id="trc_out",
         )
         self.add_event(
-            event_id="evt_other_user", open_id="ou_b", received_at=now - timedelta(hours=1), trace_id="trc_other"
+            event_id="evt_other_user",
+            open_id="ou_b",
+            received_at=now - timedelta(hours=1),
+            trace_id="trc_other",
         )
         queries = PostgresAdminQueries(self._dsn)
 
@@ -614,12 +617,18 @@ class AdminQueriesTests(AdminRegistryPostgresTestCase):
         self.assertEqual([event.trace_id for event in events], ["trc_in"])
 
     def test_recent_events_without_identifier_covers_all_users(self) -> None:
-        now = datetime.now(timezone.utc)
+        now = datetime.now(UTC)
         self.add_event(
-            event_id="evt_1", open_id="ou_a", received_at=now - timedelta(minutes=5), trace_id="trc_1"
+            event_id="evt_1",
+            open_id="ou_a",
+            received_at=now - timedelta(minutes=5),
+            trace_id="trc_1",
         )
         self.add_event(
-            event_id="evt_2", open_id="ou_b", received_at=now - timedelta(minutes=10), trace_id="trc_2"
+            event_id="evt_2",
+            open_id="ou_b",
+            received_at=now - timedelta(minutes=10),
+            trace_id="trc_2",
         )
         queries = PostgresAdminQueries(self._dsn)
 
@@ -628,7 +637,7 @@ class AdminQueriesTests(AdminRegistryPostgresTestCase):
         self.assertEqual({event.trace_id for event in events}, {"trc_1", "trc_2"})
 
     def test_recent_events_respects_limit_and_orders_newest_first(self) -> None:
-        now = datetime.now(timezone.utc)
+        now = datetime.now(UTC)
         for index in range(5):
             self.add_event(
                 event_id=f"evt_{index}",
@@ -665,7 +674,7 @@ class TraceLookupTests(AdminRegistryPostgresTestCase):
         self.add_event(
             event_id="evt_ok",
             open_id="ou_ok",
-            received_at=datetime.now(timezone.utc),
+            received_at=datetime.now(UTC),
             trace_id="trc_ok",
         )
         queries = PostgresAdminQueries(self._dsn)
@@ -686,7 +695,7 @@ class TraceLookupTests(AdminRegistryPostgresTestCase):
         self.add_event(
             event_id="evt_fail",
             open_id="ou_fail",
-            received_at=datetime.now(timezone.utc),
+            received_at=datetime.now(UTC),
             trace_id="trc_fail",
         )
         recorder = PostgresFailureReasonRecorder(self._dsn)
@@ -715,7 +724,7 @@ class TraceLookupTests(AdminRegistryPostgresTestCase):
         self.add_event(
             event_id="evt_secret",
             open_id="ou_should_not_appear",
-            received_at=datetime.now(timezone.utc),
+            received_at=datetime.now(UTC),
             trace_id="trc_secret",
         )
         queries = PostgresAdminQueries(self._dsn)
@@ -754,7 +763,7 @@ class TraceLookupTests(AdminRegistryPostgresTestCase):
         self.add_event(
             event_id="evt_task",
             open_id="ou_task",
-            received_at=datetime.now(timezone.utc),
+            received_at=datetime.now(UTC),
             trace_id="trc_task",
         )
         self.add_task(
@@ -784,7 +793,7 @@ class TraceLookupTests(AdminRegistryPostgresTestCase):
         self.add_event(
             event_id="evt_doc",
             open_id="ou_doc",
-            received_at=datetime.now(timezone.utc),
+            received_at=datetime.now(UTC),
             trace_id="trc_doc",
         )
         self.add_task(
@@ -818,11 +827,13 @@ class TraceLookupTests(AdminRegistryPostgresTestCase):
         """文档投递失败与问数任务收口是两条独立状态机；trace 查询不能用 task 的
         成功状态遮住用户未拿到文档的事实。"""
 
-        self.add_user(user_id="usr_doc_failed", open_id="ou_doc_failed", provisioning_state="active")
+        self.add_user(
+            user_id="usr_doc_failed", open_id="ou_doc_failed", provisioning_state="active"
+        )
         self.add_event(
             event_id="evt_doc_failed",
             open_id="ou_doc_failed",
-            received_at=datetime.now(timezone.utc),
+            received_at=datetime.now(UTC),
             trace_id="trc_doc_failed",
         )
         self.add_task(
@@ -860,7 +871,7 @@ class TraceLookupTests(AdminRegistryPostgresTestCase):
         self.add_event(
             event_id="evt_notask",
             open_id="ou_notask",
-            received_at=datetime.now(timezone.utc),
+            received_at=datetime.now(UTC),
             trace_id="trc_notask",
         )
         queries = PostgresAdminQueries(self._dsn)
@@ -885,7 +896,7 @@ class TraceLookupTests(AdminRegistryPostgresTestCase):
             self.add_event(
                 event_id=f"evt_{suffix}",
                 open_id=f"ou_{suffix}",
-                received_at=datetime.now(timezone.utc),
+                received_at=datetime.now(UTC),
                 trace_id=f"trc_{suffix}",
             )
         self.add_task(
@@ -916,9 +927,7 @@ class ResolveIdentifierTests(AdminRegistryPostgresTestCase):
         self.add_user(open_id="ou_target", email="someone@example.com")
         queries = PostgresAdminQueries(self._dsn)
 
-        self.assertEqual(
-            queries.resolve_identifier(identifier="someone@example.com"), "ou_target"
-        )
+        self.assertEqual(queries.resolve_identifier(identifier="someone@example.com"), "ou_target")
 
     def test_zero_hits_falls_back_to_the_original_input(self) -> None:
         queries = PostgresAdminQueries(self._dsn)
@@ -964,7 +973,7 @@ class ResolveOverrideIdTests(AdminRegistryPostgresTestCase):
     形状）：按「open_id + 公司 + 指标」真库反查当前生效的覆盖行 override_id。"""
 
     def add_pending_action_for_override(self, *, pending_id: str) -> str:
-        now = datetime.now(timezone.utc)
+        now = datetime.now(UTC)
         self.execute(
             """INSERT INTO pending_action
                    (id, action_type, target_open_id, target_state_snapshot,
@@ -1095,9 +1104,7 @@ class DisplayNamesTests(AdminRegistryPostgresTestCase):
         self.add_user(open_id="ou_target", display_name="张三", email="zhangsan@example.com")
         queries = PostgresAdminQueries(self._dsn)
 
-        self.assertEqual(
-            queries.user_label(open_id="ou_target"), "张三（zhangsan@example.com）"
-        )
+        self.assertEqual(queries.user_label(open_id="ou_target"), "张三（zhangsan@example.com）")
 
     def test_user_label_falls_back_to_display_name_only(self) -> None:
         self.add_user(open_id="ou_target", display_name="张三", email=None)

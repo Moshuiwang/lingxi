@@ -98,7 +98,9 @@ class IdempotencyTests(OnboardingFailurePostgresTestCase):
         recorder = PostgresFailureReasonRecorder(self._dsn)
 
         recorder.record_failure(
-            trace_id=trace_id, failure_reason="directory_unavailable", event_type="onboarding.result"
+            trace_id=trace_id,
+            failure_reason="directory_unavailable",
+            event_type="onboarding.result",
         )
         # 第二次写入不同的 failure_reason：模拟同一条链因为进程重启被重新处理，
         # 这次判出了不同的终态——先落的那一行必须原样保留。
@@ -151,9 +153,7 @@ class CheckConstraintTests(OnboardingFailurePostgresTestCase):
 
     def test_unknown_event_type_is_rejected(self) -> None:
         with self.assertRaises(self._psycopg.errors.CheckViolation):
-            self._insert_raw(
-                trace_id=new_ulid(), failure_reason="x", event_type="some.other.event"
-            )
+            self._insert_raw(trace_id=new_ulid(), failure_reason="x", event_type="some.other.event")
 
     def test_blank_failure_reason_is_rejected(self) -> None:
         with self.assertRaises(self._psycopg.errors.CheckViolation):

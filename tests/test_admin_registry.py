@@ -14,10 +14,10 @@ import unittest
 
 from lingxi.core.admin.registry import (
     ALL_ADMIN_ROLES,
-    AdminRegistryEntry,
-    AdminRole,
     ENTRY_STATUS_ACTIVE,
     ENTRY_STATUS_REVOKED,
+    AdminRegistryEntry,
+    AdminRole,
     is_authorized_admin,
 )
 

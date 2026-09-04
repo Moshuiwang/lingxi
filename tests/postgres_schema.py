@@ -49,6 +49,7 @@ def psycopg_available() -> bool:
 
     return importlib.util.find_spec("psycopg") is not None
 
+
 # 建库只做一次：alembic 整链前滚每次约几百毫秒，而 IdentityPostgresTestCase 是
 # **每个用例**都要重置的。重复建库会把真库这一段的耗时抬到门禁超时的量级。
 # 后续重置只清行不重建结构；确实改了结构的用例自己调 force_rebuild_schema。
@@ -82,7 +83,9 @@ def revision_sql() -> tuple[str, str]:
     静态取常量既不需要 alembic，也不会执行 revision 里的任何代码。
     """
 
-    tree = ast.parse(RETENTION_REVISION.read_text(encoding="utf-8"), filename=str(RETENTION_REVISION))
+    tree = ast.parse(
+        RETENTION_REVISION.read_text(encoding="utf-8"), filename=str(RETENTION_REVISION)
+    )
     found: dict[str, str] = {}
     for node in tree.body:
         target = None
@@ -323,7 +326,9 @@ def production_tables_with_rows(dsn: str) -> tuple[str, ...]:
         return tuple(sorted(_fetch_tables_holding_rows(cursor, tables)))
 
 
-def _child_first_order(cursor: Any, tables: tuple[str, ...]) -> tuple[tuple[str, ...], frozenset[str]]:
+def _child_first_order(
+    cursor: Any, tables: tuple[str, ...]
+) -> tuple[tuple[str, ...], frozenset[str]]:
     """把生产表排成「子表在前、父表在后」的顺序，并返回排不进去的那些表。
 
     返回的第二项是外键成环（或自环之外的循环引用）而无法定序的表。它们不参与 DELETE，

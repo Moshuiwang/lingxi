@@ -305,7 +305,9 @@ class RedactedTargetSummaryTests(unittest.TestCase):
         from lingxi.apps.gateway.config import ENV_PREFIX, load_config
 
         password = "S3cr3tP@ss-only-for-this-test"
-        dsn = f"host=db.example.internal port=5432 dbname=lingxi_prod user=lingxi password={password}"
+        dsn = (
+            f"host=db.example.internal port=5432 dbname=lingxi_prod user=lingxi password={password}"
+        )
         env = {
             f"{ENV_PREFIX}APP_ID": "cli_1234567890abcdef",
             f"{ENV_PREFIX}APP_SECRET": "fake-secret-for-test-only",

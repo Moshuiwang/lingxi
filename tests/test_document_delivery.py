@@ -39,7 +39,6 @@ from lingxi.core.execution.document_delivery import (
     DELIVER_DOCUMENT_TOOL_NAME,
     DELIVER_SPREADSHEET_TOOL_NAME,
     DELIVERY_MCP_SERVER_NAME,
-    DocumentDeliveryError,
     MAX_PARAGRAPHS,
     MAX_RAW_MARKDOWN_CHARS,
     MAX_SHEET_COLUMNS,
@@ -47,6 +46,7 @@ from lingxi.core.execution.document_delivery import (
     MAX_SHEET_TOTAL_CHARS,
     MAX_TITLE_CHARS,
     MAX_TOTAL_CHARS,
+    DocumentDeliveryError,
     build_document_request,
     build_sheet_request,
     normalize_markdown,
@@ -98,9 +98,7 @@ class NormalizeMarkdownTest(unittest.TestCase):
 
         paragraphs = normalize_markdown(markdown)
 
-        self.assertEqual(
-            paragraphs, ("# 标题", "- 第一条 - 第二条", "**加粗内容** 和 `代码`。")
-        )
+        self.assertEqual(paragraphs, ("# 标题", "- 第一条 - 第二条", "**加粗内容** 和 `代码`。"))
 
     def test_blank_input_normalizes_to_no_paragraphs(self) -> None:
         self.assertEqual(normalize_markdown("   \n\n   \n"), ())
@@ -244,7 +242,9 @@ class BuildSheetRequestTest(unittest.TestCase):
 
         self.assertEqual(request.title, "销售汇总")
         self.assertEqual(request.rows, (("月份", "销售额"), ("1月", "100")))
-        self.assertEqual(request.total_chars, sum(len(cell) for row in request.rows for cell in row))
+        self.assertEqual(
+            request.total_chars, sum(len(cell) for row in request.rows for cell in row)
+        )
 
     def test_title_out_of_bounds_is_rejected(self) -> None:
         for bad_title in ("", "   ", "x" * (MAX_TITLE_CHARS + 1)):
@@ -382,7 +382,9 @@ class ToolPolicyMergeTest(unittest.TestCase):
     def test_enabled_merges_the_literal_into_the_policy_whitelist(self) -> None:
         """变异锚点①：不合入白名单会让这条用例变绿。"""
 
-        executor = WorkerTurnExecutor(load_config(_env(LINGXI_WORKER_DOCUMENT_DELIVERY_ENABLED="1")))
+        executor = WorkerTurnExecutor(
+            load_config(_env(LINGXI_WORKER_DOCUMENT_DELIVERY_ENABLED="1"))
+        )
 
         self.assertIn(DELIVER_DOCUMENT_TOOL_NAME, executor.policy.allowed_tools)
         self.assertIn(READ_ONLY_TOOL, executor.policy.allowed_tools, "合入不能挤掉既有只读工具")
@@ -393,7 +395,9 @@ class ToolPolicyMergeTest(unittest.TestCase):
         变异锚点：不合入白名单会让这条用例变绿。
         """
 
-        executor = WorkerTurnExecutor(load_config(_env(LINGXI_WORKER_DOCUMENT_DELIVERY_ENABLED="1")))
+        executor = WorkerTurnExecutor(
+            load_config(_env(LINGXI_WORKER_DOCUMENT_DELIVERY_ENABLED="1"))
+        )
 
         self.assertIn(DELIVER_SPREADSHEET_TOOL_NAME, executor.policy.allowed_tools)
         self.assertIn(DELIVER_DOCUMENT_TOOL_NAME, executor.policy.allowed_tools)
@@ -461,7 +465,9 @@ class DeliveryMcpServerMountTest(unittest.TestCase):
     装配。"""
 
     def test_enabled_mounts_the_server_and_widens_sdk_level_allowed_tools(self) -> None:
-        executor = WorkerTurnExecutor(load_config(_env(LINGXI_WORKER_DOCUMENT_DELIVERY_ENABLED="1")))
+        executor = WorkerTurnExecutor(
+            load_config(_env(LINGXI_WORKER_DOCUMENT_DELIVERY_ENABLED="1"))
+        )
 
         options = executor.build_session_options()
 
@@ -474,7 +480,9 @@ class DeliveryMcpServerMountTest(unittest.TestCase):
         另开一个服务——见 core/execution/document_delivery.py 模块文档
         「表格分支」一节。"""
 
-        executor = WorkerTurnExecutor(load_config(_env(LINGXI_WORKER_DOCUMENT_DELIVERY_ENABLED="1")))
+        executor = WorkerTurnExecutor(
+            load_config(_env(LINGXI_WORKER_DOCUMENT_DELIVERY_ENABLED="1"))
+        )
 
         options = executor.build_session_options()
 
@@ -637,7 +645,9 @@ class DeliverSpreadsheetHandlerTest(unittest.TestCase):
             load_config(_env(LINGXI_WORKER_DOCUMENT_DELIVERY_ENABLED="1")), stderr_stream=buffer
         )
 
-        result = executor._handle_deliver_spreadsheet("销售汇总", [["月份", "销售额"], ["1月", "100"]])
+        result = executor._handle_deliver_spreadsheet(
+            "销售汇总", [["月份", "销售额"], ["1月", "100"]]
+        )
 
         self.assertNotIn("is_error", result)
         self.assertIsNotNone(executor._sheet_request)
@@ -678,7 +688,9 @@ class DeliverSpreadsheetHandlerTest(unittest.TestCase):
         self.assertEqual(events[-1]["event"], "worker.sheet_request_rejected")
         self.assertEqual(events[-1]["reason"], "leak_detected")
 
-    def test_handler_rejects_when_body_leaks_a_configured_external_text_via_real_assembly(self) -> None:
+    def test_handler_rejects_when_body_leaks_a_configured_external_text_via_real_assembly(
+        self,
+    ) -> None:
         """同 ``DeliverDocumentHandlerTest`` 的 P1-1 用例：``config.external_
         texts`` 拆包必须在表格分支同样生效，不是只有文档分支修过。"""
 
@@ -747,7 +759,9 @@ class DeliverSpreadsheetHandlerTest(unittest.TestCase):
     ) -> None:
         """同上，反过来调用顺序。"""
 
-        executor = WorkerTurnExecutor(load_config(_env(LINGXI_WORKER_DOCUMENT_DELIVERY_ENABLED="1")))
+        executor = WorkerTurnExecutor(
+            load_config(_env(LINGXI_WORKER_DOCUMENT_DELIVERY_ENABLED="1"))
+        )
 
         executor._handle_deliver_spreadsheet("表格标题", [["a"]])
         executor._handle_deliver_document("文档标题", "文档正文")
@@ -770,7 +784,9 @@ class RunTurnReportContractTest(unittest.TestCase):
     ):
         from unittest.mock import patch
 
-        executor = WorkerTurnExecutor(load_config(_env(LINGXI_WORKER_DOCUMENT_DELIVERY_ENABLED="1")))
+        executor = WorkerTurnExecutor(
+            load_config(_env(LINGXI_WORKER_DOCUMENT_DELIVERY_ENABLED="1"))
+        )
 
         async def fake_run_single_turn(
             *,
@@ -819,7 +835,7 @@ class RunTurnReportContractTest(unittest.TestCase):
         )
 
     def test_failed_turn_does_not_carry_the_document_request(self) -> None:
-        """"仅当任务成功"：工具调用发生在真实失败之前，报告仍不得带上它。"""
+        """ "仅当任务成功"：工具调用发生在真实失败之前，报告仍不得带上它。"""
 
         report, _executor = self._run_with_delivery_call(fail=True)
 
@@ -832,7 +848,9 @@ class RunTurnReportContractTest(unittest.TestCase):
 
         from unittest.mock import patch
 
-        executor = WorkerTurnExecutor(load_config(_env(LINGXI_WORKER_DOCUMENT_DELIVERY_ENABLED="1")))
+        executor = WorkerTurnExecutor(
+            load_config(_env(LINGXI_WORKER_DOCUMENT_DELIVERY_ENABLED="1"))
+        )
 
         async def deliver_then_finish(*, options, prompt, sink, timeout_seconds, **_kwargs):
             del options, prompt, timeout_seconds
@@ -861,7 +879,9 @@ class RunTurnReportContractTest(unittest.TestCase):
         from unittest.mock import patch
 
         rows = rows if rows is not None else [["月份", "销售额"], ["1月", "100"]]
-        executor = WorkerTurnExecutor(load_config(_env(LINGXI_WORKER_DOCUMENT_DELIVERY_ENABLED="1")))
+        executor = WorkerTurnExecutor(
+            load_config(_env(LINGXI_WORKER_DOCUMENT_DELIVERY_ENABLED="1"))
+        )
 
         async def fake_run_single_turn(*, options, prompt, sink, timeout_seconds, **_kwargs):
             del options, prompt, timeout_seconds

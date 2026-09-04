@@ -23,7 +23,7 @@ import os
 import threading
 import unittest
 from concurrent.futures import ThreadPoolExecutor
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 
 from postgres_schema import ensure_production_schema, psycopg_available, reset_production_rows
 
@@ -39,9 +39,9 @@ from lingxi.adapters.postgres_pending_action import PostgresPendingActionStore
 from lingxi.core.admin.card_callback import AdminCardCallbackHandler
 from lingxi.core.admin.card_dispatch import ConfirmCardDispatcher
 from lingxi.core.admin.router import AdminCommandRouter
+from lingxi.core.admin.views import AdminUserStatusView
 from lingxi.core.ids import new_id
 from lingxi.core.permission.local_override import OverrideDirection
-from lingxi.core.admin.views import AdminUserStatusView
 
 DSN = os.environ.get("LINGXI_POSTGRES_DSN")
 SKIP_REASON = (
@@ -69,7 +69,11 @@ class _FakeConfirmCardTransport:
         self.create_calls.append(
             {"chat_id": chat_id, "reply_to_message_id": reply_to_message_id, "card": card}
         )
-        return type("Created", (), {"card_id": f"card_{self._counter}", "message_id": f"msg_{self._counter}"})()
+        return type(
+            "Created",
+            (),
+            {"card_id": f"card_{self._counter}", "message_id": f"msg_{self._counter}"},
+        )()
 
     def update(self, *, card_id, sequence, card):  # pragma: no cover - 本文件不测终态更新
         raise NotImplementedError
@@ -107,7 +111,9 @@ class ManagementCardCallbackIntegrationTestCase(unittest.TestCase):
         )
 
         confirm_audit = _RecordingAudit()
-        self.pending_store = PostgresPendingActionStore(self._dsn, audit=confirm_audit, metric_map_path=None)
+        self.pending_store = PostgresPendingActionStore(
+            self._dsn, audit=confirm_audit, metric_map_path=None
+        )
         # 同一个 PostgresAdminQueries 实例结构性实现 AdminDisplayNames（Trace
         # #469 S-1），与真实 apps/gateway/__init__.py 装配同一姿态——不需要
         # 额外声明或继承，注入到下面三处需要它的构造点。
@@ -158,7 +164,7 @@ class ManagementCardCallbackIntegrationTestCase(unittest.TestCase):
     def _ensure_management_context(self, message_id: str, identifier: str) -> None:
         """职位表单的反向 FK 与生产管理卡发送侧登记保持同一前置。"""
 
-        now = datetime.now(timezone.utc) + timedelta(hours=1)
+        now = datetime.now(UTC) + timedelta(hours=1)
         self.execute(
             """INSERT INTO management_card_context
                  (message_id, card_id, identifier, chat_id, initiated_by_open_id,
@@ -307,7 +313,7 @@ class RevokeButtonClickCreatesARealPendingActionTests(ManagementCardCallbackInte
         )
         user_id = user_row[0][0]
         grant_pending_id = new_id("pac")
-        now = datetime.now(timezone.utc)
+        now = datetime.now(UTC)
         self.execute(
             """INSERT INTO pending_action
                    (id, action_type, target_open_id, target_state_snapshot,
@@ -512,8 +518,10 @@ class PositionPermissionGroupRealDbTests(ManagementCardCallbackIntegrationTestCa
 class ManagementCorrectionRealDbTests(ManagementCardCallbackIntegrationTestCase):
     """#493 P1：只有真实 daily publish 才能产生每日纠偏群摘要水位。"""
 
-    def _seed_context_and_executed_action(self, message_id: str) -> PostgresManagementCardContextStore:
-        now = datetime.now(timezone.utc)
+    def _seed_context_and_executed_action(
+        self, message_id: str
+    ) -> PostgresManagementCardContextStore:
+        now = datetime.now(UTC)
         context_store = PostgresManagementCardContextStore(self._dsn)
         context_store.remember(
             message_id=message_id,
@@ -552,7 +560,7 @@ class ManagementCorrectionRealDbTests(ManagementCardCallbackIntegrationTestCase)
         reason: str,
         permission_version: int = 1,
     ) -> None:
-        now = datetime.now(timezone.utc)
+        now = datetime.now(UTC)
         user_id = self.query(
             "SELECT id FROM app_user WHERE feishu_open_id = %s", (TARGET_OPEN_ID,)
         )[0][0]
@@ -561,7 +569,7 @@ class ManagementCorrectionRealDbTests(ManagementCardCallbackIntegrationTestCase)
                 "record_key": "target@example.com",
                 "email": "target@example.com",
                 "name": "化名用户",
-                "permissions": "{\"1011\":[\"daily_active\"]}",
+                "permissions": '{"1011":["daily_active"]}',
                 "status": "approved",
                 "updated_at": now.isoformat(),
             }
@@ -646,11 +654,9 @@ class ManagementCardStateCasRealDbTests(ManagementCardCallbackIntegrationTestCas
             chat_id="oc_1",
             initiated_by_open_id=ADMIN_OPEN_ID,
             snapshot_fingerprint="fp",
-            context_deadline_at=datetime.now(timezone.utc) + timedelta(hours=1),
+            context_deadline_at=datetime.now(UTC) + timedelta(hours=1),
         )
-        store.update_state(
-            message_id=message_id, state="effective", dispatch_status="effective"
-        )
+        store.update_state(message_id=message_id, state="effective", dispatch_status="effective")
         return store
 
     def test_concurrent_state_write_rejects_stale_sequence_claim_without_consuming_it(self) -> None:
@@ -796,7 +802,7 @@ class ManagementCardStateCasRealDbTests(ManagementCardCallbackIntegrationTestCas
         self.assertTrue(current.needs_refresh)
 
     def test_gateway_refresher_uses_real_context_port_and_clears_only_after_update(self) -> None:
-        from lingxi.apps.gateway import _GatewayManagementCardRefresher
+        from lingxi.apps.gateway.management_cards import ManagementCardRefresher
 
         class _Catalog:
             def companies(self):
@@ -834,7 +840,7 @@ class ManagementCardStateCasRealDbTests(ManagementCardCallbackIntegrationTestCas
             updated_at="2026-09-01T00:00:00+00:00",
         )
         transport = _Transport()
-        refresher = _GatewayManagementCardRefresher(
+        refresher = ManagementCardRefresher(
             transport=transport,
             catalog=_Catalog(),
             display_names=_DisplayNames(),
@@ -857,6 +863,7 @@ class ManagementCardStateCasRealDbTests(ManagementCardCallbackIntegrationTestCas
         assert current is not None
         self.assertFalse(current.needs_refresh)
         self.assertEqual(current.visual_sequence, transport.updates[0]["sequence"])
+
 
 if __name__ == "__main__":  # pragma: no cover
     unittest.main()

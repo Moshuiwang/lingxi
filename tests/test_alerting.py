@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import unittest
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 
 from lingxi.core.alerting import (
     AlertKind,
@@ -13,8 +13,7 @@ from lingxi.core.alerting import (
     NoticeAction,
 )
 
-
-UTC = timezone.utc
+UTC = UTC
 START = datetime(2026, 8, 8, 0, 0, tzinfo=UTC)
 
 
@@ -208,9 +207,7 @@ class SendFailureTests(unittest.TestCase):
             manager.send_failure(channel="card", final=False, at=START + timedelta(minutes=7)),
             (),
         )
-        third = manager.send_failure(
-            channel="card", final=False, at=START + timedelta(minutes=8)
-        )
+        third = manager.send_failure(channel="card", final=False, at=START + timedelta(minutes=8))
 
         self.assertEqual(len(third), 1)
         self.assertEqual(third[0].count, 3)

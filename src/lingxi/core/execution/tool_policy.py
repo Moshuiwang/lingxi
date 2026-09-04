@@ -1,8 +1,8 @@
 """执行层的运行时工具边界：默认拒绝，只放行显式白名单。
 
-为什么不用 ``allowed_tools`` / ``disallowed_tools`` 作为判定层：Issue #23 的第一轮
-验证中，模型执行了一次未被明确禁用的 ``CronCreate``——只列出允许的 MCP 工具不等于
-其他内置工具不可执行。因此判定层是本模块，两个 SDK 选项只作为纵深防御的外层。
+为什么不用 ``allowed_tools`` / ``disallowed_tools`` 作为判定层：真实验证中模型
+执行了一次未被明确禁用的 ``CronCreate``——只列出允许的 MCP 工具不等于其他内置
+工具不可执行。因此判定层是本模块，两个 SDK 选项只作为纵深防御的外层。
 
 本模块的核心不变量：**未出现在白名单里的工具名一律拒绝**。新增内置工具、SDK 升级
 带来的新工具、模型臆造的工具名，全部自动落入拒绝分支，不需要维护禁用名单。
@@ -11,9 +11,10 @@
 from __future__ import annotations
 
 import re
+from collections.abc import Mapping
 from dataclasses import dataclass
 from enum import Enum
-from typing import Any, Mapping
+from typing import Any
 
 _VALID_TOOL_NAME = re.compile(r"\A[A-Za-z0-9_.-]+\Z")
 _MCP_TOOL_PREFIX = "mcp__"
@@ -33,11 +34,12 @@ def is_well_formed_tool_name(tool_name: object) -> bool:
     是必须原样保留的审计事实；畸形工具名则是模型可控的任意文本，要按自由文本
     脱敏。
     """
-
     return isinstance(tool_name, str) and _VALID_TOOL_NAME.fullmatch(tool_name) is not None
 
 
 class ToolDecision(str, Enum):
+    """一次工具调用判定的最终结论。"""
+
     ALLOW = "allow"
     DENY = "deny"
 
@@ -46,7 +48,7 @@ class DenyReasonCode(str, Enum):
     """拒绝原因的内部编码。只进审计，不进模型上下文，也不进用户可见文案。"""
 
     NOT_IN_WHITELIST = "not_in_whitelist"
-    # 「查询包装式越界」的重定向场景（2026-08-27 事故，见 DENY_REDIRECT_TEMPLATE）：
+    # 「查询包装式越界」的重定向场景（见 DENY_REDIRECT_TEMPLATE）：
     # 被拒工具本身不是原生查询工具，但白名单里确实有查询工具可用——说明模型只是
     # 调用方式用错了，不是查询能力真的不可用。与 NOT_IN_WHITELIST 分开编码，供
     # 观测区分「越界后无路可走」和「越界但本该改走原生工具」这两类不同性质的拒绝。
@@ -71,21 +73,15 @@ class PolicyVerdict:
 
     @property
     def denied(self) -> bool:
+        """这次判定是否为拒绝。"""
         return self.decision is ToolDecision.DENY
 
 
-# 这段文案会原样进入模型上下文，同时约束三件事：
-# 1. 不要重试——Issue #23 补测中观察到措辞直接影响模型是否重复调用同一工具；
+# 这段文案会原样进入模型上下文，约束三件事：不要重试；
 # 2. 不要把内部工具名转述给用户——用户可见文案里不出现内部标识是产品合同要求；
-# 3. 不要编造归因（Issue #291）——2026-08-21 真实事故：白名单前缀配错导致真实
-#    工具全被拒绝，模型按旧模板"用业务语言说明无法查询"的指引，自行把"本侧配置
-#    错误"翻译成了"用户账号缺权限"，四条回复一致建议用户"联系数据平台管理员""重新
-#    登录后重试"——而事实是该用户权限完全正常，系统上午刚开通完成。旧模板本身没有
-#    错，缺的是**明确禁止**这种归因方向：拒绝原因是本侧的临时限制，不是用户的问题，
-#    不能让用户去解决一个他解决不了、也不该由他负责的配置问题。
-# 注（Issue #349，2026-08-27）：原模板曾写"问题已经被记录"——这是一句本层实际
-# 没有兑现的承诺，判定层本身不写任何记录/告警系统，说了也无法验证。已删除，只
-# 保留"这是系统侧的临时限制"这一句本层确实能保证为真的表述。
+# 不要把本侧的临时限制误归因为用户账号或权限问题——真实事故证明缺乏明确禁止
+# 时模型会代替用户"猜"一个归因，且让用户承担了不该由他负责的问题。旧版曾写
+# "问题已经被记录"，判定层本身不写记录系统、无法验证，已删除。
 DENY_REASON_TEMPLATE = (
     "该操作不在本次会话批准的只读范围内，已在执行前被拒绝。"
     "请不要重试这个操作，也不要改用其他方式绕过它。"
@@ -99,24 +95,10 @@ DENY_REASON_TEMPLATE = (
 )
 
 
-# 「查询包装式越界」导回模板（Issue #349，2026-08-27 生产事故修复）。
-#
-# 事故经过（07:36-08:42 stage 四连问数失败）：qwen3.7-plus 概率性地用
-# ``Bash: claude mcp call query …`` 包装调用问数 MCP，命中白名单拒绝；但上面
-# ``DENY_REASON_TEMPLATE`` 里"也不要改用其他方式绕过它"这句话，把模型接下来
-# 想改用原生 ``mcp__query__`` 工具的**正确**路径也一并禁止了——会话记录证明模型
-# 全程看得见原生工具（session jsonl 思考原文："Looking at the tools I have, I
-# can see the query_metric…"），却因为这句话不敢调用，转而向用户回复"这一部分
-# 暂时无法查询、系统侧临时限制"，续聊上下文又把这个错误结论自我强化。
-#
-# 与 DENY_REASON_TEMPLATE 的区别只在这一种场景：被拒的调用方式本身不是原生查询
-# 工具，但白名单里确实有查询工具可用——查询能力没有真的不可用，模型只是选错了
-# 调用方式。这段文案专门把模型导回原生工具，同时保留旧模板的三条纪律（不重试
-# 这种越界方式、不向用户暴露内部工具名/规则、不把系统侧限制说成用户的问题）。
-#
-# 措辞上刻意不出现"暂时无法查询""不可用"这类字样（即使写在否定句里）——2026-08-21
-# 与 2026-08-27 两次事故都证明模型会直接转述看到的字面词组，不管它出现在肯定句
-# 还是否定句里；唯一可靠的做法是这些词组本身就不出现在文案里。
+# 「查询包装式越界」导回模板：``DENY_REASON_TEMPLATE`` 里"不要改用其他方式
+# 绕过"会连带禁止模型改用原生 ``mcp__query__`` 工具的正确路径——本模板只在
+# 调用方式非原生但查询能力确实可用时替换使用。措辞刻意不出现"暂时无法查询"
+# "不可用"字样：模型会直接转述看到的字面词组，不论它出现在肯定句还是否定句。
 DENY_REDIRECT_TEMPLATE = (
     "该调用方式已被拒绝，但查询能力本身可用：请不要重试这种调用方式，"
     "也不要再用命令行或任何其他包装方式尝试；"
@@ -150,8 +132,11 @@ class ToolPolicy:
         allowed_tools: object,
         allowed_skills: object = (),
     ) -> None:
+        """按传入的工具名与 Skill 名集合构造白名单；配置不合法时构造期即失败。"""
         self._allowed_tools = self._freeze_names(allowed_tools, field="allowed_tools")
-        self._allowed_skills = self._freeze_names(allowed_skills, field="allowed_skills", allow_empty=True)
+        self._allowed_skills = self._freeze_names(
+            allowed_skills, field="allowed_skills", allow_empty=True
+        )
         unsupported = sorted(
             name
             for name in self._allowed_tools
@@ -167,15 +152,18 @@ class ToolPolicy:
 
     @property
     def allowed_tools(self) -> frozenset[str]:
+        """当前白名单里的工具名集合。"""
         return self._allowed_tools
 
     @property
     def allowed_skills(self) -> frozenset[str]:
+        """当前白名单里的 Skill 名集合。"""
         return self._allowed_skills
 
-    def decide(self, tool_name: object, tool_input: Mapping[str, Any] | None = None) -> PolicyVerdict:
+    def decide(
+        self, tool_name: object, tool_input: Mapping[str, Any] | None = None
+    ) -> PolicyVerdict:
         """判定一次工具调用。任何无法确认为白名单内的输入都返回拒绝。"""
-
         if not isinstance(tool_name, str) or not _VALID_TOOL_NAME.fullmatch(tool_name):
             return self._deny(self._display_name(tool_name), DenyReasonCode.MALFORMED_TOOL_NAME)
         if tool_name not in self._allowed_tools:
@@ -188,7 +176,6 @@ class ToolPolicy:
 
     def _decide_skill(self, tool_input: Mapping[str, Any] | None) -> PolicyVerdict:
         """Skill 是一个工具名下的多个能力，因此还要判定具体加载哪个 Skill。"""
-
         skill_name = None
         if isinstance(tool_input, Mapping):
             skill_name = tool_input.get("skill")
@@ -206,12 +193,10 @@ class ToolPolicy:
         确实存在至少一个查询工具（否则查询能力本身就不可用，维持旧模板，不能
         许诺一个实际不存在的替代路径）。
         """
-
         if tool_name.startswith("mcp__"):
             # 任何原生 MCP 工具（含 mcp__query__ 自身与 mcp__delivery__ 等其他
             # 服务器的工具）被拒都不是「包装式越界」：模型用的已经是原生调用
-            # 形态，只是该工具本身未获批准——导回「查询工具」在语义上答非所问
-            # （2026-08-27 跨批合流时 test_document_delivery 的开关关用例坐实），
+            # 形态，只是该工具本身未获批准——导回「查询工具」在语义上答非所问，
             # 维持通用模板。重定向只面向 Bash 之类的非 MCP 包装通道。
             return False
         return any(name.startswith(_QUERY_TOOL_PREFIX) for name in self._allowed_tools)
@@ -233,7 +218,6 @@ class ToolPolicy:
     @staticmethod
     def _display_name(tool_name: object) -> str:
         """拒绝畸形工具名时仍要在审计里留下可辨认的痕迹，但不回显任意长内容。"""
-
         if isinstance(tool_name, str):
             return tool_name[:120] if tool_name else "<empty>"
         return f"<{type(tool_name).__name__}>"

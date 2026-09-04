@@ -22,7 +22,7 @@ import unittest
 
 from lingxi.core.permission.metric_translation import (
     ALL_COMPANIES_KEY,
-    UncoveredPermissionCombination,
+    UncoveredPermissionCombinationError,
     build_company_function_metric_map,
     translate_company_functions,
 )
@@ -84,7 +84,9 @@ class BuildMapValidationTest(unittest.TestCase):
 
     def test_a_non_list_metric_value_is_rejected(self) -> None:
         with self.assertRaises(ValueError):
-            build_company_function_metric_map({"companies": {COMPANY_A: {FUNCTION_OPS: METRIC_DAU}}})
+            build_company_function_metric_map(
+                {"companies": {COMPANY_A: {FUNCTION_OPS: METRIC_DAU}}}
+            )
 
     def test_a_none_metric_entry_is_rejected(self) -> None:
         with self.assertRaises(ValueError):
@@ -128,7 +130,7 @@ class UncoveredCoverageTest(unittest.TestCase):
         self.assertEqual(result, {COMPANY_A: (METRIC_DAU,)})
 
     def test_an_entirely_uncovered_company_fails_closed(self) -> None:
-        with self.assertRaises(UncoveredPermissionCombination) as ctx:
+        with self.assertRaises(UncoveredPermissionCombinationError) as ctx:
             translate_company_functions(
                 companies=(COMPANY_A,),
                 functions=(FUNCTION_OPS,),
@@ -143,7 +145,7 @@ class UncoveredCoverageTest(unittest.TestCase):
         对应的指标"这种沉默的猜测。映射本身**不为空**，因此这是「配了但没覆盖到」，
         不是「未配置」——两种运维状态必须可分辨。"""
 
-        with self.assertRaises(UncoveredPermissionCombination) as ctx:
+        with self.assertRaises(UncoveredPermissionCombinationError) as ctx:
             translate_company_functions(
                 companies=(COMPANY_A,),
                 functions=(FUNCTION_FINANCE,),
@@ -155,7 +157,7 @@ class UncoveredCoverageTest(unittest.TestCase):
     def test_partial_coverage_across_two_companies_fails_the_whole_translation(self) -> None:
         """两家公司，只有一家有映射——**整体**失败，不产出"只翻译出那一家"的部分结果。"""
 
-        with self.assertRaises(UncoveredPermissionCombination) as ctx:
+        with self.assertRaises(UncoveredPermissionCombinationError) as ctx:
             translate_company_functions(
                 companies=(COMPANY_A, COMPANY_B),
                 functions=(FUNCTION_OPS,),
@@ -168,9 +170,9 @@ class UncoveredCoverageTest(unittest.TestCase):
     def test_an_uncovered_translation_never_falls_back_to_the_function_label(self) -> None:
         """否定断言：一个职能标签恰好在指标名词表以外时，翻译不出来就是失败关闭，
         不会有任何路径让职能标签本身冒充指标名溜进结果——本函数只有两种出口：
-        抛 :class:`UncoveredPermissionCombination`，或者返回完全翻译好的结果。"""
+        抛 :class:`UncoveredPermissionCombinationError`，或者返回完全翻译好的结果。"""
 
-        with self.assertRaises(UncoveredPermissionCombination):
+        with self.assertRaises(UncoveredPermissionCombinationError):
             translate_company_functions(
                 companies=(COMPANY_A,),
                 functions=(FUNCTION_OPS,),
@@ -183,7 +185,7 @@ class EmptyMappingIsLegalTest(unittest.TestCase):
     """映射为空时维持现有硬闸：任何用户的任何组合都翻译不出来（Issue #227 承诺）。"""
 
     def test_an_empty_mapping_uncoveres_every_combination(self) -> None:
-        with self.assertRaises(UncoveredPermissionCombination) as ctx:
+        with self.assertRaises(UncoveredPermissionCombinationError) as ctx:
             translate_company_functions(
                 companies=(COMPANY_A, COMPANY_B),
                 functions=(FUNCTION_OPS, FUNCTION_FINANCE),
@@ -202,7 +204,7 @@ class EmptyMappingIsLegalTest(unittest.TestCase):
         self.assertTrue(ctx.exception.mapping_is_empty)
 
     def test_an_empty_mapping_uncoveres_the_wildcard_scope_too(self) -> None:
-        with self.assertRaises(UncoveredPermissionCombination) as ctx:
+        with self.assertRaises(UncoveredPermissionCombinationError) as ctx:
             translate_company_functions(
                 companies=(), functions=(FUNCTION_OPS,), all_companies=True, mapping={}
             )
@@ -213,7 +215,7 @@ class EmptyMappingIsLegalTest(unittest.TestCase):
         这条状态必须能与"整份映射为空"区分开，运维据此判断是"还没开始填"还是
         "已经在填、还差几条"。"""
 
-        with self.assertRaises(UncoveredPermissionCombination) as ctx:
+        with self.assertRaises(UncoveredPermissionCombinationError) as ctx:
             translate_company_functions(
                 companies=(COMPANY_A,),
                 functions=(FUNCTION_OPS,),
@@ -231,7 +233,10 @@ class WildcardTest(unittest.TestCase):
             companies=(),
             functions=(FUNCTION_OPS,),
             all_companies=True,
-            mapping={"*": {FUNCTION_OPS: (METRIC_DAU,)}, COMPANY_A: {FUNCTION_OPS: (METRIC_REVENUE,)}},
+            mapping={
+                "*": {FUNCTION_OPS: (METRIC_DAU,)},
+                COMPANY_A: {FUNCTION_OPS: (METRIC_REVENUE,)},
+            },
         )
 
         self.assertEqual(result, {"*": (METRIC_DAU,)})
@@ -240,7 +245,7 @@ class WildcardTest(unittest.TestCase):
         """否定断言：即便具体公司键有映射，全非通配也不会"顺手"用它兜底——
         通配必须有自己显式的 ``"*"`` 条目。"""
 
-        with self.assertRaises(UncoveredPermissionCombination):
+        with self.assertRaises(UncoveredPermissionCombinationError):
             translate_company_functions(
                 companies=(),
                 functions=(FUNCTION_OPS,),
@@ -373,9 +378,7 @@ class MetricValueHygieneTests(unittest.TestCase):
     def test_company_key_wildcard_is_still_accepted(self) -> None:
         """口径分界：``"*"`` 在**键**位是合法的全公司通配，只有落到值上才是越权。"""
 
-        mapping = build_company_function_metric_map(
-            {"companies": {"*": {"销售": ["日活"]}}}
-        )
+        mapping = build_company_function_metric_map({"companies": {"*": {"销售": ["日活"]}}})
 
         self.assertEqual(mapping["*"]["销售"], ("日活",))
 
@@ -383,9 +386,7 @@ class MetricValueHygieneTests(unittest.TestCase):
         """与 S-2d 同一条口径：**只拒值、不拒公司键**——这个文件本身就是目录，
         没有第二份可以拿来核对公司键在不在里面。"""
 
-        mapping = build_company_function_metric_map(
-            {"companies": {"9999": {"销售": ["日活"]}}}
-        )
+        mapping = build_company_function_metric_map({"companies": {"9999": {"销售": ["日活"]}}})
 
         self.assertEqual(mapping["9999"]["销售"], ("日活",))
 
