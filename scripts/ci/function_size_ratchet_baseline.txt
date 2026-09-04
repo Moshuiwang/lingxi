@@ -176,7 +176,6 @@
 96	src/lingxi/core/identity/onboarding_runner.py::AutoOnboardingRunner._publish
 163	src/lingxi/core/identity/onboarding_runner.py::AutoOnboardingRunner._run
 73	src/lingxi/core/identity/onboarding_runner.py::AutoOnboardingRunner.start
-126	src/lingxi/core/permission/account_match.py::match_galaxy_account
 88	src/lingxi/core/permission/galaxy_export.py::_check_references
 68	src/lingxi/core/permission/galaxy_export.py::_normalize_table
 66	src/lingxi/core/permission/galaxy_export.py::validate_export
