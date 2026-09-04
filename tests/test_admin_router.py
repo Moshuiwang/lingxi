@@ -2306,7 +2306,7 @@ class DocumentDeliveryReasonLabelCoverageTests(unittest.TestCase):
 
     def test_every_degrade_reason_the_adapter_can_emit_has_a_display_name(self) -> None:
         from lingxi.adapters import feishu_docx_delivery
-        from lingxi.core.admin.router import _DOCUMENT_DELIVERY_REASON_LABEL
+        from lingxi.core.admin.router_render import _DOCUMENT_DELIVERY_REASON_LABEL
 
         emitted = {
             feishu_docx_delivery.BODY_TOO_LONG,

@@ -299,6 +299,9 @@ REQUIRED_MODULES = (
     "lingxi.core.admin.registry",
     "lingxi.core.admin.commands",
     "lingxi.core.admin.router",
+    # router.py 拆分（#592 B-1）：端口协议与文本渲染。
+    "lingxi.core.admin.router_ports",
+    "lingxi.core.admin.router_render",
     "lingxi.core.admin.views",
     "lingxi.adapters.admin_registry",
     # 失败原因落库（Issue #337，S-H3-1）：`onboarding_failure` 表（迁移 0077）的
@@ -1087,6 +1090,8 @@ PROCESS_RUNTIME_IMPORTS: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {
             "lingxi.core.admin.registry",
             "lingxi.core.admin.commands",
             "lingxi.core.admin.router",
+            "lingxi.core.admin.router_ports",
+            "lingxi.core.admin.router_render",
             "lingxi.core.admin.views",
             # 待确认操作全链路（Issue #96 S-M-02）：build_supervisor 在函数内
             # import PostgresPendingActionStore、LarkAdminCardTransport、
