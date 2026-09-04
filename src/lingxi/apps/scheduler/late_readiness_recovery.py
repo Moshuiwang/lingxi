@@ -75,9 +75,11 @@ class _Ticker(Protocol):
 
 
 class _Activator(Protocol):
-    """就绪之后「推进 active + 排通知」的原子写口
-    （``adapters/postgres_late_readiness_recovery.PostgresLateReadinessStore.
-    activate_after_late_readiness``）。"""
+    """就绪之后「推进 active + 排通知」的原子写口。
+
+    实现是 ``adapters/postgres_late_readiness_recovery.PostgresLateReadinessStore.
+    activate_after_late_readiness``。
+    """
 
     def activate_after_late_readiness(
         self,
@@ -126,8 +128,11 @@ class _AuditSink(Protocol):
 
 @dataclass(frozen=True)
 class LateReadinessRecoveryReport:
-    """一轮的结果。**只有计数与固定分类，没有任何字段值**（同 ``PermissionPublishReport``
-    的纪律：内部用户标识、权限值、open_id 一个都不进报告）。"""
+    """一轮的结果。
+
+    **只有计数与固定分类，没有任何字段值**（同 ``PermissionPublishReport``
+    的纪律：内部用户标识、权限值、open_id 一个都不进报告）。
+    """
 
     #: 本轮取到的恢复候选数（探针面）。
     examined: int = 0
@@ -221,9 +226,11 @@ class _Tally:
 
     @property
     def anything_happened(self) -> bool:
-        """本轮有没有任何值得记一条完成审计的事——**零候选、零待发通知**时不记，
-        本职责每轮都跑，不去重的话会在健康系统里刷出大量空审计。"""
+        """本轮有没有任何值得记一条完成审计的事。
 
+        **零候选、零待发通知**时不记，本职责每轮都跑，不去重的话会在健康
+        系统里刷出大量空审计。
+        """
         return bool(self.examined or self.notices_claimed)
 
 

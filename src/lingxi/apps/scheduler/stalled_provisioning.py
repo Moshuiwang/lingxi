@@ -1,5 +1,4 @@
-"""开通中途停摆收口职责：认领超过租约、仍卡在中途格的用户最终一定离开
-``provisioning``/``mcp_syncing``。
+"""开通中途停摆收口职责：认领超过租约、仍卡在中途格的用户最终一定离开 ``provisioning``/``mcp_syncing``。
 
 首次开通链推进到 ``provisioning`` 后死掉（进程被强杀、执行线程异常退出、
 「当场收口」自己那一次也失败）时，此前没有任何东西会再回来看这个人——用户
@@ -75,8 +74,11 @@ class _Candidates(Protocol):
 
 
 class _Aborter(Protocol):
-    """收口写口（``adapters/postgres_identity.PostgresAppUserStore.
-    abort_stalled_provisioning``，与编排层「当场收口」共用同一份实现）。"""
+    """收口写口。
+
+    实现是 ``adapters/postgres_identity.PostgresAppUserStore.
+    abort_stalled_provisioning``，与编排层「当场收口」共用同一份实现。
+    """
 
     def abort_stalled_provisioning(
         self, *, user_id: str, expected_states: Sequence[str], reason: str
@@ -100,8 +102,11 @@ class _AuditSink(Protocol):
 
 @dataclass(frozen=True)
 class StalledProvisioningReport:
-    """一轮的结果。**只有计数与固定分类，没有任何字段值**（同
-    ``LateReadinessRecoveryReport`` 的纪律：内部用户标识、open_id 一个都不进报告）。"""
+    """一轮的结果。
+
+    **只有计数与固定分类，没有任何字段值**（同 ``LateReadinessRecoveryReport``
+    的纪律：内部用户标识、open_id 一个都不进报告）。
+    """
 
     #: 本轮**真正处理**（发起了通知尝试）的候选数——**不等于**本轮候选查询取到的
     #: 行数：过采样查询取回的候选里，处于通知退避期的那些被跳过、不计入这里，
@@ -407,10 +412,13 @@ class StalledProvisioningDuty:
         self._record_failure_reason(trace_id=item.trace_id)
 
     def _record_failure_reason(self, *, trace_id: str) -> None:
-        """把这次租约到期收口的失败原因落库。**最佳努力**：与
+        """把这次租约到期收口的失败原因落库。
+
+        **最佳努力**：与
         ``core.identity.onboarding_runner.AutoOnboardingRunner._record_failure_
         reason`` 同一条纪律——落库失败不得带走已经完成的收口，只改记一条自己的
-        失败审计。"""
+        失败审计。
+        """
 
         if self._failure_reasons is None:
             return
@@ -435,15 +443,14 @@ def _build_stalled_provisioning_duty(
     audit: AuditSink,
     alert: Callable[[int], None] | None = None,
 ) -> Any:
-    """装配开通中途停摆收口职责。**总能注册**，不需要任何可选前置——候选查询、
-    收口写入与通知都只需要 ``LINGXI_POSTGRES_DSN``/飞书应用凭据，两者都是
-    :class:`SchedulerConfig` 的必填项，形状照 :func:`_build_late_readiness_recovery_duty`。
+    """装配开通中途停摆收口职责。**总能注册**，不需要任何可选前置。
 
-    装配断言：停摆租约必须严格长于一条链在 provisioning/mcp_syncing 两格上
-    可能停留的最长时间——见 :func:`~lingxi.apps.scheduler.onboarding.
-    assert_stalled_lease_exceeds_chain_budget`。这里只是拿一份
-    :class:`ReadinessSchedule` 来核对预算数字，**不需要真的装配探针**（本职责
-    本身也不发探针），因此这条断言在探针端点是否配置好之前就能跑。
+    候选查询、收口写入与通知都只需要 ``LINGXI_POSTGRES_DSN``/飞书应用凭据，
+    两者都是 :class:`SchedulerConfig` 的必填项。装配断言（停摆租约必须严格
+    长于一条链在 provisioning/mcp_syncing 两格上可能停留的最长时间，见
+    `apps/scheduler/onboarding.py::assert_stalled_lease_exceeds_chain_budget`）
+    只是拿一份 :class:`ReadinessSchedule` 来核对预算数字，**不需要真的
+    装配探针**，因此在探针端点是否配置好之前就能跑。
     """
 
     from lingxi.adapters.postgres_identity import PostgresAppUserStore
