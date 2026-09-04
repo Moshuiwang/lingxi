@@ -36,6 +36,7 @@ from lingxi.core.ids import is_ulid, new_ulid
 from .config import ENV_PREFIX, WorkerConfig, WorkerConfigError, load_config
 from .report import config_error_report
 from .service import WorkerService
+from .service_ports import SessionCleanupSettings, WorkerObservers
 from .session_cleanup import default_session_root
 from .turn import WorkerTurnExecutor
 
@@ -256,14 +257,19 @@ def _build_worker_service(
         config=config,
         queue=PostgresTaskQueue(dsn, reuse_polling_connection=True),
         listener_factory=lambda: PostgresTaskQueueListener(dsn),
-        heartbeat=_combined_heartbeat(alerting_duty, "worker"),
-        on_task_stuck=alerting_duty.task_stuck_callback(),
-        on_alert_tick=alerting_duty.run_once,
-        on_terminal_outcome=_terminal_outcome_sink(err=err, trace_id=config.trace_id),
-        session_root=session_root,
-        session_cleanup_batch_limit=config.session_cleanup_batch_limit,
-        content_capture_writer=content_capture_writer,
-        on_year_grounding_suspect=_year_grounding_suspect_sink(err=err, trace_id=config.trace_id),
+        observers=WorkerObservers(
+            heartbeat=_combined_heartbeat(alerting_duty, "worker"),
+            on_task_stuck=alerting_duty.task_stuck_callback(),
+            on_alert_tick=alerting_duty.run_once,
+            on_terminal_outcome=_terminal_outcome_sink(err=err, trace_id=config.trace_id),
+            content_capture_writer=content_capture_writer,
+            on_year_grounding_suspect=_year_grounding_suspect_sink(
+                err=err, trace_id=config.trace_id
+            ),
+        ),
+        session_cleanup=SessionCleanupSettings(
+            root=session_root, batch_limit=config.session_cleanup_batch_limit
+        ),
         user_memory_reader=PostgresUserMemoryReader(dsn),
     )
 
