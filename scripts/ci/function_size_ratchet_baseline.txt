@@ -113,8 +113,6 @@
 67	src/lingxi/apps/scheduler/stalled_provisioning.py::_build_stalled_provisioning_duty
 63	src/lingxi/apps/trace/__init__.py::_render
 71	src/lingxi/apps/trace/__init__.py::run
-66	src/lingxi/apps/worker/cli.py::_run_queue_worker
-309	src/lingxi/apps/worker/cli.py::main
 83	src/lingxi/apps/worker/service.py::WorkerService.__init__
 67	src/lingxi/apps/worker/service.py::WorkerService._cleanup_agent_sessions
 81	src/lingxi/apps/worker/service.py::WorkerService._finish_terminal
