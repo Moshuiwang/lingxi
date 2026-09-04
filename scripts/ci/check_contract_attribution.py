@@ -496,7 +496,7 @@ GROUNDED_ATTRIBUTIONS: tuple[GroundedAttribution, ...] = (
     ),
     GroundedAttribution(
         "src/lingxi/core/identity/onboarding_runner.py",
-        "# **合同要求的第二条固定提示**（`V-开通-11`）：权限已经排出去、进入同步等待时，",
+        '"""**合同要求的第二条固定提示**（`V-开通-11`）：权限已经排出去、进入同步等待时，',
         "首次对话与自动准入",
     ),
     GroundedAttribution(
