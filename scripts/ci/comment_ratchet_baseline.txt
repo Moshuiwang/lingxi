@@ -131,10 +131,7 @@
 3	docstring_over	src/lingxi/core/identity/onboarding_runner.py
 3	docstring_over	src/lingxi/core/identity/preprovision.py
 4	docstring_over	src/lingxi/core/identity/provisioning.py
-1	docstring_over	src/lingxi/core/identity/roster_audit.py
-1	docstring_over	src/lingxi/core/identity/roster_report.py
 3	docstring_over	src/lingxi/core/identity/roster_snapshot.py
-2	docstring_over	src/lingxi/core/identity/stock_token_source.py
 2	docstring_over	src/lingxi/core/innertest_content_capture.py
 1	docstring_over	src/lingxi/core/mcp_naming.py
 1	docstring_over	src/lingxi/core/permission/account_match.py
@@ -229,7 +226,6 @@
 1	hash_block_over	src/lingxi/core/identity/innertest_roster_gate.py
 1	hash_block_over	src/lingxi/core/identity/legacy_permission_import.py
 13	hash_block_over	src/lingxi/core/identity/onboarding_runner.py
-1	hash_block_over	src/lingxi/core/identity/roster_audit.py
 1	hash_block_over	src/lingxi/core/identity/roster_snapshot.py
 1	hash_block_over	src/lingxi/core/mcp_naming.py
 1	hash_block_over	src/lingxi/core/permission/metric_translation.py
@@ -376,10 +372,8 @@
 5	provenance	src/lingxi/core/identity/org_snapshot.py
 7	provenance	src/lingxi/core/identity/preprovision.py
 9	provenance	src/lingxi/core/identity/provisioning.py
-2	provenance	src/lingxi/core/identity/roster_audit.py
-5	provenance	src/lingxi/core/identity/roster_report.py
 9	provenance	src/lingxi/core/identity/roster_snapshot.py
-9	provenance	src/lingxi/core/identity/stock_token_source.py
+1	provenance	src/lingxi/core/identity/stock_token_source.py
 2	provenance	src/lingxi/core/ids.py
 7	provenance	src/lingxi/core/innertest_content_capture.py
 3	provenance	src/lingxi/core/mcp_naming.py
