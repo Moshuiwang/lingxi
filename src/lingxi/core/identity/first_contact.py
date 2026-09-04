@@ -6,13 +6,12 @@
 2. 定位到之后**实时**读取该成员的在职状态（快照里没有、也不会有这个字段）；
 3. 把定位结果、在职状态与组织资料可用性交给 :func:`decide_first_contact`。
 
-为什么在职状态是"调用时的入参"而不是快照字段：可见范围不做在职过滤，710 人
-实测中含 5 名冻结、1 名未加入；把 ``status`` 存下来会立刻产生"库里在职、飞书
-已冻结"的陈旧窗口，而这个字段的唯一用途恰恰是拦截这种情况（断言 V-开通-07）。
-
-判定顺序本身是产品行为，不能重排：专用授权账号的排除必须排在最前，
-组织资料不可用的终态必须排在定位之前——组织资料不可用时"定位不到"不是事实，
-只是我们暂时看不见。
+为什么在职状态是"调用时的入参"而不是快照字段：可见范围不做在职过滤，实测中确实
+存在冻结、未加入账号；把 ``status`` 存下来会立刻产生"库里在职、飞书已冻结"的
+陈旧窗口，而这个字段的唯一用途恰恰是拦截这种情况（断言 V-开通-07）。
+判定顺序本身是产品行为，不能重排：专用授权账号的排除必须排在最前，组织资料
+不可用的终态必须排在定位之前——组织资料不可用时"定位不到"不是事实，只是我们
+暂时看不见。
 """
 
 from __future__ import annotations
@@ -31,6 +30,8 @@ from lingxi.core.identity.org_snapshot import (
 
 
 class LocationOutcome(str, Enum):
+    """按 open_id 定位快照成员的结果分类。"""
+
     LOCATED = "located"
     AMBIGUOUS = "ambiguous"
     NOT_FOUND = "not_found"
@@ -38,6 +39,8 @@ class LocationOutcome(str, Enum):
 
 @dataclass(frozen=True)
 class LocationResult:
+    """一次定位的完整结果：结论、命中成员（若唯一）、候选条数。"""
+
     outcome: LocationOutcome
     member: SnapshotMember | None
     candidate_count: int
@@ -50,7 +53,6 @@ def locate_by_open_id(open_id: object, members: Sequence[SnapshotMember]) -> Loc
     有 57 组碰撞，姓名有重名且不假定语言，两者都不能用于比对。命中多条时返回
     ``AMBIGUOUS`` 而不是任选一条——"不猜测身份"是产品合同的硬要求。
     """
-
     if not isinstance(open_id, str):
         return LocationResult(LocationOutcome.NOT_FOUND, None, 0)
     needle = open_id.strip()
@@ -78,6 +80,7 @@ class EmploymentStatus:
 
     @property
     def employed(self) -> bool:
+        """综合五个标志位判定是否在职。"""
         return self.is_activated and not (
             self.is_exited or self.is_frozen or self.is_resigned or self.is_unjoin
         )
@@ -89,7 +92,6 @@ class EmploymentStatus:
         返回 ``None`` 表示**不可判定**，调用方必须拒绝开通，不得当作在职。默认成
         在职是这条链路最危险的错误：它会给一个已冻结的账号开通并发布权限。
         """
-
         if not isinstance(payload, Mapping):
             return None
         values: dict[str, bool] = {}
@@ -102,6 +104,8 @@ class EmploymentStatus:
 
 
 class FirstContactOutcome(str, Enum):
+    """首聊判定的最终结论。"""
+
     RECORD_READY = "record_ready"
     NOT_AUTHORIZED = "not_authorized"
     DELEGATED_SUBJECT_IGNORED = "delegated_subject_ignored"
@@ -123,13 +127,11 @@ class IdentityRecordDraft:
     """建档时允许写入 ``app_user`` 的全部字段——**只有完成身份关联必需的那些**。
 
     ``permission_record_id`` 恒为 ``None``：权限匹配确认前不先占位再回填
-    （断言 V-开通-01）。这里把它写成常量字段而不是"调用方记得别传"，是为了
-    让"占位"这件事在类型上就做不到。
-
-    没有在职状态字段，也没有 ``mobile`` / ``job_title`` / ``leader_id``：前者会
-    产生陈旧窗口，后者是可选增强。工号与邮箱按《2026-08-05 花名册身份链与工号
-    邮箱匹配》决策进入统一用户记录的保存范围（匹配银河的主/辅键），但由花名册
-    读取步骤填充、不作为建档前提，因此是可选字段。
+    （断言 V-开通-01），写成常量字段而不是"调用方记得别传"，让"占位"这件事在
+    类型上就做不到。没有在职状态字段，也没有 ``mobile``/``job_title``/
+    ``leader_id``：前者会产生陈旧窗口，后者是可选增强。工号与邮箱进入统一用户
+    记录的保存范围（匹配银河的主/辅键），但由花名册读取步骤填充、不作为建档
+    前提，因此是可选字段。
     """
 
     feishu_open_id: str
@@ -147,13 +149,13 @@ class IdentityRecordDraft:
 
 @dataclass(frozen=True)
 class FirstContactDecision:
+    """一次首聊判定的完整结果，供调用方回复用户与决定是否建档。"""
+
     outcome: FirstContactOutcome
-    #: **历史遗留字段，生产中没有任何消费方**（全仓只有
-    #: ``core/permission/notification.py`` 读 ``content_key``；``onboarding_runner._locate``
-    #: 只用 ``outcome``/``failure_reason``）。对于带必填占位（如追溯号 ``{reference}``）的
-    #: 文案键，本字段留空——判定层拿不到 ``trace_id``（:func:`decide_first_contact` 是纯
-    #: 函数，签名里没有它），也不该猜一个假值出来渲染。真正的正文由持有 ``trace_id`` 的
-    #: 发送方按 ``content_key`` 渲染（见 Issue #280 联合设计 §7.1）。
+    #: **历史遗留字段，生产中没有任何消费方**。对于带必填占位（如追溯号
+    #: ``{reference}``）的文案键，本字段留空——判定层拿不到 ``trace_id``
+    #: （:func:`decide_first_contact` 是纯函数，签名里没有它），也不该猜一个
+    #: 假值出来渲染。真正的正文由持有 ``trace_id`` 的发送方按 ``content_key`` 渲染。
     message: str
     content_key: str = ""
     content_version: str = ""
@@ -162,6 +164,7 @@ class FirstContactDecision:
 
     @property
     def creates_record(self) -> bool:
+        """这次判定是否会建档。"""
         return self.draft is not None
 
 
@@ -172,14 +175,78 @@ _MESSAGE_KEYS: dict[FirstContactOutcome, str] = {
     FirstContactOutcome.DIRECTORY_UNAVAILABLE: "onboarding.internal_error",
 }
 
-#: 带必填占位（追溯号 ``{reference}``）、不能在本模块即时渲染的文案键（Issue #280
-#: §7.1）。``_decision`` 只确认键存在、取版本号，不渲染正文——渲染需要 ``trace_id``，
+#: 带必填占位（追溯号 ``{reference}``）、不能在本模块即时渲染的文案键。
+#: ``_decision`` 只确认键存在、取版本号，不渲染正文——渲染需要 ``trace_id``，
 #: 而这条判定链路是纯函数，拿不到它。
 _DEFERRED_RENDER_KEYS: frozenset[str] = frozenset({"onboarding.internal_error"})
 
 
 def _blank(value: object) -> bool:
     return not isinstance(value, str) or not value.strip()
+
+
+def _locate_or_reject(
+    location: LocationResult,
+) -> tuple[SnapshotMember, None] | tuple[None, FirstContactDecision]:
+    """把定位结果收敛成"成员"或"拒绝理由"二选一。"""
+    if location.outcome is LocationOutcome.NOT_FOUND:
+        return None, _decision(
+            FirstContactOutcome.NOT_AUTHORIZED, failure_reason=FailureReason.NOT_LOCATED
+        )
+    if location.outcome is LocationOutcome.AMBIGUOUS or location.member is None:
+        return None, _decision(
+            FirstContactOutcome.NOT_AUTHORIZED, failure_reason=FailureReason.AMBIGUOUS_IDENTITY
+        )
+    return location.member, None
+
+
+def _reject_for_employment(employment: EmploymentStatus | None) -> FirstContactDecision | None:
+    """在职状态不可判定或明确非在职都按无可用权限结束，两者都不建档、不建待办。"""
+    if employment is None:
+        return _decision(
+            FirstContactOutcome.NOT_AUTHORIZED, failure_reason=FailureReason.EMPLOYMENT_UNKNOWN
+        )
+    if not employment.employed:
+        return _decision(
+            FirstContactOutcome.NOT_AUTHORIZED, failure_reason=FailureReason.NOT_EMPLOYED
+        )
+    return None
+
+
+def _build_draft(member: SnapshotMember) -> IdentityRecordDraft | None:
+    """必要资料齐全时组装建档草稿，否则返回 ``None``（断言 V-开通-06）。
+
+    部门仍是必要资料；把它当可选字段放行会建出 department 为空的半份档案。
+    """
+    department = (
+        member.department_names[0].strip()
+        if member.department_names and member.department_names[0]
+        else ""
+    )
+    incomplete = (
+        any(
+            _blank(value)
+            for value in (
+                member.open_id,
+                member.user_id,
+                member.union_id,
+                member.display_name,
+                member.tenant_key,
+            )
+        )
+        or not department
+    )
+    if incomplete:
+        return None
+    return IdentityRecordDraft(
+        feishu_open_id=member.open_id.strip(),
+        feishu_user_id=member.user_id.strip(),
+        feishu_union_id=member.union_id.strip(),
+        display_name=member.display_name.strip(),
+        display_name_locale=member.display_name_locale,
+        department=department,
+        tenant_key=member.tenant_key.strip(),
+    )
 
 
 def decide_first_contact(
@@ -193,9 +260,10 @@ def decide_first_contact(
     """首聊事件的最终判定。
 
     刻意**没有**目标租户参数：标识跨租户唯一，租户归属是从快照里查出来的结果，
-    不是需要预先配置的输入（Issue #16 硬约束 1）。
+    不是需要预先配置的输入。判定次序见模块文档，各步骤的拒绝条件见对应辅助
+    函数（:func:`_locate_or_reject`/:func:`_reject_for_employment`/
+    :func:`_build_draft`）。
     """
-
     incoming = open_id.strip() if isinstance(open_id, str) else ""
     delegated = (
         delegated_subject_open_id.strip() if isinstance(delegated_subject_open_id, str) else ""
@@ -210,60 +278,19 @@ def decide_first_contact(
     if directory is not DirectoryAvailability.AVAILABLE:
         return _decision(FirstContactOutcome.DIRECTORY_UNAVAILABLE)
 
-    if location.outcome is LocationOutcome.NOT_FOUND:
-        return _decision(
-            FirstContactOutcome.NOT_AUTHORIZED, failure_reason=FailureReason.NOT_LOCATED
-        )
-    if location.outcome is LocationOutcome.AMBIGUOUS or location.member is None:
-        return _decision(
-            FirstContactOutcome.NOT_AUTHORIZED, failure_reason=FailureReason.AMBIGUOUS_IDENTITY
-        )
+    member, rejection = _locate_or_reject(location)
+    if rejection is not None:
+        return rejection
 
-    member = location.member
+    employment_rejection = _reject_for_employment(employment)
+    if employment_rejection is not None:
+        return employment_rejection
 
-    # 3. 在职状态不可判定或明确非在职都按无可用权限结束。两者都不建档、不建待办。
-    if employment is None:
-        return _decision(
-            FirstContactOutcome.NOT_AUTHORIZED, failure_reason=FailureReason.EMPLOYMENT_UNKNOWN
-        )
-    if not employment.employed:
-        return _decision(
-            FirstContactOutcome.NOT_AUTHORIZED, failure_reason=FailureReason.NOT_EMPLOYED
-        )
-
-    # 4. 必要资料缺失时不写半条记录（断言 V-开通-06），统一走无可用权限出口。
-    #    部门仍是必要资料；把它当可选字段放行会建出 department 为空的半份档案。
-    department = (
-        member.department_names[0].strip()
-        if member.department_names and member.department_names[0]
-        else ""
-    )
-    if (
-        any(
-            _blank(value)
-            for value in (
-                member.open_id,
-                member.user_id,
-                member.union_id,
-                member.display_name,
-                member.tenant_key,
-            )
-        )
-        or not department
-    ):
+    draft = _build_draft(member)
+    if draft is None:
         return _decision(
             FirstContactOutcome.NOT_AUTHORIZED, failure_reason=FailureReason.INCOMPLETE_PROFILE
         )
-
-    draft = IdentityRecordDraft(
-        feishu_open_id=member.open_id.strip(),
-        feishu_user_id=member.user_id.strip(),
-        feishu_union_id=member.union_id.strip(),
-        display_name=member.display_name.strip(),
-        display_name_locale=member.display_name_locale,
-        department=department,
-        tenant_key=member.tenant_key.strip(),
-    )
     return _decision(FirstContactOutcome.RECORD_READY, draft=draft)
 
 

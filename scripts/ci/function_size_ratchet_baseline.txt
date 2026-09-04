@@ -171,7 +171,6 @@
 88	src/lingxi/core/execution/document_delivery.py::build_sheet_request
 75	src/lingxi/core/execution/hooks.py::ToolGateway._on_pre_tool_use
 62	src/lingxi/core/execution/input_safety.py::constrain_output
-83	src/lingxi/core/identity/first_contact.py::decide_first_contact
 86	src/lingxi/core/identity/legacy_permission_import.py::import_legacy_permissions
 92	src/lingxi/core/identity/onboarding_guards.py::reject_email_bound_to_another_person
 132	src/lingxi/core/identity/onboarding_runner.py::AutoOnboardingRunner.__init__
@@ -179,7 +178,6 @@
 96	src/lingxi/core/identity/onboarding_runner.py::AutoOnboardingRunner._publish
 163	src/lingxi/core/identity/onboarding_runner.py::AutoOnboardingRunner._run
 73	src/lingxi/core/identity/onboarding_runner.py::AutoOnboardingRunner.start
-70	src/lingxi/core/identity/org_snapshot.py::verify_batch
 63	src/lingxi/core/identity/roster_snapshot.py::decide_snapshot_update
 126	src/lingxi/core/permission/account_match.py::match_galaxy_account
 88	src/lingxi/core/permission/galaxy_export.py::_check_references
