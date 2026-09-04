@@ -109,12 +109,9 @@ def _render_local_overrides(
     return "\n".join(lines)
 
 
-#: 零银河权限用户曾经有一句「本地授权暂不生效」的边界提示，**已撤销**：`_refresh_user`/`_publish` 的
-#: 四源合并不再挂在 `aggregate.granted` 判据之后，管理员对这类用户发起的本地
-#: 授权现在无条件参与合并（下一轮重算或下一次开通链会把它发布出去），"暂不
-#: 生效"这句提示已经不实，直接删除——不需要在 `_render_user_status` 里再判断
-#: 是否附加它，也不再需要 `decide_prepare` 额外查一次银河权限才能决定要不要
-#: 提示（那正是删除前留着这句提示的唯一理由）。
+#: 零银河权限用户曾经有一句「本地授权暂不生效」的边界提示，**已撤销**：合并不再挂在
+#: "有银河权限"判据之后，管理员对这类用户的本地授权现在无条件参与合并，那句提示已经
+#: 不实。
 
 
 #: 银河来源摘要"算不出来"的三个原因码 → 中文提示，与
@@ -165,12 +162,9 @@ def _safe_identifier_echo(identifier: str) -> str:
     return identifier
 
 
-#: 开通与账号状态机器码 → 中文：与数据库里
-#: ``app_user`` 表 ``provisioning_state``/``account_state`` 两个 CHECK 约束的
-#: 取值域一一对应。未登记的取值原样展示，不当成异常——两个 CHECK 约束已经在
-#: 数据库层面把取值收窄到这张表列出的全部成员，这里的 "未登记" 分支结构上只在
-#: 约束本身被修改、而这份词表忘了同步时才会命中，失败开放比拒绝渲染整条回复
-#: 更安全。
+#: 开通与账号状态机器码 → 中文：与数据库两个 CHECK 约束的取值域一一对应。未登记的取值
+#: 原样展示、不当成异常——约束已经在数据库层面把取值收窄到这张表列出的成员，"未登记"
+#: 分支只在约束被改而词表忘了同步时才会命中，失败开放比拒绝渲染整条回复更安全。
 _PROVISIONING_STATE_LABEL: dict[str, str] = {
     "guest": "访客（尚未开始开通）",
     "matching": "银河权限匹配中",
@@ -187,12 +181,9 @@ _ACCOUNT_STATE_LABEL: dict[str, str] = {
     "deleted": "已删除",
 }
 
-#: 追溯回显里的入站事件类型 → 中文：
-#: 与 ``adapters/feishu_events.py`` 的 ``MESSAGE_RECEIVE_EVENT``/
-#: ``CARD_ACTION_TRIGGER_EVENT`` 两个字面量一一对应——本模块历来不 import
-#: ``adapters/``（模块文档「只依赖注入的 Protocol 端口」），因此这里独立登记
-#: 一份取值，不反向依赖那个模块。未登记的取值走 :func:`_display_or_unregistered`
-#: 回退，不假装认识每一个未来可能新增的事件类型。
+#: 追溯回显里的入站事件类型 → 中文。本模块不 import 适配器，因此这里独立登记一份取值，
+#: 不反向依赖产生这些字面量的那个模块；未登记的取值走统一回退，不假装认识每一个未来
+#: 可能新增的事件类型。
 _EVENT_TYPE_LABEL: dict[str, str] = {
     "im.message.receive_v1": "用户消息",
     "card.action.trigger": "卡片按钮/表单交互",
@@ -210,12 +201,9 @@ _HANDLED_AS_LABEL: dict[str, str] = {
     "dropped": "重复投递，已丢弃",
 }
 
-#: 开通失败原因机器码 → 中文：覆盖
-#: ``core/identity/onboarding_runner.py``/``apps/scheduler/stalled_
-#: provisioning.py`` 现有登记的全部原因码；与上面两张表同一姿态——白名单式
-#: 展示层翻译，不反向依赖产生这些字面量的具体模块。未登记的取值（未来新增
-#: 但这里忘了同步）走 :func:`_display_or_unregistered` 回退，不崩、不假装
-#: 认识。
+#: 开通失败原因机器码 → 中文，覆盖开通链与停摆收口现有登记的全部原因码。与上面两张表
+#: 同一姿态：白名单式展示层翻译，不反向依赖产生这些字面量的具体模块；未登记的取值走统一
+#: 回退，不崩、不假装认识。
 _FAILURE_REASON_LABEL: dict[str, str] = {
     "account_not_enabled": "账号未启用",
     "already_running": "该追溯号的开通已在处理中（重复触发）",
@@ -250,25 +238,11 @@ _TASK_STATUS_LABEL: dict[str, str] = {
     "stopped": "已停止",
 }
 
-#: 任务失败机器码 → 中文。**同时覆盖两列**：``task.failure_code``
-#: （迁移 ``0080`` 新增，worker 给出的**细分**失败码）与 ``task.error_kind``
-#: （被 ``apps/worker/service.py::_failure_content`` 压平成用户文案分类之后的粗
-#: 粒度值）。两列是不同的取值域：``drain_timeout``/``sdk_unavailable``/
-#: ``cancelled``/``gate_bypassed`` 在 ``error_kind`` 那一列全部塌进同一个
-#: ``session_failed``，正是这里要消灭的那种"什么都看不出来"；反过来
-#: ``error_kind`` 也有 ``failure_code`` 覆盖不到的取值——**没有经过
-#: ``write_terminal_event`` 的失败终态**（心跳超时回收 ``retry_exhausted``/
-#: ``side_effect_uncertain``、投递到期 ``delivery_expired``、排队超时
-#: ``queued_timeout`` 等，写入方是 ``adapters/postgres_conversation/
-#: _queue_lifecycle.py``）在新列上恒为 ``NULL``，只有 ``error_kind`` 说得出原因。
-#: 因此回显按「有 ``failure_code`` 用它，否则退回 ``error_kind``」取值，一张表
-#: 服务两列，不维护两份会各自漂移的词表。
-#:
-#: ``core/daily_report.py`` 另有一份只翻译 ``task.error_kind`` 的词表，服务的是
-#: 「失败分类 Top」榜单——两处对**共有**的词刻意逐字保持同一措辞，改动其一时请
-#: 同步另一处。**唯一一处有意分岔**：``session_failed`` 在那边是「会话执行失败」，
-#: 这边加了「（未分类，见底层异常）」——榜单是聚合计数、下面没有别的行可看，而
-#: 这里紧接着就是「失败签名/底层异常类型」那一行，把读者指过去正是要点。
+#: 任务失败机器码 → 中文，**同时覆盖两列**：细分失败码，与被压平成用户文案分类之后的
+#: 粗粒度错误类别。细分码里的多种失败在粗粒度那一列全部塌进同一个"会话失败"，正是这里
+#: 要消灭的"什么都看不出来"；反过来没有经过终态写入的失败（心跳超时回收、投递到期、
+#: 排队超时）在细分列上恒为空，只有粗粒度说得出原因。因此回显按「有细分码用它，否则
+#: 退回粗粒度」取值，一张表服务两列。日报另有一份只翻译粗粒度的词表，共有的词逐字同措辞。
 _TASK_FAILURE_LABEL: dict[str, str] = {
     "cancelled": "执行被取消",
     "config_error": "worker 配置错误",
@@ -482,18 +456,11 @@ def _trace_document_lines(trace: AdminTraceView) -> list[str]:
     return lines
 
 
-#: 「以 ``/admin`` 开头但没解析成功」时，按失败落点告诉管理员**哪一段**没看懂
-#: 。
-#:
-#: 缺陷现场：连发三条管理命令、三条都只收到一句"未识别的
-#: 管理命令，请发送 /admin help 查看可用命令"——这句话不含任何可据以修正的信息，
-#: 发送者无从自救，也无法判断是邮箱被客户端自动链接化了、还是公司
-#: 那一段填了中文名（假设 2）。两种情形此前产生**逐字相同**的回复。
-#:
-#: **刻意不回显管理员输入的原文**：回显最直观，但出站是一条飞书文本消息，而飞书
-#: 文本消息里的 ``<at user_id="all"></at>`` 一类标记是有语义的——把输入原样拼进
-#: 回复等于把一段可控文本反射进出站消息。段名 + 期望形状已经足够自救，不值得为
-#: 这点便利开一个反射面。
+#: 「以 ``/admin`` 开头但没解析成功」时，按失败落点告诉管理员**哪一段**没看懂。缺陷现场：
+#: 连发三条命令都只收到同一句"未识别的管理命令"，发送者无从自救，也无法判断是邮箱被客户端
+#: 自动链接化了还是公司那一段填了中文名。**刻意不回显管理员输入的原文**：出站是一条平台
+#: 文本消息，而那种消息里的 @ 标记是有语义的，把输入原样拼进回复等于开一个可控文本的反射
+#: 面；段名 ＋ 期望形状已经足够自救。
 _REJECT_HINTS: dict[AdminRejectReason, str] = {
     AdminRejectReason.UNKNOWN_SUBCOMMAND: "没有认出命令名",
     AdminRejectReason.WRONG_ARGUMENT_COUNT: "参数个数与这条命令的格式对不上",

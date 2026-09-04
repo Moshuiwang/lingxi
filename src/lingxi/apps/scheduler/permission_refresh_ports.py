@@ -76,12 +76,9 @@ SKIP_METRIC_TRANSLATION_UNAVAILABLE = "metric_translation_unavailable"
 #: 「公司 + 职能 → 指标名」翻译层**有内容，但这一次要用的组合没被覆盖**：
 #: 不发布、不撤权，只跳过。
 SKIP_METRIC_TRANSLATION_UNCOVERED = "metric_translation_uncovered"
-#: 落授权决定的那把行锁里发现这个人已经不是有效账号：本轮基线读到
-#: 他的那一刻他还有效，轮到处理他的这一刻管理员已经把他停用了。**这不是故障**——
-#: ``report.failed`` 不加一，撤权那一侧也不受影响（撤权声明"不要求账号有效"）；它是
-#: 「停用」承诺被正确兑现的证据，因此单独登记一个原因码 + 一条专属审计动作，让运维能
-#: 从审计上看出"今天真的发生过一次这样的交错"。上线后第一轮批处理应当回看这条计数，
-#: 正常为 0。
+#: 落授权决定的那把行锁里发现这个人已经不是有效账号：基线读到他时还有效，轮到处理他时
+#: 管理员已经把他停用了。**这不是故障**——失败计数不加一，撤权那一侧也不受影响；它是
+#: 「停用」承诺被正确兑现的证据，因此单独登记一个原因码 ＋ 一条专属审计动作，正常为 0。
 SKIP_ACCOUNT_NOT_ENABLED = "account_not_enabled"
 #: 本地「全部」组（rc25 S-1）下某公司被本地抑制减到空：读侧回退制无法表示，本轮既不
 #: 发布也不撤权（`merge_sources.py` 「本地 "*" 组」一节；要完全屏蔽该公司先撤组）。
@@ -93,12 +90,10 @@ STAGE_AGGREGATE = "aggregate"
 STAGE_IDENTITY = "identity"
 STAGE_TRANSLATE = "translate"
 
-#: 整轮跳过的原因码 → 审计动作名。翻译层整体
-#: 不可用（映射为空）必须让**整轮**一条发布意图都不排，包括撤权——判据不是"这一行
-#: 要不要翻译"，是"发布面这一轮开不开"。因此它和花名册/银河两组前置判据同属**整轮**
-#: 跳过，不是逐用户判据，与 :data:`SKIP_METRIC_TRANSLATION_UNCOVERED`（映射非空但
-#: 某个组合没覆盖到，仍是逐用户判据，见 :meth:`PermissionRefreshDuty._refresh_user`）
-#: 是两回事，动作名也刻意不同，以便与"配了但未覆盖"在审计上区分开。
+#: 整轮跳过的原因码 → 审计动作名。翻译层整体不可用必须让**整轮**一条发布意图都不排，
+#: 包括撤权——判据不是"这一行要不要翻译"，是"发布面这一轮开不开"，因此它与花名册、银河
+#: 两组前置判据同属整轮跳过。与"映射非空但某个组合没覆盖到"那条逐用户判据是两回事，
+#: 动作名也刻意不同，以便在审计上区分开。
 _ROUND_SKIP_ACTIONS: Mapping[str, str] = {
     SKIP_NO_GALAXY_BATCH: "permission_refresh.skipped_no_galaxy_batch",
     SKIP_MISSING_SNAPSHOT: "permission_refresh.skipped_roster_not_fresh",
@@ -110,13 +105,11 @@ _ROUND_SKIP_ACTIONS: Mapping[str, str] = {
 def _utc_date(moment: datetime) -> date:
     """把一个时刻折成**它所在的 UTC 日期**。
 
-    全模块只有这一处做「时刻 → 日期」的转换，理由是 ``date()`` 会直接取时钟自身时区的
-    日期：一个 ``+08:00`` 的时钟在 ``00:30`` 给出的 ``date()`` 已经是新的一天，而按
-    UTC 那还是前一天。日界不统一会让"今天已经跑过"与"快照是不是今天的"用两把不同的
-    尺子，表现为某些时段整天不重算、或同一天重算两轮。日期一律 UTC（接口设计
-    「二、通用约定」，与 :class:`~lingxi.apps.scheduler.RosterAuditDuty` 的日报日期同口径）。
+    全模块只有这一处做「时刻 → 日期」的转换：直接取时钟自身时区的日期会让一个东八区时钟在
+    凌晨给出新的一天，而按 UTC 那还是前一天。日界不统一会让「今天已经跑过」与「快照是不是
+    今天的」用两把不同的尺子，表现为某些时段整天不重算、或同一天重算两轮。
 
-    naive 时间**直接失败**而不是按本地时区解读：那种解读会在跨时区部署上静默算错，
+    无时区信息的时间**直接失败**而不是按本地时区解读：那种解读会在跨时区部署上静默算错，
     而算错的方向不可预测。
     """
     if not isinstance(moment, datetime):
@@ -139,18 +132,12 @@ class _AuditSink(Protocol):
 class _BaselineReader(Protocol):
     """已开通且未停用用户的读取口。
 
-    **两份实现故意不再共用**：本职责需要的口径与花名册审计（日报/审计对比）用的
-    ``PostgresRosterBaselineReader.load_active_baseline()`` 曾经逐字节相同
-    （``provisioning_state='active'`` 且 ``account_state NOT IN
-    ('deleting','deleted')``，`V-花名册-10`、`V-花名册-11`），直到后来坐实：
-    管理员停用（``account_state='suspended'``）某用户之后，这条共用的过滤没有排除
-    ``suspended``，于是次日这里仍会把这个人算进遍历集合——银河与花名册都不知道
-    "停用"这件事，照常聚合出他的有效权限并重新发布，管理员的停用承诺在数据库层面
-    被这一条批处理静默突破。修复是让**本职责专用**的
-    :class:`PostgresPermissionRefreshBaselineReader` 额外排除 ``suspended``，
-    花名册审计那份基线保持不变（它仍然需要覆盖停用期间的花名册字段漂移，这是
-    另一个产品判据，见该类文档），两个调用方从此各自独立演进各自的过滤条件，
-    不再假设"看起来一样"就可以共用同一条 SQL。
+    **与花名册审计那份基线故意不再共用**：两者曾经逐字节相同，直到坐实——管理员停用某用户
+    之后，共用的过滤没有排除「已停用」，于是次日这里仍会把这个人算进遍历集合，银河与花名册
+    都不知道「停用」这件事，照常聚合出他的有效权限并重新发布，管理员的停用承诺在数据库层面
+    被这一条批处理静默突破。修复是让**本职责专用**的实现额外排除已停用，花名册审计那份保持
+    不变（它仍然需要覆盖停用期间的字段漂移，那是另一个产品判据）——两个调用方从此各自独立
+    演进各自的过滤条件，不再假设「看起来一样」就可以共用同一条 SQL。
     """
 
     def load_active_baseline(self) -> Sequence[ArchivedIdentity]: ...
@@ -206,14 +193,12 @@ class _Decision(Protocol):
 class _DecisionStore(Protocol):
     """权限决定的落库口。
 
-    **版本推进与幂等完全由它承担**：本职责不读、不写、不比较 ``permission_version``，
-    也不自己判断"这次权限有没有变化"。那条判定连同它的锁与事务边界只有一处实现。
+    **版本推进与幂等完全由它承担**：本职责不读、不写、不比较权限版本，也不自己判断「这次权限
+    有没有变化」。那条判定连同它的锁与事务边界只有一处实现。
 
-    ``require_enabled_account`` 是**必填**关键字参数（与
-    ``merge_permission_sources(full_access_wildcard=...)`` 同一条结构性防复发纪律）：
-    授权侧传 ``True``、撤权侧传 ``False``。账号状态复检落在实现那把**已经持有的**
-    ``app_user`` 行锁里，本职责一个字都不复制——它只负责在被挡时把结果翻译成自己的
-    计数与审计（:data:`SKIP_ACCOUNT_NOT_ENABLED`）。
+    ``require_enabled_account`` 是**必填**关键字参数（同一条结构性防复发纪律）：授权侧传
+    ``True``、撤权侧传 ``False``。账号状态复检落在实现那把**已经持有的**行锁里，本职责一个
+    字都不复制——它只负责在被挡时把结果翻译成自己的计数与审计。
     """
 
     def record_decision(
@@ -242,17 +227,12 @@ class _LegacyAllScopeExpander(Protocol):
 class _LocalOverrideReader(Protocol):
     """本地权限覆盖的按用户读取口。
 
-    实现是 :meth:`~lingxi.adapters.postgres_local_permission.
-    PostgresLocalPermissionOverrideStore.effective_entries` 经装配层适配（返回值从
-    ``StoredLocalPermissionOverride`` 解出 ``.entry``——本协议只认纯类型
-    :class:`~lingxi.core.permission.local_override.LocalPermissionOverrideEntry`，
-    不认数据库分配的行标识，理由与 :class:`_PublishHistory` 只声明一个方法相同：
-    本职责只需要"这个用户当前生效的覆盖条目有哪些"，不需要收回单条覆盖的能力）。
+    本协议只认纯类型的覆盖条目，不认数据库分配的行标识：本职责只需要「这个用户当前生效的
+    覆盖条目有哪些」，不需要收回单条覆盖的能力。
 
-    ``None``（装配层未装配）与本方法读取失败在调用方眼里是**不同**的两件事：前者
-    静默按"没有本地源"处理（部署事实，不告警）；后者响亮审计
-    （:data:`~lingxi.core.permission.merge_sources.REASON_LOCAL_OVERRIDE_READ_FAILED`），
-    但结果都是"这一轮/这个用户跳过本地源"——不整轮失败、不静默吞掉异常。
+    未装配与读取失败在调用方眼里是**不同**的两件事：前者静默按「没有本地源」处理（部署事实，
+    不告警）；后者响亮审计。但结果都是「这一轮或这个用户跳过本地源」——不整轮失败、不静默
+    吞掉异常。
     """
 
     def effective_entries(self, *, user_id: str) -> Sequence[LocalPermissionOverrideEntry]: ...
@@ -347,16 +327,9 @@ class _Tally:
 class PermissionRefreshSources:
     """一轮重算要读写的全部端口。
 
-    Attributes:
-        baseline_reader: 已开通且未停用用户的基线。
-        roster_snapshot: 花名册持久快照（元信息与整份分两次读）。
-        galaxy: 银河当前有效批次。
-        decisions: 权限决定的落库口。
-        publish_history: 发布足迹判据，撤权只发给在发布链上留过足迹的人。
-        token_ciphers: 令牌密文只读口——本职责一次都不签发。
-        local_overrides: 本地覆盖读取口；留空＝装配层还没接，合并按"没有本地源"处理，
-            产出与接线之前逐字节一致。
-        legacy_all_scope: 「全部」组补行口；留空＝不补行。
+    基线、花名册快照、银河批次、决定落库、发布足迹、令牌密文，以及两个可选的本地覆盖端口。
+    令牌密文只读——本职责一次都不签发。本地覆盖读取口留空＝装配层还没接，合并按「没有本地
+    源」处理，产出与接线之前逐字节一致；「全部」组补行口留空＝不补行。
     """
 
     baseline_reader: _BaselineReader

@@ -228,18 +228,11 @@ def make_event_handler(
     group_mention_hint: Any = None,
     management_card_context_store: Any = None,
 ) -> Callable[[dict], dict | None]:
-    """把原始事件体接到管线上。
+    """把原始事件体接到管线上，返回可以直接交给长连接的处理函数。
 
-    Args:
-        pipeline: 处理私聊消息的事件管线。
-        audit: 审计出口。
-        on_parse_error: 解析失败时的附加回调，供测试与告警接线。
-        card_callback_handler: 管理卡回调处理器；留空时卡片事件只记 ``event.ignored``。
-        group_mention_hint: 群聊 @ 机器人时的固定引导；留空时群聊消息静默。
-        management_card_context_store: 管理卡上下文端口，用于补回缺失的目标标识。
-
-    Returns:
-        可以直接交给长连接的事件处理函数。
+    三个可选依赖留空时行为与该能力加入之前逐字节一致：不装回调处理器则卡片事件只记
+    ``event.ignored``；不装群聊引导则群聊消息静默；不装管理卡上下文端口则标识缺失时
+    不做恢复。
     """
     return _EventRouter(
         pipeline=pipeline,

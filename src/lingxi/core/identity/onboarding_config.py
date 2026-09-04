@@ -39,18 +39,11 @@ from lingxi.core.identity.stock_token_source import StockTokenSource
 
 @dataclass(frozen=True)
 class OnboardingSources:
-    """链上只读的那些外部事实。
+    """链上只读的那些外部事实：组织快照、在职状态、花名册、银河权限，以及同邮箱绑定回读口。
 
-    Attributes:
-        directory: 组织快照。
-        employment: 在职状态实时回读。
-        roster: 花名册。
-        galaxy: 银河权限快照。
-        email_bindings: 同邮箱是否已绑给另一个人的回读口。**必填、没有哨兵值**——这道闸
-            挡的是"两个人共用同一把问数令牌与同一行正式表权限"。
-        local_overrides: 本地权限覆盖读取口；留空＝未接线，行为与接线之前逐字节一致。
-        stock_tokens: 存量令牌只读源；留空＝该能力关闭，令牌照常新签发。
-        legacy_importer: 存量差集导入口。
+    同邮箱回读口**必填、没有哨兵值**——这道闸挡的是「两个人共用同一把问数令牌与同一行正式
+    表权限」。本地覆盖读取口留空＝未接线，行为与接线之前逐字节一致；存量令牌源留空＝该能力
+    关闭，令牌照常新签发，此时差集导入口也必须一起留空。
     """
 
     directory: DirectorySource
@@ -79,16 +72,8 @@ class OnboardingSources:
 class OnboardingActions:
     """链上会产生外部副作用的那些写侧端口。
 
-    Attributes:
-        provisioning: 建档写侧。
-        users: 用户状态机。
-        environment: 用户环境创建（含按用户落盘的问数凭据）。
-        tokens: 问数令牌签发。
-        decisions: 权限发布意图。
-        readiness: 就绪确认探针。
-        notifier: 用户私聊通知。
-        position_grants: 预授权落库口；留空时首聊路径一行都不碰它，但系统触发带了预授权
-            却没装它时整链失败关闭。
+    建档、用户状态机、用户环境、令牌签发、发布意图、就绪探针、私聊通知。预授权落库口留空时
+    首聊路径一行都不碰它，但系统触发带了预授权却没装它时整链失败关闭。
     """
 
     provisioning: IdentityProvisioning
@@ -133,19 +118,11 @@ class OnboardingRecords:
 class OnboardingPolicy:
     """判据、映射与预算。
 
-    Attributes:
-        role_function_map: 角色到职能的映射。
-        innertest_roster_gate: 内测名单闸。**没有默认放行**——缺省会让它形同虚设，而名单外
-            的真实用户会真实触达。
-        delegated_subject: 专用主体登记的读取口。每次判定**现读一次**而不是装配时读一次
-            存着：换主体之后旧值会让新的专用授权账号落回普通员工路径；也不该在进程启动
-            那一刻读，那会让进程起不起得来取决于数据库此刻通不通。
-        publish_allowed: 发布闸门。**没有默认放行**——它决定要不要往正式权限表写一行，而
-            外部表是不可回滚的。
-        metric_translation_map: 公司加职能到指标名的翻译映射；留空与空映射按同一个结论
-            处理，交给翻译层自己失败关闭。
-        publish_wait_seconds: 等发布真的写出去并读回一致的预算。
-        notify_attempts: 通知重试次数，至少一次。
+    内测名单闸与发布闸门**都没有默认放行**：前者缺省会让它形同虚设，而名单外的真实用户会
+    真实触达；后者决定要不要往正式权限表写一行，而外部表是不可回滚的。专用主体读取口每次
+    判定**现读一次**而不是装配时读一次存着——换主体之后旧值会让新账号落回普通员工路径；
+    也不该在进程启动那一刻读，那会让进程起不起得来取决于数据库此刻通不通。翻译映射留空与
+    空映射按同一个结论处理，交给翻译层自己失败关闭；通知次数至少一次。
     """
 
     role_function_map: Mapping[str, str]

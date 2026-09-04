@@ -55,14 +55,9 @@ class ManagementCardRefresher:
     ) -> bool:
         """重渲染并更新这张管理卡。
 
-        Args:
-            context: 这张卡的持久上下文（目标、卡片实体、序号快照）。
-            status: 目标用户的当前权限状态。
-            state: 卡片状态机取值；只有等待中的提交态继续隐藏表单以避免重复点击，
-                执行已结束（已生效／不完整）后恢复成可重新查询提交的表单，取消则关卡。
-            dispatch_status: 展示用的下发状态文本。
-            status_message: 追加的说明文本。
-            expected_card_sequence: CAS 期望的序号；留空时取上下文快照里的那个。
+        ``state`` 是卡片状态机取值：只有等待中的提交态继续隐藏表单以避免重复点击，执行已结束
+        （已生效／不完整）后恢复成可重新查询提交的表单，取消则关卡。``expected_card_sequence``
+        留空时取上下文快照里的那个。
 
         Returns:
             ``True`` 表示这次更新真的发出去了；``False`` 表示 CAS 落空，本次放弃。

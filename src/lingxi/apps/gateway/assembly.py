@@ -67,20 +67,13 @@ def build_supervisor(
 ) -> LongConnectionSupervisor:
     """按配置装出一个 supervisor。
 
-    Args:
-        config: 已加载的进程配置。
-        transport: 事件传输口；留空时按配置建真实长连接。真实长连接属受控验收，
-            全部本机断言注入假实现。
-        should_stop: 停机判定；停机时跳过尽力而为的出站回复，不让它把停机拖过预算。
-        onboarding: 开通编排；留空时用只记事件的惰性实现，既不会把未开通正文悄悄
-            交给下游，也不会误报已开通。
-        heartbeat: 长连接每轮的心跳回调。
-        on_onboarding_assembled: 回报本函数**最终采用**的那个开通实现，供装配断言
-            核对。之所以用回调而不是从返回的 supervisor 上读回来：supervisor 的公开面
-            被结构断言冻结成三个成员，它不该为了自证装配而长出新的公开属性。
+    ``transport`` 留空时按配置建真实长连接——真实长连接属受控验收，全部本机断言注入假
+    实现。``onboarding`` 留空时用只记事件的惰性实现，既不会把未开通正文悄悄交给下游，
+    也不会误报已开通。``should_stop`` 让停机跳过尽力而为的出站回复，不把停机拖过预算。
 
-    Returns:
-        装配好、可以直接 ``run()`` 的 supervisor。
+    ``on_onboarding_assembled`` 回报本函数**最终采用**的那个开通实现，供装配断言核对。
+    用回调而不是从返回的 supervisor 上读回来：它的公开面被结构断言冻结成三个成员，不该
+    为了自证装配而长出新的公开属性。
     """
     from lingxi.adapters.feishu_longconn import LarkEventTransport
 

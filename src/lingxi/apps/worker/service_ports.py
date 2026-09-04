@@ -47,17 +47,10 @@ YearGroundingSuspectCallback = Callable[[Mapping[str, object]], None]
 class WorkerObservers:
     """装配层注入的六个观测出口，全部可留空。
 
-    留空的那一项整体跳过：**没有装配方就没有输出**，不假装写了一条实际被吞掉的记录。
-    本服务是纯组装对象，不知道自己会被哪个进程入口装配，也不该假设标准库日志已经配过
-    handler——真实队列 worker 刻意不做日志初始化，默认阈值会把 INFO 悄悄吞掉。
-
-    Attributes:
-        heartbeat: 活性心跳。
-        on_task_stuck: 任务滞留告警，四类滞留各自独立上报。
-        on_alert_tick: 推进告警状态机的恢复计时与投递重试。
-        on_terminal_outcome: 终态收口的低敏审计事件。
-        content_capture_writer: 内测轮内容级采集的落库出口。
-        on_year_grounding_suspect: 年份接地护栏第二层的告警出口。
+    心跳、任务滞留告警、告警状态机推进、终态审计、内容采集、年份护栏。留空的那一项整体跳过：
+    **没有装配方就没有输出**，不假装写了一条实际被吞掉的记录。本服务是纯组装对象，不知道
+    自己会被哪个进程入口装配，也不该假设标准库日志已经配过 handler——真实队列 worker 刻意
+    不做日志初始化，默认阈值会把 INFO 悄悄吞掉。
     """
 
     heartbeat: HeartbeatCallback | None = None

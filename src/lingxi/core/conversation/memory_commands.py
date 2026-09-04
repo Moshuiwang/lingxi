@@ -37,15 +37,7 @@ class MemoryCommandHandler:
         memory_command: MemoryCommand,
         deferred: list[RenderedContent],
     ) -> Outcome:
-        """按子命令分派；无论走哪一支，这条事件都以"命令"终态收尾。
-
-        Args:
-            tx: 当前事务，读写都在它上面完成。
-            message: 触发命令的入站消息。
-            user: 命令发起人。
-            conversation: 命令所在话题，只用于审计字段。
-            memory_command: 已解析的子命令。
-            deferred: 事务提交后才发出的回执。
+        """按子命令分派；无论走哪一支，这条事件都以「命令」终态收尾。
 
         Returns:
             恒为命令终态的处理结论。
