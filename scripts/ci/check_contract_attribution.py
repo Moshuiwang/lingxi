@@ -527,7 +527,7 @@ GROUNDED_ATTRIBUTIONS: tuple[GroundedAttribution, ...] = (
 REGISTERED_EXCEPTIONS: tuple[RegisteredException, ...] = (
     RegisteredException(
         "src/lingxi/apps/gateway/alerting.py",
-        '只是"发送"这一步落到日志（Issue #153：合同要求"告警不可用时主流程行为有',
+        '只是"发送"这一步落到日志（合同要求"告警不可用时主流程行为有明确定义"，',
         "Issue #153",
         "2026-08-14",
         "产品负责人",
