@@ -123,7 +123,6 @@
 71	src/lingxi/apps/trace/__init__.py::run
 66	src/lingxi/apps/worker/cli.py::_run_queue_worker
 309	src/lingxi/apps/worker/cli.py::main
-79	src/lingxi/apps/worker/report_extraction.py::_load_task_system_prompt
 83	src/lingxi/apps/worker/service.py::WorkerService.__init__
 67	src/lingxi/apps/worker/service.py::WorkerService._cleanup_agent_sessions
 81	src/lingxi/apps/worker/service.py::WorkerService._finish_terminal
