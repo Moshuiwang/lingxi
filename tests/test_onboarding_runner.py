@@ -28,6 +28,13 @@ from lingxi.core.identity.innertest_roster_gate import (
     build_innertest_roster_gate,
     is_open_id_innertest_allowed,
 )
+from lingxi.core.identity.onboarding_config import (
+    OnboardingActions,
+    OnboardingPolicy,
+    OnboardingRecords,
+    OnboardingRuntime,
+    OnboardingSources,
+)
 from lingxi.core.identity.onboarding_ports import EmailBinding
 from lingxi.core.identity.onboarding_runner import (
     KEY_COMPLETED,
@@ -689,41 +696,50 @@ def build_runner(**overrides: Any) -> tuple[AutoOnboardingRunner, dict[str, Any]
     executor = overrides.get("executor") or InlineExecutor()
     parts["executor"] = executor
     runner = AutoOnboardingRunner(
-        directory=parts["directory"],
-        employment=parts["employment"],
-        roster=parts["roster"],
-        galaxy=parts["galaxy"],
-        provisioning=parts["provisioning"],
-        users=parts["users"],
-        email_bindings=parts["email_bindings"],
-        environment=parts["environment"],
-        tokens=parts["tokens"],
-        stock_tokens=parts["stock_tokens"],
-        decisions=parts["decisions"],
-        readiness=parts["readiness"],
-        notifier=parts["notifier"],
-        ledger=parts["ledger"],
-        audit=parts["audit"],
-        role_function_map=overrides.get("role_function_map", ROLE_FUNCTION_MAP),
-        metric_translation_map=overrides.get("metric_translation_map", METRIC_TRANSLATION_MAP),
-        # 默认放行：本文件绝大多数用例守的是名单闸**之后**的链路，不该被这道新增的
-        # 前置闸挡住。内测名单闸自身的行为由 `InnerTestRosterGateTests` 专门覆盖。
-        innertest_roster_gate=overrides.get("innertest_roster_gate", lambda open_id: True),
-        delegated_subject=overrides.get(
-            "delegated_subject", lambda: overrides.get("delegated_subject_open_id", "ou_delegated")
+        sources=OnboardingSources(
+            directory=parts["directory"],
+            employment=parts["employment"],
+            roster=parts["roster"],
+            galaxy=parts["galaxy"],
+            email_bindings=parts["email_bindings"],
+            stock_tokens=parts["stock_tokens"],
+            local_overrides=parts["local_overrides"],
+            legacy_importer=parts["legacy_importer"],
         ),
-        notify_attempts=overrides.get("notify_attempts", 3),
-        publish_allowed=overrides.get("publish_allowed", lambda: True),
-        submit=executor.submit,
-        sleep=overrides.get("sleep", lambda seconds: None),
-        clock=overrides.get("clock", lambda: datetime(2026, 8, 18, tzinfo=UTC)),
-        should_stop=overrides.get("should_stop", lambda: False),
-        publish_wait_seconds=overrides.get("publish_wait_seconds", 3.0),
-        onboarding_failed=parts["onboarding_failed"],
-        failure_reasons=parts["failure_reasons"],
-        local_overrides=parts["local_overrides"],
-        legacy_importer=parts["legacy_importer"],
-        position_grants=parts["position_grants"],
+        actions=OnboardingActions(
+            provisioning=parts["provisioning"],
+            users=parts["users"],
+            environment=parts["environment"],
+            tokens=parts["tokens"],
+            decisions=parts["decisions"],
+            readiness=parts["readiness"],
+            notifier=parts["notifier"],
+            position_grants=parts["position_grants"],
+        ),
+        records=OnboardingRecords(
+            ledger=parts["ledger"],
+            audit=parts["audit"],
+            onboarding_failed=parts["onboarding_failed"],
+            failure_reasons=parts["failure_reasons"],
+        ),
+        policy=OnboardingPolicy(
+            role_function_map=overrides.get("role_function_map", ROLE_FUNCTION_MAP),
+            metric_translation_map=overrides.get("metric_translation_map", METRIC_TRANSLATION_MAP),
+            innertest_roster_gate=overrides.get("innertest_roster_gate", lambda open_id: True),
+            delegated_subject=overrides.get(
+                "delegated_subject",
+                lambda: overrides.get("delegated_subject_open_id", "ou_delegated"),
+            ),
+            notify_attempts=overrides.get("notify_attempts", 3),
+            publish_allowed=overrides.get("publish_allowed", lambda: True),
+            publish_wait_seconds=overrides.get("publish_wait_seconds", 3.0),
+        ),
+        runtime=OnboardingRuntime(
+            submit=executor.submit,
+            sleep=overrides.get("sleep", lambda seconds: None),
+            clock=overrides.get("clock", lambda: datetime(2026, 8, 18, tzinfo=UTC)),
+            should_stop=overrides.get("should_stop", lambda: False),
+        ),
     )
     return runner, parts
 
@@ -3156,27 +3172,40 @@ class SystemTriggerTests(unittest.TestCase):
 class ConstructionTests(unittest.TestCase):
     """两个注入口缺省就会静默改变行为，因此在类型层就不给这个选项。"""
 
-    def _parts(self) -> dict:
-        return dict(
+    def _parts(self, **overrides) -> dict:
+        source_fields = dict(
             directory=FakeDirectory(),
             employment=FakeEmployment(),
             roster=FakeRoster(),
             galaxy=FakeGalaxy(),
-            provisioning=FakeProvisioning(),
-            users=FakeUsers(),
             email_bindings=FakeEmailBindings(),
-            environment=FakeEnvironment(),
-            tokens=FakeTokens(),
-            decisions=FakeDecisions(),
-            readiness=FakeReadiness(),
-            notifier=FakeNotifier(),
-            ledger=FakeLedger(),
-            audit=RecordingAudit(),
+        )
+        policy_fields = dict(
             role_function_map=ROLE_FUNCTION_MAP,
             metric_translation_map=METRIC_TRANSLATION_MAP,
             innertest_roster_gate=lambda open_id: True,
             delegated_subject=lambda: None,
             publish_allowed=lambda: True,
+        )
+        source_fields.update(
+            {k: v for k, v in overrides.items() if k in source_fields or k == "email_bindings"}
+        )
+        for dropped in overrides.pop("_drop_sources", ()):
+            source_fields.pop(dropped, None)
+        policy_fields.update({k: v for k, v in overrides.items() if k in policy_fields})
+        return dict(
+            sources=OnboardingSources(**source_fields),
+            actions=OnboardingActions(
+                provisioning=FakeProvisioning(),
+                users=FakeUsers(),
+                environment=FakeEnvironment(),
+                tokens=FakeTokens(),
+                decisions=FakeDecisions(),
+                readiness=FakeReadiness(),
+                notifier=FakeNotifier(),
+            ),
+            records=OnboardingRecords(ledger=FakeLedger(), audit=RecordingAudit()),
+            policy=OnboardingPolicy(**policy_fields),
         )
 
     def test_a_missing_executor_is_refused_at_construction(self) -> None:
@@ -3184,55 +3213,51 @@ class ConstructionTests(unittest.TestCase):
 
         with self.assertRaises(TypeError):
             AutoOnboardingRunner(
-                submit=None,
-                sleep=lambda seconds: None,
-                **self._parts(),  # type: ignore[arg-type]
+                runtime=OnboardingRuntime(submit=None, sleep=lambda seconds: None),
+                **self._parts(),
             )
 
     def test_a_missing_sleep_is_refused_at_construction(self) -> None:
         with self.assertRaises(TypeError):
             AutoOnboardingRunner(
-                submit=lambda task: True,
-                sleep=None,
-                **self._parts(),  # type: ignore[arg-type]
+                runtime=OnboardingRuntime(submit=lambda task: True, sleep=None),
+                **self._parts(),
             )
 
     def test_a_non_callable_onboarding_failed_is_refused_at_construction(self) -> None:
         with self.assertRaises(TypeError):
-            AutoOnboardingRunner(
-                submit=lambda task: True,
-                sleep=lambda seconds: None,
-                onboarding_failed="not-callable",  # type: ignore[arg-type]
-                **self._parts(),
+            OnboardingRecords(
+                ledger=FakeLedger(),
+                audit=RecordingAudit(),
+                onboarding_failed="not-callable",
             )
 
     def test_a_missing_email_binding_source_is_refused_at_construction(self) -> None:
-        """没有默认哨兵（rc25 S-2a）：``email_bindings`` 是必填关键字参数。
+        """没有默认哨兵（rc25 S-2a）：``email_bindings`` 是必填字段。
 
         与 ``publish_allowed``/``innertest_roster_gate`` 同一条纪律——这一格决定的是
         「两个人会不会共用同一把问数令牌与同一行正式表权限」，给个默认值等于把闸
         关掉，而关掉之后没有任何症状。漏接必须在**构造期**就是 ``TypeError``。
         """
 
-        parts = self._parts()
-        del parts["email_bindings"]
         with self.assertRaises(TypeError):
-            AutoOnboardingRunner(
-                submit=lambda task: True,
-                sleep=lambda seconds: None,
-                **parts,  # type: ignore[arg-type]
+            OnboardingSources(
+                directory=FakeDirectory(),
+                employment=FakeEmployment(),
+                roster=FakeRoster(),
+                galaxy=FakeGalaxy(),
             )
 
     def test_a_missing_innertest_roster_gate_is_refused_at_construction(self) -> None:
         """没有默认放行（Issue #302 S-N-01）：缺省会让内测名单闸形同虚设。"""
 
-        parts = self._parts()
-        parts["innertest_roster_gate"] = None
         with self.assertRaises(TypeError):
-            AutoOnboardingRunner(
-                submit=lambda task: True,
-                sleep=lambda seconds: None,
-                **parts,  # type: ignore[arg-type]
+            OnboardingPolicy(
+                role_function_map=ROLE_FUNCTION_MAP,
+                metric_translation_map=METRIC_TRANSLATION_MAP,
+                innertest_roster_gate=None,
+                delegated_subject=lambda: None,
+                publish_allowed=lambda: True,
             )
 
 

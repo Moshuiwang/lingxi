@@ -1241,7 +1241,7 @@ class QueueClaimTests(GatewayPostgresTestCase):
 
     def test_notify_is_not_emitted_when_the_transaction_rolls_back(self) -> None:
         """Issue #465：这里注入的异常发生在 ``notify_task_queued`` 之后、提交
-        之前，不经过 `QueueInsertFailure` 那条已识别路径——`EventPipeline.
+        之前，不经过 `QueueInsertError` 那条已识别路径——`EventPipeline.
         handle_message` 现在是全函数，不再让它穿出去，而是换成一条诚实的
         兜底提示（`gateway.unexpected_error`）；本用例仍然只锁 NOTIFY 本身
         随事务回滚这一件事。"""

@@ -21,6 +21,7 @@ from lingxi.apps.scheduler import (
 )
 from lingxi.apps.worker.config import WorkerConfig
 from lingxi.apps.worker.service import WorkerService
+from lingxi.apps.worker.service_ports import WorkerObservers
 from lingxi.config.content import default_content_catalog
 from lingxi.core.alerting import AlertManager, AlertPolicy
 from lingxi.core.execution.card_stream import CardCreated, CardStream, DeliveryRejected
@@ -373,10 +374,12 @@ class HeartbeatAndWorkerEntryPointTests(unittest.TestCase):
             return await WorkerService(
                 config=config,
                 queue=queue,
-                heartbeat=lambda: events.append(("heartbeat", 1)),
-                on_task_stuck=lambda kind, count: (
-                    events.append((kind, count))
-                    or (_ for _ in ()).throw(RuntimeError("alert observer"))
+                observers=WorkerObservers(
+                    heartbeat=lambda: events.append(("heartbeat", 1)),
+                    on_task_stuck=lambda kind, count: (
+                        events.append((kind, count))
+                        or (_ for _ in ()).throw(RuntimeError("alert observer"))
+                    ),
                 ),
             ).process_once()
 

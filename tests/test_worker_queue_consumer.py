@@ -48,6 +48,7 @@ from lingxi.adapters.postgres_conversation import (
 )
 from lingxi.apps.worker.config import WorkerConfig
 from lingxi.apps.worker.service import WorkerService
+from lingxi.apps.worker.service_ports import SessionCleanupSettings, WorkerObservers
 from lingxi.config.content import default_content_catalog
 from lingxi.core.conversation import EventPipeline, InboundMessage
 from lingxi.core.delivery.ports import PROGRESS_CONTENT_MAX_LENGTH
@@ -1294,7 +1295,7 @@ class WorkerServiceTests(unittest.TestCase):
                 config=worker_config(user_env_root=empty_root),
                 queue=queue,
                 executor_factory=lambda config, marker: Executor(),
-                on_terminal_outcome=sink,
+                observers=WorkerObservers(on_terminal_outcome=sink),
             )
             asyncio.run(service.process_once())
 
@@ -1388,7 +1389,7 @@ class WorkerServiceTests(unittest.TestCase):
             config=worker_config(),
             queue=queue,
             executor_factory=lambda config, marker: Executor(),
-            on_terminal_outcome=sink,
+            observers=WorkerObservers(on_terminal_outcome=sink),
         )
 
         asyncio.run(service.process_once())
@@ -1528,7 +1529,7 @@ class WorkerServiceTests(unittest.TestCase):
             config=worker_config(),
             queue=queue,
             executor_factory=lambda config, marker: Executor(),
-            on_terminal_outcome=sink,
+            observers=WorkerObservers(on_terminal_outcome=sink),
         )
         asyncio.run(service.process_once())
 
@@ -1606,7 +1607,7 @@ class WorkerServiceTests(unittest.TestCase):
             config=worker_config(),
             queue=queue,
             executor_factory=lambda config, marker: Executor(),
-            on_terminal_outcome=sink,
+            observers=WorkerObservers(on_terminal_outcome=sink),
         )
         asyncio.run(service.process_once())
 
@@ -1641,7 +1642,7 @@ class WorkerServiceTests(unittest.TestCase):
             config=worker_config(),
             queue=queue,
             executor_factory=lambda config, marker: Executor(),
-            on_terminal_outcome=sink,
+            observers=WorkerObservers(on_terminal_outcome=sink),
         )
         asyncio.run(service.process_once())
 
@@ -1676,7 +1677,7 @@ class WorkerServiceTests(unittest.TestCase):
             config=worker_config(),
             queue=queue,
             executor_factory=lambda config, marker: Executor(),
-            on_terminal_outcome=sink,
+            observers=WorkerObservers(on_terminal_outcome=sink),
         )
         asyncio.run(service.process_once())
 
@@ -1704,7 +1705,7 @@ class WorkerServiceTests(unittest.TestCase):
             config=worker_config(),
             queue=queue,
             executor_factory=lambda config, marker: Executor(),
-            on_terminal_outcome=sink,
+            observers=WorkerObservers(on_terminal_outcome=sink),
         )
         asyncio.run(service.process_once())
 
@@ -2092,7 +2093,7 @@ class WorkerServiceTests(unittest.TestCase):
             config=worker_config(),
             queue=queue,
             executor_factory=lambda config, marker: Executor(),
-            on_terminal_outcome=sink,
+            observers=WorkerObservers(on_terminal_outcome=sink),
         )
         asyncio.run(service.process_once())
 
@@ -2162,7 +2163,7 @@ class WorkerServiceTests(unittest.TestCase):
             config=worker_config(),
             queue=queue,
             executor_factory=lambda config, marker: Executor(),
-            on_terminal_outcome=sink,
+            observers=WorkerObservers(on_terminal_outcome=sink),
         )
         asyncio.run(service.process_once())
 
@@ -2192,7 +2193,7 @@ class WorkerServiceTests(unittest.TestCase):
             config=worker_config(),
             queue=queue,
             executor_factory=lambda config, marker: Executor(),
-            on_terminal_outcome=sink,
+            observers=WorkerObservers(on_terminal_outcome=sink),
         )
         asyncio.run(service.process_once())
 
@@ -2332,7 +2333,7 @@ class WorkerServiceTests(unittest.TestCase):
             config=worker_config(),
             queue=queue,
             executor_factory=lambda config, marker: Executor(),
-            on_terminal_outcome=sink,
+            observers=WorkerObservers(on_terminal_outcome=sink),
         )
         asyncio.run(service.process_once())
 
@@ -2518,7 +2519,9 @@ class WorkerServiceTests(unittest.TestCase):
                 config=worker_config(stop_poll_interval_seconds=0.02),
                 queue=queue,
                 executor_factory=lambda config, marker: SlowExecutor(),
-                heartbeat=lambda: touch_liveness("worker", directory=directory),
+                observers=WorkerObservers(
+                    heartbeat=lambda: touch_liveness("worker", directory=directory)
+                ),
             )
 
             async def poll_liveness_during_the_turn() -> None:
@@ -2942,7 +2945,7 @@ class WorkerServiceTests(unittest.TestCase):
             config=worker_config(max_concurrency=4, poll_interval_seconds=0.02),
             queue=queue,
             executor_factory=lambda config, marker: Executor(),
-            on_alert_tick=on_alert_tick,
+            observers=WorkerObservers(on_alert_tick=on_alert_tick),
         )
 
         async def scenario() -> None:
@@ -4250,7 +4253,7 @@ class SessionTranscriptReclamationTests(unittest.TestCase):
         return WorkerService(
             config=worker_config(**values),
             queue=self._IdleQueue(),
-            session_root=root,
+            session_cleanup=SessionCleanupSettings(root=root),
         )
 
     @staticmethod
@@ -4330,8 +4333,8 @@ class SessionTranscriptReclamationTests(unittest.TestCase):
                     session_reclaim_min_age_seconds=60.0,
                 ),
                 queue=self._IdleQueue(),
-                session_root=root,
                 monotonic=lambda: now,
+                session_cleanup=SessionCleanupSettings(root=root),
             )
             for index in range(4):
                 self._write_transcript(root, index, 1024)
@@ -4359,7 +4362,7 @@ class SessionTranscriptReclamationTests(unittest.TestCase):
         service = WorkerService(
             config=worker_config(session_disk_budget_bytes=1),
             queue=self._IdleQueue(),
-            session_root=None,
+            session_cleanup=SessionCleanupSettings(root=None),
         )
 
         asyncio.run(service.process_once())  # 不抛异常即通过
@@ -4414,7 +4417,7 @@ class SessionCleanupPipelineIntegrationTests(unittest.TestCase):
             service = WorkerService(
                 config=worker_config(),
                 queue=self.queue,
-                session_root=session_root,
+                session_cleanup=SessionCleanupSettings(root=session_root),
             )
             service._cleanup_agent_sessions()
 
@@ -4437,7 +4440,7 @@ class SessionCleanupPipelineIntegrationTests(unittest.TestCase):
             service = WorkerService(
                 config=worker_config(),
                 queue=self.queue,
-                session_root=Path(tmp),
+                session_cleanup=SessionCleanupSettings(root=Path(tmp)),
             )
             service._cleanup_agent_sessions()
 
@@ -4452,7 +4455,11 @@ class SessionCleanupPipelineIntegrationTests(unittest.TestCase):
 
         self._queue_cleanup(cleanup_id="asc-int-3", agent_session_id="01J00000000000000000SKIP")
 
-        service = WorkerService(config=worker_config(), queue=self.queue, session_root=None)
+        service = WorkerService(
+            config=worker_config(),
+            queue=self.queue,
+            session_cleanup=SessionCleanupSettings(root=None),
+        )
         service._cleanup_agent_sessions()
 
         with connect(DSN) as connection:
@@ -4479,7 +4486,9 @@ class SessionCleanupPipelineIntegrationTests(unittest.TestCase):
             self.assertFalse(missing_root.exists())
 
             service = WorkerService(
-                config=worker_config(), queue=self.queue, session_root=missing_root
+                config=worker_config(),
+                queue=self.queue,
+                session_cleanup=SessionCleanupSettings(root=missing_root),
             )
             service._cleanup_agent_sessions()
 
@@ -4509,7 +4518,7 @@ class SessionCleanupPipelineIntegrationTests(unittest.TestCase):
             service = WorkerService(
                 config=worker_config(),
                 queue=self.queue,
-                session_root=session_root,
+                session_cleanup=SessionCleanupSettings(root=session_root),
             )
             asyncio.run(service.process_once())
 
@@ -4540,7 +4549,7 @@ class SystemPromptFileTests(unittest.TestCase):
             config=worker_config(system_prompt_file=prompt_path),
             queue=queue,
             executor_factory=lambda config, marker: Executor(config),
-            on_terminal_outcome=sink,
+            observers=WorkerObservers(on_terminal_outcome=sink),
         )
         return service, queue, captured
 
@@ -4669,7 +4678,7 @@ class SystemPromptFileTests(unittest.TestCase):
                 config=worker_config(system_prompt_file=path),
                 queue=queue,
                 executor_factory=lambda config, marker: FailingExecutor(config),
-                on_terminal_outcome=sink,
+                observers=WorkerObservers(on_terminal_outcome=sink),
             )
             asyncio.run(service.process_once())
 
@@ -4784,7 +4793,7 @@ class ContentCaptureWiringTests(unittest.TestCase):
             config=worker_config(),
             queue=queue,
             executor_factory=lambda config, marker: Executor(),
-            content_capture_writer=received.append,
+            observers=WorkerObservers(content_capture_writer=received.append),
         )
         asyncio.run(service.process_once())
 
@@ -4819,7 +4828,7 @@ class ContentCaptureWiringTests(unittest.TestCase):
             config=worker_config(),
             queue=queue,
             executor_factory=lambda config, marker: Executor(),
-            content_capture_writer=received.append,
+            observers=WorkerObservers(content_capture_writer=received.append),
         )
         asyncio.run(service.process_once())
 
@@ -4849,7 +4858,7 @@ class ContentCaptureWiringTests(unittest.TestCase):
             config=worker_config(),
             queue=queue,
             executor_factory=lambda config, marker: Executor(),
-            content_capture_writer=failing_writer,
+            observers=WorkerObservers(content_capture_writer=failing_writer),
         )
         asyncio.run(service.process_once())  # 不得向上抛出 RuntimeError
 
@@ -4877,7 +4886,7 @@ class ContentCaptureWiringTests(unittest.TestCase):
             config=worker_config(),
             queue=queue,
             executor_factory=lambda config, marker: FailingExecutor(),
-            content_capture_writer=received.append,
+            observers=WorkerObservers(content_capture_writer=received.append),
         )
         asyncio.run(service.process_once())
 
@@ -4913,7 +4922,7 @@ class ContentCaptureWiringTests(unittest.TestCase):
                 config=worker_config(user_env_root=empty_root),
                 queue=queue,
                 executor_factory=lambda config, marker: Executor(),
-                content_capture_writer=received.append,
+                observers=WorkerObservers(content_capture_writer=received.append),
             )
             asyncio.run(service.process_once())
 
@@ -4990,10 +4999,12 @@ class YearGroundingSuspectAlertTests(unittest.TestCase):
             config=worker_config(),
             queue=queue,
             executor_factory=lambda config, marker: Executor(),
-            content_capture_writer=(
-                content_capture_writer if content_capture_writer is not None else (lambda _r: None)
+            observers=WorkerObservers(
+                content_capture_writer=content_capture_writer
+                if content_capture_writer is not None
+                else (lambda _r: None),
+                on_year_grounding_suspect=on_year_grounding_suspect,
             ),
-            on_year_grounding_suspect=on_year_grounding_suspect,
         )
         asyncio.run(service.process_once())
         return queue
@@ -5077,7 +5088,9 @@ class YearGroundingSuspectAlertTests(unittest.TestCase):
             start_date="2025-01-01",
             end_date="2025-08-25",
         )
-        with patch("lingxi.apps.worker.service.detect_year_grounding_suspect") as mock_detect:
+        with patch(
+            "lingxi.apps.worker.content_capture.detect_year_grounding_suspect"
+        ) as mock_detect:
             queue = self._run_with_record(record)  # 不传 on_year_grounding_suspect
 
         mock_detect.assert_not_called()
@@ -5124,7 +5137,7 @@ class YearGroundingSuspectAlertTests(unittest.TestCase):
         )
         received: list[Mapping[str, object]] = []
         with patch(
-            "lingxi.apps.worker.service.detect_year_grounding_suspect",
+            "lingxi.apps.worker.content_capture.detect_year_grounding_suspect",
             side_effect=RuntimeError("模拟纯判定函数异常"),
         ):
             queue = self._run_with_record(record, on_year_grounding_suspect=received.append)
@@ -5187,7 +5200,7 @@ class TerminalFailureSignatureTests(unittest.TestCase):
             config=worker_config(),
             queue=queue,
             executor_factory=lambda config, marker: executor_class(),
-            on_terminal_outcome=sink,
+            observers=WorkerObservers(on_terminal_outcome=sink),
         )
         asyncio.run(service.process_once())
         return queue, sink
@@ -5364,7 +5377,7 @@ class TerminalFailureSignatureTests(unittest.TestCase):
             config=worker_config(),
             queue=queue,
             executor_factory=lambda config, marker: NeverRuns(),
-            on_terminal_outcome=sink,
+            observers=WorkerObservers(on_terminal_outcome=sink),
         )
         asyncio.run(service.process_once())
         self.assertEqual(sink.calls[0]["terminal_kind"], "stopped")

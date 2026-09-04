@@ -46,6 +46,7 @@ from lingxi.apps.scheduler.permission_refresh import (
     SKIP_ACCOUNT_NOT_ENABLED,
     SKIP_NO_PUBLISHED_ROW,
     PermissionRefreshDuty,
+    PermissionRefreshSources,
 )
 from lingxi.core.ids import new_id
 from lingxi.core.permission.publish import (
@@ -289,19 +290,21 @@ class PermissionRefreshPostgresTestCase(unittest.TestCase):
         # **只控制先后顺序、不改变任何被测判据**的装饰器（见 WindowSuspendTest）。
         publish_store = publish_store or PostgresPermissionPublishStore(self._dsn)
         return PermissionRefreshDuty(
-            baseline_reader=PostgresPermissionRefreshBaselineReader(self._dsn),
-            roster_snapshot=PostgresRosterSnapshotStore(self._dsn),
-            galaxy=PostgresGalaxySnapshotReader(self._dsn),
-            decisions=publish_store,
-            publish_history=publish_store,
-            token_ciphers=self._token_store(),
-            role_function_map=ROLE_FUNCTION_MAP,
-            metric_translation_map=(
-                METRIC_TRANSLATION_MAP if metric_translation_map is None else metric_translation_map
+            sources=PermissionRefreshSources(
+                baseline_reader=PostgresPermissionRefreshBaselineReader(self._dsn),
+                roster_snapshot=PostgresRosterSnapshotStore(self._dsn),
+                galaxy=PostgresGalaxySnapshotReader(self._dsn),
+                decisions=publish_store,
+                publish_history=publish_store,
+                token_ciphers=self._token_store(),
+                local_overrides=local_overrides,
             ),
+            role_function_map=ROLE_FUNCTION_MAP,
+            metric_translation_map=METRIC_TRANSLATION_MAP
+            if metric_translation_map is None
+            else metric_translation_map,
             audit=self.audit,
             clock=self.clock,
-            local_overrides=local_overrides,
         )
 
     # ---- 断言辅助 ----------------------------------------------------

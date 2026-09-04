@@ -480,7 +480,7 @@ GROUNDED_ATTRIBUTIONS: tuple[GroundedAttribution, ...] = (
         "首次对话与自动准入",
     ),
     GroundedAttribution(
-        "src/lingxi/apps/gateway/__init__.py",
+        "src/lingxi/apps/gateway/onboarding.py",
         "以及立刻回一条合同要求的「已收到，正在核对」。真正的编排由 scheduler 按",
         "首次对话与自动准入",
     ),
@@ -496,16 +496,16 @@ GROUNDED_ATTRIBUTIONS: tuple[GroundedAttribution, ...] = (
     ),
     GroundedAttribution(
         "src/lingxi/core/identity/onboarding_runner.py",
-        "# **合同要求的第二条固定提示**（`V-开通-11`）：权限已经排出去、进入同步等待时，",
+        '"""**合同要求的第二条固定提示**（`V-开通-11`）：权限已经排出去、进入同步等待时，',
         "首次对话与自动准入",
     ),
     GroundedAttribution(
-        "src/lingxi/core/identity/onboarding_runner.py",
+        "src/lingxi/core/identity/onboarding_steps.py",
         '# - 也不能"先建档建环境、发布那步以后再补"：合同要求成功以发布 + 就绪确认',
         "开通流程",
     ),
     GroundedAttribution(
-        "src/lingxi/core/identity/onboarding_runner.py",
+        "src/lingxi/core/identity/onboarding_steps.py",
         "# **只有到这里才写 active**：产品合同要求成功提示在环境创建、权限发布与当前",
         "开通流程",
     ),
@@ -526,8 +526,8 @@ GROUNDED_ATTRIBUTIONS: tuple[GroundedAttribution, ...] = (
 
 REGISTERED_EXCEPTIONS: tuple[RegisteredException, ...] = (
     RegisteredException(
-        "src/lingxi/apps/gateway/__init__.py",
-        '只是"发送"这一步落到日志（Issue #153：合同要求"告警不可用时主流程行为有',
+        "src/lingxi/apps/gateway/alerting.py",
+        '只是"发送"这一步落到日志（合同要求"告警不可用时主流程行为有明确定义"，',
         "Issue #153",
         "2026-08-14",
         "产品负责人",

@@ -74,6 +74,9 @@ REQUIRED_MODULES = (
     # `apps/gateway/onboarding.py` 在函数内 import，后者同理——两者都必须随制品发布，
     # 否则「本地测试全绿但 wheel 里没有这个模块」会在部署当天才暴露（`V-部署-10`）。
     "lingxi.core.identity.onboarding_runner",
+    # onboarding_runner 拆分（#592 B-1）：注入口的参数对象与链上各步的实现。
+    "lingxi.core.identity.onboarding_config",
+    "lingxi.core.identity.onboarding_steps",
     # Trace #358 S-H-1（Issue #350 Gate G-3 裁定 Option A）纯移动拆分：14 个
     # Protocol + `EnvironmentResult` 搬进本模块，`onboarding_runner.py` 顶部
     # `from .onboarding_ports import (...)`。随 `onboarding_runner.py` 同一条
@@ -252,6 +255,8 @@ REQUIRED_MODULES = (
     # 每日权限重算职责（Issue #156 / S-C-03a）。它由 `build_loop` 在**模块级**
     # import，因此漏登记会直接让 scheduler 起不来；仍然逐项写出来，理由同上一条。
     "lingxi.apps.scheduler.permission_refresh",
+    # permission_refresh 拆分（#592 B-1）：端口协议、原因码与报告形状。
+    "lingxi.apps.scheduler.permission_refresh_ports",
     # 权限发布消费与就绪确认职责（Issue #156 / S-C-03b），同样是模块级 import。
     "lingxi.apps.scheduler.permission_publish",
     # Trace #358 S-H-2（Issue #350 Gate G-3 裁定 Option A）纯移动拆分：就绪确认+
@@ -296,6 +301,9 @@ REQUIRED_MODULES = (
     "lingxi.core.admin.registry",
     "lingxi.core.admin.commands",
     "lingxi.core.admin.router",
+    # router.py 拆分（#592 B-1）：端口协议与文本渲染。
+    "lingxi.core.admin.router_ports",
+    "lingxi.core.admin.router_render",
     "lingxi.core.admin.views",
     "lingxi.adapters.admin_registry",
     # 失败原因落库（Issue #337，S-H3-1）：`onboarding_failure` 表（迁移 0077）的
@@ -334,6 +342,13 @@ REQUIRED_MODULES = (
     "lingxi.apps.worker.report",
     "lingxi.apps.worker.turn",
     "lingxi.apps.worker.service",
+    # service.py 拆分（#592 B-1）：端口协议、巡检、终态审计与内容采集。
+    "lingxi.apps.worker.content_capture",
+    "lingxi.apps.worker.progress_reporting",
+    "lingxi.apps.worker.task_processing",
+    "lingxi.apps.worker.housekeeping",
+    "lingxi.apps.worker.service_ports",
+    "lingxi.apps.worker.terminal_outcome",
     # Trace #358 S-H-2（Issue #350 Gate G-3 裁定 Option A）纯移动拆分：8 个
     # 报告字段提取纯函数从 service.py 搬出。`service.py` 顶部**模块级** import
     # 本模块，`apps/worker/cli.py` 也直接 `from .service import
@@ -348,6 +363,10 @@ REQUIRED_MODULES = (
     "lingxi.core.conversation.session_window",
     "lingxi.core.conversation.ports",
     "lingxi.core.conversation.pipeline",
+    # 管线拆分（#592 B-1）：文案取值口、/memory 命令面、开通结果渲染层。
+    "lingxi.core.conversation.gateway_texts",
+    "lingxi.core.conversation.memory_commands",
+    "lingxi.core.conversation.onboarding_replies",
     # Issue #65 轻审 P2-2：未开通首聊交接对账扫描，由 apps/gateway 的 main() 装配。
     "lingxi.core.conversation.onboarding_recovery",
     # 用户记忆（Issue #357 S-H3-3，D1 显式登记范围）：core.conversation.commands/
@@ -377,6 +396,15 @@ REQUIRED_MODULES = (
     "lingxi.apps.gateway",
     "lingxi.apps.gateway.config",
     "lingxi.apps.gateway.__main__",
+    # gateway 入口拆分（#592 B-1）：装配、事件入口、后台循环存活保障、审计与告警
+    # 出口、管理卡收敛、投递装配，全部由 `apps/gateway/__init__.py` 模块级 import。
+    "lingxi.apps.gateway.alerting",
+    "lingxi.apps.gateway.assembly",
+    "lingxi.apps.gateway.audit_log",
+    "lingxi.apps.gateway.background_loops",
+    "lingxi.apps.gateway.delivery_assembly",
+    "lingxi.apps.gateway.event_handler",
+    "lingxi.apps.gateway.management_cards",
     # Gateway 投递消费循环（Issue #152）：CardKit 流式卡片/文本兜底 adapter 与
     # 消费循环编排，各自都在制品里必须能 import。
     "lingxi.adapters.feishu_delivery",
@@ -524,6 +552,7 @@ PROCESS_RUNTIME_IMPORTS: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {
             # `core.permission` 整组、发布 outbox 与令牌读取口都进了 scheduler 的运行时
             # 闭包。这是它们**第一次**有真实进程调用方，此前只随制品发布。
             "lingxi.apps.scheduler.permission_refresh",
+            "lingxi.apps.scheduler.permission_refresh_ports",
             # 权限发布消费与就绪确认（Issue #156 / S-C-03b）：它把 S-C-01 的发布执行器、
             # S-C-02 的就绪状态机与探针、以及权限变化通知全部接进了本进程，因此发布表
             # 传输、问数 MCP 探针与用户私聊出站三个 adapter 也进了运行时闭包。
@@ -536,7 +565,9 @@ PROCESS_RUNTIME_IMPORTS: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {
             # 它的适配器，因此必须显式登记——不列进来，extras 那条干净环境的腿永远
             # 不会红（与本文件其余「函数内 import」条目同一条理由）。
             "lingxi.apps.scheduler.onboarding",
+            "lingxi.core.identity.onboarding_config",
             "lingxi.core.identity.onboarding_runner",
+            "lingxi.core.identity.onboarding_steps",
             # Trace #358 S-H-1（Issue #350 Gate G-3 裁定 Option A）纯移动拆分：
             # `onboarding_runner.py` 顶部**模块级** import 本模块，因此它随
             # `onboarding_runner.py` 一起进了 scheduler 的静态 import 闭包
@@ -807,7 +838,10 @@ PROCESS_RUNTIME_IMPORTS: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {
             "lingxi.core.mcp_naming",
             "lingxi.core.conversation",
             "lingxi.core.conversation.commands",
+            "lingxi.core.conversation.gateway_texts",
+            "lingxi.core.conversation.memory_commands",
             "lingxi.core.conversation.onboarding_recovery",
+            "lingxi.core.conversation.onboarding_replies",
             "lingxi.core.conversation.pipeline",
             "lingxi.core.conversation.ports",
             "lingxi.core.conversation.session_window",
@@ -869,7 +903,13 @@ PROCESS_RUNTIME_IMPORTS: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {
             "lingxi.apps.worker.config",
             "lingxi.apps.worker.report",
             "lingxi.apps.worker.turn",
+            "lingxi.apps.worker.content_capture",
+            "lingxi.apps.worker.progress_reporting",
+            "lingxi.apps.worker.task_processing",
+            "lingxi.apps.worker.housekeeping",
             "lingxi.apps.worker.service",
+            "lingxi.apps.worker.service_ports",
+            "lingxi.apps.worker.terminal_outcome",
             # Trace #358 S-H-2 纯移动拆分：`service.py` 顶部**模块级** import
             # 本模块（理由见 REQUIRED_MODULES 同名条目）。
             "lingxi.apps.worker.report_extraction",
@@ -915,7 +955,10 @@ PROCESS_RUNTIME_IMPORTS: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {
             "lingxi.core.alerting",
             "lingxi.core.conversation",
             "lingxi.core.conversation.commands",
+            "lingxi.core.conversation.gateway_texts",
+            "lingxi.core.conversation.memory_commands",
             "lingxi.core.conversation.onboarding_recovery",
+            "lingxi.core.conversation.onboarding_replies",
             "lingxi.core.conversation.pipeline",
             "lingxi.core.conversation.ports",
             "lingxi.core.conversation.session_window",
@@ -979,7 +1022,14 @@ PROCESS_RUNTIME_IMPORTS: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {
             "lingxi",
             "lingxi.apps",
             "lingxi.apps.gateway",
+            "lingxi.apps.gateway.alerting",
+            "lingxi.apps.gateway.assembly",
+            "lingxi.apps.gateway.audit_log",
+            "lingxi.apps.gateway.background_loops",
             "lingxi.apps.gateway.config",
+            "lingxi.apps.gateway.delivery_assembly",
+            "lingxi.apps.gateway.event_handler",
+            "lingxi.apps.gateway.management_cards",
             "lingxi.apps.gateway.__main__",
             "lingxi.apps.liveness",
             "lingxi.apps.healthcheck",
@@ -1043,6 +1093,8 @@ PROCESS_RUNTIME_IMPORTS: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {
             "lingxi.core.admin.registry",
             "lingxi.core.admin.commands",
             "lingxi.core.admin.router",
+            "lingxi.core.admin.router_ports",
+            "lingxi.core.admin.router_render",
             "lingxi.core.admin.views",
             # 待确认操作全链路（Issue #96 S-M-02）：build_supervisor 在函数内
             # import PostgresPendingActionStore、LarkAdminCardTransport、
@@ -1147,7 +1199,10 @@ PROCESS_RUNTIME_IMPORTS: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {
             "lingxi.core.identity.org_snapshot",
             "lingxi.core.conversation",
             "lingxi.core.conversation.commands",
+            "lingxi.core.conversation.gateway_texts",
+            "lingxi.core.conversation.memory_commands",
             "lingxi.core.conversation.onboarding_recovery",
+            "lingxi.core.conversation.onboarding_replies",
             "lingxi.core.conversation.pipeline",
             "lingxi.core.conversation.ports",
             "lingxi.core.conversation.session_window",

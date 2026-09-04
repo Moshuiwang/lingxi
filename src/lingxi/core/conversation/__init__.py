@@ -10,7 +10,13 @@ from __future__ import annotations
 
 from .commands import Command, is_unrecognized_slash_message, parse_command
 from .onboarding_recovery import OnboardingReconciler
-from .pipeline import BUSY_HINT_TEXT, DEFAULT_WORKER_VERSION, EventPipeline, GatewayTexts
+from .pipeline import (
+    BUSY_HINT_TEXT,
+    DEFAULT_WORKER_VERSION,
+    DispatchGates,
+    EventPipeline,
+    GatewayTexts,
+)
 from .ports import (
     ConversationRecord,
     HandledAs,
@@ -32,6 +38,7 @@ __all__ = [
     "Command",
     "ConversationRecord",
     "DEFAULT_WORKER_VERSION",
+    "DispatchGates",
     "EventPipeline",
     "GatewayTexts",
     "HandledAs",

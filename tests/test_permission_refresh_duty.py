@@ -54,6 +54,7 @@ from lingxi.apps.scheduler.permission_refresh import (
     SKIP_NO_PUBLISHED_ROW,
     SKIP_STALE_SNAPSHOT,
     TRIGGER_REVOKE,
+    PermissionRefreshSources,
 )
 from lingxi.core.identity.roster_audit import ArchivedIdentity
 from lingxi.core.identity.roster_snapshot import StoredSnapshotFacts
@@ -485,21 +486,23 @@ def build_duty(
     )
     galaxy_reader = FakeGalaxy(galaxy_snapshot() if galaxy is None else galaxy)
     duty = PermissionRefreshDuty(
-        baseline_reader=FakeBaseline(*identities),
-        roster_snapshot=snapshot_store,
-        galaxy=galaxy_reader,
-        decisions=decisions,
-        publish_history=history,
-        token_ciphers=tokens,
-        role_function_map=ROLE_FUNCTION_MAP if role_function_map is None else role_function_map,
-        metric_translation_map=(
-            METRIC_TRANSLATION_MAP if metric_translation_map is None else metric_translation_map
+        sources=PermissionRefreshSources(
+            baseline_reader=FakeBaseline(*identities),
+            roster_snapshot=snapshot_store,
+            galaxy=galaxy_reader,
+            decisions=decisions,
+            publish_history=history,
+            token_ciphers=tokens,
+            local_overrides=local_overrides,
+            legacy_all_scope=legacy_all_scope,
         ),
+        role_function_map=ROLE_FUNCTION_MAP if role_function_map is None else role_function_map,
+        metric_translation_map=METRIC_TRANSLATION_MAP
+        if metric_translation_map is None
+        else metric_translation_map,
         audit=audit,
         clock=clock or FixedClock(TODAY),
         stop=stop,
-        local_overrides=local_overrides,
-        legacy_all_scope=legacy_all_scope,
     )
     return duty, {
         "audit": audit,

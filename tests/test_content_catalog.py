@@ -398,6 +398,9 @@ class ContentDirectoryTests(unittest.TestCase):
         source_root = Path(__file__).parents[1] / "src" / "lingxi"
         formal_renderers = (
             source_root / "core" / "conversation" / "pipeline.py",
+            source_root / "core" / "conversation" / "gateway_texts.py",
+            source_root / "core" / "conversation" / "memory_commands.py",
+            source_root / "core" / "conversation" / "onboarding_replies.py",
             source_root / "core" / "identity" / "first_contact.py",
             source_root / "core" / "identity" / "roster_report.py",
         )

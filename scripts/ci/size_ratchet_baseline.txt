@@ -6,5 +6,3 @@
 # 先拆分或精简该文件；确有理由要接受它作为新的棘轮登记对象，人工在下面加一行
 # 「行数<TAB>路径」，门禁会核对这一行是否等于该文件的当前实际行数。
 
-1502	src/lingxi/core/identity/onboarding_runner.py
-1533	src/lingxi/apps/worker/service.py

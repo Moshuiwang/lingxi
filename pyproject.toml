@@ -219,7 +219,6 @@ max-args = 10
 "src/lingxi/adapters/user_environment.py" = ["D"]
 "src/lingxi/adapters/user_mcp_config.py" = ["D"]
 "src/lingxi/apps/admin_bootstrap/__init__.py" = ["D"]
-"src/lingxi/apps/gateway/__init__.py" = ["D", "I001", "UP035"]
 "src/lingxi/apps/gateway/config.py" = ["D"]
 "src/lingxi/apps/gateway/delivery.py" = ["D", "PLR0913"]
 "src/lingxi/apps/gateway/document_delivery.py" = ["D"]
@@ -243,7 +242,6 @@ max-args = 10
 "src/lingxi/apps/scheduler/org_snapshot_sync.py" = ["D", "N818"]
 "src/lingxi/apps/scheduler/permission_publish.py" = ["D", "PLR0913"]
 "src/lingxi/apps/scheduler/permission_readiness_assembly.py" = ["D"]
-"src/lingxi/apps/scheduler/permission_refresh.py" = ["D", "PLR0913", "N818"]
 "src/lingxi/apps/scheduler/retention.py" = ["D"]
 "src/lingxi/apps/scheduler/roster_audit.py" = ["D"]
 "src/lingxi/apps/scheduler/stalled_provisioning.py" = ["D", "PLR0913"]
@@ -253,7 +251,6 @@ max-args = 10
 "src/lingxi/apps/worker/config.py" = ["D"]
 "src/lingxi/apps/worker/report.py" = ["D", "PLR0913"]
 "src/lingxi/apps/worker/report_extraction.py" = ["D"]
-"src/lingxi/apps/worker/service.py" = ["D", "PLR0913", "I001"]
 "src/lingxi/apps/worker/session_cleanup.py" = ["D"]
 "src/lingxi/apps/worker/turn.py" = ["D"]
 "src/lingxi/config/content.py" = ["D"]
@@ -266,12 +263,10 @@ max-args = 10
 "src/lingxi/core/admin/notification.py" = ["D", "N818"]
 "src/lingxi/core/admin/pending_action.py" = ["D", "N818"]
 "src/lingxi/core/admin/registry.py" = ["D", "N818"]
-"src/lingxi/core/admin/router.py" = ["D", "PLR0913", "UP035"]
 "src/lingxi/core/admin/views.py" = ["D"]
 "src/lingxi/core/alerting.py" = ["D"]
 "src/lingxi/core/conversation/commands.py" = ["D"]
 "src/lingxi/core/conversation/onboarding_recovery.py" = ["D"]
-"src/lingxi/core/conversation/pipeline.py" = ["D", "PLR0913", "N818", "I001", "UP035"]
 "src/lingxi/core/conversation/ports.py" = ["D"]
 "src/lingxi/core/conversation/session_window.py" = ["D"]
 "src/lingxi/core/daily_report.py" = ["D"]
@@ -292,7 +287,6 @@ max-args = 10
 "src/lingxi/core/identity/onboarding.py" = ["D"]
 "src/lingxi/core/identity/onboarding_guards.py" = ["D"]
 "src/lingxi/core/identity/onboarding_ports.py" = ["D"]
-"src/lingxi/core/identity/onboarding_runner.py" = ["D", "PLR0913", "F401", "I001", "UP035"]
 "src/lingxi/core/identity/onboarding_support.py" = ["D"]
 "src/lingxi/core/identity/onboarding_terminal.py" = ["D", "N818"]
 "src/lingxi/core/identity/org_snapshot.py" = ["D"]
@@ -340,11 +334,4 @@ max-args = 10
 # 贴着文件体量棘轮阈值，ruff format 的重排（引号风格、换行）会改动行数，可能顶穿
 # 阈值或让棘轮基线数字对不上。批 1 拆分完成后再移出本清单、纳入格式化。
 [tool.ruff.format]
-exclude = [
-    "src/lingxi/apps/gateway/__init__.py",
-    "src/lingxi/apps/scheduler/permission_refresh.py",
-    "src/lingxi/apps/worker/service.py",
-    "src/lingxi/core/admin/router.py",
-    "src/lingxi/core/conversation/pipeline.py",
-    "src/lingxi/core/identity/onboarding_runner.py",
-]
+exclude = []
