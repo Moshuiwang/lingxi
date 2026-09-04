@@ -181,7 +181,7 @@ class PositionManagementCardTests(unittest.TestCase):
     def test_terminal_refresh_restores_form_after_async_result(self) -> None:
         """异步下发终态只更新状态，不能把原管理卡永久锁成只读。"""
 
-        from lingxi.apps.gateway import _GatewayManagementCardRefresher
+        from lingxi.apps.gateway.management_cards import ManagementCardRefresher
 
         class _Transport:
             def __init__(self) -> None:
@@ -196,7 +196,7 @@ class PositionManagementCardTests(unittest.TestCase):
                 return 3
 
         transport = _Transport()
-        refresher = _GatewayManagementCardRefresher(
+        refresher = ManagementCardRefresher(
             transport=transport,
             catalog=_PositionCatalog(),
             display_names=_DisplayNames(),
@@ -223,7 +223,7 @@ class PositionManagementCardTests(unittest.TestCase):
         )
 
     def test_cardkit_failure_does_not_advance_visual_watermark_before_success(self) -> None:
-        from lingxi.apps.gateway import _GatewayManagementCardRefresher
+        from lingxi.apps.gateway.management_cards import ManagementCardRefresher
 
         class _Transport:
             def __init__(self) -> None:
@@ -247,7 +247,7 @@ class PositionManagementCardTests(unittest.TestCase):
             message_id="om_cardkit_failure", state="effective", dispatch_status="effective"
         )
         transport = _Transport()
-        refresher = _GatewayManagementCardRefresher(
+        refresher = ManagementCardRefresher(
             transport=transport,
             catalog=_PositionCatalog(),
             display_names=_DisplayNames(),
@@ -265,7 +265,7 @@ class PositionManagementCardTests(unittest.TestCase):
         self.assertEqual(store.list_needing_refresh(), ())
 
     def test_visual_update_failure_keeps_persistent_refresh_watermark_for_retry(self) -> None:
-        from lingxi.apps.gateway import _ManagementCardRecoveryScanner
+        from lingxi.apps.gateway.management_cards import ManagementCardRecoveryScanner
 
         store = ManagementCardContextStore()
         store.remember(
@@ -293,7 +293,7 @@ class PositionManagementCardTests(unittest.TestCase):
                 sequence = store.next_card_sequence(message_id=context.message_id)
                 store.mark_visual_refreshed(message_id=context.message_id, sequence=sequence)
 
-        scanner = _ManagementCardRecoveryScanner(
+        scanner = ManagementCardRecoveryScanner(
             context_store=store,
             refresher=_Refresher(),
             status_lookup=lambda _identifier: _status(),
@@ -303,7 +303,7 @@ class PositionManagementCardTests(unittest.TestCase):
         self.assertEqual(len(store.list_needing_refresh()), 1)
         # 用新的 scanner 实例模拟 gateway 在瞬时 CardKit 失败后重启；重试依据是
         # store 中的持久水位，而不是上一进程的 observer/内存状态。
-        restarted_scanner = _ManagementCardRecoveryScanner(
+        restarted_scanner = ManagementCardRecoveryScanner(
             context_store=store,
             refresher=_Refresher(),
             status_lookup=lambda _identifier: _status(),
@@ -316,8 +316,8 @@ class PositionManagementCardTests(unittest.TestCase):
         """scanner 读旧行后，状态推进必须让旧视觉在取号 CAS 处放弃。"""
 
         from lingxi.apps.gateway import (
-            _GatewayManagementCardRefresher,
-            _ManagementCardRecoveryScanner,
+            ManagementCardRecoveryScanner,
+            ManagementCardRefresher,
         )
 
         class _Transport:
@@ -344,7 +344,7 @@ class PositionManagementCardTests(unittest.TestCase):
             message_id="om_recovery_cas", state="effective", dispatch_status="effective"
         )
         transport = _Transport()
-        refresher = _GatewayManagementCardRefresher(
+        refresher = ManagementCardRefresher(
             transport=transport,
             catalog=_PositionCatalog(),
             display_names=_DisplayNames(),
@@ -362,7 +362,7 @@ class PositionManagementCardTests(unittest.TestCase):
             )
             return _status()
 
-        scanner = _ManagementCardRecoveryScanner(
+        scanner = ManagementCardRecoveryScanner(
             context_store=store,
             refresher=refresher,
             status_lookup=status_lookup,
@@ -382,7 +382,7 @@ class PositionManagementCardTests(unittest.TestCase):
 
         # A fresh scanner can now render and deliver the current state after the
         # old snapshot has been rejected, which also exercises restart recovery.
-        restarted = _ManagementCardRecoveryScanner(
+        restarted = ManagementCardRecoveryScanner(
             context_store=store,
             refresher=refresher,
             status_lookup=lambda _identifier: _status(),
@@ -1096,10 +1096,10 @@ def _rendered_status(transport: _RefresherTransport) -> str:
 
 
 def _render_incomplete(*, account_state: str, dispatch_status: str | None) -> str:
-    from lingxi.apps.gateway import _GatewayManagementCardRefresher
+    from lingxi.apps.gateway.management_cards import ManagementCardRefresher
 
     transport = _RefresherTransport()
-    refresher = _GatewayManagementCardRefresher(
+    refresher = ManagementCardRefresher(
         transport=transport,
         catalog=_PositionCatalog(),
         display_names=_DisplayNames(),

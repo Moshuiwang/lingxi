@@ -77,11 +77,6 @@ class _ChainAbortedError(Exception):
     """
 
 
-#: 向后兼容别名：本类改名以满足异常类命名规则（须以 Error 结尾），跨模块引用未
-#: 同步改名前继续可用，全仓统一改名后再清理。
-_ChainAborted = _ChainAbortedError
-
-
 class OnboardingChainError(RuntimeError):
     """链上某一步的**本侧故障**：走 ``LX-ONBOARD-001``，不冒充业务结论。
 

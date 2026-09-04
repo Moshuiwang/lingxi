@@ -83,9 +83,8 @@ fi
 ruff check --config pyproject.toml --no-cache "${tracked_python_files[@]}"
 printf 'ruff check：通过\n'
 
-# --force-exclude：exclude 只在 ruff 自己遍历目录时生效，显式传入的文件路径
-# 默认会被无视——不带这个参数，六个贴线/冻结文件会被当成"待格式化"而不是
-# "跳过"，[tool.ruff.format].exclude 形同虚设（实测坐实）。
+# --force-exclude：exclude 只在 ruff 自己遍历目录时生效，显式传入的文件路径默认会被
+# 无视——带上它，[tool.ruff.format].exclude 里的条目（收官后为空）才对显式路径生效。
 ruff format --config pyproject.toml --check --force-exclude "${tracked_python_files[@]}"
 printf 'ruff format --check：通过\n'
 

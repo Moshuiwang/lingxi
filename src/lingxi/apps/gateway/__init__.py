@@ -55,15 +55,6 @@ from .onboarding import _RecordingOnboarding, assert_gateway_onboarding_is_inert
 
 logger = logging.getLogger(__name__)
 
-# 搬走的符号在本包入口保留转发，既有调用方与测试的 import 路径不变。
-_LoggingAudit = LoggingAudit
-_LogOnlyAlertSender = LogOnlyAlertSender
-_RejectingCards = RejectingCards
-_GatewayManagementCardRefresher = ManagementCardRefresher
-_ManagementCardRecoveryScanner = ManagementCardRecoveryScanner
-_combined_heartbeat = combined_heartbeat
-_combined_watchdog = combined_watchdog
-
 __all__ = [
     "ADMIN_NOTICE_UUID_PREFIX",
     "GroupMentionHintResponder",

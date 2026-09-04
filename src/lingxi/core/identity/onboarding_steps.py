@@ -41,7 +41,7 @@ from lingxi.core.identity.onboarding_terminal import (
     KEY_SYNC_TIMEOUT,
     STATE_ACTIVE,
     OnboardingChainError,
-    _ChainAborted,
+    _ChainAbortedError,
     _internal,
     _not_authorized,
     _Terminal,
@@ -567,7 +567,7 @@ class OnboardingSteps:
                 return _internal(f"publish_{status}")
             if self._should_stop():
                 # 停机不是"发布没完成"：那一版意图仍然有效，下一轮重跑会等到它。
-                raise _ChainAborted()
+                raise _ChainAbortedError()
             if waited >= self._publish_wait_seconds:
                 return _internal("publish_not_completed")
             self._sleep(step)

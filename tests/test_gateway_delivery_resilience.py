@@ -27,7 +27,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from lingxi.apps.gateway import (
-    _combined_heartbeat,
+    combined_heartbeat,
     delivery_thread_watchdog,
     run_delivery_loop,
 )
@@ -483,7 +483,7 @@ class LongConnectionHeartbeatRunsTheWatchdogTests(unittest.TestCase):
         checks: list[int] = []
         with tempfile.TemporaryDirectory(prefix="issue191-liveness-") as directory:
             with patch.dict(os.environ, {"LINGXI_LIVENESS_DIR": directory}):
-                heartbeat = _combined_heartbeat(
+                heartbeat = combined_heartbeat(
                     duty, "gateway-longconn", watchdog=lambda: checks.append(1)
                 )
                 heartbeat()
@@ -499,7 +499,7 @@ class LongConnectionHeartbeatRunsTheWatchdogTests(unittest.TestCase):
         duty = self._FakeDuty()
         with tempfile.TemporaryDirectory(prefix="issue191-liveness-") as directory:
             with patch.dict(os.environ, {"LINGXI_LIVENESS_DIR": directory}):
-                _combined_heartbeat(duty, "gateway-delivery")()
+                combined_heartbeat(duty, "gateway-delivery")()
 
                 self.assertTrue((Path(directory) / "lingxi-gateway-delivery-liveness").exists())
         self.assertEqual(duty.beats, 1)

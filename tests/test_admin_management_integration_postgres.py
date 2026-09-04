@@ -802,7 +802,7 @@ class ManagementCardStateCasRealDbTests(ManagementCardCallbackIntegrationTestCas
         self.assertTrue(current.needs_refresh)
 
     def test_gateway_refresher_uses_real_context_port_and_clears_only_after_update(self) -> None:
-        from lingxi.apps.gateway import _GatewayManagementCardRefresher
+        from lingxi.apps.gateway.management_cards import ManagementCardRefresher
 
         class _Catalog:
             def companies(self):
@@ -840,7 +840,7 @@ class ManagementCardStateCasRealDbTests(ManagementCardCallbackIntegrationTestCas
             updated_at="2026-09-01T00:00:00+00:00",
         )
         transport = _Transport()
-        refresher = _GatewayManagementCardRefresher(
+        refresher = ManagementCardRefresher(
             transport=transport,
             catalog=_Catalog(),
             display_names=_DisplayNames(),

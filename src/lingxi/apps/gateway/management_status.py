@@ -108,7 +108,7 @@ def rendered_dispatch_status(
     """管理卡「当前状态」那一行最终显示的话。
 
     数据库里的 ``state``/``dispatch_status`` 都是机器状态，不能原样回显给管理员；所有
-    管理卡可见结果都在这里映射成产品术语，调用方（``_GatewayManagementCardRefresher``）
+    管理卡可见结果都在这里映射成产品术语，调用方（``ManagementCardRefresher``）
     不再自己拼任何文案。``status_message`` 是即时路径已经算好的那句话，优先级最高。
     """
     if is_account_not_enabled(status) and _claims_publishing(

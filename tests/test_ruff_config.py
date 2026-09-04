@@ -2,21 +2,12 @@
 
 两张清单只许变短，不许变长：
 
-1. ``[tool.ruff.lint.per-file-ignores]``——存量 ``D``（docstring 结构）/
-   ``PLR0913``（参数个数）以及门禁接线批留下的 ``I001``/``UP035``/``F401``/
-   ``N818``/``N802`` 残留登记表。``D`` 的强制范围收窄到 ``src/lingxi/``：
-   ``tests/**``/``migrations/**``/``scripts/**`` 三条 glob 整目录豁免 ``D``
-   （决策清单 D-21），这三条 glob 本身也是钉住条目，按同一条"只减不增"规则
-   判定——删除或收紧这三条同样需要走本文件的钉住快照。逐文件的 ``D``
-   条目仍然只登记 ``src/lingxi/`` 下的文件；三个豁免目录下若还有其他规则码
-   （``PLR0913``/``N818``/``N802``/``F401``/``I001``）的存量违规，各自登记
-   为独立条目，不搭 ``D`` 的豁免。后续清理批会逐个 ``src/lingxi/`` 文件把
-   ``D`` 条目删空或缩短，收官目标是 ``src/lingxi/`` 下的 ``D`` 条目清空
-   （不含三条豁免 glob 本身）。
-2. ``[tool.ruff.format].exclude``——全仓格式化落地时同时排除六个贴线/冻结
-   文件（结构性拆分之前，格式化的引号/换行重排会改动行数，可能顶穿文件体量
-   棘轮阈值或让基线数字对不上）；钉住集与 ``pyproject.toml`` 逐字一致。这六
-   个文件拆分完成、移出 exclude 列表后，这里同步收紧。
+1. ``[tool.ruff.lint.per-file-ignores]``——收官后只剩三类：三条目录 glob（``tests/**``/
+   ``migrations/**``/``scripts/**`` 整目录豁免 ``D``，决策清单 D-21）、这三个目录下其他
+   规则码的存量条目、``src/lingxi/`` 下 ``PLR0913`` 存量（合同 §3 登记不做）与有意保留
+   的 ``N818``。``src/lingxi/`` 下不再有任何 ``D`` 条目。
+2. ``[tool.ruff.format].exclude``——收官后为空集：全仓每个 ``.py`` 都参与格式化，钉住
+   的空集意味着任何新排除项即红。
 
 判定方式是子集，不是逐字相等：允许某个文件的条目从表里整条删除，也允许某个文件
 保留的规则码变少；唯一不允许的是**出现新文件**或**某个已登记文件出现新规则码**
@@ -60,192 +51,32 @@ PINNED_PYLINT_MAX_ARGS = 10
 PINNED_PYDOCSTYLE_CONVENTION = "google"
 
 
-# 以下常量是接线落地时 pyproject.toml 里 [tool.ruff.lint.per-file-ignores] 的
-# 逐字快照，按文件路径排序。后续清理批缩短实际清单后，无需同步缩短这份钉住
-# 快照——测试断言的是"实际 ⊆ 钉住"，钉住快照只是历史上限，不用跟着每次收紧
-# 同步下调（除非要收紧钉住本身，那是一次有意的门禁升级，不属于批次清理的日常
-# 工作）。
+# 以下常量是收官时 pyproject.toml 里 [tool.ruff.lint.per-file-ignores] 的逐字快照，按路径排序：
+# 三条目录 glob（决策清单 D-21）、tests/scripts/migrations 的非 D 存量条目、src/lingxi/ 的
+# PLR0913 存量（合同 §3 登记不做）与有意保留的 N818。实际清单只许是它的子集：任何新文件、
+# 任何已登记文件的新规则码即红；要放宽必须同时改这份快照并在 PR 正文说明。
 PINNED_PER_FILE_IGNORES: dict[str, frozenset[str]] = {
     "migrations/**": frozenset(["D"]),
     "migrations/alembic/env.py": frozenset(["I001"]),
     "scripts/**": frozenset(["D"]),
     "scripts/ops/import_local_permission_override.py": frozenset(["F401"]),
     "scripts/probe_drive_folder_permissions.py": frozenset(["N818"]),
-    "src/lingxi/adapters/admin_metric_alias_map_file.py": frozenset(["D"]),
-    "src/lingxi/adapters/admin_post_callback.py": frozenset(["D"]),
-    "src/lingxi/adapters/admin_registry.py": frozenset(["D"]),
-    "src/lingxi/adapters/claude_agent_hooks.py": frozenset(["D"]),
-    "src/lingxi/adapters/claude_agent_session.py": frozenset(["D", "PLR0913", "N818"]),
-    "src/lingxi/adapters/company_function_metric_map_file.py": frozenset(["D"]),
-    "src/lingxi/adapters/delegated_credentials.py": frozenset(["D"]),
-    "src/lingxi/adapters/delegated_subject_lookup.py": frozenset(["D"]),
-    "src/lingxi/adapters/feishu_admin_card.py": frozenset(["D"]),
-    "src/lingxi/adapters/feishu_bitable_association.py": frozenset(["D"]),
-    "src/lingxi/adapters/feishu_delivery.py": frozenset(["D"]),
-    "src/lingxi/adapters/feishu_directory.py": frozenset(["D"]),
-    "src/lingxi/adapters/feishu_docx_delivery.py": frozenset(["D"]),
-    "src/lingxi/adapters/feishu_events.py": frozenset(["D"]),
-    "src/lingxi/adapters/feishu_group_message.py": frozenset(["D"]),
-    "src/lingxi/adapters/feishu_longconn.py": frozenset(["D"]),
-    "src/lingxi/adapters/feishu_org_snapshot_reader.py": frozenset(["D"]),
-    "src/lingxi/adapters/feishu_outbound.py": frozenset(["D"]),
-    "src/lingxi/adapters/feishu_permission_bitable.py": frozenset(["D"]),
-    "src/lingxi/adapters/feishu_reauthorization.py": frozenset(["D"]),
-    "src/lingxi/adapters/feishu_roster_bitable.py": frozenset(["D"]),
-    "src/lingxi/adapters/feishu_sheets_delivery.py": frozenset(["D"]),
-    "src/lingxi/adapters/feishu_tenant_token.py": frozenset(["D"]),
-    "src/lingxi/adapters/feishu_user_message.py": frozenset(["D"]),
-    "src/lingxi/adapters/galaxy_csv_export.py": frozenset(["D"]),
-    "src/lingxi/adapters/galaxy_import.py": frozenset(["D"]),
-    "src/lingxi/adapters/mcp_token_cipher.py": frozenset(["D"]),
-    "src/lingxi/adapters/oauth_bridge_client.py": frozenset(["D"]),
-    "src/lingxi/adapters/postgres.py": frozenset(["D"]),
-    "src/lingxi/adapters/postgres_content_capture.py": frozenset(["D"]),
-    "src/lingxi/adapters/postgres_content_capture_retention.py": frozenset(["D"]),
-    "src/lingxi/adapters/postgres_conversation/_dataclasses.py": frozenset(["D"]),
-    "src/lingxi/adapters/postgres_conversation/_gateway_store.py": frozenset(["D"]),
-    "src/lingxi/adapters/postgres_conversation/_listener.py": frozenset(["D"]),
-    "src/lingxi/adapters/postgres_conversation/_queue_base.py": frozenset(["D"]),
-    "src/lingxi/adapters/postgres_conversation/_queue_gateway_delivery.py": frozenset(["D"]),
-    "src/lingxi/adapters/postgres_conversation/_queue_lifecycle.py": frozenset(["D"]),
-    "src/lingxi/adapters/postgres_conversation/_queue_outbox.py": frozenset(["D", "PLR0913"]),
-    "src/lingxi/adapters/postgres_conversation/_queue_session_cleanup.py": frozenset(["D"]),
-    "src/lingxi/adapters/postgres_conversation/_task_queue.py": frozenset(["D"]),
-    "src/lingxi/adapters/postgres_conversation/_transaction.py": frozenset(["D"]),
-    "src/lingxi/adapters/postgres_daily_report.py": frozenset(["D"]),
-    "src/lingxi/adapters/postgres_daily_report_watermark.py": frozenset(["D"]),
-    "src/lingxi/adapters/postgres_document_delivery.py": frozenset(["D", "N818"]),
-    "src/lingxi/adapters/postgres_email_binding.py": frozenset(["D"]),
-    "src/lingxi/adapters/postgres_galaxy_snapshot.py": frozenset(["D"]),
-    "src/lingxi/adapters/postgres_identity.py": frozenset(["D"]),
-    "src/lingxi/adapters/postgres_late_readiness_recovery.py": frozenset(["D"]),
-    "src/lingxi/adapters/postgres_local_permission.py": frozenset(["D", "PLR0913", "N818"]),
-    "src/lingxi/adapters/postgres_management_card_context.py": frozenset(["D", "PLR0913"]),
-    "src/lingxi/adapters/postgres_mcp_token.py": frozenset(["D"]),
-    "src/lingxi/adapters/postgres_onboarding_failure.py": frozenset(["D"]),
-    "src/lingxi/adapters/postgres_pending_action.py": frozenset(["D", "PLR0913"]),
-    "src/lingxi/adapters/postgres_permission_publish.py": frozenset(["D", "N818"]),
-    "src/lingxi/adapters/postgres_permission_recompute_trigger.py": frozenset(["D"]),
-    "src/lingxi/adapters/postgres_roster_audit.py": frozenset(["D"]),
-    "src/lingxi/adapters/postgres_roster_snapshot.py": frozenset(["D", "N818"]),
-    "src/lingxi/adapters/postgres_stalled_provisioning.py": frozenset(["D"]),
-    "src/lingxi/adapters/postgres_targeted_recompute_lookup.py": frozenset(["D"]),
-    "src/lingxi/adapters/postgres_user_memory.py": frozenset(["D"]),
-    "src/lingxi/adapters/query_mcp_probe.py": frozenset(["D"]),
-    "src/lingxi/adapters/retention.py": frozenset(["D"]),
-    "src/lingxi/adapters/role_function_map_file.py": frozenset(["D"]),
-    "src/lingxi/adapters/stock_token_bitable.py": frozenset(["D"]),
-    "src/lingxi/adapters/user_environment.py": frozenset(["D"]),
-    "src/lingxi/adapters/user_mcp_config.py": frozenset(["D"]),
-    "src/lingxi/apps/admin_bootstrap/__init__.py": frozenset(["D"]),
-    "src/lingxi/apps/gateway/__init__.py": frozenset(["D", "I001", "UP035"]),
-    "src/lingxi/apps/gateway/config.py": frozenset(["D"]),
-    "src/lingxi/apps/gateway/delivery.py": frozenset(["D", "PLR0913"]),
-    "src/lingxi/apps/gateway/document_delivery.py": frozenset(["D"]),
-    "src/lingxi/apps/gateway/group_mention_hint.py": frozenset(["D"]),
-    "src/lingxi/apps/gateway/log_redaction.py": frozenset(["D"]),
-    "src/lingxi/apps/gateway/management_status.py": frozenset(["D"]),
-    "src/lingxi/apps/gateway/onboarding.py": frozenset(["D"]),
-    "src/lingxi/apps/healthcheck/__init__.py": frozenset(["D"]),
-    "src/lingxi/apps/liveness.py": frozenset(["D"]),
-    "src/lingxi/apps/reauthorize/__init__.py": frozenset(["D"]),
-    "src/lingxi/apps/scheduler/alerting_assembly.py": frozenset(["D"]),
-    "src/lingxi/apps/scheduler/assembly.py": frozenset(["D"]),
-    "src/lingxi/apps/scheduler/audit.py": frozenset(["D"]),
-    "src/lingxi/apps/scheduler/config.py": frozenset(["D"]),
-    "src/lingxi/apps/scheduler/credential_rotation.py": frozenset(["D"]),
-    "src/lingxi/apps/scheduler/daily_report.py": frozenset(["D"]),
-    "src/lingxi/apps/scheduler/document_delivery_dead_letter.py": frozenset(["D"]),
-    "src/lingxi/apps/scheduler/late_readiness_recovery.py": frozenset(["D", "PLR0913"]),
-    "src/lingxi/apps/scheduler/loop.py": frozenset(["D"]),
-    "src/lingxi/apps/scheduler/onboarding.py": frozenset(["D"]),
-    "src/lingxi/apps/scheduler/org_snapshot_sync.py": frozenset(["D", "N818"]),
-    "src/lingxi/apps/scheduler/permission_publish.py": frozenset(["D", "PLR0913"]),
-    "src/lingxi/apps/scheduler/permission_readiness_assembly.py": frozenset(["D"]),
-    "src/lingxi/apps/scheduler/permission_refresh.py": frozenset(["D", "PLR0913", "N818"]),
-    "src/lingxi/apps/scheduler/retention.py": frozenset(["D"]),
-    "src/lingxi/apps/scheduler/roster_audit.py": frozenset(["D"]),
-    "src/lingxi/apps/scheduler/stalled_provisioning.py": frozenset(["D", "PLR0913"]),
-    "src/lingxi/apps/trace/__init__.py": frozenset(["D"]),
-    "src/lingxi/apps/worker/__init__.py": frozenset(["D"]),
-    "src/lingxi/apps/worker/cli.py": frozenset(["D"]),
-    "src/lingxi/apps/worker/config.py": frozenset(["D"]),
-    "src/lingxi/apps/worker/report.py": frozenset(["D", "PLR0913"]),
-    "src/lingxi/apps/worker/report_extraction.py": frozenset(["D"]),
-    "src/lingxi/apps/worker/service.py": frozenset(["D", "PLR0913", "I001"]),
-    "src/lingxi/apps/worker/session_cleanup.py": frozenset(["D"]),
-    "src/lingxi/apps/worker/turn.py": frozenset(["D"]),
-    "src/lingxi/config/content.py": frozenset(["D"]),
-    "src/lingxi/core/admin/card_callback.py": frozenset(["D", "PLR0913"]),
+    "src/lingxi/adapters/claude_agent_session.py": frozenset(["PLR0913"]),
+    "src/lingxi/adapters/postgres_conversation/_queue_outbox.py": frozenset(["PLR0913"]),
+    "src/lingxi/adapters/postgres_local_permission.py": frozenset(["PLR0913"]),
+    "src/lingxi/adapters/postgres_management_card_context.py": frozenset(["PLR0913"]),
+    "src/lingxi/adapters/postgres_pending_action.py": frozenset(["PLR0913"]),
+    "src/lingxi/apps/gateway/delivery.py": frozenset(["PLR0913"]),
+    "src/lingxi/apps/scheduler/late_readiness_recovery.py": frozenset(["PLR0913"]),
+    "src/lingxi/apps/scheduler/permission_publish.py": frozenset(["PLR0913"]),
+    "src/lingxi/apps/scheduler/stalled_provisioning.py": frozenset(["PLR0913"]),
+    "src/lingxi/apps/worker/report.py": frozenset(["PLR0913"]),
+    "src/lingxi/core/admin/card_callback.py": frozenset(["PLR0913"]),
     "src/lingxi/core/admin/card_callback_management.py": frozenset(["PLR0913"]),
-    "src/lingxi/core/admin/card_dispatch.py": frozenset(["D", "PLR0913"]),
-    "src/lingxi/core/admin/card_layout.py": frozenset(["D"]),
-    "src/lingxi/core/admin/commands.py": frozenset(["D"]),
-    "src/lingxi/core/admin/display_names.py": frozenset(["D"]),
-    "src/lingxi/core/admin/management_card.py": frozenset(["D"]),
-    "src/lingxi/core/admin/notification.py": frozenset(["D", "N818"]),
-    "src/lingxi/core/admin/pending_action.py": frozenset(["D", "N818"]),
-    "src/lingxi/core/admin/registry.py": frozenset(["D", "N818"]),
-    "src/lingxi/core/admin/router.py": frozenset(["D", "PLR0913", "UP035"]),
-    "src/lingxi/core/admin/views.py": frozenset(["D"]),
-    "src/lingxi/core/alerting.py": frozenset(["D"]),
-    "src/lingxi/core/conversation/commands.py": frozenset(["D"]),
-    "src/lingxi/core/conversation/onboarding_recovery.py": frozenset(["D"]),
-    "src/lingxi/core/conversation/pipeline.py": frozenset(
-        ["D", "PLR0913", "N818", "I001", "UP035"]
-    ),
-    "src/lingxi/core/conversation/ports.py": frozenset(["D"]),
-    "src/lingxi/core/conversation/session_window.py": frozenset(["D"]),
-    "src/lingxi/core/daily_report.py": frozenset(["D"]),
-    "src/lingxi/core/delivery/ports.py": frozenset(["D"]),
-    "src/lingxi/core/execution/audit.py": frozenset(["D"]),
-    "src/lingxi/core/execution/card_stream.py": frozenset(["D", "PLR0913", "N818"]),
-    "src/lingxi/core/execution/document_delivery.py": frozenset(["D"]),
-    "src/lingxi/core/execution/hooks.py": frozenset(["D"]),
-    "src/lingxi/core/execution/input_safety.py": frozenset(["D"]),
-    "src/lingxi/core/execution/message_stream.py": frozenset(["D"]),
-    "src/lingxi/core/execution/tool_policy.py": frozenset(["D"]),
-    "src/lingxi/core/identity/access_token_supply.py": frozenset(["D", "N818"]),
-    "src/lingxi/core/identity/credentials.py": frozenset(["D", "N818"]),
-    "src/lingxi/core/identity/first_contact.py": frozenset(["D"]),
-    "src/lingxi/core/identity/identifiers.py": frozenset(["D"]),
-    "src/lingxi/core/identity/innertest_roster_gate.py": frozenset(["D"]),
-    "src/lingxi/core/identity/legacy_permission_import.py": frozenset(["D"]),
-    "src/lingxi/core/identity/onboarding.py": frozenset(["D"]),
-    "src/lingxi/core/identity/onboarding_guards.py": frozenset(["D"]),
-    "src/lingxi/core/identity/onboarding_ports.py": frozenset(["D"]),
-    "src/lingxi/core/identity/onboarding_runner.py": frozenset(
-        ["D", "PLR0913", "F401", "I001", "UP035"]
-    ),
-    "src/lingxi/core/identity/onboarding_support.py": frozenset(["D"]),
-    "src/lingxi/core/identity/onboarding_terminal.py": frozenset(["D", "N818"]),
-    "src/lingxi/core/identity/org_snapshot.py": frozenset(["D"]),
-    "src/lingxi/core/identity/preprovision.py": frozenset(["D"]),
-    "src/lingxi/core/identity/provisioning.py": frozenset(["D"]),
-    "src/lingxi/core/identity/roster_audit.py": frozenset(["D"]),
-    "src/lingxi/core/identity/roster_report.py": frozenset(["D"]),
-    "src/lingxi/core/identity/roster_snapshot.py": frozenset(["D"]),
-    "src/lingxi/core/identity/stock_token_source.py": frozenset(["D"]),
-    "src/lingxi/core/ids.py": frozenset(["D"]),
-    "src/lingxi/core/innertest_content_capture.py": frozenset(["D"]),
-    "src/lingxi/core/permission/account_match.py": frozenset(["D"]),
-    "src/lingxi/core/permission/galaxy_export.py": frozenset(["D"]),
-    "src/lingxi/core/permission/galaxy_scope.py": frozenset(["D"]),
-    "src/lingxi/core/permission/legacy_diff.py": frozenset(["D"]),
-    "src/lingxi/core/permission/local_override.py": frozenset(["D"]),
-    "src/lingxi/core/permission/mcp_readiness.py": frozenset(["D"]),
-    "src/lingxi/core/permission/merge_sources.py": frozenset(["D"]),
-    "src/lingxi/core/permission/metric_translation.py": frozenset(["D", "N818"]),
-    "src/lingxi/core/permission/notification.py": frozenset(["D"]),
-    "src/lingxi/core/permission/position_override.py": frozenset(["D"]),
-    "src/lingxi/core/permission/publish.py": frozenset(["D", "N818"]),
-    "src/lingxi/core/permission/publish_row.py": frozenset(["D"]),
-    "src/lingxi/core/permission/role_function.py": frozenset(["D"]),
-    "src/lingxi/core/permission/table_access_token_supply.py": frozenset(["D", "N818"]),
-    "src/lingxi/core/permission/targeted_recompute.py": frozenset(["D", "PLR0913"]),
-    "src/lingxi/core/permission/tenant_token_supply.py": frozenset(["D"]),
-    "src/lingxi/core/user_memory.py": frozenset(["D"]),
-    "src/lingxi/core/year_grounding_guard.py": frozenset(["D"]),
+    "src/lingxi/core/admin/card_dispatch.py": frozenset(["PLR0913"]),
+    "src/lingxi/core/admin/notification.py": frozenset(["N818"]),
+    "src/lingxi/core/execution/card_stream.py": frozenset(["PLR0913"]),
+    "src/lingxi/core/permission/targeted_recompute.py": frozenset(["PLR0913"]),
     "tests/**": frozenset(["D"]),
     "tests/test_claude_agent_session_adapter.py": frozenset(["PLR0913"]),
     "tests/test_document_delivery.py": frozenset(["PLR0913"]),
@@ -256,7 +87,7 @@ PINNED_PER_FILE_IGNORES: dict[str, frozenset[str]] = {
     "tests/test_permission_publish_postgres.py": frozenset(["N818"]),
     "tests/test_permission_publish_row.py": frozenset(["N802"]),
     "tests/test_permission_refresh_duty.py": frozenset(["PLR0913"]),
-    "tests/test_roster_access_token_supply.py": frozenset(["PLR0913", "N818"]),
+    "tests/test_roster_access_token_supply.py": frozenset(["N818", "PLR0913"]),
     "tests/test_targeted_permission_recompute.py": frozenset(["PLR0913"]),
     "tests/test_worker_entry.py": frozenset(["PLR0913"]),
 }
@@ -264,16 +95,7 @@ PINNED_PER_FILE_IGNORES: dict[str, frozenset[str]] = {
 # 六个贴线/冻结文件在结构性拆分完成前不参与全仓格式化，与 pyproject.toml
 # [tool.ruff.format].exclude 逐字一致；拆分完成、移出该 exclude 列表后，这里
 # 同步收紧（只许变短，不许变长）。
-PINNED_FORMAT_EXCLUDE: frozenset[str] = frozenset(
-    [
-        "src/lingxi/apps/gateway/__init__.py",
-        "src/lingxi/apps/scheduler/permission_refresh.py",
-        "src/lingxi/apps/worker/service.py",
-        "src/lingxi/core/admin/router.py",
-        "src/lingxi/core/conversation/pipeline.py",
-        "src/lingxi/core/identity/onboarding_runner.py",
-    ]
-)
+PINNED_FORMAT_EXCLUDE: frozenset[str] = frozenset()
 
 
 class PerFileIgnoresOnlyShrinksTest(unittest.TestCase):

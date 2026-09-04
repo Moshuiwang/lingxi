@@ -643,6 +643,3 @@ def _failure_only_report(code: str, signature: str, error: Exception) -> dict[st
         "turn": {"closed": False, "final_text": "", "session_id": None},
         "failure": failure_with_signature(code, signature, error),
     }
-
-
-WorkerQueueConsumer = WorkerService
