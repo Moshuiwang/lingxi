@@ -1,61 +1,17 @@
-"""内测名单闸的纯判定层（Issue #302 S-N-01，载体 #251/#302）。
+"""内测名单闸的纯判定层。
 
-## 为什么需要这道闸，为什么必须挡在开通链最前端
+Bot-Test 应用可见范围是全员可见，任何关联组织员工都能发起私聊，不只是内测名单
+挑中的人。闸必须挡在 ``AutoOnboardingRunner._run`` 的最前面——早于组织快照读取、
+在职状态实时回读与任何数据库写入——命中放行、未命中给一句干净的"内测未开放"且不
+留任何业务状态。匹配键是 ``open_id``：私聊事件本身携带、不需要额外查询就能拿到的
+唯一稳定身份信号；email/union_id 都要等组织快照查询跑完才拿得到，而组织快照查询
+正是这道闸要挡在前面的东西，用它做匹配键等于闸自己先走了一遍要拦截的链路。
 
-编排者 2026-08-24 按飞书 API 回读核实：Bot-Test 应用的可见范围是**全员可见**
-（``is_visible_to_all=1``）。这意味着**任何**关联组织员工都能在飞书里搜到 Bot-Test
-并对它发起私聊——不只是内测名单挑中的那几个人。内测阶段只想放行一小撮存量用户真实
-走开通链，其余任何人碰到 Bot-Test 都必须得到一句干净的「内测未开放」，且**不得**
-留下任何业务状态（不建档、不发权限）。按最严实现：闸必须挡在
-:meth:`~lingxi.core.identity.onboarding_runner.AutoOnboardingRunner._run` 的最前面，
-早于组织快照读取、在职状态实时回读（那会消耗全系统独占的专用授权派生令牌）与任何
-数据库写入。
-
-## 匹配键为什么是 open_id，不是 email / union_id
-
-开通链此刻唯一稳定持有、且**不需要任何额外查询**就能拿到的身份信号，是私聊事件本身
-携带的应用侧发送者 ``open_id``（``AutoOnboardingRunner.start(*, open_id=...)`` 的入参，
-对应产品合同「首次对话与自动准入」第 2 步"普通员工私聊事件提供应用侧的发送者
-``open_id``"）。花名册工号/邮箱与组织快照成员都要等 ``_locate()`` 跑完组织快照查询
-之后才拿得到——而组织快照查询本身正是这道闸要挡在前面的东西。用 email 或 union_id
-做匹配键意味着闸必须先做一次身份解析才能判定，等于闸自己先走了一遍它要拦截的链路，
-本末倒置。``open_id`` 还天然是"同一应用语义"下的标识（产品合同用语），与 Bot-Test
-私聊事件本身的语义完全对齐，不存在跨应用换算的问题。
-
-## 默认关闭＝全拒
-
-未配置（环境变量为空/未设置）时名单为空集合，:func:`is_open_id_innertest_allowed`
-对任何 ``open_id`` 都返回 ``False``——这不是一个单独的"开关"分支，只是"空集合不包含
-任何元素"的自然结果。
-
-配置格式非法（存在无法识别的条目）时 :func:`parse_innertest_roster` **整份**拒绝
-（抛 :class:`InnerTestRosterConfigError`），不做部分采纳、不静默丢弃单条坏值——调用方
-（``apps/scheduler/config.py`` 的 ``SchedulerConfig.from_env``）据此在**进程启动期**
-快速失败，与本仓库对其余"配了但格式不对"环境变量（``LINGXI_ADMIN_GROUP_CHAT_ID``、
-``LINGXI_MCP_TOKEN_ENCRYPT_KEY`` 等，见该文件 ``optional_identifier``/``raw_chat_id``
-一节）的既有纪律一致：**错配不是未配**，静默降级会让人以为闸在正常工作。
-
-## 比对语义
-
-只做首尾空白裁剪、精确字符串相等，不做大小写归一化、不做前缀或模糊匹配——与
-``core/identity/first_contact.py`` 的 ``locate_by_open_id`` 同一条纪律（``open_id``
-前缀在 710 人实测中已知有碰撞；模糊匹配违反"不猜测身份"的产品合同硬要求）。
-
-## 已知边界（不是缺陷，是这道闸的设计范围）
-
-这道闸只挡"还没开始走开通链"的人，不是一个持续生效的访问控制列表：
-
-- **移出名单不切断已开通用户**：本闸只在 gateway/scheduler 两处"进入开通链
-  最前端"的判定点被调用（`core/conversation/pipeline.py` 的 `NOT_PROVISIONED`
-  分支、`AutoOnboardingRunner._run` 的第一步）；一个用户一旦已经开通完成
-  （`app_user` 行存在、状态为 active），后续消息结构上根本不会再触达这道闸的
-  调用点，从名单里删掉这个人的 open_id 不会让他既有的开通与问数能力失效。
-- **在途开通链不复核名单**：`AutoOnboardingRunner._run` 只在链的最开头判一次
-  名单，链跑到中途（身份定位、匹配、建档、发布……最长可达十五分钟）期间名单
-  即使被改配置重新部署，这条已经在跑的链也不会重新判定或中止。
-- **真正的切断工具是管理员停用动作**，不是改这个环境变量：让一个已开通用户
-  停止使用，属于 S-M-02（#96，登记表撤销/停用写路径 + 本人确认卡）的产品范围，
-  本 Story（S-N-01）不提供，这道闸也从未打算提供这个能力。
+未配置时名单为空集合，判定对任何输入返回 ``False``（默认关闭＝全拒）。配置格式
+非法时整份拒绝，不部分采纳、不静默丢弃单条坏值，调用方据此在进程启动期快速失败。
+比对只做首尾空白裁剪与精确字符串相等，不做大小写归一化或模糊匹配。这道闸只挡
+"还没开始走开通链"的人，不是持续生效的访问控制列表：移出名单不会切断已开通用户，
+在途链不会中途复核名单；真正的切断工具是管理员停用动作。
 """
 
 from __future__ import annotations
@@ -70,14 +26,10 @@ from collections.abc import Callable
 #: ``metric_translation.ALL_COMPANIES_KEY`` 的既有取舍。
 _OPEN_ID_PREFIX = "ou_"
 
-#: open_id 形状校验（opus 批量审查实测 P1 修复）。此前只要求"以 ou_ 开头、不含
-#: 空白字符"，宽到分号、全角逗号（，）、顿号（、）、句点（。）这类粘连手误全部
-#: "看起来像"一个合法条目——不会触发下面 `InnerTestRosterConfigError` 的整份拒绝，
-#: 而是被当成一个真实的、只是永远匹配不到任何人的 open_id 悄悄收进名单，名单因此
-#: 静默变小、对应的人静默被全拒，运维在部署日志里看不到任何异常。收紧成"ou_ 后面
-#: 只能是 20 到 64 位英文字母或数字"之后，这类手误里出现的任何一个非法字符都会让
-#: 整条目落在正则之外，从而让整份配置在**启动期**就响亮失败，而不是安静地漏掉一
-#: 个人。20–64 是留出余量的宽松边界，不是飞书官方公布的精确长度承诺。
+#: open_id 形状校验：只允许 ``ou_`` 后接 20 到 64 位英文字母或数字，宽松边界，
+#: 不是飞书官方公布的精确长度承诺。分号、全角标点等粘连手误必须落在正则之外，
+#: 让整份配置在启动期响亮失败，而不是被当成一个真实但永远匹配不到人的 open_id
+#: 悄悄收进名单、让名单静默变小。
 _OPEN_ID_PATTERN = re.compile(r"ou_[0-9A-Za-z]{20,64}")
 
 
@@ -91,6 +43,7 @@ class InnerTestRosterConfigError(ValueError):
     """
 
     def __init__(self, *, invalid_count: int) -> None:
+        """记下不合法条目数量；不接收也不回显原始条目内容。"""
         self.invalid_count = invalid_count
         super().__init__(
             f"内测名单包含 {invalid_count} 条无法识别的条目（必须是 "
@@ -114,7 +67,6 @@ def parse_innertest_roster(raw: str | None) -> frozenset[str]:
     - 全部合法：返回去重后的 open_id 集合（``frozenset``：天然去重，且类型上
       不能被误当成有序列表意外依赖顺序）。
     """
-
     if raw is None:
         return frozenset()
     tokens = [piece.strip() for piece in raw.replace("\n", ",").split(",")]
@@ -134,7 +86,6 @@ def is_open_id_innertest_allowed(open_id: object, roster: frozenset[str]) -> boo
     「比对语义」）。``roster`` 为空集合时对任何输入都返回 ``False``——这就是
     「默认关闭＝全拒」的全部实现，没有单独的开关分支需要另外测试。
     """
-
     if not isinstance(open_id, str):
         return False
     needle = open_id.strip()
@@ -149,13 +100,5 @@ def build_innertest_roster_gate(roster: frozenset[str]) -> Callable[[str], bool]
     纯粹的装配便利：把上面那个纯判定函数 :func:`is_open_id_innertest_allowed` 绑上
     一份具体的名单集合。判据、为什么匹配键是 open_id、为什么空集合＝全拒，全部写在
     本模块的文档字符串里，本函数不重复。
-
-    **从 ``AutoOnboardingRunner.build_innertest_roster_gate``（静态方法）纯移动过来**
-    （rc25 S-8a；同 Trace #358 S-H-1 与 rc25 S-2a 的先例：只搬定义，不改判定）。搬家
-    的直接原因是 ``onboarding_runner.py`` 贴着体量棘轮阈值（1500 行，`scripts/ci/
-    check_size_ratchet.py`），Issue #541 的系统触发入口放不进去；搬到闸自己的模块也比
-    留在编排类上更贴合职责——它绑的就是本模块的判定函数，此前还得为此在方法体里反向
-    import 回本模块。
     """
-
     return lambda open_id: is_open_id_innertest_allowed(open_id, roster)

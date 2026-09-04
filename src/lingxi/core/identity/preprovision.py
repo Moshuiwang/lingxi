@@ -1,85 +1,16 @@
-"""预开通（[Issue #541](https://github.com/Moshuiwang/lingxi/issues/541)，rc25 S-8a）：
-产品负责人事先给的名单里的人，在与 BI Plus 发生**任何一次对话之前**就完成身份定位、
-建档、令牌准备、权限合成与发布，于是他第一次发消息时**没有开通等待**，直接得到问数结果。
+"""预开通：名单里的人在第一次对话之前就完成开通，首聊没有等待。
 
-本模块只放**预开通独有**的东西，其余一律走既有开通链：
+只放预开通独有的东西，其余共用 ``AutoOnboardingRunner._run``（邮箱闸/零银河兜底/
+发布闸各只有一份实现，另开链会让防线各出现第二份）。三处差异：系统触发没有
+``inbound_event`` 行，无认领账本、不发"正在等"通知；名单给邮箱而非 ``open_id``，
+需提前定位（:func:`locate_by_email`）；完成时静默、首聊时才补提示。
 
-1. 「系统触发」这条入口（:func:`run_system_onboarding`，经
-   ``AutoOnboardingRunner.start_system`` 暴露）与正式首聊入口**唯一**的结构性差异——
-   没有 ``inbound_event`` 行，因此没有认领账本可记、也没有一条"用户正在等"的通知要送
-   （:func:`system_event_id`、:data:`NULL_DISPATCH_LEDGER`、:func:`deliver_silently`）；
-2. 名单给的是**邮箱**，而飞书侧的定位键是 ``open_id``：邮箱 → 花名册 ``personnel_id``
-   → 组织快照成员 → ``open_id`` 的提前定位（:func:`locate_by_email`、:func:`plan_preprovision`）；
-3. 预开通完成时静默、**首聊时**才补的那一句提示的挂起动作（:func:`deliver_silently`）。
-   那一句的文案键是 ``lingxi.config.content.KEY_PREPROVISIONED_FIRST_CHAT``——键名住在
-   内容目录那一侧（消费点在 ``core/conversation/pipeline.py`` 的 ``ACTIVE`` 分支），
-   本模块不从 ``core/identity`` 这一侧再定义一份，也是为了不把整条身份链拖进 gateway
-   与 worker 的 import 闭包。
+两条既有的停滞收口路径在系统触发下会同时失效：当场收口靠通知确认送达、四十五分钟
+兜底靠 ``INNER JOIN inbound_event``，系统触发两者皆无——:func:`deliver_silently`
+按送达处理，兜底查询改用 ``LEFT JOIN LATERAL`` 并以 ``provisioning_started_at`` 为租约起点。
 
-## 入口的三处与首聊不同的形状（rc25 S-8b 的 ops 批量入口按这个调）
-
-``start_system(*, email, trace_id, origin, initiated_by_open_id, preprovision_grant)``：
-
-- **按邮箱进，不按 open_id 进**：名单给的是邮箱，定位在
-  :func:`locate_by_email` 里做一次，落在开通链**自己**这一侧。调用方（脚本）用
-  :func:`plan_preprovision` 出 dry-run 清单时用的是同一个函数，因此"清单上写的是谁"
-  与"真正被开通的是谁"不可能分叉——两处各写一份定位才是分叉的来源。
-- **同步返回终态**，不是 ``start()`` 那样立刻返回 ``started``：批量脚本要逐人拿到
-  结论才能出清单、才能"逐人失败关闭、不阻塞其他人"。链因此跑在**调用方线程**上，
-  不进那个专属线程池——脚本本来就是一次性进程，池只会让它多一层等待。进程内
-  "同一个人只跑一条链"的去重仍然共用编排自己的那把锁。
-- **预授权随链落库**：``preprovision_grant`` 挂在与 rc25 S-1 存量差集导入**同一个
-  挂点**——``_run`` 里存量导入之后、零银河判定之前。次序是硬的：名单本身带了新权限
-  的人，如果先判零权限就会被整批拒绝（与 S-1 把差集导入挂在零银河判定之前同一条
-  理由）。``initiated_by_open_id`` 一路带到落库口，写进合成 ``pending_action`` 的
-  责任人栏——**不写死占位身份**：审计栏目里一个无法追溯的假身份比没有审计更糟。
-
-## 为什么共用 ``AutoOnboardingRunner._run``，而不是另写一条预开通链
-
-``_run`` 的公共段上排着两道失败关闭闸与整条发布链：内测名单闸、**同邮箱是否已绑给
-另一个人**（rc25 S-2a 对抗审查 X-1，:mod:`lingxi.core.identity.onboarding_guards`）、
-零银河兜底、``publish_allowed`` 发布闸、``full_access_wildcard`` 必填参数。第二条链
-意味着这五处判定各有第二份实现，而 X-1 的整个立论就是"同邮箱两人共用同一把问数令牌
-与同一行正式表权限"——一条绕过它的第二入口会把 S-2a 的根治**直接作废**。因此系统触发
-只加一个入口（``AutoOnboardingRunner.start_system``），判定与写入**逐字节**复用
-``_run``；本模块提供的三个协作者是那条链上仅有的三处差异，全部是**去掉**动作
-（不记账、不发消息），没有一处是新的判定。
-
-## 两条停滞收口在系统触发路径下会同时失效（本模块修的接缝）
-
-分水岭（``advance(provisioning)``）之后的失败，此前有两条收口路径，而它们在系统触发
-路径下**同时**不成立：
-
-- 「当场收口」``AutoOnboardingRunner._abort_if_stalled`` 的触发判据是通知**确认送达**
-  （外部审查 P2-1 修复：通知彻底失败的人不能被提前判死，要留给四十五分钟兜底）。
-  预开通静默不发通知 ⇒ ``delivered`` 恒为假 ⇒ 当场收口**永不触发**。
-- 「四十五分钟停摆兜底」``StalledProvisioningDuty`` 的候选查询原本 **INNER** 关联
-  ``inbound_event``。系统触发没有事件行 ⇒ 这个人**结构上**永远捞不到。
-
-结果是这个人永久停在 ``provisioning``/``mcp_syncing``，而他一旦发消息，pipeline 会照发
-「正在完成…请稍候」——**与 Issue #282 修复前的形状逐字相同**。两处各修一半：
-
-- 本模块的 :func:`deliver_silently` 对系统触发返回 ``True``（"按送达处理"）。P2-1 的
-  立论是"用户一条终态都没收到，却已经被收口"，而预开通**本来就不发**任何终态通知，
-  没有任何人在等它——那条立论在这条路径上不成立，把它照搬过来只会让人卡死；
-- ``adapters/postgres_stalled_provisioning.py`` 的候选查询改成 ``LEFT JOIN LATERAL``，
-  无事件行时租约起点取 ``app_user.provisioning_started_at``（**不是** ``updated_at``：
-  那一列会被任何无关更新刷新，租约会永远不到期）。
-
-## 邮箱命中多个人员 ID 一律跳过、不猜（产品负责人 2026-09-02 裁定，硬规则）
-
-花名册实测 1223 行里有 **86 组同邮箱对应多个 ``personnel_id``**，其中 3 组 / 7 人按
-"同一邮箱下出现多个不同工号"判据是**真的不同人**（W0-6b 实测）。"哪一个还在职"在系统
-里判不了（读它需要全系统单消费者的专用授权令牌）；唯一可判定的收敛（与组织快照求交）
-只覆盖 59.9% 的花名册人员，**不构成证明**。
-
-而认错人的后果在 rc25 S-2a 的部分唯一索引（迁移 ``0085``）之后是**不可自愈**的：错的
-那一行 ``app_user`` 会**永久占住这个邮箱**，真正的那个人首聊时会撞上"同邮箱已绑定他人"
-被内部错误拒绝，而仓库里**没有改绑动作**（账号删除流程是唯一出口）。因此
-:func:`locate_by_email` 在邮箱命中多个人员 ID 时**一律跳过**，出具体原因码
-:data:`SKIP_EMAIL_MULTIPLE_PERSONNEL`，交给失败清单——哪怕其中只有一个在组织快照里。
-被跳过的人由产品负责人换一种方式给（直接给 open_id 或工号），或者干脆等他自己首聊走
-正常链路：**正常链路从 open_id 出发，天然不会认错人。**
+邮箱命中多个人员 ID 时一律跳过、不猜：认错人会让错的那一行永久占住这个邮箱
+（不可自愈、无改绑动作），宁可跳过交人工处理。
 """
 
 from __future__ import annotations
@@ -111,7 +42,6 @@ ORIGIN_FIRST_CHAT = "first_chat"
 
 def system_event_id(trace_id: str) -> str:
     """系统触发这一次的合成事件标识。见 :data:`SYSTEM_EVENT_PREFIX`。"""
-
     return f"{SYSTEM_EVENT_PREFIX}{trace_id}"
 
 
@@ -122,13 +52,11 @@ def is_system_trigger(event_id: str) -> bool:
     ``start`` → 执行线程 → ``_execute`` → ``_notify`` 的每一层，用它判定不需要在这条
     链的四个方法上各加一个参数，也就不存在"某一层忘了往下传"的漏接面。
     """
-
     return str(event_id or "").startswith(SYSTEM_EVENT_PREFIX)
 
 
 def origin_of(event_id: str) -> str:
     """审计用的来源标识。"""
-
     return ORIGIN_PREPROVISION if is_system_trigger(event_id) else ORIGIN_FIRST_CHAT
 
 
@@ -158,22 +86,16 @@ class _NoticeArmer(Protocol):
 
 
 def deliver_silently(*, key: str, open_id: str, users: _NoticeArmer) -> bool:
-    """预开通的"投递"：**不发任何消息**，返回 ``True``（按送达处理）。
+    """预开通的"投递"：不发任何消息，返回 ``True``（按送达处理）。
 
-    两件事同时成立，缺一不可：
+    静默是结构性的（链上两处 ``_notify`` 都经过这里，不靠调用点自觉）：预开通是
+    我们替用户做的事，在他没有上下文时推一条「开通完成」只会造成困惑。按送达处理
+    是为了让「当场收口」照常触发（见模块文档）。
 
-    1. **静默**（产品负责人裁定 4）。预开通是我们替用户做的事，不是他发起的事；在他
-       没有任何上下文的时候推一条「开通完成」，他能做的只有困惑。链上两处 ``_notify``
-       （中途的「正在同步」与终态）都经过这里，因此静默是结构性的，不靠调用点自觉。
-    2. **按送达处理**，好让「当场收口」照常触发——立论见模块文档「两条停滞收口在系统
-       触发路径下会同时失效」。
-
-    终态是「开通完成」时，把那句话**挂起**到该用户首聊时再补
-    （文案键 ``lingxi.config.content.KEY_PREPROVISIONED_FIRST_CHAT``）。挂起是否真的落下由存储层再判一次
-    "这个人此前从没跟我们说过话"，见 ``UserStateStore.mark_preprovision_notice_pending``
-    ——同一份名单重跑不会重新挂起（幂等），已经在聊的人也不会被补一句他不需要的话。
+    终态是「开通完成」时，把那句话挂起到该用户首聊时再补——挂起是否真的落下由
+    ``UserStateStore.mark_preprovision_notice_pending`` 再判一次"此前从没说过话"，
+    同一份名单重跑不会重新挂起（幂等）。
     """
-
     if key != KEY_COMPLETED:
         return True
     users.mark_preprovision_notice_pending(open_id=open_id)
@@ -207,6 +129,7 @@ class PreprovisionTarget:
 
     @property
     def open_id(self) -> str:
+        """定位到的组织快照成员的 open_id。"""
         return self.member.open_id
 
 
@@ -224,9 +147,8 @@ class PreprovisionSkip:
         谁"，因此**不能**给他开通——与"这个人没有可用银河权限"同属确定性业务失败，
         不是本侧故障（走 ``INTERNAL_ERROR`` 会触发管理群告警，而名单写错一个邮箱不是
         需要半夜叫人的事）。``messages`` 恒为空：预开通失败**没有任何用户可见出口**，
-        逐人原因只报告给产品负责人（脚本清单，rc25 S-8b）。
+        逐人原因只报告给产品负责人（脚本清单）。
         """
-
         return OnboardingResult(state=OnboardingState.NOT_AUTHORIZED, failure_reason=self.reason)
 
 
@@ -238,7 +160,9 @@ class DirectoryByUserId(Protocol):
     组织快照适配器此前只有按 ``open_id`` 查这一条 SQL；预开通是唯一需要反向走的路径。
     """
 
-    def lookup_by_user_id(self, user_id: str) -> Any: ...
+    def lookup_by_user_id(self, user_id: str) -> Any:
+        """按 ``user_id`` 回读组织快照候选成员。"""
+        ...
 
 
 def locate_by_email(
@@ -256,7 +180,6 @@ def locate_by_email(
     不需要新查询）；邮箱按 ``account_match.normalize_email`` 的同一口径归一，避免
     "名单里大写、花名册里小写"这种纯格式差异被当成查无此人。
     """
-
     needle = normalize_email(email)
     if not needle:
         return PreprovisionSkip(email=email, reason=SKIP_EMAIL_BLANK)
@@ -271,8 +194,8 @@ def locate_by_email(
     if not personnel_ids:
         return PreprovisionSkip(email=email, reason=SKIP_EMAIL_NOT_IN_ROSTER)
     if len(personnel_ids) > 1:
-        # **一律跳过、不猜**（产品负责人 2026-09-02 裁定 6）：认错人会让错的那一行
-        # 永久占住这个邮箱（迁移 0085 的部分唯一索引），真人首聊被拒且**不可自愈**。
+        # 一律跳过、不猜：认错人会让错的那一行永久占住这个邮箱（部分唯一索引下
+        # 不可自愈），真人首聊反而会被拒。
         return PreprovisionSkip(email=email, reason=SKIP_EMAIL_MULTIPLE_PERSONNEL)
 
     lookup = directory.lookup_by_user_id(personnel_ids[0])
@@ -300,10 +223,9 @@ def plan_preprovision(
     不是两个人；对同一个人跑两次开通链没有任何新结果，只会多一条重复的审计。
 
     **逐人不阻塞**：本函数只做定位，一条都不会抛异常带走其余人；真正的开通由调用方
-    （``scripts/ops`` 的预开通入口，rc25 S-8b）逐人 ``try/except`` 调用
+    （``scripts/ops`` 的预开通入口）逐人 ``try/except`` 调用
     ``AutoOnboardingRunner.start_system``。
     """
-
     targets: list[PreprovisionTarget] = []
     skips: list[PreprovisionSkip] = []
     seen: set[str] = set()
@@ -328,16 +250,14 @@ def plan_preprovision(
 
 @dataclass(frozen=True)
 class PreprovisionGrant:
-    """随预开通链一起落库的那一笔预授权，以及**谁**要为它负责。
+    """随预开通链一起落库的那一笔预授权，以及谁要为它负责。
 
-    ``plan`` 的具体形态由落库口定义（rc25 S-8b 的
-    ``PostgresLocalPermissionOverrideStore.import_position_grant``，形状是「职位 + 公司
-    范围」展开出来的公司×指标计划）。本模块**刻意不去认识它**：开通链在这条路上只做
-    两件事——把它交给落库口、并保证落库发生在零银河判定**之前**。多认识一层就会在
-    ``core/identity`` 里长出第二份权限展开逻辑。
+    ``plan`` 的具体形态由落库口（``PostgresLocalPermissionOverrideStore.import_position_grant``）
+    定义，本模块刻意不去认识它：只负责交给落库口、并保证落库发生在零银河判定之前，
+    多认识一层会在此处长出第二份权限展开逻辑。
 
-    ``initiated_by_open_id`` 是产品负责人本人的 open_id，写进合成 ``pending_action``
-    的责任人栏。**没有默认值**：审计栏目里一个无法追溯的假身份比没有审计更糟。
+    ``initiated_by_open_id`` 写进合成 ``pending_action`` 的责任人栏，没有默认值：
+    审计栏目里一个无法追溯的假身份比没有审计更糟。
     """
 
     plan: Any
@@ -345,15 +265,15 @@ class PreprovisionGrant:
 
 
 class PositionGrantImporter(Protocol):
-    """预授权的落库口（rc25 S-8b 的 ``PostgresLocalPermissionOverrideStore.
-    import_position_grant``）。形状照 ``LegacyPermissionImporter.import_plan``：每用户
-    一事务——合成一条已终态的 ``pending_action``（``local_permission_override.
-    pending_action_id`` 是结构性 NOT NULL 外键，迁移 ``0072``「没有确认卡不能写入」）
-    与全部 ``local_permission_override`` 行原子落库，撞唯一索引降级为 ``already_present``。
+    """预授权的落库口（``PostgresLocalPermissionOverrideStore.import_position_grant``）。
 
-    任何异常原样上抛，由 ``AutoOnboardingRunner`` 按本侧故障 fail-closed（外部表零写入）
-    ——与 S-1 差集导入同一条纪律：一笔没落下去的预授权绝不能让这个人带着"少了权限"的
-    范围被发布出去。
+    形状照 ``LegacyPermissionImporter.import_plan``：每用户一事务——合成一条已终态的
+    ``pending_action``（``local_permission_override.pending_action_id`` 是结构性
+    NOT NULL 外键，没有确认卡不能写入）与全部 ``local_permission_override`` 行原子
+    落库，撞唯一索引降级为 ``already_present``。
+
+    任何异常原样上抛，由 ``AutoOnboardingRunner`` 按本侧故障 fail-closed（外部表零
+    写入）：一笔没落下去的预授权绝不能让这个人带着"少了权限"的范围被发布出去。
     """
 
     def import_position_grant(
@@ -364,7 +284,9 @@ class PositionGrantImporter(Protocol):
         grant: Any,
         now: datetime,
         initiated_by_open_id: str,
-    ) -> Any: ...
+    ) -> Any:
+        """把这一笔预授权原子落库。"""
+        ...
 
 
 def import_preprovision_grant(
@@ -381,10 +303,8 @@ def import_preprovision_grant(
 
     静默跳过的用户可见后果是：这个人被开通了、令牌签了、正式表也写了，但**范围里没有
     名单答应给他的那部分权限**——他能问数，只是问不出该问的东西，而当天没有任何东西
-    会报警。这与 rc25 S-1 那次"装了存量令牌源、没装差集导入口"的真实漏接是同一个形状，
-    修法也照抄：宁可响亮失败。
+    会报警。宁可响亮失败。
     """
-
     if importer is None:
         raise OnboardingChainError("preprovision_grant_importer_not_wired")
     report = importer.import_position_grant(
@@ -448,7 +368,6 @@ def run_system_onboarding(
     花名册读不出来（``rows()`` 返回 ``None``）时同样跳过而不是当成"查无此人"：那是
     我们暂时看不见，不是这个邮箱不存在，两者的下一步动作完全不同。
     """
-
     if origin != ORIGIN_PREPROVISION:
         raise ValueError("系统触发目前只有预开通这一个来源")
     if not str(initiated_by_open_id or "").strip():

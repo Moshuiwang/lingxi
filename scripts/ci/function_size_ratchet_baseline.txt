@@ -7,23 +7,3 @@
 # 被 --refresh 自动登记进来：先拆分或精简；确有理由要接受它作为新的棘轮登记
 # 对象，人工在下面加一行「行数<TAB>键」，门禁会核对这一行是否等于实际行数。
 
-83	src/lingxi/core/identity/first_contact.py::decide_first_contact
-86	src/lingxi/core/identity/legacy_permission_import.py::import_legacy_permissions
-92	src/lingxi/core/identity/onboarding_guards.py::reject_email_bound_to_another_person
-70	src/lingxi/core/identity/org_snapshot.py::verify_batch
-63	src/lingxi/core/identity/roster_snapshot.py::decide_snapshot_update
-126	src/lingxi/core/permission/account_match.py::match_galaxy_account
-88	src/lingxi/core/permission/galaxy_export.py::_check_references
-68	src/lingxi/core/permission/galaxy_export.py::_normalize_table
-66	src/lingxi/core/permission/galaxy_export.py::validate_export
-68	src/lingxi/core/permission/galaxy_scope.py::resolve_company_scope
-62	src/lingxi/core/permission/mcp_readiness.py::McpReadinessConfirmation.confirm
-69	src/lingxi/core/permission/mcp_readiness.py::ReadinessTicker.advance
-79	src/lingxi/core/permission/mcp_readiness.py::_ReadinessProbeRunner._probe_once
-133	src/lingxi/core/permission/merge_sources.py::merge_permission_sources
-69	src/lingxi/core/permission/metric_translation.py::build_company_function_metric_map
-71	src/lingxi/core/permission/notification.py::PermissionNoticeDispatcher.notify
-66	src/lingxi/core/permission/position_override.py::expand_position_scope
-193	src/lingxi/core/permission/publish.py::publish_claim
-128	src/lingxi/core/permission/publish_row.py::aggregate_permission
-97	src/lingxi/core/permission/targeted_recompute.py::TargetedPermissionRecompute.recompute_and_publish

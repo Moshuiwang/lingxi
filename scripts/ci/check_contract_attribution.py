@@ -417,23 +417,8 @@ GROUNDED_ATTRIBUTIONS: tuple[GroundedAttribution, ...] = (
         "系统与外部依赖边界",
     ),
     GroundedAttribution(
-        "src/lingxi/core/permission/mcp_readiness.py",
+        "src/lingxi/core/permission/mcp_readiness_base.py",
         "产品合同要求「明确确认该用户应有的公司和职能权限已经同步且可以问数后，才宣告开通成功」。",
-        "开通流程",
-    ),
-    GroundedAttribution(
-        "src/lingxi/core/permission/mcp_readiness.py",
-        "``now`` 必然略大于 ``started + 900``，于是合同要求的最后一次探针永远被跳过，",
-        "开通流程",
-    ),
-    GroundedAttribution(
-        "src/lingxi/core/permission/mcp_readiness.py",
-        "``now`` 必然略大于 ``started + 900``，于是合同要求的最后一次探针**永远被跳过**，",
-        "开通流程",
-    ),
-    GroundedAttribution(
-        "src/lingxi/core/permission/mcp_readiness.py",
-        "# 累计到第六次时 ``now`` 必然略过 ``started + 900``，合同要求的最后一次探针",
         "开通流程",
     ),
     GroundedAttribution(
@@ -553,16 +538,6 @@ REGISTERED_EXCEPTIONS: tuple[RegisteredException, ...] = (
         "PR #208 二级独立复核",
         '"合同条款"在这里是转述二级审查的用词，指验收矩阵 V-花名册-41 这条被独立复核'
         "钉住的判据，不是指产品合同与外部边界正文；该文档没有关于花名册替换判据的具体规定。",
-    ),
-    RegisteredException(
-        "src/lingxi/core/permission/publish_row.py",
-        ":mod:`lingxi.core.permission.role_function`），而合同要求这里放**指标名**。中间缺的",
-        "Issue #155",
-        "2026-08-17",
-        "产品负责人",
-        "「发布表值列表放指标名」出自 Issue #155 产品负责人对三问的答复（留痕见该 "
-        "Issue 评论），是与问数 MCP 消费方的既定数据格式约定，产品合同与外部边界 "
-        "正文没有规定发布表的具体字段格式。",
     ),
     RegisteredException(
         "tests/test_roster_snapshot.py",
