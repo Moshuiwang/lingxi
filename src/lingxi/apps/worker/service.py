@@ -206,6 +206,10 @@ class WorkerService:
         """每一轮的巡检；实现见 :class:`~lingxi.apps.worker.housekeeping.QueueHousekeeper`。"""
         return self._housekeeper.run()
 
+    def _cleanup_agent_sessions(self) -> None:
+        """会话清理转发口；实现见 :class:`~lingxi.apps.worker.housekeeping.QueueHousekeeper`。"""
+        self._housekeeper._cleanup_agent_sessions()
+
     def _emit_heartbeat(self) -> None:
         """戳一次活性；失败只记异常类型，不能因为告警输入失败而让 worker 停止消费。"""
         if self._heartbeat is None:

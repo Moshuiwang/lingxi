@@ -129,6 +129,7 @@ class _WriteAction:
     reason: str | None = None
     position_name: str | None = None
     company_scope: str | None = None
+    origin_card_message_id: str | None = None
 
 
 class AdminCommandRouter:
@@ -400,6 +401,7 @@ class AdminCommandRouter:
                 position_name=command.position_name,
                 company_scope=command.company_scope,
                 reason=command.reason,
+                origin_card_message_id=ctx.origin_card_message_id,
             ),
             ctx,
         )
@@ -624,7 +626,8 @@ class AdminCommandRouter:
         """按端口实际接受的参数形状拼准备调用的入参。
 
         旧的注入式端口只接受公司与指标字段；职位表单才附加扩展参数，避免无关的旧测试
-        因可选字段破坏接口兼容。追溯号也只在端口确实接受它时才传。
+        因可选字段破坏接口兼容。来源卡片消息号只随授权（职位表单）动作下传——收回动作
+        不引用管理卡行，否则会撞上不存在的外键。追溯号也只在端口确实接受它时才传。
         """
         kwargs: dict[str, object] = {
             "action_type": action.action_type,
@@ -638,8 +641,8 @@ class AdminCommandRouter:
             kwargs["position_name"] = action.position_name
         if action.company_scope is not None:
             kwargs["company_scope"] = action.company_scope
-        if ctx.origin_card_message_id is not None:
-            kwargs["origin_card_message_id"] = ctx.origin_card_message_id
+        if action.origin_card_message_id is not None:
+            kwargs["origin_card_message_id"] = action.origin_card_message_id
         if action.position_name is not None and self._accepts_trace_id():
             kwargs["trace_id"] = ctx.trace_id
         return kwargs
