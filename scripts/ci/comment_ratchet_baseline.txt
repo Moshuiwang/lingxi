@@ -127,7 +127,6 @@
 3	docstring_over	src/lingxi/core/identity/onboarding_runner.py
 2	docstring_over	src/lingxi/core/innertest_content_capture.py
 1	docstring_over	src/lingxi/core/mcp_naming.py
-1	docstring_over	src/lingxi/core/permission/galaxy_scope.py
 1	docstring_over	src/lingxi/core/permission/legacy_diff.py
 5	docstring_over	src/lingxi/core/permission/local_override.py
 6	docstring_over	src/lingxi/core/permission/metric_translation.py
@@ -359,7 +358,6 @@
 2	provenance	src/lingxi/core/ids.py
 7	provenance	src/lingxi/core/innertest_content_capture.py
 3	provenance	src/lingxi/core/mcp_naming.py
-4	provenance	src/lingxi/core/permission/galaxy_scope.py
 9	provenance	src/lingxi/core/permission/legacy_diff.py
 5	provenance	src/lingxi/core/permission/local_override.py
 9	provenance	src/lingxi/core/permission/metric_translation.py
