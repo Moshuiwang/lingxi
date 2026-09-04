@@ -6,12 +6,38 @@ libpq 的启动参数，连接建立后的第一条业务语句也已经受约�
 
 本模块只依赖标准库；``psycopg`` 在真正建连的函数内延迟导入，保持没有数据库驱动
 的纯逻辑测试仍能导入正式包。
+
+## 进程内连接复用（Issue #593）
+
+仓库里 140 余处 ``with connect(dsn, timeouts=...) as conn:`` 都是"建连 → 一个事务
+→ 断开"。三个常驻服务的轮询循环把这个模式放大成每分钟约 400 次 TLS 握手，
+Supabase 侧每次握手要发约 4 KB 证书链，成了出口流量的主体（#593 诊断数据）。
+
+修法不改任何调用点：``connect()`` 默认返回 ``ReusableConnection``——一个 psycopg
+``Connection`` 子类，只覆盖 ``close()``。``with`` 语句退出时驱动自己先 ``commit()`` /
+``rollback()``，再调用 ``close()``；被覆盖的 ``close()`` 把仍然健康的连接放回本进程的
+空闲栈，下一次同一 DSN、同一超时配置的 ``connect()`` 直接取用。连接已断、回滚
+失败、或空闲栈已到上界时才真正关闭。除此之外它就是一条普通的 psycopg 连接：
+游标、事务、``closed`` 状态、超时启动参数都与改动前逐位相同。
+
+两类调用方**不进**空闲栈，由 ``dedicated=True``（或任何额外的 psycopg 关键字
+参数，例如 ``autocommit=True``）声明：``LISTEN`` 适配器和常驻轮询自己长期持有的
+连接。它们拿到的是驱动原生连接，``close()`` 真正关闭。
+
+一次性命令（migrate、healthcheck、ops 脚本）行为不变：进程退出时 ``atexit``
+把空闲栈里的连接关干净，不给 pooler 留悬挂会话。
 """
 
 from __future__ import annotations
 
+import atexit
+import logging
+import threading
+import time
 from dataclasses import dataclass
 from typing import Any, Mapping
+
+logger = logging.getLogger(__name__)
 
 DEFAULT_CONNECT_TIMEOUT_SECONDS = 5
 DEFAULT_STATEMENT_TIMEOUT_SECONDS = 3
@@ -26,6 +52,19 @@ DEFAULT_LOCK_TIMEOUT_SECONDS = 2
 # (20 + 4.2 + 5 * (MAX_TIMEOUT_SECONDS + 2 * MAX_TIMEOUT_SECONDS)) * 1.5 <= 150；
 # MAX=5 时为 148.8s（取整要求 149s），MAX=6 时已为 171.3s，故合法上界只能是 5s。
 MAX_TIMEOUT_SECONDS = 5
+
+#: 每个 (DSN, 超时配置) 组合最多保留的空闲连接数；超出的连接在归还时真正关闭。
+#: 在用连接不设上界——与改动前"每次调用各自建连"的并发形状一致——所以一个进程的
+#: 连接数上界是"同时在用的数量 + 组合数 × 本值"。取 4：gateway 一个进程里有长连接
+#: 事件线程、投递线程、文档投递线程、管理回调线程四条会碰数据库的线程，恰好各留
+#: 一条；scheduler / worker 的并发更低。
+MAX_IDLE_CONNECTIONS_PER_KEY = 4
+
+#: 空闲超过这个秒数的连接，再次取用前先发一条 ``SELECT 1`` 探活。服务端在两次取用
+#: 之间悄悄掐断的连接（pooler 回收、数据库重启、``pg_terminate_backend``）在这里被
+#: 丢弃重建，调用方看不到失败。更短的空闲期不探：常驻轮询 1–2 秒一次，每次都探
+#: 等于把往返翻倍；这种间隔下即便碰上断线，也只是当次操作失败、下一轮换新连接。
+IDLE_PROBE_AFTER_SECONDS = 30.0
 
 
 class PostgresTimeoutConfigError(ValueError):
@@ -101,17 +140,191 @@ def _read_timeout(environment: Mapping[str, str], name: str, default: int) -> in
     return _validate_timeout(name, value)
 
 
+_PoolKey = tuple[str, PostgresTimeouts]
+
+
+class _IdleConnectionPool:
+    """按 (DSN, 超时配置) 分组的空闲连接栈；只保管此刻没人在用的连接。
+
+    在用的连接不在这里登记：``connect()`` 取走即离开栈，``close()`` 归还才回来。
+    因此同一线程里嵌套的两个 ``with connect()`` 拿到的是两条不同的物理连接，
+    不会出现内层退出把外层事务一并提交的情况。
+    """
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._idle: dict[_PoolKey, list[tuple[Any, float]]] = {}
+        self._atexit_registered = False
+
+    def acquire(self, key: _PoolKey) -> Any | None:
+        """取一条可用的空闲连接；没有则返回 ``None``，由调用方新建。"""
+
+        while True:
+            with self._lock:
+                stack = self._idle.get(key)
+                if not stack:
+                    return None
+                connection, released_at = stack.pop()
+            if connection.closed:
+                continue
+            if time.monotonic() - released_at > IDLE_PROBE_AFTER_SECONDS and not connection.probe():
+                logger.info("空闲数据库连接探活失败，丢弃重建")
+                connection.discard()
+                continue
+            return connection
+
+    def release(self, key: _PoolKey, connection: Any) -> bool:
+        """归还一条连接。返回 ``True`` 表示已放回空闲栈；``False`` 表示它不该再被
+        复用，调用方必须真正关闭它。"""
+
+        if connection.closed or not connection.reset_for_reuse():
+            return False
+        with self._lock:
+            stack = self._idle.setdefault(key, [])
+            if len(stack) >= MAX_IDLE_CONNECTIONS_PER_KEY:
+                return False
+            stack.append((connection, time.monotonic()))
+            if not self._atexit_registered:
+                atexit.register(self.close_all)
+                self._atexit_registered = True
+        return True
+
+    def close_all(self) -> int:
+        """真正关闭全部空闲连接，返回关闭的数量。进程退出时经 ``atexit`` 调用。"""
+
+        with self._lock:
+            stacks = list(self._idle.values())
+            self._idle.clear()
+        closed = 0
+        for stack in stacks:
+            for connection, _released_at in stack:
+                connection.discard()
+                closed += 1
+        return closed
+
+    def idle_count(self, key: _PoolKey | None = None) -> int:
+        with self._lock:
+            if key is not None:
+                return len(self._idle.get(key, ()))
+            return sum(len(stack) for stack in self._idle.values())
+
+
+_IDLE_POOL = _IdleConnectionPool()
+
+
+def close_idle_connections() -> int:
+    """关闭本进程空闲栈里的全部连接，返回数量。``apps`` 层停机或测试隔离时调用；
+    正常退出由 ``atexit`` 自动完成。"""
+
+    return _IDLE_POOL.close_all()
+
+
+def idle_connection_count() -> int:
+    """当前空闲栈里的连接数（观测与测试用）。"""
+
+    return _IDLE_POOL.idle_count()
+
+
+_reusable_connection_type: type | None = None
+
+
+def _build_reusable_connection_type() -> type:
+    """延迟构造 psycopg ``Connection`` 子类：模块顶层不能 import 驱动。"""
+
+    global _reusable_connection_type
+    if _reusable_connection_type is not None:
+        return _reusable_connection_type
+
+    import psycopg
+    from psycopg.pq import TransactionStatus
+
+    class ReusableConnection(psycopg.Connection):  # type: ignore[type-arg]
+        """``close()`` 改为归还进程内空闲栈的连接；其余行为与驱动完全一致。
+
+        ``with`` 语句退出时驱动自己先 ``commit()`` / ``rollback()``，最后调用
+        ``close()``——本类只接管这一步：连接健康就归还，坏了或栈满就真关。
+        """
+
+        _lingxi_pool_key: _PoolKey | None = None
+
+        def close(self) -> None:
+            key = self._lingxi_pool_key
+            if key is None or self.closed:
+                super().close()
+                return
+            if _IDLE_POOL.release(key, self):
+                return
+            self.discard()
+
+        def discard(self) -> None:
+            """真正关闭，不再归还。"""
+
+            self._lingxi_pool_key = None
+            super().close()
+
+        def reset_for_reuse(self) -> bool:
+            """把连接恢复到"没有事务、默认会话属性"的初始形状。
+
+            返回 ``False`` 表示恢复不了（回滚失败、状态未知或语句仍在执行），这条
+            连接必须丢弃。回滚是这里唯一会发数据库语句的动作：调用方经 ``close()``
+            直接归还而没有先 ``commit()`` 时，未提交的改动与直接关闭一样被丢弃——
+            不能带着别人的半截事务给下一位借用者。属性复位都是本地赋值，不发语句。
+            """
+
+            status = self.pgconn.transaction_status
+            if status in (TransactionStatus.ACTIVE, TransactionStatus.UNKNOWN):
+                return False
+            try:
+                if status != TransactionStatus.IDLE:
+                    self.rollback()
+                if self.autocommit:
+                    self.autocommit = False
+                if self.read_only is not None:
+                    self.read_only = None
+                if self.isolation_level is not None:
+                    self.isolation_level = None
+                if self.deferrable is not None:
+                    self.deferrable = None
+            except Exception as error:  # noqa: BLE001 - 复位失败只意味着不复用，不需要区分原因
+                logger.info("数据库连接归还前复位失败，改为关闭：%s", type(error).__name__)
+                return False
+            return True
+
+        def probe(self) -> bool:
+            """一次往返确认服务端还在；失败返回 ``False``。"""
+
+            try:
+                self.autocommit = True
+                try:
+                    with self.cursor() as cursor:
+                        cursor.execute("SELECT 1")
+                        cursor.fetchone()
+                finally:
+                    self.autocommit = False
+            except Exception:  # noqa: BLE001 - 探活失败的原因不重要，结论都是丢弃
+                return False
+            return True
+
+    _reusable_connection_type = ReusableConnection
+    return ReusableConnection
+
+
 def connect(
     dsn: str,
     *,
     timeouts: PostgresTimeouts = DEFAULT_POSTGRES_TIMEOUTS,
+    dedicated: bool = False,
     **kwargs: Any,
 ) -> Any:
-    """按仓库约定建立一个 PostgreSQL 连接。
+    """按仓库约定取得一个 PostgreSQL 连接。
+
+    默认返回可复用连接（见模块说明）：同一 DSN 与超时配置下，上一次 ``close()``
+    归还的健康连接会被直接取用；没有可用的空闲连接时才真正建连。
+    ``dedicated=True`` 或任何额外的 psycopg 关键字参数（``autocommit`` 等）表示
+    调用方要一条驱动原生的独占连接：不从空闲栈取、``close()`` 真正关闭。
 
     ``connect_timeout`` 与 ``options`` 不允许由调用方通过 ``kwargs`` 覆盖；需要改变
-    边界时必须先构造经过校验的 :class:`PostgresTimeouts`。其余 psycopg 连接参数（例如
-    ``autocommit`` 或 ``user``）可以用于测试与受控适配场景。
+    边界时必须先构造经过校验的 :class:`PostgresTimeouts`。
     """
 
     if "connect_timeout" in kwargs or "options" in kwargs:
@@ -120,9 +333,22 @@ def connect(
         raise TypeError("数据库连接超时必须使用 PostgresTimeouts")
     import psycopg
 
-    return psycopg.connect(
+    if dedicated or kwargs:
+        return psycopg.connect(
+            dsn,
+            connect_timeout=timeouts.connect_timeout_seconds,
+            options=timeouts.libpq_options,
+            **kwargs,
+        )
+
+    key: _PoolKey = (dsn, timeouts)
+    connection = _IDLE_POOL.acquire(key)
+    if connection is not None:
+        return connection
+    connection = _build_reusable_connection_type().connect(
         dsn,
         connect_timeout=timeouts.connect_timeout_seconds,
         options=timeouts.libpq_options,
-        **kwargs,
     )
+    connection._lingxi_pool_key = key
+    return connection

@@ -99,7 +99,7 @@ class _TaskQueueBase:
         connection = self._pooled_connection
         reused = connection is not None and not connection.closed
         if not reused:
-            connection = connect(self._dsn, timeouts=self._timeouts)
+            connection = connect(self._dsn, timeouts=self._timeouts, dedicated=True)
             self._pooled_connection = connection
 
         try:
@@ -113,7 +113,7 @@ class _TaskQueueBase:
             # `connect()`），或重试的 `operation` 在提交前又失败，都不再兜底，
             # 原样向上抛出——只有"提交前失败"才走这条重试分支；重试之后的
             # `commit()` 与首次尝试共用下面同一段"提交阶段绝不重试"的逻辑。
-            connection = connect(self._dsn, timeouts=self._timeouts)
+            connection = connect(self._dsn, timeouts=self._timeouts, dedicated=True)
             self._pooled_connection = connection
             try:
                 result = operation(connection)
