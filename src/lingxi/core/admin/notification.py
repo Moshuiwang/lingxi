@@ -67,12 +67,12 @@ _GROUP_REASON_PREVIEW_LENGTH = 20
 
 
 def _permission_payload(pending: PendingAction) -> dict[str, Any] | None:
-    """解析 ``pending.payload``（JSON 字符串，仅本地权限三类动作非空，见迁移
-    ``0073``）。解析失败或缺失时返回 ``None``——调用方据此跳过范围行的渲染，不让
-    一条格式异常的历史行让整个渲染函数崩溃（本模块全程是纯函数，不允许因为一条
+    """解析 ``pending.payload``（JSON 字符串，仅本地权限三类动作非空）。
+
+    解析失败或缺失时返回 ``None``——调用方据此跳过范围行的渲染，不让一条
+    格式异常的历史行让整个渲染函数崩溃（本模块全程是纯函数，不允许因为一条
     脏数据抛出未预期的异常）。
     """
-
     if not pending.payload:
         return None
     try:
@@ -83,12 +83,12 @@ def _permission_payload(pending: PendingAction) -> dict[str, Any] | None:
 
 
 def _direction_prefix(payload: dict[str, Any]) -> str:
-    """收回的 payload 携带 ``direction``（被收回那一行原本是授权还是抑制，见
-    ``adapters/postgres_pending_action.py`` 模块文档「本地权限收回如何复用同一
-    套机制」）；授权/抑制两类动作的 payload 从不携带这个键（`.get` 落空返回
-    ``""``），对它们完全不改变既有渲染——这条"方向"信息只有收回才需要额外说明。
-    """
+    """收回场景下渲染一行"方向：..."前缀，其余动作返回空字符串。
 
+    收回的 payload 携带 ``direction``（被收回那一行原本是授权还是抑制）；
+    授权/抑制两类动作的 payload 从不携带这个键（``.get`` 落空返回 ``""``），
+    对它们完全不改变既有渲染。
+    """
     direction = payload.get("direction")
     if not direction:
         return ""
@@ -111,7 +111,6 @@ def permission_scope_ids(pending: PendingAction) -> tuple[str, str] | None:
     ``company_label``/``metric_label`` 参数。非本地权限动作或 payload 不可用
     都返回 ``None``，渲染函数自身仍会走既有的降级路径。
     """
-
     if pending.action_type not in LOCAL_PERMISSION_ACTION_TYPES:
         return None
     payload = _permission_payload(pending)
@@ -130,7 +129,6 @@ def _position_company_count(payload: Mapping[str, Any]) -> int:
     新 payload 会保存展开后的 ``companies``，但旧/手工构造的 payload 可能只保留
     ``pairs``；两者都按去重后的真实公司键计数，绝不把 ``*`` 当成一家公司的标签。
     """
-
     raw_companies = payload.get("companies")
     values: list[str] = []
     if isinstance(raw_companies, (list, tuple, set)):
@@ -161,8 +159,8 @@ def _permission_scope_block(
     静默返回空字符串（会让管理员误以为不涉及具体范围），改为渲染
     :data:`_SCOPE_UNAVAILABLE_TEXT` 显式降级提示。``company_label``/
     ``metric_label`` 缺省时退回 payload 里的原始 ID；收回额外插入一行
-    "方向：..."（见 :func:`_direction_prefix`）。"""
-
+    "方向：..."（见 :func:`_direction_prefix`）。
+    """
     if pending.action_type not in LOCAL_PERMISSION_ACTION_TYPES:
         return ""
     payload = _permission_payload(pending)
@@ -194,10 +192,12 @@ def _permission_scope_suffix(
     company_label: str | None = None,
     metric_label: str | None = None,
 ) -> str:
-    """管理群通知（单行文案）里的范围后缀；非本地权限动作返回空字符串。收回的
-    后缀额外带上方向（同上，见 :func:`_direction_prefix`）。``company_label``/
-    ``metric_label`` 同 :func:`_permission_scope_block`。"""
+    """管理群通知（单行文案）里的范围后缀。
 
+    非本地权限动作返回空字符串。收回的后缀额外带上方向（同上，见
+    :func:`_direction_prefix`）。``company_label``/``metric_label`` 同
+    :func:`_permission_scope_block`。
+    """
     payload = _permission_payload(pending)
     if payload is None:
         return ""
@@ -235,6 +235,8 @@ DECISION_CANCEL = "cancel"
 
 @dataclass(frozen=True)
 class ConfirmCardButton:
+    """确认卡上一个可点击按钮的展示文本与回传值。"""
+
     label: str
     #: 绑定在按钮上的回传值；``card.action.trigger`` 事件的 ``action.value`` 原样
     #: 带回这个 mapping。只放 ``pending_action_id`` 与 ``decision`` 两个字段——
@@ -252,21 +254,19 @@ class RenderedConfirmCard:
 
     @property
     def is_terminal(self) -> bool:
+        """没有任何按钮即视为终态卡片。"""
         return not self.buttons
 
 
 def render_card_payload(card: RenderedConfirmCard) -> dict[str, Any]:
     """把 :class:`RenderedConfirmCard` 编码成 CardKit JSON 2.0 的 ``data`` 载荷。
 
-    不 import 飞书 SDK，供真实出站发送、回调应答两个调用点复用，不允许分叉出
-    第二份。两个按钮横排进一个 ``column_set`` 容器
-    （``core/admin/card_layout.button_row``），不套
-    ``{"tag": "action", "actions": [...]}``——那个容器已被真实 CardKit 拒绝。
-    回调形态用 ``"behaviors": [{"type": "callback", "value": {...}}]``，
-    ``value`` 内容是 ``pending_action_id``/``decision`` 两个键；按钮不在
-    ``form`` 容器内不需要 ``name`` 字段。``buttons`` 为空（终态卡片）时只有
-    一个 markdown 元素、没有任何按钮元素，不靠禁用态按钮或前端约定表达。"""
-
+    不 import 飞书 SDK，供真实出站发送、回调应答两个调用点复用。两个按钮横排
+    进一个 ``column_set`` 容器，不套已被真实 CardKit 拒绝的
+    ``{"tag": "action", "actions": [...]}``。回调形态用 ``"behaviors":
+    [{"type": "callback", "value": {...}}]``，按钮不在 ``form`` 容器内不需要
+    ``name`` 字段。``buttons`` 为空（终态卡片）时只有一个 markdown 元素。
+    """
     elements: list[dict[str, Any]] = [
         {"tag": "markdown", "content": f"**{card.title}**\n\n{card.body}"}
     ]
@@ -294,25 +294,34 @@ def render_card_payload(card: RenderedConfirmCard) -> dict[str, Any]:
 
 @dataclass(frozen=True)
 class AdminCardCreated:
-    """建卡并作为消息发出后的结果，与 ``core.execution.card_stream.CardCreated``
-    同一形状（``card_id`` 用于后续更新，``message_id`` 是可回读标识）。"""
+    """建卡并作为消息发出后的结果。
+
+    与 ``core.execution.card_stream.CardCreated`` 同一形状（``card_id`` 用于
+    后续更新，``message_id`` 是可回读标识）。
+    """
 
     card_id: str
     message_id: str
 
 
+#: **有意不按 N818 改名为 ``...Error`` 后缀**：``ConfirmCardDispatcher`` 的失败
+#: 审计把 ``type(error).__name__`` 原样记进审计字段，``SendFailureAuditTests``
+#: 断言这个字段等于字面量 ``"AdminCardDeliveryRejected"``——改名会让审计
+#: 字段的取值静默改变，是一次真实的行为变化，不是纯移动式重构允许的范围；
+#: 宁可登记一条已知的 N818 违规，也不做隐性行为改动。
 class AdminCardDeliveryRejected(Exception):
     """服务端已经给出完整响应、并以明确的业务错误码拒绝这次外发——不是"结果不明"。
 
-    与 ``core.execution.card_stream.DeliveryRejected`` 同一白名单纪律：真实 adapter
-    只在能读到 ``code``/``msg`` 的明确拒绝响应时才抛出它；其余异常（网络类、JSON
-    解析失败、响应缺可回读标识）一律不属于这个类型，落进调用方的"结果不明"分支
-    （待确认操作因此保持 ``card_delivered=False``，视为作废，不冒险当成已送达）。
+    与 ``core.execution.card_stream.DeliveryRejectedError`` 同一白名单纪律：真实
+    adapter 只在能读到 ``code``/``msg`` 的明确拒绝响应时才抛出它；其余异常（网络类、
+    JSON 解析失败、响应缺可回读标识）一律不属于这个类型，落进调用方的"结果不明"
+    分支（待确认操作因此保持 ``card_delivered=False``，视为作废，不冒险当成已送达）。
     """
 
     def __init__(
         self, message: str = "", *, code: int | str | None = None, log_id: str | None = None
     ) -> None:
+        """``code``/``log_id`` 是服务端明确拒绝时可回读的诊断字段，可选。"""
         self.code = code
         self.message = message
         self.log_id = log_id
@@ -320,8 +329,11 @@ class AdminCardDeliveryRejected(Exception):
 
 
 class AdminCardTransport(Protocol):
-    """确认卡片的出站端口。真实实现见 ``adapters/feishu_admin_card.LarkAdminCardTransport``；
-    测试注入内存假实现。"""
+    """确认卡片的出站端口。
+
+    真实实现见 ``adapters/feishu_admin_card.LarkAdminCardTransport``；测试
+    注入内存假实现。
+    """
 
     def create(
         self,
@@ -330,18 +342,23 @@ class AdminCardTransport(Protocol):
         thread_id: str | None,
         reply_to_message_id: str,
         card: RenderedConfirmCard,
-    ) -> AdminCardCreated: ...
+    ) -> AdminCardCreated:
+        """建一张确认卡并作为消息发出。"""
 
-    def update(self, *, card_id: str, sequence: int, card: RenderedConfirmCard) -> None: ...
+    def update(self, *, card_id: str, sequence: int, card: RenderedConfirmCard) -> None:
+        """按持久 sequence 把确认卡刷新成新内容。"""
 
 
 class GroupNotifier(Protocol):
-    """管理群通知端口。真实实现是既有
-    ``adapters.feishu_group_message.FeishuGroupMessages.send_text``——本 Protocol
-    只声明调用方（``core/admin/card_callback.py``）实际用到的这一个方法，不要求
-    注入完整的 ``FeishuGroupMessages`` 类型。"""
+    """管理群通知端口。
 
-    def send_text(self, *, chat_id: str, text: str, dedupe_key: str) -> None: ...
+    真实实现是既有 ``adapters.feishu_group_message.FeishuGroupMessages.
+    send_text``——本 Protocol 只声明调用方实际用到的这一个方法，不要求注入
+    完整的 ``FeishuGroupMessages`` 类型。
+    """
+
+    def send_text(self, *, chat_id: str, text: str, dedupe_key: str) -> None:
+        """发一条管理群文本通知。"""
 
 
 def render_confirm_card(
@@ -359,8 +376,8 @@ def render_confirm_card(
     override_id 查出真正的目标用户 open_id 后写回）都不再展示原始 open_id。
     ``company_label``/``metric_label`` 经 :func:`permission_scope_ids` 解析，
     缺省时退回 payload 原始 ID（兼容未接线的调用点）。本地权限三类动作额外
-    插入一行"范围+原因"；撤销再多一行"方向"，不回显其余任何权限内容。"""
-
+    插入一行"范围+原因"；撤销再多一行"方向"，不回显其余任何权限内容。
+    """
     action_label = _ACTION_LABEL[pending.action_type]
     ttl_minutes = PENDING_ACTION_TTL_SECONDS // 60
     body = (
@@ -394,11 +411,12 @@ def render_terminal_card(
     company_label: str | None = None,
     metric_label: str | None = None,
 ) -> RenderedConfirmCard:
-    """终态更新：不再带任何按钮（合同"更新为不可再次操作的最终状态"）。本地权限
-    三类动作同样带上"范围+原因"（撤销再多一行"方向"）这一行，与确认卡同一姿态
-    （见 ``render_confirm_card``；``target_label``/``company_label``/
-    ``metric_label`` 缺省时退回原始 ID）。"""
+    """终态更新：不再带任何按钮（合同"更新为不可再次操作的最终状态"）。
 
+    本地权限三类动作同样带上"范围+原因"（撤销再多一行"方向"）这一行，与
+    确认卡同一姿态（见 ``render_confirm_card``；``target_label``/
+    ``company_label``/``metric_label`` 缺省时退回原始 ID）。
+    """
     action_label = _ACTION_LABEL[pending.action_type]
     scope_block = _permission_scope_block(
         pending, company_label=company_label, metric_label=metric_label
@@ -435,21 +453,23 @@ _FAILED_REASON_TEXT: dict[str, str] = {
 
 
 def describe_failed_reason(reason: str | None) -> str:
-    """把 ``pending.reason``（``FAILED`` 终态的机器码）翻译成中文，供
-    ``card_callback._outcome_text``（发起人私聊终态卡）与 :func:`_group_outcome_text`
-    （管理群广播）共用同一份词表——同一个失败原因不允许两处出现不同的中文说法。
-    """
+    """把 ``pending.reason``（``FAILED`` 终态的机器码）翻译成中文。
 
+    供 ``card_callback._outcome_text``（发起人私聊终态卡）与
+    :func:`_group_outcome_text`（管理群广播）共用同一份词表——同一个失败
+    原因不允许两处出现不同的中文说法。
+    """
     return _FAILED_REASON_TEXT.get(_safe_reason(reason), _FAILED_REASON_TEXT["other"])
 
 
 def _group_outcome_text(pending: PendingAction) -> str:
-    """群通知专用的终态文案。与 ``core/admin/card_callback._outcome_text`` 同一组
-    状态分支，但 ``FAILED`` 分支的 ``reason`` 经过上面的形状白名单——群消息是多人
-    可见的广播面，风险面比只发给发起管理员本人的私聊终态卡片更大，因此单独在这里
-    收窄，不影响 ``card_callback._outcome_text`` 展示给发起人本人的原始 reason。
-    """
+    """群通知专用的终态文案。
 
+    与 ``core/admin/card_callback._outcome_text`` 同一组状态分支，但
+    ``FAILED`` 分支的 ``reason`` 经过上面的形状白名单——群消息是多人可见的
+    广播面，风险面比只发给发起管理员本人的私聊终态卡片更大，因此单独在这里
+    收窄，不影响展示给发起人本人的原始 reason。
+    """
     if pending.status is PendingActionStatus.EXECUTED:
         payload = _permission_payload(pending)
         if payload is not None and payload.get("position_name"):
@@ -471,17 +491,14 @@ def render_group_notice(
     company_label: str | None = None,
     metric_label: str | None = None,
 ) -> str:
-    """管理群终态广播正文：显示被操作用户身份（``target_label``，解析成
-    "姓名（邮箱）"）与可读内容（动作/公司/指标中文名 + 结果），不再显示待确认
-    操作内部 ID——那只用于出站发送的 ``dedupe_key``，定位具体操作改走审计日志；
-    群里也没有任何按钮、命令提示或可执行入口。
+    """管理群终态广播正文。
 
-    终态文案由 :func:`_group_outcome_text` 内部计算，不接受调用方传入
-    ``outcome_text``，确保 ``FAILED`` 分支的 ``reason`` 经过形状白名单。本地
-    权限三类动作额外带"（公司 ... · 指标 ... · 原因 ...）"后缀，撤销场景额外
-    带一段方向文案（见 :func:`_permission_scope_suffix`）；管理员填写的
-    ``reason`` 是自由文本，不做形状白名单（信任级别同确认卡私聊正文）。"""
-
+    显示被操作用户身份与可读内容（动作/公司/指标中文名 + 结果），不再显示
+    待确认操作内部 ID，群里也没有任何按钮、命令提示或可执行入口。终态文案由
+    :func:`_group_outcome_text` 内部计算，确保 ``FAILED`` 分支经过形状白
+    名单。本地权限三类动作额外带范围后缀，撤销场景额外带方向文案；管理员
+    填写的 ``reason`` 是自由文本，不做形状白名单。
+    """
     action_label = _ACTION_LABEL[pending.action_type]
     scope_suffix = _permission_scope_suffix(
         pending, company_label=company_label, metric_label=metric_label

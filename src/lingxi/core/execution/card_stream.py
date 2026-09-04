@@ -9,7 +9,7 @@
 状态连续出现只原地刷新用时；``initial_progress_history`` 让这份累积状态同样
 能跨轮询 resume。同一步骤身份持续过久会被明示为"停滞"。
 
-**「明确失败」与「结果不明」判别用白名单**：三处外发调用只认 ``DeliveryRejected``
+**「明确失败」与「结果不明」判别用白名单**：三处外发调用只认 ``DeliveryRejectedError``
 为"明确失败"，其余异常一律归"结果不明"、原样 ``raise``、不降级不重试。终态
 **关闭**失败不受此规则约束：更新已成功时仅关闭失败不构成结果丢失。
 """
@@ -121,7 +121,6 @@ def encode_progress_action(
     参数或任何查询内容**：编码后的字符串只可能是白名单内的固定形状，永远不含
     调用方传入的原始工具名或输入正文。
     """
-
     if action == PROGRESS_ACTION_QUERYING:
         if query_count is None or query_count < 1:
             raise ValueError("querying 动作必须带一个 >=1 的 query_count")
@@ -145,7 +144,6 @@ def decode_progress_action(content: str | None) -> tuple[str, int | None, str | 
     显示默认文案，也不能让一条脏数据（含蓄意构造、注入内部标识的 `content`）
     炸掉整条投递消费循环，或把不可信内容带进用户可见卡片。
     """
-
     if content == PROGRESS_ACTION_COMPOSING:
         return PROGRESS_ACTION_COMPOSING, None, None
     if content == PROGRESS_ACTION_WORKING:
@@ -174,7 +172,7 @@ class CardCreated:
     message_id: str
 
 
-class DeliveryRejected(Exception):
+class DeliveryRejectedError(Exception):
     """服务端已经给出完整响应、并以明确的业务错误码拒绝这次外发——不是「结果不明」。
 
     本模块与 ``apps.gateway.delivery`` 唯一当作"明确失败"处理的异常类型：
@@ -188,13 +186,21 @@ class DeliveryRejected(Exception):
     def __init__(
         self, message: str = "", *, code: int | str | None = None, log_id: str | None = None
     ) -> None:
+        """``code``/``log_id`` 是服务端明确拒绝时可回读的诊断字段，可选。"""
         self.code = code
         self.message = message
         self.log_id = log_id
         super().__init__(message or f"服务端明确拒绝：code={code} log_id={log_id}")
 
 
+#: 向后兼容别名（N818 改名前的旧名）：其它模块仍在导入 ``DeliveryRejected``，
+#: 统一清理留给集成批次。
+DeliveryRejected = DeliveryRejectedError
+
+
 class CardTransport(Protocol):
+    """流式问数卡片的出站端口：建卡、流式更新、关闭。"""
+
     def create(
         self,
         *,
@@ -202,17 +208,23 @@ class CardTransport(Protocol):
         thread_id: str | None,
         reply_to_message_id: str,
         card: RenderedCard,
-    ) -> CardCreated: ...
+    ) -> CardCreated:
+        """建一张卡片并作为消息发出，返回可用于后续更新的标识。"""
 
-    def update(self, *, card_id: str, sequence: int, card: RenderedCard) -> None: ...
+    def update(self, *, card_id: str, sequence: int, card: RenderedCard) -> None:
+        """按递增的 ``sequence`` 把卡片刷新成新内容。"""
 
-    def close(self, *, card_id: str, sequence: int, card: RenderedCard) -> None: ...
+    def close(self, *, card_id: str, sequence: int, card: RenderedCard) -> None:
+        """把卡片更新为不可再操作的最终状态。"""
 
 
 class TextTransport(Protocol):
+    """同话题文本兜底通道的出站端口。"""
+
     def send_text(
         self, *, chat_id: str, thread_id: str | None, reply_to_message_id: str, text: str
-    ) -> str: ...
+    ) -> str:
+        """发一条文本消息，返回可回读的 message_id。"""
 
 
 SendOutcomeCallback = Callable[[str, bool], None]
@@ -230,10 +242,12 @@ class CardRateLimiter:
     """一个 worker 进程共享：单话题 500ms、全进程 50 次/秒。"""
 
     def __init__(self) -> None:
+        """构造一个空的限流状态；不预先登记任何话题。"""
         self._last_by_topic: dict[str, float] = {}
         self._global_updates: deque[float] = deque()
 
     def allow(self, *, topic: str, now: float) -> bool:
+        """判断这次调用是否放行；放行时顺带记入两条限流窗口。"""
         last = self._last_by_topic.get(topic)
         if last is not None and now - last < 0.5:
             return False
@@ -254,7 +268,6 @@ class CardRateLimiter:
         否则并发多话题同时终态时全局计数会失真。只推进全局窗口，不改动单话题
         的 500ms 记录——终态调用不受单话题节流约束，也不应该反过来影响它。
         """
-
         while self._global_updates and now - self._global_updates[0] >= 1.0:
             self._global_updates.popleft()
         self._global_updates.append(now)
@@ -262,6 +275,8 @@ class CardRateLimiter:
 
 @dataclass(frozen=True)
 class CardStreamResult:
+    """一轮卡片流式交互结束时的最终形态快照。"""
+
     card_id: str | None
     sequence: int
     fallback_text: bool
@@ -333,6 +348,7 @@ class CardStream:
         initial_fallback_needed: bool = False,
         initial_progress_history: Sequence[ProgressStepSnapshot] = (),
     ) -> None:
+        """``initial_*`` 参数接续一次此前已经持久化的状态，见模块文档 resume。"""
         self._chat_id = chat_id
         self._thread_id = thread_id
         self._reply_to_message_id = reply_to_message_id
@@ -368,27 +384,30 @@ class CardStream:
 
     @property
     def fallback_needed(self) -> bool:
+        """是否已经降级为文本兜底通道。"""
         return self._fallback_needed
 
     @property
     def sequence(self) -> int:
+        """当前卡片的最新更新序号。"""
         return self._sequence
 
     @property
     def card_id(self) -> str | None:
+        """当前卡片的标识；尚未建卡时为 ``None``。"""
         return self._card_id
 
     @property
     def message_id(self) -> str | None:
         """当前投递通道（卡片或文本兜底）绑定的可回读标识；尚未取得时为 ``None``。"""
-
         return self._message_id
 
     def start(self) -> None:
-        """建卡并发出。resume 场景下（已经有 ``card_id`` 或已经降级）直接不做事——
-        调用方按持久化状态决定要不要调用这一步，这里的判断只是防御性幂等。
-        """
+        """建卡并发出。
 
+        resume 场景下（已经有 ``card_id`` 或已经降级）直接不做事——调用方按
+        持久化状态决定要不要调用这一步，这里的判断只是防御性幂等。
+        """
         if self._card_id is not None or self._fallback_needed:
             return
         # 初始占位文案（"正在处理 · 0 秒"）刻意**不**计入累积步骤列表：它这一
@@ -413,7 +432,7 @@ class CardStream:
             self._last_update = self._monotonic()
             # 创建本身就是该话题的首帧，后续更新也要遵守 500ms 间隔。
             self._rate_limiter.allow(topic=self._topic, now=self._last_update)
-        except DeliveryRejected:
+        except DeliveryRejectedError:
             # 明确失败：卡片路径统一走同话题文本回退。
             self._notify_send("card_non_final", False)
             self._fallback_needed = True
@@ -429,6 +448,7 @@ class CardStream:
         query_count: int | None = None,
         query_step: str | None = None,
     ) -> None:
+        """记一次进度信号：限流放行时追加/刷新累积正文并出带外更新卡片。"""
         if self._card_id is None or self._fallback_needed:
             return
         if elapsed_seconds >= CARD_AUTO_CLOSE_HANDOFF_SECONDS:
@@ -476,7 +496,6 @@ class CardStream:
         这枚身份已经持续了多久，跨过 :data:`STALL_THRESHOLD_SECONDS` 才交给
         ``_render_step_line`` 切换成停滞明示文案；换成新身份时清零锚点。
         """
-
         if action == PROGRESS_ACTION_QUERYING:
             identity = (action, query_count, query_step)
         else:
@@ -498,16 +517,13 @@ class CardStream:
         self._last_step_identity = identity
 
     def _accumulated_status_card(self) -> RenderedCard:
-        """把当前累积的步骤列表渲染成一张 ``query.status`` 卡片：正文是"已走过
-        的步骤名"按时间顺序换行追加，飞书官方的流式打字机效果天然承担"新行
-        出现"的动态观感，这里只负责让正文本身持续变长。
+        """把当前累积的步骤列表渲染成一张 ``query.status`` 卡片。
 
-        **每次调用都重新渲染全部行**：只有列表里**最后一行**（当前正在发生
-        的步骤）用"正在..."的现在时措辞，其余历史行一律改用"已..."的完成时
-        措辞，避免一条历史行永远停在它被追加那一刻的现在时措辞。停滞判定只对
-        最后一行计算——历史行代表"已经翻篇的步骤"，不存在"停滞"这个概念。
+        正文是"已走过的步骤名"按时间顺序换行追加，这里只负责让正文本身持续
+        变长。**每次调用都重新渲染全部行**：只有列表里**最后一行**用"正在..."
+        的现在时措辞，其余历史行一律改用"已..."的完成时措辞，避免一条历史行
+        永远停在它被追加那一刻的现在时措辞；停滞判定只对最后一行计算。
         """
-
         last_index = len(self._step_records) - 1
         lines: list[str] = []
         for index, record in enumerate(self._step_records):
@@ -546,7 +562,6 @@ class CardStream:
         改走文本通道"这个既定动作——``finally`` 保证 ``_fallback_needed`` 一定
         被置位；即使这一帧没有送达，后续文本终态仍会正常送达最终答案。
         """
-
         now = self._monotonic()
         card = self._status_card_handoff_notice()
         self._sequence += 1
@@ -572,7 +587,6 @@ class CardStream:
         自然语言词表拦截模型日常措辞；没有结果时用 ``query.empty`` 卡自己的
         模板一次性说成一句连贯的话，不先拼"已完成"再拼"没有结果"制造矛盾感。
         """
-
         if failure is not None:
             return self._catalog.card(
                 "query.failure", message=failure.text, contains_model_text=True
@@ -603,7 +617,6 @@ class CardStream:
           答案在同一话题里出现两遍，直接违反"不得同时形成卡片终态与重复文本
           终态"（`V-卡片-03`）。因此关闭失败**不**置位 ``_fallback_needed``。
         """
-
         if self._card_id is None or self._fallback_needed:
             return
         card = self._build_finish_card(
@@ -616,7 +629,7 @@ class CardStream:
             self._rate_limiter.record(topic=self._topic, now=self._monotonic())
             self._transport.update(card_id=self._card_id, sequence=self._sequence, card=card)
             self._notify_send("card_final", True)
-        except DeliveryRejected:
+        except DeliveryRejectedError:
             # 明确失败：终态正文还没确定送达，只能整体降级。
             self._notify_send("card_final", False)
             self._fallback_needed = True
@@ -633,9 +646,9 @@ class CardStream:
             self._transport.close(card_id=self._card_id, sequence=self._sequence, card=card)
             self._notify_send("card_final", True)
         except Exception:  # 见上面的方法说明：不降级，避免重复投递
-            # 这条规则不延伸到这里：关闭失败——无论是 DeliveryRejected 还是
+            # 这条规则不延伸到这里：关闭失败——无论是 DeliveryRejectedError 还是
             # 任何其它异常——都不改变"更新已经成功、答案对用户可见"这个结论，
-            # 因此不单独拆出 ``except DeliveryRejected``。
+            # 因此不单独拆出 ``except DeliveryRejectedError``。
             self._notify_send("card_final", False)
 
     def send_fallback(self, content: RenderedContent) -> str | None:
@@ -643,12 +656,11 @@ class CardStream:
 
         调用方负责在这次调用之前完成"外发前预留位"的持久化——文本发送没有飞书
         原生幂等键，这里的异常刻意不吞掉，交由调用方区分"同步捕获的明确失败"
-        （``DeliveryRejected``，可以清预留位、下一轮重试）、"结果不明"（除
-        ``DeliveryRejected`` 以外的一切异常：转 ``uncertain``，不清预留位、
+        （``DeliveryRejectedError``，可以清预留位、下一轮重试）、"结果不明"（除
+        ``DeliveryRejectedError`` 以外的一切异常：转 ``uncertain``，不清预留位、
         不重试）与"进程崩溃"（预留位留在数据库里，下一轮识别为 ``uncertain``
         而不是自动重发）。
         """
-
         if not self._fallback_needed:
             return None
         try:
@@ -659,7 +671,7 @@ class CardStream:
                 reply_to_message_id=self._reply_to_message_id,
                 text=content.text,
             )
-        except DeliveryRejected:
+        except DeliveryRejectedError:
             # 明确失败：同步捕获，可以清预留位、下一轮重试。
             self._notify_send("message_final", False)
             raise
@@ -690,7 +702,6 @@ class CardStream:
         分支，第三层防御）一律落回通用文案 ``worker.action.querying_metrics``，
         不做任何字符串拼接或动态键名。
         """
-
         if action == PROGRESS_ACTION_COMPLETED:
             return self._catalog.text("worker.action.completed").text
         if action == PROGRESS_ACTION_QUERYING and query_count is not None:
@@ -745,7 +756,6 @@ class CardStream:
         常规的 ``worker.status``；``action_text`` 本身不变——它已经带着"停滞
         发生在哪一步"这个位置信息，停滞措辞只是换了个更明确的后缀。
         """
-
         action_text = self._select_step_action_text(
             action=action, query_count=query_count, query_step=query_step, completed=completed
         )
@@ -758,11 +768,11 @@ class CardStream:
         ).text
 
     def _status_card_handoff_notice(self) -> RenderedCard:
-        """G-CARD 10 分钟自动关闭提前收口的固定文案，复用 ``query.status``
-        卡片形状——不是常规的"{action} · {elapsed_seconds} 秒"状态句，直接
-        展示一句完整、不含占位符的说明。
-        """
+        """G-CARD 10 分钟自动关闭提前收口的固定文案。
 
+        复用 ``query.status`` 卡片形状，不是常规的"{action} · {elapsed_seconds}
+        秒"状态句，直接展示一句完整、不含占位符的说明。
+        """
         return self._catalog.card(
             "query.status", status=self._catalog.text("worker.card_handoff_notice").text
         )
@@ -779,7 +789,6 @@ class CardStream:
 
     def _notify_send(self, operation: str, succeeded: bool) -> None:
         """把发送结果交给告警层；告警层故障不能改变用户任务的出站语义。"""
-
         if self._on_send_outcome is None:
             return
         try:

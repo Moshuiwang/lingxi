@@ -56,17 +56,21 @@ def _safe_identifier_echo(identifier: str) -> str:
 
 
 class CompanyMetricCatalog(Protocol):
-    """公司/指标下拉选项目录端口。真实实现读取
-    ``config/company_function_metric_map.toml``（``adapters/
-    company_function_metric_map_file.py``，已有、未改动），见
+    """公司/指标下拉选项目录端口。
+
+    真实实现读取 ``config/company_function_metric_map.toml``，见
     ``adapters/feishu_admin_card.TomlCompanyMetricCatalog``。本模块不 import
-    adapters/，只声明调用方需要的最小接口（代码框架第二节）。"""
+    adapters/，只声明调用方需要的最小接口（代码框架第二节）。
+    """
 
-    def companies(self) -> Sequence[str]: ...
+    def companies(self) -> Sequence[str]:
+        """全部公司编号。"""
 
-    def metrics(self) -> Sequence[str]: ...
+    def metrics(self) -> Sequence[str]:
+        """全部指标 ID。"""
 
-    def positions(self) -> Sequence[str]: ...
+    def positions(self) -> Sequence[str]:
+        """全部银河职位名。"""
 
 
 def _plain_text(content: str) -> dict[str, str]:
@@ -81,10 +85,12 @@ def _select_static(
     label_for: Callable[[str], str] | None = None,
     required: bool = False,
 ) -> dict[str, Any]:
-    """``label_for``：把每个候选值翻译成管理员看到的展示文本；``value`` 字段
-    永远是原始候选值本身（提交语义不变）。``None`` 时展示文本与提交值相同，
-    占位选项永远不经过 ``label_for``——它本来就不是一个真实的公司/指标。"""
+    """把候选值列表渲染成一个 ``select_static`` 组件。
 
+    ``label_for``：把每个候选值翻译成管理员看到的展示文本；``value`` 字段
+    永远是原始候选值本身（提交语义不变）。``None`` 时展示文本与提交值相同，
+    占位选项永远不经过 ``label_for``——它本来就不是一个真实的公司/指标。
+    """
     option_values = list(dict.fromkeys(options)) or [_CATALOG_UNAVAILABLE_PLACEHOLDER]
 
     def _label(value: str) -> str:
@@ -128,11 +134,13 @@ def _callback_button(
     form_submit: bool = False,
     name: str | None = None,
 ) -> dict[str, Any]:
-    """``name``：form 内提交按钮必须携带非空 ``name``——飞书官方错误码
+    """构造一个卡片按钮元素。
+
+    ``name``：form 内提交按钮必须携带非空 ``name``——飞书官方错误码
     ``200530`` 明确要求（真实点击时触发，建卡请求本身不会暴露）。
     ``form_submit=True`` 但未传 ``name`` 是实现缺陷，直接 ``ValueError`` 失败
-    关闭，不静默漏发这个字段。非 form 内的独立按钮不需要 ``name``。"""
-
+    关闭，不静默漏发这个字段。非 form 内的独立按钮不需要 ``name``。
+    """
     if form_submit and not name:
         raise ValueError("form 内提交按钮必须提供非空 name（飞书官方错误码 200530）")
     button: dict[str, Any] = {
@@ -155,12 +163,13 @@ def _markdown(content: str) -> dict[str, Any]:
 def _galaxy_source_markdown(
     status: AdminUserStatusView, *, company_label_for: Callable[[str], str]
 ) -> str:
-    """与 ``core/admin/router._render_galaxy_source`` 同一段文案逻辑的卡片版
-    （两处刻意不共享实现——一处是纯文本回复，一处是卡片 markdown 片段，调用面
-    很薄，抽公共函数换来的耦合大于收益）。``company_label_for``：调用方已经用
-    批量端口一次性翻译好这次渲染需要的全部公司编号，这里只做字典查找，不再
-    直接持有 ``AdminDisplayNames``、不再自己触发任何一次单项查询。"""
+    """渲染银河来源那一段 markdown 文案。
 
+    与 ``core/admin/router._render_galaxy_source`` 同一段文案逻辑的卡片版
+    （两处刻意不共享实现，调用面很薄，抽公共函数换来的耦合大于收益）。
+    ``company_label_for``：调用方已经用批量端口一次性翻译好这次渲染需要的
+    全部公司编号，这里只做字典查找，不再自己触发任何一次单项查询。
+    """
     summary = status.galaxy_source
     unavailable_reasons = {
         "roster_snapshot_unavailable",
@@ -197,9 +206,11 @@ def _override_row_elements(
     company_label_for: Callable[[str], str],
     metric_label_for: Callable[[str], str],
 ) -> tuple[dict[str, Any], dict[str, Any]]:
-    """``company_label_for``/``metric_label_for``：与 :func:`_galaxy_source_markdown`
-    同一姿态——调用方已经批量翻译好这次渲染需要的全部编号，这里只做字典查找。"""
+    """把一行本地覆盖渲染成"描述 markdown + 撤销按钮"对。
 
+    ``company_label_for``/``metric_label_for``：与 :func:`_galaxy_source_markdown`
+    同一姿态——调用方已经批量翻译好这次渲染需要的全部编号，这里只做字典查找。
+    """
     direction_label = _DIRECTION_LABEL.get(override.direction, override.direction)
     reason = override.reason
     if len(reason) > _OVERRIDE_REASON_PREVIEW_LENGTH:
@@ -242,7 +253,6 @@ def _permission_group_elements(
     ``permission_group_id`` 代表的一个业务项。组 ID 只进入按钮隐藏回调值，不进入
     可见 markdown，避免把内部标识重新变成用户界面语义。
     """
-
     if not overrides or not permission_group_id:
         raise ValueError("职位授权组必须包含至少一行且有 permission_group_id")
     first = overrides[0]
@@ -276,7 +286,6 @@ def _resolve_catalog_data(
     的反序列化兼容；生产目录和所有新卡都提供 ``positions()`` 并走新表单。
     返回 ``(companies, companies_available, metrics, positions, position_form)``。
     """
-
     companies_available = True
     try:
         companies = tuple(catalog.companies())
@@ -312,7 +321,6 @@ def _batch_translate_labels(
     单项查询——真实实现每次单项查询都新建数据库连接，批量端口把连接数收敛到
     与编号数量无关的常数。
     """
-
     galaxy_source = status.galaxy_source
     galaxy_company_ids: tuple[str, ...] = (
         ()
@@ -346,11 +354,12 @@ def _batch_translate_labels(
 def _resolve_user_label(
     display_names: AdminDisplayNames, *, status: AdminUserStatusView, display_identifier: str
 ) -> str:
-    """卡片顶部展示的用户标识：优先经 ``display_names.user_label`` 解析出的
-    人类可读文本，解析不可用或失败时退回管理员实际输入的标识本身（内部 ID
-    形状仍会被 :func:`_safe_identifier_echo` 折叠成通用占位）。
-    """
+    """解析卡片顶部展示的用户标识。
 
+    优先经 ``display_names.user_label`` 解析出的人类可读文本，解析不可用或
+    失败时退回管理员实际输入的标识本身（内部 ID 形状仍会被
+    :func:`_safe_identifier_echo` 折叠成通用占位）。
+    """
     user_label = _safe_identifier_echo(display_identifier)
     user_label_reader = getattr(display_names, "user_label", None)
     if callable(user_label_reader):
@@ -370,9 +379,10 @@ def _render_header_elements(
     display_identifier: str,
     company_label_for: Callable[[str], str],
 ) -> list[dict[str, Any]]:
-    """卡片头部三段 markdown：用户标识行、开通/账号状态行、银河来源行，加上
-    "本地覆盖"分节标题。"""
+    """卡片头部三段 markdown 加上"本地覆盖"分节标题。
 
+    依次是用户标识行、开通/账号状态行、银河来源行。
+    """
     provisioning_labels = {
         "guest": "访客（尚未开始开通）",
         "matching": "银河权限匹配中",
@@ -408,10 +418,11 @@ def _render_local_override_elements(
     company_label_for: Callable[[str], str],
     metric_label_for: Callable[[str], str],
 ) -> list[dict[str, Any]]:
-    """把本地覆盖行渲染成"描述 markdown + 撤销按钮"对；同一
-    ``permission_group_id`` 的多行只渲染一个聚合撤销项，历史无组行各自逐行
-    渲染。"""
+    """把本地覆盖行渲染成"描述 markdown + 撤销按钮"对。
 
+    同一 ``permission_group_id`` 的多行只渲染一个聚合撤销项，历史无组行
+    各自逐行渲染。
+    """
     if not local_overrides:
         return [_markdown("无本地覆盖")]
     elements: list[dict[str, Any]] = []
@@ -452,7 +463,6 @@ def _grant_form_elements(
     display_identifier: str,
 ) -> list[dict[str, Any]]:
     """构造补充授权表单本体：职位/公司范围下拉 + 原因输入框 + 单个提交按钮。"""
-
     scope_options = ("*", *companies)
 
     def _scope_label(value: str) -> str:
@@ -502,10 +512,11 @@ def _render_grant_section(
     status_message: str | None,
     closed: bool,
 ) -> list[dict[str, Any]]:
-    """新形状（``positions()`` 目录可用）的"补充授权"分节：三种互斥态——已
-    关闭、已提交待确认、可继续编辑并提交的表单，外加一个非终态时才出现的
-    取消按钮。"""
+    """新形状（``positions()`` 目录可用）的"补充授权"分节。
 
+    三种互斥态——已关闭、已提交待确认、可继续编辑并提交的表单，外加一个
+    非终态时才出现的取消按钮。
+    """
     elements: list[dict[str, Any]] = [_markdown("**补充授权**")]
     if closed:
         elements.append(_markdown(status_message or dispatch_status or "已关闭"))
@@ -540,9 +551,11 @@ def _render_grant_section(
 
 
 def _legacy_grant_unavailable_elements() -> list[dict[str, Any]]:
-    """旧假目录（无 ``positions()``）分支：命令面已不存在，不渲染任何写入
-    表单，只提示当前不可用——不给管理员一个按不动的按钮。"""
+    """旧假目录（无 ``positions()``）分支的"补充授权"提示。
 
+    命令面已不存在，不渲染任何写入表单，只提示当前不可用——不给管理员一个
+    按不动的按钮。
+    """
     return [
         _markdown("**补充授权**"),
         _markdown("当前目录不可用，暂时无法发起补充授权。"),
@@ -562,7 +575,6 @@ def _prepare_label_resolvers(
     positions, position_form)``——后四项供调用方渲染表单/统计公司数时复用，
     不需要重新读一次目录。
     """
-
     companies, companies_available, metrics, positions, position_form = _resolve_catalog_data(
         catalog
     )
@@ -595,9 +607,10 @@ def _render_overview_elements(
     company_label_for: Callable[[str], str],
     metric_label_for: Callable[[str], str],
 ) -> list[dict[str, Any]]:
-    """卡片头部三段 markdown 加上本地覆盖行——查询结果部分，写表单之前的
-    全部只读展示内容。"""
+    """卡片头部三段 markdown 加上本地覆盖行。
 
+    查询结果部分，写表单之前的全部只读展示内容。
+    """
     elements = _render_header_elements(
         status,
         user_label=user_label,
@@ -628,9 +641,11 @@ def _render_grant_or_legacy_elements(
     status_message: str | None,
     closed: bool,
 ) -> list[dict[str, Any]]:
-    """写表单部分：目录提供 ``positions()`` 时走新形状表单，否则走旧假目录的
-    "当前不可用"提示分支。"""
+    """写"补充授权"表单部分。
 
+    目录提供 ``positions()`` 时走新形状表单，否则走旧假目录的"当前不可用"
+    提示分支。
+    """
     if not position_form:
         return _legacy_grant_unavailable_elements()
     return _render_grant_section(
@@ -664,7 +679,6 @@ def render_management_card(
     指标/用户标识全部经此翻译成人类可读文本。返回值三个分区依次：银河来源 +
     本地覆盖、补充授权表单、（无，不额外追加分隔或页脚）。
     """
-
     (
         company_label_for,
         metric_label_for,
@@ -708,19 +722,22 @@ def render_management_card(
 
 @dataclass(frozen=True)
 class ManagementCardCreated:
-    """建卡并作为消息发出后的结果——与 ``core/admin/notification.AdminCardCreated``
-    同一形状，独立定义是为了不让本模块反向 import ``notification.py``（两张卡各自
-    独立，见模块文档）。"""
+    """建卡并作为消息发出后的结果。
+
+    与 ``core/admin/notification.AdminCardCreated`` 同一形状，独立定义是为了
+    不让本模块反向 import ``notification.py``（两张卡各自独立，见模块文档）。
+    """
 
     card_id: str
     message_id: str
 
 
 class ManagementCardTransport(Protocol):
-    """用户权限管理卡的出站端口。真实实现见
-    ``adapters/feishu_admin_card.LarkAdminManagementCardTransport``；测试注入
-    内存假实现。管理卡的 ``update()`` 在原卡片实体上刷新懒过期、已提交和异步
-    下发状态；更新序号由持久上下文存储提供，不能由调用方硬编码。
+    """用户权限管理卡的出站端口。
+
+    真实实现见 ``adapters/feishu_admin_card.LarkAdminManagementCardTransport``；
+    管理卡的 ``update()`` 在原卡片实体上刷新懒过期、已提交和异步下发状态；
+    更新序号由持久上下文存储提供，不能由调用方硬编码。
     """
 
     def create(
@@ -730,6 +747,8 @@ class ManagementCardTransport(Protocol):
         thread_id: str | None,
         reply_to_message_id: str,
         card: dict[str, Any],
-    ) -> ManagementCardCreated: ...
+    ) -> ManagementCardCreated:
+        """建一张管理卡并作为消息发出。"""
 
-    def update(self, *, card_id: str, sequence: int, card: dict[str, Any]) -> None: ...
+    def update(self, *, card_id: str, sequence: int, card: dict[str, Any]) -> None:
+        """按持久 sequence 把管理卡刷新成新内容。"""

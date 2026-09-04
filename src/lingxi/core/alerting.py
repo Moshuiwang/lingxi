@@ -48,6 +48,8 @@ class AlertKind(str, Enum):
 
 
 class NoticeAction(str, Enum):
+    """一条通知是「告警」还是「恢复」。"""
+
     ALERT = "alert"
     RECOVERY = "recovery"
 
@@ -72,6 +74,7 @@ class AlertPolicy:
     retry_ceiling_seconds: float = 60.0
 
     def __post_init__(self) -> None:
+        """校验各阈值字段都是正的有限数字，非法配置在构造期直接失败关闭。"""
         durations = (
             ("heartbeat_timeout_seconds", self.heartbeat_timeout_seconds),
             ("queued_timeout_seconds", self.queued_timeout_seconds),
@@ -136,7 +139,6 @@ class AlertPolicy:
 
     def retry_delay(self, attempt: int) -> float:
         """返回第 ``attempt`` 次重试前的等待秒数。"""
-
         if isinstance(attempt, bool) or attempt < 0:
             raise ValueError("重试次数不能为负")
         return min(
@@ -163,7 +165,6 @@ def _safe_scope(raw: str, *, fallback_prefix: str) -> str:
     （开通编排的 ``failure_reason``、异常类名拼出的 ``unexpected_ValueError`` 之类）
     完全不受这里的格式约束，归一失败绝不能让告警回调本身抛出异常打断调用方的主流程。
     """
-
     scope = re.sub(r"[^a-z0-9_.-]", "_", (raw or "unknown").lower())[:64]
     if not scope or not scope[0].isalpha():
         scope = f"{fallback_prefix}_{scope}"[:64]
@@ -182,6 +183,7 @@ class AlertSignal:
     final: bool = False
 
     def __post_init__(self) -> None:
+        """把 ``observed_at``/``scope`` 归一化并校验各字段的取值域。"""
         object.__setattr__(self, "observed_at", _as_utc(self.observed_at))
         object.__setattr__(self, "scope", _category(self.scope, "scope"))
         if isinstance(self.count, bool) or not isinstance(self.count, int) or self.count <= 0:
@@ -229,17 +231,17 @@ class AlertNotice:
 
     @property
     def event_type(self) -> str:
+        """供审计记录/告警去重使用的"scope.kind"组合键。"""
         return f"{self.scope}.{self.kind.value}"
 
     @property
     def text(self) -> str:
-        """只渲染类型、范围、时间、数量和 trace_id，不接收业务正文——分行中文
-        标签范式，照抄 ``scripts/ops/host_health_alert.py::render_message`` 的
-        姊妹渲染函数。``event_type`` 这个"scope.kind"组合键仍通过
-        :attr:`event_type` 属性对外（供审计记录/告警去重使用），只是不再原样
-        拼进人类可读正文——正文改成"类型"与"范围"两个独立标签，信息量不减。
-        """
+        """渲染成分行中文标签正文，只含类型、范围、时间、数量和 trace_id。
 
+        不接收业务正文，照抄 ``scripts/ops/host_health_alert.py::
+        render_message`` 的姊妹渲染函数。``event_type`` 这个"scope.kind"
+        组合键仍通过 :attr:`event_type` 属性对外，只是不再原样拼进正文。
+        """
         action_label = _NOTICE_ACTION_LABEL[self.action]
         kind_label = _ALERT_KIND_LABEL.get(self.kind, self.kind.value)
         trace = self.trace_id or "-"
@@ -255,6 +257,8 @@ class AlertNotice:
 
 @dataclass(frozen=True)
 class HeartbeatStatus:
+    """某一次心跳判定的结果快照。"""
+
     component: str
     last_seen_at: datetime | None
     active: bool
@@ -276,12 +280,14 @@ class HeartbeatRegistry:
     """
 
     def __init__(self, *, default_timeout_seconds: float = 120.0) -> None:
+        """``default_timeout_seconds`` 是未显式指定阈值的组件的默认心跳超时。"""
         if not math.isfinite(default_timeout_seconds) or default_timeout_seconds <= 0:
             raise ValueError("default_timeout_seconds 必须是正的有限数字")
         self._default_timeout_seconds = default_timeout_seconds
         self._records: dict[str, _Heartbeat] = {}
 
     def register(self, component: str, *, timeout_seconds: float | None = None) -> None:
+        """登记一个组件；已登记的组件重复调用不改变阈值。"""
         component = _category(component, "component")
         timeout = self._default_timeout_seconds if timeout_seconds is None else timeout_seconds
         if not math.isfinite(timeout) or timeout <= 0:
@@ -294,6 +300,7 @@ class HeartbeatRegistry:
             raise ValueError("同一组件不能在运行中更换心跳阈值")
 
     def beat(self, component: str, *, at: datetime) -> None:
+        """记一次心跳；组件未登记过时按默认阈值隐式登记。"""
         component = _category(component, "component")
         self.register(component)
         record = self._records[component]
@@ -313,7 +320,6 @@ class HeartbeatRegistry:
         决定观察/恢复，而 ``active`` 是 ``(at, last_seen_at, timeout)`` 的纯函数，
         与基线推进无关；``changed`` 只作日志与边沿判定参考。
         """
-
         component = _category(component, "component")
         record = self._records.get(component)
         if record is None:
@@ -332,6 +338,7 @@ class HeartbeatRegistry:
         return HeartbeatStatus(component, record.last_seen_at, active, changed)
 
     def statuses(self, *, at: datetime) -> tuple[HeartbeatStatus, ...]:
+        """按组件名排序，返回全部已登记组件的当前活跃判定。"""
         return tuple(self.status(component, at=at) for component in sorted(self._records))
 
 
@@ -357,6 +364,7 @@ class AlertManager:
         policy: AlertPolicy | None = None,
         heartbeats: HeartbeatRegistry | None = None,
     ) -> None:
+        """未传入时各自用默认策略/心跳注册表构造。"""
         self.policy = policy or AlertPolicy()
         self.heartbeats = heartbeats or HeartbeatRegistry(
             default_timeout_seconds=self.policy.heartbeat_timeout_seconds
@@ -364,14 +372,17 @@ class AlertManager:
         self._windows: dict[tuple[AlertKind, str], _FailureWindow] = {}
 
     def register_process(self, component: str) -> None:
+        """登记一个心跳组件，超时阈值取自策略配置。"""
         self.heartbeats.register(component, timeout_seconds=self.policy.heartbeat_timeout_seconds)
 
     def heartbeat(self, component: str, *, at: datetime) -> None:
+        """记一次心跳，转发给内部的 :class:`HeartbeatRegistry`。"""
         self.heartbeats.beat(component, at=at)
 
     def check_heartbeats(
         self, *, at: datetime, trace_id: str | None = None
     ) -> tuple[AlertNotice, ...]:
+        """对全部已登记组件各判定一次活跃状态，翻转产出告警/恢复通知。"""
         notices: list[AlertNotice] = []
         for status in self.heartbeats.statuses(at=at):
             if status.last_seen_at is None:
@@ -397,6 +408,7 @@ class AlertManager:
         scope: str = "worker",
         trace_id: str | None = None,
     ) -> tuple[AlertNotice, ...]:
+        """任务滞留类告警的统一入口，只接受五类任务滞留 kind。"""
         if kind not in {
             AlertKind.QUEUED_STUCK,
             AlertKind.RUNNING_HEARTBEAT_TIMEOUT,
@@ -417,6 +429,7 @@ class AlertManager:
         at: datetime,
         trace_id: str | None = None,
     ) -> tuple[AlertNotice, ...]:
+        """记一次飞书发送失败信号。"""
         return self.observe(
             AlertSignal(
                 kind=AlertKind.FEISHU_SEND_FAILED,
@@ -434,6 +447,7 @@ class AlertManager:
         at: datetime,
         trace_id: str | None = None,
     ) -> tuple[AlertNotice, ...]:
+        """记一次飞书发送成功，推进对应故障窗口的恢复计时。"""
         return self.resolve(
             AlertSignal(
                 kind=AlertKind.FEISHU_SEND_FAILED,
@@ -444,6 +458,7 @@ class AlertManager:
         )
 
     def observe(self, signal: AlertSignal) -> tuple[AlertNotice, ...]:
+        """记一次故障观察，跨过阈值/去重窗口才真正产出一条告警通知。"""
         key = (signal.kind, signal.scope)
         window = self._windows.get(key)
         if window is None or self._new_send_window(window, signal):
@@ -485,6 +500,7 @@ class AlertManager:
         return (self._notice(window, NoticeAction.ALERT, signal.observed_at),)
 
     def resolve(self, signal: AlertSignal) -> tuple[AlertNotice, ...]:
+        """记一次恢复观察，进入稳定期计时，真正的恢复通知由 :meth:`tick` 产出。"""
         key = (signal.kind, signal.scope)
         window = self._windows.get(key)
         if window is None:
@@ -500,7 +516,6 @@ class AlertManager:
 
     def tick(self, *, at: datetime) -> tuple[AlertNotice, ...]:
         """推进稳定恢复计时，也让待恢复事件不依赖下一次业务发送。"""
-
         return self._recover_due(_as_utc(at))
 
     def _recover_due(self, at: datetime) -> tuple[AlertNotice, ...]:
@@ -552,13 +567,17 @@ class AlertManager:
 
 
 class AuditSink(Protocol):
-    def record(self, action: str, /, **fields: object) -> None: ...
+    """告警观察/投递结果的审计记账口，与其余模块的同名 Protocol 结构相同。"""
+
+    def record(self, action: str, /, **fields: object) -> None:
+        """记一条审计事件；实现应保证记账失败不抛出到调用方。"""
 
 
 class AlertSender(Protocol):
     """把一条已经渲染好的安全告警文本发到某个目标；具体传输由调用方注入。"""
 
-    def send_text(self, *, chat_id: str, text: str, dedupe_key: str) -> None: ...
+    def send_text(self, *, chat_id: str, text: str, dedupe_key: str) -> None:
+        """发送一条文本告警；``dedupe_key`` 供实现自行去重，失败时应抛出异常。"""
 
 
 @dataclass
@@ -585,6 +604,7 @@ class AlertDispatcher:
         audit: AuditSink | None = None,
         clock: Callable[[], datetime] | None = None,
     ) -> None:
+        """``chat_id`` 是唯一的投递目标，未传策略/时钟时各自使用默认值。"""
         if not chat_id:
             raise ValueError("告警投递目标不能为空")
         self._sender = sender
@@ -597,11 +617,11 @@ class AlertDispatcher:
 
     @property
     def pending_count(self) -> int:
+        """当前还没有成功投递、仍在等待重试的告警数量。"""
         return len(self._pending)
 
     def submit(self, notices: Sequence[AlertNotice]) -> None:
         """加入待投递队列；相同去重键只保留一条。"""
-
         now = _as_utc(self._clock())
         for notice in sorted(notices, key=lambda item: item.dedupe_key):
             self._pending.setdefault(
@@ -611,7 +631,6 @@ class AlertDispatcher:
 
     def run_once(self, *, at: datetime | None = None) -> int:
         """投递当前到期的告警，返回本轮成功数。"""
-
         now = _as_utc(self._clock() if at is None else at)
         sent = 0
         for dedupe_key in sorted(tuple(self._pending)):
@@ -684,7 +703,6 @@ _FINAL_DELIVERY_ALERT_EXACT: frozenset[str] = frozenset(
 
 def _normalize_delivery_alert_scope(kind: str) -> str:
     """把投递消费循环的自由字符串 kind 归一化成安全的 ``AlertSignal.scope``。"""
-
     scope = re.sub(r"[^a-z0-9_.-]", "_", kind.lower())[:64]
     if not scope or not scope[0].isalpha():
         scope = f"delivery_{scope}"[:64]
@@ -699,7 +717,6 @@ def _is_final_delivery_alert(kind: str) -> bool:
     抖动，或本就会在窗口内自然攒够阈值的批量计数类）继续走既有的"攒够阈值
     次数"降噪路径。
     """
-
     return kind.startswith(_FINAL_DELIVERY_ALERT_PREFIXES) or kind in _FINAL_DELIVERY_ALERT_EXACT
 
 
@@ -723,6 +740,7 @@ class AlertingDuty:
         clock: Callable[[], datetime] | None = None,
         stop: threading.Event | None = None,
     ) -> None:
+        """未传入 ``stop`` 时新建一个独立的停止事件。"""
         self._manager = manager
         self._dispatcher = dispatcher
         self._audit = audit
@@ -731,17 +749,21 @@ class AlertingDuty:
 
     @property
     def manager(self) -> AlertManager:
+        """底层的阈值/去重状态机，供测试直接断言内部状态。"""
         return self._manager
 
     @property
     def dispatcher(self) -> AlertDispatcher:
+        """底层的投递队列，供测试直接断言内部状态。"""
         return self._dispatcher
 
     @property
     def stopping(self) -> bool:
+        """是否已经收到停止信号。"""
         return self._stop.is_set()
 
     def request_stop(self) -> None:
+        """请求后台循环在下一轮检查时退出。"""
         self._stop.set()
 
     def heartbeat_callback(self, component: str) -> Callable[[], None]:
@@ -857,11 +879,13 @@ class AlertingDuty:
         return report
 
     def observe(self, signal: AlertSignal) -> tuple[AlertNotice, ...]:
+        """记一次故障观察并把产出的通知立即提交给投递队列。"""
         notices = self._manager.observe(signal)
         self._submit(notices)
         return notices
 
     def run_once(self) -> tuple[AlertNotice, ...] | None:
+        """定时职责的单次轮询：检查心跳、推进恢复计时、投递到期告警。"""
         if self._stop.is_set():
             return None
         now = _as_utc(self._clock())

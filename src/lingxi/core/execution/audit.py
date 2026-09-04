@@ -134,12 +134,12 @@ class ToolCallAudit:
 
     @property
     def denied(self) -> bool:
+        """这次调用是否被执行层明确拒绝。"""
         return self.allowed is False
 
     @property
     def gated(self) -> bool:
         """这次调用是否经过了执行层的判定。"""
-
         return self.allowed is not None
 
 
@@ -163,10 +163,12 @@ class TurnAuditSummary:
 
     @property
     def denied_tool_names(self) -> tuple[str, ...]:
+        """被拒绝的调用各自的工具名。"""
         return tuple(call.tool_name for call in self.denied_calls)
 
     @property
     def executed_tool_names(self) -> tuple[str, ...]:
+        """已执行的调用各自的工具名。"""
         return tuple(call.tool_name for call in self.calls if call.executed)
 
 
@@ -178,9 +180,11 @@ class AuditRedactor:
     """
 
     def __init__(self, allowed_input_fields: Iterable[str] = ()) -> None:
+        """``allowed_input_fields`` 是允许原样记录（经脱敏）的字段名白名单。"""
         self._allowed = frozenset(allowed_input_fields)
 
     def redact(self, tool_input: Any) -> dict[str, Any]:
+        """按白名单裁剪一次工具调用的入参，返回可安全落审计表的字典。"""
         if not isinstance(tool_input, Mapping):
             return {}
         redacted: dict[str, Any] = {}
@@ -221,6 +225,7 @@ class TurnAudit:
     def __init__(
         self, *, rules: ResultRules | None = None, redactor: AuditRedactor | None = None
     ) -> None:
+        """未传入时各自用默认规则/脱敏器构造，随即开始记账第一个回合。"""
         self._rules = rules or ResultRules()
         self._redactor = redactor or AuditRedactor()
         self.start_turn()
@@ -232,7 +237,6 @@ class TurnAudit:
         ``terminal_result_count`` 从第二回合起必然大于 1、``terminal_ok`` 恒为假，
         ``user_result`` 也会把多个回合的调用混在一起判。调用方每开一个回合必须先调本方法。
         """
-
         self._calls: list[dict[str, Any]] = []
         self._by_tool_use_id: dict[str, dict[str, Any]] = {}
         self._final_text: str = ""
@@ -250,7 +254,6 @@ class TurnAudit:
         verdict: PolicyVerdict,
     ) -> None:
         """记录 ``PreToolUse`` 的判定。放行和拒绝都记，拒绝额外带上理由。"""
-
         record = self._new_record(
             tool_use_id=tool_use_id,
             tool_name=tool_name,
@@ -266,7 +269,6 @@ class TurnAudit:
         判定结果此时已经算出并会照常返回，所以这条记录只说明"这次调用的明细丢了"，
         不说明它被放行还是被拒绝——因此记为本层未判定。
         """
-
         self._calls.append(
             {
                 "tool_use_id": tool_use_id,
@@ -289,7 +291,6 @@ class TurnAudit:
         "没有任何工具调用"——那是一条假的否定结论。屏障失效（hook 注册失败、超时、
         事件名变更）恰恰就落在这条路径上，必须可检出。
         """
-
         record = self._locate(tool_use_id, tool_name)
         if record is None:
             record = self._new_record(
@@ -309,7 +310,6 @@ class TurnAudit:
         error: Any,
     ) -> None:
         """记录 ``PostToolUseFailure``：工具抛错。语义是"工具失败"，不是"用户没拿到结果"。"""
-
         record = self._locate(tool_use_id, tool_name)
         if record is None:
             record = self._new_record(
@@ -332,7 +332,6 @@ class TurnAudit:
         的调用。否则规则层（``disallowed_tools``）拦下的调用会在审计里彻底消失——
         L4a 实测中就出现过这一幕。
         """
-
         kind = classify_tool_result(content, is_error=is_error, rules=self._rules)
         record = self._locate(tool_use_id, None)
         if record is None:
@@ -353,9 +352,11 @@ class TurnAudit:
     # ---- 回合收口 ----
 
     def record_final_text(self, text: Any) -> None:
+        """记下这个回合最终发给用户的文本正文，非字符串一律按空文本处理。"""
         self._final_text = text if isinstance(text, str) else ""
 
     def record_terminal_result(self) -> None:
+        """记一次终态结果已经生成（用于识别是否出现了不止一次终态）。"""
         self._terminal_result_count += 1
 
     def record_oversize_rewrite(self, *, tool_name: str, tool_use_id: str | None) -> None:
@@ -367,10 +368,10 @@ class TurnAudit:
         发生过几次"，具体是哪个工具触发的可以从 ``calls`` 里的 ``tool_use_id``
         反查，不需要在这里重复保留。
         """
-
         self._oversize_rewrite_count += 1
 
     def summary(self) -> TurnAuditSummary:
+        """汇总当前回合累积的全部事实，产出可落审计表/门禁断言的结论。"""
         calls = tuple(ToolCallAudit(**record) for record in self._calls)
         denied = tuple(call for call in calls if call.denied)
         failed = tuple(
@@ -402,7 +403,6 @@ class TurnAudit:
         问题；因此混合回合一律保守记为 :attr:`UserResultStatus.UNKNOWN`——宁可
         说不知道，不可谎报已送达。
         """
-
         if not calls:
             return UserResultStatus.NO_TOOL_CALL
         # 被本层拒绝的调用不参与"拿没拿到结果"的判断（它压根没执行）；
@@ -470,7 +470,6 @@ class TurnAudit:
         失败，真正失败的那次留空，回合结论还会从 NOT_OBTAINED 被拉成 UNKNOWN。
         现在候选多于一条就不猜，返回 ``None`` 让调用方另建一条未判定记录。
         """
-
         if tool_use_id and tool_use_id in self._by_tool_use_id:
             return self._by_tool_use_id[tool_use_id]
         if tool_name is None:
@@ -494,7 +493,6 @@ def classify_tool_result(
     既不匹配失败规则、又拿不出可识别数据的回执归为
     :attr:`ToolResultKind.UNCLASSIFIED`，由调用方决定如何处理。
     """
-
     rules = rules or ResultRules()
     if bool(is_error):
         return ToolResultKind.TOOL_ERROR
@@ -575,7 +573,6 @@ def _classify_metrics_collection(value: Sequence[Any], rules: ResultRules) -> To
     真实 ``list_metrics`` 的条目是有内容的对象。空对象、null、字符串等形状都
     缺少足够证据，记未知；条目自身出现已登记失败形状时，整次回执记业务失败。
     """
-
     for item in value:
         if not isinstance(item, Mapping) or not item:
             return ToolResultKind.UNCLASSIFIED
@@ -586,7 +583,6 @@ def _classify_metrics_collection(value: Sequence[Any], rules: ResultRules) -> To
 
 def _failure_in_mapping(parsed: Mapping[str, Any], rules: ResultRules) -> bool:
     """按显式登记的失败规则判断一个映射是否表示业务失败。"""
-
     for key in rules.failure_keys:
         if key in parsed and parsed[key]:
             return True
@@ -602,7 +598,6 @@ def _failure_in_mapping(parsed: Mapping[str, Any], rules: ResultRules) -> bool:
 
 def _coerce(content: Any) -> tuple[str, Any]:
     """把 SDK 的回执内容统一成 (纯文本, 解析出的 JSON 或 None)。"""
-
     if isinstance(content, Mapping):
         return _dump(content), content
     if isinstance(content, Sequence) and not isinstance(content, (str, bytes)):
@@ -666,7 +661,6 @@ def redact_free_text(text: str) -> str:
     这道脱敏的能力边界与 :func:`_redact_free_text` 完全相同，**不是绝对保证**：
     纯字母且短于 32 字符的秘密盖不住。不得据此声称出口是干净的。
     """
-
     return _redact_free_text(text)
 
 
@@ -681,7 +675,6 @@ def redact_free_text_with_count(text: str) -> tuple[str, int]:
     前后是否不同"自行计数。这个计数**不是**安全边界的一部分，带有与
     `V-审计-03` 相同的已知局限，不得据此声称"命中数为零"等价于无凭据。
     """
-
     count = 0
 
     def _sub_assignment(match: re.Match[str]) -> str:
@@ -736,7 +729,6 @@ def redact_query_parameter_values(text: str) -> str:
     是两类互补脱敏：那一个按**键名关键词**匹配自由文本里的赋值语句；这一个按
     **URL 查询串的位置**匹配查询参数值本身，两者可以同时施加，互不冲突。
     """
-
     return _QUERY_PARAM_VALUE.sub(lambda m: m.group(1) + "***", text)
 
 
@@ -746,7 +738,6 @@ def _redact_free_text(text: str) -> str:
     比 :func:`_redact_secrets` 多一道长串抹除，用来兑现合同里「不保存完整令牌」
     的绝对要求——键名匹配是尽力而为，长度上界是结构性的。
     """
-
     return _TOKEN_RUN.sub(_mask_token_run, _redact_secrets(text))
 
 

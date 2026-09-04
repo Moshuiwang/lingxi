@@ -68,8 +68,7 @@ _REASON_CODE_PATTERN = re.compile(r"[a-z0-9_]{1,64}")
 
 
 def _safe_reason_code(reason_code: str) -> str:
-    """套一层形状白名单，不匹配的一律归入 ``"other"``，不让形状之外的取值
-    直接进入群发的日报正文。
+    """套一层形状白名单，不匹配的一律归入 ``"other"``，不让形状之外的取值直接进入群发的日报正文。
 
     **已知边界（不是回归）**：这是形状校验，不是语义校验——挡得住带形状之外
     字符的泄露（大写、CJK、``@``/``.``、空格……），挡不住通篇小写字母/数字/
@@ -77,8 +76,8 @@ def _safe_reason_code(reason_code: str) -> str:
     恰好整体落在这个盲区里，对它覆盖率为零。当前全仓 ``error_kind`` 写入点
     均为固定蛇形小写字面量；若未来引入动态取值，必须先把白名单改为枚举已知
     集合，不能继续依赖字符集校验（见 ``tests/test_daily_report_render.py``
-    对这条边界的记录）。"""
-
+    对这条边界的记录）。
+    """
     if isinstance(reason_code, str) and _REASON_CODE_PATTERN.fullmatch(reason_code):
         return reason_code
     return "other"
@@ -117,7 +116,6 @@ def _humanize_error_kind(safe_reason_code: str) -> str:
     显示名）」，与 ``core/admin/router.py`` ``_display_or_unregistered`` 同一
     样式。
     """
-
     label = _ERROR_KIND_LABEL.get(safe_reason_code)
     if label is None:
         return f"{safe_reason_code}（未登记显示名）"
@@ -135,11 +133,11 @@ _BEIJING_OFFSET = timedelta(hours=8)
 
 
 def _format_window_header(window_start: datetime, window_end: datetime) -> str:
-    """窗口起止**各自带日期**，不只写时分——`00:00–00:00` 这种同名时刻的写法会让人
-    误读成"零时长窗口"，两端都写全日期才不会歧义，且两个时区都完整给出，不需要
-    读者自己心算偏移量。
-    """
+    """窗口起止**各自带日期**，不只写时分——避免读者误读成"零时长窗口"。
 
+    两端都写全日期才不会歧义，且两个时区都完整给出，不需要读者自己心算
+    偏移量。
+    """
     utc_start = window_start.astimezone(UTC)
     utc_end = window_end.astimezone(UTC)
     beijing_start = utc_start + _BEIJING_OFFSET
@@ -217,12 +215,12 @@ def _render_guard_triggered(section: Section[int]) -> str:
 
 
 def _render_coverage_note(*, covered_tasks: int, uncovered_tasks: int) -> str:
-    """``uncovered_tasks > 0`` 时附加的覆盖度说明——告诉读者这个数字不是窗口内
-    全部任务的准确总和，还有多少个任务因为字段缺失没有参与求和。
-    ``uncovered_tasks == 0`` 时不附加任何说明，避免给完全覆盖的正常情形也
-    画蛇添足。
-    """
+    """``uncovered_tasks > 0`` 时附加的覆盖度说明。
 
+    告诉读者这个数字不是窗口内全部任务的准确总和，还有多少个任务因为字段
+    缺失没有参与求和。``uncovered_tasks == 0`` 时不附加任何说明，避免给
+    完全覆盖的正常情形也画蛇添足。
+    """
     if uncovered_tasks <= 0:
         return ""
     total_tasks = covered_tasks + uncovered_tasks
@@ -283,12 +281,12 @@ def _render_resource_usage(section: Section[TokenUsageStats]) -> str:
 
 
 def _format_delivery_window_note(window_start: datetime, window_end: datetime) -> str:
-    """投递结果段的窗口标注，刻意不复用 `_format_window_header` 的原样输出——
-    这一段的窗口本来就与页首、以及其余全部段落不同（见模块文档「投递结果段为
-    什么用一个独立、更早的窗口」），必须让读者一眼看出"这段说的是哪一天"，不能
-    默认它跟页首那一行是同一个窗口。
-    """
+    """投递结果段的窗口标注，刻意不复用 `_format_window_header` 的原样输出。
 
+    这一段的窗口本来就与页首、以及其余全部段落不同（见模块文档「投递结果段
+    为什么用一个独立、更早的窗口」），必须让读者一眼看出"这段说的是哪一天"，
+    不能默认它跟页首那一行是同一个窗口。
+    """
     utc_start = window_start.astimezone(UTC)
     utc_end = window_end.astimezone(UTC)
     beijing_start = utc_start + _BEIJING_OFFSET
@@ -317,12 +315,13 @@ def _render_delivery_outcome(
 
 
 def _render_metric_coverage_gap(section: Section[MetricCoverageGap | None] | None) -> str:
-    """「待分配」段。返回空字符串表示**这一段完全不出现**——与其余段落不同，
-    本段允许彻底不出现，见 :attr:`DailyReportInputs.metric_coverage_gap` 的
-    三态说明。未接线（``section is None``）与「接线了、查过、没有差异」
-    （``section.value is None``）都返回空字符串，调用方据此不往正文里插入这一段。
-    """
+    """「待分配」段。返回空字符串表示**这一段完全不出现**。
 
+    与其余段落不同，本段允许彻底不出现，见
+    :attr:`DailyReportInputs.metric_coverage_gap` 的三态说明。未接线
+    （``section is None``）与「接线了、查过、没有差异」
+    （``section.value is None``）都返回空字符串。
+    """
     if section is None:
         return ""
     if not section.is_determined:
@@ -341,17 +340,16 @@ def _render_metric_coverage_gap(section: Section[MetricCoverageGap | None] | Non
 def _render_local_override_activity(
     section: Section[LocalOverrideActivity | None] | None,
 ) -> str:
-    """「本地权限覆盖活动」段。返回空字符串表示这一段完全不出现——未接线
-    与查过但当日无变化且当前无生效条目都返回空字符串。
+    """「本地权限覆盖活动」段。返回空字符串表示这一段完全不出现。
 
-    正文只含计数：不含 open_id、公司 ID、指标名或理由文本，与 `V-花名册-34`
+    未接线与查过但当日无变化且当前无生效条目都返回空字符串。正文只含计数：
+    不含 open_id、公司 ID、指标名或理由文本，与 `V-花名册-34`
     的隐私纪律同向。用「本窗口」不用「今日」——本段统计的实际是与其余六段
     同一个 UTC 窗口。用「登记」不用「生效」：三个笔数只是对
     ``local_permission_override`` 表本身的如实计数，额外单独注明生效口径
     （开通链已生效，重算侧待每日重算恢复运行），不笼统断言「生效」。三个
     计数名字与管理卡/确认卡的 ``_ACTION_LABEL`` 同一份口径。
     """
-
     if section is None:
         return ""
     if not section.is_determined:
@@ -380,7 +378,6 @@ def render_daily_report(
     正文**没有任何可执行入口**（没有按钮、链接、回调），与 `roster_report.py` 的
     `V-花名册-24` 同一条纪律：管理群是通知面，不是操作面。
     """
-
     lines = [
         "【内测每日通报】",
         _format_window_header(inputs.window_start, inputs.window_end),
