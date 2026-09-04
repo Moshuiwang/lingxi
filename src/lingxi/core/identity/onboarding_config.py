@@ -10,9 +10,11 @@
 
 from __future__ import annotations
 
+import dataclasses
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime
+from typing import Any
 
 from lingxi.core.identity.onboarding_ports import (
     DirectorySource,
@@ -179,3 +181,21 @@ class OnboardingRuntime:
             raise TypeError("必须注入执行器：start 绝不能在调用线程上跑完整条链")
         if not callable(self.sleep):
             raise TypeError("sleep 必须可调用：缺省会把发布等待压成瞬时")
+
+
+def group_runner_kwargs(kwargs: dict[str, Any]) -> dict[str, Any]:
+    """按字段名把一份扁平的构造参数装进上面五组参数对象；键对不上任何字段就响亮失败。"""
+    remaining = dict(kwargs)
+    grouped: dict[str, Any] = {}
+    for name, cls in (
+        ("sources", OnboardingSources),
+        ("actions", OnboardingActions),
+        ("records", OnboardingRecords),
+        ("policy", OnboardingPolicy),
+        ("runtime", OnboardingRuntime),
+    ):
+        fields = {field.name for field in dataclasses.fields(cls)}
+        grouped[name] = cls(**{key: remaining.pop(key) for key in list(remaining) if key in fields})
+    if remaining:
+        raise TypeError(f"AutoOnboardingRunner 不认识的构造参数：{sorted(remaining)}")
+    return grouped

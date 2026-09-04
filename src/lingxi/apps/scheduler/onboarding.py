@@ -16,7 +16,6 @@ gateway 去换等于制造第二条凭据通道，代价是首次开通要等一
 
 from __future__ import annotations
 
-import dataclasses
 import logging
 import queue
 import threading
@@ -770,6 +769,7 @@ def _build_onboarding_runner(
     ``readiness`` 与顶层 ``clock`` 必须共用**同一个**单调时钟实例：两者都参与
     「成功来得太晚」的判定，一份对象各自持有会让两处时间基准悄悄分叉。
     """
+    from lingxi.core.identity.onboarding_config import group_runner_kwargs
     from lingxi.core.identity.onboarding_runner import AutoOnboardingRunner
 
     tokens, schedule, guarded_probe = readiness_probe
@@ -807,36 +807,7 @@ def _build_onboarding_runner(
             clock=clock,
         )
     )
-    return AutoOnboardingRunner(**_group_runner_kwargs(kwargs))
-
-
-def _group_runner_kwargs(kwargs: dict[str, Any]) -> dict[str, Any]:
-    """把三段扁平的构造参数按字段名装进 runner 的五个参数对象。
-
-    任何对不上字段的键都必须响亮失败——静默丢弃会让某个端口在运行期才暴露为缺失。
-    """
-    from lingxi.core.identity.onboarding_config import (
-        OnboardingActions,
-        OnboardingPolicy,
-        OnboardingRecords,
-        OnboardingRuntime,
-        OnboardingSources,
-    )
-
-    remaining = dict(kwargs)
-    grouped: dict[str, Any] = {}
-    for name, cls in (
-        ("sources", OnboardingSources),
-        ("actions", OnboardingActions),
-        ("records", OnboardingRecords),
-        ("policy", OnboardingPolicy),
-        ("runtime", OnboardingRuntime),
-    ):
-        fields = {field.name for field in dataclasses.fields(cls)}
-        grouped[name] = cls(**{key: remaining.pop(key) for key in list(remaining) if key in fields})
-    if remaining:
-        raise TypeError(f"AutoOnboardingRunner 不认识的构造参数：{sorted(remaining)}")
-    return grouped
+    return AutoOnboardingRunner(**group_runner_kwargs(kwargs))
 
 
 def _finalize_onboarding_duty(
