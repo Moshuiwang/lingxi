@@ -151,8 +151,6 @@
 200	src/lingxi/core/admin/router.py::AdminCommandRouter._dispatch_write_action
 73	src/lingxi/core/admin/router.py::AdminCommandRouter.route
 98	src/lingxi/core/admin/router.py::_render_trace
-84	src/lingxi/core/alerting.py::AlertingDuty.delivery_alert_callback
-69	src/lingxi/core/alerting.py::AlertingDuty.delivery_alert_callback.report
 106	src/lingxi/core/conversation/pipeline.py::EventPipeline._enqueue
 123	src/lingxi/core/conversation/pipeline.py::EventPipeline._handle_memory_command
 107	src/lingxi/core/conversation/pipeline.py::EventPipeline._handle_message

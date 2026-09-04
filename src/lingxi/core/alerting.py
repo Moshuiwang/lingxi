@@ -34,18 +34,16 @@ class AlertKind(str, Enum):
     QUEUED_STUCK = "queued_stuck"
     RUNNING_HEARTBEAT_TIMEOUT = "running_heartbeat_timeout"
     RETRY_EXHAUSTED = "retry_exhausted"
-    # 待投递（awaiting_delivery）二十四小时强制到期收敛（Issue #153 最小可观测性
-    # 第二类：queued/running/awaiting-delivery 滞留三选一）。与 QUEUED_STUCK 分开，
+    # 待投递（awaiting_delivery）二十四小时强制到期收敛，与 QUEUED_STUCK 分开，
     # 因为运维要看到的诊断动作不同——这类是"确认送达一直没发生"，不是"还没被领取"。
     AWAITING_DELIVERY_STUCK = "awaiting_delivery_stuck"
     # 目标 worker 版本压根没有可用实例（灰度发布配置漏配一版）——与"单纯排队太久"
-    # 是两类不同的运维动作，因此独立成一个告警类型（Issue #153 最小可观测性第四类）。
+    # 是两类不同的运维动作，因此独立成一个告警类型。
     WORKER_VERSION_UNAVAILABLE = "worker_version_unavailable"
     FEISHU_SEND_FAILED = "feishu_send_failed"
-    # 首次开通失败需要管理员核查（Issue #280 §7.3）——此前 `LINGXI_ADMIN_GROUP_CHAT_ID`
-    # 的全部消费方都与开通失败无关，「已转交管理员处理」这句用户文案背后没有任何送达
-    # 动作。这一格补上开通失败（本侧故障终态 `LX-ONBOARD-001`）以及开通中途停摆收口的
-    # 送达面。
+    # 首次开通失败需要管理员核查——此前 `LINGXI_ADMIN_GROUP_CHAT_ID` 的全部消费方
+    # 都与开通失败无关，「已转交管理员处理」这句用户文案背后没有任何送达动作。
+    # 这一格补上开通失败以及开通中途停摆收口的送达面。
     ONBOARDING_FAILED = "onboarding_failed"
 
 
@@ -58,8 +56,8 @@ class NoticeAction(str, Enum):
 class AlertPolicy:
     """告警体验的部署口径。
 
-    数值默认值对应 Issue #92 已确认的 MVP 口径；正式入口通过
-    :meth:`from_mapping` 接收 `LINGXI_ALERT_` 前缀配置，避免为了调阈值改代码。
+    数值默认值对应已确认的 MVP 口径；正式入口通过 :meth:`from_mapping` 接收
+    `LINGXI_ALERT_` 前缀配置，避免为了调阈值改代码。
     """
 
     heartbeat_timeout_seconds: float = 120.0
@@ -195,14 +193,11 @@ class AlertSignal:
             raise ValueError("只有飞书发送失败事件可以标记为 final")
 
 
-#: 八类系统告警 → 中文标签（Trace #469 S-1 TOP-2）：此前群消息是一行英文
-#: key=value（``action=alert event=worker.queued_stuck time=... count=...
-#: trace_id=...``），运维之外的管理员读不懂哪个英文键对应什么故障；照抄
-#: ``scripts/ops/host_health_alert.py::render_message`` 的分行中文标签范式
-#: （见该脚本模块文档"防骚扰与恢复通知"一节的姊妹渲染函数），标题带
-#: ``[BI Plus 运行告警]`` 前缀 + 告警/恢复动作，正文按"类型/范围/次数/时间/
-#: 追溯号"五个中文标签分行——与宿主监控脚本的"容器/状态/主机/时间"四行同一
-#: 视觉范式，不是碰巧长得像。
+#: 八类系统告警 → 中文标签：此前群消息是一行英文 key=value，运维之外的管理员
+#: 读不懂哪个英文键对应什么故障；照抄 ``scripts/ops/host_health_alert.py::
+#: render_message`` 的分行中文标签范式，标题带 ``[BI Plus 运行告警]`` 前缀 +
+#: 告警/恢复动作，正文按"类型/范围/次数/时间/追溯号"五个中文标签分行——与宿主
+#: 监控脚本同一视觉范式，不是碰巧长得像。
 _ALERT_KIND_LABEL: dict[AlertKind, str] = {
     AlertKind.PROCESS_INACTIVE: "进程无心跳",
     AlertKind.QUEUED_STUCK: "任务排队超时未领取",
@@ -239,12 +234,10 @@ class AlertNotice:
     @property
     def text(self) -> str:
         """只渲染类型、范围、时间、数量和 trace_id，不接收业务正文——分行中文
-        标签范式（Trace #469 S-1 TOP-2），照抄
-        ``scripts/ops/host_health_alert.py::render_message`` 的姊妹渲染函数。
-        ``event_type`` 这个"scope.kind"组合键仍然通过 :attr:`event_type` 属性
-        对外（供审计记录/告警去重使用），只是不再原样拼进人类可读正文——正文
-        改成"类型"（中文标签）与"范围"两个独立标签，可读性更好，且信息量
-        不减（组合键仍能从这两行反推）。
+        标签范式，照抄 ``scripts/ops/host_health_alert.py::render_message`` 的
+        姊妹渲染函数。``event_type`` 这个"scope.kind"组合键仍通过
+        :attr:`event_type` 属性对外（供审计记录/告警去重使用），只是不再原样
+        拼进人类可读正文——正文改成"类型"与"范围"两个独立标签，信息量不减。
         """
 
         action_label = _NOTICE_ACTION_LABEL[self.action]
@@ -313,14 +306,12 @@ class HeartbeatRegistry:
     def status(self, component: str, *, at: datetime) -> HeartbeatStatus:
         """返回组件的活跃判定；``changed`` 是“自上次观察以来是否翻转”的边沿信号。
 
-        这里**有意**推进 ``previous_active`` 基线：``changed`` 按设计是边沿触发的翻转
-        信号（活跃↔不活跃只在发生的那一次为真），所以每次观察都要把基线推进到当前
-        判定，否则同一次翻转会被反复报告。``HeartbeatTests`` 固化了这一语义（翻转当次
-        为真、下一次同态为假），因此不能改成“读不改状态”。
-
-        对告警决策没有副作用：唯一的生产消费者 ``AlertManager.check_heartbeats`` 只用
-        ``active`` 决定观察 / 恢复，而 ``active`` 是 ``(at, last_seen_at, timeout)`` 的纯
-        函数，与基线推进无关；``changed`` 只作日志与边沿判定参考。
+        这里**有意**推进 ``previous_active`` 基线：``changed`` 是边沿触发的翻转信号
+        （活跃↔不活跃只在发生的那一次为真），每次观察都要把基线推进到当前判定，
+        否则同一次翻转会被反复报告，因此不能改成"读不改状态"。对告警决策没有副
+        作用：唯一的生产消费者 ``AlertManager.check_heartbeats`` 只用 ``active``
+        决定观察/恢复，而 ``active`` 是 ``(at, last_seen_at, timeout)`` 的纯函数，
+        与基线推进无关；``changed`` 只作日志与边沿判定参考。
         """
 
         component = _category(component, "component")
@@ -554,18 +545,9 @@ class AlertManager:
 
 
 # ---------------------------------------------------------------------------
-# 投递编排：把状态机接到管理群（Issue #92 建立，Issue #153 移至此处并接入生产
-# main()）。
-#
-# 这一段最初写在 ``apps/scheduler/__init__.py``——#92 当时唯一的调用方是 scheduler
-# 的审计日报职责。#153 需要 gateway（``DeliveryConsumer.on_alert`` 注入点）与 worker
-# （队列消费循环）各自装配同一套状态机与投递重试/去重语义，三个进程各自是独立部署
-# 单元，不能互相 import ``apps.<name>``（那会让镜像依赖面互相牵连）。这几个类只编排
-# 注入的 ``sender``/``audit`` 接口、不直接做网络或文件 I/O（真正的 I/O 藏在调用方传入
-# 的对象里），与 ``core/conversation/pipeline.py`` 里 ``EventPipeline`` 编排注入的
-# ``reactions``/``replies`` 是同一种"core 里编排、adapters 里做事"的形状，因此挪到这里
-# 而不是新增一个四进程都要 import 的 ``apps`` 工具模块。``apps/scheduler/__init__.py``
-# 继续从这里 re-export，保持既有导入路径与测试不必改动。
+# 投递编排：把状态机接到管理群。gateway/worker/scheduler 三个独立部署单元不能
+# 互相 import ``apps.<name>``，这几个类只编排注入的 ``sender``/``audit`` 接口、
+# 不直接做 I/O，与 ``EventPipeline`` 同一种"core 里编排、adapters 里做事"的形状。
 # ---------------------------------------------------------------------------
 
 
@@ -681,6 +663,46 @@ class AlertDispatcher:
             logger.error("运行告警审计失败 action=%s error=%s", action, type(error).__name__)
 
 
+#: 命中即报（``final=True``）的投递告警 kind 前缀/精确值：结果不明只能人工
+#: 核对、循环已死或已达内部阈值、文档交付低频到几乎不可能在同一窗口内自然
+#: 复现——原样套用"攒够阈值次数"会让这几类实质上永远发不出告警（生产默认下
+#: 两个 300 秒窗口长度恰好相等，导致"攒够 N 次"的判定永远追不上窗口过期）。
+_FINAL_DELIVERY_ALERT_PREFIXES: tuple[str, ...] = (
+    "dispatch_uncertain:",
+    "fallback_send_failed:",
+    "delivery_loop_",
+    "document_delivery_loop_dead",
+)
+_FINAL_DELIVERY_ALERT_EXACT: frozenset[str] = frozenset(
+    {
+        "document_delivery_failed",
+        "document_delivery_uncertain",
+        "document_delivery_notice_failed",
+    }
+)
+
+
+def _normalize_delivery_alert_scope(kind: str) -> str:
+    """把投递消费循环的自由字符串 kind 归一化成安全的 ``AlertSignal.scope``。"""
+
+    scope = re.sub(r"[^a-z0-9_.-]", "_", kind.lower())[:64]
+    if not scope or not scope[0].isalpha():
+        scope = f"delivery_{scope}"[:64]
+    return scope
+
+
+def _is_final_delivery_alert(kind: str) -> bool:
+    """这几类命中即报，不等阈值次数攒够。
+
+    仍受 ``alert_min_interval_seconds``（上报节流）与 ``dedupe_window_seconds``
+    （重复告警去重）双重约束，不会因为"立即"而刷屏。其余 kind（一次可恢复的
+    抖动，或本就会在窗口内自然攒够阈值的批量计数类）继续走既有的"攒够阈值
+    次数"降噪路径。
+    """
+
+    return kind.startswith(_FINAL_DELIVERY_ALERT_PREFIXES) or kind in _FINAL_DELIVERY_ALERT_EXACT
+
+
 class AlertingDuty:
     """把告警状态机、恢复计时和投递接在一个定时职责/后台线程上。
 
@@ -759,7 +781,7 @@ class AlertingDuty:
         return outcome
 
     def onboarding_failed_callback(self) -> Callable[[str, str], None]:
-        """返回给首次开通编排的失败回调（Issue #280 §7.3 步 1）。
+        """返回给首次开通编排的失败回调。
 
         群消息只含**故障类别**（内部原因码 ``reason``，经归一化，不是自由文本）、
         **计数**与**追溯号**（``trace_id``）；不接受、也不可能接受 open_id、姓名或
@@ -782,7 +804,7 @@ class AlertingDuty:
         return report
 
     def onboarding_stalled_callback(self) -> Callable[[int], None]:
-        """返回给「开通中途停摆收口」的计数回调（Issue #280 §7.3 步 2）。
+        """返回给「开通中途停摆收口」的计数回调。
 
         「有人卡住了」此前没有任何审计信号会送到管理群——这里只报一轮里真正被收口
         的候选**聚合计数**，不含 user_id、open_id 或任何单个候选的追溯号（聚合批次
@@ -804,74 +826,20 @@ class AlertingDuty:
         return report
 
     def delivery_alert_callback(self) -> Callable[[str, str], None]:
-        """返回给 Gateway ``DeliveryConsumer.on_alert`` 的回调（Issue #153）。
+        """返回给 Gateway ``DeliveryConsumer.on_alert`` 的回调。
 
         投递消费循环的告警形状是 ``(kind: str, task_id: str)``——``kind`` 是自由
-        字符串（``"dispatch_uncertain:card_finish"``、``"progress_persist_failed:
-        RuntimeError"`` 等，见 ``apps/gateway/delivery.py``），与 ``AlertKind`` 枚举
-        不是同一套分类。这里统一归入 ``FEISHU_SEND_FAILED``（语义上都是"投递/飞书
-        发送这条链路出了结果不明或失败"），把原始 kind 字符串标准化后放进
-        ``scope``，让不同子类型各自独立限流与去重，不互相掩盖。``task_id`` 是
-        ULID，通常满足 ``AlertSignal.trace_id`` 的安全格式；不满足时退化为不带
+        字符串（见 ``apps/gateway/delivery.py``），与 ``AlertKind`` 枚举不是同一
+        套分类。这里统一归入 ``FEISHU_SEND_FAILED``，把原始 kind 字符串标准化后
+        放进 ``scope``，让不同子类型各自独立限流与去重，不互相掩盖。``task_id``
+        通常满足 ``AlertSignal.trace_id`` 的安全格式；不满足时退化为不带
         trace_id，不让一次格式意外的输入打断整条告警链路。
         """
 
         def report(kind: str, task_id: str) -> None:
-            scope = re.sub(r"[^a-z0-9_.-]", "_", kind.lower())[:64]
-            if not scope or not scope[0].isalpha():
-                scope = f"delivery_{scope}"[:64]
+            scope = _normalize_delivery_alert_scope(kind)
             at = _as_utc(self._clock())
-            # PR #173 独立复核 P1-4：生产默认下 `AlertPolicy.send_failure_window_
-            # seconds`（300s）与 `DeliveryConsumer.DEFAULT_ALERT_MIN_INTERVAL_
-            # SECONDS`（300s，见 apps/gateway/delivery.py）两个 300 秒相等——
-            # `_alert_deduped` 把同一 (kind, task_id) 的上报频率压到约每 300 秒
-            # 一次，而 `AlertManager._new_send_window` 用 `>= 300s` 判定"窗口已
-            # 过期、换新窗口"，于是每一次上报都恰好落在"窗口刚过期"那一侧，
-            # `consecutive_failures` 每次被重置回 1，`threshold=3` 永远到不了：
-            # 用生产默认复现过，两小时内单个 uncertain 任务被上报 24 次、实际
-            # 发出的告警条数 = 0。
-            #
-            # 下面这两类不能等"攒够 N 次"：
-            # - `dispatch_uncertain:*`——结果不明、按设计**绝不自动重发**，必须
-            #   人工核对，是这条恢复路径的唯一入口；
-            # - `fallback_send_failed:*`——文本兜底发送遇到明确拒绝错误，
-            #   `V-告警-03`「终态失败立即告警」原文覆盖的正是这一类。
-            # - `delivery_loop_*`（Issue #191）——投递消费循环自身的连续异常
-            #   （`delivery_loop_failed:*`）与后台线程已经死亡
-            #   （`delivery_loop_dead:*`）。这两类**上报之前就已经攒过次数了**：
-            #   前者要求连续 `DEFAULT_LOOP_FAILURE_ALERT_THRESHOLD` 轮失败才上报，
-            #   后者是一次不可逆事件，再让告警状态机攒第二遍等于重复计数，且会
-            #   原样踩中上面那个 300 秒撞 300 秒的陷阱——那意味着"整条投递能力
-            #   已经停摆"这件事永远发不出告警，正是 #191 要消灭的"无声"。
-            # - `document_delivery_failed`/`document_delivery_uncertain`/
-            #   `document_delivery_notice_failed`/`document_delivery_loop_dead:*`
-            #   （Issue #341，opus 审查 R-1）——``apps/gateway/document_delivery.py``
-            #   文档交付独立消费循环的同型四类：前三个各自对应一行请求的确定性终态
-            #   （明确拒绝 / 结果不明 / 交付已确认但通知发送失败）或一次不可逆的
-            #   循环退出事件，与上面 `dispatch_uncertain:*`/`delivery_loop_*` 同一条
-            #   理由——要么"结果不明只能人工核对，不能等阈值"，要么"这条循环已经
-            #   死了，再让状态机攒第二遍等于重复计数"；且文档交付本身是低频动作
-            #   （见该模块 `DEFAULT_BATCH_LIMIT` 的文档），单个任务在 300 秒窗口内
-            #   几乎不可能自然重复三次触发同一条 `(kind, task_id)`，原样套用
-            #   "攒够阈值次数"会让这三类实质上永远发不出告警，同一个 300 秒撞
-            #   300 秒的陷阱。
-            # 三者都改成 `final=True`：命中即报，不等阈值；仍然受
-            # `alert_min_interval_seconds`（上报节流）与 `dedupe_window_seconds`
-            # （重复告警去重）双重约束，不会因为"立即"而刷屏。其余 kind
-            # （目前只有 `progress_persist_failed:*`，一次可恢复的 DB 写入
-            # 抖动；以及 `document_delivery_attempts_exhausted:*`/
-            # `document_delivery_reclaim_failed:*`/`document_delivery_pending_
-            # expired:*` 这类批量计数告警——持续复现时本来就会在窗口内自然攒够
-            # 阈值，不属于"一次性事件"）继续走"攒够阈值次数"的既有降噪路径。
-            final = (
-                kind.startswith("dispatch_uncertain:")
-                or kind.startswith("fallback_send_failed:")
-                or kind.startswith("delivery_loop_")
-                or kind == "document_delivery_failed"
-                or kind == "document_delivery_uncertain"
-                or kind == "document_delivery_notice_failed"
-                or kind.startswith("document_delivery_loop_dead")
-            )
+            final = _is_final_delivery_alert(kind)
             try:
                 signal = AlertSignal(
                     kind=AlertKind.FEISHU_SEND_FAILED,
