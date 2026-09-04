@@ -78,12 +78,6 @@
 226	src/lingxi/apps/gateway/__init__.py::main
 205	src/lingxi/apps/gateway/__init__.py::make_event_handler
 121	src/lingxi/apps/gateway/__init__.py::make_event_handler.handle
-84	src/lingxi/apps/gateway/document_delivery.py::DocumentDeliveryConsumer._create_docx_body
-61	src/lingxi/apps/gateway/document_delivery.py::DocumentDeliveryConsumer._finalize_claim
-77	src/lingxi/apps/gateway/document_delivery.py::DocumentDeliveryConsumer._process_docx_claim
-105	src/lingxi/apps/gateway/document_delivery.py::DocumentDeliveryConsumer._send_ready_notice
-69	src/lingxi/apps/gateway/document_delivery.py::DocumentDeliveryConsumer.run_once
-67	src/lingxi/apps/gateway/document_delivery.py::assemble_document_delivery_consumer
 107	src/lingxi/apps/healthcheck/__init__.py::run
 166	src/lingxi/apps/reauthorize/__init__.py::_run
 86	src/lingxi/apps/scheduler/assembly.py::_build_management_correction_callback
