@@ -84,7 +84,6 @@
 3	docstring_over	src/lingxi/apps/scheduler/stalled_provisioning.py
 1	docstring_over	src/lingxi/apps/trace/__init__.py
 7	docstring_over	src/lingxi/apps/worker/service.py
-6	docstring_over	src/lingxi/apps/worker/turn.py
 1	docstring_over	src/lingxi/config/content.py
 5	docstring_over	src/lingxi/core/admin/card_callback.py
 3	docstring_over	src/lingxi/core/admin/card_dispatch.py
@@ -186,7 +185,6 @@
 2	hash_block_over	src/lingxi/apps/scheduler/roster_audit.py
 5	hash_block_over	src/lingxi/apps/scheduler/stalled_provisioning.py
 24	hash_block_over	src/lingxi/apps/worker/service.py
-8	hash_block_over	src/lingxi/apps/worker/turn.py
 1	hash_block_over	src/lingxi/config/content.py
 10	hash_block_over	src/lingxi/core/admin/card_callback.py
 1	hash_block_over	src/lingxi/core/admin/card_dispatch.py
@@ -313,7 +311,6 @@
 3	provenance	src/lingxi/apps/trace/__init__.py
 1	provenance	src/lingxi/apps/worker/config.py
 95	provenance	src/lingxi/apps/worker/service.py
-54	provenance	src/lingxi/apps/worker/turn.py
 16	provenance	src/lingxi/config/content.py
 2	provenance	src/lingxi/core/admin/__init__.py
 45	provenance	src/lingxi/core/admin/card_callback.py

@@ -120,10 +120,6 @@
 537	src/lingxi/apps/worker/service.py::WorkerService._process_task
 71	src/lingxi/apps/worker/service.py::WorkerService._process_task._write_progress_if_due
 113	src/lingxi/apps/worker/service.py::WorkerService._run_rolling_claim_loop
-69	src/lingxi/apps/worker/turn.py::WorkerTurnExecutor.__init__
-61	src/lingxi/apps/worker/turn.py::WorkerTurnExecutor._audit_mcp_status
-65	src/lingxi/apps/worker/turn.py::WorkerTurnExecutor._handle_deliver_document
-321	src/lingxi/apps/worker/turn.py::WorkerTurnExecutor.run_turn
 76	src/lingxi/config/content.py::ContentCatalog.from_mapping
 112	src/lingxi/core/admin/card_callback.py::AdminCardCallbackHandler._management_context
 171	src/lingxi/core/admin/card_callback.py::AdminCardCallbackHandler.handle
