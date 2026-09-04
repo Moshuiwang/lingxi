@@ -25,6 +25,7 @@ FILENAME_TEMPLATE = "lingxi-{role}-liveness"
 
 
 def liveness_path(role: str, *, directory: Path | None = None) -> Path:
+    """算出该角色的活性文件路径；`directory` 缺省时按环境变量或默认目录取。"""
     base = directory
     if base is None:
         override = os.environ.get("LINGXI_LIVENESS_DIR", "").strip()
@@ -35,9 +36,7 @@ def liveness_path(role: str, *, directory: Path | None = None) -> Path:
 def touch_liveness(
     role: str, *, directory: Path | None = None, clock: Callable[[], float] = time.time
 ) -> None:
-    """写入当前时间戳。写失败不抛异常——活性文件写不进去不能带走主循环；
-    healthcheck 会因为文件缺失或过期如实变红，这本身就是我们想要的诚实失败。
-    """
+    """写入当前时间戳。写失败不抛异常——活性文件写不进去不能带走主循环；healthcheck 会因为文件缺失或过期如实变红，这本身就是我们想要的诚实失败。"""
     path = liveness_path(role, directory=directory)
     try:
         path.write_text(repr(clock()), encoding="utf-8")

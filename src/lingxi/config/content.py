@@ -272,6 +272,7 @@ class ContentCatalog:
         texts: Mapping[str, _TextTemplate],
         cards: Mapping[str, _CardTemplate],
     ) -> None:
+        """接入已校验完毕的版本号、文本模板与卡片模板。"""
         self.version = version
         self._texts = dict(texts)
         self._cards = dict(cards)
@@ -404,9 +405,11 @@ class ContentCatalog:
         )
 
     def text_keys(self) -> tuple[str, ...]:
+        """目录中全部文本模板的键。"""
         return tuple(self._texts)
 
     def card_keys(self) -> tuple[str, ...]:
+        """目录中全部卡片模板的键。"""
         return tuple(self._cards)
 
 

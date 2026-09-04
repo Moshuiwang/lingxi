@@ -34,8 +34,7 @@ def default_admin_metric_alias_map_path() -> Path:
 
 
 def load_admin_metric_alias_map(path: Path | None = None) -> Mapping[str, str]:
-    """解析「别名 → 真实指标 ID」映射；读取或格式失败一律返回空映射（模块文档
-    「fail-open」一节）。
+    """解析「别名 → 真实指标 ID」映射；读取或格式失败一律返回空映射（模块文档「fail-open」一节）。
 
     ``path`` 为 ``None`` 时落回包内默认路径。返回值只保留 ``[aliases]`` 表下
     键非空字符串、值符合 :data:`_METRIC_VALUE_PATTERN` 形状的条目——单条目

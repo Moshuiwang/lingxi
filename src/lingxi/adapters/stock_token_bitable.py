@@ -44,6 +44,7 @@ class StockTokenSourceError(RuntimeError):
     """存量令牌源只读查询失败。``code`` 供程序判断，消息里不含邮箱、密文或 Base 标识。"""
 
     def __init__(self, code: str, *, definite: bool | None = None) -> None:
+        """记录错误码，并按 `definite` 或错误码前缀判定是否为飞书明确拒绝。"""
         super().__init__(f"存量令牌源查询失败：{code}")
         self.code = code
         self.definite = definite if definite is not None else code.startswith("feishu_code_")
@@ -86,6 +87,7 @@ class BitableStockTokenSource:
         page_size: int = DEFAULT_PAGE_SIZE,
         max_pages: int = DEFAULT_MAX_PAGES,
     ) -> None:
+        """校验并接入 Base 标识、令牌供给与分页参数；不做任何 I/O。"""
         self._base_url = _require_https(base_url)
         self._app_token = _require_identifier(app_token, "存量令牌源 Base app_token")
         self._table_id = _require_identifier(table_id, "存量令牌源表 table_id")
@@ -199,6 +201,7 @@ class DecryptingStockTokenSource:
     """
 
     def __init__(self, reader: BitableStockTokenSource, *, cipher: McpTokenCipher) -> None:
+        """接入原始只读源与已校验主密钥的解密器。"""
         if not isinstance(cipher, McpTokenCipher):
             # 同 PostgresMcpTokenStore 的同一条纪律：只接受已经校验过主密钥的对象。
             raise TypeError("存量令牌源必须注入已校验主密钥的 McpTokenCipher")
@@ -206,6 +209,7 @@ class DecryptingStockTokenSource:
         self._cipher = cipher
 
     def lookup(self, email: str) -> StockTokenLookup:
+        """按邮箱查一条存量令牌，把原始三态翻译成四态查询结果。"""
         raw = self._reader.lookup_raw(email)
         if raw is None:
             return StockTokenLookup(state=NO_ROW)

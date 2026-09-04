@@ -149,16 +149,12 @@ def _load_json(raw: bytes) -> Any:
 
 
 def _reject_non_finite_constant(constant: str) -> Any:
-    """M3：``json.loads`` 默认把 ``NaN``/``Infinity``/``-Infinity`` 当合法值——那是
-    JSON 标准之外的 Python 扩展，真实合同里没有这种取值的位置。拒绝比容忍更安全。
-    """
+    """M3：``json.loads`` 默认把 ``NaN``/``Infinity``/``-Infinity`` 当合法值——那是 JSON 标准之外的 Python 扩展，真实合同里没有这种取值的位置。拒绝比容忍更安全。"""
     raise ValueError(f"json 载荷含非标准常量: {constant}")
 
 
 def _reject_duplicate_object_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
-    """M3：重复键在 JSON 标准下未定义行为，``json`` 模块默认静默取最后一个值——等于让
-    "后一个同名键覆盖前一个"无声通过。逐字失败更安全。
-    """
+    """M3：重复键在 JSON 标准下未定义行为，``json`` 模块默认静默取最后一个值——等于让"后一个同名键覆盖前一个"无声通过。逐字失败更安全。"""
     seen: set[str] = set()
     for key, _value in pairs:
         if key in seen:
@@ -168,10 +164,9 @@ def _reject_duplicate_object_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any
 
 
 def _parse_json_strictly(text: str) -> Any:
-    """三个隐藏口子统一在这里收口：``RecursionError``（极深嵌套触发，不是
-    ``ValueError`` 子类，若只捕获后者会穿透逃到轮询循环变成未归类异常）、
-    ``NaN``/``Infinity``/``-Infinity`` 等非标准常量、重复键——三者统一折成
-    :class:`McpProbeError` 的 ``unrecognized_result_shape``，与本模块其余
+    """三个隐藏口子统一在这里收口：``RecursionError``（极深嵌套触发，不是 ``ValueError`` 子类，若只捕获后者会穿透逃到轮询循环变成未归类异常）、``NaN``/``Infinity``/``-Infinity`` 等非标准常量、重复键。
+
+    三者统一折成 :class:`McpProbeError` 的 ``unrecognized_result_shape``，与本模块其余
     未知形状同一个错误码、同一个方向：宁可说"读不懂"，不能说"这个人可以
     用了"。不设响应尺寸上限：真实问题是读不懂就说读不懂，不是太大就拒绝。
     """
@@ -186,9 +181,9 @@ def _parse_json_strictly(text: str) -> Any:
 
 
 def default_metrics_reader(result: Mapping[str, Any]) -> int:
-    """默认的指标计数：只认一种形状——``result.structuredContent.metrics``
-    是一个列表，其余一切（缺键、类型不对、列表挂在别的键上）一律抛
-    ``unrecognized_result_shape``。窄到这个程度是刻意的：假就绪是唯一不可
+    """默认的指标计数：只认一种形状——``result.structuredContent.metrics`` 是一个列表，其余一切（缺键、类型不对、列表挂在别的键上）一律抛 ``unrecognized_result_shape``。
+
+    窄到这个程度是刻意的：假就绪是唯一不可
     犯的方向，依次尝试多个候选键会让一份与指标毫无关系的响应也数出条数、
     判成就绪；真实形状未实测时，猜多种形状不比猜一种更接近真相，只是把
     猜错的后果从响亮失败换成静默假成功。永远不数 ``content`` 的块数：那
@@ -203,11 +198,7 @@ def default_metrics_reader(result: Mapping[str, Any]) -> int:
 
 
 def _require_valid_metric_record(record: Any) -> None:
-    """按实测样本校验一条指标记录——``metric_id``/``name``/
-    ``name_en``（:data:`METRIC_RECORD_FIELDS`）三个字段都必须存在且是字符串。缺字段
-    或类型不对，一律 ``unrecognized_result_shape``：服务端契约若变了应当被响亮地发现，
-    而不是被静默容忍。
-    """
+    """按实测样本校验一条指标记录——``metric_id``/``name``/``name_en``（:data:`METRIC_RECORD_FIELDS`）三个字段都必须存在且是字符串。缺字段或类型不对，一律 ``unrecognized_result_shape``：服务端契约若变了应当被响亮地发现，而不是被静默容忍。"""
     if not isinstance(record, Mapping):
         raise McpProbeError("unrecognized_result_shape", denied=False)
     for field in METRIC_RECORD_FIELDS:
@@ -216,9 +207,8 @@ def _require_valid_metric_record(record: Any) -> None:
 
 
 def content_text_metrics_reader(result: Mapping[str, Any]) -> int:
-    """已验证的指标计数：读 ``result.content`` 中唯一一个块，要求
-    ``type == "text"``，把 ``text`` 解析成 JSON，要求顶层恰好是
-    ``{"metrics": [...]}``，对列表每条记录按实测字段集合校验后返回条数。
+    """已验证的指标计数：读 ``result.content`` 中唯一一个块，要求 ``type == "text"``，把 ``text`` 解析成 JSON，要求顶层恰好是 ``{"metrics": [...]}``，对列表每条记录按实测字段集合校验后返回条数。
+
     真实响应样例见 ``docs/参考证据/问数MCP-list_metrics真实响应形状.md``；
     ``default_metrics_reader`` 在真实 MCP 上读不懂该形状，本函数由装配层
     显式注入替换默认值。假定调用方已经过 ``isError`` 门，单独复用时须
@@ -246,8 +236,7 @@ def content_text_metrics_reader(result: Mapping[str, Any]) -> int:
 
 
 def content_text_metric_ids_reader(result: Mapping[str, Any]) -> frozenset[str]:
-    """``list_metrics`` 的 ``metric_id`` 集合读取（每日「MCP 指标目录 vs 映射表
-    覆盖面」日检用）。
+    """``list_metrics`` 的 ``metric_id`` 集合读取（每日「MCP 指标目录 vs 映射表覆盖面」日检用）。
 
     与 :func:`content_text_metrics_reader` 出自同一份已实测响应形状，校验
     规则逐条相同，唯一差异是返回值：那个函数只数条数，这个函数要拿到
@@ -347,6 +336,7 @@ class QueryMcpProbe:
         tool_error_is_denied: bool = False,
         timeout_seconds: int = REQUEST_TIMEOUT_SECONDS,
     ) -> None:
+        """校验并接入探针端点、令牌供给、传输层与拒绝判定规则。"""
         self._endpoint = _require_https(endpoint)
         if not callable(token_provider):
             raise ValueError("token_provider 必须是按 user_id 返回明文令牌的可调用对象")
@@ -369,17 +359,12 @@ class QueryMcpProbe:
 
     @property
     def timeout_seconds(self) -> int:
-        """单次传输超时。装配层必须让它与
-        :attr:`lingxi.core.permission.mcp_readiness.ReadinessSchedule.probe_timeout_seconds`
-        一致——那边算出来的"结论最晚什么时候落地"就是拿这个数算的。
-        """
+        """单次传输超时。装配层必须让它与 :attr:`lingxi.core.permission.mcp_readiness.ReadinessSchedule.probe_timeout_seconds` 一致——那边算出来的"结论最晚什么时候落地"就是拿这个数算的。"""
         return self._timeout_seconds
 
     @property
     def metrics_reader(self) -> Callable[[Mapping[str, Any]], int]:
-        """当前生效的指标计数函数。装配层与测试用它自证接线：
-        没有它，"装配层是不是真的注入了已验证的 reader"就只能靠读代码相信，读不出来。
-        """
+        """当前生效的指标计数函数。装配层与测试用它自证接线：没有它，"装配层是不是真的注入了已验证的 reader"就只能靠读代码相信，读不出来。"""
         return self._metrics_reader
 
     def list_metrics(self, *, user_id: str) -> int:

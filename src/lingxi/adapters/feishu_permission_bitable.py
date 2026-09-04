@@ -42,9 +42,7 @@ def _require_https(base_url: object) -> str:
 
 
 def _require_identifier(value: object, label: str) -> str:
-    """校验 Base / 表 / 记录标识非空且不含空白。**不回显值**：它们是外部标识，一旦进
-    错误消息就会被日志、CI 输出和工单一路复制出去。
-    """
+    """校验 Base / 表 / 记录标识非空且不含空白。**不回显值**：它们是外部标识，一旦进错误消息就会被日志、CI 输出和工单一路复制出去。"""
     if not isinstance(value, str) or not value.strip():
         raise ValueError(f"{label}必须由配置注入，不得为空（不回显收到的值）")
     text = value.strip()
@@ -81,6 +79,7 @@ class BitablePermissionTable:
         page_size: int = DEFAULT_PAGE_SIZE,
         max_pages: int = DEFAULT_MAX_PAGES,
     ) -> None:
+        """校验并接入 Base 标识、令牌供给与分页参数；不做任何 I/O。"""
         self._base_url = _require_https(base_url)
         self._app_token = _require_identifier(app_token, "权限发布 Base app_token")
         self._table_id = _require_identifier(table_id, "权限发布表 table_id")
@@ -214,6 +213,7 @@ class BitablePermissionTable:
         return tuple(matched)
 
     def create_row(self, fields: Mapping[str, str]) -> str:
+        """新建一行权限发布记录，返回新记录的 record_id。"""
         data = self._call(
             "POST", f"{self._base_url}{self._records_path}", body={"fields": dict(fields)}
         )
@@ -227,6 +227,7 @@ class BitablePermissionTable:
         logger.info("权限发布行已更新 record=%s", record_id)
 
     def read_row(self, record_id: str) -> dict[str, Any]:
+        """读回 `record_id` 对应行的字段，供写入后逐字段比对。"""
         data = self._call("GET", self._record_url(record_id), body=None)
         _, fields = self._record(data)
         return fields

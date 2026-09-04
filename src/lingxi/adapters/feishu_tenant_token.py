@@ -35,6 +35,7 @@ class FeishuTenantTokenError(RuntimeError):
     """应用身份令牌获取失败。``code`` 供程序判断，消息里不含任何凭据。"""
 
     def __init__(self, code: str) -> None:
+        """记录失败分类码，消息体只含 `code`、不带任何凭据。"""
         self.code = code
         super().__init__(code)
 
@@ -58,13 +59,15 @@ def _require_https(base_url: str) -> str:
 
 
 class Transport(Protocol):
-    def __call__(self, method: str, url: str, *, body: Mapping[str, Any] | None = ...) -> Any: ...
+    """传输层的可替换形状：给定方法、URL 与可选请求体，返回已解析的响应。"""
+
+    def __call__(self, method: str, url: str, *, body: Mapping[str, Any] | None = ...) -> Any:
+        """发起一次请求并返回已解析的响应；测试可注入假实现替换真实网络调用。"""
+        ...
 
 
 def urllib_transport(method: str, url: str, *, body: Mapping[str, Any] | None = None) -> Any:
-    """默认传输层：只发 HTTPS，不重试有副作用的请求（换令牌本身就是一次性调用，
-    重试会在飞书那一侧产生第二次计次；调用方按分类失败关闭，下一轮自然会再试）。
-    """
+    """默认传输层：只发 HTTPS，不重试有副作用的请求（换令牌本身就是一次性调用，重试会在飞书那一侧产生第二次计次；调用方按分类失败关闭，下一轮自然会再试）。"""
     payload = json.dumps(body, ensure_ascii=False).encode() if body is not None else None
     headers = {"Content-Type": "application/json; charset=utf-8"} if body is not None else {}
     request = Request(url, data=payload, headers=headers, method=method)
@@ -83,9 +86,7 @@ def urllib_transport(method: str, url: str, *, body: Mapping[str, Any] | None = 
 
 
 class FeishuTenantTokenClient:
-    """应用身份令牌的换取调用。上层只得到 :class:`DerivedAccessToken`，不接触飞书
-    响应字典。
-    """
+    """应用身份令牌的换取调用。上层只得到 :class:`DerivedAccessToken`，不接触飞书响应字典。"""
 
     def __init__(
         self,
@@ -95,6 +96,7 @@ class FeishuTenantTokenClient:
         app_secret: str,
         transport: Callable[..., Any] | None = None,
     ) -> None:
+        """校验应用身份凭据并接入 base_url 与传输层。"""
         if not app_id or not app_secret:
             raise ValueError("缺少应用身份凭据")
         self._base_url = _require_https(base_url)
@@ -103,9 +105,7 @@ class FeishuTenantTokenClient:
         self._transport: Callable[..., Any] = transport or urllib_transport
 
     def fetch(self) -> DerivedAccessToken:
-        """换一份新的应用身份令牌。**每次调用都真的发起一次请求**——本方法不缓存，
-        缓存与"该不该现在去换"的判断在
-        :mod:`lingxi.core.permission.tenant_token_supply`。
+        """换一份新的应用身份令牌。**每次调用都真的发起一次请求**——本方法不缓存，缓存与"该不该现在去换"的判断在 :mod:`lingxi.core.permission.tenant_token_supply`。
 
         令牌与寿命任一缺失、类型不符或寿命非正都失败关闭：这条调用没有"部分成功"
         （不像专用授权续期那样还要落盘一份新的 ``refresh_token``），因此这里不采用

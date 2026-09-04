@@ -70,6 +70,7 @@ class RetentionReport:
 
     @property
     def deleted(self) -> int:
+        """本轮跨所有表删除的行数合计。"""
         return sum(result.deleted for result in self.tables)
 
     @property
@@ -99,6 +100,7 @@ class PostgresRetentionCleaner:
         batch_limit: int = DEFAULT_BATCH_LIMIT,
         timeouts: PostgresTimeouts = RETENTION_CLEANUP_TIMEOUTS,
     ) -> None:
+        """校验批量上限并接入连接串与超时配置；不建连接。"""
         if batch_limit <= 0:
             raise ValueError("保留清理的批量必须是正整数")
         self._dsn = dsn
@@ -107,6 +109,7 @@ class PostgresRetentionCleaner:
 
     @property
     def batch_limit(self) -> int:
+        """每次清理调用允许删除的最大行数。"""
         return self._batch_limit
 
     def run_once(self) -> RetentionReport:

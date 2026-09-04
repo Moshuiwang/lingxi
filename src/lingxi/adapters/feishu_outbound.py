@@ -46,10 +46,12 @@ class LarkReactions:
     """加表情。实现 ``core.conversation.ports.Reactions``。"""
 
     def __init__(self, client: Any, *, emoji_type: str = RECEIPT_EMOJI) -> None:
+        """接入已构造的 SDK 客户端与要添加的表情类型。"""
         self._client = client
         self._emoji_type = emoji_type
 
     def add(self, *, message_id: str) -> None:
+        """给 `message_id` 对应的消息加一个表情；飞书拒绝时抛出。"""
         from lark_oapi.api.im.v1 import (
             CreateMessageReactionRequest,
             CreateMessageReactionRequestBody,
@@ -77,6 +79,7 @@ class LarkReplies:
     """发文本。实现 ``core.conversation.ports.Replies``。"""
 
     def __init__(self, client: Any) -> None:
+        """接入已构造的 SDK 客户端。"""
         self._client = client
 
     def send_text(

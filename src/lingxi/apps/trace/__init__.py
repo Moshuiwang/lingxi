@@ -307,6 +307,7 @@ def run(
 
 
 def main() -> int:  # pragma: no cover - 由 __main__.py 与真实 CLI 调用
+    """入口封装，交给 `__main__.py` 与真实 CLI 调用。"""
     return run()
 
 

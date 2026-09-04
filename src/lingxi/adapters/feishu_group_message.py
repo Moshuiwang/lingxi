@@ -72,6 +72,7 @@ class FeishuGroupMessageError(RuntimeError):
     """
 
     def __init__(self, code: str, *, definite: bool | None = None) -> None:
+        """记录错误码，并按 `definite` 或错误码前缀判定是否为飞书明确拒绝。"""
         super().__init__(f"飞书群消息发送失败：{code}")
         self.code = code
         self.definite = definite if definite is not None else code.startswith("feishu_code_")
@@ -121,6 +122,7 @@ class FeishuGroupMessages:
         on_send_outcome: SendOutcomeCallback | None = None,
         uuid_prefix: str = DELIVERY_UUID_PREFIX,
     ) -> None:
+        """接入群消息发送所需的凭据、传输层与去重前缀；不建 client、不发请求。"""
         self._base_url = _require_https(base_url)
         self._app_id = app_id
         self._app_secret = app_secret
@@ -147,9 +149,7 @@ class FeishuGroupMessages:
             )
 
     def _tenant_access_token(self) -> str:
-        """取应用身份令牌。每次发送现取：日报一天一次，缓存换不来任何东西，
-        却会多出一份「缓存过期与失效」的失败模式。
-        """
+        """取应用身份令牌。每次发送现取：日报一天一次，缓存换不来任何东西，却会多出一份「缓存过期与失效」的失败模式。"""
         response = self._transport(
             "POST",
             f"{self._base_url}/auth/v3/tenant_access_token/internal",

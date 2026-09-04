@@ -67,6 +67,7 @@ class UserEnvironmentError(RuntimeError):
     """用户环境创建失败。``code`` 只有错误码，**不带路径、内容或凭据片段**。"""
 
     def __init__(self, code: str) -> None:
+        """记录失败分类码，消息体不含路径、内容或凭据片段。"""
         super().__init__(code)
         self.code = code
 
@@ -122,6 +123,7 @@ class LocalUserEnvironment:
         credential_file_mode: int = CREDENTIAL_FILE_MODE,
         root_dir_mode: int = ROOT_DIR_MODE,
     ) -> None:
+        """校验根目录与各权限位并接入端点、服务名；不碰文件系统。"""
         if not root or not str(root).strip():
             raise ValueError("用户环境根目录不能为空")
         if not str(root).startswith("/"):

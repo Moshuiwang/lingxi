@@ -1,5 +1,4 @@
-"""专用授权主体标识的只读查询——从 ``adapters/delegated_credentials.py`` 拆出来的
-单一函数。
+"""专用授权主体标识的只读查询——从 ``adapters/delegated_credentials.py`` 拆出来的单一函数。
 
 为什么单独成一个模块：``delegated_credentials.py`` 本身在别的函数里
 ``from cryptography.fernet import Fernet``（密文读写），而依赖闭包检查按整个
@@ -27,8 +26,7 @@ DELEGATED_PURPOSE = "org_directory_sync"
 def registered_delegated_subject_open_id(
     dsn: str, *, timeouts: PostgresTimeouts = DEFAULT_POSTGRES_TIMEOUTS
 ) -> str | None:
-    """读取正式登记的专用授权主体标识。只读登记表，不碰凭据文件、不碰
-    refresh_token。
+    """读取正式登记的专用授权主体标识。只读登记表，不碰凭据文件、不碰 refresh_token。
 
     做成模块级函数而不是只挂在 ``HostFileDelegatedCredentialVault`` 上，是为
     让不该持有凭据的进程也能拿到这个标识：gateway 既没有 Fernet 主密钥、也不

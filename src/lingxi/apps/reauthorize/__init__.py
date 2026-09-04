@@ -52,6 +52,7 @@ BOOTSTRAP_AUDIT_EVENT = "reauthorize.bootstrap"
 
 
 def required(name: str, env: Mapping[str, str] | None = None) -> str:
+    """读取一个必需的环境变量，缺失或为空即失败关闭。"""
     source = os.environ if env is None else env
     value = source.get(name, "").strip()
     if not value:
@@ -158,11 +159,13 @@ class BootstrapAuditHandler(logging.Handler):
     """
 
     def __init__(self, stream: TextIO) -> None:
+        """接入受控输出流，写入计数从零开始。"""
         super().__init__(level=logging.INFO)
         self._stream = stream
         self.written = 0
 
     def emit(self, record: logging.LogRecord) -> None:
+        """把审计事件写进受控流并计数；非审计日志直接丢弃。"""
         if getattr(record, "audit_event", None) != BOOTSTRAP_AUDIT_EVENT:
             # 同一 logger 上的普通诊断日志不进审计出口。
             return
@@ -248,6 +251,7 @@ def _build_entry(
 
 
 def bridge_wait_seconds(env: Mapping[str, str]) -> int:
+    """从环境变量解出等待 OAuth Bridge 回执的超时秒数；缺省或非法值有各自的处理。"""
     raw = env.get("LINGXI_OAUTH_BRIDGE_WAIT_SECONDS", "").strip()
     if not raw:
         return DEFAULT_BRIDGE_WAIT_SECONDS

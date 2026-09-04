@@ -58,8 +58,9 @@ _HEALTHCHECK_INTERVAL_SECONDS_BY_ROLE: Mapping[str, float] = {
 
 
 def _compute_db_cache_ttl_seconds(role: str) -> float:
-    """依赖可达判定的成功结果缓存有效期公式：``TTL = liveness_max_age −
-    2 × interval``，下限 0（=禁用缓存）。减两倍 interval 而非一倍：
+    """依赖可达判定的成功结果缓存有效期公式：``TTL = liveness_max_age − 2 × interval``，下限 0（=禁用缓存）。
+
+    减两倍 interval 而非一倍：
     健康检查只在自己被调用的离散节拍上发现缓存过期，最坏情况下还要再
     等一个 interval 才会触发真实探测，减一倍刚好卡线，减两倍才留出
     显式安全余量，保证"依赖不可达"的最坏发现时延不超过"主循环停摆"
@@ -373,10 +374,7 @@ def _resolve_options(args: argparse.Namespace) -> _ResolvedOptions:
 
 
 def _resolve_directory(source: Mapping[str, str]) -> Path | None:
-    """活性/DB 缓存目录必须从传入的 ``source``（而不是真实进程
-    ``os.environ``）解出来，再显式下传给各判定函数，否则调用方传入的
-    隔离环境会被静默忽略（真实生产路径行为不变）。
-    """
+    """活性/DB 缓存目录必须从传入的 ``source``（而不是真实进程 ``os.environ``）解出来，再显式下传给各判定函数，否则调用方传入的隔离环境会被静默忽略（真实生产路径行为不变）。"""
     liveness_dir_override = (source.get("LINGXI_LIVENESS_DIR") or "").strip()
     return Path(liveness_dir_override) if liveness_dir_override else None
 
@@ -402,6 +400,7 @@ def run(
     env: Mapping[str, str] | None = None,
     stderr: object = None,
 ) -> int:
+    """跑一轮健康检查，打印结果并返回 CLI 退出码（0=健康，1=不健康）。"""
     args = _build_parser().parse_args(list(argv) if argv is not None else None)
     source = os.environ if env is None else env
     err = sys.stderr if stderr is None else stderr
@@ -420,4 +419,5 @@ def run(
 
 
 def main() -> int:  # pragma: no cover - 由 __main__.py 与真实 CLI 调用
+    """入口封装，交给 `__main__.py` 与真实 CLI 调用。"""
     return run()

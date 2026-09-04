@@ -53,6 +53,8 @@ class GalaxyImportVerificationError(RuntimeError):
 
 @dataclass(frozen=True)
 class ImportResult:
+    """一次银河导出落库的结果：结论、批次号、各表行数与问题清单。"""
+
     outcome: str
     batch_id: str | None
     row_counts: Mapping[str, int]
@@ -78,6 +80,7 @@ class PostgresGalaxyImportStore:
     """银河导出的落库入口。构造时不连接数据库，每次调用自带事务。"""
 
     def __init__(self, dsn: str, *, timeouts: PostgresTimeouts = DEFAULT_POSTGRES_TIMEOUTS) -> None:
+        """接入连接串与超时配置；不建连接。"""
         from psycopg.types.json import Json
 
         self._json = Json

@@ -44,6 +44,7 @@ class McpTokenCipherError(RuntimeError):
     """
 
     def __init__(self, code: str) -> None:
+        """记录失败分类码，消息体不含明文、密文与密钥。"""
         super().__init__(f"MCP 令牌加解密失败：{code}")
         self.code = code
 
@@ -86,6 +87,7 @@ class McpTokenCipher:
     """AES-256-CBC 的加解密面。构造即校验主密钥，不做任何 I/O。"""
 
     def __init__(self, master_key: str) -> None:
+        """校验并解出主密钥；不做任何 I/O。"""
         self._key = load_master_key(master_key)
 
     def __repr__(self) -> str:

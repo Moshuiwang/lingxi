@@ -63,6 +63,7 @@ class UserMcpConfigError(RuntimeError):
     """按用户读取 MCP 配置失败。``code`` 只有错误码，不带路径、内容或凭据片段。"""
 
     def __init__(self, code: str) -> None:
+        """记录失败分类码，消息体不带路径、内容或凭据片段。"""
         super().__init__(code)
         self.code = code
 
@@ -117,9 +118,7 @@ def _errno_name(error: OSError) -> str:
 
 
 def load_user_mcp_servers(*, root: str, user_id: str) -> Mapping[str, Any]:
-    """读取 ``user_id`` 自己的 ``.mcp.json``，返回其中的 ``mcpServers`` 映射
-    （``server_name -> server_config``，与 ``WorkerConfig.mcp_servers`` 同一形状，
-    可以直接作为 ``mcp_servers=`` 传给 ``build_agent_options``）。
+    """读取 ``user_id`` 自己的 ``.mcp.json``，返回其中的 ``mcpServers`` 映射（``server_name -> server_config``，与 ``WorkerConfig.mcp_servers`` 同一形状，可以直接作为 ``mcp_servers=`` 传给 ``build_agent_options``）。
 
     这是本模块**唯一的对外入口**，没有默认值参数、没有回退开关：任何失败都以
     :class:`UserMcpConfigError` 抛出，调用方据此走既有的失败关闭终态，不得吞掉
@@ -243,9 +242,7 @@ def _parse_mcp_servers(payload: bytes) -> Mapping[str, Any]:
 
 
 def _validate_server_shape(value: Any) -> None:
-    """严格校验单个 server 配置恰好是写侧会产出的那一种形状：
-    ``{"type": "http", "url": "https://…", "headers":
-    {"Authorization": "Bearer <非空令牌>"}}``，不多一个键、不少一个键。
+    """严格校验单个 server 配置恰好是写侧会产出的那一种形状：``{"type": "http", "url": "https://…", "headers": {"Authorization": "Bearer <非空令牌>"}}``，不多一个键、不少一个键。
 
     只检查"是不是 dict"不够：``{"type": "stdio", "command": "…"}`` 这类形状
     也能原样通过，读侧因此可能被诱导去启动任意本地进程。这里结构性地只

@@ -46,6 +46,7 @@ class BackgroundPostCallbackExecutor:
         queue_maxsize: int = _DEFAULT_QUEUE_MAXSIZE,
         thread_name: str = "lingxi-gateway-admin-post-callback",
     ) -> None:
+        """校验队列容量并启动后台 daemon 工作线程消费提交的任务。"""
         if isinstance(queue_maxsize, bool) or not isinstance(queue_maxsize, int):
             raise ValueError("queue_maxsize 必须是整数")
         if not _MIN_QUEUE_MAXSIZE <= queue_maxsize <= _MAX_QUEUE_MAXSIZE:

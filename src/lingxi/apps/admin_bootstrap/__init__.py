@@ -35,6 +35,7 @@ DELEGATED_SUBJECT_LABEL = "delegated_subject"
 
 
 def parse_arguments(argv: Sequence[str] = ()) -> argparse.Namespace:
+    """解析命令行参数，缺省即只读检查、不写库。"""
     parser = argparse.ArgumentParser(prog="python -m lingxi.apps.admin_bootstrap")
     parser.add_argument(
         "--confirm",
@@ -186,6 +187,7 @@ def run(
 
 
 def main() -> int:  # pragma: no cover - 由 __main__.py 调用
+    """入口封装，交给 `__main__.py` 调用。"""
     return run()
 
 
