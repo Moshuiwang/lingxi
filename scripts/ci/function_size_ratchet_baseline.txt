@@ -7,32 +7,6 @@
 # 被 --refresh 自动登记进来：先拆分或精简；确有理由要接受它作为新的棘轮登记
 # 对象，人工在下面加一行「行数<TAB>键」，门禁会核对这一行是否等于实际行数。
 
-91	src/lingxi/adapters/admin_registry.py::PostgresAdminQueries.trace_lookup
-74	src/lingxi/adapters/admin_registry.py::PostgresAdminQueries.user_status
-90	src/lingxi/adapters/admin_registry.py::seed_admin_registry_entry
-61	src/lingxi/adapters/claude_agent_session.py::build_agent_options
-62	src/lingxi/adapters/claude_agent_session.py::normalize_message
-132	src/lingxi/adapters/claude_agent_session.py::run_single_turn
-124	src/lingxi/adapters/delegated_credentials.py::HostFileDelegatedCredentialVault.claim_due
-147	src/lingxi/adapters/delegated_credentials.py::HostFileDelegatedCredentialVault.save
-73	src/lingxi/adapters/feishu_admin_card.py::LarkAdminCardTransport.create
-69	src/lingxi/adapters/feishu_admin_card.py::LarkAdminManagementCardTransport.create
-82	src/lingxi/adapters/feishu_bitable_association.py::analyze_association
-77	src/lingxi/adapters/feishu_delivery.py::LarkCardTransport.create
-66	src/lingxi/adapters/feishu_directory.py::FeishuAuthorizationClient.exchange_authorization_code
-123	src/lingxi/adapters/feishu_directory.py::_PagedClient._pages
-128	src/lingxi/adapters/feishu_directory.py::_PagedClient._pages_multi
-69	src/lingxi/adapters/feishu_directory.py::_PagedClient._request
-71	src/lingxi/adapters/feishu_docx_delivery.py::LarkDocxDelivery.create_document_with_markdown
-73	src/lingxi/adapters/feishu_events.py::parse_card_action_event
-72	src/lingxi/adapters/feishu_events.py::parse_message_event
-82	src/lingxi/adapters/feishu_longconn.py::LarkEventTransport.stream
-129	src/lingxi/adapters/feishu_org_snapshot_reader.py::_walk_user_scope
-73	src/lingxi/adapters/feishu_org_snapshot_reader.py::read_org_snapshot
-132	src/lingxi/adapters/feishu_reauthorization.py::FeishuReauthorizationEntry.handle_callback
-99	src/lingxi/adapters/feishu_roster_bitable.py::read_roster_snapshot
-65	src/lingxi/adapters/feishu_sheets_delivery.py::LarkSheetsDelivery.write_values
-102	src/lingxi/adapters/galaxy_import.py::PostgresGalaxyImportStore.import_export
 114	src/lingxi/adapters/postgres.py::_build_reusable_connection_type
 85	src/lingxi/adapters/postgres_conversation/_queue_base.py::_TaskQueueBase._run_polling_operation
 95	src/lingxi/adapters/postgres_conversation/_queue_lifecycle.py::_TaskLifecycleMixin._write_system_terminal
@@ -70,11 +44,6 @@
 68	src/lingxi/adapters/postgres_permission_recompute_trigger.py::PermissionRecomputeAdapter.trigger
 65	src/lingxi/adapters/postgres_roster_snapshot.py::PostgresRosterSnapshotStore.replace
 125	src/lingxi/adapters/postgres_stalled_provisioning.py::PostgresStalledProvisioningStore.stalled_provisioning_candidates
-71	src/lingxi/adapters/query_mcp_probe.py::content_text_metrics_reader
-69	src/lingxi/adapters/query_mcp_probe.py::fetch_metric_catalog
-112	src/lingxi/apps/admin_bootstrap/__init__.py::run
-107	src/lingxi/apps/healthcheck/__init__.py::run
-166	src/lingxi/apps/reauthorize/__init__.py::_run
 86	src/lingxi/apps/scheduler/assembly.py::_build_management_correction_callback
 300	src/lingxi/apps/scheduler/assembly.py::build_loop
 211	src/lingxi/apps/scheduler/config.py::SchedulerConfig.from_env
@@ -100,9 +69,6 @@
 69	src/lingxi/apps/scheduler/roster_audit.py::_build_roster_snapshot_sync_duty
 65	src/lingxi/apps/scheduler/stalled_provisioning.py::StalledProvisioningDuty._process_one
 67	src/lingxi/apps/scheduler/stalled_provisioning.py::_build_stalled_provisioning_duty
-63	src/lingxi/apps/trace/__init__.py::_render
-71	src/lingxi/apps/trace/__init__.py::run
-76	src/lingxi/config/content.py::ContentCatalog.from_mapping
 112	src/lingxi/core/admin/card_callback.py::AdminCardCallbackHandler._management_context
 171	src/lingxi/core/admin/card_callback.py::AdminCardCallbackHandler.handle
 158	src/lingxi/core/admin/card_callback.py::AdminCardCallbackHandler.handle_management_form_submit

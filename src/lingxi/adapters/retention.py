@@ -75,12 +75,10 @@ class RetentionReport:
     @property
     def blocked_tables(self) -> tuple[str, ...]:
         """本轮因锁等待超时而未能清理的表。非空即这一轮没做完。"""
-
         return tuple(result.table for result in self.tables if result.blocked)
 
     def summary(self) -> str:
         """写进日志的一行摘要。只有表名与计数，永远不取行内容。"""
-
         if not self.tables:
             return "保留清理：本轮无目标表"
         parts = [
@@ -119,7 +117,6 @@ class PostgresRetentionCleaner:
         变成偶发失败。整个调用是一个事务，中途被信号打断只会整体回滚，不会留下
         删了父行没删子行的半删状态（断言 V-保留-17）。
         """
-
         with (
             connect(self._dsn, timeouts=self._timeouts) as connection,
             connection.cursor() as cursor,

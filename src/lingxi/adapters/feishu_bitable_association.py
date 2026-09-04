@@ -93,18 +93,45 @@ def _match_stats(
     }
 
 
-def analyze_association(
-    bitable_rows: Iterable[Mapping[str, Any]],
-    snapshot_rows: Iterable[Mapping[str, Any]],
-) -> dict[str, Any]:
-    """返回不包含原始记录的关联统计，供脚本和测试共同使用。"""
+def _snapshot_stats(
+    snapshot: list[dict[str, Any]],
+    by_user_id: Mapping[str, list[dict[str, Any]]],
+    by_open_id: Mapping[str, list[dict[str, Any]]],
+) -> dict[str, int]:
+    return {
+        "member_rows": len(snapshot),
+        "distinct_user_id": len(by_user_id),
+        "distinct_open_id": len(by_open_id),
+        "distinct_union_id": len(
+            {
+                row["union_id"] or row["union_user_id"]
+                for row in snapshot
+                if row["union_id"] or row["union_user_id"]
+            }
+        ),
+    }
 
-    bitable = _normalize_bitable_rows(bitable_rows)
-    snapshot = _normalize_snapshot_rows(snapshot_rows)
-    by_user_id = _index(snapshot, "user_id")
-    by_open_id = _index(snapshot, "open_id")
-    by_name = _index(snapshot, "name")
 
+def _bitable_stats(bitable: list[dict[str, Any]]) -> dict[str, int]:
+    return {
+        "record_rows": len(bitable),
+        "nonempty_personnel_id": sum(bool(row["personnel_id"]) for row in bitable),
+        "distinct_personnel_id": len(
+            {row["personnel_id"] for row in bitable if row["personnel_id"]}
+        ),
+        "nonempty_open_id": sum(bool(row["open_id"]) for row in bitable),
+        "distinct_open_id": len({row["open_id"] for row in bitable if row["open_id"]}),
+        "nonempty_work_no": sum(bool(row["work_no"]) for row in bitable),
+        "distinct_work_no": len({row["work_no"] for row in bitable if row["work_no"]}),
+    }
+
+
+def _both_keys_same_member(
+    bitable: list[dict[str, Any]],
+    by_user_id: Mapping[str, list[dict[str, Any]]],
+    by_open_id: Mapping[str, list[dict[str, Any]]],
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """两把键都命中的行，以及两把键指向的候选成员集合有交集的子集。"""
     both_keys = []
     same_member = []
     for row in bitable:
@@ -121,57 +148,57 @@ def analyze_association(
         }
         if user_members & open_members:
             same_member.append(row)
+    return both_keys, same_member
 
+
+def _join_stats(
+    bitable: list[dict[str, Any]],
+    by_user_id: Mapping[str, list[dict[str, Any]]],
+    by_open_id: Mapping[str, list[dict[str, Any]]],
+    by_name: Mapping[str, list[dict[str, Any]]],
+) -> dict[str, Any]:
+    both_keys, same_member = _both_keys_same_member(bitable, by_user_id, by_open_id)
     name_matches = [row for row in bitable if row["name"] and row["name"] in by_name]
     personnel_to_open = [
         row for row in bitable if row["personnel_id"] and row["personnel_id"] in by_open_id
     ]
     open_to_user = [row for row in bitable if row["open_id"] and row["open_id"] in by_user_id]
-
     return {
-        "snapshot": {
-            "member_rows": len(snapshot),
-            "distinct_user_id": len(by_user_id),
-            "distinct_open_id": len(by_open_id),
-            "distinct_union_id": len(
-                {
-                    row["union_id"] or row["union_user_id"]
-                    for row in snapshot
-                    if row["union_id"] or row["union_user_id"]
-                }
+        "personnel_id_to_user_id": _match_stats(bitable, "personnel_id", by_user_id),
+        "open_id_to_open_id": _match_stats(bitable, "open_id", by_open_id),
+        "both_keys_same_member": {
+            "rows_with_both_keys": len(both_keys),
+            "same_member_rows": len(same_member),
+        },
+        "name_only": {
+            "matched_rows": len(name_matches),
+            "unique_snapshot_name_matches": sum(
+                len(by_name[row["name"]]) == 1 for row in name_matches
+            ),
+            "ambiguous_snapshot_name_matches": sum(
+                len(by_name[row["name"]]) > 1 for row in name_matches
             ),
         },
-        "bitable": {
-            "record_rows": len(bitable),
-            "nonempty_personnel_id": sum(bool(row["personnel_id"]) for row in bitable),
-            "distinct_personnel_id": len(
-                {row["personnel_id"] for row in bitable if row["personnel_id"]}
-            ),
-            "nonempty_open_id": sum(bool(row["open_id"]) for row in bitable),
-            "distinct_open_id": len({row["open_id"] for row in bitable if row["open_id"]}),
-            "nonempty_work_no": sum(bool(row["work_no"]) for row in bitable),
-            "distinct_work_no": len({row["work_no"] for row in bitable if row["work_no"]}),
+        "work_no": {"matched_against_snapshot_identity_fields": 0},
+        "cross_checks": {
+            "personnel_id_to_snapshot_open_id": len(personnel_to_open),
+            "open_id_to_snapshot_user_id": len(open_to_user),
         },
-        "joins": {
-            "personnel_id_to_user_id": _match_stats(bitable, "personnel_id", by_user_id),
-            "open_id_to_open_id": _match_stats(bitable, "open_id", by_open_id),
-            "both_keys_same_member": {
-                "rows_with_both_keys": len(both_keys),
-                "same_member_rows": len(same_member),
-            },
-            "name_only": {
-                "matched_rows": len(name_matches),
-                "unique_snapshot_name_matches": sum(
-                    len(by_name[row["name"]]) == 1 for row in name_matches
-                ),
-                "ambiguous_snapshot_name_matches": sum(
-                    len(by_name[row["name"]]) > 1 for row in name_matches
-                ),
-            },
-            "work_no": {"matched_against_snapshot_identity_fields": 0},
-            "cross_checks": {
-                "personnel_id_to_snapshot_open_id": len(personnel_to_open),
-                "open_id_to_snapshot_user_id": len(open_to_user),
-            },
-        },
+    }
+
+
+def analyze_association(
+    bitable_rows: Iterable[Mapping[str, Any]],
+    snapshot_rows: Iterable[Mapping[str, Any]],
+) -> dict[str, Any]:
+    """返回不包含原始记录的关联统计，供脚本和测试共同使用。"""
+    bitable = _normalize_bitable_rows(bitable_rows)
+    snapshot = _normalize_snapshot_rows(snapshot_rows)
+    by_user_id = _index(snapshot, "user_id")
+    by_open_id = _index(snapshot, "open_id")
+    by_name = _index(snapshot, "name")
+    return {
+        "snapshot": _snapshot_stats(snapshot, by_user_id, by_open_id),
+        "bitable": _bitable_stats(bitable),
+        "joins": _join_stats(bitable, by_user_id, by_open_id, by_name),
     }

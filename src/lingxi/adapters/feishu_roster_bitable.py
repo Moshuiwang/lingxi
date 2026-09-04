@@ -1,38 +1,17 @@
-"""花名册多维表格的只读 adapter（正式壳）。
+"""花名册多维表格的只读 adapter。
 
-它承接的是受控验证已经证明的读取模式（`scripts/read_feishu_bitable_association.py`
-与 `adapters/feishu_bitable_association.py` 这两个**测试资产**），把其中会长期存在的
-部分固定下来：分页读取、对象型单元格取文本、只取匹配链路需要的字段。
+分两段：**归一化**把一条原始记录变成 `RosterRow`；**分页 reader 与完整性
+判定**按 `page_token` 读完整轮，结算「这一轮能不能当作快照」所需的事实。
+**判定「要不要替换快照」不在这里**，门槛与保旧告警在别处。
+``read_roster_snapshot`` 是唯一入口。
 
-本模块分两段，都在同一个外部系统（花名册多维表格）上，因此不拆成第二个 adapter：
+**真实调用未验证（证据等级 L1）**：断言跑在假传输层上；本模块不 import
+任何 SDK、不读凭据文件、构造时不发请求，`access_token` 由调用方注入。
 
-1. **归一化**（`field_text` / `normalize_record`）：把一条原始记录变成 `RosterRow`。
-2. **分页 reader 与完整性判定**（`BitableRosterPages` / `read_roster_snapshot`，
-   Issue [#52](https://github.com/Moshuiwang/lingxi/issues/52)）：按 `page_token` 读完
-   整轮，并把「这一轮能不能当作快照」所需的事实结算成 :class:`RosterReadOutcome`。
-   **判定「要不要替换快照」不在这里**：门槛与保旧告警在 `core/identity/roster_snapshot.py`，
-   持久载体在 `adapters/postgres_roster_snapshot.py`（迁移 `0063_roster_snapshot`）。
-
-**只剩一条读取路径**（S-B-04，消解 PR #208 二级审查 P2-1）：早先那条 legacy
-``read_roster_records``（读完全部分页、只返回行）已随日报接线一并**删除**。它只回答
-「行是什么」，把「花名册真的空了」和「这一轮没读完」压成同一个空元组，而保旧判定要的
-恰恰是这两者的区别；两条路径并存的代价是总有调用方接到不带判定的那一条。
-:func:`read_roster_snapshot` 是唯一入口。
-
-**真实调用未验证（证据等级 L1）**，与 `adapters/feishu_directory.py`、
-`adapters/feishu_group_message.py` 同一姿态：全部断言跑在注入的假传输层上。真实读取
-所需的专用主体凭据自 2026-08-09 起未落盘（Issue #52 的 G-READ 判定），真实面等
-bootstrap 重授权。本模块因此**不 import 任何 SDK、不读任何凭据文件、构造时不发请求**：
-`access_token` 由调用方以「已就绪凭据」的形式注入。真实读取的 scope、Base 与可复跑
-方式见[飞书组织快照与多维表格关联](../../../docs/技术设计/飞书组织快照与多维表格关联.md)。
-
-边界（同上文与产品合同）：花名册是**下游人员信息表**，不是权限权威，不得据此
-创建或扩大任何 Lingxi 权限；这里只把它当作「飞书 user_id → 邮箱」的查表。
-同一人员 ID 的重复行**保留不去重**——实测存在，去重会把歧义变成静默的错误选择。
-
-数据范围没有因为本次新增而扩大（`V-花名册-09`）：保留进内存的仍然只有
-:data:`ROSTER_FIELD_NAMES` 这四列，完整性判定读到的其余原始列**只产生计数**，值
-不进任何返回对象、日志或审计（`V-花名册-33`）。
+边界（同产品合同）：花名册是**下游人员信息表**，不是权限权威，不得据此
+创建或扩大任何 Lingxi 权限；同一人员 ID 的重复行**保留不去重**。数据范围
+不因本模块扩大：保留进内存的仍然只有 :data:`ROSTER_FIELD_NAMES` 这四列，
+其余原始列只产生计数，值不进任何返回对象、日志或审计。
 """
 
 from __future__ import annotations
@@ -67,10 +46,7 @@ class RosterRow(NamedTuple):
     record_id: str
 
     def get(self, key: str, default: object = None) -> object:
-        """让本行可直接交给 ``match_galaxy_account``（它按 Mapping 的 ``get``
-        取值）。NamedTuple 没有 ``get``，此前必须先 ``_asdict()``，文档却声称
-        可直接组合（终轮 Codex 发现的接口不兼容）。"""
-
+        """让本行可直接交给 ``match_galaxy_account``（它按 Mapping 的 ``get`` 取值）。"""
         return getattr(self, key, default)
 
 
@@ -80,7 +56,6 @@ def field_text(value: Any) -> str:
     多维表格的同一列在不同字段类型下可能是字符串、数字、对象或对象数组，
     受控读取中三种形态都真实出现过。
     """
-
     if value is None or value is False:
         return ""
     if isinstance(value, str):
@@ -114,14 +89,11 @@ def normalize_record(record: Any) -> RosterRow:
     判的是 `Mapping` 而不是 `dict`：分页 reader 在上一层已经按 `Mapping` 挡下非对象项，
     两层用不同的类型判据会让"通过了上层校验的记录在这里静默归一成空行"。
 
-    **形状不对就响亮失败**（PR #208 二级审查 P2-1）：记录本身不是对象、或它的 ``fields``
-    不是对象时，此前会静默归一成一条全空的行。持久快照落地后这条静默路径的代价变了
-    ——那条全空行会**被写进快照**，在比对时表现为一个"资料被清空"的人，而源头其实只是
-    给了一个形状不对的记录。这里抛 :class:`RosterReadError`（结果不明），与上一层对
-    非对象项抛 ``invalid_page_item`` 同一姿态：整轮判失败、保留上一份快照，而不是让
-    一条坏记录混进一份看起来正常的快照。
+    **形状不对就响亮失败**：记录本身不是对象、或它的 ``fields`` 不是对象时，
+    抛 :class:`RosterReadError`（结果不明），整轮判失败、保留上一份快照——
+    静默归一成一条全空的行会在比对时表现为一个"资料被清空"的人，而源头其实
+    只是给了一个形状不对的记录。
     """
-
     if not isinstance(record, Mapping):
         raise RosterReadError("invalid_page_item", definite=False)
     fields = record.get("fields", {})
@@ -137,12 +109,11 @@ def normalize_record(record: Any) -> RosterRow:
 
 
 # ---------------------------------------------------------------------------
-# 分页 reader 与完整性判定（Issue #52）
+# 分页 reader 与完整性判定
 # ---------------------------------------------------------------------------
 
-# 单页记录数。受控读取（2026-08-05）用 500 读完 1206 行，实测成立；平台上限本身
-# 未回源确认，因此这里只把它作为**本地**的合法上界——配置越界在构造时就失败，
-# 而不是等到当天第一次读取被飞书拒绝。
+# 单页记录数。平台上限本身未回源确认，因此这里只把它作为**本地**的合法
+# 上界——配置越界在构造时就失败，而不是等到当天第一次读取被飞书拒绝。
 DEFAULT_PAGE_SIZE = 500
 MAX_PAGE_SIZE = 500
 
@@ -151,9 +122,7 @@ MAX_PAGE_SIZE = 500
 # 宁可判失败也不空转、更不把半轮结果当成一轮。
 DEFAULT_MAX_PAGES = 200
 
-# 形态校验的基准列。默认就是匹配链要用的四列（:data:`ROSTER_FIELD_NAMES`），
-# 与 2026-08-05 受控读取的 38 列 / 1206 行历史参照对应的那一部分。
-#
+# 形态校验的基准列，默认就是匹配链要用的四列（:data:`ROSTER_FIELD_NAMES`）。
 # **可配置只影响计数，不影响保留的字段集**：无论传什么列进来，返回的仍然只有
 # `RosterRow` 的四个字段，其余列的**值**一次都不会离开这个函数（`V-花名册-09`）。
 DEFAULT_REQUIRED_COLUMNS: tuple[str, ...] = ROSTER_FIELD_NAMES
@@ -168,9 +137,9 @@ DEFAULT_DUPLICATE_KEY_FIELDS: tuple[str, ...] = ("personnel_id", "employee_no")
 class RosterReadStatus(Enum):
     """一轮读取的结论。四态各自对应调用方一个明确动作。
 
-    这四态是给持久快照层（Issue #52「源头返回空 / 失败 / 超时 / 半轮不覆盖」）用的：
-    只有 :attr:`COMPLETE` 才**可能**成为候选快照，其余三态一律保留上一份快照。
-    「是否替换、如何告警」由快照层决定，本模块只负责把事实结算清楚。
+    这四态是给持久快照层用的：只有 :attr:`COMPLETE` 才**可能**成为候选
+    快照，其余三态一律保留上一份快照。「是否替换、如何告警」由快照层
+    决定，本模块只负责把事实结算清楚。
     """
 
     # 整轮读完、完整性判定通过、且有行。
@@ -207,6 +176,7 @@ class RosterReadError(RuntimeError):
     """
 
     def __init__(self, code: str, *, definite: bool | None = None) -> None:
+        """记录安全分类字符串；``definite`` 缺省时按 feishu_code_ 前缀推断。"""
         super().__init__(f"花名册多维表格读取失败：{code}")
         self.code = code
         self.definite = definite if definite is not None else code.startswith("feishu_code_")
@@ -255,10 +225,11 @@ class RosterIntegrity:
 
     @property
     def shape_ok(self) -> bool:
-        """形态是否通过。**重复行不算形态问题**——它是花名册的实测常态，由比对层
-        判 `AMBIGUOUS`（`V-花名册-06`）；把它算成"这轮不可用"会让快照因为两行重复
-        而整轮停更。"""
+        """形态是否通过。
 
+        **重复行不算形态问题**——它是花名册的实测常态，由比对层判
+        `AMBIGUOUS`；把它算成"这轮不可用"会让快照因为两行重复而整轮停更。
+        """
         return not self.absent_columns and self.total_matches_rows is not False
 
 
@@ -273,6 +244,7 @@ class RosterReadFailure:
 
     @property
     def definite(self) -> bool:
+        """是否为服务端明确拒绝（区别于结果不明的传输/形状类失败）。"""
         return self.kind is RosterFailureKind.DEFINITE
 
 
@@ -292,9 +264,11 @@ class RosterReadOutcome:
 
     @property
     def complete_nonempty(self) -> bool:
-        """整轮读完、完整性通过、且非空。这是"可以拿去替换快照"的**必要条件**；
-        是否真的替换、以及空源与失败如何告警，由快照层决定，不在本模块。"""
+        """整轮读完、完整性通过、且非空。
 
+        这是"可以拿去替换快照"的必要条件；是否真的替换、以及空源与失败
+        如何告警，由快照层决定，不在本模块。
+        """
         return self.status is RosterReadStatus.COMPLETE
 
     def audit_facts(self) -> dict[str, Any]:
@@ -304,7 +278,6 @@ class RosterReadOutcome:
         :attr:`rows` 序列化进去。姓名、工号、邮箱、人员 ID 一个都不在这里
         （`V-花名册-33`）。
         """
-
         return {
             "status": self.status.value,
             "rows": self.integrity.row_count,
@@ -326,8 +299,11 @@ class RosterReadOutcome:
 
 
 class RosterRecordPage(NamedTuple):
-    """一页原始记录。除了记录与游标，还带一个 ``total``：完整性判定要拿源头自报的
-    总数与累计行数对账，而那个数字在分页响应里，取不到就传 ``None``。"""
+    """一页原始记录。
+
+    除了记录与游标，还带一个 ``total``：完整性判定要拿源头自报的总数与
+    累计行数对账，而那个数字在分页响应里，取不到就传 ``None``。
+    """
 
     records: tuple[Any, ...]
     next_page_token: str | None = None
@@ -337,21 +313,24 @@ class RosterRecordPage(NamedTuple):
 class RosterPageSource(Protocol):
     """按页返回花名册记录的只读传输（可注入面）。"""
 
-    def fetch_page(self, page_token: str | None = None) -> RosterRecordPage: ...
+    def fetch_page(self, page_token: str | None = None) -> RosterRecordPage:
+        """读一页；起始页省略 ``page_token``。"""
+        ...
 
 
 def _require_https(base_url: object) -> str:
     """飞书出站必须 HTTPS；误配 http:// 会把 Bearer token 明文上路。不回显收到的值。"""
-
     if not isinstance(base_url, str) or not base_url.startswith("https://"):
         raise ValueError("飞书 base_url 必须以 https:// 开头（不回显收到的值）")
     return base_url.rstrip("/")
 
 
 def _require_identifier(value: object, label: str) -> str:
-    """校验 Base / 表标识非空且不含空白。**不回显值**：它们是外部标识，一旦进错误
-    消息就会被日志、CI 输出和工单一路复制出去。"""
+    """校验 Base / 表标识非空且不含空白。
 
+    **不回显值**：它们是外部标识，一旦进错误消息就会被日志、CI 输出和
+    工单一路复制出去。
+    """
     if not isinstance(value, str) or not value.strip():
         raise ValueError(f"{label}必须由配置注入，不得为空（不回显收到的值）")
     text = value.strip()
@@ -382,6 +361,7 @@ class BitableRosterPages:
         transport: Callable[..., Any] | None = None,
         page_size: int = DEFAULT_PAGE_SIZE,
     ) -> None:
+        """校验 Base/表标识、令牌供给与分页大小；不发起任何请求。"""
         self._base_url = _require_https(base_url)
         self._app_token = _require_identifier(app_token, "花名册 Base app_token")
         self._table_id = _require_identifier(table_id, "花名册表 table_id")
@@ -397,6 +377,7 @@ class BitableRosterPages:
 
     @property
     def page_size(self) -> int:
+        """本实例使用的单页记录数。"""
         return self._page_size
 
     def _records_url(self, page_token: str | None) -> str:
@@ -417,7 +398,6 @@ class BitableRosterPages:
         告警指向错误的地方（去查花名册，而问题在凭据）。只有"provider 正常返回却给了
         空值"这一种才算读取失败——那时确实无法判断源头状态。
         """
-
         token = self._access_token()
         if not isinstance(token, str) or not token:
             raise RosterReadError("access_token_missing", definite=False)
@@ -425,7 +405,6 @@ class BitableRosterPages:
 
     def fetch_page(self, page_token: str | None = None) -> RosterRecordPage:
         """读一页；把飞书的响应形状与错误码翻译成本模块的语义，不泄漏给上层。"""
-
         token = self._token()
         try:
             response = self._transport("GET", self._records_url(page_token), body=None, token=token)
@@ -476,7 +455,6 @@ def _integrity(
     reported_total: int | None,
 ) -> RosterIntegrity:
     """把一轮读取结算成完整性事实。纯计数，不看任何值。"""
-
     row_count = len(rows)
     duplicates: list[DuplicateCount] = []
     for field in duplicate_key_fields:
@@ -512,39 +490,19 @@ def _integrity(
 
 def _row_text(row: Any, field: str) -> str:
     """取归一化行上的一个字段并归一为可比较文本。"""
-
     value = row.get(field) if hasattr(row, "get") else getattr(row, field, "")
     return value.strip() if isinstance(value, str) else ""
 
 
-def read_roster_snapshot(
-    source: RosterPageSource,
-    *,
-    required_columns: Sequence[str] = DEFAULT_REQUIRED_COLUMNS,
-    duplicate_key_fields: Sequence[str] = DEFAULT_DUPLICATE_KEY_FIELDS,
-    max_pages: int = DEFAULT_MAX_PAGES,
-) -> RosterReadOutcome:
-    """读完整轮花名册，并结算"这一轮能不能当作快照"所需的全部事实。
+def _read_all_pages(
+    source: RosterPageSource, required: tuple[str, ...], max_pages: int
+) -> tuple[list[RosterRow], dict[str, int], int, int | None, RosterReadFailure | None]:
+    """按页读完整轮，返回 ``(rows, blank_counts, pages_read, reported_total, failure)``。
 
-    **本函数不抛外部失败**：预期的读取失败（:class:`RosterReadError`）被结算成
-    :attr:`RosterReadStatus.FAILED` 的结果对象，因为调用方要的是"保留上一份快照并
-    带着原因告警"，而不是一个会把整轮职责带走的异常。未预期的异常一律不捕获、原样
-    向上传播（纪律同 `adapters/feishu_delivery.py`）：把它们也吞成"读取失败"会让真正的
-    缺陷伪装成源头异常，每天安静地重试下去。
-
-    四态的判定次序是刻意的：**先判完整性、再判空**。源头自报 1206 行却一行没给，是
-    "读取不完整"而不是"花名册空了"——两者都保旧，但报给管理员的原因不能反。
+    **不抛外部失败**：预期的读取失败（:class:`RosterReadError`）被结算成
+    ``failure``，因为调用方要的是"保留上一份快照并带着原因告警"，而不是一个
+    会把整轮职责带走的异常；未预期的异常一律不捕获、原样向上传播。
     """
-
-    if not isinstance(max_pages, int) or isinstance(max_pages, bool) or max_pages < 1:
-        raise ValueError("max_pages 必须是正整数")
-    # 去重且保序（PR #208 二级审查 P3-1）：同一列在清单里出现两次时，下面的空值统计
-    # 会对同一行加两次，于是"整列都取不到值"的判据（计数 == 行数）永远不成立，
-    # **整列缺失的检测被静默击穿**——列被改名或删掉时这一轮会被判成 COMPLETE 并顶掉
-    # 好快照。`dict.fromkeys` 保留首次出现的次序，让完整性事实的输出次序仍然稳定。
-    required = tuple(dict.fromkeys(required_columns))
-    key_fields = tuple(dict.fromkeys(duplicate_key_fields))
-
     rows: list[RosterRow] = []
     blank_counts: dict[str, int] = {column: 0 for column in required}
     pages_read = 0
@@ -584,35 +542,83 @@ def read_roster_snapshot(
             partial_pages=pages_read,
             partial_rows=len(rows),
         )
+    return rows, blank_counts, pages_read, reported_total, failure
 
+
+def _outcome_from_read(
+    *,
+    rows: list[RosterRow],
+    blank_counts: dict[str, int],
+    pages_read: int,
+    reported_total: int | None,
+    failure: RosterReadFailure | None,
+    required: tuple[str, ...],
+    key_fields: tuple[str, ...],
+) -> RosterReadOutcome:
+    """把一轮读取的原始结果结算成 :class:`RosterReadOutcome`。
+
+    四态判定次序是刻意的：先判完整性、再判空——源头自报 1206 行却一行没给，
+    是"读取不完整"而不是"花名册空了"，两者都保旧，但报给管理员的原因不能反。
+    """
     if failure is not None:
-        outcome = RosterReadOutcome(
+        return RosterReadOutcome(
             status=RosterReadStatus.FAILED,
             # 半轮的行一行都不返回，理由见 RosterReadOutcome 的类文档。
             rows=(),
             integrity=RosterIntegrity(pages_read=pages_read),
             failure=failure,
         )
+    integrity = _integrity(
+        rows=rows,
+        blank_counts=blank_counts,
+        required_columns=required,
+        duplicate_key_fields=key_fields,
+        pages_read=pages_read,
+        reported_total=reported_total,
+    )
+    if not integrity.shape_ok:
+        status = RosterReadStatus.INCOMPLETE
+    elif not rows:
+        status = RosterReadStatus.EMPTY_SOURCE
     else:
-        integrity = _integrity(
-            rows=rows,
-            blank_counts=blank_counts,
-            required_columns=required,
-            duplicate_key_fields=key_fields,
-            pages_read=pages_read,
-            reported_total=reported_total,
-        )
-        if not integrity.shape_ok:
-            status = RosterReadStatus.INCOMPLETE
-        elif not rows:
-            status = RosterReadStatus.EMPTY_SOURCE
-        else:
-            status = RosterReadStatus.COMPLETE
-        outcome = RosterReadOutcome(status=status, rows=tuple(rows), integrity=integrity)
+        status = RosterReadStatus.COMPLETE
+    return RosterReadOutcome(status=status, rows=tuple(rows), integrity=integrity)
 
-    # 只记计数、列名与错误码，依据是 `V-花名册-33`：**审计与日志**不含花名册字段值。
-    # （此前这行援引的是"日报脱敏口径"，那条口径已被产品负责人 2026-08-08 的 D2 裁定
-    # 覆盖——受控管理群的日报**可以**展示姓名 / 工号 / 邮箱原值。日志侧的约束与日报
-    # 正文无关、也没有随之放宽：日志会流向排障、CI 输出与工单，那些地方不是受控管理群。）
+
+def read_roster_snapshot(
+    source: RosterPageSource,
+    *,
+    required_columns: Sequence[str] = DEFAULT_REQUIRED_COLUMNS,
+    duplicate_key_fields: Sequence[str] = DEFAULT_DUPLICATE_KEY_FIELDS,
+    max_pages: int = DEFAULT_MAX_PAGES,
+) -> RosterReadOutcome:
+    """读完整轮花名册，并结算"这一轮能不能当作快照"所需的全部事实。
+
+    详见 :func:`_read_all_pages`（预期失败的结算方式）与 :func:`_outcome_from_read`
+    （四态判定次序）。
+    """
+    if not isinstance(max_pages, int) or isinstance(max_pages, bool) or max_pages < 1:
+        raise ValueError("max_pages 必须是正整数")
+    # 去重且保序：同一列在清单里出现两次时，下面的空值统计会对同一行加两次，
+    # 于是"整列都取不到值"的判据（计数 == 行数）永远不成立，整列缺失的检测
+    # 被静默击穿。`dict.fromkeys` 保留首次出现的次序，输出次序仍然稳定。
+    required = tuple(dict.fromkeys(required_columns))
+    key_fields = tuple(dict.fromkeys(duplicate_key_fields))
+
+    rows, blank_counts, pages_read, reported_total, failure = _read_all_pages(
+        source, required, max_pages
+    )
+    outcome = _outcome_from_read(
+        rows=rows,
+        blank_counts=blank_counts,
+        pages_read=pages_read,
+        reported_total=reported_total,
+        failure=failure,
+        required=required,
+        key_fields=key_fields,
+    )
+
+    # 只记计数、列名与错误码：审计与日志不含花名册字段值（受控管理群的日报
+    # 可以展示姓名/工号/邮箱原值，但日志会流向排障、CI 输出与工单，约束不同）。
     logger.info("花名册读取结束 %s", outcome.audit_facts())
     return outcome

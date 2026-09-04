@@ -38,13 +38,12 @@ def read_csv_table(path: Path) -> list[dict[str, str]]:
 
     未转义逗号或损坏导出会让 `DictReader` 把溢出值挂在 `None` 键下；静默丢弃
     意味着该行的邮箱/姓名/公司字段可能已整体错位，却仍能通过校验并取代有效
-    批次（Codex 复查发现）。错误信息只报行号，不回显内容。
+    批次。错误信息只报行号，不回显内容。
     """
-
     # utf-8-sig：Excel 导出的 CSV 常带 BOM，不去掉会让首列列名对不上。
     with path.open("r", encoding="utf-8-sig", newline="") as csv_file:
-        # strict 方言：引号错误抛 csv.Error 而不是把文件余下内容吞进当前字段
-        # （终轮 Codex：未闭合引号的错位行可能带着关键 ID 通过校验）。
+        # strict 方言：引号错误抛 csv.Error 而不是把文件余下内容吞进当前字段——
+        # 未闭合引号的错位行可能带着关键 ID 通过校验。
         reader = csv.DictReader(csv_file, strict=True)
         rows: list[dict[str, str]] = []
         overflow_rows: list[int] = []
@@ -75,7 +74,6 @@ def read_csv_table(path: Path) -> list[dict[str, str]]:
 
 def load_export_directory(directory: Path) -> ExportBundle:
     """读取目录下的五个 CSV；缺文件立即失败并列出缺哪几个。"""
-
     directory = Path(directory)
     missing = [
         file_name

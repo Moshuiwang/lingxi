@@ -87,12 +87,10 @@ class OAuthBridgeClient:
 
     def set_processor(self, processor: OAuthBridgeMessageHandler) -> None:
         """设置未注册 state 的默认处理器，保持首次开通兼容路径。"""
-
         self._processor = processor
 
     def register_state_handler(self, state: str, handler: StateHandler) -> None:
         """为当前授权 state 注册一次性业务处理器。"""
-
         if not isinstance(state, str) or _STATE_PATTERN.fullmatch(state) is None:
             raise ValueError("无效的 OAuth 状态")
         if not callable(handler):
@@ -104,7 +102,6 @@ class OAuthBridgeClient:
 
     def handle_message(self, message: OAuthBridgeMessage) -> None:
         """处理一条已完成结构校验的消息；供 WebSocket 与注入测试共用。"""
-
         if not isinstance(message, OAuthBridgeMessage):
             raise TypeError("OAuth Bridge 消息类型无效")
         with self._state_handlers_lock:

@@ -242,6 +242,7 @@ REQUIRED_MODULES = (
     "lingxi.core.permission.tenant_token_supply",
     "lingxi.adapters.feishu_tenant_token",
     "lingxi.adapters.feishu_directory",
+    "lingxi.adapters.feishu_paged_client",
     "lingxi.adapters.delegated_credentials",
     "lingxi.adapters.delegated_subject_lookup",
     "lingxi.adapters.oauth_bridge_client",
@@ -753,6 +754,7 @@ PROCESS_RUNTIME_IMPORTS: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {
             # extras 依赖，只是让静态闭包清单如实反映新的 import 边。
             "lingxi.adapters.delegated_subject_lookup",
             "lingxi.adapters.feishu_directory",
+            "lingxi.adapters.feishu_paged_client",
             "lingxi.adapters.retention",
             "lingxi.adapters.feishu_group_message",
             "lingxi.adapters.feishu_roster_bitable",
@@ -874,6 +876,7 @@ PROCESS_RUNTIME_IMPORTS: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {
             # extras 依赖，只是让静态闭包清单如实反映新的 import 边。
             "lingxi.adapters.delegated_subject_lookup",
             "lingxi.adapters.feishu_directory",
+            "lingxi.adapters.feishu_paged_client",
             "lingxi.adapters.feishu_reauthorization",
             "lingxi.adapters.oauth_bridge_client",
             "lingxi.adapters.postgres",
@@ -1067,6 +1070,7 @@ PROCESS_RUNTIME_IMPORTS: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {
             # 类型），因此这条链一并登记，与 scheduler 组同一份依赖来源。
             "lingxi.adapters.feishu_group_message",
             "lingxi.adapters.feishu_directory",
+            "lingxi.adapters.feishu_paged_client",
             # 管理命令面（Issue #95 S-M-01）：build_supervisor 在函数内 import
             # PostgresAdminRegistryLookup/PostgresAdminQueries，无条件装配（不受
             # 任何 feature flag 控制，见该函数内注释），因此这条闭包必须显式登记。

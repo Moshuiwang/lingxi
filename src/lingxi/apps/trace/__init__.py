@@ -1,41 +1,17 @@
-"""``python -m lingxi.apps.trace``：追溯号只读查询入口（Issue #280 §7.2「谁、用什么入口」）。
+"""``python -m lingxi.apps.trace``：追溯号只读查询入口。
 
-## 补的是哪个洞
-
-用户看到的失败终态（``LX-ONBOARD-001``）现在带一个追溯号（``{reference}``，见
-``core/identity/onboarding_runner.py`` 的 ``_KEYS_REQUIRING_REFERENCE``），但在本命令
-之前，能解析这个追溯号的唯一出口是结构化日志——`apps/scheduler/audit.py` 的
-``StructuredLogAuditSink.record``。按项目记忆，产品负责人没有生产宿主机访问，
-「给了追溯号却没人能解析」等于没给。本命令是最小可行的解析入口：**受控只读 CLI**，
-形状照 ``apps/healthcheck``、``apps/reauthorize``——两者都已经是"一个小 ``__main__.py``
-+ 只读/受控逻辑"的先例（后者是双人复核写入，前者是纯只读，本命令属于后者）。
-
-## 只读，没有任何写路径
-
-本模块**没有 INSERT/UPDATE/DELETE**，全程只用一个只读事务读四张表。不做网页查询页、
-不进管理 MCP（那是 S9 与管理 MCP Story 的范围）——见联合设计 §7.2「不做的事」。
-
-## 身份最小化
-
-默认**不打印** ``open_id``：只打印内部 ``user_id`` 与账号/开通状态。追溯号在多数情形下
-足以定位到具体一次事件（哪一次首聊、卡在哪一步、有没有人在跑），不需要先亮出 open_id
-才能诊断。需要核对具体是哪个人时，用显式 ``--include-open-id`` 打开（受控管理动作的
-既有姿态：默认收紧，显式选择才放宽）。
-
-## 能回答什么、回答不了什么
-
-能回答：这一次事件是谁、什么时候到的、有没有被认领、当前用户 ``provisioning_state``/
-``account_state``、发布意图状态、就绪探针历史。**本命令自身回答不了**
-``failure_reason``——那不在本命令查询的四张表里。
-
-**这条缺口已由 Issue #337（Trace #373 S-H3-1）在别处补上，本命令登记式不动**：
-``failure_reason`` 现在同事务落进新表 ``onboarding_failure``（迁移 ``0077``），管理员
-私聊 ``/admin trace <追溯号>``（``core/admin/router.py``，真实查询见
-``adapters/admin_registry.PostgresAdminQueries.trace_lookup``）就能自助查到，不再需要
-检索容器日志。本模块保持零变更——它仍然是给持有容器访问权限的运维用的补充诊断视图
-（能看到发布意图与就绪探针历史，`/admin trace` 目前不展示这两项），不是要被
-``/admin trace`` 取代；给本命令也接上 ``onboarding_failure`` 查询是可选的后续加固，
-不在本次范围内。
+补的是哪个洞：用户看到的失败终态带一个追溯号，但在本命令之前，能解析
+它的唯一出口是结构化日志，而产品负责人没有生产宿主机访问——给了追溯
+号却没人能解析等于没给。本命令是最小可行的解析入口：受控只读 CLI，
+形状照 ``apps/healthcheck``/``apps/reauthorize``（后者是双人复核写入，
+前者是纯只读，本命令属于后者）。只读，没有任何写路径：全程只用一个
+只读事务读四张表，不做网页查询页、不进管理 MCP。身份最小化：默认不
+打印 ``open_id``，只打印内部 ``user_id`` 与账号/
+开通状态，需要核对具体是哪个人时用显式 ``--include-open-id`` 打开
+（默认收紧、显式选择才放宽）。能回答：事件是谁、何时到的、有没有被
+认领、用户开通/账号状态、发布意图状态、就绪探针历史；回答不了
+``failure_reason``——管理员私聊 ``/admin trace`` 可查，本模块保持零
+变更，是给持有容器访问权限的运维用的补充诊断视图。
 """
 
 from __future__ import annotations
@@ -152,6 +128,75 @@ def _fetch_readiness(cursor: Any, user_id: str) -> tuple[_ReadinessRow, ...]:
     return tuple(_ReadinessRow(*row) for row in cursor.fetchall())
 
 
+def _render_publish_lines(publish_rows: Sequence[_PublishRow]) -> list[str]:
+    if not publish_rows:
+        return ["权限发布意图: 无"]
+    lines = ["权限发布意图（最近 5 条）:"]
+    for row in publish_rows:
+        lines.append(
+            f"  - 版本={row.permission_version} 状态={row.status} "
+            f"尝试次数={row.attempts} 上次结论={row.last_outcome or '(无)'} "
+            f"创建于={row.created_at} 发布于={row.published_at or '(未发布)'}"
+        )
+    return lines
+
+
+def _render_readiness_lines(readiness_rows: Sequence[_ReadinessRow]) -> list[str]:
+    if not readiness_rows:
+        return ["就绪探针历史: 无"]
+    lines = ["就绪探针历史（最近 5 条）:"]
+    for row in readiness_rows:
+        lines.append(
+            f"  - 版本={row.permission_version} 第{row.attempt_no}次 "
+            f"结论={row.result} 错误码={row.error_code or '(无)'} "
+            f"指标数={row.metric_count if row.metric_count is not None else '(无)'} "
+            f"起始={row.started_at} 结束={row.finished_at or '(未结束)'}"
+        )
+    return lines
+
+
+def _render_event(
+    event: _EventRow,
+    users: Mapping[str, _UserRow | None],
+    publishes: Mapping[str, tuple[_PublishRow, ...]],
+    readiness: Mapping[str, tuple[_ReadinessRow, ...]],
+    *,
+    include_open_id: bool,
+) -> list[str]:
+    """一条入站事件的展示行，含（若已建档）用户/发布意图/就绪探针历史。"""
+    lines: list[str] = [
+        "",
+        f"事件标识: {event.feishu_event_id}",
+        f"接收时间: {event.received_at}",
+        f"事件类型: {event.event_type}",
+        f"处理方式: {event.handled_as or '(未标记)'}",
+    ]
+    if event.onboarding_dispatched_at is None:
+        lines.append("是否已认领: 否")
+    else:
+        lines.append(f"是否已认领: 是（{event.onboarding_dispatched_at}）")
+    if include_open_id:
+        lines.append(f"open_id: {event.user_open_id or '(无)'}")
+
+    user = users.get(event.feishu_event_id)
+    if user is None:
+        lines.append("用户记录: 未找到（尚未建档，或该事件不带 open_id）")
+        return lines
+
+    lines.extend(
+        [
+            f"用户内部标识: {user.user_id}",
+            f"开通状态: {user.provisioning_state}",
+            f"账号状态: {user.account_state}",
+            f"当前权限版本: {user.permission_version}",
+            f"用户记录更新时间: {user.updated_at}",
+        ]
+    )
+    lines.extend(_render_publish_lines(publishes.get(event.feishu_event_id, ())))
+    lines.extend(_render_readiness_lines(readiness.get(event.feishu_event_id, ())))
+    return lines
+
+
 def _render(
     trace_id: str,
     events: Sequence[_EventRow],
@@ -166,55 +211,46 @@ def _render(
 
     lines: list[str] = [f"追溯号 {trace_id}：{len(events)} 条入站事件"]
     for event in events:
-        lines.append("")
-        lines.append(f"事件标识: {event.feishu_event_id}")
-        lines.append(f"接收时间: {event.received_at}")
-        lines.append(f"事件类型: {event.event_type}")
-        lines.append(f"处理方式: {event.handled_as or '(未标记)'}")
-        if event.onboarding_dispatched_at is None:
-            lines.append("是否已认领: 否")
-        else:
-            lines.append(f"是否已认领: 是（{event.onboarding_dispatched_at}）")
-        if include_open_id:
-            lines.append(f"open_id: {event.user_open_id or '(无)'}")
-
-        user = users.get(event.feishu_event_id)
-        if user is None:
-            lines.append("用户记录: 未找到（尚未建档，或该事件不带 open_id）")
-            continue
-
-        lines.append(f"用户内部标识: {user.user_id}")
-        lines.append(f"开通状态: {user.provisioning_state}")
-        lines.append(f"账号状态: {user.account_state}")
-        lines.append(f"当前权限版本: {user.permission_version}")
-        lines.append(f"用户记录更新时间: {user.updated_at}")
-
-        publish_rows = publishes.get(event.feishu_event_id, ())
-        if publish_rows:
-            lines.append("权限发布意图（最近 5 条）:")
-            for row in publish_rows:
-                lines.append(
-                    f"  - 版本={row.permission_version} 状态={row.status} "
-                    f"尝试次数={row.attempts} 上次结论={row.last_outcome or '(无)'} "
-                    f"创建于={row.created_at} 发布于={row.published_at or '(未发布)'}"
-                )
-        else:
-            lines.append("权限发布意图: 无")
-
-        readiness_rows = readiness.get(event.feishu_event_id, ())
-        if readiness_rows:
-            lines.append("就绪探针历史（最近 5 条）:")
-            for row in readiness_rows:
-                lines.append(
-                    f"  - 版本={row.permission_version} 第{row.attempt_no}次 "
-                    f"结论={row.result} 错误码={row.error_code or '(无)'} "
-                    f"指标数={row.metric_count if row.metric_count is not None else '(无)'} "
-                    f"起始={row.started_at} 结束={row.finished_at or '(未结束)'}"
-                )
-        else:
-            lines.append("就绪探针历史: 无")
-
+        lines.extend(
+            _render_event(event, users, publishes, readiness, include_open_id=include_open_id)
+        )
     return "\n".join(lines)
+
+
+def _build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(prog="python -m lingxi.apps.trace")
+    parser.add_argument("trace_id", help="要查询的追溯号（ULID）")
+    parser.add_argument(
+        "--include-open-id",
+        action="store_true",
+        default=False,
+        help="同时打印 open_id（默认不打印，见模块文档「身份最小化」）",
+    )
+    return parser
+
+
+def _collect_trace_data(
+    cursor: Any, trace_id: str
+) -> tuple[
+    tuple[_EventRow, ...],
+    dict[str, Any],
+    dict[str, tuple[_PublishRow, ...]],
+    dict[str, tuple[_ReadinessRow, ...]],
+]:
+    """按追溯号读四张表；只为带 ``open_id`` 的事件补查用户/发布/就绪历史。"""
+    events = _fetch_events(cursor, trace_id)
+    users: dict[str, Any] = {}
+    publishes: dict[str, tuple[_PublishRow, ...]] = {}
+    readiness: dict[str, tuple[_ReadinessRow, ...]] = {}
+    for event in events:
+        if not event.user_open_id:
+            continue
+        user = _fetch_user(cursor, event.user_open_id)
+        users[event.feishu_event_id] = user
+        if user is not None:
+            publishes[event.feishu_event_id] = _fetch_publish(cursor, user.user_id)
+            readiness[event.feishu_event_id] = _fetch_readiness(cursor, user.user_id)
+    return events, users, publishes, readiness
 
 
 def run(
@@ -230,18 +266,9 @@ def run(
     ``connect`` 仅供测试注入（默认 ``lingxi.adapters.postgres.connect``，与业务代码
     同一个连接工厂、同一套受限超时——不给这个只读工具开一条不受超时约束的旁路）。
     """
-
     import os
 
-    parser = argparse.ArgumentParser(prog="python -m lingxi.apps.trace")
-    parser.add_argument("trace_id", help="要查询的追溯号（ULID）")
-    parser.add_argument(
-        "--include-open-id",
-        action="store_true",
-        default=False,
-        help="同时打印 open_id（默认不打印，见模块文档「身份最小化」）",
-    )
-    args = parser.parse_args(list(argv) if argv is not None else None)
+    args = _build_parser().parse_args(list(argv) if argv is not None else None)
 
     source = os.environ if env is None else env
     out = sys.stdout if stdout is None else stdout
@@ -260,18 +287,7 @@ def run(
         with connect_fn(dsn) as connection:
             connection.read_only = True
             with connection.cursor() as cursor:
-                events = _fetch_events(cursor, args.trace_id)
-                users: dict[str, Any] = {}
-                publishes: dict[str, tuple[_PublishRow, ...]] = {}
-                readiness: dict[str, tuple[_ReadinessRow, ...]] = {}
-                for event in events:
-                    if not event.user_open_id:
-                        continue
-                    user = _fetch_user(cursor, event.user_open_id)
-                    users[event.feishu_event_id] = user
-                    if user is not None:
-                        publishes[event.feishu_event_id] = _fetch_publish(cursor, user.user_id)
-                        readiness[event.feishu_event_id] = _fetch_readiness(cursor, user.user_id)
+                events, users, publishes, readiness = _collect_trace_data(cursor, args.trace_id)
     except Exception as error:  # 查询失败只需要区分"能不能查"
         print(f"查询失败：{type(error).__name__}", file=err)
         return 1

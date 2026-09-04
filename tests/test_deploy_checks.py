@@ -1919,7 +1919,7 @@ class RealRepositoryTest(unittest.TestCase):
     def test_scheduler_constants_are_readable(self) -> None:
         # 停止宽限期的联动检查依赖这两个常量读得到；读不到时它会退化成不判定。
         self.assertIsInstance(
-            CONTRACT.module_constant(CONTRACT.FEISHU_DIRECTORY, "REQUEST_TIMEOUT_SECONDS"), int
+            CONTRACT.module_constant(CONTRACT.FEISHU_PAGED_CLIENT, "REQUEST_TIMEOUT_SECONDS"), int
         )
         backoff = CONTRACT.module_constant(
             CONTRACT.SCHEDULER_CREDENTIAL_ROTATION, "SAVE_RETRY_BACKOFF_SECONDS"

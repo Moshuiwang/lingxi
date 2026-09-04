@@ -1,7 +1,7 @@
 """飞书出站：加表情与发文本。
 
-按 2026-08-06 决策走官方 ``lark-oapi``。``lark_oapi`` 在**函数内延迟导入**，与仓库既有
-惯例一致（``adapters/feishu_onboarding.py``）：不碰这两个类的测试无需装 SDK。
+走官方 ``lark-oapi``。``lark_oapi`` 在**函数内延迟导入**，与仓库既有惯例一致
+（``adapters/feishu_onboarding.py``）：不碰这两个类的测试无需装 SDK。
 
 出站约束以[接口设计「四、飞书出站」](../../../docs/技术设计/接口设计.md)为准：
 加表情失败不阻断后续处理（本模块只负责**抛出**，不阻断的语义由管线的
@@ -35,7 +35,6 @@ def build_client(*, app_id: str, app_secret: str, timeout_seconds: float) -> Any
     加表情或回复就能让停机超出承诺，而这两个调用都在主线程上、不可取消。让调用方
     从停机预算里分配，比在这里再写一个可能与预算冲突的默认值安全。
     """
-
     import lark_oapi as lark
 
     return (
@@ -90,7 +89,6 @@ class LarkReplies:
         的消息就是普通回复。``chat_id`` 保留在签名里供实现选择与记录，本实现不需要它
         ——回复的目标由被回复的消息决定，这比自己拼 chat_id 少一次出错机会。
         """
-
         from lark_oapi.api.im.v1 import ReplyMessageRequest, ReplyMessageRequestBody
 
         # content 是一段 **JSON 字符串**（飞书如此定义），不是对象。

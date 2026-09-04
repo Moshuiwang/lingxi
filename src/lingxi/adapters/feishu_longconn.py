@@ -1,18 +1,13 @@
 """飞书长连接接入：错误分类、重连策略与事件泵。
 
-2026-08-06 决策保留官方 ``lark-oapi``，长连接用它的 ``ws.Client``。但**重连策略与终止
-判定不交给 SDK**，理由是三条实测事实（读 ``lark_oapi/ws/client.py`` 1.7.1 得到）：
+保留官方 ``lark-oapi``，长连接用它的 ``ws.Client``。但**重连策略与终止判定
+不交给 SDK**：``Client.start()`` 是一个永久循环、绑死模块级全局事件循环，
+进程无法在它之上做优雅停机（`V-部署-03`）；SDK 的重连是固定间隔、没有
+退避；同一个 403 在 SDK 里有两种相反的语义（endpoint HTTP 的 403 可重试，
+wss 握手头的 403 不可重试），只看异常类型或只看数字都会得到错的结论。
 
-1. ``Client.start()`` 是 ``run_until_complete`` 加一个永久 ``await sleep(3600)`` 循环，
-   还绑死模块级全局事件循环；进程无法在它之上做优雅停机（`V-部署-03`）。
-2. SDK 的重连是**固定间隔**（默认 120 秒）加一次首连抖动，没有退避；间隔由服务端下发
-   覆盖，构造参数改不了。
-3. **同一个 403 在 SDK 里有两种相反的语义**：endpoint HTTP 接口返回 403 会被包成
-   ``ServerException``（可重试），而 wss 握手响应头里的 403 会被包成 ``ClientException``
-   （不可重试）。只看异常类型或只看数字都会得到错的结论。
-
-因此本模块自己拥有分类与重连循环，SDK 只承担"建一条连接、把帧交出来"。这也正是
-`V-接入-06` 要求的——**终止判定必须落在我们自己可注入的一层**，否则该断言在 L2 不成立。
+因此本模块自己拥有分类与重连循环，SDK 只承担"建一条连接、把帧交出来"。这也
+正是 `V-接入-06` 要求的——终止判定必须落在我们自己可注入的一层。
 """
 
 from __future__ import annotations
@@ -42,6 +37,8 @@ class FailureSource(str, Enum):
 
 
 class FailureKind(str, Enum):
+    """判定结果：终止型不再重连，可重试型交给退避循环。"""
+
     TERMINAL = "terminal"
     RETRYABLE = "retryable"
 
@@ -64,6 +61,7 @@ class LongConnectionError(Exception):
     """建连失败。``failure`` 是分类的唯一输入。"""
 
     def __init__(self, failure: HandshakeFailure) -> None:
+        """记录分类用的 failure 表示，消息只含状态码与来源，不含凭据。"""
         super().__init__(
             f"{failure.source.value}: status={failure.status_code} detail={failure.detail}"
         )
@@ -73,20 +71,14 @@ class LongConnectionError(Exception):
 def classify_handshake_failure(failure: HandshakeFailure) -> FailureKind:
     """终止型还是可重试？
 
-    终止型只有两种（#57 决策登记：「403/514 终止型错误不得进入无限重连循环」）：
-
-    - **403**：凭据或权限被拒。无论来自 endpoint HTTP 还是 wss 握手头都判终止——
-      重试一个被拒的凭据不会变成通过，只会把日志刷满并持续占用飞书侧的连接配额。
-      这比 SDK 严格：SDK 只把 wss 握手头里的 403 当终止，HTTP 那条当可重试。
-    - **514 且 autherrcode = 1000040350**：超出连接数上限。再连只会继续被拒，
-      而且会把已经建好的那条连接挤掉。
-
-    其余一律可重试，**包括 514 配其他 autherrcode**。这一条是刻意保守：决策登记只
-    点名了 1000040350，把"凭据错误"这类 514 也判终止属于扩大解释，会让一次服务端
-    抖动直接停掉进程。代价是凭据真错时会一直重试——由审计里的连续失败暴露，不由
-    这里替产品负责人做判断。
+    终止型只有两种：**403**（凭据或权限被拒，无论来自 endpoint HTTP 还是
+    wss 握手头都判终止——重试一个被拒的凭据不会变成通过，只会把日志刷满并
+    持续占用飞书侧的连接配额，这比 SDK 严格）；**514 且 autherrcode =
+    1000040350**（超出连接数上限，再连只会继续被拒并把已经建好的连接挤掉）。
+    其余一律可重试，包括 514 配其他 autherrcode——这一条是刻意保守，把
+    "凭据错误"这类 514 也判终止属于扩大解释，会让一次服务端抖动直接停掉
+    进程；代价是凭据真错时会一直重试，由审计里的连续失败暴露。
     """
-
     if failure.status_code == FORBIDDEN:
         return FailureKind.TERMINAL
     if failure.status_code == AUTH_FAILED and failure.auth_errcode == EXCEED_CONN_LIMIT:
@@ -108,6 +100,7 @@ class BackoffPolicy:
     ceiling_seconds: float = 60.0
 
     def __post_init__(self) -> None:
+        """校验退避参数：下限为正、倍数大于 1、上限不小于下限。"""
         if self.base_seconds <= 0:
             raise ValueError("重连退避的下限必须为正数，零间隔会变成忙循环")
         if self.factor <= 1:
@@ -117,13 +110,14 @@ class BackoffPolicy:
 
     def delay_for(self, attempt: int) -> float:
         """第 ``attempt`` 次重连（从 0 起）之前要等多久。"""
-
         if attempt < 0:
             raise ValueError("重连次数不能为负")
         return min(self.base_seconds * (self.factor**attempt), self.ceiling_seconds)
 
 
 class TerminationReason(str, Enum):
+    """事件泵停下来的原因：正常停机，还是撞上了终止型错误。"""
+
     STOPPED = "stopped"  # 收到停机信号，正常退出
     TERMINAL_ERROR = "terminal"  # 终止型错误，不再重连
 
@@ -139,7 +133,9 @@ class EventTransport(Protocol):
     看见（`V-部署-03`）。
     """
 
-    def stream(self) -> Iterator[dict | None]: ...
+    def stream(self) -> Iterator[dict | None]:
+        """建连并逐条产出事件；空闲心跳产出 ``None``。"""
+        ...
 
 
 class LongConnectionSupervisor:
@@ -161,6 +157,7 @@ class LongConnectionSupervisor:
         audit: Callable[..., None] | None = None,
         heartbeat: Callable[[], None] | None = None,
     ) -> None:
+        """装配事件泵；``sleep``/``audit``/``heartbeat`` 未注入时各有默认实现。"""
         self._transport = transport
         self._handle_event = handle_event
         self._backoff = backoff or BackoffPolicy()
@@ -174,7 +171,6 @@ class LongConnectionSupervisor:
 
     def run(self, *, should_stop: Callable[[], bool]) -> TerminationReason:
         """跑到收到停机信号或遇到终止型错误为止。"""
-
         attempt = 0
         while not should_stop():
             self._emit_heartbeat()
@@ -248,24 +244,13 @@ class LongConnectionSupervisor:
     def _dispatch(self, payload: dict) -> None:
         """把一条事件交给处理器，并把结果（含处理器的返回值）回报给传输层。
 
-        `V-接入-12`：处理器抛异常（含收到未订阅、无处理器的事件类型）时，长连接不断开、
-        后续事件照常处理。捕获 ``Exception`` 是刻意的——一条事件的失败不该影响整条连接。
-
-        **结果必须回报给传输层。** 真实传输层的 SDK 线程正阻塞在这条事件上等 ack：
-        成功才让它向飞书回 OK，失败要让它回 500 由平台重投。不回报的话，落库失败
-        依然会被飞书当成投递成功，消息静默丢失（验收 P1-2）。
-
-        **处理器的返回值随 ``response`` 一起回报（Issue #96 卡片回调应答修复）。**
-        普通消息事件的处理器不返回任何东西（隐式 ``None``），行为与本参数加入之前
-        逐字节一致；``card.action.trigger`` 回调的处理器（``AdminCardCallbackHandler.
-        handle``，经 ``apps/gateway.make_event_handler`` 接线）返回一个应答字典，
-        经这里、``LarkEventTransport.report``、``PendingEvent.complete`` 一路传到
-        ``_RawEventSink._do_without_validation`` 的返回值，供 lark SDK marshal 进
-        应答帧 ``resp.data``（见 ``core/admin/card_callback.py`` 模块文档「载体
-        #96」）。处理器抛异常时 ``response`` 保持 ``None``——失败没有应答可言，
-        ``error`` 本身已经足够让传输层向飞书回失败。
+        `V-接入-12`：处理器抛异常时长连接不断开、后续事件照常处理。**结果
+        必须回报给传输层**：SDK 线程正阻塞在这条事件上等 ack，不回报的话
+        落库失败会被飞书当成投递成功，消息静默丢失。**处理器的返回值随
+        ``response`` 一起回报**：``card.action.trigger`` 回调的处理器返回
+        一个应答字典供 lark SDK marshal 进应答帧；普通消息事件与处理器
+        抛异常时都恒为 ``None``。
         """
-
         error: BaseException | None = None
         response: dict | None = None
         try:
@@ -282,21 +267,21 @@ class LongConnectionSupervisor:
 class PendingEvent:
     """一条正在处理中的事件，以及它的落库结果。
 
-    ``_RawEventSink`` 提交它、阻塞等待；supervisor 处理完之后回填结果并唤醒。
-
-    ``response``（Issue #96 卡片回调应答修复）承载处理器成功时的返回值——普通消息
-    事件的处理器不返回东西，恒为 ``None``；``card.action.trigger`` 回调的处理器
-    返回一个应答字典，``_RawEventSink._do_without_validation`` 在成功时把它原样
-    作为自己的返回值交回给 SDK（见该方法文档）。
+    ``_RawEventSink`` 提交它、阻塞等待；supervisor 处理完之后回填结果并
+    唤醒。``response`` 承载处理器成功时的返回值——普通消息事件恒为
+    ``None``；``card.action.trigger`` 回调的处理器返回一个应答字典，
+    ``_RawEventSink._do_without_validation`` 在成功时把它原样交回给 SDK。
     """
 
     def __init__(self, payload: dict) -> None:
+        """记录待处理的原始 payload；``done`` 由 :meth:`complete` 置位。"""
         self.payload = payload
         self.done = threading.Event()
         self.error: BaseException | None = None
         self.response: dict | None = None
 
     def complete(self, error: BaseException | None, response: dict | None = None) -> None:
+        """回填处理结果并唤醒等待方。"""
         self.error = error
         self.response = response
         self.done.set()
@@ -305,30 +290,13 @@ class PendingEvent:
 class _RawEventSink:
     """冒充 SDK 的 ``EventDispatcherHandler``，把**原始事件体**交出来，并等它处理完。
 
-    ``ws.Client`` 对 ``event_handler`` 只调用一个方法——``_do_without_validation(bytes)``
-    （实测 ``lark_oapi/ws/client.py:341`` 是全文件唯一一处 ``_event_handler`` 调用点）。
-    因此这里不需要猴补任何 SDK 内部，只要实现那一个方法即可拿到未经 SDK 类型化的
-    payload。不让真实路径和被测路径分叉：``parse_message_event`` 承载着 `V-接入-11`，
-    它吃的是 dict。
-
-    **本方法必须阻塞到落库有结果为止。** SDK 在这个方法返回之后立刻回一个 OK 帧
-    （``client.py:336`` 起：正常返回 → ``Response(code=OK)``；抛异常 →
-    ``Response(code=INTERNAL_SERVER_ERROR)``）。早先的实现只是把 payload 塞进队列就
-    返回，于是"飞书认为已投递"发生在"我们把它写进数据库"之前——进程在这个窗口里崩溃，
-    消息就永久丢了，而平台不会重投。接口设计 3.2 要求的是「处理完成后才返回成功」。
-
-    超时或落库失败一律**向 SDK 抛异常**，让它回 500、由飞书按平台语义重投；
-    我们这边因为整条入队是一个事务，回滚后 ``inbound_event`` 没有该行，重投能被
-    重新完整处理（`V-队列-01`）。
-
-    **本方法的返回值就是卡片回调应答通道（Issue #96 卡片回调应答修复）。** 成功时
-    返回 ``pending.response``（不是恒为 ``None``）：``ws.Client._handle_data_frame``
-    实测（``lark_oapi/ws/client.py:341`` 起，1.7.1）把这里的返回值 marshal 进应答帧
-    ``resp.data``——``result = self._event_handler._do_without_validation(pl)``，
-    非 ``None`` 时 ``resp.data = base64.b64encode(JSON.marshal(result)...)``。普通
-    消息事件的处理器不产出应答内容，``pending.response`` 恒为 ``None``，行为与本
-    通道加入之前逐字节一致；``card.action.trigger`` 回调需要飞书据此换上新卡片，
-    见 ``core/admin/card_callback.py`` 模块文档「载体 #96」。
+    ``ws.Client`` 对 ``event_handler`` 只调用 ``_do_without_validation(bytes)``
+    一个方法；``parse_message_event`` 承载着 `V-接入-11`，吃的是 dict。**本
+    方法必须阻塞到落库有结果为止**：SDK 在方法返回后立刻回帧，不阻塞会让
+    "飞书认为已投递"早于"写进数据库"，进程在这个窗口崩溃会永久丢消息
+    （`V-队列-01`）。返回值就是卡片回调应答通道：成功时返回
+    ``pending.response``（不恒为 ``None``），供 ``card.action.trigger``
+    换上新卡片；普通消息事件恒为 ``None``。
     """
 
     def __init__(
@@ -354,18 +322,13 @@ class _RawEventSink:
 def translate_sdk_exception(error: BaseException) -> HandshakeFailure:
     """把 SDK 的建连异常翻译成我们自己的 ``HandshakeFailure``。
 
-    映射依据是实测的 SDK 分支（``lark_oapi/ws/client.py`` 1.7.1）：
-
-    - ``ClientException(403)`` ← wss 握手响应头里的 403；
-    - ``ServerException(403)`` ← endpoint HTTP 接口返回 403；
-    - ``ClientException(514)`` ← 514 **且** autherrcode = 1000040350（SDK 只在这一种
-      组合下抛 ClientException，见 ``_parse_ws_conn_exception``）；
-    - ``ServerException(514)`` ← 514 配其他 autherrcode。
-
-    两个 514 分支的区分是这段翻译存在的主要理由：SDK 把"超连接数上限"与"其他鉴权
-    失败"用异常类型区分开了，而 autherrcode 本身没有出现在异常对象上。
+    ``ClientException(403)`` ← wss 握手响应头里的 403；``ServerException(403)``
+    ← endpoint HTTP 接口返回 403；``ClientException(514)`` ← 514 且
+    autherrcode = 1000040350（SDK 只在这一种组合下抛 ClientException）；
+    ``ServerException(514)`` ← 514 配其他 autherrcode。两个 514 分支的区分
+    是这段翻译存在的主要理由：SDK 把"超连接数上限"与"其他鉴权失败"用异常
+    类型区分开了，而 autherrcode 本身没有出现在异常对象上。
     """
-
     from lark_oapi.ws.exception import ClientException, ServerException
 
     code = getattr(error, "code", None)
@@ -389,25 +352,13 @@ def translate_sdk_exception(error: BaseException) -> HandshakeFailure:
 class LarkEventTransport:
     """基于官方 ``lark-oapi`` 的真实长连接传输层。
 
-    **本类的真实行为未验证（证据等级 1），属 L4a。** 全部 27 条 L2 断言跑在注入的假传输
-    层上，不连真实飞书——这是本切片的既定口径，不是遗漏。
-
-    已知边界，交付时一并登记而不是等部署暴露：
-
-    - ``ws.Client`` 没有 ``stop()``，``start()`` 是永久阻塞的。这里把它放进 **daemon
-      线程**，进程退出不被它挡住；优雅停机靠 supervisor 那一层的 ``should_stop``
-      在事件之间生效，在途事件处理完即退出。
-    - ``auto_reconnect=False``：重连由 ``LongConnectionSupervisor`` 负责，SDK 自己的
-      固定间隔重连必须关掉，否则两套重连会叠加。
-    - SDK 在 ``auto_reconnect=False`` 下，**连接中途**断开的异常抛在一个没人 await 的
-      task 里会被吞掉（实测 ``client.py:211`` + ``:230``）。这里靠 ``start()`` 返回或
-      线程结束来发现连接已死；真实断线重连的行为只有 L4a 能验。
-    - 建连超时（``handshake_timeout``）收尾对 pump 线程 ``join(timeout=2)``；若端点是
-      真正的网络层挂起（而非同一 asyncio loop 上可被 ``stop()`` 打断的等待），线程可能
-      不在 2 秒内退出，此时刻意**不关闭仍被占用的 loop**（见 ``stream()`` 的 finally
-      块——关掉一个在用的 loop 是把资源泄漏换成崩溃），线程留存。多次挂死重试是否累积、
-      有无上限，**未做真实部署观测**（原因未明层面不做频率判断）；接受为已知边界，
-      复审条件：stage 观测到线程数异常增长，或补一条线程存活数监控（#57 收口登记）。
+    **本类的真实行为未验证（证据等级 1），属 L4a**：全部断言跑在注入的假
+    传输层上，不连真实飞书，这是本切片的既定口径。已知边界：``ws.Client``
+    没有 ``stop()``，``start()`` 永久阻塞，因此放进 daemon 线程；
+    ``auto_reconnect=False``，重连改由 ``LongConnectionSupervisor`` 负责；
+    SDK 连接中途断开的异常会被吞掉，靠 ``start()`` 返回或线程结束来发现
+    连接已死；建连超时收尾对 pump 线程 ``join(timeout=2)``，未能退出时刻意
+    不关闭仍被占用的 loop，累积上限未做真实部署观测。
     """
 
     def __init__(
@@ -420,6 +371,7 @@ class LarkEventTransport:
         ack_timeout_seconds: float = 30.0,
         handshake_timeout_seconds: float = 30.0,
     ) -> None:
+        """记录应用凭据与各项超时；不在构造期建立任何连接。"""
         self._app_id = app_id
         self._app_secret = app_secret
         self._queue_max = queue_max
@@ -432,7 +384,7 @@ class LarkEventTransport:
         # 建连截止时间。**没有它就有一个活性黑洞**：endpoint 请求卡住、或首轮询之前
         # 连接就断了，``connected_once`` 会恒为 False，于是"掉线"判定永远不成立、
         # 空闲心跳永远产出，supervisor 认为一切正常而永不重连——一条从未连上的连接
-        # 能让进程静默失聪到重启为止（codex 二轮 P1-B）。
+        # 能让进程静默失聪到重启为止。
         self._handshake_timeout_seconds = handshake_timeout_seconds
         # 正在等待落库结果的事件，按 payload 的对象身份索引。
         self._pending: dict[int, PendingEvent] = {}
@@ -443,9 +395,10 @@ class LarkEventTransport:
     def report(
         self, payload: dict, error: BaseException | None, response: dict | None = None
     ) -> None:
-        """supervisor 处理完一条事件后回填结果（成功时含处理器的返回值，例如卡片
-        回调应答，Issue #96），唤醒还在等 ack 的 SDK 线程。"""
+        """Supervisor 处理完一条事件后回填结果，唤醒还在等 ack 的 SDK 线程。
 
+        成功时含处理器的返回值（例如卡片回调应答）。
+        """
         pending = self._pending.pop(id(payload), None)
         if pending is not None:
             pending.complete(error, response)
@@ -453,37 +406,47 @@ class LarkEventTransport:
     def stream(self) -> Iterator[dict | None]:
         """建连并逐条产出事件；空闲时定期产出 ``None`` 心跳。
 
-        **心跳不是装饰，是停机与断线检测的唯一入口。** 独立复查实测：不带超时地
-        阻塞在队列上时，「当前没有用户消息」这个最常见的状态下 ``SIGTERM`` 根本
-        不会被看见——supervisor 只在收到一条事件之后才检查停机信号，于是进程一直
-        挂到编排层 SIGKILL。空闲时让出控制权之后，这两件事才有机会发生。
+        **心跳不是装饰，是停机与断线检测的唯一入口。** 不带超时地阻塞在队列上
+        时，supervisor 只在收到一条事件之后才检查停机信号，于是进程一直挂到
+        编排层 SIGKILL；空闲时让出控制权之后，停机与断线检测才有机会发生。
         """
-
-        import asyncio
         import queue as queue_module
-
-        import lark_oapi as lark
-        from lark_oapi.ws import client as ws_client_module
 
         # 有界队列：处理慢于收取时必须显式阻塞收取侧，而不是让内存无声增长。
         events: queue_module.Queue = queue_module.Queue(maxsize=self._queue_max)
         finished = object()
         failure: list[BaseException] = []
+        fresh_loop, client, thread = self._spawn_pump_thread(events, finished, failure)
 
-        # —— 每次建连都给 SDK 换一个全新的事件循环。
-        # SDK 的 loop 是**模块级全局**（lark_oapi/ws/client.py:34-35，import 时创建）。
-        # 建连成功后 start() 驻留在 `loop.run_until_complete(_select())` 上永不返回；
-        # 连接中途死亡时异常被吞进一个没人 await 的 task，那个 loop 仍然 running。
-        # 于是第二次 stream() 里的新 client.start() 会在一个已经 running 的 loop 上
-        # 调 run_until_complete，立刻 RuntimeError——**重连一次就永久失聪**。
-        # 换新 loop 是三个可选方向里唯一不引入子进程、且能在本地不连飞书复现验证的。
-        #
-        # 代价与边界，写清楚不藏着：
-        #   1. 这是在改第三方模块的全局状态，只在 lark-oapi==1.7.1 上验证过（版本已
-        #      精确锁定）；升级必须重跑 tests/test_gateway_transport.py。
-        #   2. 因此**一个进程只能有一条飞书长连接**——gateway 正是如此，别处不要复用。
-        #   3. 旧 loop 在 finally 里被 stop()，让上一条连接的线程真正退出，否则每次
-        #      重连都漏一个永久阻塞的线程。
+        try:
+            yield from self._drain(events, finished, thread, client)
+            # **在 finally 之前**判断失败。下面的清理会主动 stop 掉这条连接的 loop，
+            # 那会让 pump 线程的 run_until_complete 抛错并记进 failure——那是我们
+            # 自己造成的，不是连接故障。放到 finally 之后判断的话，每一次正常收尾
+            # 都会被报成一次连接错误。
+            if failure:
+                raise LongConnectionError(translate_sdk_exception(failure[0])) from failure[0]
+        finally:
+            self._teardown_connection(fresh_loop, thread)
+
+    def _spawn_pump_thread(
+        self, events: object, finished: object, failure: list[BaseException]
+    ) -> tuple[object, object, threading.Thread]:
+        """给这次连接换一个全新的事件循环，起一个后台线程跑 SDK 的 ``ws.Client.start()``。
+
+        SDK 的 loop 是**模块级全局**：连接中途死亡时异常被吞进一个没人
+        await 的 task，那个 loop 仍然 running——第二次 ``stream()`` 里的新
+        ``client.start()`` 会在已经 running 的 loop 上调用，立刻
+        ``RuntimeError``（重连一次就永久失聪）。换新 loop 是唯一能在本地
+        复现验证的方向；这是在改第三方模块的全局状态，因此**一个进程只能
+        有一条飞书长连接**。旧 loop 在 :meth:`_teardown_connection` 里被
+        停掉。
+        """
+        import asyncio
+
+        import lark_oapi as lark
+        from lark_oapi.ws import client as ws_client_module
+
         fresh_loop = asyncio.new_event_loop()
         ws_client_module.loop = fresh_loop
 
@@ -502,36 +465,31 @@ class LarkEventTransport:
             except BaseException as error:  # 交给主线程分类
                 failure.append(error)
             finally:
-                events.put(finished)
+                events.put(finished)  # type: ignore[attr-defined]
 
         thread = threading.Thread(target=pump, name="lingxi-gateway-longconn", daemon=True)
         thread.start()
+        return fresh_loop, client, thread
 
+    def _teardown_connection(self, fresh_loop: object, thread: threading.Thread) -> None:
+        """连接结束后的清理：唤醒仍在等 ack 的事件，停掉并按需关闭这条连接专属的 loop。
+
+        线程没能在超时内退出时**不关闭** loop——关掉一个仍在被使用的 loop
+        会把一个资源泄漏换成一个崩溃；每条连接一个 loop，能关掉时不关就是
+        每次重连漏一组文件描述符。
+        """
+        # 唤醒还在等 ack 的 SDK 线程：连接已经没了，让它们向飞书报失败而不是
+        # 一直等到超时。
+        for pending in list(self._pending.values()):
+            pending.complete(ConnectionError("长连接已结束，事件未完成落库"))
+        self._pending.clear()
         try:
-            yield from self._drain(events, finished, thread, client)
-            # **在 finally 之前**判断失败。下面的清理会主动 stop 掉这条连接的 loop，
-            # 那会让 pump 线程的 run_until_complete 抛错并记进 failure——那是我们
-            # 自己造成的，不是连接故障。放到 finally 之后判断的话，每一次正常收尾
-            # 都会被报成一次连接错误。
-            if failure:
-                raise LongConnectionError(translate_sdk_exception(failure[0])) from failure[0]
-        finally:
-            # 唤醒还在等 ack 的 SDK 线程：连接已经没了，让它们向飞书报失败而不是
-            # 一直等到超时。
-            for pending in list(self._pending.values()):
-                pending.complete(ConnectionError("长连接已结束，事件未完成落库"))
-            self._pending.clear()
-            # 让上一条连接的线程退出，不留永久阻塞的线程。
-            try:
-                fresh_loop.call_soon_threadsafe(fresh_loop.stop)
-            except RuntimeError:
-                pass  # 已经停了
-            # 线程退出后把 loop 关掉：每条连接一个 loop，不关就是每次重连漏一组
-            # 文件描述符。线程没能在超时内退出时**不关**——关掉一个仍在被使用的
-            # loop 会把一个资源泄漏换成一个崩溃。
-            thread.join(timeout=2)
-            if not thread.is_alive():
-                fresh_loop.close()
+            fresh_loop.call_soon_threadsafe(fresh_loop.stop)  # type: ignore[attr-defined]
+        except RuntimeError:
+            pass  # 已经停了
+        thread.join(timeout=2)
+        if not thread.is_alive():
+            fresh_loop.close()  # type: ignore[attr-defined]
 
     def _submit_pending(self, events: object) -> Callable[[PendingEvent], None]:
         def submit(pending: PendingEvent) -> None:
@@ -562,12 +520,10 @@ class LarkEventTransport:
                     self.last_close_reason = "handshake_timeout"
                     break
                 if lost:
-                    # 连接中途静默死亡：SDK 在 auto_reconnect=False 下把
-                    # _receive_message_loop 的异常抛在一个没人 await 的 task 里，
-                    # 异常被吞、start() 永不返回、线程一直活着。唯一可观察的信号是
-                    # SDK 在抛之前先调了 _disconnect()，把 _conn 置回 None
-                    # （实测 lark_oapi 1.7.1 ws/client.py:226 → _disconnect 的 finally）。
-                    # 不检测它的话，进程看起来健康但再也收不到任何用户消息。
+                    # 连接中途静默死亡：SDK 在 auto_reconnect=False 下把接收循环的
+                    # 异常抛在一个没人 await 的 task 里，异常被吞、start() 永不返回、
+                    # 线程一直活着。唯一可观察的信号是 SDK 在抛之前先把 _conn 置回
+                    # None；不检测它的话，进程看起来健康但再也收不到任何用户消息。
                     self.last_close_reason = "connection_lost_silently"
                     break
                 yield None  # 空闲心跳：把控制权交回 supervisor
@@ -585,7 +541,6 @@ def _connection_liveness(client: object, connected_once: bool) -> tuple[bool, bo
     ``connected_once`` 永远为假，于是本函数永远报「没掉线」——退回到没有断线检测的
     行为（与本次修复前一致），而不是反过来误报掉线、把进程带进重连风暴。
     """
-
     conn = getattr(client, "_conn", None)
     if conn is not None:
         return True, False
@@ -598,7 +553,6 @@ def _real_sleep(seconds: float, should_stop: Callable[[], bool]) -> None:
     一次性 ``time.sleep(60)`` 会把停机拖到退避结束——验收实测 SIGTERM 之后 45 秒
     进程仍未退出，而配置的停机超时是 20 秒。
     """
-
     import time
 
     deadline = time.monotonic() + seconds
