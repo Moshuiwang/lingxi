@@ -174,7 +174,7 @@ GROUNDED_ATTRIBUTIONS: tuple[GroundedAttribution, ...] = (
     ),
     GroundedAttribution(
         "src/lingxi/core/execution/input_safety.py",
-        '核对更正，见 Issue #238）；但"不伪装成功"这个动机本身确有合同依据（结果',
+        "个动机本身有合同依据，与 `apps/worker/report.py` 的 ``obtained`` 同一条",
         "交付规则",
     ),
     # docs/参考证据/MVP联合验收执行卡.md 的登记项已随该一次性执行卡退场删除
@@ -398,7 +398,7 @@ GROUNDED_ATTRIBUTIONS: tuple[GroundedAttribution, ...] = (
     ),
     GroundedAttribution(
         "src/lingxi/core/execution/audit.py",
-        "# 产品合同要求「不在审计中保存凭据、完整令牌」，这是绝对措辞，靠认键名做不到——",
+        "# 产品合同要求「不在审计中保存凭据、完整令牌」——没有键名上下文的裸令牌永远",
         "管理员处理入口与安全确认",
     ),
     GroundedAttribution(

@@ -188,6 +188,10 @@ REQUIRED_MODULES = (
     # 的形状。判重水位持久化（Issue #325）新增独立的 watermark 适配器，读写路径
     # 分开（`postgres_daily_report` 只读，本模块只写判重标记），同样按需加载。
     "lingxi.core.daily_report",
+    # `daily_report.py` 拆分出的同包子模块（rc25 B-5 可读性重构）：统计聚合的
+    # 纯函数部分，由 `daily_report.py` 模块级 import，随它一起进入 scheduler
+    # 的运行时闭包。
+    "lingxi.core.daily_report_stats",
     "lingxi.adapters.postgres_daily_report",
     "lingxi.adapters.postgres_daily_report_watermark",
     # 内测轮内容级采集（Issue #251/#304 批次 3）：凭据形状过滤、原始素材收集与
@@ -321,6 +325,11 @@ REQUIRED_MODULES = (
     "lingxi.core.admin.notification",
     "lingxi.core.admin.card_dispatch",
     "lingxi.core.admin.card_callback",
+    # `card_callback.py` 拆分出的两个同包子模块（rc25 B-5 可读性重构）：端口
+    # Protocol 声明与管理卡表单/撤销分支的 mixin 实现，均由 `card_callback.py`
+    # 模块级 import，随它一起进入 gateway 的运行时闭包，不单独被其它进程消费。
+    "lingxi.core.admin.card_callback_ports",
+    "lingxi.core.admin.card_callback_management",
     "lingxi.adapters.postgres_pending_action",
     "lingxi.adapters.postgres_management_card_context",
     "lingxi.adapters.feishu_admin_card",
@@ -832,6 +841,7 @@ PROCESS_RUNTIME_IMPORTS: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {
             # 模块级 import 聚合与渲染层，与上面三个花名册 core 模块同一条"进程
             # 起来时必然已被 import 过一遍"的理由。
             "lingxi.core.daily_report",
+            "lingxi.core.daily_report_stats",
             "lingxi.core.alerting",
             "lingxi.core.ids",
             # 独立审查（分支 fix/291-280-user-experience 收尾）：`adapters.
@@ -1113,6 +1123,10 @@ PROCESS_RUNTIME_IMPORTS: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {
             "lingxi.core.admin.notification",
             "lingxi.core.admin.card_dispatch",
             "lingxi.core.admin.card_callback",
+            # `card_callback.py` 拆分出的两个同包子模块（rc25 B-5 可读性重构），
+            # 见上面 REQUIRED_MODULES 同名条目的注释。
+            "lingxi.core.admin.card_callback_ports",
+            "lingxi.core.admin.card_callback_management",
             "lingxi.adapters.postgres_pending_action",
             "lingxi.adapters.postgres_management_card_context",
             "lingxi.adapters.feishu_admin_card",

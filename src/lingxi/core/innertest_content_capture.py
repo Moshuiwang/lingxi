@@ -1,55 +1,16 @@
-"""内测轮内容级采集：原始素材收集、凭据形状过滤与落库记录构造（Issue #251/#304 批次 3）。
+"""内测轮内容级采集：原始素材收集、凭据形状过滤与落库记录构造。
 
 ## 为什么是一个独立模块，不是扩展 ``core/execution/audit.py``
 
-``core/execution/audit.py`` 的 ``TurnAudit``/``AuditRedactor`` 是执行层安全边界的一
-部分：它按**字段白名单**裁剪工具入参、只留字节数与哈希，目的是"审计明细本身不能
-成为第二个泄露业务内容的地方"。本模块要做的是**相反方向**的事——产品负责人
-2026-08-24 就 #251 第二项裁定"内容级采集全量开启，用户问题/模型回答/工具调用详情，
-原文与结果正文不设限"（决策留痕见 #304），即这里要保留执行层审计**刻意不保留**的
-东西。把两件目的相反的事塞进同一个模块，迟早会有一次改动为了满足采集侧的"多留一点"
-而悄悄放宽了审计侧的"少留一点"。因此本模块与 ``core/execution/audit.py`` 是**两个
-独立通道**：
-
-- 复用 :func:`~lingxi.core.execution.audit.redact_free_text_with_count`
-  做**唯一必须保留**的过滤——凭据形状（token/密钥/连接串一类）——结构约束
-  "凭据类一律排除"不因为口径全量开启而放松；
-- 除凭据形状外，不对内容做任何字段白名单裁剪、不做业务语义脱敏；
-- 只在开关开启时才会被构造（见 ``apps/worker/turn.py`` 的 ``WorkerTurnExecutor``
-  与 ``apps/worker/config.py`` 的 ``innertest_content_capture_enabled``），默认关闭
-  状态下这个模块的对象不会被实例化，不产生任何额外的内存占用或行为差异。
-
-## 为什么"模型回答"取的是回合内原始正文，不是 ``report["turn"]["final_text"]``
-
-``apps/worker/report.py`` 的 ``final_text`` 已经过 ``constrain_output``（出口安全，
-防系统提示词/外部文本泄露）与 ``redact_free_text``（凭据形状）两道处理，是"允许
-展示给用户、允许离开进程"的投影。产品负责人的"原文不设限"裁定针对的是内容级采集
-这一条**全新、独立、默认关闭、只在 stage 内测轮**的通道，不是要放宽面向用户或面向
-日志的既有出口——那条既有纪律（"日志不含业务正文"）原样不动。本模块因此从
-``RawTurnCapture.on_stream_event`` 直接拿消息流的原始 ``assistant_message`` 文本
-（与 ``core/execution/message_stream.py`` 的 ``TurnStreamRecorder.handle`` 读的是
-**同一个**规范化事件，只是另开一条独立的内存收集，互不影响），只在写入采集表之前
-过一道凭据形状过滤，不经过出口安全约束——这样当模型输出触发了出口安全遮蔽时，
-采集里仍能看到"模型真实说了什么"，这正是"以日志分析缺陷"要看的那类信号。
-
-## 为什么"工具调用详情"不自己重新判断哪次结果对应哪次调用
-
-``TurnAuditSummary``（``core/execution/audit.py``）已经解决过这个相关性问题，包含
-它踩过的全部边界（并发同名调用不允许模糊回退、无 ``tool_use_id`` 的旁路调用、
-审计记账自身失败的兜底记录……见该模块文档）。本模块的 :class:`RawTurnCapture` 只在
-旁路收集"这个 ``tool_use_id`` 对应的原始入参/原始回执内容分别是什么"，真正的调用—
-结果配对仍然完全交给 ``TurnAuditSummary.calls``；:meth:`RawTurnCapture.build_record`
-只是把"structure 来自审计摘要、content 来自本收集器"合并成一条采集记录。重新发明
-一遍相关性判断只会引入第二套可能与审计侧不一致的逻辑。
-
-## 凭据形状过滤的边界（与 ``V-审计-03`` 相同的已知局限）
-
-:func:`~lingxi.core.execution.audit.redact_free_text_with_count` 与
-``redact_free_text`` 逐字节同源，因此同样的残余缺口在这里原样成立：纯字母且短于
-32 字符的裸秘密、被模型当成合法形态工具名发出的凭据不会被过滤掉。这是产品负责人
-在 PR #36 第三轮审核中知情接受的既有边界，内容级采集复用同一套规则，不重新承诺
-更强的保证；`redaction_count` 只是"命中并替换了几处"的可观测计数，不是"零命中即
-无凭据"的证明。
+``core/execution/audit.py`` 的 ``TurnAudit``/``AuditRedactor`` 是执行层安全边界的
+一部分：按**字段白名单**裁剪工具入参、只留字节数与哈希，目的是"审计明细本身不能
+成为第二个泄露业务内容的地方"。本模块要做的是**相反方向**的事——按产品要求
+"内容级采集全量开启，用户问题/模型回答/工具调用详情，原文与结果正文不设限"，即
+这里要保留执行层审计刻意不保留的东西。把两件目的相反的事塞进同一个模块，迟早会
+有一次改动为了满足采集侧的"多留一点"而悄悄放宽了审计侧的"少留一点"，因此是两个
+独立通道：只复用凭据形状过滤这一项**唯一必须保留**的约束（结构性"凭据类一律排除"
+不因口径全量开启而放松），除此之外不做任何字段白名单裁剪或业务语义脱敏；只在开关
+开启时才会被构造，默认关闭状态下这个模块的对象不会被实例化。
 """
 
 from __future__ import annotations
@@ -61,11 +22,10 @@ from typing import Any
 
 from lingxi.core.execution.audit import TurnAuditSummary, redact_free_text_with_count
 
-# "结果摘要"（#251 原文用词）按字面是摘要，不是全文；只有用户问题与模型回答按
-# 2026-08-24 裁定"原文/正文不设限"。超过这个字节数的工具结果按 UTF-8 边界截断，
-# 并在 CapturedToolCall.result_summary 里显式标注 truncated=True——不静默丢字节，
-# 也不假装截断后的内容是完整的（与验证与门禁「否定测试」同一条纪律：显式呈现，
-# 不隐藏局限）。
+# "结果摘要"按字面是摘要，不是全文；只有用户问题与模型回答按产品要求"原文/正文
+# 不设限"。超过这个字节数的工具结果按 UTF-8 边界截断，并在
+# CapturedToolCall.result_summary 里显式标注 truncated=True——不静默丢字节，也
+# 不假装截断后的内容是完整的。
 MAX_TOOL_RESULT_SUMMARY_BYTES = 4000
 
 # 递归脱敏的深度上限：模型可控的工具入参嵌套深度没有上界，
@@ -76,8 +36,9 @@ _MAX_JSON_REDACTION_DEPTH = 20
 
 @dataclass(frozen=True)
 class CapturedToolCall:
-    """一次工具调用在内容采集里的投影：与执行层审计的 ``ToolCallAudit`` 不是同一份数据
-    ——``tool_input`` 是原始参数（只过凭据形状），不是字段白名单裁剪后的版本。
+    """一次工具调用在内容采集里的投影，与执行层审计的 ``ToolCallAudit`` 不是同一份数据。
+
+    ``tool_input`` 是原始参数（只过凭据形状），不是字段白名单裁剪后的版本。
     """
 
     tool_use_id: str | None
@@ -101,11 +62,11 @@ class ContentCaptureRecord:
 
     @property
     def tool_calls_redaction_count(self) -> int:
+        """全部工具调用的脱敏命中次数之和。"""
         return sum(call.redaction_count for call in self.tool_calls)
 
     def tool_calls_payload(self) -> list[dict[str, Any]]:
         """给适配器写 JSONB 列用的纯 JSON 安全结构。"""
-
         return [
             {
                 "tool_use_id": call.tool_use_id,
@@ -123,20 +84,14 @@ class RawTurnCapture:
 
     只在开关开启时才会被构造（见 ``apps/worker/turn.py``）：关闭状态下这是"默认
     关闭可被断言证明"的一部分——不是多一个 if 分支跳过写库，而是这个对象压根
-    没被实例化，没有任何原始入参/正文会被多持有一份。
-
-    两个注入点分别对接两条互不相同的原始数据来源（与 ``core/execution/audit.py``
-    模块文档「来源一/二/三」同一套划分）：
-
-    - :meth:`on_pre_tool_use` 接 ``core/execution/hooks.py`` 的
-      ``ToolGateway.raw_pre_tool_use``（hook 判定时的原始入参，字段白名单裁剪
-      **之前**）；
-    - :meth:`on_stream_event` 接消息流（最终正文与工具回执原文），事件形状与
-      ``core/execution/message_stream.py`` 的 ``TurnStreamRecorder.handle`` 完全
-      相同（``apps/worker/turn.py`` 把同一个事件对象喂给两者）。
+    没被实例化。两个注入点对接两条不同的原始数据来源：:meth:`on_pre_tool_use`
+    接 hook 判定时的原始入参（字段白名单裁剪之前）；:meth:`on_stream_event` 接
+    消息流（最终正文与工具回执原文，与执行层消息流读的是同一个规范化事件，只是
+    另开一条独立内存收集，互不影响）。
     """
 
     def __init__(self) -> None:
+        """建立空的原始入参/回执内存收集状态。"""
         self._raw_tool_input: dict[str, Any] = {}
         self._raw_tool_result: dict[str, tuple[Any, Any]] = {}
         self._final_text = ""
@@ -148,13 +103,20 @@ class RawTurnCapture:
         可靠相关联的调用宁可在采集里显式"未捕获"，也不猜测按名字回退（同名并发
         调用会挂错，见 ``core/execution/audit.py`` 的 ``_locate`` 文档）。
         """
-
         if tool_use_id:
             self._raw_tool_input[tool_use_id] = tool_input
 
     def on_stream_event(self, event: Mapping[str, Any]) -> None:
-        """消息流回调，事件 ``kind`` 取值域与 ``TurnStreamRecorder.handle`` 相同。"""
+        """消息流回调，事件 ``kind`` 取值域与 ``TurnStreamRecorder.handle`` 相同。
 
+        取的是回合内原始正文，不是出口投影 ``report["turn"]["final_text"]``——那份
+        投影已经过出口安全约束（防系统提示词/外部文本泄露）与凭据过滤两道处理，是
+        "允许离开进程"的版本；内容级采集这条全新、默认关闭、只在 stage 内测轮的
+        独立通道要保留"模型真实说了什么"，不经过出口安全约束，只在写入采集表之前
+        过一道凭据形状过滤——这样即使模型输出触发了出口安全遮蔽，采集里仍能看到
+        原始内容，这正是"以日志分析缺陷"要看的那类信号；日志侧"不含业务正文"的
+        既有纪律原样不动。
+        """
         kind = event.get("kind")
         if kind == "assistant_message":
             # 后一条覆盖前一条，与 TurnStreamRecorder 同一语义：最终正文是最后
@@ -169,7 +131,6 @@ class RawTurnCapture:
     @property
     def final_text(self) -> str:
         """本回合目前观察到的最终正文原文（未经出口安全约束、未经凭据过滤）。"""
-
         return self._final_text
 
     def build_record(
@@ -180,10 +141,13 @@ class RawTurnCapture:
         question: str,
         summary: TurnAuditSummary,
     ) -> ContentCaptureRecord:
-        """结合执行层已经算好的回合审计摘要（结构/相关性）与本收集器持有的原始
-        素材（内容），构造最终的采集记录。参见模块文档「为什么不自己重新实现相关性」。
-        """
+        """结合执行层已经算好的回合审计摘要与本收集器持有的原始素材，构造采集记录。
 
+        不自己重新判断哪次结果对应哪次调用——``TurnAuditSummary`` 已经解决过这个
+        相关性问题（含并发同名调用不允许模糊回退等边界），本收集器只在旁路收集
+        每个 ``tool_use_id`` 对应的原始入参/回执内容，真正的调用—结果配对完全交给
+        ``summary.calls``，这里只是把结构与内容合并成一条记录。
+        """
         redacted_question, question_count = redact_free_text_with_count(question)
         redacted_answer, answer_count = redact_free_text_with_count(self._final_text)
         calls = tuple(self._build_call(call) for call in summary.calls)
@@ -231,8 +195,14 @@ class RawTurnCapture:
 
 
 def _redact_json(value: Any, *, _depth: int = 0) -> tuple[Any, int]:
-    """递归对 JSON 安全结构里的字符串叶子做凭据形状过滤，返回 (结构, 命中次数)。"""
+    """递归对 JSON 安全结构里的字符串叶子做凭据形状过滤，返回 (结构, 命中次数)。
 
+    与执行层审计的过滤逐字节同源，因此同样的已知局限在这里原样成立：纯字母且
+    短于 32 字符的裸秘密、被模型当成合法形态工具名发出的凭据不会被过滤掉——
+    这是产品已知情接受的既有边界，内容级采集复用同一套规则，不重新承诺更强的
+    保证；``redaction_count`` 只是"命中并替换了几处"的可观测计数，不是"零命中
+    即无凭据"的证明。
+    """
     if _depth >= _MAX_JSON_REDACTION_DEPTH:
         text, count = redact_free_text_with_count(_stringify(value))
         return {"depth_truncated": True, "value": text}, count
@@ -268,7 +238,6 @@ def _stringify(value: Any) -> str:
     函数的目的是"判定回执分类"，这个函数的目的是"得到一段可读文本存进采集表"，
     两者分叉是有意的（判定失败不能影响能否落一段可读文本）。
     """
-
     if value is None:
         return ""
     if isinstance(value, str):

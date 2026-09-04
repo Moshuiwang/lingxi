@@ -1,4 +1,4 @@
-"""用户记忆（Issue #357 S-H3-3，D1 显式登记范围）：数据形状与纯渲染逻辑。
+"""用户记忆：数据形状与纯渲染逻辑（D1 显式登记范围）。
 
 只放不碰数据库、不做 I/O 的部分——真正的存取在 ``adapters/postgres_conversation``
 （``/memory`` 命令面复用的 CRUD 四方法）与 ``adapters/postgres_user_memory``
@@ -60,7 +60,9 @@ class MemoryTypeLabels(Protocol):
     dataclass/枚举常量外零依赖。
     """
 
-    def __call__(self, memory_type: str) -> str: ...
+    def __call__(self, memory_type: str) -> str:
+        """按记忆类型取一个短标签字符串。"""
+        ...
 
 
 @dataclass(frozen=True)
@@ -88,7 +90,6 @@ def render_user_memory_prompt(
     丢弃，直到剩余文本落在上限之内——保留的是「最近登记」的记忆，与产品直觉一致
     （越新登记的口径偏好/术语映射越可能仍然有效）。
     """
-
     if not entries:
         return RenderedUserMemoryPrompt(text="", truncated=False, total_entries=0, kept_entries=0)
 

@@ -177,6 +177,7 @@ PINNED_PER_FILE_IGNORES: dict[str, frozenset[str]] = {
     "src/lingxi/apps/worker/turn.py": frozenset(["D"]),
     "src/lingxi/config/content.py": frozenset(["D"]),
     "src/lingxi/core/admin/card_callback.py": frozenset(["D", "PLR0913"]),
+    "src/lingxi/core/admin/card_callback_management.py": frozenset(["PLR0913"]),
     "src/lingxi/core/admin/card_dispatch.py": frozenset(["D", "PLR0913"]),
     "src/lingxi/core/admin/card_layout.py": frozenset(["D"]),
     "src/lingxi/core/admin/commands.py": frozenset(["D"]),
