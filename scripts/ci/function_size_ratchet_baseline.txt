@@ -176,7 +176,6 @@
 96	src/lingxi/core/identity/onboarding_runner.py::AutoOnboardingRunner._publish
 163	src/lingxi/core/identity/onboarding_runner.py::AutoOnboardingRunner._run
 73	src/lingxi/core/identity/onboarding_runner.py::AutoOnboardingRunner.start
-68	src/lingxi/core/permission/metric_translation.py::build_company_function_metric_map
 70	src/lingxi/core/permission/notification.py::PermissionNoticeDispatcher.notify
 65	src/lingxi/core/permission/position_override.py::expand_position_scope
 97	src/lingxi/core/permission/targeted_recompute.py::TargetedPermissionRecompute.recompute_and_publish
