@@ -107,9 +107,8 @@ class _TaskLifecycleMixin:
         # 原来的 `connect(...)`，只有装配方显式打开复用时才改为持有常驻
         # 连接；打开时复用连接首次失败会重建重试一次，见该方法文档）。
 
-        # SQL 就地内联、不提到模块常量：两条真库结构性用例直接用
-        # `inspect.getsource(...claim)` 扫这个方法自身的源码文本找 SET
-        # 子句/`FOR UPDATE SKIP LOCKED`，挪到别处会让判据落空、断言失明。
+        # SQL 必须就地内联在本方法体内、不提到模块常量：外部结构性核对按本方法
+        # 源码扫 SET 子句与 `FOR UPDATE SKIP LOCKED`，挪走会让核对失明。
 
         def _claim(connection: Any) -> list[ClaimedTask]:
             with connection.cursor() as cursor:
@@ -294,11 +293,9 @@ class _TaskLifecycleMixin:
         """回收心跳超时任务；可安全重试的第一轮回到 queued，其余进入失败终态。
 
         同样**不碰 ``target_worker_version``**：任务被回收重排后，用户仍然进入他当初
-        被分到的那个版本（`V-灰度-01` 的回收路径）。安全重试的 ``UPDATE`` 就地内联、
-        不提到模块常量：``tests/test_gateway_postgres.py::WorkerVersionTests``
-        用 ``inspect.getsource(...reclaim_stale)`` 直接扫本方法自身的源码文本
-        确认 SET 子句没有写 ``target_worker_version``，挪到别处会让这条判据
-        落空。
+        被分到的那个版本（`V-灰度-01` 的回收路径）。安全重试的 ``UPDATE`` 必须就地
+        内联在本方法体内、不提到模块常量：外部结构性核对按本方法源码确认 SET 子句
+        没有写 ``target_worker_version``，挪走会让核对失明。
         """
         if isinstance(max_auto_retries, bool) or max_auto_retries < 0:
             raise ValueError("max_auto_retries 必须是非负整数")

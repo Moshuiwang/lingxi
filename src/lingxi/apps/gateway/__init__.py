@@ -341,8 +341,7 @@ def _run(config: GatewayConfig) -> int:
         stop_event.set()
         loops.join_within(shutdown, config.shutdown_timeout_seconds)
         # 所有职责与后台线程都已收口：显式关闭本进程空闲栈里的连接，不再只靠
-        # atexit（D-17）。清理本身的异常不得覆盖上面可能已经在传播的真实故障，
-        # 因此只记日志不重抛。
+        # atexit。清理本身的异常不得覆盖上面可能已经在传播的真实故障，只记日志不重抛。
         try:
             close_idle_connections()
         except Exception as error:
