@@ -13,10 +13,10 @@
    为独立条目，不搭 ``D`` 的豁免。后续清理批会逐个 ``src/lingxi/`` 文件把
    ``D`` 条目删空或缩短，收官目标是 ``src/lingxi/`` 下的 ``D`` 条目清空
    （不含三条豁免 glob 本身）。
-2. ``[tool.ruff.format].exclude``——门禁接线批刻意不写这一节，全仓格式化留给
-   后续批次；因此这里钉住的是**空集**，那个批次接线时需要同步把这条测试的
-   钉住清单换成它实际写入的排除列表（那是它自己的收口职责，不是本测试要提前
-   预留的空子）。
+2. ``[tool.ruff.format].exclude``——全仓格式化落地时同时排除六个贴线/冻结
+   文件（结构性拆分之前，格式化的引号/换行重排会改动行数，可能顶穿文件体量
+   棘轮阈值或让基线数字对不上）；钉住集与 ``pyproject.toml`` 逐字一致。这六
+   个文件拆分完成、移出 exclude 列表后，这里同步收紧。
 
 判定方式是子集，不是逐字相等：允许某个文件的条目从表里整条删除，也允许某个文件
 保留的规则码变少；唯一不允许的是**出现新文件**或**某个已登记文件出现新规则码**
@@ -239,9 +239,19 @@ PINNED_PER_FILE_IGNORES: dict[str, frozenset[str]] = {
     "tests/test_worker_entry.py": frozenset(["PLR0913"]),
 }
 
-# 门禁接线批不写 [tool.ruff.format]，exclude 就是空集；全仓格式化批接线时这条
-# 常量需要同步换成它实际写入的排除列表。
-PINNED_FORMAT_EXCLUDE: frozenset[str] = frozenset()
+# 六个贴线/冻结文件在结构性拆分完成前不参与全仓格式化，与 pyproject.toml
+# [tool.ruff.format].exclude 逐字一致；拆分完成、移出该 exclude 列表后，这里
+# 同步收紧（只许变短，不许变长）。
+PINNED_FORMAT_EXCLUDE: frozenset[str] = frozenset(
+    [
+        "src/lingxi/apps/gateway/__init__.py",
+        "src/lingxi/apps/scheduler/permission_refresh.py",
+        "src/lingxi/apps/worker/service.py",
+        "src/lingxi/core/admin/router.py",
+        "src/lingxi/core/conversation/pipeline.py",
+        "src/lingxi/core/identity/onboarding_runner.py",
+    ]
+)
 
 
 class PerFileIgnoresOnlyShrinksTest(unittest.TestCase):

@@ -335,3 +335,16 @@ max-args = 10
 "tests/test_roster_access_token_supply.py" = ["PLR0913", "N818"]
 "tests/test_targeted_permission_recompute.py" = ["PLR0913"]
 "tests/test_worker_entry.py" = ["PLR0913"]
+
+# 六个贴线/冻结文件（结构性拆分之前的暂缓对象）暂不参与全仓格式化：它们各自
+# 贴着文件体量棘轮阈值，ruff format 的重排（引号风格、换行）会改动行数，可能顶穿
+# 阈值或让棘轮基线数字对不上。批 1 拆分完成后再移出本清单、纳入格式化。
+[tool.ruff.format]
+exclude = [
+    "src/lingxi/apps/gateway/__init__.py",
+    "src/lingxi/apps/scheduler/permission_refresh.py",
+    "src/lingxi/apps/worker/service.py",
+    "src/lingxi/core/admin/router.py",
+    "src/lingxi/core/conversation/pipeline.py",
+    "src/lingxi/core/identity/onboarding_runner.py",
+]
