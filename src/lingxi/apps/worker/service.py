@@ -114,7 +114,7 @@ class WorkerService:
         self._tick_alerts()
         # 巡检搬离事件循环：占住循环＝只读屏障唯一判定层的工具前置钩子应答不了，而钩子
         # 超时是失败关闭。
-        terminal_tasks = await asyncio.to_thread(self._housekeep)
+        terminal_tasks = await asyncio.to_thread(self._housekeeper.run)
 
         # 紧贴 claim() 之前再判一次停机信号（见 `_STOP_SIGNAL_DRAIN_YIELDS`）：判定与
         # claim() 之间几乎全同步，信号若落在那段窗口里，标志位读到的还是旧值——会把一条
@@ -162,7 +162,7 @@ class WorkerService:
                 if now - last_housekeep_at >= self._config.poll_interval_seconds:
                     last_housekeep_at = now
                     self._tick_alerts()
-                    terminal_tasks.extend(await asyncio.to_thread(self._housekeep))
+                    terminal_tasks.extend(await asyncio.to_thread(self._housekeeper.run))
         except BaseException:
             for task in pending:
                 task.cancel()
@@ -201,14 +201,6 @@ class WorkerService:
         errors = [error for task in done if (error := task.exception()) is not None]
         if errors:
             raise errors[0]
-
-    def _housekeep(self) -> list[TerminalTask]:
-        """每一轮的巡检；实现见 :class:`~lingxi.apps.worker.housekeeping.QueueHousekeeper`。"""
-        return self._housekeeper.run()
-
-    def _cleanup_agent_sessions(self) -> None:
-        """会话清理转发口；实现见 :class:`~lingxi.apps.worker.housekeeping.QueueHousekeeper`。"""
-        self._housekeeper._cleanup_agent_sessions()
 
     def _emit_heartbeat(self) -> None:
         """戳一次活性；失败只记异常类型，不能因为告警输入失败而让 worker 停止消费。"""
