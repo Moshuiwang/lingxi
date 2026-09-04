@@ -9,7 +9,7 @@
 行里很大一块是连贯的中文正文说明），一个偏低的绝对上限只会逼人把连贯逻辑劈成互相
 牵连、更难读的两半。改用**棘轮**：
 
-- 已经超过阈值（1500 行）的文件，登记在
+- 已经超过阈值（1000 行）的文件，登记在
   ``scripts/ci/size_ratchet_baseline.txt`` 里，只许变小、不许变大；
 - 未超阈值的文件不得新超过阈值——不存在"先登记后随便涨"的口子；
 - 基线**必须是生成的**：``--refresh`` 重新丈量已登记文件的当前行数，只会调小或整条
@@ -17,13 +17,9 @@
   文件的行数比基线记录的还多，``--refresh`` 直接拒绝写入并报错，不会把这次增长当成
   新的基线；这正是"棘轮"这个名字的来源。
 
-阈值取 1500 行：本仓库 ``src/lingxi/`` 下一次真实丈量显示，绝大多数模块（含文档字符串
-很重的 ``publish_row.py`` 980 行、``mcp_readiness.py`` 1140 行）都在 1500 行以内，
-只有 ``adapters/postgres_conversation.py``（1951 行）与 ``apps/scheduler/__init__.py``
-（2048 行）这两个已知需要拆分的文件超过它——这正是 Issue #238 点名允许存量存在、
-但要求今后只减不增的两个文件。取更低的阈值会把 publish_row.py / mcp_readiness.py
-这类偏长但内聚、连贯的文件也提前拖进棘轮，逼着今后自然的补充硬拆成不连贯的两半，
-不符合 Issue 的明确要求。
+阈值取 1000 行：文件体量、函数体量、注释卫生三条棘轮合力让「压缩注释、内联调用」不再是
+合规路径，拆分成为唯一路径；1000 行是一次结构性清理收官后 ``src/lingxi/`` 全部文件都已
+落在其下的值，此后只减不增。
 
 范围只覆盖 ``src/lingxi/`` 下的正式代码：测试文件按用例数量自然变长是正常现象，
 拆分测试的成本和收益与拆分业务逻辑完全不同，不在本门禁的目标问题（生产代码里的
@@ -42,7 +38,7 @@ from pathlib import Path
 REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
 SOURCE_ROOT = REPOSITORY_ROOT / "src" / "lingxi"
 BASELINE_PATH = REPOSITORY_ROOT / "scripts" / "ci" / "size_ratchet_baseline.txt"
-THRESHOLD_LINES = 1500
+THRESHOLD_LINES = 1000
 
 BASELINE_HEADER = (
     f"# 文件体量棘轮基线（Issue #238）：登记当前已超过 {THRESHOLD_LINES} 行的文件与其行数上限。",

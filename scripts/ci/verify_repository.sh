@@ -123,7 +123,7 @@ python3 scripts/ci/check_project_skills.py
 # 验收矩阵的三态状态列与合同条款覆盖清单。这两样此前只是散文约定：
 # 断言可以没人认领、合同可以新增一节而没有任何断言，门禁照样全绿。
 python3 scripts/ci/check_acceptance_matrix.py
-# 代码框架第一节「文件体量棘轮」（Issue #238）：已超过阈值（1500 行）的文件登记在
+# 代码框架第一节「文件体量棘轮」（Issue #238）：已超过阈值（1000 行）的文件登记在
 # scripts/ci/size_ratchet_baseline.txt 里，只许变小、不许变大；未超阈值的文件不得
 # 新超过阈值。基线由 --refresh 生成，拒绝被手工调大——见该脚本头注释。
 python3 scripts/ci/check_size_ratchet.py

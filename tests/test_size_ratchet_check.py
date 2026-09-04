@@ -216,7 +216,7 @@ class RealBaselineIsHonestTest(unittest.TestCase):
 
 class EmptyBaselineIsLegalTest(unittest.TestCase):
     """空基线是合法终态，不是异常：当两个大文件都被拆分完、``src/lingxi/``
-    下不再有任何文件超过阈值时，棘轮退化成"不许新文件跨过 1500 行"，那仍是
+    下不再有任何文件超过阈值时，棘轮退化成"不许新文件跨过 1000 行"，那仍是
     它的主要价值——不能把"基线空"和"扫描坏了"混为一谈（补充复查要求，
     2026-08-19，与 A6"目录存在但零个 .py 文件"是两回事：那种是扫描本身失败，
     这里是扫描正常、只是没有文件超阈值）。
