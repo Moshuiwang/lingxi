@@ -1,15 +1,16 @@
-"""gateway 侧的首次开通装配断言，以及它唯一允许的那个惰性实现。
+"""gateway 侧的首次开通装配断言。
 
-首次开通编排整体住在 ``lingxi-scheduler``（见「首次开通编排住在 scheduler」决策记录）。
-搬迁之后 gateway 在这条链上只剩两件事：
+首次开通编排整体归属 ``lingxi-scheduler``（决策见 ``docs/决策记录/`` 对应记录：
+首次开通编排住在 scheduler）；搬迁之后 gateway 在这条链上只剩两件事：把未开通
+用户的首聊事件落进 ``inbound_event`` 并标成 ``auto_provisioning``（管线的事务），
+以及立刻回一条合同要求的「已收到，正在核对」。
 
-1. 把未开通用户的首聊事件落进 ``inbound_event`` 并标成 ``auto_provisioning``（管线的事务）；
-2. 立刻回一条合同要求的「已收到，正在核对」。
-
-**它不再持有任何会产生外部副作用的开通实现**，因此原先那条「两处装配必须拿到同一个
-编排实例」的对账断言失去了对象。那条断言挡的两个伤害各自有了新的守卫：对账落回失败
-关闭桩，由 scheduler 侧的认领容量断言挡；分钟级编排落在长连接线程，由本模块的
-:func:`assert_gateway_onboarding_is_inert` 挡。
+gateway 不再持有任何会产生外部副作用的开通实现，因此原先那条「装配点必须拿到
+同一个 runner 实例」的断言失去了对象——搬迁之后 gateway 只有一个注入点，对账
+那一路整个搬走了。那条断言挡的两个伤害各自有了新的守卫：对账落回失败关闭桩、
+「认领即平账」把孤儿烧掉，改由 ``apps/scheduler/onboarding`` 的容量断言与释放
+认领的反向路径守住；分钟级编排落在长连接线程/投递线程上，由本模块的
+:func:`assert_gateway_onboarding_is_inert` 守住。
 """
 
 from __future__ import annotations
