@@ -224,6 +224,10 @@ REQUIRED_MODULES = (
     "lingxi.core.permission.local_override",
     "lingxi.core.permission.position_override",
     "lingxi.adapters.postgres_local_permission",
+    # 存量差集导入/职位范围预授权的落库细节，从 `postgres_local_permission.py`
+    # 按体量棘轮纯移动拆出（#592 可读性批）；`postgres_local_permission.py`
+    # 顶层 import 它，随它同一条发布理由，见下面 scheduler/gateway 闭包同名注释。
+    "lingxi.adapters.postgres_local_permission_import",
     "lingxi.core.permission.merge_sources",
     # 存量用户首聊差集导入的纯逻辑（rc25 S-1，Issue #540）：开通编排、每日/定向重算
     # 与本地覆盖适配器都消费它（见下面 scheduler/gateway 闭包）；开通链的两步编排
@@ -649,6 +653,7 @@ PROCESS_RUNTIME_IMPORTS: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {
             # 闭包里了）。
             "lingxi.core.permission.local_override",
             "lingxi.adapters.postgres_local_permission",
+            "lingxi.adapters.postgres_local_permission_import",
             "lingxi.core.permission.merge_sources",
             # 存量差集导入纯逻辑（rc25 S-1）：`onboarding_runner`/`permission_refresh`/
             # `postgres_local_permission` 模块级 import；开通链两步编排随 runner 进闭包。
@@ -1086,6 +1091,7 @@ PROCESS_RUNTIME_IMPORTS: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {
             # 的 LocalPermissionOverrideEntry/OverrideDirection（纯类型，供
             # confirm() 解析 payload 后构造要写入的条目）。
             "lingxi.adapters.postgres_local_permission",
+            "lingxi.adapters.postgres_local_permission_import",
             "lingxi.core.permission.local_override",
             "lingxi.core.permission.position_override",
             # 管理员写动作确认执行成功后的定向单用户权限重算+发布（Issue #438）：

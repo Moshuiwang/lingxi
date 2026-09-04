@@ -40,26 +40,6 @@ _SYSTEM_TERMINAL_CONTENT_KEYS: dict[str, str] = {
     "side_effect_uncertain": "worker.side_effect_uncertain",
 }
 
-_CLAIM_TASKS_SQL = """
-UPDATE task SET status = 'running',
-                worker_id = %s,
-                started_at = now(),
-                heartbeat_at = now(),
-                attempts = attempts + 1
- WHERE id IN (
-     SELECT id FROM task
-      WHERE status = 'queued'
-        AND scheduled_at <= now()
-        AND target_worker_version = %s
-      ORDER BY scheduled_at, id
-        FOR UPDATE SKIP LOCKED
-      LIMIT %s
- )
-RETURNING id, conversation_id, user_id, prompt,
-          resumed_session, target_worker_version, attempts,
-          reply_to_message_id, stop_requested, side_effect_state
-"""
-
 _FINISH_TASK_SQL = """
 UPDATE task
    SET status = %s,
@@ -92,12 +72,6 @@ SELECT id, conversation_id, attempts, side_effect_state
    AND heartbeat_at < now() - %s::interval
  ORDER BY heartbeat_at, id
  FOR UPDATE SKIP LOCKED
-"""
-
-_REQUEUE_TASK_SQL = """
-UPDATE task SET status = 'queued', worker_id = NULL,
-                started_at = NULL, heartbeat_at = NULL
- WHERE id = %s AND status = 'running'
 """
 
 
@@ -133,9 +107,34 @@ class _TaskLifecycleMixin:
         # 原来的 `connect(...)`，只有装配方显式打开复用时才改为持有常驻
         # 连接；打开时复用连接首次失败会重建重试一次，见该方法文档）。
 
+        # SQL 就地内联、不提到模块常量：两条真库结构性用例直接用
+        # `inspect.getsource(...claim)` 扫这个方法自身的源码文本找 SET
+        # 子句/`FOR UPDATE SKIP LOCKED`，挪到别处会让判据落空、断言失明。
+
         def _claim(connection: Any) -> list[ClaimedTask]:
             with connection.cursor() as cursor:
-                cursor.execute(_CLAIM_TASKS_SQL, (worker_id, target_worker_version, limit))
+                cursor.execute(
+                    """
+                    UPDATE task SET status = 'running',
+                                    worker_id = %s,
+                                    started_at = now(),
+                                    heartbeat_at = now(),
+                                    attempts = attempts + 1
+                     WHERE id IN (
+                         SELECT id FROM task
+                          WHERE status = 'queued'
+                            AND scheduled_at <= now()
+                            AND target_worker_version = %s
+                          ORDER BY scheduled_at, id
+                            FOR UPDATE SKIP LOCKED
+                          LIMIT %s
+                     )
+                    RETURNING id, conversation_id, user_id, prompt,
+                              resumed_session, target_worker_version, attempts,
+                              reply_to_message_id, stop_requested, side_effect_state
+                    """,
+                    (worker_id, target_worker_version, limit),
+                )
                 return [_row_to_claimed_task(row) for row in cursor.fetchall()]
 
         return self._run_polling_operation(_claim)
@@ -295,7 +294,11 @@ class _TaskLifecycleMixin:
         """回收心跳超时任务；可安全重试的第一轮回到 queued，其余进入失败终态。
 
         同样**不碰 ``target_worker_version``**：任务被回收重排后，用户仍然进入他当初
-        被分到的那个版本（`V-灰度-01` 的回收路径）。
+        被分到的那个版本（`V-灰度-01` 的回收路径）。安全重试的 ``UPDATE`` 就地内联、
+        不提到模块常量：``tests/test_gateway_postgres.py::WorkerVersionTests``
+        用 ``inspect.getsource(...reclaim_stale)`` 直接扫本方法自身的源码文本
+        确认 SET 子句没有写 ``target_worker_version``，挪到别处会让这条判据
+        落空。
         """
         if isinstance(max_auto_retries, bool) or max_auto_retries < 0:
             raise ValueError("max_auto_retries 必须是非负整数")
@@ -307,37 +310,39 @@ class _TaskLifecycleMixin:
                 cursor = connection.cursor()
                 cursor.execute(_RECLAIM_STALE_CANDIDATES_SQL, (older_than,))
                 for task_id, conversation_id, attempts, side_effect_state in cursor.fetchall():
-                    requeued_id, terminal_task = self._reclaim_stale_row(
+                    safe_retry = side_effect_state == "none" and attempts <= max_auto_retries
+                    if safe_retry:
+                        cursor.execute(
+                            """
+                            UPDATE task SET status = 'queued', worker_id = NULL,
+                                            started_at = NULL, heartbeat_at = NULL
+                             WHERE id = %s AND status = 'running'
+                            """,
+                            (task_id,),
+                        )
+                        requeued.append(task_id)
+                        continue
+                    terminal_task = self._reclaim_stale_terminal(
                         cursor,
                         task_id=task_id,
                         conversation_id=conversation_id,
-                        attempts=attempts,
                         side_effect_state=side_effect_state,
-                        max_auto_retries=max_auto_retries,
                     )
-                    if requeued_id is not None:
-                        requeued.append(requeued_id)
                     if terminal_task is not None:
                         terminal.append(terminal_task)
         if _with_outcomes:
             return requeued, terminal
         return requeued
 
-    def _reclaim_stale_row(
+    def _reclaim_stale_terminal(
         self,
         cursor: Any,
         *,
         task_id: str,
         conversation_id: str,
-        attempts: int,
         side_effect_state: str | None,
-        max_auto_retries: int,
-    ) -> tuple[str | None, TerminalTask | None]:
-        """单条心跳超时任务的分流：可安全重试则重排回 queued，否则代为收口。"""
-        safe_retry = side_effect_state == "none" and attempts <= max_auto_retries
-        if safe_retry:
-            cursor.execute(_REQUEUE_TASK_SQL, (task_id,))
-            return task_id, None
+    ) -> TerminalTask | None:
+        """不可安全重试的心跳超时任务：代为收口为失败终态。"""
         error_kind = "side_effect_uncertain" if side_effect_state != "none" else "retry_exhausted"
         # 这类任务从未被一个仍然存活的 worker 正常收口，不能只改 task.status
         # 就直接释放话题——必须写出与真实 worker 完全同型的投递事件序列并
@@ -345,8 +350,8 @@ class _TaskLifecycleMixin:
         if not self._write_system_terminal(
             cursor, task_id=task_id, error_kind=error_kind, from_status="running"
         ):
-            return None, None  # pragma: no cover - 见该方法文档的竞态防御说明
-        return None, TerminalTask(
+            return None  # pragma: no cover - 见该方法文档的竞态防御说明
+        return TerminalTask(
             task_id=task_id,
             conversation_id=conversation_id,
             status="awaiting_delivery",
