@@ -255,6 +255,8 @@ REQUIRED_MODULES = (
     # 每日权限重算职责（Issue #156 / S-C-03a）。它由 `build_loop` 在**模块级**
     # import，因此漏登记会直接让 scheduler 起不来；仍然逐项写出来，理由同上一条。
     "lingxi.apps.scheduler.permission_refresh",
+    # permission_refresh 拆分（#592 B-1）：端口协议、原因码与报告形状。
+    "lingxi.apps.scheduler.permission_refresh_ports",
     # 权限发布消费与就绪确认职责（Issue #156 / S-C-03b），同样是模块级 import。
     "lingxi.apps.scheduler.permission_publish",
     # Trace #358 S-H-2（Issue #350 Gate G-3 裁定 Option A）纯移动拆分：就绪确认+
@@ -550,6 +552,7 @@ PROCESS_RUNTIME_IMPORTS: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {
             # `core.permission` 整组、发布 outbox 与令牌读取口都进了 scheduler 的运行时
             # 闭包。这是它们**第一次**有真实进程调用方，此前只随制品发布。
             "lingxi.apps.scheduler.permission_refresh",
+            "lingxi.apps.scheduler.permission_refresh_ports",
             # 权限发布消费与就绪确认（Issue #156 / S-C-03b）：它把 S-C-01 的发布执行器、
             # S-C-02 的就绪状态机与探针、以及权限变化通知全部接进了本进程，因此发布表
             # 传输、问数 MCP 探针与用户私聊出站三个 adapter 也进了运行时闭包。
