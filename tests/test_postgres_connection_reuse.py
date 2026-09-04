@@ -305,7 +305,9 @@ class IdleConnectionPoolDiscardsClosedConnectionsTests(unittest.TestCase):
         result = pool.acquire(key)
 
         self.assertIsNone(result, "栈里只有一条已关闭的连接，弹出丢弃后应无可用连接")
-        self.assertEqual(stale.discard_calls, 1, "已关闭的连接必须被显式 discard()，不能只是 continue")
+        self.assertEqual(
+            stale.discard_calls, 1, "已关闭的连接必须被显式 discard()，不能只是 continue"
+        )
 
 
 class DedicatedCallSiteWiringTests(unittest.TestCase):
