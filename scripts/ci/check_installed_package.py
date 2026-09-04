@@ -312,6 +312,11 @@ REQUIRED_MODULES = (
     "lingxi.core.admin.notification",
     "lingxi.core.admin.card_dispatch",
     "lingxi.core.admin.card_callback",
+    # `card_callback.py` 拆分出的两个同包子模块（rc25 B-5 可读性重构）：端口
+    # Protocol 声明与管理卡表单/撤销分支的 mixin 实现，均由 `card_callback.py`
+    # 模块级 import，随它一起进入 gateway 的运行时闭包，不单独被其它进程消费。
+    "lingxi.core.admin.card_callback_ports",
+    "lingxi.core.admin.card_callback_management",
     "lingxi.adapters.postgres_pending_action",
     "lingxi.adapters.postgres_management_card_context",
     "lingxi.adapters.feishu_admin_card",
@@ -1057,6 +1062,10 @@ PROCESS_RUNTIME_IMPORTS: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {
             "lingxi.core.admin.notification",
             "lingxi.core.admin.card_dispatch",
             "lingxi.core.admin.card_callback",
+            # `card_callback.py` 拆分出的两个同包子模块（rc25 B-5 可读性重构），
+            # 见上面 REQUIRED_MODULES 同名条目的注释。
+            "lingxi.core.admin.card_callback_ports",
+            "lingxi.core.admin.card_callback_management",
             "lingxi.adapters.postgres_pending_action",
             "lingxi.adapters.postgres_management_card_context",
             "lingxi.adapters.feishu_admin_card",
