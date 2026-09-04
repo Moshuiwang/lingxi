@@ -17,38 +17,18 @@ from __future__ import annotations
 import logging
 import threading
 from collections.abc import Callable, Sequence
-from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta
 from typing import Protocol
 
 from lingxi.apps.scheduler.audit import AuditSink
 from lingxi.apps.scheduler.config import SchedulerConfig
-from lingxi.core.daily_report import (
-    DENIED_COUNT_ALL_NULL_REASON,
-    RESOURCE_USAGE_ALL_NULL_REASON,
-    ActiveUserStats,
-    DailyReportInputs,
-    DeliveryOutcomeRow,
-    LocalOverrideActivity,
-    MetricCoverageGap,
-    PartialCount,
-    Section,
-    StatusDistribution,
-    TaskOutcomeRow,
-    TokenUsageStats,
-    apply_repeat_throttle,
-    build_active_user_stats,
-    build_delivery_outcome,
-    build_denied_count_stats,
-    build_failure_top,
-    build_guard_triggered_count,
-    build_latency_stats,
-    build_local_override_activity,
-    build_metric_coverage_gap,
-    build_status_distribution,
-    build_token_usage_stats,
-    render_daily_report,
+from lingxi.apps.scheduler.daily_report_sections import (
+    _build_daily_report_sections,
+    _DailyReportRawData,
+    _DailyReportSections,
+    _render_daily_report_text,
 )
+from lingxi.core.daily_report import DeliveryOutcomeRow, Section, TaskOutcomeRow
 
 logger = logging.getLogger(__name__)
 
@@ -152,53 +132,6 @@ class _SentWatermark(Protocol):
     def mark_sent(self, *, report_date: date, chat_id: str) -> None: ...
 
 
-@dataclass(frozen=True)
-class _DailyReportRawData:
-    """`_fetch_daily_report_raw` 的返回值。
-
-    六段（含两段可选）各自的原始结果与读取失败原因，供
-    `_build_daily_report_sections` 转成 Section。
-    """
-
-    active_counts: Sequence[int] | None
-    active_reason: str | None
-    outcome_rows: Sequence[TaskOutcomeRow] | None
-    outcome_reason: str | None
-    durations: Sequence[float] | None
-    latency_reason: str | None
-    delivery_rows: Sequence[DeliveryOutcomeRow] | None
-    delivery_reason: str | None
-    guard_denied_raw: tuple[int, int, int] | None
-    guard_denied_fetch_reason: str | None
-    token_usage_raw: tuple[int, int, int, int, int, int] | None
-    token_usage_fetch_reason: str | None
-    metric_coverage_raw: tuple[Sequence[str], Sequence[str]] | None
-    metric_coverage_fetch_reason: str | None
-    local_override_raw: tuple[int, int, int, int, int, int] | None
-    local_override_fetch_reason: str | None
-
-
-@dataclass(frozen=True)
-class _DailyReportSections:
-    """`_build_daily_report_sections` 的返回值。
-
-    六段（含两段可选）的 Section 与节流计算结果，供渲染与收尾阶段消费。
-    """
-
-    active_users: Section[ActiveUserStats]
-    status_distribution: Section[StatusDistribution]
-    failure_top: Section
-    guard_triggered: Section
-    denied_count: Section[PartialCount]
-    latency: Section
-    delivery_outcome: Section
-    resource_usage: Section[TokenUsageStats]
-    metric_coverage_gap: Section[MetricCoverageGap | None] | None
-    local_override_activity: Section[LocalOverrideActivity | None] | None
-    throttled_lines: tuple
-    updated_streaks: dict[str, int]
-
-
 class DailyReportDuty:
     """内测每日统计通报。"""
 
@@ -218,6 +151,7 @@ class DailyReportDuty:
         metric_coverage: Callable[[], tuple[Sequence[str], Sequence[str]]] | None = None,
         local_override_activity: _LocalOverrideActivitySource | None = None,
     ) -> None:
+        """按注入的数据源/发送器/水位装配一个内测每日通报职责实例。"""
         self._source = source
         self._watermark = watermark
         self._sender = sender
@@ -246,6 +180,7 @@ class DailyReportDuty:
 
     @property
     def stopping(self) -> bool:
+        """是否已收到停止信号。"""
         return self._stop.is_set()
 
     @property
@@ -259,6 +194,7 @@ class DailyReportDuty:
         return self._completed_on
 
     def request_stop(self) -> None:
+        """置位停止信号：本轮及之后不再发起新的聚合。"""
         self._stop.set()
 
     def _fetch(self, section: str, factory):
@@ -268,7 +204,6 @@ class DailyReportDuty:
         （`core.daily_report.Section.undetermined` 的输入），其余段落不受
         影响——异常只吞在这一层，绝不向上冒泡带走整轮通报。
         """
-
         try:
             return factory(), None
         except Exception as error:  # 单段失败不得带走其余段落
@@ -295,7 +230,6 @@ class DailyReportDuty:
         `run_once` 会先返回 `None`，真正的发送与收尾在后台线程里完成（见类
         文档「聚合挪出主线程」）。
         """
-
         if self._stop.is_set():
             return None
         now = self._clock()
@@ -442,8 +376,8 @@ class DailyReportDuty:
             logger.info("停止信号在通报数据读取期间到达，本轮不发送")
             return None
 
-        sections = self._build_daily_report_sections(raw, today)
-        text = self._render_daily_report_text(
+        sections = self._build_sections_from_raw(raw, today)
+        text = _render_daily_report_text(
             sections,
             window_start=window_start,
             window_end=window_end,
@@ -468,6 +402,21 @@ class DailyReportDuty:
             watermark_persisted=watermark_persisted,
         )
         return text
+
+    def _build_sections_from_raw(
+        self, raw: _DailyReportRawData, today: date
+    ) -> _DailyReportSections:
+        """把实例状态显式快照后交给纯函数 `_build_daily_report_sections`。
+
+        实现见 `daily_report_sections.py`。
+        """
+        return _build_daily_report_sections(
+            raw,
+            today,
+            reason_streaks=self._reason_streaks,
+            metric_coverage_wired=self._metric_coverage is not None,
+            local_override_activity_wired=self._local_override_activity is not None,
+        )
 
     def _fetch_daily_report_raw(
         self,
@@ -639,216 +588,6 @@ class DailyReportDuty:
             local_override_fetch_reason,
         )
 
-    def _build_daily_report_sections(
-        self, raw: _DailyReportRawData, today: date
-    ) -> _DailyReportSections:
-        """把取数阶段的原始结果转成 Section。
-
-        含两段可选段的 Section，以及节流计算结果。
-        """
-        active_users = self._section_active_users(raw)
-        status_distribution, failure_top, guard_triggered, throttled_lines, updated_streaks = (
-            self._sections_status_and_throttle(raw)
-        )
-        latency, delivery_outcome = self._sections_latency_and_delivery(raw)
-        denied_count, resource_usage = self._sections_denied_and_usage(raw)
-        metric_coverage_gap, local_override_activity = self._sections_coverage_and_override(raw)
-        return _DailyReportSections(
-            active_users=active_users,
-            status_distribution=status_distribution,
-            failure_top=failure_top,
-            guard_triggered=guard_triggered,
-            denied_count=denied_count,
-            latency=latency,
-            delivery_outcome=delivery_outcome,
-            resource_usage=resource_usage,
-            metric_coverage_gap=metric_coverage_gap,
-            local_override_activity=local_override_activity,
-            throttled_lines=throttled_lines,
-            updated_streaks=updated_streaks,
-        )
-
-    def _section_active_users(self, raw: _DailyReportRawData) -> Section[ActiveUserStats]:
-        """把 active_users 原始取数结果转成 Section。"""
-        if raw.active_reason is not None:
-            return Section.undetermined(raw.active_reason)
-        return Section.of(build_active_user_stats(raw.active_counts or ()))
-
-    def _sections_status_and_throttle(
-        self, raw: _DailyReportRawData
-    ) -> tuple[Section[StatusDistribution], Section, Section, tuple, dict]:
-        """状态分布 / 失败 Top / 拦截触发三段，外加节流计算。
-
-        三段共用同一次取数结果；节流状态依赖本轮是否取到失败分类，因此与
-        这三段放在一起处理。
-        """
-        if raw.outcome_reason is not None:
-            status_distribution = Section.undetermined(raw.outcome_reason)
-            failure_top = Section.undetermined(raw.outcome_reason)
-            guard_triggered = Section.undetermined(raw.outcome_reason)
-            today_top: tuple = ()
-            failure_top_determined = False
-        else:
-            rows = raw.outcome_rows or ()
-            status_distribution = Section.of(build_status_distribution(rows))
-            today_top = build_failure_top(rows)
-            failure_top = Section.of(today_top)
-            guard_triggered = Section.of(build_guard_triggered_count(rows))
-            failure_top_determined = True
-
-        if failure_top_determined:
-            throttled_lines, updated_streaks = apply_repeat_throttle(
-                self._reason_streaks, today_top
-            )
-        else:
-            # 本轮取不到失败分类：节流状态原样冻结，不因一次瞬时故障被清零或
-            # 提前推进（见 `core.daily_report.apply_repeat_throttle` 的文档）。
-            throttled_lines, updated_streaks = (), dict(self._reason_streaks)
-
-        return status_distribution, failure_top, guard_triggered, throttled_lines, updated_streaks
-
-    def _sections_latency_and_delivery(self, raw: _DailyReportRawData) -> tuple[Section, Section]:
-        """延迟统计段 + 投递结果段。
-
-        两段各自独立取数、独立降级，放在一起只是因为都只需要一次 if/else
-        判断。
-        """
-        if raw.latency_reason is not None:
-            latency = Section.undetermined(raw.latency_reason)
-        else:
-            latency = Section.of(build_latency_stats(raw.durations or ()))
-
-        if raw.delivery_reason is not None:
-            delivery_outcome = Section.undetermined(raw.delivery_reason)
-        else:
-            delivery_outcome = Section.of(build_delivery_outcome(raw.delivery_rows or ()))
-
-        return latency, delivery_outcome
-
-    def _sections_denied_and_usage(
-        self, raw: _DailyReportRawData
-    ) -> tuple[Section[PartialCount], Section[TokenUsageStats]]:
-        """拦截计数段 + 资源用量段。
-
-        查询本身失败 → 走 `_fetch` 的既有不可判定路径；查询成功但窗口内的
-        任务在这个字段上全部是 NULL → 纯函数返回 `None`，这里才降级为不可
-        判定（与查询失败是两种不同原因，用不同的 reason 文案区分）。
-        """
-        if raw.guard_denied_fetch_reason is not None:
-            denied_count = Section.undetermined(raw.guard_denied_fetch_reason)
-        else:
-            covered, uncovered, total = raw.guard_denied_raw
-            denied_stats = build_denied_count_stats(
-                covered_tasks=covered, uncovered_tasks=uncovered, total=total
-            )
-            denied_count = (
-                Section.of(denied_stats)
-                if denied_stats is not None
-                else Section.undetermined(DENIED_COUNT_ALL_NULL_REASON)
-            )
-
-        if raw.token_usage_fetch_reason is not None:
-            resource_usage = Section.undetermined(raw.token_usage_fetch_reason)
-        else:
-            covered, uncovered, input_tokens, output_tokens, cache_creation, cache_read = (
-                raw.token_usage_raw
-            )
-            usage_stats = build_token_usage_stats(
-                covered_tasks=covered,
-                uncovered_tasks=uncovered,
-                input_tokens=input_tokens,
-                output_tokens=output_tokens,
-                cache_creation_input_tokens=cache_creation,
-                cache_read_input_tokens=cache_read,
-            )
-            resource_usage = (
-                Section.of(usage_stats)
-                if usage_stats is not None
-                else Section.undetermined(RESOURCE_USAGE_ALL_NULL_REASON)
-            )
-
-        return denied_count, resource_usage
-
-    def _sections_coverage_and_override(
-        self, raw: _DailyReportRawData
-    ) -> tuple[
-        Section[MetricCoverageGap | None] | None, Section[LocalOverrideActivity | None] | None
-    ]:
-        """「未覆盖新指标」日检 + 「本地权限覆盖活动」段。
-
-        两段都是三态，见 `core/daily_report.py` 的 `DailyReportInputs` 对应
-        字段文档：未接线保持 `None`；接线但本轮取数失败 → 不可判定；取数
-        成功 → 纯函数判定（差集/活动量为空时 `Section.of(None)`，正文因此
-        完全不出现这一段——无差异不报）。
-        """
-        metric_coverage_gap: Section[MetricCoverageGap | None] | None
-        if self._metric_coverage is None:
-            metric_coverage_gap = None
-        elif raw.metric_coverage_fetch_reason is not None:
-            metric_coverage_gap = Section.undetermined(raw.metric_coverage_fetch_reason)
-        else:
-            assert raw.metric_coverage_raw is not None
-            mcp_metric_ids, mapped_metric_ids = raw.metric_coverage_raw
-            metric_coverage_gap = Section.of(
-                build_metric_coverage_gap(mcp_metric_ids, mapped_metric_ids)
-            )
-
-        local_override_activity: Section[LocalOverrideActivity | None] | None
-        if self._local_override_activity is None:
-            local_override_activity = None
-        elif raw.local_override_fetch_reason is not None:
-            local_override_activity = Section.undetermined(raw.local_override_fetch_reason)
-        else:
-            assert raw.local_override_raw is not None
-            (
-                granted_today,
-                suppressed_today,
-                revoked_today,
-                active_grant_total,
-                active_suppress_total,
-                affected_user_count,
-            ) = raw.local_override_raw
-            local_override_activity = Section.of(
-                build_local_override_activity(
-                    granted_today=granted_today,
-                    suppressed_today=suppressed_today,
-                    revoked_today=revoked_today,
-                    active_grant_total=active_grant_total,
-                    active_suppress_total=active_suppress_total,
-                    affected_user_count=affected_user_count,
-                )
-            )
-
-        return metric_coverage_gap, local_override_activity
-
-    def _render_daily_report_text(
-        self,
-        sections: _DailyReportSections,
-        *,
-        window_start: datetime,
-        window_end: datetime,
-        delivery_window_start: datetime,
-        delivery_window_end: datetime,
-    ) -> str:
-        """把六段 Section 装进 `DailyReportInputs` 并渲染成正文。"""
-        inputs = DailyReportInputs(
-            window_start=window_start,
-            window_end=window_end,
-            active_users=sections.active_users,
-            status_distribution=sections.status_distribution,
-            failure_top=sections.failure_top,
-            guard_triggered=sections.guard_triggered,
-            denied_count=sections.denied_count,
-            latency=sections.latency,
-            resource_usage=sections.resource_usage,
-            delivery_outcome=sections.delivery_outcome,
-            metric_coverage_gap=sections.metric_coverage_gap,
-            local_override_activity=sections.local_override_activity,
-            delivery_window_start=delivery_window_start,
-            delivery_window_end=delivery_window_end,
-        )
-        return render_daily_report(inputs, throttled_failure_lines=sections.throttled_lines)
-
     def _send_daily_report(self, today: date, text: str) -> bool:
         """发送正文，成功返回 ``True``。
 
@@ -984,7 +723,6 @@ def _build_daily_report_duty(
     这个进程级必需配置里，不需要任何额外的外部标识；没有目的地就没有必要跑
     六段查询。``on_send_outcome`` 复用与花名册日报共用的告警接线。
     """
-
     if not config.admin_group_chat_id:
         # 只报变量名，不回显任何值（`V-花名册-29` 的同一条纪律）。
         audit.record(
@@ -1037,7 +775,6 @@ def _build_local_override_activity_check(
     运行期故障按 `DailyReportDuty._fetch` 的既有单段失败纪律降级（这一段显式
     「不可判定」，不影响通报其余段落），不在装配阶段另建审计重复这件事。
     """
-
     from lingxi.adapters.postgres_local_permission import PostgresLocalPermissionOverrideStore
 
     store = PostgresLocalPermissionOverrideStore(
@@ -1151,7 +888,6 @@ def _wire_daily_report_duty(
     duties.append(x)`` 两行，本函数不改变那个惯例，只是让**这一个**新增
     职责不必再占用 assembly.py 的行数预算。
     """
-
     duty = _build_daily_report_duty(
         config,
         stop=stop,
