@@ -283,6 +283,31 @@ class ConnectionReuseTests(unittest.TestCase):
             connect(DSN, keepalives_idle=1)
 
 
+class IdleConnectionPoolDiscardsClosedConnectionsTests(unittest.TestCase):
+    """#593 P2-a：弹出已物理关闭的空闲连接时必须显式 ``discard()``，不能只是跳过
+    （否则底层 PGconn 要等 GC 才释放）。假连接对象，不需要真库。"""
+
+    def test_acquire_discards_a_closed_connection_popped_from_the_stack(self) -> None:
+        class _FakeConnection:
+            def __init__(self) -> None:
+                self.closed = True
+                self.discard_calls = 0
+                self._lingxi_idle = True
+
+            def discard(self) -> None:
+                self.discard_calls += 1
+
+        pool = postgres._IdleConnectionPool()
+        key = ("postgresql://test/db", PostgresTimeouts())
+        stale = _FakeConnection()
+        pool._idle[key] = [(stale, 0.0)]
+
+        result = pool.acquire(key)
+
+        self.assertIsNone(result, "栈里只有一条已关闭的连接，弹出丢弃后应无可用连接")
+        self.assertEqual(stale.discard_calls, 1, "已关闭的连接必须被显式 discard()，不能只是 continue")
+
+
 class DedicatedCallSiteWiringTests(unittest.TestCase):
     """三处长期手工持有连接的调用点必须声明 ``dedicated=True``，不进空闲栈。"""
 
