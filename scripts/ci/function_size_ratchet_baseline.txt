@@ -91,10 +91,6 @@
 166	src/lingxi/apps/reauthorize/__init__.py::_run
 86	src/lingxi/apps/scheduler/assembly.py::_build_management_correction_callback
 300	src/lingxi/apps/scheduler/assembly.py::build_loop
-335	src/lingxi/apps/scheduler/daily_report.py::DailyReportDuty._aggregate_and_send
-89	src/lingxi/apps/scheduler/daily_report.py::DailyReportDuty.run_once
-68	src/lingxi/apps/scheduler/daily_report.py::_build_daily_report_duty
-82	src/lingxi/apps/scheduler/daily_report.py::_build_metric_coverage_check
 69	src/lingxi/apps/scheduler/permission_refresh.py::PermissionRefreshDuty._enqueue_publish
 112	src/lingxi/apps/scheduler/permission_refresh.py::PermissionRefreshDuty._refresh_user
 78	src/lingxi/apps/scheduler/permission_refresh.py::PermissionRefreshDuty._refresh_zero_galaxy_user
