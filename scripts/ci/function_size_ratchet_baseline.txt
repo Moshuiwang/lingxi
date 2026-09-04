@@ -135,8 +135,6 @@
 537	src/lingxi/apps/worker/service.py::WorkerService._process_task
 71	src/lingxi/apps/worker/service.py::WorkerService._process_task._write_progress_if_due
 113	src/lingxi/apps/worker/service.py::WorkerService._run_rolling_claim_loop
-67	src/lingxi/apps/worker/session_cleanup.py::delete_agent_session_files
-92	src/lingxi/apps/worker/session_cleanup.py::reclaim_session_transcripts
 69	src/lingxi/apps/worker/turn.py::WorkerTurnExecutor.__init__
 61	src/lingxi/apps/worker/turn.py::WorkerTurnExecutor._audit_mcp_status
 65	src/lingxi/apps/worker/turn.py::WorkerTurnExecutor._handle_deliver_document
