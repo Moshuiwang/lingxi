@@ -78,11 +78,11 @@ from lingxi.core.permission.merge_sources import (
     merge_permission_sources,
 )
 from lingxi.core.permission.metric_translation import (
-    UncoveredPermissionCombination,
+    UncoveredPermissionCombinationError,
     metric_translation_available,
     translate_company_functions,
 )
-from lingxi.core.permission.publish import PermissionGrantBlockedByAccountState
+from lingxi.core.permission.publish import PermissionGrantBlockedByAccountStateError
 from lingxi.core.permission.publish_row import (
     ADMIN_FULL_ACCESS_FUNCTION,
     aggregate_permission,
@@ -375,7 +375,7 @@ class PermissionRefreshDuty:
                 all_companies=aggregate.all_companies,
                 mapping=self._metric_translation_map,
             )
-        except UncoveredPermissionCombination as error:
+        except UncoveredPermissionCombinationError as error:
             reason = (
                 SKIP_METRIC_TRANSLATION_UNAVAILABLE
                 if error.mapping_is_empty
@@ -514,7 +514,7 @@ class PermissionRefreshDuty:
                 # 保留的投递正文。
                 clear_delivered_content=True,
             )
-        except PermissionGrantBlockedByAccountState as blocked:
+        except PermissionGrantBlockedByAccountStateError as blocked:
             self._count_grant_blocked(tally, identity, blocked)
             return
         if decision.enqueued:

@@ -189,12 +189,8 @@ def translate_company_functions(
     return result
 
 
-#: 向后兼容别名，供既有导入方使用。
-UncoveredPermissionCombination = UncoveredPermissionCombinationError
-
 __all__ = [
     "ALL_COMPANIES_KEY",
-    "UncoveredPermissionCombination",
     "UncoveredPermissionCombinationError",
     "build_company_function_metric_map",
     "metric_translation_available",

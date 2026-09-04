@@ -73,10 +73,6 @@ class RosterSnapshotInconsistentError(RuntimeError):
     """
 
 
-#: 兼容别名：跨模块引用与既有测试仍按旧名导入（N818 改名，收官批统一清）。
-RosterSnapshotInconsistent = RosterSnapshotInconsistentError
-
-
 @dataclass(frozen=True)
 class StoredRosterSnapshot:
     """回读出来的完整快照：元信息 + 行。

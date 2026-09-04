@@ -22,7 +22,7 @@ import sys
 from collections.abc import Callable, Mapping, Sequence
 from typing import TextIO
 
-from lingxi.core.admin.registry import AdminRegistrySeedConflict
+from lingxi.core.admin.registry import AdminRegistrySeedConflictError
 from lingxi.core.identity.identifiers import redact_identifier
 
 logger = logging.getLogger(__name__)
@@ -103,7 +103,7 @@ def _perform_seed(
     """执行写入并按结果打印/记账；返回进程退出码。"""
     try:
         inserted = seed(subject_open_id)
-    except AdminRegistrySeedConflict as error:
+    except AdminRegistrySeedConflictError as error:
         # "没插入"不能无条件当成"已经登记过、幂等成功"——已存在的那一行可能
         # 根本不是这次意图播种的内容，必须响亮拒绝，不能把一次真正的不一致
         # 悄悄放过。只报字段名，不回显任何取到的值。

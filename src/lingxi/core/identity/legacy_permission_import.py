@@ -21,7 +21,7 @@ from lingxi.core.permission.legacy_diff import (
     plan_legacy_import,
 )
 from lingxi.core.permission.metric_translation import (
-    UncoveredPermissionCombination,
+    UncoveredPermissionCombinationError,
     translate_company_functions,
 )
 from lingxi.core.permission.publish_row import parse_permissions
@@ -52,7 +52,7 @@ def translate_galaxy(
             all_companies=aggregate.all_companies,
             mapping=metric_translation_map,
         )
-    except UncoveredPermissionCombination as error:
+    except UncoveredPermissionCombinationError as error:
         reason = (
             "permission_translation_unavailable"
             if error.mapping_is_empty

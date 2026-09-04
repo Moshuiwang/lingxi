@@ -193,11 +193,6 @@ class DeliveryRejectedError(Exception):
         super().__init__(message or f"服务端明确拒绝：code={code} log_id={log_id}")
 
 
-#: 向后兼容别名（N818 改名前的旧名）：其它模块仍在导入 ``DeliveryRejected``，
-#: 统一清理留给集成批次。
-DeliveryRejected = DeliveryRejectedError
-
-
 class CardTransport(Protocol):
     """流式问数卡片的出站端口：建卡、流式更新、关闭。"""
 

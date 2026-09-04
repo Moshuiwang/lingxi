@@ -210,11 +210,11 @@ class KeepPreviousTest(unittest.TestCase):
         它由职责层的失败隔离承接（`V-花名册-17`），下一轮重试通常就好了。
         """
 
-        from lingxi.adapters.postgres_roster_snapshot import RosterSnapshotInconsistent
+        from lingxi.adapters.postgres_roster_snapshot import RosterSnapshotInconsistentError
 
-        store = _Store(load_error=RosterSnapshotInconsistent("元信息 1206 行，实际回来 0 行"))
+        store = _Store(load_error=RosterSnapshotInconsistentError("元信息 1206 行，实际回来 0 行"))
 
-        with self.assertRaises(RosterSnapshotInconsistent):
+        with self.assertRaises(RosterSnapshotInconsistentError):
             _source(_empty_source(), store=store).current(now=NOW)
 
 
@@ -397,9 +397,9 @@ class DutyBehaviourTest(unittest.TestCase):
     def test_a_readback_inconsistency_isolates_to_this_duty_and_retries_next_round(self) -> None:
         """`V-花名册-17`：响亮失败由循环隔离，其余职责本轮照跑，水位不置位。"""
 
-        from lingxi.adapters.postgres_roster_snapshot import RosterSnapshotInconsistent
+        from lingxi.adapters.postgres_roster_snapshot import RosterSnapshotInconsistentError
 
-        store = _Store(load_error=RosterSnapshotInconsistent("元信息 1206 行，实际回来 0 行"))
+        store = _Store(load_error=RosterSnapshotInconsistentError("元信息 1206 行，实际回来 0 行"))
         sender, audit, clock = self._Sender(), RecordingAudit(), FixedClock(start=NOW.date())
         duty = self._duty(_empty_source(), store=store, sender=sender, audit=audit, clock=clock)
 

@@ -22,7 +22,7 @@ import unittest
 
 from lingxi.core.permission.metric_translation import (
     ALL_COMPANIES_KEY,
-    UncoveredPermissionCombination,
+    UncoveredPermissionCombinationError,
     build_company_function_metric_map,
     translate_company_functions,
 )
@@ -130,7 +130,7 @@ class UncoveredCoverageTest(unittest.TestCase):
         self.assertEqual(result, {COMPANY_A: (METRIC_DAU,)})
 
     def test_an_entirely_uncovered_company_fails_closed(self) -> None:
-        with self.assertRaises(UncoveredPermissionCombination) as ctx:
+        with self.assertRaises(UncoveredPermissionCombinationError) as ctx:
             translate_company_functions(
                 companies=(COMPANY_A,),
                 functions=(FUNCTION_OPS,),
@@ -145,7 +145,7 @@ class UncoveredCoverageTest(unittest.TestCase):
         对应的指标"这种沉默的猜测。映射本身**不为空**，因此这是「配了但没覆盖到」，
         不是「未配置」——两种运维状态必须可分辨。"""
 
-        with self.assertRaises(UncoveredPermissionCombination) as ctx:
+        with self.assertRaises(UncoveredPermissionCombinationError) as ctx:
             translate_company_functions(
                 companies=(COMPANY_A,),
                 functions=(FUNCTION_FINANCE,),
@@ -157,7 +157,7 @@ class UncoveredCoverageTest(unittest.TestCase):
     def test_partial_coverage_across_two_companies_fails_the_whole_translation(self) -> None:
         """两家公司，只有一家有映射——**整体**失败，不产出"只翻译出那一家"的部分结果。"""
 
-        with self.assertRaises(UncoveredPermissionCombination) as ctx:
+        with self.assertRaises(UncoveredPermissionCombinationError) as ctx:
             translate_company_functions(
                 companies=(COMPANY_A, COMPANY_B),
                 functions=(FUNCTION_OPS,),
@@ -170,9 +170,9 @@ class UncoveredCoverageTest(unittest.TestCase):
     def test_an_uncovered_translation_never_falls_back_to_the_function_label(self) -> None:
         """否定断言：一个职能标签恰好在指标名词表以外时，翻译不出来就是失败关闭，
         不会有任何路径让职能标签本身冒充指标名溜进结果——本函数只有两种出口：
-        抛 :class:`UncoveredPermissionCombination`，或者返回完全翻译好的结果。"""
+        抛 :class:`UncoveredPermissionCombinationError`，或者返回完全翻译好的结果。"""
 
-        with self.assertRaises(UncoveredPermissionCombination):
+        with self.assertRaises(UncoveredPermissionCombinationError):
             translate_company_functions(
                 companies=(COMPANY_A,),
                 functions=(FUNCTION_OPS,),
@@ -185,7 +185,7 @@ class EmptyMappingIsLegalTest(unittest.TestCase):
     """映射为空时维持现有硬闸：任何用户的任何组合都翻译不出来（Issue #227 承诺）。"""
 
     def test_an_empty_mapping_uncoveres_every_combination(self) -> None:
-        with self.assertRaises(UncoveredPermissionCombination) as ctx:
+        with self.assertRaises(UncoveredPermissionCombinationError) as ctx:
             translate_company_functions(
                 companies=(COMPANY_A, COMPANY_B),
                 functions=(FUNCTION_OPS, FUNCTION_FINANCE),
@@ -204,7 +204,7 @@ class EmptyMappingIsLegalTest(unittest.TestCase):
         self.assertTrue(ctx.exception.mapping_is_empty)
 
     def test_an_empty_mapping_uncoveres_the_wildcard_scope_too(self) -> None:
-        with self.assertRaises(UncoveredPermissionCombination) as ctx:
+        with self.assertRaises(UncoveredPermissionCombinationError) as ctx:
             translate_company_functions(
                 companies=(), functions=(FUNCTION_OPS,), all_companies=True, mapping={}
             )
@@ -215,7 +215,7 @@ class EmptyMappingIsLegalTest(unittest.TestCase):
         这条状态必须能与"整份映射为空"区分开，运维据此判断是"还没开始填"还是
         "已经在填、还差几条"。"""
 
-        with self.assertRaises(UncoveredPermissionCombination) as ctx:
+        with self.assertRaises(UncoveredPermissionCombinationError) as ctx:
             translate_company_functions(
                 companies=(COMPANY_A,),
                 functions=(FUNCTION_OPS,),
@@ -245,7 +245,7 @@ class WildcardTest(unittest.TestCase):
         """否定断言：即便具体公司键有映射，全非通配也不会"顺手"用它兜底——
         通配必须有自己显式的 ``"*"`` 条目。"""
 
-        with self.assertRaises(UncoveredPermissionCombination):
+        with self.assertRaises(UncoveredPermissionCombinationError):
             translate_company_functions(
                 companies=(),
                 functions=(FUNCTION_OPS,),

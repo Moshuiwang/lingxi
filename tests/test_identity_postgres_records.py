@@ -566,11 +566,11 @@ class OnDemandRefreshCeilingTest(IdentityPostgresTestCase):
         必须变红（`self.vault.load()` 会因为凭据被标成"消费中"而变成 ``None``）。
         """
 
-        from lingxi.core.identity.credentials import RefreshMinIntervalNotElapsed
+        from lingxi.core.identity.credentials import RefreshMinIntervalNotElapsedError
 
         self._save(refresh_consumed_at=self.NOON, refresh_consumed_count=1)
 
-        with self.assertRaises(RefreshMinIntervalNotElapsed) as raised:
+        with self.assertRaises(RefreshMinIntervalNotElapsedError) as raised:
             self.vault.claim_due(for_supply=True, now=self.NOON + timedelta(minutes=1))
 
         self.assertNotIn(FAKE_TOKEN, str(raised.exception))
@@ -623,12 +623,12 @@ class OnDemandRefreshCeilingTest(IdentityPostgresTestCase):
         """0 被拒之后，"几乎没有间隔"的语义由一个**极小的正值**承担——它仍然是一道
         真的检查（同一时刻再领一次照样被挡），只是门槛小到不干扰别的断言。"""
 
-        from lingxi.core.identity.credentials import RefreshMinIntervalNotElapsed
+        from lingxi.core.identity.credentials import RefreshMinIntervalNotElapsedError
 
         tiny = timedelta(microseconds=1)
         self._save(refresh_consumed_at=self.NOON, refresh_consumed_count=1)
 
-        with self.assertRaises(RefreshMinIntervalNotElapsed):
+        with self.assertRaises(RefreshMinIntervalNotElapsedError):
             # 与上一次消费**同一时刻**：间隔为 0，仍然小于 1 微秒，照样被挡。
             self.vault.claim_due(for_supply=True, now=self.NOON, min_interval=tiny)
 
@@ -639,11 +639,11 @@ class OnDemandRefreshCeilingTest(IdentityPostgresTestCase):
         钉住的只是"日上界"这一条判据，不与最小间隔混在一起。
         """
 
-        from lingxi.core.identity.credentials import RefreshDailyLimitReached
+        from lingxi.core.identity.credentials import RefreshDailyLimitReachedError
 
         self._save(refresh_consumed_at=self.NOON, refresh_consumed_count=1)
 
-        with self.assertRaises(RefreshDailyLimitReached) as raised:
+        with self.assertRaises(RefreshDailyLimitReachedError) as raised:
             self.vault.claim_due(for_supply=True, now=self.NOON + timedelta(hours=1), daily_limit=1)
 
         self.assertNotIn(FAKE_TOKEN, str(raised.exception))
@@ -653,18 +653,18 @@ class OnDemandRefreshCeilingTest(IdentityPostgresTestCase):
         """同一条领取路径下，最小间隔与当日上界必须能被明确区分（约束 2 的直接钉子）。"""
 
         from lingxi.core.identity.credentials import (
-            RefreshDailyLimitReached,
-            RefreshMinIntervalNotElapsed,
+            RefreshDailyLimitReachedError,
+            RefreshMinIntervalNotElapsedError,
         )
 
         self._save(refresh_consumed_at=self.NOON, refresh_consumed_count=1)
 
-        with self.assertRaises(RefreshMinIntervalNotElapsed):
+        with self.assertRaises(RefreshMinIntervalNotElapsedError):
             self.vault.claim_due(
                 for_supply=True, now=self.NOON + timedelta(seconds=1), daily_limit=1
             )
 
-        with self.assertRaises(RefreshDailyLimitReached):
+        with self.assertRaises(RefreshDailyLimitReachedError):
             self.vault.claim_due(for_supply=True, now=self.NOON + timedelta(hours=1), daily_limit=1)
 
     def test_the_ceiling_resets_across_utc_midnight_judged_by_the_locks_clock(self) -> None:
@@ -675,14 +675,14 @@ class OnDemandRefreshCeilingTest(IdentityPostgresTestCase):
         证明复位真的是靠"日界"而不是单纯"隔了很久"。
         """
 
-        from lingxi.core.identity.credentials import RefreshDailyLimitReached
+        from lingxi.core.identity.credentials import RefreshDailyLimitReachedError
 
         near_midnight = datetime(2026, 8, 18, 23, 59, 30, tzinfo=UTC)
         self._save(refresh_consumed_at=near_midnight, refresh_consumed_count=1)
 
         # 6 分钟之后（已过最小间隔）、仍是 8-19 的 00:05:30——已经跨过 UTC 午夜，
         # 但故意先验证"跨天之后同一个低上界照常放行"，再验证"没跨天则会被挡住"。
-        with self.assertRaises(RefreshDailyLimitReached):
+        with self.assertRaises(RefreshDailyLimitReachedError):
             # 20 秒之后：还没过最小间隔，也还是同一个 UTC 日，用日上界为 1 的当日
             # 计数（已是 1）钉住"没跨天时会被挡住"这一半。
             # 最小间隔用一个**极小的正值**（不是 0——0 是被拒的哨兵，见
@@ -710,10 +710,10 @@ class OnDemandRefreshCeilingTest(IdentityPostgresTestCase):
         账本副本做不到的事——它只记得"已经用过、用了几次"，认不出这是一条新凭据。
         """
 
-        from lingxi.core.identity.credentials import RefreshDailyLimitReached
+        from lingxi.core.identity.credentials import RefreshDailyLimitReachedError
 
         self._save(refresh_consumed_at=self.NOON, refresh_consumed_count=1)
-        with self.assertRaises(RefreshDailyLimitReached):
+        with self.assertRaises(RefreshDailyLimitReachedError):
             # 用一个紧上界（1）确认"消费过一次"确实卡住了后续领取，不是因为间隔。
             self.vault.claim_due(for_supply=True, now=self.NOON + timedelta(hours=1), daily_limit=1)
 
@@ -737,7 +737,7 @@ class OnDemandRefreshCeilingTest(IdentityPostgresTestCase):
         """失效优先于一切：一条已经失效的凭据要被清掉并要求重新授权，
         而不是先报一句频率上界的拒绝把真正的问题盖住。"""
 
-        from lingxi.core.identity.credentials import RefreshRateLimited
+        from lingxi.core.identity.credentials import RefreshRateLimitedError
 
         moment = datetime.now(UTC)
         self._save(refresh_consumed_at=moment, refresh_consumed_count=1, seconds=3600)
@@ -745,7 +745,7 @@ class OnDemandRefreshCeilingTest(IdentityPostgresTestCase):
         later = moment + timedelta(seconds=3601)
         try:
             claimed = self.vault.claim_due(for_supply=True, now=later)
-        except RefreshRateLimited:  # pragma: no cover - 次序错了才会走到这里
+        except RefreshRateLimitedError:  # pragma: no cover - 次序错了才会走到这里
             self.fail("失效判定必须排在频率上界之前")
 
         self.assertIsNone(claimed)
@@ -759,7 +759,7 @@ class OnDemandRefreshCeilingTest(IdentityPostgresTestCase):
         当日计数会被这次写入悄悄清零，日上界因此形同虚设。
         """
 
-        from lingxi.core.identity.credentials import RefreshDailyLimitReached
+        from lingxi.core.identity.credentials import RefreshDailyLimitReachedError
 
         self._save(refresh_consumed_at=self.NOON, refresh_consumed_count=1)
         claimed = self.vault.claim_due(
@@ -779,7 +779,7 @@ class OnDemandRefreshCeilingTest(IdentityPostgresTestCase):
             refresh_consumed_count=claimed.refresh_consumed_count,
         )
 
-        with self.assertRaises(RefreshDailyLimitReached) as raised:
+        with self.assertRaises(RefreshDailyLimitReachedError) as raised:
             # 当日上界仍是 2、已经用掉 2 次：第三次在同一天必须被挡住。
             self.vault.claim_due(for_supply=True, now=self.NOON + timedelta(hours=2), daily_limit=2)
         self.assertEqual(raised.exception.consumed_at, claimed.consumed_at)

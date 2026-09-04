@@ -7,10 +7,10 @@
 为什么必须在这一层单独测：`adapters/feishu_delivery.py` 是"明确失败 vs 结果不明"的
 **唯一裁定点**，也是"不重复投递"红线的最后一道闸。消费侧
 （`tests/test_gateway_delivery.py`、`tests/test_worker_queue_consumer.py`）的用例注入的是
-假 transport 直接抛出的 ``DeliveryRejected``/``LookupError``/``TimeoutError``——它们验证的是
+假 transport 直接抛出的 ``DeliveryRejectedError``/``LookupError``/``TimeoutError``——它们验证的是
 "拿到某类异常之后怎么办"，**模拟**了本层的产出，却覆盖不到"哪种 ``lark_oapi`` 响应形状
 产出哪类异常"这一步。日后有人把"缺可回读标识"那条 ``LookupError`` 改成
-``DeliveryRejected``（或把 ``raise DeliveryRejected`` 加到不该有的位置），红线会重新
+``DeliveryRejectedError``（或把 ``raise DeliveryRejectedError`` 加到不该有的位置），红线会重新
 打开而全量门禁仍然全绿。这正是独立审核 O-2 / N-3 登记的缺口。
 
 测试手段：按仓库既有惯例（`tests/test_gateway_transport.py`、
@@ -19,10 +19,10 @@
 用例蓝本是 PR #172 第 4 轮独立复核的一次性人工探针（10 种形状），本文件把它固化成回归并
 补齐探针没走到的穿透路径。
 
-覆盖原则：**每个外发点都要有两侧用例**——「业务拒绝 → ``DeliveryRejected``」与「异常
+覆盖原则：**每个外发点都要有两侧用例**——「业务拒绝 → ``DeliveryRejectedError``」与「异常
 原样穿透 → 结果不明」。只测其中一侧的外发点等于没有守住那一侧（PR #199 二级独立审查
 P1 实证：卡片发送点起初只有拒绝侧，给该点的外呼包一层 ``except Exception: raise
-DeliveryRejected`` 时全部用例仍然全绿）。
+DeliveryRejectedError`` 时全部用例仍然全绿）。
 
 分类规则本身不在本 Issue 范围内改动；本文件只把现有规则钉死。
 """
@@ -36,7 +36,7 @@ import unittest
 from typing import Any
 
 from lingxi.config.content import default_content_catalog
-from lingxi.core.execution.card_stream import CardCreated, DeliveryRejected
+from lingxi.core.execution.card_stream import CardCreated, DeliveryRejectedError
 
 # --------------------------------------------------------------------------------------
 # 桩 SDK：只提供 adapters.feishu_delivery 真正用到的 builder 与模型
@@ -260,7 +260,7 @@ def _json_decode_error() -> json.JSONDecodeError:
 class _ClassificationTestCase(unittest.TestCase):
     """两类映射的公共断言入口。
 
-    刻意不写成"断言抛了某个异常就算过"：那样把 ``DeliveryRejected`` 与"结果不明"混在
+    刻意不写成"断言抛了某个异常就算过"：那样把 ``DeliveryRejectedError`` 与"结果不明"混在
     一起也能全绿。这里每次都同时断言**是哪一类**。
     """
 
@@ -272,10 +272,12 @@ class _ClassificationTestCase(unittest.TestCase):
 
         return LarkCardTransport(client), LarkDeliveryText(client)
 
-    def assert_explicit_rejection(self, call, *, expected_code: Any = 230001) -> DeliveryRejected:
+    def assert_explicit_rejection(
+        self, call, *, expected_code: Any = 230001
+    ) -> DeliveryRejectedError:
         """应归"明确失败"：消费侧会据此清预留位、允许重试或降级文本。"""
 
-        with self.assertRaises(DeliveryRejected) as caught:
+        with self.assertRaises(DeliveryRejectedError) as caught:
             call()
         error = caught.exception
         self.assertEqual(error.code, expected_code, "平台业务错误码必须透传，否则告警无法定位")
@@ -290,29 +292,29 @@ class _ClassificationTestCase(unittest.TestCase):
         error = caught.exception
         self.assertNotIsInstance(
             error,
-            DeliveryRejected,
-            "这是「结果不明」形状，一旦被判成 DeliveryRejected，消费侧就会重发或降级，"
+            DeliveryRejectedError,
+            "这是「结果不明」形状，一旦被判成 DeliveryRejectedError，消费侧就会重发或降级，"
             "重复投递红线被打开",
         )
         return error
 
 
 class DeliveryRejectedTypeBoundaryTests(unittest.TestCase):
-    """白名单成立的前提：``DeliveryRejected`` 不能和"结果不明"那几类异常有继承关系。"""
+    """白名单成立的前提：``DeliveryRejectedError`` 不能和"结果不明"那几类异常有继承关系。"""
 
     def test_it_is_not_a_supertype_of_the_result_unknown_families(self) -> None:
         # 若哪天有人让它继承 OSError / LookupError / ValueError，消费侧的
-        # `except DeliveryRejected` 会把网络异常、缺标识、JSON 解析失败一起吞成"明确失败"。
+        # `except DeliveryRejectedError` 会把网络异常、缺标识、JSON 解析失败一起吞成"明确失败"。
         for family in (OSError, LookupError, ValueError):
             self.assertFalse(
-                issubclass(family, DeliveryRejected),
-                f"{family.__name__} 不得是 DeliveryRejected 的子类",
+                issubclass(family, DeliveryRejectedError),
+                f"{family.__name__} 不得是 DeliveryRejectedError 的子类",
             )
             self.assertFalse(
-                issubclass(DeliveryRejected, family),
-                f"DeliveryRejected 不得继承 {family.__name__}，否则白名单会漏成黑名单",
+                issubclass(DeliveryRejectedError, family),
+                f"DeliveryRejectedError 不得继承 {family.__name__}，否则白名单会漏成黑名单",
             )
-        self.assertTrue(issubclass(DeliveryRejected, Exception))
+        self.assertTrue(issubclass(DeliveryRejectedError, Exception))
 
 
 class CardCreateClassificationTests(_ClassificationTestCase):
@@ -445,10 +447,10 @@ class CardCreateClassificationTests(_ClassificationTestCase):
     def test_send_read_timeout_passes_through_as_result_unknown(self) -> None:
         """形状 10：卡片**已经建好**、发送消息时读超时——``create()`` 里误判后果最重的一格。
 
-        飞书可能已经把这张卡片发出去了，我们只是没等到响应。判成 ``DeliveryRejected``
+        飞书可能已经把这张卡片发出去了，我们只是没等到响应。判成 ``DeliveryRejectedError``
         会让消费侧清预留位并重试或降级文本，用户于是收到两遍同一个答案——正是不重复
         投递红线要挡的事。PR #199 二级独立审查 P1：这一格此前零覆盖，给该外呼包一层
-        ``except Exception: raise DeliveryRejected`` 时整组用例仍然全绿。
+        ``except Exception: raise DeliveryRejectedError`` 时整组用例仍然全绿。
         """
 
         client = _FakeClient(create=_created(), reply=TimeoutError("read timed out"))

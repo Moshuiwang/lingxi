@@ -90,13 +90,6 @@ class RefreshDailyLimitReachedError(RefreshRateLimitedError):
     _message = "当日消费次数已达上界，本次领取被拒"
 
 
-#: 向后兼容别名：三个异常类已改名以满足异常类命名规则（须以 Error 结尾），跨模块
-#: 引用未同步改名前继续可用，全仓统一改名后再清理。
-RefreshRateLimited = RefreshRateLimitedError
-RefreshMinIntervalNotElapsed = RefreshMinIntervalNotElapsedError
-RefreshDailyLimitReached = RefreshDailyLimitReachedError
-
-
 @dataclass(frozen=True)
 class DerivedAccessToken:
     """一次续期顺带派生出来的**短期** ``access_token`` 及其寿命。

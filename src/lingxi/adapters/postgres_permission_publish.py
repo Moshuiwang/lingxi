@@ -96,9 +96,6 @@ class PublishClaimLostError(RuntimeError):
     """
 
 
-#: 向后兼容别名：迁移前的名字不满足 ruff N818（异常类需以 ``Error`` 结尾）。
-PublishClaimLost = PublishClaimLostError
-
 #: 本文件正文不直接调用它（真正的调用在 postgres_permission_publish_decision.py），
 #: 但 tests/test_permission_publish_postgres.py 按
 #: postgres_permission_publish._ConversationTransaction 这个路径打桩注入清理

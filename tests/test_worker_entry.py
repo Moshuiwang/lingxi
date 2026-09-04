@@ -2247,7 +2247,7 @@ class ReviewHardeningTest(unittest.TestCase):
 class StopCausalTerminationTest(unittest.TestCase):
     """#201：``/stop`` 恰好落在回合终点、SDK 以 ``aborted_*`` 收尾时的失败归类。
 
-    正常情况下本地 stop 会让适配器抛 ``AgentSessionInterrupted``（→ ``interrupted``）。
+    正常情况下本地 stop 会让适配器抛 ``AgentSessionInterruptedError``（→ ``interrupted``）。
     但 SDK 完全可能抢在 ``client.interrupt()`` 返回之前就把这一轮收完，此时回合从
     形状上看就是"SDK 自己 abort 了"，原实现一律归为 ``cancelled``，队列侧按 #195
     的终态优先级收口成 ``failed/session_failed``，用户主动停止却看到「请稍后重试」

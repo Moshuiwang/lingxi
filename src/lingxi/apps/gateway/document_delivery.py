@@ -204,11 +204,11 @@ class DocumentDeliveryConsumer:
 
     def _process_docx_claim(self, claim: DocumentDeliveryClaim) -> None:
         from lingxi.adapters.feishu_docx_delivery import FeishuDocxDeliveryError
-        from lingxi.adapters.postgres_document_delivery import DocumentDeliveryOwnershipLost
+        from lingxi.adapters.postgres_document_delivery import DocumentDeliveryOwnershipLostError
 
         try:
             document_id, members, body_degraded_reason = self._drive_docx_channel(claim)
-        except DocumentDeliveryOwnershipLost:
+        except DocumentDeliveryOwnershipLostError:
             # 建档检查点提交时发现持有权已经不在本次调用手里（典型：这次调用
             # 是一个被 reclaim_stale_processing 判定为"卡住"并回收过的慢
             # 消费者）。当场中止，交给真正持有它的那次调用。
@@ -319,7 +319,7 @@ class DocumentDeliveryConsumer:
         （同样无条件重放，不需要检查点），建表响应自带链接。
         """
         from lingxi.adapters.feishu_sheets_delivery import FeishuSheetsDeliveryError
-        from lingxi.adapters.postgres_document_delivery import DocumentDeliveryOwnershipLost
+        from lingxi.adapters.postgres_document_delivery import DocumentDeliveryOwnershipLostError
 
         spreadsheet_token = claim.document_id
         resource_url = claim.resource_url
@@ -337,7 +337,7 @@ class DocumentDeliveryConsumer:
             )
             self._sheets.grant_full_access(spreadsheet_token, claim.requester_open_id)
             members = self._sheets.read_members(spreadsheet_token)
-        except DocumentDeliveryOwnershipLost:
+        except DocumentDeliveryOwnershipLostError:
             logger.warning(
                 "文档投递：建表成功但持有权已丢失，放弃本行续做 task_id=%s", claim.task_id
             )
@@ -374,7 +374,7 @@ class DocumentDeliveryConsumer:
         ``body_degraded_reason`` 只由 docx 分支传，非 ``None`` 时成功通知
         改用明示降级的文案；sheet 分支结构上恒为 ``None``。
         """
-        from lingxi.adapters.postgres_document_delivery import DocumentDeliveryOwnershipLost
+        from lingxi.adapters.postgres_document_delivery import DocumentDeliveryOwnershipLostError
 
         if not _has_confirmed_full_access(
             members, claim.requester_open_id, delivery_type=claim.delivery_type
@@ -387,7 +387,7 @@ class DocumentDeliveryConsumer:
 
         try:
             self._store.mark_succeeded(request_id=claim.id)
-        except DocumentDeliveryOwnershipLost:
+        except DocumentDeliveryOwnershipLostError:
             # 流程已经全部跑完，但落终态这一步才发现持有权已经丢失——不发
             # 通知：这一行现在究竟是什么状态由真正持有它的那次调用决定。
             logger.warning(
@@ -416,11 +416,11 @@ class DocumentDeliveryConsumer:
         )
 
     def _fail(self, claim: DocumentDeliveryClaim, *, last_error: str) -> None:
-        from lingxi.adapters.postgres_document_delivery import DocumentDeliveryOwnershipLost
+        from lingxi.adapters.postgres_document_delivery import DocumentDeliveryOwnershipLostError
 
         try:
             self._store.mark_failed(request_id=claim.id, last_error=last_error)
-        except DocumentDeliveryOwnershipLost:
+        except DocumentDeliveryOwnershipLostError:
             # 这一行已经不是我们的了——另一次调用可能已经落下了不同的结论。
             # 不覆盖、不告警：告警必须描述真实发生的终态。
             logger.warning(
@@ -454,11 +454,11 @@ class DocumentDeliveryConsumer:
         )
 
     def _uncertain(self, claim: DocumentDeliveryClaim, *, last_error: str) -> None:
-        from lingxi.adapters.postgres_document_delivery import DocumentDeliveryOwnershipLost
+        from lingxi.adapters.postgres_document_delivery import DocumentDeliveryOwnershipLostError
 
         try:
             self._store.mark_uncertain(request_id=claim.id, last_error=last_error)
-        except DocumentDeliveryOwnershipLost:
+        except DocumentDeliveryOwnershipLostError:
             # 同 _fail：持有权已经不在我们手里，不覆盖、不告警。
             logger.warning(
                 "文档投递：判定为 uncertain 但持有权已丢失，放弃写入终态与告警 task_id=%s",

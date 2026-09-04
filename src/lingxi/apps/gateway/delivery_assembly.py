@@ -10,7 +10,7 @@ from __future__ import annotations
 import logging
 from typing import Any
 
-from lingxi.core.execution.card_stream import CardCreated, CardTransport, DeliveryRejected
+from lingxi.core.execution.card_stream import CardCreated, CardTransport, DeliveryRejectedError
 
 from .config import GatewayConfig
 
@@ -37,19 +37,19 @@ class RejectingCards:
     def create(self, **kwargs: object) -> CardCreated:
         """建卡；命中注入时确定性拒绝。"""
         if self._inject in ("create", "all"):
-            raise DeliveryRejected("card failure injected for acceptance (create)", code=-1)
+            raise DeliveryRejectedError("card failure injected for acceptance (create)", code=-1)
         return self._real.create(**kwargs)  # type: ignore[arg-type]
 
     def update(self, **kwargs: object) -> None:
         """更新卡片；命中注入时确定性拒绝。"""
         if self._inject in ("update", "all"):
-            raise DeliveryRejected("card failure injected for acceptance (update)", code=-1)
+            raise DeliveryRejectedError("card failure injected for acceptance (update)", code=-1)
         self._real.update(**kwargs)  # type: ignore[arg-type]
 
     def close(self, **kwargs: object) -> None:
         """关闭卡片；命中注入时确定性拒绝。"""
         if self._inject in ("close", "all"):
-            raise DeliveryRejected("card failure injected for acceptance (close)", code=-1)
+            raise DeliveryRejectedError("card failure injected for acceptance (close)", code=-1)
         self._real.close(**kwargs)  # type: ignore[arg-type]
 
 

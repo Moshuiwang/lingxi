@@ -101,7 +101,7 @@ ALL_COMPANIES_KEY`（``"*"``）键，同样整份导出拒绝导入**（rc21 修
 导入前对每一个 ``(user_id, company_id, metric_name)`` 先查是否已有同极性
 （``direction='grant'``）生效行，命中则跳过（计入"已存在"，不重复写入）；
 即使这一步之后仍然撞上数据库唯一索引（并发写入的极小概率窗口），本工具捕获
-:class:`~lingxi.adapters.postgres_local_permission.DuplicateActiveOverride`
+:class:`~lingxi.adapters.postgres_local_permission.DuplicateActiveOverrideError`
 后同样降级为"已存在"，不让异常中断整批导入。同一份导出文件反复执行本工具，
 产出的新增行数恒为零。
 
@@ -177,7 +177,7 @@ from lingxi.core.permission.legacy_diff import (
     compute_company_diff,
 )
 from lingxi.core.permission.metric_translation import (
-    UncoveredPermissionCombination,
+    UncoveredPermissionCombinationError,
     translate_company_functions,
 )
 from lingxi.core.permission.publish_row import (
@@ -329,7 +329,7 @@ def resolve_galaxy_current(
             all_companies=aggregate.all_companies,
             mapping=metric_translation_map,
         )
-    except UncoveredPermissionCombination as error:
+    except UncoveredPermissionCombinationError as error:
         reason = (
             REASON_TRANSLATION_UNAVAILABLE
             if error.mapping_is_empty

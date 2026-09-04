@@ -42,7 +42,7 @@ class PendingActionDecider(Protocol):
 
     与 ``adapters.postgres_pending_action.PostgresPendingActionStore`` 结构
     相同，测试注入内存假实现。真实实现在审计写入失败时抛出
-    :class:`~lingxi.core.admin.pending_action.PendingActionAuditWriteFailed`。
+    :class:`~lingxi.core.admin.pending_action.PendingActionAuditWriteFailedError`。
     """
 
     def confirm(self, *, pending_action_id: str, clicker_open_id: str) -> _Outcome:

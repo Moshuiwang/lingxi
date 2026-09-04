@@ -81,10 +81,6 @@ class TokenSupplyFailureError(RuntimeError):
         self.supply = supply
 
 
-#: 向后兼容别名：异常类改名前的旧名字，供未随批次同步更新的调用方与测试导入。
-TokenSupplyFailure = TokenSupplyFailureError
-
-
 class _AuditSink(Protocol):
     def record(self, action: str, /, **fields: object) -> None: ...
 

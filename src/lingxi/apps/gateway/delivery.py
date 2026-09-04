@@ -30,7 +30,7 @@ from lingxi.core.execution.card_stream import (
     CardRateLimiter,
     CardStream,
     CardTransport,
-    DeliveryRejected,
+    DeliveryRejectedError,
     ProgressStepSnapshot,
     SendOutcomeCallback,
     TextTransport,
@@ -543,7 +543,7 @@ class DeliveryConsumer:
             return _FallbackOutcome.RETRY_LATER
         try:
             stream.send_fallback(content)
-        except DeliveryRejected as error:
+        except DeliveryRejectedError as error:
             # 明确失败（白名单）：清预留位，下一轮按退避重试。
             self._queue.clear_dispatch_reservation(task_id=task.task_id)
             self._record_fallback_attempt_failed(task.task_id)

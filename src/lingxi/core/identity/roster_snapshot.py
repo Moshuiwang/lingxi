@@ -416,7 +416,7 @@ class DailyRosterSource:
     可替换（``COMPLETE``）时比对用**本轮读到的行**；不可替换（空源/不完整/失败）
     时比对用**库里上一次成功的快照**并把保旧原因带进日报。**完全没有快照时不
     比对**（`V-花名册-48`）：如实交出 ``available=False``，由日报侧改发告警，不拿
-    空行比对（会把全体已开通用户报成"查无此人"）。``RosterSnapshotInconsistent``
+    空行比对（会把全体已开通用户报成"查无此人"）。``RosterSnapshotInconsistentError``
     **不在这里捕获**：那是并发替换窗口内的响亮信号，由职责层的失败隔离承接。
     """
 

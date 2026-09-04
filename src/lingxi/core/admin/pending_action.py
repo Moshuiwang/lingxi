@@ -532,12 +532,6 @@ class PendingActionTransientFailureError(RuntimeError):
         self.classification = classification
 
 
-#: 向后兼容别名：本批清理把异常类改名以满足 N818（须以 Error 结尾），跨模块
-#: 引用仍在别处；收官批统一清理全部旧名引用后移除这两个别名。
-PendingActionAuditWriteFailed = PendingActionAuditWriteFailedError
-PendingActionTransientFailure = PendingActionTransientFailureError
-
-
 def _terminal_message(status: PendingActionStatus) -> str:
     if status is PendingActionStatus.EXECUTED:
         return "该操作已经执行过，不会重复执行。"

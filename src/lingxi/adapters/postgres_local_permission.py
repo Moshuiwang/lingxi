@@ -92,11 +92,6 @@ class DuplicateActiveOverrideError(Exception):
     """
 
 
-#: 向后兼容别名：迁移前的名字不满足 ruff N818（异常类需以 ``Error`` 结尾），
-#: 保留旧名字供既有调用方（``adapters/postgres_pending_action.py`` 等）继续导入。
-DuplicateActiveOverride = DuplicateActiveOverrideError
-
-
 @dataclass(frozen=True)
 class StoredLocalPermissionOverride:
     """写路径/读路径共同的返回形状：数据库分配的行标识 + 纯类型内容。

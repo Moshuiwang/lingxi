@@ -33,7 +33,7 @@ from lingxi.apps.scheduler import (
     StructuredLogAuditSink,
     build_loop,
 )
-from lingxi.core.identity.access_token_supply import AccessTokenUnavailable
+from lingxi.core.identity.access_token_supply import AccessTokenUnavailableError
 from lingxi.core.identity.roster_audit import ArchivedIdentity, DiffKind
 from lingxi.core.identity.roster_snapshot import (
     DEFAULT_SNAPSHOT_STALE_AFTER,
@@ -1321,7 +1321,7 @@ class DutyRegistrationTest(unittest.TestCase):
         failing_audit = RecordingAudit()
 
         def always_failing() -> str:
-            raise AccessTokenUnavailable("no_credential_available")
+            raise AccessTokenUnavailableError("no_credential_available")
 
         registered = _build_roster_audit_duty(
             config,

@@ -62,7 +62,7 @@ from lingxi.core.execution.card_stream import (
     CardCreated,
     CardRateLimiter,
     CardStream,
-    DeliveryRejected,
+    DeliveryRejectedError,
     ProgressStepSnapshot,
     decode_progress_action,
     encode_progress_action,
@@ -134,13 +134,13 @@ def worker_config(**overrides: object) -> WorkerConfig:
 
 
 class RecordingCards:
-    """``error`` 默认 ``DeliveryRejected``（明确失败，独立审核 R-1 白名单）；传入
+    """``error`` 默认 ``DeliveryRejectedError``（明确失败，独立审核 R-1 白名单）；传入
     ``TimeoutError`` 等其它任何异常类型模拟"结果不明"，见
     ``core.execution.card_stream`` 模块说明。
     """
 
     def __init__(
-        self, *, fail: str | None = None, error: type[BaseException] = DeliveryRejected
+        self, *, fail: str | None = None, error: type[BaseException] = DeliveryRejectedError
     ) -> None:
         self.fail = fail
         self._error = error
@@ -169,7 +169,7 @@ class RecordingCards:
 
 class RecordingText:
     def __init__(
-        self, *, fail: bool = False, error: type[BaseException] = DeliveryRejected
+        self, *, fail: bool = False, error: type[BaseException] = DeliveryRejectedError
     ) -> None:
         self.texts: list[str] = []
         self.calls: list[dict[str, object]] = []
@@ -918,7 +918,7 @@ class CardStreamTests(unittest.TestCase):
     def test_create_timeout_is_not_swallowed_into_a_fallback_downgrade(self) -> None:
         """独立审核 B-1/R-1：``TimeoutError``（真实 adapter 走 ``requests``，其网络
         异常全部是内置 ``OSError`` 的子类）不是"明确失败"——``start()`` 必须原样把
-        它抛出去，不能像 ``DeliveryRejected`` 那样吞掉并置位 ``fallback_needed``
+        它抛出去，不能像 ``DeliveryRejectedError`` 那样吞掉并置位 ``fallback_needed``
         （那会让调用方误以为已经拿到"应该改走文本通道"这个明确结论）。
         """
 
@@ -965,7 +965,7 @@ class CardStreamTests(unittest.TestCase):
     def test_close_timeout_still_does_not_fall_back_like_any_other_close_failure(self) -> None:
         """``close()`` 步骤的异常分类不延伸到这里（见 ``card_stream.py`` 注释）：
         无论关闭失败是明确拒绝还是网络类异常，都不改变"更新已经成功、答案已对
-        用户可见"这个结论，``TimeoutError`` 与 ``DeliveryRejected`` 在这一步行为
+        用户可见"这个结论，``TimeoutError`` 与 ``DeliveryRejectedError`` 在这一步行为
         一致。
         """
 

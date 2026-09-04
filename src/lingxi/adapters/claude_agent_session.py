@@ -49,10 +49,6 @@ class AgentSessionInterruptedError(Exception):
     """worker 收到 /stop 后要求 SDK 尽快中断当前回合。"""
 
 
-#: 兼容别名：跨模块引用仍按旧名导入，收官批统一清（N818 改名）。
-AgentSessionInterrupted = AgentSessionInterruptedError
-
-
 class DrainTimeoutError(Exception):
     """会话收尾（``ClaudeSDKClient.__aexit__``）超过独立宽限。
 

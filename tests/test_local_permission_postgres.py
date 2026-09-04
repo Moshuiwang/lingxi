@@ -6,7 +6,7 @@
 - 读路径（:meth:`PostgresLocalPermissionOverrideStore.effective_entries`）只返回
   ``entry_status='active'`` 的行，按用户隔离；
 - 写路径（:meth:`~.insert`）先做字段校验再写库，撞上同用户同极性同公司同指标的
-  部分唯一索引时转译为 :class:`DuplicateActiveOverride`；
+  部分唯一索引时转译为 :class:`DuplicateActiveOverrideError`；
 - **没有确认卡就写不进去**：伪造/不存在的 ``pending_action_id`` 被外键拒绝
   （否定断言，对应 #319「可观察完成标准」第二条）；
 - :meth:`~.revoke` 是条件更新，只对当前 ``active`` 的行生效，收回后同一行不再
@@ -23,7 +23,7 @@ from postgres_schema import ensure_production_schema, psycopg_available, reset_p
 
 from lingxi.adapters.postgres import connect
 from lingxi.adapters.postgres_local_permission import (
-    DuplicateActiveOverride,
+    DuplicateActiveOverrideError,
     PostgresLocalPermissionOverrideStore,
 )
 from lingxi.core.ids import new_id
@@ -535,7 +535,7 @@ class DuplicateActiveOverrideTests(LocalPermissionOverridePostgresTestCase):
             company_id="1011", metric_name="日活", direction=OverrideDirection.GRANT
         )
 
-        with self.assertRaises(DuplicateActiveOverride):
+        with self.assertRaises(DuplicateActiveOverrideError):
             self.insert_override(
                 company_id="1011", metric_name="日活", direction=OverrideDirection.GRANT
             )

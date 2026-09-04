@@ -57,7 +57,7 @@ from lingxi.core.permission.merge_sources import (
     merge_permission_sources,
 )
 from lingxi.core.permission.notification import describe_scope
-from lingxi.core.permission.publish import PermissionGrantBlockedByAccountState
+from lingxi.core.permission.publish import PermissionGrantBlockedByAccountStateError
 from lingxi.core.permission.publish_row import (
     ADMIN_FULL_ACCESS_FUNCTION,
     STATUS_APPROVED,
@@ -505,7 +505,7 @@ class OnboardingSteps:
                 require_enabled_account=True,
                 decided_at=self._clock(),
             )
-        except PermissionGrantBlockedByAccountState as blocked:
+        except PermissionGrantBlockedByAccountStateError as blocked:
             self._audit.record(
                 "onboarding.halted_account_state",
                 user=user_id,

@@ -412,16 +412,16 @@ class ReadFailedAuditTest(unittest.TestCase):
         self.assertNotIn("code", fields, "没有 code 属性的异常不得凭空造出一个 code 字段")
 
     def test_the_token_supply_classification_is_unaffected(self) -> None:
-        """``TokenSupplyFailure.supply`` 这条既有分类（F6）必须原样保留，不被 F1
+        """``TokenSupplyFailureError.supply`` 这条既有分类（F6）必须原样保留，不被 F1
         的 code 逻辑挤掉或覆盖。"""
 
-        from lingxi.apps.scheduler.org_snapshot_sync import TokenSupplyFailure
+        from lingxi.apps.scheduler.org_snapshot_sync import TokenSupplyFailureError
 
         store = FakeStore()
         audit = RecordingAudit()
 
         def failing_read() -> SnapshotBatch:
-            raise TokenSupplyFailure("app_access_token")
+            raise TokenSupplyFailureError("app_access_token")
 
         duty = OrgSnapshotSyncDuty(
             read_snapshot=failing_read,
@@ -438,14 +438,14 @@ class ReadFailedAuditTest(unittest.TestCase):
         self.assertNotIn("code", fields)
 
     def test_a_token_supply_failures_cause_code_is_recovered(self) -> None:
-        """应修 F（独立审查 2026-08-20 可选建议）：``TokenSupplyFailure`` 本身没有
-        ``.code``，但它是 ``raise TokenSupplyFailure(...) from error`` 包出来的——
+        """应修 F（独立审查 2026-08-20 可选建议）：``TokenSupplyFailureError`` 本身没有
+        ``.code``，但它是 ``raise TokenSupplyFailureError(...) from error`` 包出来的——
         底层 ``error``（例如 ``FeishuTenantTokenError``）若带 ``code``，应当能透过
         ``__cause__`` 追到，不能让令牌供给失败在审计里只剩 ``supply``、丢了具体
         原因。变异锚点：把 `__cause__` 那段追溯删掉，本用例会从"code 出现"变红成
         "code 缺失"。"""
 
-        from lingxi.apps.scheduler.org_snapshot_sync import TokenSupplyFailure
+        from lingxi.apps.scheduler.org_snapshot_sync import TokenSupplyFailureError
 
         store = FakeStore()
         audit = RecordingAudit()
@@ -454,7 +454,7 @@ class ReadFailedAuditTest(unittest.TestCase):
             try:
                 raise FakeFeishuDirectoryError("feishu_code_99991663")
             except FakeFeishuDirectoryError as cause:
-                raise TokenSupplyFailure("app_access_token") from cause
+                raise TokenSupplyFailureError("app_access_token") from cause
 
         duty = OrgSnapshotSyncDuty(
             read_snapshot=failing_read,
@@ -480,7 +480,7 @@ class ReadFailedAuditTest(unittest.TestCase):
         `logger.error` 那行的 `fields.get("code", "unknown")` 改回直接用未过滤的
         `code` 变量，本用例的日志断言会变红。"""
 
-        from lingxi.apps.scheduler.org_snapshot_sync import TokenSupplyFailure
+        from lingxi.apps.scheduler.org_snapshot_sync import TokenSupplyFailureError
 
         store = FakeStore()
         audit = RecordingAudit()
@@ -490,7 +490,7 @@ class ReadFailedAuditTest(unittest.TestCase):
             try:
                 raise FakeFeishuDirectoryError(forged)
             except FakeFeishuDirectoryError as cause:
-                raise TokenSupplyFailure("app_access_token") from cause
+                raise TokenSupplyFailureError("app_access_token") from cause
 
         duty = OrgSnapshotSyncDuty(
             read_snapshot=failing_read,

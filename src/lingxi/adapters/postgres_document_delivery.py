@@ -65,11 +65,6 @@ class DocumentDeliveryOwnershipLostError(RuntimeError):
         self.request_id = request_id
 
 
-#: 兼容别名：调用点（`apps/gateway/document_delivery.py`）仍按旧名导入（N818
-#: 改名，收官批统一清）。
-DocumentDeliveryOwnershipLost = DocumentDeliveryOwnershipLostError
-
-
 #: 支持的交付类型（迁移 0078 CHECK 同一取值集合）：``docx`` 走
 #: ``adapters/feishu_docx_delivery.py``，``sheet`` 走
 #: ``adapters/feishu_sheets_delivery.py``。

@@ -64,7 +64,7 @@ from lingxi.core.permission.merge_sources import (
     REASON_LOCAL_OVERRIDE_READ_FAILED,
     REASON_SUPPRESS_INAPPLICABLE_WILDCARD,
 )
-from lingxi.core.permission.publish import PermissionGrantBlockedByAccountState
+from lingxi.core.permission.publish import PermissionGrantBlockedByAccountStateError
 from lingxi.core.permission.publish_row import (
     ADMIN_FULL_ACCESS_FUNCTION,
     REVOKED_PERMISSIONS_TEXT,
@@ -336,7 +336,7 @@ class FakeDecisions:
         self._failing = failing_users or set()
         self._cleared_events_by_user = cleared_events_by_user or {}
         # Issue #483：``require_enabled_account=True`` 的调用命中这些用户时，照真实
-        # 实现抛 ``PermissionGrantBlockedByAccountState``——真库里那把行锁的复检在
+        # 实现抛 ``PermissionGrantBlockedByAccountStateError``——真库里那把行锁的复检在
         # 假 store 上替不了，但"调用方被挡之后怎么收口"是纯职责层行为，可以在这里钉。
         self._blocked = blocked_users or set()
 
@@ -358,7 +358,7 @@ class FakeDecisions:
                 "声明不要求账号有效的权限决定只能排撤权行"
             )
         if require_enabled_account and user_id in self._blocked:
-            raise PermissionGrantBlockedByAccountState("suspended")
+            raise PermissionGrantBlockedByAccountStateError("suspended")
         if user_id in self._failing:
             raise RuntimeError("注入的落库失败")
         self.calls.append(
