@@ -205,14 +205,12 @@ class RealBaselineIsHonestTest(unittest.TestCase):
         全量 `unittest discover` 才暴露。逐字恢复原始导入与注释后，行数精确回到
         1502，与该批开工前的登记值相同：该文件在当前 lint 规则集下没有可安全
         移除的死代码，1502 继续保留为封顶，不下调，也不再登记新增理由。
+        2026-09-04 #592 B-1 拆分后两条全部移除（`service.py` 634 行、`onboarding_runner.py`
+        798 行），基线首次回到空文件；此后新增登记只能走「人工加行＋理由」路径。
         """
-
         self.assertEqual(
             CHECK.load_baseline(CHECK.BASELINE_PATH),
-            {
-                "src/lingxi/core/identity/onboarding_runner.py": 1502,
-                "src/lingxi/apps/worker/service.py": 1533,
-            },
+            {},
         )
 
 
