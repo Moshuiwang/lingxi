@@ -40,7 +40,7 @@ from test_gateway_pipeline import message
 
 from lingxi.apps.gateway import make_event_handler
 from lingxi.core.admin.router import AdminRouteOutcome
-from lingxi.core.conversation import EventPipeline
+from lingxi.core.conversation import DispatchGates, EventPipeline
 from lingxi.core.conversation.ports import HandledAs, OnboardingResult, OnboardingState
 
 
@@ -101,9 +101,11 @@ class AdminRoutingPipelineTests(unittest.TestCase):
             replies=FakeReplies(self.log),
             audit=FakeAudit(self.log),
             onboarding=onboarding,
-            admin_router=admin_router,
-            innertest_roster_gate=innertest_roster_gate,
-            delegated_subject_open_id=delegated_subject_open_id,
+            gates=DispatchGates(
+                admin_router=admin_router,
+                innertest_roster_gate=innertest_roster_gate,
+                delegated_subject_open_id=delegated_subject_open_id,
+            ),
         )
 
     def test_active_admin_short_circuits_before_auto_provisioning(self) -> None:
@@ -253,7 +255,7 @@ class WriteCommandContextThreadingTests(unittest.TestCase):
             reactions=FakeReactions(self.log),
             replies=FakeReplies(self.log),
             audit=FakeAudit(self.log),
-            admin_router=router,
+            gates=DispatchGates(admin_router=router),
         )
 
         pipeline.handle_message(
@@ -280,7 +282,7 @@ class WriteCommandContextThreadingTests(unittest.TestCase):
             reactions=FakeReactions(self.log),
             replies=FakeReplies(self.log),
             audit=FakeAudit(self.log),
-            admin_router=router,
+            gates=DispatchGates(admin_router=router),
         )
 
         pipeline.handle_message(
@@ -318,9 +320,11 @@ class DelegatedSubjectStructuralExitTests(unittest.TestCase):
             replies=FakeReplies(self.log),
             audit=FakeAudit(self.log),
             onboarding=onboarding,
-            admin_router=admin_router,
-            innertest_roster_gate=innertest_roster_gate,
-            delegated_subject_open_id=delegated_subject_open_id,
+            gates=DispatchGates(
+                admin_router=admin_router,
+                innertest_roster_gate=innertest_roster_gate,
+                delegated_subject_open_id=delegated_subject_open_id,
+            ),
         )
 
     def test_drifted_app_user_row_still_reaches_the_admin_face_not_the_business_queue(
@@ -480,7 +484,7 @@ class NonPrivateChatNeverReachesAdminRoutingTests(unittest.TestCase):
             reactions=FakeReactions(log),
             replies=FakeReplies(log),
             audit=FakeAudit(log),
-            admin_router=router,
+            gates=DispatchGates(admin_router=router),
         )
         handler = make_event_handler(pipeline, audit=FakeAudit(log))
 

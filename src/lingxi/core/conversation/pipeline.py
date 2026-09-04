@@ -3,56 +3,23 @@
 **次序本身是合同要求，不能重排。** 这个模块的全部价值就是把那张次序表变成可判定的代码，
 因此每一步上方都标了它对应的断言编号；调换任意两步都应当有用例变红。
 
-    1. 通道级认证        —— 长连接握手期完成，不在逐事件层做（见下方「关于第 1 步」）
-    2. event_id 落库     冲突 → 重复投递，直接返回成功        V-接入-01/02/09
-    3. 加表情            失败 → 记审计，继续                  V-接入-07/08
-    4. 专用主体判定      发送者 open_id 命中配置中已解析好的专用授权主体
-       → 只能进管理命令面（登记表实时判定）或既有「确定性拒绝出口」
-       （`onboarding.delegated_subject`），绝无业务路径、绝不进入开通链；
-       比对的是装配期已经算好的单个 open_id，**不对全体消息新增登记表
-       查询**。未命中 → 原状态分派不变。结构性防的是"专用主体因数据漂移
-       获得 app_user 行、跳过管理面落入业务队列"这一类不该发生却理论上
-       可能发生的情形（opus P3-1 实测复现：此前这一分流嵌在下面「查用户状态」的
-       `NOT_PROVISIONED` 分支内，`state` 一旦不是 `NOT_PROVISIONED` 整段判定就
-       被跳过）。V-管理-24
-    5. 查用户状态        未开通 → 内测名单闸（名单外→既有「确定性拒绝出口」
-       `onboarding.innertest_not_open`，不发 `onboarding.checking`、不进入
-       开通；名单内→原行为不变）→ 丢弃正文并认领开通；已停用 → 回提示
-       V-审计-05
-       （未开通分支内先按登记表实时判定是否为当前有效管理员：是 → 管理命令面，
-       不进入开通；否 → 原有开通逻辑不变。Issue #95 S-M-01，V-管理-2x）
-    6. 解析命令          /stop /new；以 / 开头但不被认识的文本直接回绝、不入队，
-       且**不受下面第 7 步忙碌判定影响**——这条消息不管忙不忙碌都不会被受理，
-       没有理由先让用户等一轮忙碌提示再重发一遍（Trace #304 批次 5 直修，
-       产品负责人 biai-stage 实测暴露：执行层把 / 开头文本解析成系统命令而
-       不是用户文本，/config /model /help 令会话瞬断，/loop 触发内部工具
-       误用）                                                  V-会话-05/06/11
-    7. 话题忙碌判定      忙碌 且 非 /stop → 只回提示，不入队    V-会话-04/09/10
-    8. 入队 + NOTIFY                                           V-队列-01…05
+第 2 步到第 8 步跑在**同一个事务**里（`V-队列-01`）：任务插入失败时 ``inbound_event``
+那一行也不存在，飞书重投能把这条消息重新完整处理；抢占也随事务一起回滚，话题不会永久
+停在"忙碌"。第 3 步的加表情是事务里唯一不可回滚的外部调用，这是知情取舍——表情"只表示
+已经收到，不表示消息能够执行"。反过来不成立：任何表示"已受理"的**回复**都必须等事务
+提交之后才发出（`V-队列-03`），因此本模块把它们攒进 ``deferred`` 列表统一发送。
 
-编号以[验证与门禁](../../../../docs/技术设计/验证与门禁.md)的矩阵为准（两位数字，
-不用字母后缀）；断言表里的 `V-会话-02a`/`05a`/`06a` 登记时续号为 08/09/10。
-
-**关于第 1 步。** 接口设计原文写的是「验签」，那是 Webhook 语义。本切片按 2026-08-06
-决策走官方 ``lark-oapi`` 的长连接，认证发生在**握手期**（应用凭据换取 endpoint 与
-wss 地址），单条事件上没有可验的签名。承接同一产品意图的是 `V-接入-10`：进程不监听
-任何入站端口，事件只能从那条已认证的长连接进来。判定面比逐事件验签更严——不存在
-"签名对了就受理"的旁路，因为根本没有第二个入口。接口设计 3.2 随本切片同步修订。
-
-**关于事务边界。** 第 2 步到第 8 步跑在**同一个事务**里（`V-队列-01`）。这意味着任务
-插入失败时 ``inbound_event`` 那一行也不存在，飞书重投时该消息能被重新完整处理；也意味着
-抢占会随事务一起回滚，话题不会永久停在"忙碌"（`V-队列-02`）。
-
-第 3 步的加表情是**外部调用，落在事务里且不可回滚**——事务回滚后表情已经加上了。这是
-知情取舍，合同允许：表情"只表示已经收到，不表示消息能够执行或任务已经开始"。反过来
-不成立：任何表示"已受理"的**回复**都不能在入队成功前发出（`V-队列-03`）。
+通道级认证（第 1 步）发生在长连接握手期，单条事件上没有可验的签名；承接同一产品意图的
+是 `V-接入-10`——进程不监听任何入站端口，事件只能从那条已认证的长连接进来。
 """
 
 from __future__ import annotations
 
 import logging
+from collections.abc import Callable
+from dataclasses import dataclass
 from datetime import UTC, datetime
-from typing import Any, Callable
+from typing import Any
 
 from lingxi.config.content import RenderedContent
 from lingxi.core.ids import new_id
@@ -86,48 +53,69 @@ from .session_window import should_resume_session
 
 logger = logging.getLogger(__name__)
 
-#: 搬走的符号在原路径保留转发，调用方与测试的 import 不受影响。
+#: 搬到 ``onboarding_replies`` 的旧名转发：跨渲染入口对账按这个名字读取。
 _KEYS_REQUIRING_REFERENCE = KEYS_REQUIRING_REFERENCE
+
 __all__ = [
     "BUSY_HINT_TEXT",
     "DEFAULT_WORKER_VERSION",
+    "TEXT_MESSAGE_TYPE",
+    "DispatchGates",
     "EventPipeline",
     "GatewayTexts",
-    "QueueInsertFailure",
-    "TEXT_MESSAGE_TYPE",
+    "QueueInsertError",
     "fixed_stable_version",
 ]
 
-# #45 的分流规则形态属 S11（决策第 3 条）。本批最小实现固定 stable，
-# 断言只约束「入队时固化」与「领取带版本条件」两件事。
+# 分流规则形态尚未展开，这里固定 stable；断言只约束「入队时固化」与「领取带版本条件」。
 DEFAULT_WORKER_VERSION = "stable"
 
-# 本批唯一会被入队的消息类型。
+#: 唯一会被入队的消息类型；其余类型加过表情后丢弃。
 TEXT_MESSAGE_TYPE = "text"
 
 
-class QueueInsertFailure(RuntimeError):
+class QueueInsertError(RuntimeError):
     """task 写入失败，入队事务必须整体回滚。"""
 
 
-class _InboundEventInsertFailure(RuntimeError):
-    """``insert_inbound_event`` 落库之前失败的内部标记（Issue #469 opus 独立
-    审查 P2-1）。
+class _InboundEventInsertError(RuntimeError):
+    """``insert_inbound_event`` 落库**之前**就失败的内部标记。
 
-    只在 :meth:`EventPipeline._within_transaction` 第 2 步、``tx.
-    insert_inbound_event(...)`` 这一次调用本身抛异常时使用，包一层
-    ``__cause__`` 原样带上原始异常，只为了让 ``handle_message`` 能在自己的
-    顶层 ``except`` 分流表里区分出"这条事件在 `inbound_event` 表里还没有留下
-    任何幂等记录"这一种特殊情况——真正的处理与提示逻辑仍然统一走
-    ``_handle_unexpected_failure``（见其 ``retryable`` 参数文档）。不对外
-    暴露、不在本模块之外被捕获或构造。
+    这是唯一一种"重投真能带来恢复"的失败：幂等记录还没写进 ``inbound_event``，
+    平台重投这条事件会被当成全新事件正常处理。包一层 ``__cause__`` 原样带上原始
+    异常，只为了让 ``handle_message`` 的顶层兜底能把它与其余异常分开（见
+    :meth:`EventPipeline._handle_unexpected_failure` 的 ``retryable``）。
+    不对外暴露，也不在本模块之外被捕获或构造。
     """
 
 
 def fixed_stable_version(*, user_id: str, now: datetime) -> str:
-    """默认版本求值：恒为 ``stable``。签名保留 #45 要求的两个输入。"""
+    """默认版本求值：恒为 ``stable``。
 
+    签名保留 ``user_id`` / ``now`` 两个输入，供按用户或按时间分流的实现替换。
+    """
     return DEFAULT_WORKER_VERSION
+
+
+@dataclass(frozen=True)
+class DispatchGates:
+    """普通业务路径之前的三道分流闸，全部由装配层解析好后传入。
+
+    三项都留空（默认）时，管线行为与这三道闸加入之前逐字节一致。
+
+    Attributes:
+        admin_router: 管理命令面。类型刻意是 ``Any``——本模块只用得到 ``route(...)``
+            与返回值的四个属性，鸭子类型足够；import 具体类型会让每个只想要会话
+            类型的调用方（含 worker 进程）平白多出一条 ``core.admin`` 依赖边。
+        innertest_roster_gate: 内测名单判定口，收的是装配期解析好的名单，这里不
+            重新解析、不读环境变量。另一侧另有一道同名闸，两道独立判定互为纵深。
+        delegated_subject_open_id: 专用授权主体的 open_id。**刻意是一个已解析好的
+            值而不是每次都查登记表的回调**：对全体消息只做一次内存字符串比较。
+    """
+
+    admin_router: Any = None
+    innertest_roster_gate: Callable[[str], bool] | None = None
+    delegated_subject_open_id: str | None = None
 
 
 class EventPipeline:
@@ -144,31 +132,9 @@ class EventPipeline:
         resolve_version: VersionResolver = fixed_stable_version,
         should_stop: Callable[[], bool] | None = None,
         onboarding: OnboardingRunner | None = None,
-        # 类型刻意是 Any，不 import 具体的 Protocol/实现：核对下方调用点即知，本模块
-        # 只用得到 ``.route(open_id=..., text=..., trace_id=...)``，返回值只读
-        # ``.handled``/``.content_key``/``.content_version``/``.reply_text`` 四个
-        # 属性——这正是「管理命令面」端口（`core/admin/router.AdminRouter`）的形状，
-        # 鸭子类型足够。真正 import 具体类型的是 ``apps/gateway`` 的函数内延迟
-        # import；这里 import 会让每一个只想要会话类型（例如 ``UserState``，经
-        # `core/conversation/__init__.py` 重导出）的调用方——包括与管理命令面完全
-        # 无关的 worker 进程——平白多出一条 `core.admin.*` 依赖边（`scripts/ci/
-        # check_installed_package.py` 的静态闭包检查会如实标红这条多余耦合）。
-        admin_router: Any = None,
-        # 内测名单闸的 gateway 侧前移一份（opus 批量审查 P1，Issue #302 S-N-01 的
-        # 纵深）：``None`` 表示未装配，行为与本项加入之前逐字节一致（不做任何名单
-        # 判定，直接进入既有 AUTO_PROVISIONING 分支）。装配之后是纯粹的判定口——
-        # 传入的是已经在 ``apps/gateway`` 用 `core.identity.innertest_roster_gate`
-        # 解析好的名单，这里不重新解析、不读环境变量。scheduler 侧的同名闸原样
-        # 保留（纵深防御，两道闸各自独立判定）。
-        innertest_roster_gate: Callable[[str], bool] | None = None,
-        # 专用主体结构性出口前置（opus P3-1）：装配期已经解析好的单个 open_id，
-        # ``None`` 表示未装配，行为与本项加入之前逐字节一致。**刻意是一个已解析好
-        # 的值，不是一个每次调用都重新查登记表的回调**——这样"判断发送者是不是
-        # 专用主体"这件事，对着**全体消息**都只是一次内存里的字符串比较，不会给
-        # 每一条普通用户消息都额外加一次登记表查询（性能面，opus P3-5）。真正的
-        # 登记表实时判定只发生在命中之后、转给 ``admin_router.route()`` 的那一步。
-        delegated_subject_open_id: str | None = None,
+        gates: DispatchGates | None = None,
     ) -> None:
+        """装配一条管线；除 ``store`` 等四个端口外都可以留默认值。"""
         self._store = store
         self._reactions = reactions
         self._replies = replies
@@ -177,75 +143,50 @@ class EventPipeline:
         self._memory = MemoryCommandHandler(texts=self._texts, audit=audit)
         self._onboarding_replies = OnboardingReplyRenderer(texts=self._texts, audit=audit)
         self._resolve_version = resolve_version
-        # The runner is an application boundary: it owns the #89 identity result,
-        # account matching and the #17 environment/permission/MCP orchestration.
-        # Keeping it optional preserves the old negative-only assembly for callers
-        # that have not opted into the #65 path; the gateway app passes it explicitly
-        # when the product path is enabled.
+        # 开通编排是一条应用边界：身份结果、账号匹配、环境/权限/MCP 编排都归它。
+        # 保持可选，是为了让没有启用正向开通的装配继续拿到原来的否定终态。
         self._onboarding = onboarding
-        # 管理命令面（Issue #95 S-M-01）：可选注入，未装配时行为与本项加入之前逐字节
-        # 一致。装配之后仍然是"登记表里没有有效条目就什么都不改变"——见
-        # ``_within_transaction`` 里的调用点文档。
-        self._admin_router = admin_router
-        self._innertest_roster_gate = innertest_roster_gate
-        self._delegated_subject_open_id = delegated_subject_open_id
-        # 停机位。停机时**已提交的结论不动**，只跳过提交之后那些尽力而为的动作——
-        # 中途放弃一个快要提交完的事务只会把工作丢掉再让平台重投一次。
-        # 跳过的有两样：出站回复，以及开通编排的触发（Issue #65 轻审 P2-3）。后者
-        # 跳过之后会留下一条待对账的事件，不会丢——见 ``handle_message``。
+        self._gates = gates or DispatchGates()
+        # 停机位。停机时**已提交的结论不动**，只跳过提交之后那些尽力而为的动作：
+        # 出站回复，以及开通编排的触发。中途放弃一个快要提交完的事务，只会把工作
+        # 丢掉再让平台重投一次；被跳过的开通会留下一条待对账的事件，不会丢。
         self._should_stop = should_stop or (lambda: False)
 
     @property
     def onboarding(self) -> OnboardingRunner | None:
         """这条管线实际拿到的开通编排。**只读**，供装配层回读。
 
-        Epic D 的装配断言（``apps/gateway/onboarding.assert_gateway_onboarding_is_inert``、
-        ``apps/scheduler/onboarding.assert_claim_limit_follows_capacity``）要回读构造好的
-        对象**实际持有**的那个引用——比较传进去的变量两次，什么也证明不了。
+        装配断言要回读构造好的对象**实际持有**的那个引用——比较传进去的变量两次，
+        什么也证明不了。
         """
-
         return self._onboarding
 
     def handle_message(self, message: InboundMessage, *, now: datetime | None = None) -> Outcome:
         """处理一条 ``im.message.receive_v1``。
 
-        ``now`` 只为注入时钟开放（`V-会话-02`），正常调用不传。
+        **本方法对绝大多数失败是全函数：不向调用方抛出异常。** 已被识别的失败各自
+        落到对应的诚实提示，这一层只兜住剩余异常——否则它们会一路穿到长连接调度层，
+        那里只记审计、什么都不回给用户，而一个稳定复现的缺陷会让平台重投一直撞在
+        同一个异常上，用户永远等不到任何回应。
 
-        **回复一律在事务提交之后才发出。** 早先的写法在事务里就把"当前任务仍在处理中"
-        发出去了，于是回复成功、``mark_handled_as`` 或提交失败时：事务回滚 → 平台重投
-        → 提示重发；更糟的是**原任务如果这时已经结束**，这条本应"不生效"的消息会在
-        重投时被正常入队执行——直接违反合同「该消息不进入对话历史、不排队，也不会在
-        当前任务结束后自动提交或自动生效」。
+        Args:
+            message: 待处理的入站消息。
+            now: 注入时钟（`V-会话-02`），正常调用不传。
 
-        改成先把 ``handled_as`` 结论持久化并提交、再发回复之后：重投时事件行已经在
-        库里，幂等去重挡住重处理；回复失败只记审计。这是知情取舍——用户少收一条提示
-        可以接受，合同的硬承诺是"不自动生效"，那一条现在由已提交的事件行保证。
+        Returns:
+            这条事件的处理结论。
 
-        **本方法对绝大多数失败是全函数（Issue #465：100% 响应覆盖产品合同）：
-        不向调用方抛出异常。** 已被识别的失败（`QueueInsertFailure` 等）在
-        :meth:`_handle_message` 内部各自落到对应的诚实提示；本方法这一层只兜住
-        "没有被任何既有分支识别"的剩余异常——数据库瞬时错误、还没被枚举过的编程
-        缺陷等。没有这一层时，这类异常会一路穿透 ``apps/gateway/__init__.py`` 的
-        ``make_event_handler``，被 ``adapters/feishu_longconn.py`` 的
-        ``LongConnectionSupervisor._dispatch`` 接住——但那一层只记
-        ``event.handler_failed`` 审计，什么都不回给用户：飞书会按处理失败重投这条
-        事件，可一个稳定复现的缺陷会让重投一直撞在同一个异常上，用户永远等不到
-        任何回应（这正是 Issue #465 的触发现场）。因此这里改成"任何异常都必须换成
-        一条诚实的失败提示"，不再指望重投本身能替用户兜底。
-
-        **唯一的例外（Issue #469 opus 独立审查 P2-1）：`_InboundEventInsertFailure`
-        ——``insert_inbound_event`` 落库之前的失败。** 发完提示之后仍会破例向上
-        穿出原始异常，理由与分界见 :meth:`_handle_unexpected_failure` 的
-        ``retryable`` 参数文档。
+        Raises:
+            Exception: 只在幂等记录尚未落库时破例穿出原始异常，见
+                :meth:`_handle_unexpected_failure` 的 ``retryable``。
         """
-
         try:
             return self._handle_message(message, now=now)
-        except _InboundEventInsertFailure as error:
+        except _InboundEventInsertError as error:
             return self._handle_unexpected_failure(
                 message, error.__cause__ or error, retryable=True
             )
-        except Exception as error:  # noqa: BLE001 - 见上方 docstring：这是全函数的最后一道防线
+        except Exception as error:
             return self._handle_unexpected_failure(message, error)
 
     def _handle_unexpected_failure(
@@ -253,511 +194,454 @@ class EventPipeline:
     ) -> Outcome:
         """``handle_message`` 兜底出口：记审计＋尽力而为发一条诚实失败提示。
 
-        **不重新进入事务**——异常已经使当前这一轮的事务连同它可能做过的任何写入
-        一起回滚（Python ``with`` 语句在异常路径上的标准行为），这里只用
-        ``message`` 本身携带的、与数据库状态无关的字段（``chat_id``/``thread_id``/
-        ``message_id``/``trace_id``）尽力送一条提示。停机中跳过发送，姿态与
-        ``handle_message`` 末尾"尽力而为的出站副作用"一致。
+        **不重新进入事务**——异常已经把这一轮的写入连同事务一起回滚了，这里只用
+        ``message`` 自带的、与数据库状态无关的字段送提示。审计只记异常类名不记正文：
+        驱动的异常串可能原样带着外部标识原值，写进审计就抵触审计脱敏纪律。
 
-        **默认（``retryable=False``）吞掉异常、不重新抛出**——这是这里此前唯一
-        的行为，但下面这段说明此前写错了取舍前提（Issue #469 opus 独立审查
-        P2-1 纠偏）：吞掉之后 ``handle_message`` 正常返回，
-        ``LongConnectionSupervisor._dispatch`` 看到的是一次成功处理
-        （``error=None``），照此向飞书回 ack——**飞书不会因此重投这条事件**，
-        不存在"重投几次、用户就收到几条这条提示"这回事。真实后果反而是：一次
-        瞬时故障（DB 死锁、连接被重置等）在这层兜底加入之前，会被飞书按处理
-        失败重投、下一次尝试大概率自愈；加入之后，同一次瞬时故障变成"这条用户
-        消息被永久丢弃＋一条内部错误提示"，不再有任何自愈机会。
-
-        **``retryable=True``：唯一的例外，仅对应 `insert_inbound_event` 落库
-        之前的失败**（调用方 ``handle_message`` 只在这一种出口传 ``True``）。
-        这次失败发生在这条事件的幂等记录写进 ``inbound_event`` 表之前，飞书
-        重投这条事件会被当成一条全新事件正常处理、不会被去重挡下——是这条
-        分支里唯一"重投真的能带来恢复"的出口。因此这里在发完提示之后**重新
-        抛出**原始异常，让它破例穿出 ``handle_message``，`_dispatch` 收到真正
-        的失败（非 ``error=None``），照此向飞书返回失败以触发重投。其余出口
-        （幂等记录已经落库之后的任何失败）继续吞掉：重投只会撞上已经写好的
-        去重行，在 :meth:`_within_transaction` 第 2 步被判重直接短路返回，对
-        恢复没有任何帮助，穿出异常只是把同一条日志再刷一遍噪音。
-
-        已知取舍：``retryable=True`` 期间飞书按自己的重投策略再次投递同一条
-        事件，每次命中同一个瞬时故障都会再触发一次这条提示——用户可能在重投
-        窗口内收到最多 3 条重复的这条提示（飞书长连接对单条事件的重投次数
-        上限）；比起消息被永久丢弃且无法自愈，这是可以接受的已知取舍（已在
-        交付报告登记）。
+        Args:
+            message: 触发失败的入站消息。
+            error: 被兜住的原始异常。
+            retryable: 幂等记录尚未落库时传 ``True``：发完提示后重新抛出原始异常，
+                让调度层向平台报失败以触发重投——这是唯一一种重投真能恢复的失败。
+                其余出口一律吞掉，重投只会撞上已经写好的去重行，白刷一遍日志。
         """
-
         content = self._texts.catalog.text("gateway.unexpected_error", reference=message.trace_id)
         self._audit.record(
             "event.pipeline_failed",
             event_id=message.event_id,
-            # 只记异常类名，不记异常正文（Issue #469 opus 独立审查 P2-5，与
-            # `task.enqueue_failed`、`onboarding.failed` 等既有审计纪律一致）：
-            # 这里接住的是"没有被任何既有分支识别"的剩余异常，psycopg 等驱动的
-            # 异常串可能原样带着 `DETAIL: Key (feishu_open_id)=(ou_...)` 这类
-            # 外部标识原值，写进审计正文就抵触 V-花名册-33「审计与日志不含外部
-            # 标识原值」。
             error=type(error).__name__,
             trace_id=message.trace_id,
         )
         if self._should_stop():
-            self._audit.record(
-                "reply.skipped_while_stopping",
-                event_id=message.event_id,
-                content_key=content.key,
-                content_version=content.version,
-                trace_id=message.trace_id,
-            )
+            self._audit_reply_skipped(message, content)
         else:
-            try:
-                self._replies.send_text(
-                    chat_id=message.chat_id,
-                    thread_id=message.thread_id,
-                    reply_to_message_id=message.message_id,
-                    text=content.text,
-                )
-                self._audit.record(
-                    "reply.sent",
-                    event_id=message.event_id,
-                    content_key=content.key,
-                    content_version=content.version,
-                    trace_id=message.trace_id,
-                )
-            except Exception as send_error:  # noqa: BLE001 - 已经在兜底路径，发送失败只记审计
-                self._audit.record(
-                    "reply.failed",
-                    event_id=message.event_id,
-                    content_key=content.key,
-                    content_version=content.version,
-                    error=f"{type(send_error).__name__}: {send_error}",
-                    trace_id=message.trace_id,
-                )
+            self._send_reply(message, content)
         if retryable:
             raise error
         return Outcome(handled_as=None)
 
     def _handle_message(self, message: InboundMessage, *, now: datetime | None = None) -> Outcome:
         """``handle_message`` 的实际业务逻辑；异常安全网见调用方。"""
-
         moment = now or datetime.now(UTC)
         deferred: list[RenderedContent] = []
 
         try:
             outcome = self._within_transaction(message, moment, deferred)
-        except QueueInsertFailure as error:
-            # 真正的 PostgreSQL store 通过独立事务取得一次发送权；没有该能力的旧注入
-            # store 继续抛出原始异常，以免把一个仅测试事务回滚的假实现冒充生产发送器。
-            claim_notice = getattr(self._store, "claim_queue_failure_notice", None)
-            if claim_notice is None:
-                raise error.__cause__ or error
-            if claim_notice(event_id=message.event_id):
-                content = self._texts.queue_failed_content()
-                if not self._should_stop():
-                    try:
-                        self._replies.send_text(
-                            chat_id=message.chat_id,
-                            thread_id=message.thread_id,
-                            reply_to_message_id=message.message_id,
-                            text=content.text,
-                        )
-                        self._audit.record(
-                            "reply.sent",
-                            event_id=message.event_id,
-                            content_key=content.key,
-                            content_version=content.version,
-                            trace_id=message.trace_id,
-                        )
-                    except Exception as send_error:  # noqa: BLE001 - 结论已回滚，提示尽力而为
-                        self._audit.record(
-                            "reply.failed",
-                            event_id=message.event_id,
-                            content_key=content.key,
-                            content_version=content.version,
-                            error=f"{type(send_error).__name__}: {send_error}",
-                            trace_id=message.trace_id,
-                        )
-            self._audit.record(
-                "task.enqueue_failed",
-                event_id=message.event_id,
-                error=f"{type(error.__cause__ or error).__name__}",
-                trace_id=message.trace_id,
-            )
-            return Outcome(handled_as=None)
+        except QueueInsertError as error:
+            return self._report_queue_failure(message, error)
 
         # 到这里事务已经提交。现在才允许产生用户可见的出站副作用。
         if outcome.handled_as is HandledAs.AUTO_PROVISIONING:
-            if self._should_stop():
-                # 停机中**不触发**开通编排（Issue #65 轻审 P2-3）。此前这里无条件调用
-                # runner，再由下面那段停机检查把渲染结果整批丢掉——正式 runner 有外部
-                # 副作用（建档、建环境、发权限、MCP 同步，合同允许到十五分钟），那等于
-                # 在停机窗口里发起一串不可回滚的外部动作，然后把用户唯一能看到的结论
-                # 扔掉；停机预算（默认二十秒量级）也压根装不下它。
-                #
-                # 事件行已经提交、``handled_as`` 已经是 ``auto_provisioning``，但账本上
-                # 的 ``onboarding_dispatched_at`` 仍是空——这条事件因此是一条**故意**
-                # 留下的孤儿，由 P2-2 的对账扫描在下次启动后重新交接。这是知情取舍：
-                # 晚几分钟开通，好过在停机中途开一半。
-                self._audit.record(
-                    "onboarding.deferred_while_stopping",
-                    event_id=message.event_id,
-                    trace_id=message.trace_id,
-                )
-            else:
-                self._start_onboarding(message, deferred)
-
-        if deferred and self._should_stop():
-            # 停机中：结论已经落库，提示是尽力而为的那一部分。此时再发一次出站
-            # HTTP 只会把停机拖过预算（出站默认 30 秒 > 停机 20 秒），而用户少收
-            # 一条提示不改变任何硬承诺。
-            for content in deferred:
-                self._audit.record(
-                    "reply.skipped_while_stopping",
-                    event_id=message.event_id,
-                    content_key=content.key,
-                    content_version=content.version,
-                    trace_id=message.trace_id,
-                )
-            return outcome
-        for content in deferred:
-            try:
-                self._replies.send_text(
-                    chat_id=message.chat_id,
-                    thread_id=message.thread_id,
-                    reply_to_message_id=message.message_id,
-                    text=content.text,
-                )
-                self._audit.record(
-                    "reply.sent",
-                    event_id=message.event_id,
-                    content_key=content.key,
-                    content_version=content.version,
-                    trace_id=message.trace_id,
-                )
-            except Exception as error:  # noqa: BLE001 - 回复失败不改变已提交的结论
-                self._audit.record(
-                    "reply.failed",
-                    event_id=message.event_id,
-                    content_key=content.key,
-                    content_version=content.version,
-                    error=f"{type(error).__name__}: {error}",
-                    trace_id=message.trace_id,
-                )
+            self._trigger_onboarding(message, deferred)
+        self._deliver_deferred(message, deferred)
         return outcome
+
+    def _report_queue_failure(self, message: InboundMessage, error: QueueInsertError) -> Outcome:
+        """入队失败：取得一次发送权后回一条诚实提示，并记 ``task.enqueue_failed``。
+
+        发送权由 store 用独立事务发放，保证平台重投时用户也只收到一次提示；没有该
+        能力的旧注入 store 继续抛出原始异常，以免把一个仅测试事务回滚的假实现冒充
+        生产发送器。
+        """
+        claim_notice = getattr(self._store, "claim_queue_failure_notice", None)
+        if claim_notice is None:
+            raise error.__cause__ or error
+        if claim_notice(event_id=message.event_id):
+            content = self._texts.queue_failed_content()
+            if not self._should_stop():
+                self._send_reply(message, content)
+        self._audit.record(
+            "task.enqueue_failed",
+            event_id=message.event_id,
+            error=f"{type(error.__cause__ or error).__name__}",
+            trace_id=message.trace_id,
+        )
+        return Outcome(handled_as=None)
+
+    def _trigger_onboarding(self, message: InboundMessage, deferred: list[RenderedContent]) -> None:
+        """提交之后才触发开通编排；停机中改为留下一条待对账的事件。
+
+        正式编排有建档、建环境、发权限、MCP 同步这一串不可回滚的外部副作用，合同
+        允许它跑到十五分钟——停机预算（二十秒量级）装不下，中途开一半更糟。事件行
+        已提交、结论已是"认领开通"，但账本上的派发时间仍是空，于是这条事件是一条
+        **故意**留下的孤儿，由对账扫描在下次启动后重新交接：晚几分钟开通，好过在
+        停机中途开一半。
+        """
+        if self._should_stop():
+            self._audit.record(
+                "onboarding.deferred_while_stopping",
+                event_id=message.event_id,
+                trace_id=message.trace_id,
+            )
+            return
+        self._start_onboarding(message, deferred)
+
+    def _deliver_deferred(self, message: InboundMessage, deferred: list[RenderedContent]) -> None:
+        """把攒下的回复在事务提交后统一发出；停机中只记一条跳过审计。
+
+        结论已经落库，提示是尽力而为的那一部分：停机时再发一次出站 HTTP 只会把停机
+        拖过预算（出站默认 30 秒 > 停机 20 秒），而用户少收一条提示不改变硬承诺。
+        """
+        if deferred and self._should_stop():
+            for content in deferred:
+                self._audit_reply_skipped(message, content)
+            return
+        for content in deferred:
+            self._send_reply(message, content)
+
+    def _send_reply(self, message: InboundMessage, content: RenderedContent) -> None:
+        """尽力而为地回一条文本：成功记 ``reply.sent``，失败只记 ``reply.failed``。
+
+        捕获 ``Exception`` 是刻意的——回复失败不得改变任何已经提交的结论。
+        """
+        try:
+            self._replies.send_text(
+                chat_id=message.chat_id,
+                thread_id=message.thread_id,
+                reply_to_message_id=message.message_id,
+                text=content.text,
+            )
+            self._audit.record(
+                "reply.sent",
+                event_id=message.event_id,
+                content_key=content.key,
+                content_version=content.version,
+                trace_id=message.trace_id,
+            )
+        except Exception as error:
+            self._audit.record(
+                "reply.failed",
+                event_id=message.event_id,
+                content_key=content.key,
+                content_version=content.version,
+                error=f"{type(error).__name__}: {error}",
+                trace_id=message.trace_id,
+            )
+
+    def _audit_reply_skipped(self, message: InboundMessage, content: RenderedContent) -> None:
+        """停机中跳过一条回复时的留痕。"""
+        self._audit.record(
+            "reply.skipped_while_stopping",
+            event_id=message.event_id,
+            content_key=content.key,
+            content_version=content.version,
+            trace_id=message.trace_id,
+        )
+
+    # ------------------------------------------------------------------
+    # 第 2 步到第 8 步：事务内的次序
+    # ------------------------------------------------------------------
 
     def _within_transaction(
         self, message: InboundMessage, moment: datetime, deferred: list[RenderedContent]
     ) -> Outcome:
-        """第 2 步到第 8 步，全部落在同一个事务里。"""
-
+        """按 3.2 的次序走完第 2 步到第 8 步，全部落在同一个事务里。"""
         with self._store.transaction() as tx:
-            # —— 第 2 步：幂等。冲突即重复投递，**在此立刻返回**。
-            # 早退发生在加表情之前，因此重复投递在用户可见面同样不重复：不再加表情、
-            # 不再发任何回复（`V-接入-09` 断的是出站调用次数，不只是数据库行数）。
-            try:
-                first_time = tx.insert_inbound_event(
-                    event_id=message.event_id,
-                    event_type=message.event_type,
-                    user_open_id=message.sender_open_id,
-                    trace_id=message.trace_id,
-                )
-            except Exception as error:  # noqa: BLE001 - 见 _InboundEventInsertFailure 文档
-                # 这一次调用本身失败：幂等记录还没有落库，是 handle_message 顶层
-                # 兜底里唯一"重投能真正带来恢复"的出口（Issue #469 opus 独立审查
-                # P2-1，见 _handle_unexpected_failure 的 retryable 参数文档）。
-                raise _InboundEventInsertFailure(error) from error
-            if not first_time:
-                self._audit.record(
-                    "inbound_event.duplicate",
-                    event_id=message.event_id,
-                    trace_id=message.trace_id,
-                )
+            # 第 2 步（`V-接入-01/02/09`）：幂等。早退发生在加表情之前，因此重复
+            # 投递在用户可见面同样不重复——断言断的是出站调用次数，不只是行数。
+            if not self._insert_inbound_event(tx, message):
                 return Outcome(handled_as=None, duplicate=True)
 
-            # —— 第 3 步：加表情。合同：任何消息都加，失败不阻断后续处理。
+            # 第 3 步（`V-接入-07/08`）：任何消息都加表情，失败不阻断后续处理。
             self._add_reaction(message)
 
-            # —— 第 4 步：专用主体判定（opus P3-1 修复，见类文档「关于第 4 步」）。
-            # 必须在按用户状态分派**之前**判定：数据漂移让专用主体意外获得 app_user
-            # 行时，state 就不再是 NOT_PROVISIONED，若判定仍嵌在那个分支内会被
-            # 整段跳过、直接落入下面的业务队列。这里比对的是装配期已经解析好的
-            # 单个 open_id（内存字符串比较），不查库，因此对全体消息零额外开销；
-            # 命中之后转给 ``admin_router`` 的那一次调用才是真正的登记表实时读取。
-            if (
-                self._delegated_subject_open_id is not None
-                and message.sender_open_id == self._delegated_subject_open_id
-            ):
+            # 第 4 步（`V-管理-24`）：专用授权主体只能进管理命令面或确定性拒绝出口。
+            # 判定必须在按状态分派**之前**——数据漂移让专用主体意外拿到 app_user 行
+            # 时，状态就不再是"未开通"，嵌在那个分支里的判定会被整段跳过、直接落进
+            # 业务队列。这里只做一次内存字符串比较，不查库。
+            delegated = self._gates.delegated_subject_open_id
+            if delegated is not None and message.sender_open_id == delegated:
                 return self._route_delegated_subject(tx, message, deferred)
 
-            # —— 第 5 步：用户状态。
-            # 任务归属只由发送者标识解析而来（`V-接入-11`）：这里传的是
-            # message.sender_open_id，而 InboundMessage 里根本没有第二个用户标识可传。
+            # 第 5 步（`V-审计-05`）：用户状态。任务归属只由发送者标识解析而来
+            # （`V-接入-11`）：``InboundMessage`` 里根本没有第二个用户标识可传。
             user = tx.lookup_user(open_id=message.sender_open_id)
             state = user.state if user is not None else UserState.NOT_PROVISIONED
-
             if state is UserState.NOT_PROVISIONED:
-                # 管理命令面分流（Issue #95 S-M-01）：登记表里当前有效的管理员发来的
-                # 私聊文本消息，从「确定性拒绝出口」改道进入管理命令面，完全不进入
-                # 自动开通这条链。登记表里没有当前有效条目的发送者（未登记、已撤销、
-                # 或未装配本路由）落回下面既有分支——真正的判定发生在
-                # ``AdminCommandRouter.route`` 内部的实时读表，这里只负责按结果分流。
-                # （专用授权主体本身已经在第 4 步被识别并短路返回，不会走到这里；
-                # 本分支覆盖的是登记表里*其他*当前有效条目，例如未来的人类管理员。）
-                if self._try_admin_route(tx, message, deferred):
-                    return Outcome(handled_as=HandledAs.COMMAND)
-
-                # 内测名单闸（Issue #302 S-N-01，opus 批量审查 P1 修复）：在发
-                # `onboarding.checking`、把这条事件标记成 AUTO_PROVISIONING 之前
-                # 判名单。名单外——包括名单未装配、名单为空——一律落到既有的
-                # 「确定性拒绝出口」`onboarding.innertest_not_open`，零建档、零
-                # 开通派发，只留一条与 scheduler 侧同名的审计（不带 open_id）。
-                # scheduler 侧的同名闸原样保留，两道闸独立判定，互为纵深。
-                if self._onboarding is not None:
-                    roster_gate = self._innertest_roster_gate
-                    if roster_gate is not None and not roster_gate(message.sender_open_id):
-                        deferred.append(self._texts.catalog.text("onboarding.innertest_not_open"))
-                        self._audit.record(
-                            "onboarding.innertest_roster_rejected",
-                            event_id=message.event_id,
-                            trace_id=message.trace_id,
-                        )
-                        tx.mark_handled_as(event_id=message.event_id, handled_as=HandledAs.DROPPED)
-                        return Outcome(handled_as=HandledAs.DROPPED)
-
-                    # 合同：未开通用户发来的业务内容不进入问数、不保存也不回显
-                    # （`V-审计-05`）。注意审计里也不带消息正文：内容"不保存"包括
-                    # 不写进审计。
-                    self._audit.record(
-                        "inbound_event.auto_provisioning",
-                        event_id=message.event_id,
-                        trace_id=message.trace_id,
-                    )
-                    tx.mark_handled_as(
-                        event_id=message.event_id, handled_as=HandledAs.AUTO_PROVISIONING
-                    )
-                    return Outcome(handled_as=HandledAs.AUTO_PROVISIONING)
-
-                # 未配置正向编排的旧装配仍然保持明确的否定终态；正式 gateway
-                # 通过 apps.gateway.build_supervisor 的 onboarding 注入口启用 #65。
-                self._audit.record(
-                    "inbound_event.not_provisioned",
-                    event_id=message.event_id,
-                    trace_id=message.trace_id,
-                )
-                tx.mark_handled_as(event_id=message.event_id, handled_as=HandledAs.NOT_PROVISIONED)
-                return Outcome(handled_as=HandledAs.NOT_PROVISIONED)
+                return self._handle_not_provisioned(tx, message, deferred)
 
             assert user is not None  # NOT_PROVISIONED 已在上一分支返回
-
             if state is UserState.PROVISIONING:
-                # 开通正在进行中，用户又发了一条。合同：「权限同步期间，卡片明确显示
-                # 『权限正在同步，预计最多需要十五分钟』，用户无需重复开通」。
-                # **不重新触发编排**（那一条正在 scheduler 里跑），也不入队。
-                deferred.append(self._texts.catalog.text("onboarding.matched"))
-                self._audit.record(
-                    "inbound_event.onboarding_in_flight",
-                    event_id=message.event_id,
-                    user_id=user.user_id,
-                    trace_id=message.trace_id,
-                )
-                tx.mark_handled_as(event_id=message.event_id, handled_as=HandledAs.NOT_PROVISIONED)
-                return Outcome(handled_as=HandledAs.NOT_PROVISIONED)
-
+                return self._handle_onboarding_in_flight(tx, message, user, deferred)
             if state is UserState.SUSPENDED:
-                deferred.append(self._texts.suspended_content())
-                self._audit.record(
-                    "inbound_event.suspended",
-                    event_id=message.event_id,
-                    user_id=user.user_id,
-                    trace_id=message.trace_id,
-                )
-                tx.mark_handled_as(event_id=message.event_id, handled_as=HandledAs.DROPPED)
-                return Outcome(handled_as=HandledAs.DROPPED)
+                return self._handle_suspended(tx, message, user, deferred)
 
             conversation = tx.ensure_conversation(
                 user_id=user.user_id,
                 chat_id=message.chat_id,
                 thread_id=message.thread_id,
             )
+            self._append_one_shot_notices(tx, message, user, conversation, deferred)
+            return self._handle_active_message(tx, message, user, conversation, moment, deferred)
 
-            # 用户这次主动发消息：如果这个话题上一次问数因二十四小时未获得
-            # platform_received 而到期（`delivery_expired`），且还没提示过，就在这里
-            # 提示一次「请重新提问」（Issue #152、`V-投递-06` 后半句）。这条检查
-            # **不影响**当前消息接下来按第 6～8 步的正常处理——用户这条消息该入队
-            # 还是入队，该被判忙碌还是判忙碌，过期提示只是额外追加的一条回复，且
-            # 只提示一次，不主动推送、不重放旧答案。
-            if tx.consume_delivery_expired_notice(conversation_id=conversation.conversation_id):
-                deferred.append(self._texts.catalog.text("gateway.delivery_expired"))
+    def _insert_inbound_event(self, tx, message: InboundMessage) -> bool:
+        """第 2 步：落幂等记录。返回 ``False`` 表示这条事件此前已经处理过。
 
-            # 预开通用户的首聊补一句（Issue #541，产品负责人裁定 4：预开通期间静默）。
-            # 与上面那条过期提示**逐字同一条纪律**：消费一次、只提示一次，且**不影响**
-            # 这条消息接下来按第 6～8 步的正常处理——该入队入队、该判忙碌判忙碌。
-            # 挂起是谁写的、为什么只可能挂给"从没跟我们说过话的人"，见
-            # ``core/identity/onboarding_ports.UserStateStore.mark_preprovision_notice_pending``。
-            #
-            # 次序是硬的（rc25 修复包 F1）：**先渲染、渲染成功才消费一次性标志**。
-            # 那句文案带真实公司/职能占位，渲染可能失败；先消费再渲染，失败会把标志
-            # 白白烧掉、异常又被吞成审计，这个人**永远**收不到产品承诺的那句话。渲染
-            # 是纯函数，提前到 consume 之前不改变事务语义；渲染失败只记审计、不消费、
-            # 不打断这条消息的正常处理，下一条消息还会再试。
-            pending_notice = tx.peek_preprovision_notice(user_id=user.user_id)
-            if pending_notice is not None:
-                rendered_notice = self._onboarding_replies.render_preprovision_notice(
-                    pending_notice,
-                    event_id=message.event_id,
-                    user_id=user.user_id,
-                    trace_id=message.trace_id,
-                )
-                if rendered_notice is not None and tx.consume_preprovision_notice(
-                    user_id=user.user_id
-                ):
-                    deferred.append(rendered_notice)
-
-            # —— 第 6 步：解析命令。在忙碌判定**之前**，因为 /stop 不受忙碌拦截。
-            command = parse_command(message.text)
-            # /memory 命令面（Issue #357 S-H3-3）：与 /stop 同一姿态——查/清/登记
-            # 记忆是元数据操作，不需要等当前任务跑完，不应该被"当前任务仍在处理
-            # 中"拦住。解析结果在下面 is_unrecognized_slash_message 判定之后、
-            # 忙碌判定之前分支处理，见该处注释。
-            memory_command = parse_memory_command(message.text)
-
-            # 第 6 步的延伸（Trace #304 批次 5 直修，产品负责人 biai-stage 真实测试
-            # 暴露）：以 / 开头、但不是上面 parse_command 认识的任何命令的文本消息，
-            # 在这里直接回绝——执行层（Agent SDK 底层的 Claude Code CLI）把这类文本
-            # 解析成系统斜杠命令而不是用户问题，不是我们能控制的解析行为：
-            # /config、/model、/help 令会话在一两秒内瞬断（session_failed），/loop
-            # 会让模型尝试调用内部工具（被工具白名单拦下、无真实副作用，但已构成
-            # model_protocol_breakdown 失败）。同样放在忙碌判定**之前**、且刻意不
-            # 受它影响：这条消息不管话题忙不忙碌都不会被受理，没有理由先回一轮
-            # 「当前任务仍在处理中」，逼用户在任务结束后重新发一遍同样会被拒的输入。
-            # 只看整条消息去除首尾空白后的第一个字符，句子中间的 /（日期、URL）
-            # 不受影响；判断复用 parse_command 的整条匹配语义，/new /stop 不会被
-            # 误伤（`is_unrecognized_slash_message`）。管理员的 /admin 命令面分流
-            # 发生在更早的第 4/5 步（专用主体判定、NOT_PROVISIONED 分支内的登记表
-            # 判定），到这里说明发送者已经确认是普通业务用户，不影响管理面。
-            if is_unrecognized_slash_message(message.text):
-                deferred.append(self._texts.catalog.text("gateway.slash_rejected"))
-                self._audit.record(
-                    "command.unsupported_slash",
-                    event_id=message.event_id,
-                    user_id=user.user_id,
-                    conversation_id=conversation.conversation_id,
-                    trace_id=message.trace_id,
-                )
-                tx.mark_handled_as(event_id=message.event_id, handled_as=HandledAs.COMMAND)
-                return Outcome(handled_as=HandledAs.COMMAND)
-
-            # —— 第 7 步：忙碌判定。
-            busy = conversation.running_task_id is not None
-
-            if command is Command.STOP:
-                # `V-会话-10`：3.2 第 7 步的条件是「忙碌 **且非 /stop**」，
-                # 因此 /stop 在忙碌时照常被处理，而不是收到"当前任务仍在处理中"。
-                stopped = tx.request_stop(conversation_id=conversation.conversation_id)
-                self._audit.record(
-                    "command.stop",
-                    event_id=message.event_id,
-                    user_id=user.user_id,
-                    conversation_id=conversation.conversation_id,
-                    stopped_task_id=stopped,
-                    trace_id=message.trace_id,
-                )
-                tx.mark_handled_as(event_id=message.event_id, handled_as=HandledAs.COMMAND)
-                return Outcome(handled_as=HandledAs.COMMAND)
-
-            if memory_command.kind is not MemoryCommandKind.NONE or is_memory_command_message(
-                message.text
-            ):
-                # /memory 命令面：与 /stop 同一姿态，放在忙碌判定之前——见类顶部
-                # 文档「第 6 步的延伸」与 `_handle_memory_command` 的文档。
-                return self._memory.handle(
-                    tx, message, user, conversation, memory_command, deferred
-                )
-
-            if busy:
-                # 忙碌期：只回提示。合同——该消息不进入对话历史、不排队，也不会在当前
-                # 任务结束后自动提交或自动生效。`/new` 被合同明确列入受限命令，因此这条
-                # 分支在 /new 之前（`V-会话-09`）：忙碌时的 /new 不清空上下文。
-                #
-                # 文案如实（Issue #465）：`conversation` 是这次事务**开始时**读到的
-                # 快照，`running_task_status` 与判定 `busy` 用的 `running_task_id`
-                # 同源、同一次查询——这里能可靠区分"已经在跑"与"还在排队没人领"。
-                deferred.append(self._busy_hint_for(conversation))
-                tx.mark_handled_as(event_id=message.event_id, handled_as=HandledAs.BUSY_HINT)
-                return Outcome(handled_as=HandledAs.BUSY_HINT)
-
-            if command is Command.NEW:
-                # 空闲时的 /new：立即清空当前对话上下文，其他话题不受影响
-                # （条件写在 conversation_id 上，天然只影响这一行）。
-                #
-                # 清空本身**再判一次忙碌**，因为上面那个 busy 读的是事务开始时的快照：
-                # 另一条连接可能在这中间抢占成功并已经在跑。条件更新影响 0 行就说明
-                # 话题已经忙了，走忙碌分支——否则会把一个正在执行的任务的上下文清掉。
-                if not tx.clear_agent_session(conversation_id=conversation.conversation_id):
-                    # 竞态分支（Issue #465 不覆盖）：`conversation` 快照读到的是"空闲"，
-                    # 真正清空时才发现另一条连接已经抢占成功——抢占它的那个任务的
-                    # 状态从未被本次事务读到，无法诚实地判定"排队中"还是"处理中"，
-                    # 因此保留原有的"处理中"默认文案，不去猜。这条竞态本身极罕见
-                    # （两条消息几乎同时到达同一话题）。
-                    deferred.append(self._texts.busy_hint_content())
-                    tx.mark_handled_as(event_id=message.event_id, handled_as=HandledAs.BUSY_HINT)
-                    return Outcome(handled_as=HandledAs.BUSY_HINT)
-                self._audit.record(
-                    "command.new",
-                    event_id=message.event_id,
-                    user_id=user.user_id,
-                    conversation_id=conversation.conversation_id,
-                    trace_id=message.trace_id,
-                )
-                # 产品合同「系统明确告诉用户已经开启新会话」：表情继续充当「已收到」
-                # 信号，这里追加一条明确的文字确认，随事务提交后统一发送循环发出
-                # （不改变事务边界，见类顶部说明）。
-                deferred.append(self._texts.catalog.text("gateway.new_session"))
-                tx.mark_handled_as(event_id=message.event_id, handled_as=HandledAs.COMMAND)
-                return Outcome(handled_as=HandledAs.COMMAND)
-
-            # 非文本消息（图片、语音、富文本……）：表情已经加过（合同：任何消息都加），
-            # 但**不入队**——把一条语音当成空问题排进队列，用户只会拿到一个莫名其妙的
-            # 失败，而且会白占一次话题串行名额。
-            #
-            # 刻意**不回复任何文案**：「是否要明确告诉用户暂不支持这种消息」是一条新的
-            # 用户可见承诺，合同没有写，本批不发明（与入队失败的处理同一姿态），
-            # 已登记为待产品负责人定夺项。
-            #
-            # 位置在忙碌判定**之后**：忙碌期的非文本消息与其他消息一样只得到
-            # 「当前任务仍在处理中」，不因为类型不同而给出第二种回应。
-            if message.message_type != TEXT_MESSAGE_TYPE:
-                self._audit.record(
-                    "message.unsupported_type",
-                    event_id=message.event_id,
-                    user_id=user.user_id,
-                    message_type=message.message_type,
-                    trace_id=message.trace_id,
-                )
-                tx.mark_handled_as(event_id=message.event_id, handled_as=HandledAs.DROPPED)
-                return Outcome(handled_as=HandledAs.DROPPED)
-
-            # —— 第 8 步：入队。
-            return self._enqueue(
-                tx,
-                message,
-                user_id=user.user_id,
-                conversation=conversation,
-                now=moment,
-                deferred=deferred,
+        Raises:
+            _InboundEventInsertError: 落库调用本身失败——见该异常的文档。
+        """
+        try:
+            first_time = tx.insert_inbound_event(
+                event_id=message.event_id,
+                event_type=message.event_type,
+                user_open_id=message.sender_open_id,
+                trace_id=message.trace_id,
             )
+        except Exception as error:
+            raise _InboundEventInsertError(error) from error
+        if not first_time:
+            self._audit.record(
+                "inbound_event.duplicate",
+                event_id=message.event_id,
+                trace_id=message.trace_id,
+            )
+            return False
+        return True
+
+    def _handle_not_provisioned(
+        self, tx, message: InboundMessage, deferred: list[RenderedContent]
+    ) -> Outcome:
+        """未开通用户：先看管理命令面，再过内测名单闸，最后才认领开通。
+
+        登记表里当前有效的管理员发来的私聊文本改道进入管理命令面，完全不进入自动
+        开通这条链；真正的判定发生在路由内部的实时读表，这里只按结果分流。名单闸
+        放在发「正在核对」之前——名单外（含未装配、名单为空）一律落到既有的确定性
+        拒绝出口，零建档、零开通派发。合同：未开通用户发来的业务内容不进入问数、
+        不保存也不回显（`V-审计-05`），因此审计里同样不带消息正文。
+        """
+        if self._try_admin_route(tx, message, deferred):
+            return Outcome(handled_as=HandledAs.COMMAND)
+
+        if self._onboarding is None:
+            # 未配置正向编排的旧装配仍然保持明确的否定终态。
+            self._audit.record(
+                "inbound_event.not_provisioned",
+                event_id=message.event_id,
+                trace_id=message.trace_id,
+            )
+            tx.mark_handled_as(event_id=message.event_id, handled_as=HandledAs.NOT_PROVISIONED)
+            return Outcome(handled_as=HandledAs.NOT_PROVISIONED)
+
+        roster_gate = self._gates.innertest_roster_gate
+        if roster_gate is not None and not roster_gate(message.sender_open_id):
+            deferred.append(self._texts.catalog.text("onboarding.innertest_not_open"))
+            self._audit.record(
+                "onboarding.innertest_roster_rejected",
+                event_id=message.event_id,
+                trace_id=message.trace_id,
+            )
+            tx.mark_handled_as(event_id=message.event_id, handled_as=HandledAs.DROPPED)
+            return Outcome(handled_as=HandledAs.DROPPED)
+
+        self._audit.record(
+            "inbound_event.auto_provisioning",
+            event_id=message.event_id,
+            trace_id=message.trace_id,
+        )
+        tx.mark_handled_as(event_id=message.event_id, handled_as=HandledAs.AUTO_PROVISIONING)
+        return Outcome(handled_as=HandledAs.AUTO_PROVISIONING)
+
+    def _handle_onboarding_in_flight(
+        self, tx, message: InboundMessage, user, deferred: list[RenderedContent]
+    ) -> Outcome:
+        """开通正在进行中，用户又发了一条：只回同步中的固定提示。
+
+        合同：「权限同步期间，卡片明确显示『权限正在同步，预计最多需要十五分钟』，
+        用户无需重复开通」。**不重新触发编排**（那一条正在别处跑），也不入队。
+        """
+        deferred.append(self._texts.catalog.text("onboarding.matched"))
+        self._audit.record(
+            "inbound_event.onboarding_in_flight",
+            event_id=message.event_id,
+            user_id=user.user_id,
+            trace_id=message.trace_id,
+        )
+        tx.mark_handled_as(event_id=message.event_id, handled_as=HandledAs.NOT_PROVISIONED)
+        return Outcome(handled_as=HandledAs.NOT_PROVISIONED)
+
+    def _handle_suspended(
+        self, tx, message: InboundMessage, user, deferred: list[RenderedContent]
+    ) -> Outcome:
+        """已停用用户：回停用提示并丢弃这条消息。"""
+        deferred.append(self._texts.suspended_content())
+        self._audit.record(
+            "inbound_event.suspended",
+            event_id=message.event_id,
+            user_id=user.user_id,
+            trace_id=message.trace_id,
+        )
+        tx.mark_handled_as(event_id=message.event_id, handled_as=HandledAs.DROPPED)
+        return Outcome(handled_as=HandledAs.DROPPED)
+
+    def _append_one_shot_notices(
+        self, tx, message: InboundMessage, user, conversation, deferred: list[RenderedContent]
+    ) -> None:
+        """追加两条"消费一次、只提示一次"的附加回复。
+
+        两条都**不影响**这条消息接下来按第 6～8 步的正常处理——该入队入队、该判忙碌
+        判忙碌，只是额外多一条回复：
+
+        - 上一次问数因二十四小时未获得平台回执而到期时，提示一次「请重新提问」
+          （`V-投递-06` 后半句），不主动推送、不重放旧答案；
+        - 预开通用户的首聊补一句。次序是硬的：**先渲染、渲染成功才消费一次性标志**
+          ——先消费再渲染会在渲染失败时白白烧掉标志，这个人**永远**收不到那句话。
+        """
+        if tx.consume_delivery_expired_notice(conversation_id=conversation.conversation_id):
+            deferred.append(self._texts.catalog.text("gateway.delivery_expired"))
+
+        pending_notice = tx.peek_preprovision_notice(user_id=user.user_id)
+        if pending_notice is None:
+            return
+        rendered_notice = self._onboarding_replies.render_preprovision_notice(
+            pending_notice,
+            event_id=message.event_id,
+            user_id=user.user_id,
+            trace_id=message.trace_id,
+        )
+        if rendered_notice is not None and tx.consume_preprovision_notice(user_id=user.user_id):
+            deferred.append(rendered_notice)
+
+    def _handle_active_message(
+        self,
+        tx,
+        message: InboundMessage,
+        user,
+        conversation,
+        moment: datetime,
+        deferred: list[RenderedContent],
+    ) -> Outcome:
+        """第 6 到第 8 步：解析命令、判忙碌、入队。
+
+        次序是合同的：``/stop`` 与 ``/memory`` 都是元数据操作，放在忙碌判定**之前**
+        （`V-会话-10`）；不被认识的斜杠文本同样不受忙碌影响——这条消息不管忙不忙碌
+        都不会被受理，没有理由先让用户等一轮忙碌提示再重发一遍同样会被拒的输入。
+        ``/new`` 反过来被合同列入受限命令，因此排在忙碌判定**之后**（`V-会话-09`）。
+        """
+        command = parse_command(message.text)
+        memory_command = parse_memory_command(message.text)
+
+        if is_unrecognized_slash_message(message.text):
+            return self._reject_unrecognized_slash(tx, message, user, conversation, deferred)
+        if command is Command.STOP:
+            return self._request_stop(tx, message, user, conversation)
+        if memory_command.kind is not MemoryCommandKind.NONE or is_memory_command_message(
+            message.text
+        ):
+            return self._memory.handle(tx, message, user, conversation, memory_command, deferred)
+
+        if conversation.running_task_id is not None:
+            # 第 7 步（`V-会话-04/09/10`）：忙碌期只回提示。合同——该消息不进入对话
+            # 历史、不排队，也不会在当前任务结束后自动提交或自动生效。
+            deferred.append(self._busy_hint_for(conversation))
+            tx.mark_handled_as(event_id=message.event_id, handled_as=HandledAs.BUSY_HINT)
+            return Outcome(handled_as=HandledAs.BUSY_HINT)
+
+        if command is Command.NEW:
+            return self._start_new_session(tx, message, user, conversation, deferred)
+        if message.message_type != TEXT_MESSAGE_TYPE:
+            return self._drop_unsupported_type(tx, message, user)
+        return self._enqueue(
+            tx,
+            message,
+            user_id=user.user_id,
+            conversation=conversation,
+            now=moment,
+            deferred=deferred,
+        )
+
+    def _reject_unrecognized_slash(
+        self, tx, message: InboundMessage, user, conversation, deferred: list[RenderedContent]
+    ) -> Outcome:
+        """以 ``/`` 开头但不被认识的文本：直接回绝，不入队（`V-会话-05/06/11`）。
+
+        执行层（Agent SDK 底下的 CLI）会把这类文本解析成系统斜杠命令而不是用户
+        问题：``/config`` ``/model`` ``/help`` 令会话在一两秒内瞬断，``/loop`` 会让
+        模型尝试调用内部工具。只看整条消息去掉首尾空白后的第一个字符，句子中间的
+        ``/``（日期、URL）不受影响；``/new`` ``/stop`` 由整条匹配语义排除在外。
+        管理员的命令面分流发生在更早的第 4/5 步，到这里发送者已经确认是普通用户。
+        """
+        deferred.append(self._texts.catalog.text("gateway.slash_rejected"))
+        self._audit.record(
+            "command.unsupported_slash",
+            event_id=message.event_id,
+            user_id=user.user_id,
+            conversation_id=conversation.conversation_id,
+            trace_id=message.trace_id,
+        )
+        tx.mark_handled_as(event_id=message.event_id, handled_as=HandledAs.COMMAND)
+        return Outcome(handled_as=HandledAs.COMMAND)
+
+    def _request_stop(self, tx, message: InboundMessage, user, conversation) -> Outcome:
+        """``/stop``：忙碌时照常受理（`V-会话-10`），不回「当前任务仍在处理中」。"""
+        stopped = tx.request_stop(conversation_id=conversation.conversation_id)
+        self._audit.record(
+            "command.stop",
+            event_id=message.event_id,
+            user_id=user.user_id,
+            conversation_id=conversation.conversation_id,
+            stopped_task_id=stopped,
+            trace_id=message.trace_id,
+        )
+        tx.mark_handled_as(event_id=message.event_id, handled_as=HandledAs.COMMAND)
+        return Outcome(handled_as=HandledAs.COMMAND)
+
+    def _start_new_session(
+        self, tx, message: InboundMessage, user, conversation, deferred: list[RenderedContent]
+    ) -> Outcome:
+        """空闲时的 ``/new``：清空当前话题的上下文，其他话题不受影响。
+
+        清空本身**再判一次忙碌**：上面那次判定读的是事务开始时的快照，另一条连接
+        可能在这中间抢占成功并已经在跑。条件更新影响 0 行就说明话题已经忙了，走
+        忙碌分支——否则会把一个正在执行的任务的上下文清掉。这条竞态下抢占方的任务
+        状态从未被本次事务读到，无法诚实判定"排队中"还是"处理中"，因此保留默认的
+        「处理中」文案，不去猜。
+        """
+        if not tx.clear_agent_session(conversation_id=conversation.conversation_id):
+            deferred.append(self._texts.busy_hint_content())
+            tx.mark_handled_as(event_id=message.event_id, handled_as=HandledAs.BUSY_HINT)
+            return Outcome(handled_as=HandledAs.BUSY_HINT)
+        self._audit.record(
+            "command.new",
+            event_id=message.event_id,
+            user_id=user.user_id,
+            conversation_id=conversation.conversation_id,
+            trace_id=message.trace_id,
+        )
+        # 合同「系统明确告诉用户已经开启新会话」：表情只表示「已收到」，这里补一条
+        # 明确的文字确认，随事务提交后统一发送。
+        deferred.append(self._texts.catalog.text("gateway.new_session"))
+        tx.mark_handled_as(event_id=message.event_id, handled_as=HandledAs.COMMAND)
+        return Outcome(handled_as=HandledAs.COMMAND)
+
+    def _drop_unsupported_type(self, tx, message: InboundMessage, user) -> Outcome:
+        """非文本消息（图片、语音、富文本……）：表情已经加过，但**不入队**。
+
+        把一条语音当成空问题排进队列，用户只会拿到一个莫名其妙的失败，还白占一次
+        话题串行名额。刻意**不回复任何文案**：「是否要明确告诉用户暂不支持这种
+        消息」是一条新的用户可见承诺，合同没有写，本模块不发明。位置在忙碌判定
+        之后——忙碌期的非文本消息与其他消息一样只得到「当前任务仍在处理中」。
+        """
+        self._audit.record(
+            "message.unsupported_type",
+            event_id=message.event_id,
+            user_id=user.user_id,
+            message_type=message.message_type,
+            trace_id=message.trace_id,
+        )
+        tx.mark_handled_as(event_id=message.event_id, handled_as=HandledAs.DROPPED)
+        return Outcome(handled_as=HandledAs.DROPPED)
 
     # ------------------------------------------------------------------
-    # 内部步骤
+    # 提交之后：开通编排与出站回复
     # ------------------------------------------------------------------
 
     def _start_onboarding(self, message: InboundMessage, deferred: list[RenderedContent]) -> None:
         """提交后启动一次自动开通，并把结果限制在内容目录内。
 
-        事务只负责认领 ``event_id``；身份读取、匹配、开通和 MCP 同步由 runner
-        自己用独立的幂等边界完成。这样 gateway 不会把长耗时外部调用放进队列事务，
-        也不会把用户原文传入权限链。
+        事务只负责认领 ``event_id``；身份读取、匹配、开通和 MCP 同步由编排自己用
+        独立的幂等边界完成。这样 gateway 不会把长耗时外部调用放进队列事务，也不会
+        把用户原文传入权限链。
         """
-
         assert self._onboarding is not None
         checking = self._texts.catalog.text("onboarding.checking")
         deferred.append(checking)
@@ -773,32 +657,8 @@ class EventPipeline:
             rendered = self._onboarding_replies.render_result(
                 result, checking_key=checking.key, message=message
             )
-        except Exception as error:  # noqa: BLE001 - 失败必须落到统一终态文案
-            # 独立审查 codex P1-2（已核实，见 commit 说明的核实证据）：这条分支发的
-            # 「已转交管理员处理」不像 onboarding_runner.py 的同名文案那样接了
-            # ONBOARDING_FAILED 管理员告警回调。**防御性分支，生产不可达**：
-            # `apps/gateway/__init__.py` 的 `main()` 硬编码把 `_RecordingOnboarding`
-            # （`start()` 永不抛异常，恒定返回 `OnboardingResult(state=STARTED)`）
-            # 接到这条管线上，而 `assert_gateway_onboarding_is_inert` +
-            # `INERT_ONBOARDING_TYPES == {"_RecordingOnboarding"}` 在装配期就响亮
-            # 拒绝任何其他实现——真正会抛异常或返回坏结果的 `AutoOnboardingRunner`
-            # 结构上装不到这条管线上。告警缺失因此**无生产影响**；gateway 侧若未来
-            # 装配真实 runner（松开这条装配断言），需要同步在这里接上告警出口，
-            # 不能让这条兜底继续悄悄不告警。
-            internal = self._texts.catalog.text(
-                "onboarding.internal_error", reference=message.trace_id
-            )
-            deferred.append(internal)
-            self._audit.record(
-                "onboarding.failed",
-                event_id=message.event_id,
-                state=OnboardingState.INTERNAL_ERROR.value,
-                error=type(error).__name__,
-                trace_id=message.trace_id,
-            )
-            # 编排确实被调用过（异常来自它内部），账本必须记上：不记的话对账扫描会
-            # 把一条已经得到冻结失败终态的事件再交接一次，用户会收到第二遍 LX-ONBOARD-001。
-            self._mark_onboarding_dispatched(message)
+        except Exception as error:
+            self._report_onboarding_failure(message, error, deferred)
             return
 
         deferred.extend(rendered)
@@ -811,35 +671,50 @@ class EventPipeline:
             trace_id=message.trace_id,
         )
         if result.state is OnboardingState.STARTED:
-            # **``started`` 的账由编排自己记。** 它表示编排已经异步接手、结论还没有产生；
-            # 这里就把事件记成"已交接"，会让一次跑到一半的崩溃（进程被杀、机器重启）
-            # 变成谁都不会再看的悬空状态——对账扫描被账本挡在门外，用户永远停在「正在
-            # 核对」。正式 runner 在链跑到终态、并把结论发给用户之后才记这一笔
-            # （``core/identity/onboarding_runner.AutoOnboardingRunner._execute``），
-            # 因此崩在中途的那一条仍然是孤儿，仍然会被扫描重新交接一次。
-            #
-            # 同步返回终态的编排（失败关闭桩、旧的同步实现）不受影响：它们的结论此刻
-            # 已经产生，账照记。
+            # **``started`` 的账由编排自己记。** 它表示编排已经异步接手、结论还没有
+            # 产生；这里就记成"已交接"，会让一次跑到一半的崩溃变成谁都不会再看的
+            # 悬空状态——对账扫描被账本挡在门外，用户永远停在「正在核对」。同步返回
+            # 终态的编排不受影响：它们的结论此刻已经产生，账照记。
             return
         self._mark_onboarding_dispatched(message)
 
+    def _report_onboarding_failure(
+        self, message: InboundMessage, error: Exception, deferred: list[RenderedContent]
+    ) -> None:
+        """编排本身抛异常或返回坏结果：回冻结的内部故障文案并把事件记成已交接。
+
+        **这条分支在生产不可达**：gateway 装配期硬性只接受一种恒定返回"已接手"且
+        永不抛异常的惰性编排实现，真正会失败的编排结构上装不到这条管线上。因此这里
+        没有接管理员告警回调；gateway 侧若未来装配真实编排，须同步在这里补上告警。
+        编排确实被调用过，账必须记上——不记的话对账扫描会把一条已经得到冻结失败终态
+        的事件再交接一次，用户会收到第二遍同样的内部故障提示。
+        """
+        deferred.append(
+            self._texts.catalog.text("onboarding.internal_error", reference=message.trace_id)
+        )
+        self._audit.record(
+            "onboarding.failed",
+            event_id=message.event_id,
+            state=OnboardingState.INTERNAL_ERROR.value,
+            error=type(error).__name__,
+            trace_id=message.trace_id,
+        )
+        self._mark_onboarding_dispatched(message)
+
     def _mark_onboarding_dispatched(self, message: InboundMessage) -> None:
-        """记账：这条事件已经交给开通编排了（Issue #65 轻审 P2-2）。
+        """记账：这条事件已经交给开通编排了。
 
         **失败只记审计，绝不向上抛。** 记不上账的最坏后果是对账扫描过一会儿再交接
         一次，而 ``OnboardingRunner.start`` 按合同幂等；反过来，让一次已经拿到结论的
         开通因为一条簿记 ``UPDATE`` 失败而炸掉，会把用户可见的终态提示也一起带走。
-        旧注入 store 没有这个方法时同样落进这里（``AttributeError``），行为一致：
-        账本没记上，孤儿由扫描兜底。
+        旧注入 store 没有这个方法时同样落进这里（``AttributeError``），行为一致。
 
-        动作名带 ``failed`` 后缀是为了让 ``apps/gateway`` 的审计实现把它升到
-        ``WARNING``：这是一次真实的数据库写失败，淹没在 INFO 流水里就等于没记
-        （#175/#185 的教训）。
+        动作名带 ``failed`` 后缀，让审计实现把它升到 ``WARNING``：这是一次真实的
+        数据库写失败，淹没在 INFO 流水里等于没记。
         """
-
         try:
             self._store.mark_onboarding_dispatched(event_id=message.event_id)
-        except Exception as error:  # noqa: BLE001 - 见 docstring
+        except Exception as error:
             self._audit.record(
                 "onboarding.dispatch_record_failed",
                 event_id=message.event_id,
@@ -848,16 +723,12 @@ class EventPipeline:
             )
 
     def _busy_hint_for(self, conversation) -> RenderedContent:
-        """按话题当前占用任务的真实阶段选文案（Issue #465，rc22 S-3）。
+        """按话题当前占用任务的真实阶段选忙碌文案。
 
-        只信 `running_task_status == "queued"` 这一个精确值：`task.status` 的其余
-        取值（`running`/`awaiting_delivery`/终态）都归入"处理中"这一桶——它们共同
-        的事实是"已经有 worker 或投递流程在处理这个任务，不是单纯地在队列里等"，
-        继续沿用既有的 `gateway.busy_hint` 文案不算说谎；`None`（结构上不应该在
-        `running_task_id` 非空时出现，见 `ConversationRecord` 的 LEFT JOIN）同样
-        保守地落回这一桶，不对不认识的取值猜测成"排队中"。
+        只信 ``running_task_status == "queued"`` 这一个精确值：其余取值共同的事实是
+        "已经有人在处理这个任务，不是单纯在队列里等"，沿用「处理中」文案不算说谎；
+        读不到状态时同样保守地落回这一桶，不对不认识的取值猜成"排队中"。
         """
-
         if conversation.running_task_status == "queued":
             return self._texts.busy_hint_queued_content()
         return self._texts.busy_hint_content()
@@ -865,14 +736,13 @@ class EventPipeline:
     def _add_reaction(self, message: InboundMessage) -> None:
         """第 3 步。失败只记审计，绝不向上抛（`V-接入-08`）。
 
-        捕获 ``Exception`` 是刻意的：这一步的产品语义就是"尽力而为"，任何失败形态都
-        不该改变后续处理。把它收窄成某几个异常类型，等于让没预料到的失败形态重新获得
-        阻断后续处理的能力。
+        捕获 ``Exception`` 是刻意的：这一步的产品语义就是"尽力而为"，任何失败形态
+        都不该改变后续处理。收窄成某几个异常类型，等于让没预料到的失败形态重新
+        获得阻断后续处理的能力。
         """
-
         try:
             self._reactions.add(message_id=message.message_id)
-        except Exception as error:  # noqa: BLE001 - 见 docstring
+        except Exception as error:
             self._audit.record(
                 "reaction.failed",
                 event_id=message.event_id,
@@ -884,25 +754,27 @@ class EventPipeline:
     def _try_admin_route(
         self, tx, message: InboundMessage, deferred: list[RenderedContent]
     ) -> bool:
-        """尝试把这条私聊文本消息交给管理命令面；两个调用点共用同一份接线
-        （第 4 步的专用主体判定、第 5 步 NOT_PROVISIONED 分支内的既有分流），
-        避免同一段"调 route、按结果落终态"逻辑各自维护一份而彼此漂移。
+        """尝试把这条私聊文本消息交给管理命令面；两个调用点共用这一份接线。
 
-        返回 ``True`` 表示已经处理完（``deferred``/审计/``mark_handled_as``
-        都已经落好，调用方只需要直接返回 ``Outcome(handled_as=HandledAs.COMMAND)``）；
-        返回 ``False`` 表示未命中——非文本消息、未装配路由，或登记表判定不通过
-        （未登记/已撤销/零角色）——调用方按各自的下一步兜底出口继续，这里不产生
-        任何副作用。
+        Args:
+            tx: 当前事务。
+            message: 待分流的入站消息。
+            deferred: 命中时把管理面的回执追加进来。
+
+        Returns:
+            ``True`` 表示已经处理完（回执、审计、事件终态都已落好，调用方直接返回
+            命令终态）；``False`` 表示未命中——非文本消息、未装配路由，或登记表判定
+            不通过——调用方按各自的下一步兜底继续，这里不产生任何副作用。
         """
-
-        if self._admin_router is None or message.message_type != TEXT_MESSAGE_TYPE:
+        router = self._gates.admin_router
+        if router is None or message.message_type != TEXT_MESSAGE_TYPE:
             return False
-        admin_outcome = self._admin_router.route(
+        admin_outcome = router.route(
             open_id=message.sender_open_id,
             text=message.text,
             trace_id=message.trace_id,
-            # Issue #96 S-M-02：suspend/resume 这类写命令要把确认卡片回复到触发
-            # 这条命令的同一条私聊消息上，需要这三个字段；只读命令忽略它们。
+            # 写命令要把确认卡片回复到触发它的那条私聊消息上，需要这三个字段；
+            # 只读命令忽略它们。
             chat_id=message.chat_id,
             thread_id=message.thread_id,
             message_id=message.message_id,
@@ -927,17 +799,13 @@ class EventPipeline:
     def _route_delegated_subject(
         self, tx, message: InboundMessage, deferred: list[RenderedContent]
     ) -> Outcome:
-        """第 4 步命中专用授权主体之后的分流：管理命令面，或既有确定性拒绝出口。
+        """第 4 步命中专用授权主体之后的分流：管理命令面，或确定性拒绝出口。
 
-        **绝无业务路径**——不查 `state`、不进 `AUTO_PROVISIONING`、不入队。先试
-        管理命令面（登记表实时判定，命中即回话）；未命中（非文本消息、未装配
-        路由，或登记表判定不通过）则回落到本模块加入本项前就存在的确定性拒绝
-        文案 ``onboarding.delegated_subject``——与 `core/identity/onboarding_runner.
-        py` 的 `KEY_DELEGATED_SUBJECT` 是同一份产品文案，只是此前只能异步经开通链
-        才能触达；现在专用主体不再进入开通链，因此这条文案必须由本模块直接同步
-        发出，不能再指望开通链替它发。
+        **绝无业务路径**——不查状态、不进开通、不入队。先试管理命令面（登记表实时
+        判定，命中即回话）；未命中则回落到确定性拒绝文案。该文案与开通链里的同一份
+        产品文案同源，只是此前只能异步经开通链才能触达；专用主体既然不再进入开通链，
+        这条文案就必须由本模块直接同步发出，不能再指望开通链替它发。
         """
-
         if self._try_admin_route(tx, message, deferred):
             return Outcome(handled_as=HandledAs.COMMAND)
 
@@ -960,82 +828,38 @@ class EventPipeline:
         now: datetime,
         deferred: list[RenderedContent],
     ) -> Outcome:
-        task_id = new_id("tsk")
+        """第 8 步：抢占话题并插入任务，成功后 NOTIFY（`V-队列-01…05`）。
 
-        # 抢占与入队同事务：抢不到即忙碌（`V-会话-01`）；抢到之后任何失败都会让
-        # 抢占随事务一起回滚，话题不会永久忙碌（`V-队列-02`）。
+        抢占与入队同事务：抢不到即忙碌（`V-会话-01`）；抢到之后任何失败都会让抢占
+        随事务一起回滚，话题不会永久忙碌（`V-队列-02`）。抢占竞态下抢占方的任务
+        状态从未被本次事务读到，因此保留默认的「处理中」文案。
+
+        Raises:
+            QueueInsertError: 任务插入失败，调用方据此整体回滚并回一条诚实提示。
+        """
+        task_id = new_id("tsk")
         if not tx.claim_conversation(conversation_id=conversation.conversation_id, task_id=task_id):
-            # 竞态分支（Issue #465 不覆盖，理由同 `/new` 的同类竞态注释）：抢占它
-            # 的任务同样是本次事务从未读到的一条，保留"处理中"默认文案。
             deferred.append(self._texts.busy_hint_content())
             tx.mark_handled_as(event_id=message.event_id, handled_as=HandledAs.BUSY_HINT)
             return Outcome(handled_as=HandledAs.BUSY_HINT)
 
-        # 续用判定发生在**入队时**并落库（`V-会话-08`）：排队多久都不再改变它。
-        # 只读 last_task_ended_at，读不到任务开始时间或时长（`V-会话-03`）。
-        resumed = should_resume_session(
-            last_task_ended_at=conversation.last_task_ended_at,
-            agent_session_id=conversation.agent_session_id,
-            now=now,
-        )
-        # 产品合同「系统明确告诉用户已经开启新会话」的**第二条触发路径**（Issue #189）：
-        # 不是用户敲的 `/new`，而是两小时空闲后下一条消息自然开的新会话。判定**不重算
-        # 窗口、不改 `should_resume_session`**，只把"不续用"的三种成因区分开来：
-        #
-        # - 本来有会话可续（``agent_session_id`` 非空）、也确实结束过上一次任务
-        #   （``last_task_ended_at`` 非空），却仍然判为不续用 → 唯一可能的成因就是
-        #   间隔超过了两小时，提示；
-        # - 首次提问（两者皆空）→ 不提示，用户没有任何"此前上下文"可言；
-        # - `/new` 之后（``agent_session_id`` 已被清空，``last_task_ended_at`` 按
-        #   `V-会话-05` 保持不动）→ 不提示，用户刚收到过 `gateway.new_session` 的确认，
-        #   再补一句「距上次对话已超过两小时」既重复又与事实不符。
-        #
-        # 空闲会话到点清除（`sweep_idle_conversations`）刻意**不清空** ``agent_session_id``，
-        # 因此隔了两小时才回来的用户仍然落在第一种情形里，不会被误判成 `/new` 之后。
-        session_rotated = (
-            not resumed
-            and bool(conversation.agent_session_id)
-            and conversation.last_task_ended_at is not None
-        )
-        if not resumed and conversation.agent_session_id:
-            # 判废即清（2026-08-23 真实故障）：此前这里只发提示、不动旧
-            # ``agent_session_id``，指望下一次入队的时间戳比较继续把它挡在 resume
-            # 之外。但轮换后的首个任务一旦失败（失败任务不写回新 session id，却会
-            # 刷新 ``last_task_ended_at``），下一条消息就落回两小时窗口内，把这个
-            # 早已判废、JSONL 也可能已被物理清理的旧会话当作可续用——用户连发几条
-            # 都撞在「会话不存在」的瞬间失败上，只能手动 `/new` 自救；就算旧文件
-            # 还在，续上的也是「已明确告知不携带」的过期上下文。清空动作同时把旧
-            # 会话排进物理清理队列，维持「凡被排队清理的 session id 都不再被
-            # conversation 指向」的不变量（只清指针不排队，空闲扫描
-            # ``sweep_idle_conversations`` 就永远找不到这份 JSONL）。上面
-            # ``session_rotated`` 的三种成因区分不受影响：它已在本次清空之前求值。
-            tx.discard_stale_agent_session(conversation_id=conversation.conversation_id)
-        # 目标 worker 版本同样在入队时求值一次并写入（`V-灰度-01`）。
-        # 重试、重启、心跳超时回收都不得改写它——数据库触发器兜底。
+        resumed, session_rotated = self._resolve_session_reuse(tx, conversation, now)
+        # 目标 worker 版本同样在入队时求值一次并写入（`V-灰度-01`）。重试、重启、
+        # 心跳超时回收都不得改写它——数据库触发器兜底。
         version = self._resolve_version(user_id=user_id, now=now)
-
-        try:
-            tx.insert_task(
-                task_id=task_id,
-                conversation_id=conversation.conversation_id,
-                user_id=user_id,
-                inbound_event_id=message.event_id,
-                prompt=message.text,
-                resumed_session=resumed,
-                target_worker_version=version,
-                reply_to_message_id=message.message_id,
-            )
-        except Exception as error:  # noqa: BLE001 - 事务外只做一次失败提示
-            raise QueueInsertFailure("task insert failed") from error
-        tx.mark_handled_as(event_id=message.event_id, handled_as=HandledAs.TASK_QUEUED)
-        tx.notify_task_queued()
+        self._insert_queued_task(
+            tx,
+            message,
+            task_id=task_id,
+            user_id=user_id,
+            conversation_id=conversation.conversation_id,
+            resumed=resumed,
+            version=version,
+        )
 
         if session_rotated:
-            # 追加在入队**成功之后**：与 `/new`、忙碌两条分支同一姿态——只有真正
-            # 生效的那一步才追加它的文案。入队失败路径另有一道保险（整体丢弃
-            # ``deferred``，`V-队列-03`），两道合起来保证用户不会收到一条"已经换
-            # 新会话了"却其实没有任何任务在跑的告知。发送本身仍在事务提交后的
-            # 统一循环里，不改变事务边界。
+            # 追加在入队**成功之后**：只有真正生效的那一步才追加它的文案，用户不会
+            # 收到一条"已经换新会话了"却其实没有任何任务在跑的告知。
             deferred.append(self._texts.catalog.text("gateway.session_rotated"))
 
         self._audit.record(
@@ -1054,3 +878,65 @@ class EventPipeline:
             resumed_session=resumed,
             target_worker_version=version,
         )
+
+    def _insert_queued_task(
+        self,
+        tx,
+        message: InboundMessage,
+        *,
+        task_id: str,
+        user_id: str,
+        conversation_id: str,
+        resumed: bool,
+        version: str,
+    ) -> None:
+        """写入任务行、标记事件终态并 NOTIFY。
+
+        Raises:
+            QueueInsertError: 插入失败——包一层让调用方整体回滚，事务外只做一次
+                失败提示，而不是让驱动异常穿到管线顶层的通用兜底里。
+        """
+        try:
+            tx.insert_task(
+                task_id=task_id,
+                conversation_id=conversation_id,
+                user_id=user_id,
+                inbound_event_id=message.event_id,
+                prompt=message.text,
+                resumed_session=resumed,
+                target_worker_version=version,
+                reply_to_message_id=message.message_id,
+            )
+        except Exception as error:
+            raise QueueInsertError("task insert failed") from error
+        tx.mark_handled_as(event_id=message.event_id, handled_as=HandledAs.TASK_QUEUED)
+        tx.notify_task_queued()
+
+    def _resolve_session_reuse(self, tx, conversation, now: datetime) -> tuple[bool, bool]:
+        """判定本次任务是否续用旧会话，并顺手清掉已经判废的旧会话。
+
+        续用判定发生在**入队时**并落库（`V-会话-08`），排队多久都不再改变它，且只读
+        ``last_task_ended_at``（`V-会话-03`）。第二个返回值把「两小时空闲后自然开的
+        新会话」与另外两种不续用区分开——首次提问没有上下文可言，``/new`` 之后用户
+        刚收到过新会话确认，两者都不该再补一句「距上次对话已超过两小时」。
+
+        判废即清：只发提示不清旧会话时，轮换后的首个任务一旦失败就会刷新
+        ``last_task_ended_at`` 却不写新会话 id，下一条消息落回两小时窗口内，把早已
+        判废、文件可能已被物理清理的旧会话当作可续用。清空同时把旧会话排进清理队列。
+
+        Returns:
+            ``(是否续用旧会话, 是否需要告知用户已换新会话)``。
+        """
+        resumed = should_resume_session(
+            last_task_ended_at=conversation.last_task_ended_at,
+            agent_session_id=conversation.agent_session_id,
+            now=now,
+        )
+        session_rotated = (
+            not resumed
+            and bool(conversation.agent_session_id)
+            and conversation.last_task_ended_at is not None
+        )
+        if not resumed and conversation.agent_session_id:
+            tx.discard_stale_agent_session(conversation_id=conversation.conversation_id)
+        return resumed, session_rotated

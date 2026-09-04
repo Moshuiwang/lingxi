@@ -51,6 +51,7 @@ from lingxi.config.content import (
 )
 from lingxi.core.conversation import (
     BUSY_HINT_TEXT,
+    DispatchGates,
     EventPipeline,
     InboundMessage,
     UserRecord,
@@ -134,9 +135,11 @@ class PipelineTestCase(unittest.TestCase):
             audit=FakeAudit(self.log),
             onboarding=onboarding,
             should_stop=should_stop,
-            admin_router=admin_router,
-            innertest_roster_gate=innertest_roster_gate,
-            delegated_subject_open_id=delegated_subject_open_id,
+            gates=DispatchGates(
+                admin_router=admin_router,
+                innertest_roster_gate=innertest_roster_gate,
+                delegated_subject_open_id=delegated_subject_open_id,
+            ),
         )
 
 
@@ -2590,11 +2593,11 @@ class ResponseCoverageTests(PipelineTestCase):
     抢占（``claim_conversation``）、``/memory remember`` 写路径
     （``remember_user_memory``）。三者分别代表"事务最前端"、"业务分支中段"、
     "命令面写路径"三类不同位置，共同证明这道兜底不是只补了某一个具体调用点，
-    而是整个方法级别的安全网（`QueueInsertFailure`/``insert_task`` 那条已识别
+    而是整个方法级别的安全网（`QueueInsertError`/``insert_task`` 那条已识别
     的失败路径见 ``EnqueueFailureTests``，不在本组重复覆盖）。
 
     **变异验红**（验证与门禁第八节）：临时把 ``EventPipeline.handle_message``
-    的 ``except Exception`` 缩窄成 ``except QueueInsertFailure``（去掉本条
+    的 ``except Exception`` 缩窄成 ``except QueueInsertError``（去掉本条
     兜底分支）后，本组用例全部由绿转红（异常原样穿出 ``handle_message``）；
     恢复后复绿。红/绿证据见交付报告，不在本文件重复记录。
 

@@ -48,7 +48,7 @@ from lingxi.core.admin.management_card import (
     GRANT_SUBMIT_BUTTON_NAME,
     render_management_card,
 )
-from lingxi.core.conversation.pipeline import EventPipeline
+from lingxi.core.conversation.pipeline import DispatchGates, EventPipeline
 from lingxi.core.conversation.ports import OnboardingResult, OnboardingRunner, OnboardingState
 from lingxi.core.execution.card_stream import CardCreated, CardTransport, DeliveryRejected
 from lingxi.core.permission.targeted_recompute import RecomputeKind
@@ -1062,9 +1062,11 @@ def build_supervisor(
         replies=replies,
         audit=audit,
         onboarding=effective_onboarding,
-        admin_router=admin_router,
-        innertest_roster_gate=innertest_roster_gate,
-        delegated_subject_open_id=delegated_subject_open_id,
+        gates=DispatchGates(
+            admin_router=admin_router,
+            innertest_roster_gate=innertest_roster_gate,
+            delegated_subject_open_id=delegated_subject_open_id,
+        ),
         # 停机时跳过尽力而为的出站回复，不让它把停机拖过预算。
         should_stop=should_stop,
     )
