@@ -95,8 +95,6 @@
 89	src/lingxi/apps/scheduler/daily_report.py::DailyReportDuty.run_once
 68	src/lingxi/apps/scheduler/daily_report.py::_build_daily_report_duty
 82	src/lingxi/apps/scheduler/daily_report.py::_build_metric_coverage_check
-87	src/lingxi/apps/scheduler/late_readiness_recovery.py::LateReadinessRecoveryDuty._recover_one
-114	src/lingxi/apps/scheduler/late_readiness_recovery.py::_build_late_readiness_recovery_duty
 335	src/lingxi/apps/scheduler/onboarding.py::_build_onboarding_duty
 68	src/lingxi/apps/scheduler/onboarding.py::build_stock_token_source
 192	src/lingxi/apps/scheduler/org_snapshot_sync.py::OrgSnapshotSyncDuty._run_round
@@ -110,8 +108,6 @@
 82	src/lingxi/apps/scheduler/permission_refresh.py::PermissionRefreshDuty._revoke
 118	src/lingxi/apps/scheduler/permission_refresh.py::PermissionRefreshDuty.run_once
 133	src/lingxi/apps/scheduler/permission_refresh.py::_build_permission_refresh_duty
-65	src/lingxi/apps/scheduler/stalled_provisioning.py::StalledProvisioningDuty._process_one
-67	src/lingxi/apps/scheduler/stalled_provisioning.py::_build_stalled_provisioning_duty
 63	src/lingxi/apps/trace/__init__.py::_render
 71	src/lingxi/apps/trace/__init__.py::run
 66	src/lingxi/apps/worker/cli.py::_run_queue_worker
