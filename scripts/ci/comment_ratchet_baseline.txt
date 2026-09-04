@@ -107,7 +107,6 @@
 6	docstring_over	src/lingxi/core/admin/notification.py
 5	docstring_over	src/lingxi/core/admin/pending_action.py
 8	docstring_over	src/lingxi/core/admin/router.py
-2	docstring_over	src/lingxi/core/admin/views.py
 2	docstring_over	src/lingxi/core/alerting.py
 6	docstring_over	src/lingxi/core/conversation/commands.py
 2	docstring_over	src/lingxi/core/conversation/onboarding_recovery.py
@@ -132,7 +131,6 @@
 1	docstring_over	src/lingxi/core/identity/roster_report.py
 3	docstring_over	src/lingxi/core/identity/roster_snapshot.py
 2	docstring_over	src/lingxi/core/identity/stock_token_source.py
-2	docstring_over	src/lingxi/core/innertest_content_capture.py
 1	docstring_over	src/lingxi/core/permission/account_match.py
 1	docstring_over	src/lingxi/core/permission/galaxy_export.py
 1	docstring_over	src/lingxi/core/permission/galaxy_scope.py
@@ -149,7 +147,6 @@
 1	docstring_over	src/lingxi/core/permission/table_access_token_supply.py
 2	docstring_over	src/lingxi/core/permission/targeted_recompute.py
 2	docstring_over	src/lingxi/core/permission/tenant_token_supply.py
-1	docstring_over	src/lingxi/core/year_grounding_guard.py
 2	hash_block_over	src/lingxi/adapters/admin_registry.py
 4	hash_block_over	src/lingxi/adapters/claude_agent_session.py
 3	hash_block_over	src/lingxi/adapters/delegated_credentials.py
@@ -211,7 +208,6 @@
 6	hash_block_over	src/lingxi/core/admin/notification.py
 5	hash_block_over	src/lingxi/core/admin/pending_action.py
 12	hash_block_over	src/lingxi/core/admin/router.py
-1	hash_block_over	src/lingxi/core/admin/views.py
 3	hash_block_over	src/lingxi/core/alerting.py
 1	hash_block_over	src/lingxi/core/conversation/commands.py
 1	hash_block_over	src/lingxi/core/conversation/onboarding_recovery.py
@@ -348,7 +344,6 @@
 21	provenance	src/lingxi/core/admin/notification.py
 19	provenance	src/lingxi/core/admin/pending_action.py
 68	provenance	src/lingxi/core/admin/router.py
-11	provenance	src/lingxi/core/admin/views.py
 16	provenance	src/lingxi/core/alerting.py
 11	provenance	src/lingxi/core/conversation/commands.py
 7	provenance	src/lingxi/core/conversation/onboarding_recovery.py
@@ -379,7 +374,6 @@
 5	provenance	src/lingxi/core/identity/roster_report.py
 9	provenance	src/lingxi/core/identity/roster_snapshot.py
 9	provenance	src/lingxi/core/identity/stock_token_source.py
-7	provenance	src/lingxi/core/innertest_content_capture.py
 2	provenance	src/lingxi/core/permission/account_match.py
 5	provenance	src/lingxi/core/permission/galaxy_export.py
 4	provenance	src/lingxi/core/permission/galaxy_scope.py
@@ -396,4 +390,3 @@
 10	provenance	src/lingxi/core/permission/table_access_token_supply.py
 15	provenance	src/lingxi/core/permission/targeted_recompute.py
 5	provenance	src/lingxi/core/permission/tenant_token_supply.py
-5	provenance	src/lingxi/core/year_grounding_guard.py
