@@ -32,6 +32,7 @@ from __future__ import annotations
 
 import atexit
 import logging
+import select
 import threading
 import time
 from dataclasses import dataclass
@@ -60,10 +61,13 @@ MAX_TIMEOUT_SECONDS = 5
 #: 一条；scheduler / worker 的并发更低。
 MAX_IDLE_CONNECTIONS_PER_KEY = 4
 
-#: 空闲超过这个秒数的连接，再次取用前先发一条 ``SELECT 1`` 探活。服务端在两次取用
-#: 之间悄悄掐断的连接（pooler 回收、数据库重启、``pg_terminate_backend``）在这里被
-#: 丢弃重建，调用方看不到失败。更短的空闲期不探：常驻轮询 1–2 秒一次，每次都探
-#: 等于把往返翻倍；这种间隔下即便碰上断线，也只是当次操作失败、下一轮换新连接。
+#: 空闲超过这个秒数的连接，再次取用前先发一条 ``SELECT 1`` 探活。更短的空闲期不按
+#: 时间探——常驻轮询 1–2 秒一次，每次都探等于把往返翻倍——而是看 socket：一条健康
+#: 的空闲连接不会有任何待读数据，服务端掐断它（pooler 回收、数据库重启、
+#: ``pg_terminate_backend``）时一定会先送来 FATAL 再关 socket，于是 socket 变为可读；
+#: 取用前用零成本的 ``select()`` 看一眼，可读才探活。两条路径下坏连接都在这里被
+#: 丢弃重建，调用方看不到失败（#593 完成标准 2 实测：不看 socket 时，worker
+#: ``_housekeep`` 里一次未包 try 的操作会用到刚被掐断的连接，整个进程退出）。
 IDLE_PROBE_AFTER_SECONDS = 30.0
 
 
@@ -167,7 +171,11 @@ class _IdleConnectionPool:
                 connection, released_at = stack.pop()
             if connection.closed:
                 continue
-            if time.monotonic() - released_at > IDLE_PROBE_AFTER_SECONDS and not connection.probe():
+            suspicious = (
+                time.monotonic() - released_at > IDLE_PROBE_AFTER_SECONDS
+                or connection.has_pending_input()
+            )
+            if suspicious and not connection.probe():
                 logger.info("空闲数据库连接探活失败，丢弃重建")
                 connection.discard()
                 continue
@@ -289,6 +297,16 @@ def _build_reusable_connection_type() -> type:
                 logger.info("数据库连接归还前复位失败，改为关闭：%s", type(error).__name__)
                 return False
             return True
+
+        def has_pending_input(self) -> bool:
+            """socket 上有没有待读数据。空闲连接本不该有：有就是服务端来过话
+            （FATAL 后关连接），当作可疑，交给 ``probe()`` 定夺。看不了 socket 也算可疑。"""
+
+            try:
+                readable, _writable, _errors = select.select([self.fileno()], [], [], 0)
+            except (OSError, ValueError):
+                return True
+            return bool(readable)
 
         def probe(self) -> bool:
             """一次往返确认服务端还在；失败返回 ``False``。"""

@@ -112,16 +112,26 @@ class ConnectionReuseTests(unittest.TestCase):
                 self.assertNotEqual(_backend_pid(connection), victim)
         self.assertEqual(idle_connection_count(), 1)
 
-    def test_a_connection_terminated_while_idle_fails_once_then_recovers_without_probe(self) -> None:
+    def test_a_connection_terminated_while_idle_is_replaced_transparently_within_the_probe_window(
+        self,
+    ) -> None:
+        """空闲不足 30 秒也要透明：被掐断的连接 socket 变为可读，取用前看 socket 就够。"""
+
         with connect(DSN) as connection:
             victim = _backend_pid(connection)
         _terminate(victim)
-        with self.assertRaises(Exception):
-            with connect(DSN) as connection:
-                _backend_pid(connection)
-        self.assertEqual(idle_connection_count(), 0, "坏掉的连接不得留在空闲栈里")
         with connect(DSN) as connection:
             self.assertNotEqual(_backend_pid(connection), victim)
+        self.assertEqual(idle_connection_count(), 1, "坏掉的连接不得留在空闲栈里，新连接归还")
+
+    def test_a_healthy_idle_connection_is_not_probed_within_the_window(self) -> None:
+        """看 socket 不等于每次都探活：健康连接在窗口内取用不额外发语句。"""
+
+        with connect(DSN) as connection:
+            pid = _backend_pid(connection)
+        with mock.patch.object(type(connection), "probe", side_effect=AssertionError("不该探活")):
+            with connect(DSN) as reused:
+                self.assertEqual(_backend_pid(reused), pid)
 
     def test_idle_stack_is_bounded_and_the_overflow_is_really_closed(self) -> None:
         connections = [connect(DSN) for _ in range(MAX_IDLE_CONNECTIONS_PER_KEY + 2)]
