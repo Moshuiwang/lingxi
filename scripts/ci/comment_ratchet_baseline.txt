@@ -125,7 +125,6 @@
 2	docstring_over	src/lingxi/core/execution/hooks.py
 4	docstring_over	src/lingxi/core/execution/input_safety.py
 5	docstring_over	src/lingxi/core/identity/access_token_supply.py
-2	docstring_over	src/lingxi/core/identity/innertest_roster_gate.py
 3	docstring_over	src/lingxi/core/identity/onboarding_runner.py
 2	docstring_over	src/lingxi/core/innertest_content_capture.py
 1	docstring_over	src/lingxi/core/mcp_naming.py
@@ -217,7 +216,6 @@
 8	hash_block_over	src/lingxi/core/execution/hooks.py
 5	hash_block_over	src/lingxi/core/execution/input_safety.py
 2	hash_block_over	src/lingxi/core/execution/tool_policy.py
-1	hash_block_over	src/lingxi/core/identity/innertest_roster_gate.py
 13	hash_block_over	src/lingxi/core/identity/onboarding_runner.py
 1	hash_block_over	src/lingxi/core/mcp_naming.py
 1	hash_block_over	src/lingxi/core/permission/metric_translation.py
@@ -356,7 +354,7 @@
 1	provenance	src/lingxi/core/execution/message_stream.py
 9	provenance	src/lingxi/core/execution/tool_policy.py
 15	provenance	src/lingxi/core/identity/access_token_supply.py
-7	provenance	src/lingxi/core/identity/innertest_roster_gate.py
+1	provenance	src/lingxi/core/identity/innertest_roster_gate.py
 2	provenance	src/lingxi/core/identity/legacy_permission_import.py
 64	provenance	src/lingxi/core/identity/onboarding_runner.py
 1	provenance	src/lingxi/core/identity/provisioning.py
