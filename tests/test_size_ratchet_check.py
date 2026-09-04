@@ -193,6 +193,14 @@ class RealBaselineIsHonestTest(unittest.TestCase):
         注释）。这是完成标准 2（断线不重启进程）的必要改动，在 main 上用
         pg_terminate_backend 实测复现进程退出。结构性拆分不塞进热修窗口，作为
         后续技术债登记在 #593。
+        `onboarding_runner.py`（1502 行）复核：一次批量 lint 自动修复曾把该文件里
+        五个仅供跨模块 re-export 的导入名（`EnvironmentResult`、
+        `KEY_INTERNAL_ERROR`、`KEY_NOT_AUTHORIZED`、`KEY_STALLED`、
+        `_KEYS_REQUIRING_REFERENCE`）连同各自的说明注释一并误删——这些名字本文件
+        自身确实不用，但外部消费方按名字从这里取用，删掉即触发导入报错；跑一次
+        全量 `unittest discover` 才暴露。逐字恢复原始导入与注释后，行数精确回到
+        1502，与该批开工前的登记值相同：该文件在当前 lint 规则集下没有可安全
+        移除的死代码，1502 继续保留为封顶，不下调，也不再登记新增理由。
         """
 
         self.assertEqual(
