@@ -174,7 +174,7 @@ GROUNDED_ATTRIBUTIONS: tuple[GroundedAttribution, ...] = (
     ),
     GroundedAttribution(
         "src/lingxi/core/execution/input_safety.py",
-        '个动机本身有合同依据，与 `apps/worker/report.py` 的 ``obtained`` 同一条',
+        "个动机本身有合同依据，与 `apps/worker/report.py` 的 ``obtained`` 同一条",
         "交付规则",
     ),
     # docs/参考证据/MVP联合验收执行卡.md 的登记项已随该一次性执行卡退场删除
