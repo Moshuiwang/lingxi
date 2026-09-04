@@ -335,36 +335,6 @@ class PostgresOrgSnapshotStore:
         return Jsonb(value)
 
 
-#: 花名册字段的保留只对"同一个人"成立：feishu_user_id 变了说明账号复用换人，
-#: 旧人的工号/邮箱绝不能挂在新人身上——工号是匹配银河的主键，残留会把新人
-#: 直接接到旧人的权限记录。
-_UPSERT_APP_USER_SQL = """INSERT INTO app_user
-     (id, feishu_open_id, feishu_user_id, feishu_union_id, display_name,
-      display_name_locale, department, tenant_key, employee_no, email,
-      provisioning_state)
-   VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-   ON CONFLICT (feishu_open_id) DO UPDATE SET
-     feishu_user_id = EXCLUDED.feishu_user_id,
-     feishu_union_id = EXCLUDED.feishu_union_id,
-     display_name = EXCLUDED.display_name,
-     display_name_locale = EXCLUDED.display_name_locale,
-     department = EXCLUDED.department,
-     tenant_key = EXCLUDED.tenant_key,
-     employee_no = CASE
-         WHEN app_user.feishu_user_id IS DISTINCT FROM EXCLUDED.feishu_user_id
-         THEN EXCLUDED.employee_no
-         ELSE COALESCE(EXCLUDED.employee_no, app_user.employee_no)
-     END,
-     email = CASE
-         WHEN app_user.feishu_user_id IS DISTINCT FROM EXCLUDED.feishu_user_id
-         THEN EXCLUDED.email
-         ELSE COALESCE(EXCLUDED.email, app_user.email)
-     END,
-     updated_at = now()
-RETURNING id, provisioning_state, permission_record_id, employee_no, email,
-          (xmax = 0) AS inserted"""
-
-
 def _verify_persisted_identity(record: AppUserRecord, draft: IdentityRecordDraft) -> None:
     """确认花名册字段原样落库。
 
@@ -375,6 +345,19 @@ def _verify_persisted_identity(record: AppUserRecord, draft: IdentityRecordDraft
         if expected is not None and getattr(record, field) != expected:
             # 异常发生在连接事务内，当前写入随事务回滚；日志和异常都不带字段值。
             raise IdentityStorageIntegrityError(f"app_user {field} 持久化回读不一致")
+
+
+def _fetch_verified_identity_record(cursor: Any, draft: IdentityRecordDraft) -> AppUserRecord:
+    """取 upsert 返回的行、转成 ``AppUserRecord``，并确认花名册字段原样落库。
+
+    校验必须在调用方仍持有的事务内完成：不一致时抛出的异常要让这次写入随
+    事务回滚，不能已经提交了才发现。
+    """
+    row = cursor.fetchone()
+    assert row is not None
+    record = AppUserRecord(str(row[0]), str(row[1]), row[2], bool(row[5]), row[3], row[4])
+    _verify_persisted_identity(record, draft)
+    return record
 
 
 class PostgresAppUserStore:
@@ -453,15 +436,36 @@ class PostgresAppUserStore:
 
         两条刻意不做的事：不写 ``permission_record_id``/``permission_version``
         （"先占位再回填"因此没有实现路径）；冲突时不回写 ``provisioning_state``
-        （否则一个已经推进到发布或同步中的用户会因为再发一条消息被打回
-        ``matching``）。
+        （否则已推进到发布/同步中的用户会因再发一条消息被打回 ``matching``）。
         """
         with (
             connect(self._dsn, timeouts=self._timeouts) as connection,
             connection.cursor() as cursor,
         ):
+            # 花名册字段的保留只对"同一个人"成立：feishu_user_id 变了说明账号
+            # 复用换人，旧人的工号/邮箱不能挂在新人身上（工号是匹配银河的主键）。
             cursor.execute(
-                _UPSERT_APP_USER_SQL,
+                """INSERT INTO app_user
+                     (id, feishu_open_id, feishu_user_id, feishu_union_id, display_name,
+                      display_name_locale, department, tenant_key, employee_no, email,
+                      provisioning_state)
+                   VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                   ON CONFLICT (feishu_open_id) DO UPDATE SET
+                     feishu_user_id = EXCLUDED.feishu_user_id,
+                     feishu_union_id = EXCLUDED.feishu_union_id,
+                     display_name = EXCLUDED.display_name,
+                     display_name_locale = EXCLUDED.display_name_locale,
+                     department = EXCLUDED.department,
+                     tenant_key = EXCLUDED.tenant_key,
+                     employee_no = CASE WHEN app_user.feishu_user_id
+                             IS DISTINCT FROM EXCLUDED.feishu_user_id THEN EXCLUDED.employee_no
+                         ELSE COALESCE(EXCLUDED.employee_no, app_user.employee_no) END,
+                     email = CASE WHEN app_user.feishu_user_id
+                             IS DISTINCT FROM EXCLUDED.feishu_user_id THEN EXCLUDED.email
+                         ELSE COALESCE(EXCLUDED.email, app_user.email) END,
+                     updated_at = now()
+                RETURNING id, provisioning_state, permission_record_id, employee_no, email,
+                          (xmax = 0) AS inserted""",
                 (
                     new_id("usr"),
                     draft.feishu_open_id,
@@ -476,10 +480,7 @@ class PostgresAppUserStore:
                     draft.provisioning_state,
                 ),
             )
-            row = cursor.fetchone()
-            assert row is not None
-            record = AppUserRecord(str(row[0]), str(row[1]), row[2], bool(row[5]), row[3], row[4])
-            _verify_persisted_identity(record, draft)
+            record = _fetch_verified_identity_record(cursor, draft)
         logger.info(
             "统一用户记录已写入 open_id=%s created=%s state=%s",
             redact_identifier(draft.feishu_open_id),
