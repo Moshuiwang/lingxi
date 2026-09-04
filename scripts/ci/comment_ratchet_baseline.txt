@@ -103,7 +103,6 @@
 5	docstring_over	src/lingxi/core/admin/card_callback.py
 8	docstring_over	src/lingxi/core/admin/router.py
 11	docstring_over	src/lingxi/core/conversation/pipeline.py
-4	docstring_over	src/lingxi/core/execution/audit.py
 8	docstring_over	src/lingxi/core/execution/card_stream.py
 5	docstring_over	src/lingxi/core/identity/access_token_supply.py
 4	docstring_over	src/lingxi/core/identity/credentials.py
@@ -191,7 +190,6 @@
 10	hash_block_over	src/lingxi/core/admin/card_callback.py
 12	hash_block_over	src/lingxi/core/admin/router.py
 20	hash_block_over	src/lingxi/core/conversation/pipeline.py
-4	hash_block_over	src/lingxi/core/execution/audit.py
 10	hash_block_over	src/lingxi/core/execution/card_stream.py
 1	hash_block_over	src/lingxi/core/identity/first_contact.py
 1	hash_block_over	src/lingxi/core/identity/innertest_roster_gate.py
@@ -315,7 +313,6 @@
 68	provenance	src/lingxi/core/admin/router.py
 52	provenance	src/lingxi/core/conversation/pipeline.py
 1	provenance	src/lingxi/core/conversation/ports.py
-12	provenance	src/lingxi/core/execution/audit.py
 61	provenance	src/lingxi/core/execution/card_stream.py
 1	provenance	src/lingxi/core/execution/input_safety.py
 15	provenance	src/lingxi/core/identity/access_token_supply.py

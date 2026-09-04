@@ -398,7 +398,7 @@ GROUNDED_ATTRIBUTIONS: tuple[GroundedAttribution, ...] = (
     ),
     GroundedAttribution(
         "src/lingxi/core/execution/audit.py",
-        "# 产品合同要求「不在审计中保存凭据、完整令牌」，这是绝对措辞，靠认键名做不到——",
+        "# 产品合同要求「不在审计中保存凭据、完整令牌」——没有键名上下文的裸令牌永远",
         "管理员处理入口与安全确认",
     ),
     GroundedAttribution(
