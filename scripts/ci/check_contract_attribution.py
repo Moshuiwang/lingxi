@@ -540,16 +540,6 @@ REGISTERED_EXCEPTIONS: tuple[RegisteredException, ...] = (
         "钉住的判据，不是指产品合同与外部边界正文；该文档没有关于花名册替换判据的具体规定。",
     ),
     RegisteredException(
-        "src/lingxi/core/permission/publish_row.py",
-        ":mod:`lingxi.core.permission.role_function`），而合同要求这里放**指标名**。中间缺的",
-        "Issue #155",
-        "2026-08-17",
-        "产品负责人",
-        "「发布表值列表放指标名」出自 Issue #155 产品负责人对三问的答复（留痕见该 "
-        "Issue 评论），是与问数 MCP 消费方的既定数据格式约定，产品合同与外部边界 "
-        "正文没有规定发布表的具体字段格式。",
-    ),
-    RegisteredException(
         "tests/test_roster_snapshot.py",
         "# **否定用例（PR #208 二级审查钉入的合同条款）**：INCOMPLETE 保留 rows 是有意",
         "PR #208",

@@ -314,9 +314,9 @@ class RealRepositoryTest(unittest.TestCase):
         self.assertEqual(failures, [], failures)
         self.assertIn("归属核对：扫描到", summary)
 
-    def test_real_repository_has_the_five_known_exceptions(self) -> None:
+    def test_real_repository_has_the_four_known_exceptions(self) -> None:
         _failures, exceptions, _summary = CHECK.evaluate()
-        self.assertEqual(len(exceptions), 5, exceptions)
+        self.assertEqual(len(exceptions), 4, exceptions)
 
 
 class MetaExclusionDoesNotSwallowRealAssertionsTest(unittest.TestCase):
