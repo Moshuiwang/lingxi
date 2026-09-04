@@ -60,6 +60,12 @@ fi
 ruff check --no-cache "${tracked_python_files[@]}"
 printf 'ruff check：通过\n'
 
+# --force-exclude：exclude 只在 ruff 自己遍历目录时生效，显式传入的文件路径
+# 默认会被无视——不带这个参数，六个贴线/冻结文件会被当成"待格式化"而不是
+# "跳过"，[tool.ruff.format].exclude 形同虚设（实测坐实）。
+ruff format --check --force-exclude "${tracked_python_files[@]}"
+printf 'ruff format --check：通过\n'
+
 # src/lingxi/ 不允许任何抑制注释，唯一合法入口是 pyproject.toml 的
 # per-file-ignores。大小写不敏感、`#` 后有无空格都要命中（#noqa、# NOQA、
 # #  ruff:noqa 均需命中），限定到具体规则码的 `# noqa: CODE` 同样不放行。
