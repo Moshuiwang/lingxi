@@ -312,15 +312,15 @@ run_l1() {
 run_fast() {
   local -A spec=()
   load_spec spec python3 scripts/dev/gate_spec.py fast
-  for key in EXTRAS SHELLCHECK_VERSION PYTHON_VERSION; do
+  for key in EXTRAS SHELLCHECK_VERSION RUFF_VERSION PYTHON_VERSION; do
     require_spec_key spec "${key}"
   done
-  printf 'Story Fast 环境配方（现读自 .github/workflows/story.yml）：extras=%s shellcheck=%s python=%s\n' \
-    "${spec[EXTRAS]}" "${spec[SHELLCHECK_VERSION]}" "${spec[PYTHON_VERSION]}" >&2
+  printf 'Story Fast 环境配方（现读自 .github/workflows/story.yml）：extras=%s shellcheck=%s ruff=%s python=%s\n' \
+    "${spec[EXTRAS]}" "${spec[SHELLCHECK_VERSION]}" "${spec[RUFF_VERSION]}" "${spec[PYTHON_VERSION]}" >&2
 
   local venv_dir="${repository_root}/.dev-check/venv-fast"
   mkdir -p "${repository_root}/.dev-check"
-  build_venv "${venv_dir}" "${spec[PYTHON_VERSION]}" ".[${spec[EXTRAS]}]" "shellcheck-py==${spec[SHELLCHECK_VERSION]}"
+  build_venv "${venv_dir}" "${spec[PYTHON_VERSION]}" ".[${spec[EXTRAS]}]" "shellcheck-py==${spec[SHELLCHECK_VERSION]}" "ruff==${spec[RUFF_VERSION]}"
 
   check_installed_package_outside_repo "${venv_dir}/bin/python"
   "${venv_dir}/bin/python" scripts/ci/check_agent_sdk_binding.py
@@ -347,11 +347,11 @@ cleanup_full_pg() {
 run_full() {
   local -A spec=()
   load_spec spec python3 scripts/dev/gate_spec.py gate
-  for key in EXTRAS SHELLCHECK_VERSION PYTHON_VERSION POSTGRES_IMAGE POSTGRES_AUTH_METHOD POSTGRES_DB; do
+  for key in EXTRAS SHELLCHECK_VERSION RUFF_VERSION PYTHON_VERSION POSTGRES_IMAGE POSTGRES_AUTH_METHOD POSTGRES_DB; do
     require_spec_key spec "${key}"
   done
-  printf 'Epic Full / gate 环境配方（现读自 .github/workflows/ci.yml）：extras=%s shellcheck=%s python=%s postgres=%s\n' \
-    "${spec[EXTRAS]}" "${spec[SHELLCHECK_VERSION]}" "${spec[PYTHON_VERSION]}" "${spec[POSTGRES_IMAGE]}" >&2
+  printf 'Epic Full / gate 环境配方（现读自 .github/workflows/ci.yml）：extras=%s shellcheck=%s ruff=%s python=%s postgres=%s\n' \
+    "${spec[EXTRAS]}" "${spec[SHELLCHECK_VERSION]}" "${spec[RUFF_VERSION]}" "${spec[PYTHON_VERSION]}" "${spec[POSTGRES_IMAGE]}" >&2
 
   command -v docker >/dev/null || {
     printf '缺少 docker：full 模式要起一次性真库容器，与 Epic Full / gate 同构。\n' >&2
@@ -360,7 +360,7 @@ run_full() {
 
   local venv_dir="${repository_root}/.dev-check/venv-full"
   mkdir -p "${repository_root}/.dev-check"
-  build_venv "${venv_dir}" "${spec[PYTHON_VERSION]}" ".[${spec[EXTRAS]}]" "shellcheck-py==${spec[SHELLCHECK_VERSION]}"
+  build_venv "${venv_dir}" "${spec[PYTHON_VERSION]}" ".[${spec[EXTRAS]}]" "shellcheck-py==${spec[SHELLCHECK_VERSION]}" "ruff==${spec[RUFF_VERSION]}"
 
   check_installed_package_outside_repo "${venv_dir}/bin/python"
   "${venv_dir}/bin/python" scripts/ci/check_agent_sdk_binding.py

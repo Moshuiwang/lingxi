@@ -74,7 +74,7 @@ jobs:
           cache-dependency-path: pyproject.toml
 
       - name: 安装快速门禁依赖
-        run: python3 -m pip install '.[scheduler,migrate,worker]' 'shellcheck-py==0.11.0.1'
+        run: python3 -m pip install '.[scheduler,migrate,worker]' 'shellcheck-py==0.11.0.1' 'ruff==0.16.4'
 
       - name: 配置 Worker 校验运行时
         if: needs.classify.outputs.worker_changed == 'true'

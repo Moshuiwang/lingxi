@@ -48,7 +48,7 @@ jobs:
         with:
           python-version: '3.12'
       - name: 安装测试依赖与锁定版本的 shellcheck
-        run: python3 -m pip install '.[scheduler,migrate]' 'shellcheck-py==0.11.0.1'
+        run: python3 -m pip install '.[scheduler,migrate]' 'shellcheck-py==0.11.0.1' 'ruff==0.16.4'
       - name: 真实 Agent SDK 冒烟（不调模型、不用凭据）
         run: |
           python3 -m pip install '.[worker]'
@@ -68,7 +68,7 @@ jobs:
         with:
           python-version: '3.12'
       - name: 安装快速门禁依赖
-        run: python3 -m pip install '.[scheduler,migrate,worker]' 'shellcheck-py==0.11.0.1'
+        run: python3 -m pip install '.[scheduler,migrate,worker]' 'shellcheck-py==0.11.0.1' 'ruff==0.16.4'
   full:
     name: Story / high-risk full
 """
@@ -82,6 +82,7 @@ class GateSpecOnSyntheticWorkflowTest(unittest.TestCase):
 
         self.assertEqual(spec.extras, ["scheduler", "migrate", "worker"])
         self.assertEqual(spec.shellcheck_version, "0.11.0.1")
+        self.assertEqual(spec.ruff_version, "0.16.4")
         self.assertEqual(spec.python_version, "3.12")
         self.assertEqual(
             spec.postgres,
@@ -93,6 +94,7 @@ class GateSpecOnSyntheticWorkflowTest(unittest.TestCase):
 
         self.assertEqual(spec.extras, ["scheduler", "migrate", "worker"])
         self.assertEqual(spec.shellcheck_version, "0.11.0.1")
+        self.assertEqual(spec.ruff_version, "0.16.4")
         self.assertEqual(spec.python_version, "3.12")
 
 
@@ -107,7 +109,7 @@ class GateSpecFailsLoudOnUnexpectedShapeTest(unittest.TestCase):
         """ci.yml 若把 extras 从单行 `'.[a,b]'` 改成本解析器不认的形态，必须失败。"""
 
         broken = MINIMAL_GATE_JOB.replace(
-            "run: python3 -m pip install '.[scheduler,migrate]' 'shellcheck-py==0.11.0.1'",
+            "run: python3 -m pip install '.[scheduler,migrate]' 'shellcheck-py==0.11.0.1' 'ruff==0.16.4'",
             "run: python3 -m pip install --requirement gate-requirements.txt",
         )
         with self.assertRaises(GATE_SPEC.GateSpecError):
@@ -115,8 +117,16 @@ class GateSpecFailsLoudOnUnexpectedShapeTest(unittest.TestCase):
 
     def test_missing_shellcheck_pin_is_rejected(self) -> None:
         broken = MINIMAL_GATE_JOB.replace(
+            "run: python3 -m pip install '.[scheduler,migrate]' 'shellcheck-py==0.11.0.1' 'ruff==0.16.4'",
+            "run: python3 -m pip install '.[scheduler,migrate]' 'ruff==0.16.4'",
+        )
+        with self.assertRaises(GATE_SPEC.GateSpecError):
+            GATE_SPEC.parse_gate_spec(broken)
+
+    def test_missing_ruff_pin_is_rejected(self) -> None:
+        broken = MINIMAL_GATE_JOB.replace(
+            "run: python3 -m pip install '.[scheduler,migrate]' 'shellcheck-py==0.11.0.1' 'ruff==0.16.4'",
             "run: python3 -m pip install '.[scheduler,migrate]' 'shellcheck-py==0.11.0.1'",
-            "run: python3 -m pip install '.[scheduler,migrate]'",
         )
         with self.assertRaises(GATE_SPEC.GateSpecError):
             GATE_SPEC.parse_gate_spec(broken)
@@ -147,6 +157,7 @@ class GateSpecOnRealWorkflowFilesTest(unittest.TestCase):
 
         self.assertEqual(spec.extras, ["scheduler", "migrate", "worker"])
         self.assertEqual(spec.shellcheck_version, "0.11.0.1")
+        self.assertEqual(spec.ruff_version, "0.16.4")
         self.assertEqual(spec.python_version, "3.12")
         self.assertEqual(spec.postgres["image"], "postgres:16-alpine")
         self.assertEqual(spec.postgres["auth_method"], "trust")
@@ -157,6 +168,7 @@ class GateSpecOnRealWorkflowFilesTest(unittest.TestCase):
 
         self.assertEqual(spec.extras, ["scheduler", "migrate", "worker"])
         self.assertEqual(spec.shellcheck_version, "0.11.0.1")
+        self.assertEqual(spec.ruff_version, "0.16.4")
         self.assertEqual(spec.python_version, "3.12")
 
 
