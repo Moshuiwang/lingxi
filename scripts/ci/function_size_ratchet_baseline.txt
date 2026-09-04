@@ -149,7 +149,6 @@
 86	src/lingxi/core/admin/card_callback.py::AdminCardCallbackHandler.handle_management_revoke
 92	src/lingxi/core/admin/commands.py::parse_admin_command
 266	src/lingxi/core/admin/management_card.py::render_management_card
-87	src/lingxi/core/admin/pending_action.py::decide_confirm
 254	src/lingxi/core/admin/router.py::AdminCommandRouter._dispatch
 200	src/lingxi/core/admin/router.py::AdminCommandRouter._dispatch_write_action
 73	src/lingxi/core/admin/router.py::AdminCommandRouter.route

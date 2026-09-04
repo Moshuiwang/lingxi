@@ -104,7 +104,6 @@
 7	docstring_over	src/lingxi/core/admin/commands.py
 3	docstring_over	src/lingxi/core/admin/management_card.py
 6	docstring_over	src/lingxi/core/admin/notification.py
-5	docstring_over	src/lingxi/core/admin/pending_action.py
 8	docstring_over	src/lingxi/core/admin/router.py
 2	docstring_over	src/lingxi/core/alerting.py
 11	docstring_over	src/lingxi/core/conversation/pipeline.py
@@ -198,7 +197,6 @@
 5	hash_block_over	src/lingxi/core/admin/commands.py
 2	hash_block_over	src/lingxi/core/admin/management_card.py
 6	hash_block_over	src/lingxi/core/admin/notification.py
-5	hash_block_over	src/lingxi/core/admin/pending_action.py
 12	hash_block_over	src/lingxi/core/admin/router.py
 3	hash_block_over	src/lingxi/core/alerting.py
 20	hash_block_over	src/lingxi/core/conversation/pipeline.py
@@ -327,7 +325,6 @@
 40	provenance	src/lingxi/core/admin/commands.py
 22	provenance	src/lingxi/core/admin/management_card.py
 21	provenance	src/lingxi/core/admin/notification.py
-19	provenance	src/lingxi/core/admin/pending_action.py
 68	provenance	src/lingxi/core/admin/router.py
 16	provenance	src/lingxi/core/alerting.py
 52	provenance	src/lingxi/core/conversation/pipeline.py
