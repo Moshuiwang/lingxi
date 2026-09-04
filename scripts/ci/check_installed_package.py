@@ -320,6 +320,7 @@ REQUIRED_MODULES = (
     "lingxi.core.admin.card_dispatch",
     "lingxi.core.admin.card_callback",
     "lingxi.adapters.postgres_pending_action",
+    "lingxi.adapters.postgres_pending_action_execution",
     "lingxi.adapters.postgres_management_card_context",
     "lingxi.adapters.feishu_admin_card",
     # 回调应答之后那批网络往返的后台执行器（#493 块 B）：确认成功后的出带外换卡、
@@ -1069,6 +1070,7 @@ PROCESS_RUNTIME_IMPORTS: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {
             "lingxi.core.admin.card_dispatch",
             "lingxi.core.admin.card_callback",
             "lingxi.adapters.postgres_pending_action",
+            "lingxi.adapters.postgres_pending_action_execution",
             "lingxi.adapters.postgres_management_card_context",
             "lingxi.adapters.feishu_admin_card",
             "lingxi.adapters.admin_post_callback",
@@ -1089,13 +1091,13 @@ PROCESS_RUNTIME_IMPORTS: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {
             # 一起进入 gateway 的运行时闭包。
             "lingxi.core.admin.card_layout",
             "lingxi.core.admin.display_names",
-            # 本地权限授权/抑制全链路（#319 S-P-1b）：
-            # adapters.postgres_pending_action 模块级 import 了
-            # adapters.postgres_local_permission 的 _insert_locked/
-            # DuplicateActiveOverride（confirm() 同一事务内落库本地权限覆盖行，
-            # 见该模块文档「为什么拆分」），以及 core.permission.local_override
-            # 的 LocalPermissionOverrideEntry/OverrideDirection（纯类型，供
-            # confirm() 解析 payload 后构造要写入的条目）。
+            # 本地权限授权/抑制全链路：adapters.postgres_pending_action_execution
+            # （待确认操作里"自己不开连接"的纯执行辅助方法，见该模块文档）模块级
+            # import 了 adapters.postgres_local_permission 的 _insert_locked/
+            # DuplicateActiveOverrideError（confirm() 同一事务内落库本地权限覆盖
+            # 行），以及 core.permission.local_override 的
+            # LocalPermissionOverrideEntry/OverrideDirection（纯类型，供 confirm()
+            # 解析 payload 后构造要写入的条目）。
             "lingxi.adapters.postgres_local_permission",
             "lingxi.adapters.postgres_local_permission_import",
             "lingxi.core.permission.local_override",
