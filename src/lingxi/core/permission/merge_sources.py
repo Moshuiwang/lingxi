@@ -126,7 +126,8 @@ def _merge_limited_wildcard(
     wildcard_permissions: dict[str, tuple[str, ...]] = {}
     if wildcard_values:
         wildcard_permissions[ALL_COMPANIES_KEY] = tuple(sorted(wildcard_values))
-    # wildcard_values 为空：丢弃 "*" 键，不写空列表（模块文档「空结果」）。
+    # wildcard_values 为空：丢弃 "*" 键，不写空列表——缺键与空列表对读侧的
+    # lookup_metrics 等价（缺键回退通配，这里通配本就不存在，两者都收敛到空）。
     return MergedPermissionSources(permissions=wildcard_permissions, skipped_reasons=())
 
 
@@ -181,7 +182,7 @@ def _merge_default(
         values -= set(local_suppressions.get(key, ()))
         if values:
             merged[key] = tuple(sorted(values))
-        # values 为空：丢弃这个键，不写空列表（模块文档「空结果」一节）。
+        # values 为空：丢弃这个键，不写空列表——与翻译层"写侧不产出空列表"同一纪律。
 
     return MergedPermissionSources(permissions=merged, skipped_reasons=())
 
