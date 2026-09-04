@@ -127,7 +127,6 @@
 3	docstring_over	src/lingxi/core/identity/onboarding_runner.py
 2	docstring_over	src/lingxi/core/innertest_content_capture.py
 1	docstring_over	src/lingxi/core/mcp_naming.py
-1	docstring_over	src/lingxi/core/permission/table_access_token_supply.py
 2	docstring_over	src/lingxi/core/permission/targeted_recompute.py
 2	docstring_over	src/lingxi/core/permission/tenant_token_supply.py
 1	docstring_over	src/lingxi/core/year_grounding_guard.py
@@ -351,7 +350,7 @@
 7	provenance	src/lingxi/core/innertest_content_capture.py
 3	provenance	src/lingxi/core/mcp_naming.py
 1	provenance	src/lingxi/core/permission/publish_row.py
-10	provenance	src/lingxi/core/permission/table_access_token_supply.py
+3	provenance	src/lingxi/core/permission/table_access_token_supply.py
 15	provenance	src/lingxi/core/permission/targeted_recompute.py
 5	provenance	src/lingxi/core/permission/tenant_token_supply.py
 1	provenance	src/lingxi/core/user_memory.py
