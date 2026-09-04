@@ -97,9 +97,6 @@
 82	src/lingxi/apps/scheduler/daily_report.py::_build_metric_coverage_check
 335	src/lingxi/apps/scheduler/onboarding.py::_build_onboarding_duty
 68	src/lingxi/apps/scheduler/onboarding.py::build_stock_token_source
-192	src/lingxi/apps/scheduler/org_snapshot_sync.py::OrgSnapshotSyncDuty._run_round
-100	src/lingxi/apps/scheduler/org_snapshot_sync.py::OrgSnapshotSyncDuty.run_once
-86	src/lingxi/apps/scheduler/org_snapshot_sync.py::_build_org_snapshot_sync_duty
 69	src/lingxi/apps/scheduler/permission_refresh.py::PermissionRefreshDuty._enqueue_publish
 112	src/lingxi/apps/scheduler/permission_refresh.py::PermissionRefreshDuty._refresh_user
 78	src/lingxi/apps/scheduler/permission_refresh.py::PermissionRefreshDuty._refresh_zero_galaxy_user
