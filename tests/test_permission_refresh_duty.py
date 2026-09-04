@@ -1700,7 +1700,7 @@ class ZeroGalaxyLocalGrantTest(unittest.TestCase):
             local_overrides=overrides,
         )
 
-        report = duty.run_once()
+        duty.run_once()
 
         self.assertEqual(len(parts["decisions"].calls), 1)
         call = parts["decisions"].calls[0]

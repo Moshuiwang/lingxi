@@ -51,10 +51,9 @@ wss 地址），单条事件上没有可验的签名。承接同一产品意图�
 from __future__ import annotations
 
 import logging
-from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
-from typing import Any
+from typing import Any, Callable
 
 from lingxi.config.content import (
     KEY_PREPROVISIONED_FIRST_CHAT,
@@ -66,7 +65,6 @@ from lingxi.config.content import (
     validate_user_visible_text,
 )
 from lingxi.core.ids import new_id
-
 # 预开通首聊补一句（rc25 修复包 F1）：公司/职能取值与 ``onboarding.completed`` 同一
 # 来源。两个模块都是纯函数 + 内容目录，不把身份链或任何适配器拖进 gateway 的 import
 # 闭包（``apps/gateway`` 本就引用 ``core.permission.*``）。

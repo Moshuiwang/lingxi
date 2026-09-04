@@ -37,7 +37,7 @@ import socket
 import sys
 import threading
 from collections.abc import Mapping, Sequence
-from datetime import UTC, datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import TextIO
 

@@ -28,6 +28,13 @@ from lingxi.apps.scheduler.loop import SchedulerLoop
 from lingxi.apps.scheduler.onboarding import _build_onboarding_duty
 from lingxi.apps.scheduler.org_snapshot_sync import _build_org_snapshot_sync_duty
 from lingxi.apps.scheduler.permission_publish import _build_permission_publish_duty
+
+# 本文件不直接调用它，只是 re-export：``apps/scheduler/__init__.py`` 历史上一直
+# 从这里（不是 ``permission_readiness_assembly`` 本身）导入它。冗余别名让 ruff
+# 认得这是有意保留的重新导出，不判未用。
+from lingxi.apps.scheduler.permission_readiness_assembly import (
+    _build_readiness_follow_up as _build_readiness_follow_up,
+)
 from lingxi.apps.scheduler.permission_refresh import _build_permission_refresh_duty
 from lingxi.apps.scheduler.retention import (
     IDLE_CONVERSATION_SWEEP_AFTER,

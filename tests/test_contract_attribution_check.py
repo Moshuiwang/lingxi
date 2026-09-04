@@ -36,14 +36,14 @@ def _tmp_file(content: str):
     import tempfile
 
     class _Ctx:
-        def __enter__(self_inner):
-            self_inner.dir = tempfile.TemporaryDirectory()
-            path = Path(self_inner.dir.name) / "sample.py"
+        def __enter__(self):
+            self.dir = tempfile.TemporaryDirectory()
+            path = Path(self.dir.name) / "sample.py"
             path.write_text(content, encoding="utf-8")
             return path
 
-        def __exit__(self_inner, *exc_info):
-            self_inner.dir.cleanup()
+        def __exit__(self, *exc_info):
+            self.dir.cleanup()
 
     return _Ctx()
 

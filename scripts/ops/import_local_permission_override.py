@@ -169,6 +169,8 @@ from typing import Any, Protocol
 
 from lingxi.core.permission.account_match import MATCHED, match_galaxy_account, normalize_email
 from lingxi.core.permission.legacy_diff import (
+    IMPORT_REASON,
+    PENDING_ACTION_REASON,
     SHAPE_SPECIFIC,
     LegacyImportPlan,
     classify_legacy_permissions,

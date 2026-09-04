@@ -23,8 +23,7 @@ import signal
 import sys
 import threading
 import time
-from collections.abc import Callable, Mapping
-from typing import Any
+from typing import Any, Callable, Mapping
 
 from lingxi.adapters.feishu_events import (
     CARD_ACTION_TRIGGER_EVENT,
@@ -58,17 +57,11 @@ from .config import GatewayConfig, GatewayConfigError, load_config
 from .delivery import LOOP_ALERT_TRACE_ID
 from .document_delivery import (
     LOOP_ALERT_TRACE_ID as DOCUMENT_DELIVERY_LOOP_ALERT_TRACE_ID,
-)
-from .document_delivery import (
     assemble_document_delivery_consumer,
 )
 from .group_mention_hint import GroupMentionHintResponder, build_group_mention_hint_throttle
 from .log_redaction import install_credential_redaction
-from .management_status import (
-    PUBLISHING_STATUS_TEXT,
-    rendered_dispatch_status,
-    skipped_recompute_status_message,
-)
+from .management_status import PUBLISHING_STATUS_TEXT, rendered_dispatch_status, skipped_recompute_status_message
 from .onboarding import assert_gateway_onboarding_is_inert
 
 logger = logging.getLogger(__name__)
@@ -686,7 +679,6 @@ def build_supervisor(
 
     from lingxi.adapters.admin_post_callback import BackgroundPostCallbackExecutor
     from lingxi.adapters.admin_registry import PostgresAdminQueries, PostgresAdminRegistryLookup
-
     # 刻意从 `delegated_subject_lookup`（不是 `delegated_credentials`）导入：后者
     # 的其它函数用到 cryptography（Fernet 密文读写），而 `pyproject.toml` 的
     # `gateway` extras 组明确不含 cryptography——gateway 不碰 Fernet（2026-08-18

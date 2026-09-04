@@ -12,10 +12,11 @@
 
 from __future__ import annotations
 
+from contextlib import AbstractContextManager
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from enum import Enum
-from typing import ContextManager, Protocol
+from typing import Protocol
 
 from lingxi.core.user_memory import UserMemoryEntry
 
@@ -311,7 +312,7 @@ class GatewayTransaction(Protocol):
 
 
 class GatewayStore(Protocol):
-    def transaction(self) -> ContextManager[GatewayTransaction]: ...
+    def transaction(self) -> AbstractContextManager[GatewayTransaction]: ...
 
     def claim_queue_failure_notice(self, *, event_id: str) -> bool: ...
 

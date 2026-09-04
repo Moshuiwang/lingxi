@@ -33,6 +33,7 @@ import unittest
 from collections.abc import Mapping
 from datetime import datetime, timedelta
 from pathlib import Path
+from typing import Any
 
 from gateway_fakes import CallLog, FakeAudit, FakeReactions, FakeReplies
 from postgres_schema import ensure_production_schema, psycopg_available, reset_production_rows
@@ -2919,9 +2920,9 @@ class WorkerServiceTests(unittest.TestCase):
 
         **断言的牙齿在哪**：``answered_while_blocked``——那次假的数据库往返**还没
         返回**的时候，钩子就必须已经应答过。产品口径的 30 秒预算
-        （``_HOOK_ANSWER_BUDGET_SECONDS``）同时断言，但它不是这条用例的牙齿：把
+        （``hook_answer_budget_seconds``）同时断言，但它不是这条用例的牙齿：把
         阻塞时长做到真的超过 30 秒会让 fast 层多花半分钟，因此阻塞只留
-        ``_BLOCKED_DB_GRACE_SECONDS`` 秒的兜底（同时也保证退化时用例不会挂死）。
+        ``blocked_db_grace_seconds`` 秒的兜底（同时也保证退化时用例不会挂死）。
 
         变异验红：把 ``process_once()`` 里的
         ``await asyncio.to_thread(self._housekeep)`` 改回裸调 ``self._housekeep()``，
@@ -2972,8 +2973,8 @@ class WorkerServiceTests(unittest.TestCase):
         from lingxi.core.execution.hooks import ToolGateway
         from lingxi.core.execution.tool_policy import ToolPolicy
 
-        _HOOK_ANSWER_BUDGET_SECONDS = 30.0
-        _BLOCKED_DB_GRACE_SECONDS = 5.0
+        hook_answer_budget_seconds = 30.0
+        blocked_db_grace_seconds = 5.0
 
         entered_database_call = threading.Event()
         hook_answered = threading.Event()
@@ -2985,7 +2986,7 @@ class WorkerServiceTests(unittest.TestCase):
             def reclaim_queued(self, *, max_wait: object) -> list:
                 entered_database_call.set()
                 observed["answered_while_blocked"] = hook_answered.wait(
-                    timeout=_BLOCKED_DB_GRACE_SECONDS
+                    timeout=blocked_db_grace_seconds
                 )
                 return []
 
@@ -3009,7 +3010,7 @@ class WorkerServiceTests(unittest.TestCase):
         async def scenario() -> None:
             housekeeping = asyncio.ensure_future(service.process_once())
             # 等巡检真的走进那次卡住的数据库往返，再发钩子——不用 sleep 猜时序。
-            await asyncio.to_thread(entered_database_call.wait, _BLOCKED_DB_GRACE_SECONDS)
+            await asyncio.to_thread(entered_database_call.wait, blocked_db_grace_seconds)
             started_at = time.monotonic()
             decision = await gateway.on_hook_event(
                 {
@@ -3022,7 +3023,7 @@ class WorkerServiceTests(unittest.TestCase):
             observed["latency"] = time.monotonic() - started_at
             observed["decision"] = decision
             hook_answered.set()
-            await asyncio.wait_for(housekeeping, timeout=_BLOCKED_DB_GRACE_SECONDS * 4)
+            await asyncio.wait_for(housekeeping, timeout=blocked_db_grace_seconds * 4)
 
         asyncio.run(scenario())
 
@@ -3036,7 +3037,7 @@ class WorkerServiceTests(unittest.TestCase):
         self.assertIsNotNone(observed.get("decision"), "钩子必须真的返回了一个判定")
         self.assertLess(
             float(observed["latency"]),  # type: ignore[arg-type]
-            _HOOK_ANSWER_BUDGET_SECONDS,
+            hook_answer_budget_seconds,
             "钩子应答必须落在 30 秒预算之内",
         )
 

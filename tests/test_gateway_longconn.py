@@ -68,8 +68,7 @@ class ScriptedTransport:
             if last:
                 self.exhausted = True
             raise episode
-        for payload in episode:
-            yield payload
+        yield from episode
         if last:
             self.exhausted = True
 

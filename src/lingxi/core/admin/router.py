@@ -21,9 +21,8 @@ from __future__ import annotations
 
 import inspect
 import logging
-from collections.abc import Sequence
 from dataclasses import dataclass
-from typing import Protocol
+from typing import Protocol, Sequence
 
 from lingxi.config.content import ContentCatalog, RenderedContent, default_content_catalog
 from lingxi.core.admin.commands import (

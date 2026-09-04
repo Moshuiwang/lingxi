@@ -170,10 +170,9 @@ from __future__ import annotations
 import logging
 import threading
 import traceback
-from collections.abc import Callable, Mapping, Sequence
 from dataclasses import replace
 from datetime import UTC, datetime
-from typing import Any
+from typing import Any, Callable, Mapping, Sequence
 
 from lingxi.core.conversation.ports import (
     OnboardingResult,
@@ -203,6 +202,8 @@ from lingxi.core.identity.onboarding_ports import (
     # 类型，方法体不需要按名字标注它），导入只是为了让它继续作为 ``onboarding_
     # runner`` 模块的属性可见——``adapters/user_environment.py:102`` 与
     # ``tests/test_onboarding_runner.py`` 都从这里导入。
+    EnvironmentResult,
+    # 失败原因落库口（Issue #337，可选，见该协议文档）。
     FailureReasonRecorder,
     GalaxySource,
     # 存量差集导入口（rc25 S-1，Issue #540）。
@@ -219,10 +220,6 @@ from lingxi.core.identity.onboarding_ports import (
 )
 from lingxi.core.identity.onboarding_support import draft_from_member, roster_row_for
 from lingxi.core.identity.onboarding_terminal import (
-    # ``_KEYS_REQUIRING_REFERENCE`` 本身在本文件不直接使用（``_with_reference`` 已经
-    # 在 onboarding_terminal.py 内部自包含），这里导入只是为了让它继续作为
-    # ``onboarding_runner`` 模块的属性可见——``tests/test_content_catalog.py`` 按
-    # ``onboarding_runner_module._KEYS_REQUIRING_REFERENCE`` 取用。
     KEY_COMPLETED,
     KEY_DELEGATED_SUBJECT,
     KEY_INNERTEST_NOT_OPEN,
@@ -232,6 +229,9 @@ from lingxi.core.identity.onboarding_terminal import (
     # 模块的属性可见——``tests/test_onboarding_runner.py``（前两个）与
     # ``apps/scheduler/stalled_provisioning.py``/``tests/test_stalled_
     # provisioning.py``（``KEY_STALLED``）都从这里导入。
+    KEY_INTERNAL_ERROR,
+    KEY_NOT_AUTHORIZED,
+    KEY_STALLED,
     KEY_SUSPENDED,
     KEY_SYNC_TIMEOUT,
     KEY_SYNCING,
@@ -244,19 +244,14 @@ from lingxi.core.identity.onboarding_terminal import (
     _not_authorized,
     _Terminal,
     _with_reference,
+    # ``_KEYS_REQUIRING_REFERENCE`` 本身在本文件不直接使用（``_with_reference`` 已经
+    # 在 onboarding_terminal.py 内部自包含），这里导入只是为了让它继续作为
+    # ``onboarding_runner`` 模块的属性可见——``tests/test_content_catalog.py`` 按
+    # ``onboarding_runner_module._KEYS_REQUIRING_REFERENCE`` 取用。
+    _KEYS_REQUIRING_REFERENCE,
 )
 from lingxi.core.identity.org_snapshot import DirectoryAvailability, SnapshotMember
-from lingxi.core.identity.preprovision import (
-    NULL_DISPATCH_LEDGER,
-    ORIGIN_PREPROVISION,
-    PositionGrantImporter,
-    PreprovisionGrant,
-    deliver_silently,
-    import_preprovision_grant,
-    is_system_trigger,
-    origin_of,
-    run_system_onboarding,
-)
+from lingxi.core.identity.preprovision import NULL_DISPATCH_LEDGER, ORIGIN_PREPROVISION, PositionGrantImporter, PreprovisionGrant, deliver_silently, import_preprovision_grant, is_system_trigger, origin_of, run_system_onboarding
 from lingxi.core.identity.provisioning import (
     IdentityProvisioning,
     ProvisioningRejection,
@@ -271,10 +266,7 @@ from lingxi.core.identity.stock_token_source import (
 from lingxi.core.permission.account_match import MATCHED, match_galaxy_account
 from lingxi.core.permission.local_override import ResolvedLocalOverrides, resolve_local_overrides
 from lingxi.core.permission.mcp_readiness import ReadinessBinding, ReadinessOutcome
-from lingxi.core.permission.merge_sources import (
-    REASON_LOCAL_OVERRIDE_READ_FAILED,
-    merge_permission_sources,
-)
+from lingxi.core.permission.merge_sources import REASON_LOCAL_OVERRIDE_READ_FAILED, merge_permission_sources
 from lingxi.core.permission.notification import describe_scope
 from lingxi.core.permission.publish import PermissionGrantBlockedByAccountState
 from lingxi.core.permission.publish_row import (

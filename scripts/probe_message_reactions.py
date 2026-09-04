@@ -120,8 +120,7 @@ def _list_reaction_pages(client: Any, message_id: str) -> Iterable[Any]:
                 f"log_id={response.get_log_id()}"
             )
         data = response.data
-        for item in getattr(data, "items", None) or []:
-            yield item
+        yield from getattr(data, "items", None) or []
         page_token = getattr(data, "page_token", None)
         if not getattr(data, "has_more", False) or not page_token:
             return

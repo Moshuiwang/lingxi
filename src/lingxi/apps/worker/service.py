@@ -29,10 +29,7 @@ from lingxi.apps.worker.report_extraction import (
     failure_with_signature,
     sanitize_failure_signature,
 )
-from lingxi.apps.worker.session_cleanup import (
-    delete_agent_session_files,
-    run_session_transcript_reclaim,
-)
+from lingxi.apps.worker.session_cleanup import delete_agent_session_files, run_session_transcript_reclaim
 from lingxi.apps.worker.turn import MCP_BAD_GATEWAY_FAILURE_CODE, WorkerTurnExecutor
 from lingxi.config.content import ContentCatalog, RenderedContent, default_content_catalog
 from lingxi.core.delivery.ports import DeliveryEventType, TerminalKind, assert_content_allowed
@@ -583,9 +580,8 @@ class WorkerService:
         if context is None:
             return
 
-        marker = lambda: self._queue.mark_side_effect(
-            task_id=claimed.task_id, worker_id=self._config.worker_id
-        )
+        def marker() -> None:
+            self._queue.mark_side_effect(task_id=claimed.task_id, worker_id=self._config.worker_id)
         self._append_event(claimed, event_type="started", idempotency_key_suffix="started")
 
         stop_event = asyncio.Event()

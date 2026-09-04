@@ -215,7 +215,7 @@ class RoundEndCleanupTests(ContentCapturePostgresTestCase):
             """,
             (old_row,),
         )
-        new_row = self.writer.write(self.sample_record(task_id="t-new"))
+        self.writer.write(self.sample_record(task_id="t-new"))
         round_start = datetime.now(UTC) - timedelta(days=1)
         round_end = datetime.now(UTC) + timedelta(days=1)
 

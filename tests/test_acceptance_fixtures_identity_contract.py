@@ -17,13 +17,13 @@ import unittest
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
-REPOSITORY_ROOT = Path(__file__).parents[1]
-SCRIPT = REPOSITORY_ROOT / "scripts" / "acceptance_fixtures_identity.py"
-
 from lingxi.adapters.role_function_map_file import load_role_function_map
 from lingxi.core.permission.account_match import MATCHED, NOT_FOUND, match_galaxy_account
 from lingxi.core.permission.mcp_readiness import ReadinessSchedule
 from lingxi.core.permission.role_function import resolve_role_functions
+
+REPOSITORY_ROOT = Path(__file__).parents[1]
+SCRIPT = REPOSITORY_ROOT / "scripts" / "acceptance_fixtures_identity.py"
 
 
 def _load_script():

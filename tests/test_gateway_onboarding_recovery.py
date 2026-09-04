@@ -286,7 +286,9 @@ class CapacityCouplingTests(ReconcilerTestCase):
         self.assertEqual(runner.calls, [])
 
     def test_the_capacity_source_is_readable_for_the_assembly_assertion(self) -> None:
-        source = (lambda: 5)
+        def source() -> int:
+            return 5
+
         self.assertIs(self.build(capacity=source).capacity_source, source)
         self.assertIsNone(self.build().capacity_source)
 

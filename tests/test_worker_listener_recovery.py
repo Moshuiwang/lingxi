@@ -86,7 +86,9 @@ class ListenerDisconnectTests(unittest.TestCase):
         _run_until(service, lambda: len(listeners) >= 3 and listeners[2].wait_calls >= 2)
 
         self.assertGreaterEqual(len(listeners), 3, "前两个监听各断一次，必须各重建一次")
-        self.assertEqual([l.exit_calls for l in listeners[:2]], [1, 1], "断掉的监听要被关掉")
+        self.assertEqual(
+            [listener.exit_calls for listener in listeners[:2]], [1, 1], "断掉的监听要被关掉"
+        )
         self.assertGreaterEqual(queue.claim_calls, 3, "每次重建前后都照常领取")
 
     def test_when_the_listener_cannot_be_established_the_loop_polls_and_retries(self) -> None:
