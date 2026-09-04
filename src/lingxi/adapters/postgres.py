@@ -89,6 +89,7 @@ class PostgresTimeouts:
     lock_timeout_seconds: int = DEFAULT_LOCK_TIMEOUT_SECONDS
 
     def __post_init__(self) -> None:
+        """校验三项等待边界均为非负整数。"""
         for name in (
             "connect_timeout_seconds",
             "statement_timeout_seconds",
@@ -104,7 +105,6 @@ class PostgresTimeouts:
         prefix: str = "LINGXI_POSTGRES_",
     ) -> PostgresTimeouts:
         """从已由 ``apps`` 传入的环境映射构造配置，不直接读取进程环境。"""
-
         return cls(
             connect_timeout_seconds=_read_timeout(
                 environment, f"{prefix}CONNECT_TIMEOUT_SECONDS", DEFAULT_CONNECT_TIMEOUT_SECONDS
@@ -120,7 +120,6 @@ class PostgresTimeouts:
     @property
     def libpq_options(self) -> str:
         """返回不可由调用点修改的 PostgreSQL 会话启动参数。"""
-
         return (
             f"-c statement_timeout={self.statement_timeout_seconds}s "
             f"-c lock_timeout={self.lock_timeout_seconds}s"
@@ -165,7 +164,6 @@ class _IdleConnectionPool:
 
     def acquire(self, key: _PoolKey) -> Any | None:
         """取一条可用的空闲连接；没有则返回 ``None``，由调用方新建。"""
-
         while True:
             with self._lock:
                 stack = self._idle.get(key)
@@ -189,9 +187,11 @@ class _IdleConnectionPool:
             return connection
 
     def release(self, key: _PoolKey, connection: Any) -> bool:
-        """归还一条连接。返回 ``True`` 表示已放回空闲栈；``False`` 表示它不该再被
-        复用，调用方必须真正关闭它。顺手回收栈底空闲过久的连接。"""
+        """归还一条连接。
 
+        返回 ``True`` 表示已放回空闲栈；``False`` 表示它不该再被复用，调用方
+        必须真正关闭它。顺手回收栈底空闲过久的连接。
+        """
         if connection.closed or not connection.reset_for_reuse():
             return False
         now = time.monotonic()
@@ -217,7 +217,6 @@ class _IdleConnectionPool:
 
     def close_all(self) -> int:
         """真正关闭全部空闲连接，返回关闭的数量。进程退出时经 ``atexit`` 调用。"""
-
         with self._lock:
             stacks = list(self._idle.values())
             self._idle.clear()
@@ -242,15 +241,15 @@ _IDLE_POOL = _IdleConnectionPool()
 
 
 def close_idle_connections() -> int:
-    """关闭本进程空闲栈里的全部连接，返回数量。``apps`` 层停机或测试隔离时调用；
-    正常退出由 ``atexit`` 自动完成。"""
+    """关闭本进程空闲栈里的全部连接，返回数量。
 
+    ``apps`` 层停机或测试隔离时调用；正常退出由 ``atexit`` 自动完成。
+    """
     return _IDLE_POOL.close_all()
 
 
 def idle_connection_count() -> int:
     """当前空闲栈里的连接数（观测与测试用）。"""
-
     return _IDLE_POOL.idle_count()
 
 
@@ -258,15 +257,15 @@ _reusable_connection_type: type | None = None
 
 
 class _ReusableConnectionMixin:
-    """``close()`` 改为归还进程内空闲栈的连接，与 ``psycopg.Connection`` 组合成
-    ``ReusableConnection``（见 :func:`_build_reusable_connection_type`）。
+    """``close()`` 改为归还进程内空闲栈的连接。
 
-    借用者看到的合同与驱动一致：``with`` 退出由驱动 ``commit()`` / ``rollback()``
-    再 ``close()``；``close()`` 之后 ``closed`` 为真、重复 ``close()`` 空操作、再开
-    游标或提交报"连接已关闭"。区别只在物理连接没有断开，而是等下一位借用者。
-    本类不依赖 ``psycopg``：模块顶层不能 import 第三方 SDK，需要引用驱动异常或
-    状态枚举的方法各自延迟导入；``super()`` 在实际拼接出的 ``ReusableConnection``
-    的 MRO 上解析到 ``psycopg.Connection``，与直接继承时行为一致。
+    与 ``psycopg.Connection`` 组合成 ``ReusableConnection``（见
+    :func:`_build_reusable_connection_type`）。借用者看到的合同与驱动一致：
+    ``with`` 退出由驱动 ``commit()``/``rollback()`` 再 ``close()``；之后
+    ``closed`` 为真、重复 ``close()`` 空操作、再用报"连接已关闭"，区别只在物理
+    连接没断、等下一位借用者。模块顶层不能 import 第三方 SDK，本类需要引用驱动
+    异常/状态枚举的方法各自延迟导入；``super()`` 在拼接出的 ``ReusableConnection``
+    MRO 上解析到 ``psycopg.Connection``，行为与直接继承一致。
     """
 
     _lingxi_pool_key: _PoolKey | None = None
@@ -311,7 +310,6 @@ class _ReusableConnectionMixin:
 
     def discard(self) -> None:
         """真正关闭，不再归还。"""
-
         self._lingxi_idle = False
         self._lingxi_pool_key = None
         super().close()
@@ -324,7 +322,6 @@ class _ReusableConnectionMixin:
         直接归还而没有先 ``commit()`` 时，未提交的改动与直接关闭一样被丢弃——
         不能带着别人的半截事务给下一位借用者。属性复位都是本地赋值，不发语句。
         """
-
         from psycopg.pq import TransactionStatus
 
         status = self.pgconn.transaction_status
@@ -347,9 +344,11 @@ class _ReusableConnectionMixin:
         return True
 
     def has_pending_input(self) -> bool:
-        """socket 上有没有待读数据。空闲连接本不该有：有就是服务端来过话
-        （FATAL 后关连接），当作可疑，交给 ``probe()`` 定夺。看不了 socket 也算可疑。"""
+        """Socket 上有没有待读数据。
 
+        空闲连接本不该有：有就是服务端来过话（FATAL 后关连接），当作可疑，
+        交给 ``probe()`` 定夺。看不了 socket 也算可疑。
+        """
         try:
             readable, _writable, _errors = select.select([self.fileno()], [], [], 0)
         except (OSError, ValueError):
@@ -358,7 +357,6 @@ class _ReusableConnectionMixin:
 
     def probe(self) -> bool:
         """一次往返确认服务端还在；失败返回 ``False``。"""
-
         try:
             self.autocommit = True
             try:
@@ -374,7 +372,6 @@ class _ReusableConnectionMixin:
 
 def _build_reusable_connection_type() -> type:
     """延迟构造 psycopg ``Connection`` 子类：模块顶层不能 import 驱动。"""
-
     global _reusable_connection_type
     if _reusable_connection_type is not None:
         return _reusable_connection_type
@@ -405,7 +402,6 @@ def connect(
     ``connect_timeout``/``options``/TCP 保活参数不接受调用方覆盖；需要改变超时
     边界必须先构造经过校验的 :class:`PostgresTimeouts`。
     """
-
     if "connect_timeout" in kwargs or "options" in kwargs:
         raise TypeError("数据库连接的超时参数只能通过 PostgresTimeouts 提供")
     if kwargs.keys() & TCP_KEEPALIVE_PARAMETERS.keys():
