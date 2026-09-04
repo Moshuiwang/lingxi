@@ -53,7 +53,7 @@ docker compose --env-file deploy/.env.stage -f deploy/compose.yaml -f deploy/com
 - **禁止 `latest` 或分支名**。`scripts/ci/check_deploy_contract.py` 会拦住它们。
 - 与源码验收标签 `l4a-accepted-*` **不混用**：那是 git tag，只固定源码，不是镜像 tag。
 
-镜像仓库为 GHCR（2026-08-06 产品负责人拍板，见 Issue #62 决策登记），CI 用 Actions 原生 `GITHUB_TOKEN` 推送，不新增外部账号凭据。
+镜像仓库为 GHCR（2026-08-06 产品负责人拍板，见 Issue #62 决策登记），CI 用 Actions 原生 `GITHUB_TOKEN` 尝试推送，不新增外部账号凭据。发布结果以 Actions summary 的逐镜像条目为准：标记“已推送 GHCR”且带回读 digest 才是仓库中的镜像；权限不足时会明确标记“未推送、仅 CI artifact”，此时只有备用包。
 
 ## 版本号规则
 
