@@ -136,6 +136,7 @@ class StalledProvisioningReport:
     notifier_wired: bool = True
 
     def audit_facts(self) -> dict[str, Any]:
+        """把计数字段展开成一份可以直接喂给审计记录的字典。"""
         facts: dict[str, Any] = {
             "examined": self.examined,
             "notified": self.notified,
@@ -205,6 +206,7 @@ class StalledProvisioningDuty:
         clock: Callable[[], float] | None = None,
         stop: threading.Event | None = None,
     ) -> None:
+        """按注入的候选查询/收口写口装配一个开通中途停摆收口职责实例。"""
         if (
             isinstance(lease_seconds, bool)
             or not isinstance(lease_seconds, int)
@@ -239,14 +241,15 @@ class StalledProvisioningDuty:
     @property
     def notifier_wired(self) -> bool:
         """通知出口装配了没有。见模块文档「缺通知出口时的姿态」。"""
-
         return self._notifier is not None
 
     @property
     def stopping(self) -> bool:
+        """是否已收到停止信号。"""
         return self._stop.is_set()
 
     def request_stop(self) -> None:
+        """置位停止信号：本轮及之后不再领取新的候选。"""
         self._stop.set()
 
     # ------------------------------------------------------------------
@@ -255,7 +258,6 @@ class StalledProvisioningDuty:
 
     def run_once(self) -> StalledProvisioningReport | None:
         """跑一轮。返回 ``None`` 表示本轮没有执行（停止中）。"""
-
         if self._stop.is_set():
             return None
 
@@ -306,7 +308,6 @@ class StalledProvisioningDuty:
         （发通知、可能收口）——过采样是为了不让排在最前面、正处于退避期的候选把
         ``limit`` 名额占满，饿死后面真正等待处理的新候选。
         """
-
         fetch_limit = min(self._limit * STALLED_FETCH_OVERSAMPLE, _MAX_FETCH_LIMIT)
         candidates = self._candidates.stalled_provisioning_candidates(
             lease_seconds=self._lease_seconds, limit=fetch_limit
@@ -358,7 +359,6 @@ class StalledProvisioningDuty:
         静默路径按送达处理，收口写入、审计与失败原因落库照旧。用户自己发起
         的链一字不变。
         """
-
         if is_system_trigger(item.event_id):
             tally.silenced_system += 1
         else:
@@ -384,7 +384,6 @@ class StalledProvisioningDuty:
 
     def _abort_after_notify(self, item: Any, tally: _Tally) -> None:
         """通知已完成（或静默豁免）之后，CAS 收口成 ``aborted`` 并落审计与失败原因。"""
-
         aborted = self._aborter.abort_stalled_provisioning(
             user_id=item.user_id,
             expected_states=_EXPECTED_STATES,
@@ -419,7 +418,6 @@ class StalledProvisioningDuty:
         reason`` 同一条纪律——落库失败不得带走已经完成的收口，只改记一条自己的
         失败审计。
         """
-
         if self._failure_reasons is None:
             return
         try:
@@ -452,7 +450,6 @@ def _build_stalled_provisioning_duty(
     只是拿一份 :class:`ReadinessSchedule` 来核对预算数字，**不需要真的
     装配探针**，因此在探针端点是否配置好之前就能跑。
     """
-
     from lingxi.adapters.postgres_identity import PostgresAppUserStore
     from lingxi.adapters.postgres_onboarding_failure import PostgresFailureReasonRecorder
     from lingxi.adapters.postgres_stalled_provisioning import PostgresStalledProvisioningStore
@@ -484,7 +481,6 @@ def _build_stalled_provisioning_duty(
 
 def _build_stalled_notifier(config: SchedulerConfig) -> Any:
     """装配停摆终态通知的发送口（``CatalogNotifier``）。"""
-
     from lingxi.adapters.feishu_user_message import FeishuUserMessages
     from lingxi.apps.scheduler.onboarding import CatalogNotifier
     from lingxi.config.content import default_content_catalog

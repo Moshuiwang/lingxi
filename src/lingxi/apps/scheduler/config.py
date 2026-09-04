@@ -68,7 +68,6 @@ class _Secret(str):
 
 def _required(source: Mapping[str, str], name: str) -> str:
     """必需的环境变量：缺失快速失败，只报变量名，不回显任何值。"""
-
     value = (source.get(name) or "").strip()
     if not value:
         raise ValueError(f"缺少必需的环境变量：{name}")
@@ -81,7 +80,6 @@ def _parse_optional_identifier(source: Mapping[str, str], name: str) -> str | No
     **错配不是未配**——一个带了换行的 Base token 静默降级成"没配"，会让相应职责
     悄悄不注册，而运维那边看到的是"我明明配了"。错误消息只报变量名，不回显值。
     """
-
     value = (source.get(name) or "").strip()
     if not value:
         return None
@@ -236,7 +234,6 @@ def _parse_admin_group_chat_id(source: Mapping[str, str]) -> str | None:
 
 def _parse_bitable_coordinates(source: Mapping[str, str]) -> tuple[str | None, ...]:
     """权限表与存量令牌源的四个 Base/表标识，均可选、均按同一条纪律解析。"""
-
     return (
         _parse_optional_identifier(source, "LINGXI_PERMISSION_BITABLE_APP_TOKEN"),
         _parse_optional_identifier(source, "LINGXI_PERMISSION_BITABLE_TABLE_ID"),
@@ -261,6 +258,8 @@ def _parse_alert_policy(source: Mapping[str, str]) -> AlertPolicy:
 
 @dataclass(frozen=True)
 class SchedulerConfig:
+    """scheduler 进程的全部配置；敏感字段用 `field(repr=False)` 挡住 repr 回显。"""
+
     postgres_dsn: str = field(repr=False)
     credential_key: str = field(repr=False)
     # 凭据文件的宿主机路径。部署契约：必须指向跨部署持久的挂载路径，镜像替换与
@@ -379,7 +378,6 @@ class SchedulerConfig:
     @classmethod
     def from_env(cls, environ: Mapping[str, str] | None = None) -> SchedulerConfig:
         """一次性读完全部配置。缺项只报变量名，绝不回显取到的值。"""
-
         source = os.environ if environ is None else environ
 
         interval = _parse_interval_seconds(source)
@@ -441,5 +439,4 @@ class SchedulerConfig:
         ——``apps/gateway/config.py`` 读同一个变量时用的是同一个函数，两个进程因此
         不可能对"该读哪一份映射"给出不同答案，见该函数文档。
         """
-
         return parse_metric_map_path(self.company_function_metric_map_path)

@@ -166,6 +166,7 @@ class LateReadinessRecoveryReport:
     probe_wired: bool = True
 
     def audit_facts(self) -> dict[str, Any]:
+        """把计数字段展开成一份可以直接喂给审计记录的字典。"""
         facts: dict[str, Any] = {
             "examined": self.examined,
             "ready": self.ready,
@@ -262,6 +263,7 @@ class LateReadinessRecoveryDuty:
         notice_limit: int = DEFAULT_NOTICE_DRAIN_LIMIT,
         stop: threading.Event | None = None,
     ) -> None:
+        """按注入的候选/写口/通知协作者装配一个迟到就绪恢复职责实例。"""
         if not isinstance(reason, str) or not reason.strip():
             raise ValueError("必须指明本职责负责恢复哪一类发布意图")
         if (
@@ -290,14 +292,15 @@ class LateReadinessRecoveryDuty:
     @property
     def probe_wired(self) -> bool:
         """探针面装配了没有。见 :class:`_Ticker` 的文档。"""
-
         return self._ticker is not None
 
     @property
     def stopping(self) -> bool:
+        """是否已收到停止信号。"""
         return self._stop.is_set()
 
     def request_stop(self) -> None:
+        """置位停止信号：本轮及之后不再推进新的候选。"""
         self._stop.set()
 
     # ------------------------------------------------------------------
@@ -311,7 +314,6 @@ class LateReadinessRecoveryDuty:
         它自己的传输超时；候选查询与通知认领都已经把没到期的挡在外面，一轮什么都不
         到期时只是两次空查询。
         """
-
         if self._stop.is_set():
             return None
 
@@ -350,7 +352,6 @@ class LateReadinessRecoveryDuty:
 
     def _advance_candidates(self, tally: _Tally) -> bool:
         """取到期候选并逐个推进。返回本轮是否被停止信号中断。"""
-
         candidates = self._candidates.late_onboarding_recovery_candidates(
             reason=self._reason,
             recovery_interval_seconds=self._interval,
@@ -388,7 +389,6 @@ class LateReadinessRecoveryDuty:
         步骤分别加保护，各自用发起时刻真实的 ``attempt_no``，避免一个抛异常
         的候选在下一个 tick 立刻重入、饿死其余候选。
         """
-
         binding = ReadinessBinding(user_id=item.user_id, permission_version=item.permission_version)
         if self._ticker is None:
             # 探针未接线：本轮不落任何记录，端点配好后从库里的进度原样继续。
@@ -425,7 +425,6 @@ class LateReadinessRecoveryDuty:
         active。探针之后的步骤一旦抛出未预期异常，占住这一次调度窗口再上抛，
         用**下一个** attempt_no（探针那一次已经真的成功记过账了）。
         """
-
         try:
             company, function = describe_scope(parse_permissions(item.permissions))
             dedupe_key = f"onboarding:recovery:{item.user_id}:{item.permission_version}"
@@ -470,7 +469,6 @@ class LateReadinessRecoveryDuty:
 
     def _drain_notices(self, tally: _Tally) -> bool:
         """认领并发送到期的待发通知。返回本轮是否被停止信号中断。"""
-
         for _ in range(self._notice_limit):
             if self._stop.is_set():
                 return True
@@ -551,7 +549,6 @@ def _build_late_readiness_recovery_duty(
     需要真探针才能推进的那一路本轮不推进，只留**恰一条**审计；通知面（认领
     已排出的待发通知并重试直到送达）不依赖探针，照常运行。
     """
-
     from lingxi.adapters.feishu_user_message import FeishuUserMessages
     from lingxi.adapters.postgres_late_readiness_recovery import PostgresLateReadinessStore
     from lingxi.adapters.postgres_permission_publish import PostgresPermissionPublishStore
@@ -591,7 +588,6 @@ def _build_late_readiness_recovery_duty(
 
 def _build_late_readiness_ticker(config: SchedulerConfig, *, audit: AuditSink) -> Any:
     """装配探针面；缺 MCP 令牌主密钥或问数 MCP 端点时只留**恰一条**审计并返回 ``None``。"""
-
     if not config.mcp_token_encrypt_key:
         from lingxi.adapters.mcp_token_cipher import MASTER_KEY_ENV
 

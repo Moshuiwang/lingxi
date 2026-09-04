@@ -40,7 +40,6 @@ def _build_readiness_follow_up(
     探针**：那会让每条确认以技术失败耗满预算再转运维，把"还没接线"伪装成
     "接线了但一直失败"。
     """
-
     if not config.mcp_token_encrypt_key:
         from lingxi.adapters.mcp_token_cipher import MASTER_KEY_ENV
 
@@ -92,7 +91,6 @@ def _build_readiness_probe(
     ``result.content[0].text`` 的一段 JSON 字符串里，默认的 reader 认不出这个
     形状，不注入的话探针在真实 MCP 上会永远技术失败。
     """
-
     schedule = ReadinessSchedule(probe_timeout_seconds=config.query_mcp_timeout_seconds)
     if not config.query_mcp_endpoint:
         # **恰一条**审计：只关掉探针，撤权通知照常。
@@ -131,7 +129,6 @@ def _build_notice_dispatcher(config: SchedulerConfig, *, audit: AuditSink, stop:
     对应编号时按既有行为原样展示编号，不阻塞通知发送。退避用 ``stop.wait`` 而
     不是 ``time.sleep``：SIGTERM 能立刻打断它。
     """
-
     from lingxi.adapters.feishu_user_message import FeishuUserMessages
     from lingxi.adapters.postgres_galaxy_snapshot import PostgresCompanyNames
     from lingxi.core.permission.notification import PermissionNoticeDispatcher

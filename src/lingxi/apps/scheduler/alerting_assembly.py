@@ -37,7 +37,6 @@ def build_alerting_duty(config: SchedulerConfig, *, audit: AuditSink | None = No
     地方——gateway 与 worker 各自在自己的 ``apps/<name>`` 里装配同型的一份，三者
     互不共享状态（各自是独立部署单元）。
     """
-
     if config.admin_group_chat_id:
         from lingxi.adapters.feishu_group_message import FeishuGroupMessages
 
@@ -67,7 +66,6 @@ def _combined_heartbeat(alerting_duty: AlertingDuty, liveness_role: str) -> Call
     重启也能观察到的阈值/去重状态机，活性文件供同容器内的
     ``python -m lingxi.apps.healthcheck`` 判断主循环是否还在跳动。
     """
-
     from lingxi.apps.liveness import touch_liveness
 
     beat = alerting_duty.heartbeat_callback(liveness_role)

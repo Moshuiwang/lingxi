@@ -74,7 +74,6 @@ def monotonic_utc_clock() -> Callable[[], datetime]:
     墙钟会缓慢漂移，这条链上只消费"两个时刻之间差了多久"，漂移不影响；需要
     绝对时刻的地方另有各自的来源。
     """
-
     base_wall = datetime.now(_UTC)
     base_monotonic = time.monotonic()
 
@@ -101,6 +100,7 @@ class HardDeadlineProbe:
     """
 
     def __init__(self, *, probe: Any, timeout_seconds: float) -> None:
+        """把一个真实探针包进执行级看门狗；`probe` 不得为空。"""
         if probe is None:
             raise TypeError("硬截止看门狗必须包住一个真实探针")
         if not isinstance(timeout_seconds, (int, float)) or timeout_seconds <= 0:
@@ -111,10 +111,10 @@ class HardDeadlineProbe:
     @property
     def timeout_seconds(self) -> float:
         """透传被包住那个探针的传输超时，供装配断言 2 逐值比对。"""
-
         return getattr(self._probe, "timeout_seconds", self._timeout_seconds)
 
     def list_metrics(self, *, user_id: str) -> int:
+        """跑一次真实探针，超过执行级硬截止仍未返回就判技术失败。"""
         from lingxi.core.permission.mcp_readiness import McpProbeError
 
         outcome: list[Any] = []
@@ -164,6 +164,7 @@ class OnboardingExecutor:
         should_stop: Callable[[], bool] | None = None,
         stop_poll_seconds: float = STOP_POLL_INTERVAL_SECONDS,
     ) -> None:
+        """按线程数与队列上限装配一个开通链专属执行器；线程尚未启动。"""
         if isinstance(workers, bool) or not isinstance(workers, int) or workers <= 0:
             raise ValueError("开通执行器至少要有一条线程")
         if not isinstance(stop_poll_seconds, (int, float)) or stop_poll_seconds <= 0:
@@ -190,6 +191,7 @@ class OnboardingExecutor:
         ]
 
     def start(self) -> None:
+        """启动全部工作线程；调用方负责只调用一次。"""
         for thread in self._threads:
             thread.start()
 
@@ -203,7 +205,6 @@ class OnboardingExecutor:
         算进去。少认领一条下一轮照捞，多认领一条就要靠释放路径救回来——两种错的代价
         完全不对称。
         """
-
         if self._stopping.is_set() or self._should_stop():
             return 0
         # 只算队列里还空着的位置，**不把「正在跑的那几条马上会腾出线程」算进去**。
@@ -214,7 +215,6 @@ class OnboardingExecutor:
 
     def submit(self, task: Callable[[], None]) -> bool:
         """排一条链。队列满或已停机时返回 ``False``，**不阻塞调用线程**。"""
-
         with self._gate:
             # 检查与入队必须在同一把锁内，理由见 ``self._gate`` 的注释。
             if self._stopping.is_set() or self._should_stop():
@@ -236,7 +236,6 @@ class OnboardingExecutor:
         队列满时哨兵会投递失败，真正兜底的是 :meth:`_loop` 里带超时的
         ``get()``，自己定期复查停止标志与队列是否已排空。
         """
-
         with self._gate:
             # 与 ``submit`` 同一把锁：置位之后就不可能再有新任务排到哨兵后面去。
             self._stopping.set()
@@ -249,12 +248,14 @@ class OnboardingExecutor:
                     pass
 
     def join(self, timeout: float) -> None:
+        """至多等 `timeout` 秒，让在途任务在预算内收尾；超时不强杀线程。"""
         deadline = time.monotonic() + max(0.0, timeout)
         for thread in self._threads:
             thread.join(timeout=max(0.0, deadline - time.monotonic()))
 
     @property
     def alive(self) -> bool:
+        """是否还有工作线程活着。"""
         return any(thread.is_alive() for thread in self._threads)
 
     def _loop(self) -> None:
@@ -267,7 +268,6 @@ class OnboardingExecutor:
         一段时间就会重新复查停止标志与队列是否已空。**不改变** ``stop()`` 的
         产品语义：已排队的任务照常正常出队执行，只是多了一条定期自查的路径。
         """
-
         while True:
             try:
                 task = self._queue.get(timeout=self._stop_poll_seconds)
@@ -313,7 +313,6 @@ def join_onboarding_executors(duties: Sequence[Any]) -> None:
     装配，这里只需要认这一个约定好的接缝，不需要重新认识那个类型本身。没有
     任何职责挂了这个属性时本函数是纯粹的空操作。
     """
-
     for duty in duties:
         executor = getattr(duty, "onboarding_executor", None)
         if executor is None:
@@ -341,9 +340,11 @@ class RosterRows:
     """
 
     def __init__(self, store: Any) -> None:
+        """包住一个花名册持久快照读取口。"""
         self._store = store
 
     def rows(self) -> Sequence[Mapping[str, Any]] | None:
+        """当前全部花名册行，没有快照时返回 ``None``。"""
         snapshot = self._store.load()
         return None if snapshot is None else snapshot.rows
 
@@ -356,12 +357,14 @@ class CatalogNotifier:
     """
 
     def __init__(self, *, sender: Any, catalog: Any) -> None:
+        """包住一个私聊发送口与一份内容目录。"""
         self._sender = sender
         self._catalog = catalog
 
     def send(
         self, *, open_id: str, key: str, values: Mapping[str, object], dedupe_key: str
     ) -> None:
+        """渲染内容目录里的一条 key 并私聊发给用户本人。"""
         content = self._catalog.text(key, **values)
         self._sender.send_text(open_id=open_id, text=content.text, dedupe_key=dedupe_key)
 
@@ -377,7 +380,6 @@ def assert_probe_timeouts_agree(*, probe: Any, schedule: Any) -> None:
     不相等时，就绪那一侧算出来的「结论最晚什么时候落地」就是假的：它按
     ``预算 + 单次超时`` 给上游承诺收口，而真正卡住链路的是传输层那个数。
     """
-
     if probe.timeout_seconds != schedule.probe_timeout_seconds:
         raise RuntimeError("探针传输超时必须与就绪节奏的单次超时一致，否则收口上界是假的")
     if schedule.probe_timeout_seconds > schedule.interval_seconds:  # pragma: no cover - 上游已守
@@ -393,7 +395,6 @@ def assert_claim_limit_follows_capacity(reconciler: Any, executor: OnboardingExe
     循环真的绑上了**这一个**执行器的 ``free_slots``，而不是"装配时传过一个
     函数"——绑错执行器与没绑一样危险。
     """
-
     source = getattr(reconciler, "capacity_source", None)
     if source is None:
         raise RuntimeError(
@@ -415,7 +416,6 @@ def assert_stalled_lease_exceeds_chain_budget(
     之间没有独立上界的几步靠这段余量吸收。终态确定之后的通知重试耗时不计入
     公式，相对余量可忽略不计。
     """
-
     chain_budget = (
         float(publish_wait_seconds)
         + float(schedule.budget_seconds)
@@ -437,7 +437,6 @@ def _stock_token_unwired_reason(config: Any, access_token: Callable[[], str] | N
     :func:`build_stock_token_source` 直接使用的审计 ``reason`` 取值，各自对应
     一种半开的错误配置。
     """
-
     app_token = config.stock_token_app_token
     table_id = config.stock_token_table_id
     if not app_token and not table_id:
@@ -466,7 +465,6 @@ def build_stock_token_source(
     主密钥没接线、坐标与主密钥都齐但调用方没有交出令牌供给。复用权限发布表
     的应用身份令牌供给，不新增任何凭据材料。
     """
-
     unwired = _stock_token_unwired_reason(config, access_token)
     if unwired is not None:
         if audit is not None and unwired != "disabled":
@@ -497,7 +495,6 @@ def _onboarding_missing_prerequisite(
     config: SchedulerConfig, employment_access_token: Callable[[], str] | None
 ) -> tuple[str, str] | None:
     """检查权限发布/角色映射/用户环境之外的前置；``None`` 表示齐全。"""
-
     from lingxi.adapters.mcp_token_cipher import MASTER_KEY_ENV
 
     for variable, value in (
@@ -516,7 +513,6 @@ def _onboarding_missing_prerequisite(
 
 def _load_role_function_map_or_none(audit: AuditSink) -> Mapping[str, Any] | None:
     """加载角色职能映射；失败时记审计并返回 ``None``（不注册整个职责）。"""
-
     from lingxi.adapters.role_function_map_file import load_role_function_map
 
     try:
@@ -538,7 +534,6 @@ def _build_onboarding_readiness_probe(
     config: SchedulerConfig,
 ) -> tuple[Any, ReadinessSchedule, Any]:
     """装配就绪判定的令牌读写口、节奏与带执行级硬截止的探针。"""
-
     from lingxi.adapters.mcp_token_cipher import McpTokenCipher
     from lingxi.adapters.postgres_mcp_token import PostgresMcpTokenStore, token_cipher_provider
     from lingxi.adapters.query_mcp_probe import QueryMcpProbe, content_text_metrics_reader
@@ -575,7 +570,6 @@ def _sweep_onboarding_user_environment(config: SchedulerConfig, audit: AuditSink
     把上界压到至多一个进程生命周期。扫不动就不注册：那意味着管不了这个即将
     接收明文凭据的目录。
     """
-
     from lingxi.adapters.user_environment import LocalUserEnvironment, UserEnvironmentError
 
     environment = LocalUserEnvironment(
@@ -604,7 +598,6 @@ def _onboarding_identity_kwargs(
     stock_tokens: Any | None,
 ) -> dict[str, Any]:
     """身份定位与权限差集这一半的 ``AutoOnboardingRunner`` 构造参数。"""
-
     from lingxi.adapters.feishu_directory import FeishuDirectoryClient, FeishuEmploymentReader
     from lingxi.adapters.postgres_galaxy_snapshot import PostgresGalaxySnapshotReader
     from lingxi.adapters.postgres_identity import PostgresAppUserStore, PostgresOrgSnapshotStore
@@ -662,7 +655,6 @@ def _onboarding_readiness_kwargs(
     ``clock`` 由调用方传入并原样使用——见 :func:`_build_onboarding_runner` 的
     文档字符串：这里不得自建第二个单调时钟实例。
     """
-
     from lingxi.adapters.feishu_user_message import FeishuUserMessages
     from lingxi.adapters.postgres_permission_publish import PostgresPermissionPublishStore
     from lingxi.config.content import default_content_catalog
@@ -715,7 +707,6 @@ def _onboarding_publish_kwargs(
     ``clock`` 必须与 :func:`_onboarding_readiness_kwargs` 用的是同一个实例，
     理由同上。
     """
-
     from lingxi.adapters.delegated_credentials import registered_delegated_subject_open_id
     from lingxi.adapters.postgres_email_binding import PostgresEmailBindingSource
     from lingxi.adapters.postgres_onboarding_failure import PostgresFailureReasonRecorder
@@ -778,7 +769,6 @@ def _build_onboarding_runner(
     ``readiness`` 与顶层 ``clock`` 必须共用**同一个**单调时钟实例：两者都参与
     「成功来得太晚」的判定，一份对象各自持有会让两处时间基准悄悄分叉。
     """
-
     from lingxi.core.identity.onboarding_runner import AutoOnboardingRunner
 
     tokens, schedule, guarded_probe = readiness_probe
@@ -830,7 +820,6 @@ def _finalize_onboarding_duty(
     schedule: ReadinessSchedule,
 ) -> Any:
     """把 runner 包成 ``OnboardingReconciler``，接上执行器容量断言与动态属性挂载。"""
-
     from lingxi.core.conversation.onboarding_recovery import OnboardingReconciler
 
     duty = OnboardingReconciler(
@@ -880,7 +869,6 @@ def _onboarding_prerequisites_missing(
     仍会返回一个"仅就绪"的半装配对象，``is not None`` 会误放行开通、让发布
     意图排进 outbox 却没有任何职责会再看它一眼。
     """
-
     if permission_publish is None or not permission_publish.publish_wired:
         # 恰一条审计：只报「发布执行者不在」这个结构性原因，不夹带 `permission_publish`
         # 自己那一层的原因（那一层已经在自己的装配点留过审计）——两条审计合起来
@@ -919,7 +907,6 @@ def _build_onboarding_ledger_and_executor(
     config: SchedulerConfig, stop: threading.Event
 ) -> tuple[Any, OnboardingExecutor]:
     """装配开通事件账本存取口与专属线程池执行器。"""
-
     from lingxi.adapters.postgres_conversation import PostgresGatewayStore
 
     store = PostgresGatewayStore(config.postgres_dsn, timeouts=config.postgres_timeouts)
@@ -943,7 +930,6 @@ def _build_onboarding_duty(
     缺项时返回 ``None``，于是没有任何人认领 ``auto_provisioning`` 事件，比装
     一个失败关闭桩安全。装配不变量见 :func:`_onboarding_prerequisites_missing`。
     """
-
     if _onboarding_prerequisites_missing(
         config,
         audit=audit,

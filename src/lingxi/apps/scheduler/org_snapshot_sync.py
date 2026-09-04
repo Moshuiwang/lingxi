@@ -76,6 +76,7 @@ class TokenSupplyFailureError(RuntimeError):
     """
 
     def __init__(self, supply: str) -> None:
+        """记下是哪一条令牌供给失败（`supply` 只是分类标签，不含令牌值）。"""
         super().__init__(f"组织快照令牌供给失败：{supply}")
         self.supply = supply
 
@@ -123,6 +124,7 @@ class OrgSnapshotSyncDuty:
         stop: threading.Event | None = None,
         round_join_timeout_seconds: float = DEFAULT_ROUND_JOIN_TIMEOUT_SECONDS,
     ) -> None:
+        """按注入的读取函数/写入端口装配一个组织快照同步职责实例。"""
         if not source_app_id:
             raise ValueError("source_app_id 不能为空——它是写进 feishu_org_sync_run 的必填列")
         self._read_snapshot = read_snapshot
@@ -161,14 +163,15 @@ class OrgSnapshotSyncDuty:
     @property
     def completed_on(self) -> date | None:
         """已完成同步的那一天。``None`` 表示本进程实例今天还没成功过一轮。"""
-
         return self._completed_on
 
     @property
     def stopping(self) -> bool:
+        """是否已收到停止信号。"""
         return self._stop.is_set()
 
     def request_stop(self) -> None:
+        """置位停止信号：本轮及之后不再发起新的同步。"""
         self._stop.set()
 
     def _advance_backoff(self) -> int:
@@ -180,7 +183,6 @@ class OrgSnapshotSyncDuty:
         误导排障。在方法内部取而不是让每个调用点各自取，是为了让这条不变量
         没有调用点可以忘记。
         """
-
         self._failure_streak += 1
         backoff_seconds = min(
             self._failure_streak * READ_FAILURE_BACKOFF_STEP_SECONDS,
@@ -201,7 +203,6 @@ class OrgSnapshotSyncDuty:
         与方法内部现取是同一个时刻，行为不变。返回写入的 ``run_id``；未执行或
         本轮未能提交时返回 ``None``。
         """
-
         if self._stop.is_set():
             return None
         if self._completed_on == today:
@@ -229,7 +230,6 @@ class OrgSnapshotSyncDuty:
         不是凭据风险。查询失败按"未知"处理、不阻塞本轮：这只是一个避免重复
         工作的优化，不是完整性判据本身。
         """
-
         self._checked_persisted_watermark_for = today
         try:
             already_done = self._store.has_complete_run_on(today)
@@ -255,7 +255,6 @@ class OrgSnapshotSyncDuty:
 
     def _read_snapshot_or_record_failure(self) -> SnapshotBatch | None:
         """读一整份组织通讯录；失败时记审计、推进退避，返回 ``None``。"""
-
         try:
             return self._read_snapshot()
         except Exception as error:  # 只记异常类型，正文可能带响应内容
@@ -297,7 +296,6 @@ class OrgSnapshotSyncDuty:
 
     def _track_round_budget_streak(self, code: object) -> None:
         """连续撞「整轮预算」达到阈值时升一条独立审计与告警（打破静默活锁）。"""
-
         if code == "round_budget_exceeded":
             self._consecutive_round_budget_exceeded += 1
         else:
@@ -325,7 +323,6 @@ class OrgSnapshotSyncDuty:
         self, batch: SnapshotBatch, *, now: datetime, today: date
     ) -> str | None:
         """提交批次；完整性校验失败或写库失败都推进退避，成功则收口。"""
-
         try:
             run_id = self._store.commit_batch(
                 batch, source_app_id=self._source_app_id, started_at=now
@@ -374,7 +371,6 @@ class OrgSnapshotSyncDuty:
 
     def _record_committed(self, run_id: str, batch: SnapshotBatch, today: date) -> None:
         """收口成功批次：置位当日水位、清退避、记审计与摘要日志。"""
-
         self._completed_on = today
         self._reset_backoff()
         self._audit.record(
@@ -403,7 +399,6 @@ class OrgSnapshotSyncDuty:
         只被 `SchedulerLoop` 那一条调度线程串行调用，检查-派发之间没有
         竞态窗口。
         """
-
         if self._stop.is_set():
             return None
         now = self._clock()
@@ -431,7 +426,6 @@ class OrgSnapshotSyncDuty:
         疑似僵死，响亮告警一次——线程死没死是同一个持续事实，每个 tick 都
         重复上报只会刷屏。
         """
-
         if self._pending_thread is None or not self._pending_thread.is_alive():
             return False
         if (
@@ -455,7 +449,6 @@ class OrgSnapshotSyncDuty:
 
     def _dispatch_round(self, now: datetime, today: date) -> str | None:
         """派发后台线程跑一轮，同步等一个很短的上限就把控制权交还调用方。"""
-
         result: dict[str, str | None] = {}
 
         def worker() -> None:
@@ -497,7 +490,6 @@ def _stop_aware_sleep(stop: threading.Event) -> Callable[[float], None]:
     `_run_round()` 既有的 read_failed→退避→保留上一份完成批次路径。只挡
     下一次等待/请求，不中断正在进行中的单次 HTTP 请求。
     """
-
     from lingxi.adapters.feishu_directory import FeishuDirectoryError
 
     def sleep(seconds: float) -> None:
@@ -524,7 +516,6 @@ def _build_org_snapshot_sync_duty(
     失败记成"未注册"会让排障去找配置，反过来会让"还没接线"看起来像"接线
     了但一直失败"。
     """
-
     if user_access_token is None:
         audit.record("org_snapshot_sync.duty_not_registered", reason="user_access_token_unwired")
         logger.warning(
@@ -556,7 +547,6 @@ def _build_read_snapshot(
     app_access_token: Callable[[], str],
 ) -> Callable[[], Any]:
     """装配整趟递归遍历的读取闭包，含令牌重分类与整轮预算包装。"""
-
     from lingxi.adapters.feishu_directory import FeishuDirectoryClient
     from lingxi.adapters.feishu_org_snapshot_reader import read_org_snapshot
 

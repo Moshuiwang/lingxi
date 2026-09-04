@@ -48,6 +48,7 @@ class DocumentDeliveryMaintenanceReport:
     content_redacted: int = 0
 
     def audit_facts(self) -> dict[str, Any]:
+        """把计数字段展开成一份可以直接喂给审计记录的字典。"""
         return {"dead_lettered": self.dead_lettered, "content_redacted": self.content_redacted}
 
 
@@ -70,6 +71,7 @@ class DocumentDeliveryMaintenanceDuty:
         alert: Callable[[str, str], None] | None = None,
         stop: threading.Event | None = None,
     ) -> None:
+        """按注入的死信保管库/审计/告警回调装配一个维护职责实例。"""
         self._store = store
         self._audit = audit
         self._alert = alert
@@ -77,14 +79,15 @@ class DocumentDeliveryMaintenanceDuty:
 
     @property
     def stopping(self) -> bool:
+        """是否已收到停止信号。"""
         return self._stop.is_set()
 
     def request_stop(self) -> None:
+        """置位停止信号：本轮及之后不再处置任何行。"""
         self._stop.set()
 
     def run_once(self) -> DocumentDeliveryMaintenanceReport | None:
         """已经在停止中就一条都不处置。返回 ``None`` 表示本轮未执行。"""
-
         if self._stop.is_set():
             return None
 
@@ -157,7 +160,6 @@ def _wire_document_delivery_maintenance_duty(
     ``delivery_alert_callback``：告警文案归一化、kind 前缀与去重命名空间三个
     进程共用同一份纪律，不重复实现。
     """
-
     from lingxi.adapters.postgres_document_delivery import PostgresDocumentDeliveryStore
 
     duties.append(

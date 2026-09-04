@@ -41,6 +41,8 @@ SAVE_RETRY_BACKOFF_SECONDS = (0.2, 1.0, 3.0)
 
 @dataclass(frozen=True)
 class RotationReport:
+    """一轮凭据轮换的计数结果。"""
+
     claimed: int = 0
     rotated: int = 0
     revoked: int = 0
@@ -94,6 +96,7 @@ class CredentialRotationLoop:
         holder: DerivedAccessTokenHolder | None = None,
         clock: Callable[[], datetime] | None = None,
     ) -> None:
+        """按注入的保管库/授权客户端装配一个轮换循环实例。"""
         self._vault = vault
         self._authorization = authorization
         self._interval_seconds = interval_seconds
@@ -113,6 +116,7 @@ class CredentialRotationLoop:
 
     @property
     def stopping(self) -> bool:
+        """是否已收到停止信号。"""
         return self._stop.is_set()
 
     @property
@@ -122,15 +126,14 @@ class CredentialRotationLoop:
         只读暴露，供装配处断言"日报侧读的正是轮换职责写的那一份"——这条链断了不会有
         任何用例变红，除非它有一个可观察的接缝。
         """
-
         return self._holder
 
     def request_stop(self) -> None:
+        """置位停止信号：本轮及之后不再领取新的到期凭据。"""
         self._stop.set()
 
     def run_once(self) -> RotationReport:
         """领取至多一条到期凭据并处理它。已经在停止中则一条都不领。"""
-
         if self._stop.is_set():
             return RotationReport()
         # 先收殓崩溃窗口留下的「已消费未落库」行：它们的旧令牌已被飞书作废，
@@ -195,7 +198,6 @@ class CredentialRotationLoop:
         **落盘成功之后**才把派生令牌交给进程内持有者：反过来会让"续期成功但写盘
         失败＝凭据丢失"这条路径在日报照常工作的表象下发生。
         """
-
         saved = self._save_with_retry(
             subject_open_id=claim.subject_open_id,
             replacement=replacement,
@@ -237,7 +239,6 @@ class CredentialRotationLoop:
         进程重启、崩溃循环、同宿主机第二实例都绕不过它。失败一律抛
         :class:`AccessTokenUnavailable`，只带分类、不带值。
         """
-
         if self._stop.is_set():
             # 停止中不再开启任何一次续期：半途中断的续期等于凭据丢失（模块头注释）。
             raise AccessTokenUnavailable("scheduler_stopping")
@@ -293,7 +294,6 @@ class CredentialRotationLoop:
 
         任何非成功结果都转成 :class:`AccessTokenUnavailable`，不静默返回。
         """
-
         saved = self._save_with_retry(
             subject_open_id=claim.subject_open_id,
             replacement=replacement,
@@ -335,7 +335,6 @@ class CredentialRotationLoop:
         换了凭据代际（人工重授权、或另一个进程完成的轮换）时两者必然不同，记号自动失效
         ——那种情况下本进程对新凭据一无所知，只能如实报上界。
         """
-
         if self._derived_unusable_at is not None and self._derived_unusable_at == error.consumed_at:
             return "derived_token_unusable"
         if isinstance(error, RefreshMinIntervalNotElapsed):
@@ -355,7 +354,6 @@ class CredentialRotationLoop:
         令牌值不进日志：这里只记"有没有拿到可用的一份"，以及"哪一次消费换回来的那份
         不可用"。
         """
-
         if self._holder is None:
             # 没有装配持有者（接线之前的形态）。不是"这一份不可用"，不记那个状态。
             return False
@@ -385,7 +383,6 @@ class CredentialRotationLoop:
         撤销"，因此"落盘了"与"被新授权取代"曾被压成同一个真值；但派生短期令牌关心的是
         "这条链还有没有活着的凭据"，两者在那个问题上是相反的答案。
         """
-
         for delay_seconds in (0.0, *SAVE_RETRY_BACKOFF_SECONDS):
             if delay_seconds:
                 self._stop.wait(delay_seconds)
@@ -408,6 +405,7 @@ class CredentialRotationLoop:
         return CredentialSaveOutcome.FAILED
 
     def run_forever(self) -> None:
+        """按 `interval_seconds` 循环跑 `run_once`，直到停止信号置位。"""
         while not self._stop.is_set():
             try:
                 self.run_once()
@@ -426,6 +424,5 @@ def _is_definite_failure(error: BaseException) -> bool:
     分类是协议细节，由 adapters 层以 ``definite`` 属性给出（代码框架第二节：
     协议细节不进 apps 层）；没有该属性的异常一律视为"结果不明确"。
     """
-
     definite = getattr(error, "definite", None)
     return definite is True

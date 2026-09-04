@@ -21,7 +21,9 @@ class AuditSink(Protocol):
     满足），合并后可收敛成一份，不需要现在跨切片耦合。
     """
 
-    def record(self, action: str, /, **fields: object) -> None: ...
+    def record(self, action: str, /, **fields: object) -> None:
+        """记一条审计事件；`action` 是动作名，`fields` 是不含资料值的结构化字段。"""
+        ...
 
 
 class StructuredLogAuditSink:
@@ -39,6 +41,7 @@ class StructuredLogAuditSink:
     _EXTRA_WARNING_ACTIONS = frozenset({"stalled_provisioning.notifier_not_wired"})
 
     def record(self, action: str, /, **fields: object) -> None:
+        """把一条审计事件写成一行结构化日志，按命名规则决定是否升级为 WARNING。"""
         promote = (
             action.endswith(("failed", "error", "unparsable"))
             or (action == "onboarding.result" and bool(fields.get("failure_reason")))

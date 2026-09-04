@@ -35,19 +35,21 @@ class RetentionCleanupDuty:
     name = "保留清理"
 
     def __init__(self, *, cleaner: _Cleaner, stop: threading.Event | None = None) -> None:
+        """按注入的受限清理函数装配一个保留清理职责实例。"""
         self._cleaner = cleaner
         self._stop = threading.Event() if stop is None else stop
 
     @property
     def stopping(self) -> bool:
+        """是否已收到停止信号。"""
         return self._stop.is_set()
 
     def request_stop(self) -> None:
+        """置位停止信号：本轮及之后不再领取新的到期批次。"""
         self._stop.set()
 
     def run_once(self) -> Any:
         """已经在停止中就一批都不领。返回 ``None`` 表示本轮未执行。"""
-
         if self._stop.is_set():
             return None
         report = self._cleaner.run_once()
@@ -84,15 +86,18 @@ class IdleConversationSweepDuty:
     def __init__(
         self, *, queue: Any, idle_after: timedelta, stop: threading.Event | None = None
     ) -> None:
+        """按注入的任务队列与空闲阈值装配一个空闲会话清理职责实例。"""
         self._queue = queue
         self._idle_after = idle_after
         self._stop = threading.Event() if stop is None else stop
 
     @property
     def stopping(self) -> bool:
+        """是否已收到停止信号。"""
         return self._stop.is_set()
 
     def request_stop(self) -> None:
+        """置位停止信号：本轮及之后不再领取新的到期批次。"""
         self._stop.set()
 
     def run_once(self) -> int | None:
@@ -101,7 +106,6 @@ class IdleConversationSweepDuty:
         返回 ``None`` 表示本轮未执行，否则返回本轮清除了已送达正文的会话数
         （供日志/断言，不承载业务语义）。
         """
-
         if self._stop.is_set():
             return None
         cleared = self._queue.sweep_idle_conversations(idle_after=self._idle_after)
@@ -163,6 +167,7 @@ class PermissionRetentionReport:
     checks_wired: bool = True
 
     def audit_facts(self) -> dict[str, Any]:
+        """把计数字段展开成一份可以直接喂给审计记录的字典。"""
         return {
             "redacted": self.redacted,
             "purged": self.purged,
@@ -194,6 +199,7 @@ class PermissionRetentionSweepDuty:
         audit: AuditSink,
         stop: threading.Event | None = None,
     ) -> None:
+        """按注入的三个到期处置协作者装配一个权限链到期清理职责实例。"""
         self._outbox = outbox
         self._checks = checks
         self._notices = notices
@@ -202,18 +208,20 @@ class PermissionRetentionSweepDuty:
 
     @property
     def stopping(self) -> bool:
+        """是否已收到停止信号。"""
         return self._stop.is_set()
 
     @property
     def checks_wired(self) -> bool:
+        """判定记录那一面装配了没有（缺 MCP 令牌主密钥时为 ``False``）。"""
         return self._checks is not None
 
     def request_stop(self) -> None:
+        """置位停止信号：本轮及之后不再领取新的到期批次。"""
         self._stop.set()
 
     def run_once(self) -> PermissionRetentionReport | None:
         """已经在停止中就一条都不处置。返回 ``None`` 表示本轮未执行。"""
-
         if self._stop.is_set():
             return None
         redacted = self._sweep("publish_outbox", self._outbox.redact_expired_payloads)
@@ -282,20 +290,22 @@ class ContentCaptureRetentionDuty:
         audit: AuditSink,
         stop: threading.Event | None = None,
     ) -> None:
+        """按注入的到期采集清除器装配一个内测采集到期删除职责实例。"""
         self._captures = captures
         self._audit = audit
         self._stop = threading.Event() if stop is None else stop
 
     @property
     def stopping(self) -> bool:
+        """是否已收到停止信号。"""
         return self._stop.is_set()
 
     def request_stop(self) -> None:
+        """置位停止信号：本轮及之后不再领取新的到期批次。"""
         self._stop.set()
 
     def run_once(self) -> int | None:
         """已经在停止中就一条都不删。返回 ``None`` 表示本轮未执行。"""
-
         if self._stop.is_set():
             return None
         try:
@@ -326,7 +336,6 @@ def _build_content_capture_retention_duty(
     audit: AuditSink,
 ) -> ContentCaptureRetentionDuty:
     """装配内测采集到期删除职责。**总是装配**，理由见类文档。"""
-
     from lingxi.adapters.postgres_content_capture_retention import (
         PostgresContentCaptureRetention,
     )
@@ -356,7 +365,6 @@ def _build_permission_retention_duty(
     不删的后果只是一张只含内部 ULID 与结论码的表继续变长。
     ``onboarding_completion_notice`` 与 ``publish_outbox`` 同一面，无条件装配。
     """
-
     from lingxi.adapters.postgres_late_readiness_recovery import PostgresLateReadinessStore
     from lingxi.adapters.postgres_permission_publish import PostgresPermissionPublishStore
 

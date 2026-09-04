@@ -151,6 +151,7 @@ class PermissionPublishReport:
     probe_wired: bool = True
 
     def audit_facts(self) -> dict[str, Any]:
+        """把计数字段展开成一份可以直接喂给审计记录的字典。"""
         facts: dict[str, Any] = {
             "reclaimed": self.reclaimed,
             "attempts": self.attempts,
@@ -244,6 +245,7 @@ class PermissionPublishDuty:
         clock: Callable[[], datetime] | None = None,
         stop: threading.Event | None = None,
     ) -> None:
+        """按注入的发布/就绪协作者装配一个职责实例；两面至少要装配一面。"""
         for label, value in (("发布", publish_limit), ("就绪", readiness_limit)):
             if isinstance(value, bool) or not isinstance(value, int) or value < 1:
                 raise ValueError(f"单轮{label}预算必须是正整数")
@@ -273,21 +275,21 @@ class PermissionPublishDuty:
 
     @property
     def stopping(self) -> bool:
+        """是否已收到停止信号。"""
         return self._stop.is_set()
 
     @property
     def publish_wired(self) -> bool:
         """发布面装配了没有。缺权限表坐标或令牌供给时它是 ``False``，就绪面照常推进。"""
-
         return self._executor is not None
 
     @property
     def readiness_wired(self) -> bool:
         """就绪与通知这一面装配了没有。装配层缺配置时它是 ``False``，发布面照常。"""
-
         return self._readiness is not None
 
     def request_stop(self) -> None:
+        """置位停止信号：本轮及之后不再领取新的意图或探针。"""
         self._stop.set()
 
     def _out_of_time(self, started: datetime) -> bool:
@@ -299,7 +301,6 @@ class PermissionPublishDuty:
         一轮跑过头会让告警状态机把"这个进程还活着、只是这一轮很慢"读成"心跳丢了"。
         因此本轮到点就止步，剩下的下一轮继续——发布与就绪都是可重入的。
         """
-
         return self._clock() - started >= self._round_budget
 
     # ------------------------------------------------------------------
@@ -312,7 +313,6 @@ class PermissionPublishDuty:
         **本方法不会等待**：一条还没就绪的确认只是被推进一步或原样留着，绝不 ``sleep``。
         整轮耗时的上界因此是"外部调用次数 × 单次超时"，与十五分钟的就绪预算无关。
         """
-
         if self._stop.is_set():
             # 已经在停止中：一条意图都不领，一次探针都不发。
             return None
@@ -332,7 +332,6 @@ class PermissionPublishDuty:
         self, readiness: ReadinessFollowUp, tally: _Tally, started: datetime
     ) -> bool:
         """取待确认候选并逐条推进一步；返回本轮是否被停止信号或时间预算中断。"""
-
         # 探针没接线时**只取撤权那一类**：授权候选这一轮推进不了，留在查询之外才不会
         # 把窗口占死（:data:`REVOKE_ONLY_REASONS` 的文档写明了饿死是怎么发生的）。
         reasons = FOLLOW_UP_REASONS if readiness.ticker.probe_wired else REVOKE_ONLY_REASONS
@@ -373,7 +372,6 @@ class PermissionPublishDuty:
         self, tally: _Tally, interrupted: bool, readiness: ReadinessFollowUp | None
     ) -> PermissionPublishReport:
         """冻结报告、记完成审计、触发管理卡补偿观察、写摘要日志。"""
-
         report = tally.freeze(
             interrupted=interrupted,
             publish_wired=self.publish_wired,
@@ -430,7 +428,6 @@ class PermissionPublishDuty:
         反复认领、烧完重试额度。清单是每轮新建的局部变量，跨轮持有会让一条
         意图在这个进程里再也轮不到。
         """
-
         if self._executor is None:
             return False
         claimed: list[str] = []
@@ -466,7 +463,6 @@ class PermissionPublishDuty:
         用户永远收不到通知。先查则相反：查询失败就本轮不推进、终态不落、下一轮
         原样重来，代价只是"还没到期"的候选多一次只读查询，是有界的。
         """
-
         binding = ReadinessBinding(user_id=item.user_id, permission_version=item.permission_version)
         # 先查收件人：这一步失败不留任何终态，下一轮重来。
         open_id = self._intents.notice_recipient_open_id(item.user_id)
@@ -506,7 +502,6 @@ class PermissionPublishDuty:
         已落库、通知还没发出去时进程崩溃，这条通知就永久丢了；不做通知 outbox
         是刻意的，要求的是"有限重试 + 审计"，不是 exactly-once。
         """
-
         if not open_id:
             # 还没开通完、已停用或正在删除的账号：不发，只计数与留痕。
             tally.notices_skipped += 1
@@ -541,7 +536,6 @@ class PermissionPublishDuty:
 
     def _alert(self, kind: str, item: Any) -> None:
         """把一条可告警事实交给注入的出口；**回调失败不改变任何结果**。"""
-
         if self._on_alert is None:
             return
         try:
@@ -566,7 +560,6 @@ def _build_permission_publish_duty(
     "暂时写不了新的一行"就把它们一起停掉；反过来 MCP 端点没配时发布照常。
     两个面都装不起来才不注册。
     """
-
     executor, unwired, store = _build_publish_executor(
         config, permission_table_access_token, audit=audit
     )
@@ -620,7 +613,6 @@ def _build_publish_executor(
     ``None`` 的含义是"调用方真的没有交出任何供给"，不是"还没接线"）。存取口
     ``store`` 无论发布面是否装得起来都要返回——就绪/通知面复用同一个实例。
     """
-
     unwired: tuple[str, str] | None = None
     for variable, value in (
         ("LINGXI_PERMISSION_BITABLE_APP_TOKEN", config.permission_app_token),

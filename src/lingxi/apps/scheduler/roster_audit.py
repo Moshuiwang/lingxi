@@ -78,6 +78,7 @@ class RosterAuditDuty:
         clock: Callable[[], datetime] | None = None,
         stop: threading.Event | None = None,
     ) -> None:
+        """按注入的花名册读取/比对基线/发送器装配一个花名册审计日报职责实例。"""
         self._baseline_reader = baseline_reader
         self._roster_source = roster_source
         self._sender = sender
@@ -90,20 +91,20 @@ class RosterAuditDuty:
 
     @property
     def stopping(self) -> bool:
+        """是否已收到停止信号。"""
         return self._stop.is_set()
 
     @property
     def completed_on(self) -> date | None:
         """已完成日报的那一天。``None`` 表示本进程实例今天还没发过。"""
-
         return self._completed_on
 
     def request_stop(self) -> None:
+        """置位停止信号：本轮及之后不再发起新的比对。"""
         self._stop.set()
 
     def run_once(self) -> RosterAuditReport | None:
         """跑一轮。返回 ``None`` 表示本轮没有执行比对（停止中，或今天已经做完）。"""
-
         if self._stop.is_set():
             # 已经在停止中：一轮都不开。停止之后必须 0 次发送（`V-花名册-20`）。
             return None
@@ -146,7 +147,6 @@ class RosterAuditDuty:
         异常原样上抛，由 :class:`SchedulerLoop` 做职责级隔离并在下一轮重试
         （`V-花名册-17`）；水位不置位，因此这一天还没算做完。
         """
-
         round_result = self._roster_source.current(now=now)
         snapshot = round_result.snapshot
         baseline = self._baseline_reader.load_active_baseline()
@@ -166,7 +166,6 @@ class RosterAuditDuty:
         today: date,
     ) -> RosterAuditReport:
         """渲染正文并发送；失败只记审计留给下一轮重试，成功则收口水位与日志。"""
-
         content = render_daily_report_content(
             report,
             report_date=today,
@@ -206,7 +205,6 @@ class RosterAuditDuty:
         摘要只有计数（审计与日志不含花名册字段值）；日报正文的展示口径放宽到
         「受控管理群可含原值」，日志侧没有随之放宽——日志流向排障、CI 输出与工单。
         """
-
         self._audit.record(
             "roster_audit.report_sent",
             report_date=today.isoformat(),
@@ -253,6 +251,7 @@ class RosterSnapshotSyncDuty:
         clock: Callable[[], datetime] | None = None,
         stop: threading.Event | None = None,
     ) -> None:
+        """按注入的花名册读取口装配一个花名册快照同步职责实例。"""
         self._roster_source = roster_source
         self._clock = clock or (lambda: datetime.now(UTC))
         self._stop = threading.Event() if stop is None else stop
@@ -260,20 +259,20 @@ class RosterSnapshotSyncDuty:
 
     @property
     def stopping(self) -> bool:
+        """是否已收到停止信号。"""
         return self._stop.is_set()
 
     @property
     def completed_on(self) -> date | None:
         """已完成本轮读取与写入的那一天。``None`` 表示本进程实例今天还没读过。"""
-
         return self._completed_on
 
     def request_stop(self) -> None:
+        """置位停止信号：本轮及之后不再发起新的读取。"""
         self._stop.set()
 
     def run_once(self) -> RosterRound | None:
         """跑一轮。返回 ``None`` 表示本轮没有触发读取（停止中，或今天已经做完）。"""
-
         if self._stop.is_set():
             # 已经在停止中：不开新一轮读取（与 RosterAuditDuty 的停止语义同一条：
             # 停止之后不得再触发新的花名册读取）。
@@ -301,7 +300,6 @@ def _log_snapshot_alert(decision: SnapshotDecision) -> None:
 
     只记分类与错误码，不记任何行内容（`V-花名册-33`）。
     """
-
     logger.warning(
         "花名册本轮读取未成功，保留上一份快照 status=%s alert=%s failure_code=%s 上一份行数=%s",
         decision.status,
@@ -322,7 +320,6 @@ def _roster_audit_missing_prerequisite(
     按固定次序检查，缺第一个就返回：逐条报会让一个什么都没配的部署一次刷出多条
     审计，反而看不出该先配哪个。
     """
-
     if not config.admin_group_chat_id:
         # 只报变量名，不回显任何值。
         audit.record(
@@ -366,7 +363,6 @@ def _build_roster_audit_duty(
     on_send_outcome: Callable[[str, bool], None] | None = None,
 ) -> RosterAuditDuty | None:
     """装配审计日报职责；前置不齐就**不注册**并留下**恰一条**审计，返回 ``None``。"""
-
     if _roster_audit_missing_prerequisite(
         config, roster_access_token=roster_access_token, audit=audit
     ):
@@ -425,7 +421,6 @@ def _build_roster_snapshot_sync_duty(
     `_build_roster_audit_duty` 返回 `None` 时才会调用本函数**：两个职责互斥
     注册，避免同时跑出两条各自独立的 `DailyRosterSource`。
     """
-
     for variable, value in (
         ("LINGXI_ROSTER_BITABLE_APP_TOKEN", config.roster_app_token),
         ("LINGXI_ROSTER_BITABLE_TABLE_ID", config.roster_table_id),
