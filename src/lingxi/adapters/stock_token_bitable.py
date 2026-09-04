@@ -1,44 +1,16 @@
-"""存量令牌只读源的飞书 bitable 适配器（Issue #281 载体，Trace #304 批次 3）。
+"""存量令牌只读源的飞书 bitable 适配器。
 
-实现 :class:`lingxi.core.identity.stock_token_source.StockTokenSource`：按用户邮箱精确查
-正式权限多维表格 ``user_company_permissions`` 的一行，翻成四态之一交给开通链（`core/
-identity/onboarding_runner.py` 的 ``_issue_token``）。**全程只读**——本模块没有任何写
-方法，也不修改正式表的任何字段（不做批量预登记、不做轮换/覆写，边界见 #281 改道裁定）。
-
-## 两层，一个文件
-
-- :class:`BitableStockTokenSource`：**纯 I/O 层**，只读字段、不碰密钥。构造与
-  ``adapters/feishu_permission_bitable.BitablePermissionTable`` 同姿态（不 import SDK、
-  不建 client、不发请求；``access_token`` 由调用方以"已就绪短期令牌"注入），查找同样是
-  **整表分页**而不是 search 接口（同一份 G-BIT 2026-08-17 回源实测覆盖的读路径；理由见
-  ``feishu_permission_bitable`` 模块文档「为什么查找是『整表分页』」，本模块不复述）。
-  ``lookup_raw`` 只返回「查无此行 / 有行无密文 / 有行有密文」三种原始事实
-  （:class:`RawStockTokenRow` 或 ``None``），**不尝试解密**——core 不 import 加解密适配器，
-  三态读端口因此必须是一个不需要主密钥就能独立测试的纯读取动作。
-- :class:`DecryptingStockTokenSource`：**组合层**，包一个 :class:`BitableStockTokenSource`
-  与一个 ``McpTokenCipher``，把三态原始事实翻成 core 端口要的四态
-  :class:`~lingxi.core.identity.stock_token_source.StockTokenLookup`
-  （``NO_ROW``/``NO_CIPHER`` 原样透传；``有密文`` 尝试解密，成功→``ADOPTABLE`` 且带上
-  明文，失败→``DECRYPT_FAILED``，**不向上抛异常**——解密失败是本端口要表达的一个合法
-  状态，不是"读取失败"）。这是唯一对 ``core`` 暴露的实现：装配层
-  （``apps/scheduler/onboarding.build_stock_token_source``）只构造这一个类。
-
-## 只读需要的三个字段
-
-正式表 7 个字段全部是单行文本（``core/permission/publish_row.py`` 模块文档「发布表的
-通道事实」），本模块只取其中三个：``token_cipher``（有没有密文、密文本身）、
-``status``（供调用方审计标注"是否非 approved"，不参与本模块的判定）与
-``permissions``（rc25 S-1，Issue #540：存量用户首聊时把「旧行权限 − 银河当前翻译」
-落成本地授权的唯一输入，只在有密文可采纳时才向上透传）。**不读
-``record_key``/``name``/``updated_at``**——匹配只需要 ``email``，其余字段一次都不进
-本模块的返回值，减少可识别数据的暴露面（同 ``feishu_roster_bitable`` 模块文档
-「数据范围没有因为本次新增而扩大」的同一条纪律）。
-
-## 多行命中：失败关闭，不猜
-
-正式表理论上不该有重复邮箱（``record_key``/``email`` 是发布链的 upsert 键），但本模块
-不假设这件事永远成立——命中不止一行时 ``lookup_raw`` 抛 :class:`StockTokenSourceError`
-（``code="multiple_rows_matched"``），交给调用方按"本侧故障"收口，绝不挑一行返回。
+实现 :class:`lingxi.core.identity.stock_token_source.StockTokenSource`：按
+用户邮箱精确查正式权限多维表格的一行，翻成四态之一交给开通链。全程只读，
+没有任何写方法，也不修改正式表的任何字段。两层：:class:`BitableStockTokenSource` 是纯 I/O 层，只读字段、不碰密钥，
+整表分页查找（理由同 ``feishu_permission_bitable``），``lookup_raw`` 只
+返回「查无此行/有行无密文/有行有密文」三种原始事实、不尝试解密——core
+不 import 加解密适配器，三态读端口因此要能不靠主密钥独立测试。
+:class:`DecryptingStockTokenSource` 是组合层，把三态翻成 core 端口的
+四态：解密失败不向上抛异常，是四态里合法的一态，不是"读取失败"。
+只读三个字段：``token_cipher``、``status``、``permissions``，不读其余
+字段以减少可识别数据暴露面；多行命中不假设永远不发生，命中不止一行时
+失败关闭、交给调用方按本侧故障收口，绝不挑一行返回。
 """
 
 from __future__ import annotations
