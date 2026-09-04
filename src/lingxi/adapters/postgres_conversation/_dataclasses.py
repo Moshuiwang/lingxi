@@ -1,4 +1,4 @@
-"""``PostgresTaskQueue``/Gateway 消费共用的返回值形状（Issue #239 拆分）。
+"""``PostgresTaskQueue``/Gateway 消费共用的返回值形状。
 
 这些 dataclass 本身不承载读写边界，只是多个 mixin 共用的返回类型，因此单独放在
 一个模块里，避免任一 mixin 反过来 import 另一个 mixin 才能拿到类型定义。
@@ -52,7 +52,7 @@ class TerminalTask:
 
 @dataclass(frozen=True)
 class AppendedEvent:
-    """一次投递事件写入的结果（Issue #151）。
+    """一次投递事件写入的结果。
 
     ``duplicate=True`` 表示 ``idempotency_key`` 已存在——调用方的这次写入是对同一
     次逻辑动作的重试，``sequence`` 是**已经写入的那一条**的序号，不是新分配的；
@@ -65,7 +65,7 @@ class AppendedEvent:
 
 @dataclass(frozen=True)
 class DeliveryEventRecord:
-    """Gateway 消费循环读回的一条 outbox 事件（Issue #152）。"""
+    """Gateway 消费循环读回的一条 outbox 事件。"""
 
     sequence: int
     event_type: str
@@ -98,10 +98,12 @@ class PendingDeliveryTask:
 
 @dataclass(frozen=True)
 class StaleQueuedTask:
-    """一条已入队超过排队阈值、仍未被任何 worker 领取的任务（Issue #465，S-3：
-    排队可感知）。只读扫描的结果形状，供 ``apps/gateway/delivery.py`` 的
-    ``DeliveryConsumer`` 尽力而为发一条"前面还有任务在排队"的提示——不改变
-    ``task``/``conversation`` 任何一行，因此不需要携带消费进度这类字段。"""
+    """一条已入队超过排队阈值、仍未被任何 worker 领取的任务。
+
+    只读扫描的结果形状，供 ``apps/gateway/delivery.py`` 的 ``DeliveryConsumer``
+    尽力而为发一条"前面还有任务在排队"的提示——不改变 ``task``/``conversation``
+    任何一行，因此不需要携带消费进度这类字段。
+    """
 
     task_id: str
     chat_id: str
@@ -111,7 +113,7 @@ class StaleQueuedTask:
 
 @dataclass(frozen=True)
 class UncertainDeliveryTask:
-    """外发前预留位没有被清空、原因不明的任务（Issue #151 审核 P3-6）。
+    """外发前预留位没有被清空、原因不明的任务。
 
     只用于告警与人工核对；消费循环不会自动处理这类任务，见
     :meth:`PostgresTaskQueue.reserve_dispatch` 的说明。
@@ -123,7 +125,7 @@ class UncertainDeliveryTask:
 
 @dataclass(frozen=True)
 class SessionCleanupTask:
-    """一条待物理清理的 Agent 会话 JSONL 请求（Issue #153）。"""
+    """一条待物理清理的 Agent 会话 JSONL 请求。"""
 
     id: str
     user_id: str
