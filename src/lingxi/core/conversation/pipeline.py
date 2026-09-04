@@ -51,47 +51,32 @@ wss 地址），单条事件上没有可验的签名。承接同一产品意图�
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import Any, Callable
 
-from lingxi.config.content import (
-    KEY_PREPROVISIONED_FIRST_CHAT,
-    ContentCatalog,
-    ContentRenderError,
-    ContentSafetyError,
-    RenderedContent,
-    default_content_catalog,
-    validate_user_visible_text,
-)
+from lingxi.config.content import RenderedContent
 from lingxi.core.ids import new_id
-# 预开通首聊补一句（rc25 修复包 F1）：公司/职能取值与 ``onboarding.completed`` 同一
-# 来源。两个模块都是纯函数 + 内容目录，不把身份链或任何适配器拖进 gateway 的 import
-# 闭包（``apps/gateway`` 本就引用 ``core.permission.*``）。
-from lingxi.core.permission.notification import describe_scope
-from lingxi.core.permission.publish_row import parse_permissions
-from lingxi.core.user_memory import UserMemoryEntry
 
 from .commands import (
     Command,
-    MemoryCommand,
     MemoryCommandKind,
     is_memory_command_message,
     is_unrecognized_slash_message,
     parse_command,
     parse_memory_command,
 )
+from .gateway_texts import BUSY_HINT_TEXT, GatewayTexts
+from .memory_commands import MemoryCommandHandler
+from .onboarding_replies import KEYS_REQUIRING_REFERENCE, OnboardingReplyRenderer
 from .ports import (
     AuditSink,
     GatewayStore,
     HandledAs,
     InboundMessage,
-    OnboardingMessage,
     OnboardingResult,
     OnboardingRunner,
     OnboardingState,
     Outcome,
-    PendingPreprovisionNotice,
     Reactions,
     Replies,
     UserState,
@@ -101,8 +86,17 @@ from .session_window import should_resume_session
 
 logger = logging.getLogger(__name__)
 
-# 对外保留这个旧导出，避免调用方为读取固定提示而复制文案；正文唯一来源是内容目录。
-BUSY_HINT_TEXT = default_content_catalog().text("gateway.busy_hint").text
+#: 搬走的符号在原路径保留转发，调用方与测试的 import 不受影响。
+_KEYS_REQUIRING_REFERENCE = KEYS_REQUIRING_REFERENCE
+__all__ = [
+    "BUSY_HINT_TEXT",
+    "DEFAULT_WORKER_VERSION",
+    "EventPipeline",
+    "GatewayTexts",
+    "QueueInsertFailure",
+    "TEXT_MESSAGE_TYPE",
+    "fixed_stable_version",
+]
 
 # #45 的分流规则形态属 S11（决策第 3 条）。本批最小实现固定 stable，
 # 断言只约束「入队时固化」与「领取带版本条件」两件事。
@@ -110,35 +104,6 @@ DEFAULT_WORKER_VERSION = "stable"
 
 # 本批唯一会被入队的消息类型。
 TEXT_MESSAGE_TYPE = "text"
-
-# 编排层没有自带 messages 时，每种状态各自的缺省文案（`OnboardingState` → 内容目录 key）。
-# ``completed`` 刻意不在表内：那条文案必须带上公司与职能范围，而范围只有编排层知道，
-# 补一句说不清范围的「开通完成」等于替它宣告一个未经确认的成功。``started`` 同样不在
-# 表内，但理由相反——它已经由 ``onboarding.checking`` 交代完毕。两者的兜底见
-# ``EventPipeline._render_onboarding_result``。
-_DEFAULT_ONBOARDING_MESSAGES: dict[OnboardingState, OnboardingMessage] = {
-    OnboardingState.MATCHED: OnboardingMessage("onboarding.matched"),
-    OnboardingState.NOT_AUTHORIZED: OnboardingMessage("onboarding.not_authorized"),
-    OnboardingState.SYNC_TIMEOUT: OnboardingMessage("onboarding.sync_timeout"),
-    OnboardingState.INTERNAL_ERROR: OnboardingMessage("onboarding.internal_error"),
-}
-
-#: 需要追溯号占位（``{reference}``）的文案键（Issue #280 §7.1）。与
-#: ``core/identity/onboarding_runner.py`` 里同名判据各自维护一份——两条渲染入口
-#: 此前就是彼此独立的失败关闭桩（本模块只在 gateway 侧 runner 惰性桩/测试注入下
-#: 才会真的走到，见该模块「共用线程复核」一节），靠字面值对齐而不是跨模块 import。
-_KEYS_REQUIRING_REFERENCE: frozenset[str] = frozenset(
-    {"onboarding.internal_error", "onboarding.sync_timeout"}
-)
-
-
-def _with_reference(key: str, values: dict[str, object], trace_id: str) -> dict[str, object]:
-    """给需要追溯号的终态文案补上 ``reference`` 占位值，已有值不覆盖。"""
-
-    merged = dict(values)
-    if key in _KEYS_REQUIRING_REFERENCE:
-        merged.setdefault("reference", trace_id)
-    return merged
 
 
 class QueueInsertFailure(RuntimeError):
@@ -163,41 +128,6 @@ def fixed_stable_version(*, user_id: str, now: datetime) -> str:
     """默认版本求值：恒为 ``stable``。签名保留 #45 要求的两个输入。"""
 
     return DEFAULT_WORKER_VERSION
-
-
-@dataclass(frozen=True)
-class GatewayTexts:
-    """用户可见文案。
-
-    文字字段保留为 ``str``，兼容现有注入式测试；默认值来自版本化内容目录。发送前通过
-    ``*_content`` 方法补回键和版本，审计不记录渲染后的用户正文。
-    """
-
-    busy_hint: str = field(
-        default_factory=lambda: default_content_catalog().text("gateway.busy_hint").text
-    )
-    # Issue #465（rc22 S-3）：同一个"话题被占用"状态的另一种真话——任务已经入队，
-    # 但还没有任何 worker 领取（`task.status == 'queued'`）。默认值同样来自内容
-    # 目录，保留字符串字段是为了跟 ``busy_hint`` 一样兼容既有注入式测试直接赋值。
-    busy_hint_queued: str = field(
-        default_factory=lambda: default_content_catalog().text("gateway.busy_hint_queued").text
-    )
-    suspended: str = field(
-        default_factory=lambda: default_content_catalog().text("gateway.suspended").text
-    )
-    catalog: ContentCatalog = field(default_factory=default_content_catalog, repr=False, compare=False)
-
-    def busy_hint_content(self) -> RenderedContent:
-        return _as_content(self.catalog, "gateway.busy_hint", self.busy_hint)
-
-    def busy_hint_queued_content(self) -> RenderedContent:
-        return _as_content(self.catalog, "gateway.busy_hint_queued", self.busy_hint_queued)
-
-    def suspended_content(self) -> RenderedContent:
-        return _as_content(self.catalog, "gateway.suspended", self.suspended)
-
-    def queue_failed_content(self) -> RenderedContent:
-        return self.catalog.text("gateway.queue_failed")
 
 
 class EventPipeline:
@@ -244,6 +174,8 @@ class EventPipeline:
         self._replies = replies
         self._audit = audit
         self._texts = texts or GatewayTexts()
+        self._memory = MemoryCommandHandler(texts=self._texts, audit=audit)
+        self._onboarding_replies = OnboardingReplyRenderer(texts=self._texts, audit=audit)
         self._resolve_version = resolve_version
         # The runner is an application boundary: it owns the #89 identity result,
         # account matching and the #17 environment/permission/MCP orchestration.
@@ -588,9 +520,7 @@ class EventPipeline:
                             event_id=message.event_id,
                             trace_id=message.trace_id,
                         )
-                        tx.mark_handled_as(
-                            event_id=message.event_id, handled_as=HandledAs.DROPPED
-                        )
+                        tx.mark_handled_as(event_id=message.event_id, handled_as=HandledAs.DROPPED)
                         return Outcome(handled_as=HandledAs.DROPPED)
 
                     # 合同：未开通用户发来的业务内容不进入问数、不保存也不回显
@@ -613,9 +543,7 @@ class EventPipeline:
                     event_id=message.event_id,
                     trace_id=message.trace_id,
                 )
-                tx.mark_handled_as(
-                    event_id=message.event_id, handled_as=HandledAs.NOT_PROVISIONED
-                )
+                tx.mark_handled_as(event_id=message.event_id, handled_as=HandledAs.NOT_PROVISIONED)
                 return Outcome(handled_as=HandledAs.NOT_PROVISIONED)
 
             assert user is not None  # NOT_PROVISIONED 已在上一分支返回
@@ -631,9 +559,7 @@ class EventPipeline:
                     user_id=user.user_id,
                     trace_id=message.trace_id,
                 )
-                tx.mark_handled_as(
-                    event_id=message.event_id, handled_as=HandledAs.NOT_PROVISIONED
-                )
+                tx.mark_handled_as(event_id=message.event_id, handled_as=HandledAs.NOT_PROVISIONED)
                 return Outcome(handled_as=HandledAs.NOT_PROVISIONED)
 
             if state is UserState.SUSPENDED:
@@ -675,7 +601,7 @@ class EventPipeline:
             # 不打断这条消息的正常处理，下一条消息还会再试。
             pending_notice = tx.peek_preprovision_notice(user_id=user.user_id)
             if pending_notice is not None:
-                rendered_notice = self._render_preprovision_notice(
+                rendered_notice = self._onboarding_replies.render_preprovision_notice(
                     pending_notice,
                     event_id=message.event_id,
                     user_id=user.user_id,
@@ -743,7 +669,7 @@ class EventPipeline:
             ):
                 # /memory 命令面：与 /stop 同一姿态，放在忙碌判定之前——见类顶部
                 # 文档「第 6 步的延伸」与 `_handle_memory_command` 的文档。
-                return self._handle_memory_command(
+                return self._memory.handle(
                     tx, message, user, conversation, memory_command, deferred
                 )
 
@@ -773,9 +699,7 @@ class EventPipeline:
                     # 因此保留原有的"处理中"默认文案，不去猜。这条竞态本身极罕见
                     # （两条消息几乎同时到达同一话题）。
                     deferred.append(self._texts.busy_hint_content())
-                    tx.mark_handled_as(
-                        event_id=message.event_id, handled_as=HandledAs.BUSY_HINT
-                    )
+                    tx.mark_handled_as(event_id=message.event_id, handled_as=HandledAs.BUSY_HINT)
                     return Outcome(handled_as=HandledAs.BUSY_HINT)
                 self._audit.record(
                     "command.new",
@@ -826,9 +750,7 @@ class EventPipeline:
     # 内部步骤
     # ------------------------------------------------------------------
 
-    def _start_onboarding(
-        self, message: InboundMessage, deferred: list[RenderedContent]
-    ) -> None:
+    def _start_onboarding(self, message: InboundMessage, deferred: list[RenderedContent]) -> None:
         """提交后启动一次自动开通，并把结果限制在内容目录内。
 
         事务只负责认领 ``event_id``；身份读取、匹配、开通和 MCP 同步由 runner
@@ -848,7 +770,7 @@ class EventPipeline:
             )
             if not isinstance(result, OnboardingResult):
                 raise TypeError("onboarding runner returned an invalid result")
-            rendered = self._render_onboarding_result(
+            rendered = self._onboarding_replies.render_result(
                 result, checking_key=checking.key, message=message
             )
         except Exception as error:  # noqa: BLE001 - 失败必须落到统一终态文案
@@ -925,128 +847,6 @@ class EventPipeline:
                 trace_id=message.trace_id,
             )
 
-    def _render_onboarding_result(
-        self, result: OnboardingResult, *, checking_key: str, message: InboundMessage
-    ) -> tuple[RenderedContent, ...]:
-        """把编排结果翻成用户可见内容；**任何非 ``started`` 的结果都必须有话说**。
-
-        默认文案表只覆盖三条失败终态时（Issue #65 轻审 P2-4），一个不带 messages 的
-        ``matched`` / ``completed`` 会渲染出空列表：用户收到「正在核对，请稍候」之后
-        再也没有下文，而系统这边认为一切正常。悬空的沉默比一条不完美的提示更糟——
-        用户既不知道该等还是该重发，也没有任何可以拿去找管理员的线索。
-
-        因此：
-
-        - ``matched`` 补默认文案。它本身不需要任何变量，含义与状态完全一致
-          （已核对到权限、正在完成开通、稍后通知）。
-        - ``completed`` **不补**「开通完成」文案。那条文案必须报出公司与职能范围
-          （产品合同：成功只在开通链路最终确认后报告范围），而这两个值只有编排层
-          知道；gateway 编不出来，也不允许宣告一个说不清范围的成功。
-        - 于是 ``completed`` 连同任何其他渲染为空的非 ``started`` 结果，一起落到冻结的
-          ``LX-ONBOARD-001`` 内部故障终态：它的原文正是「已转交管理员处理」，而
-          「编排说开通完成却说不出范围」确实需要管理员看一眼。
-        - ``started`` 是唯一允许没有下文的状态：它表示编排已异步接手，用户刚收到的
-          「正在核对，请稍候」就是这一轮的完整交代。
-
-        兜底时记一条 ``onboarding.render_failed``，字段里保留编排真正返回的状态。
-        动作名带 ``failed`` 后缀，让审计实现把它升到 ``WARNING``——用户虽然拿到了
-        提示，但「编排返回了一个渲染不出来的结果」是必须有人看见的内部缺陷。
-        """
-
-        messages = list(result.messages)
-        if not messages:
-            default_message = _DEFAULT_ONBOARDING_MESSAGES.get(result.state)
-            if default_message is not None:
-                messages.append(default_message)
-
-        rendered: list[RenderedContent] = []
-        for onboarding_message in messages:
-            if onboarding_message.key == checking_key:
-                # checking is owned by the gateway and is sent exactly once.
-                continue
-            values = _with_reference(
-                onboarding_message.key, onboarding_message.as_values(), message.trace_id
-            )
-            rendered.append(self._texts.catalog.text(onboarding_message.key, values))
-        if not rendered and result.state is not OnboardingState.STARTED:
-            # 独立审查 codex P1-2（已核实，见 commit 说明的核实证据）：同一类兜底——
-            # 「已转交管理员处理」没有接 ONBOARDING_FAILED 管理员告警回调。
-            # **防御性分支，生产不可达**：理由同上一处兜底（`_start_onboarding` 的
-            # `except`）——生产 gateway 恒定接的是 `_RecordingOnboarding`，它只
-            # 返回 `state=STARTED`（本条件的 `result.state is not STARTED` 恒假），
-            # 装配期断言挡住任何会返回非 `STARTED` 结果的其他实现。告警缺失因此
-            # **无生产影响**；gateway 侧若未来装配真实 runner，需要同步在这里接上
-            # 告警出口。
-            self._audit.record(
-                "onboarding.render_failed",
-                event_id=message.event_id,
-                state=result.state.value,
-                trace_id=message.trace_id,
-            )
-            return (
-                self._texts.catalog.text(
-                    "onboarding.internal_error", reference=message.trace_id
-                ),
-            )
-        return tuple(rendered)
-
-    def _render_preprovision_notice(
-        self,
-        pending: PendingPreprovisionNotice,
-        *,
-        event_id: str,
-        user_id: str,
-        trace_id: str,
-    ) -> RenderedContent | None:
-        """渲染预开通首聊那句「你的 BI Plus 已经开通……」；失败返回 ``None``、只记审计。
-
-        公司/职能取值与开通链发 ``onboarding.completed`` 时**同一来源、同一姿势**：
-        该用户当前权限版本已发布的权限文档，经 ``describe_scope(parse_permissions(...))``
-        说成两串展示文本（``core/identity/onboarding_runner._completed`` 与
-        ``apps/scheduler/late_readiness_recovery`` 逐字同一调用）。
-
-        **不能因为一句附加提示打断这个人的问数**——他这条消息的正常处理与这句话无关，
-        因此两类失败都只留审计、返回 ``None``；调用方据此**不消费**一次性标志，下一条
-        消息重试（rc25 修复包 F1：「只提示一次」保持，「失败即永远丢失」消除）：
-
-        - 文案侧失败 → 既有 ``onboarding.preprovision_notice_content_missing``。生产
-          上键缺失走不到（内容目录加载期要求键集合完全相等，缺键的构建起不来），这一
-          桶覆盖内容目录与代码分两次合入的中间态，以及占位集合不符、出口安全校验拦截；
-        - 权限快照不可用（``publish_outbox.payload`` 过九十天保留期被擦成 ``'{}'``、
-          或当前版本没有已发布意图）或读不懂 →
-          ``onboarding.preprovision_notice_scope_unavailable``。
-        """
-
-        try:
-            if pending.permissions is None:
-                # 内部错误消息不进用户可见面；本文件禁嵌中文字面量（内容目录守卫）。
-                raise ValueError("preprovision scope snapshot unavailable")
-            company, function = describe_scope(
-                parse_permissions(pending.permissions), catalog=self._texts.catalog
-            )
-            return self._texts.catalog.text(
-                KEY_PREPROVISIONED_FIRST_CHAT,
-                company_name=company,
-                function_name=function,
-            )
-        except (ContentRenderError, ContentSafetyError):
-            # 注意 except 次序：ContentError 继承自 ValueError，先窄后宽。
-            self._audit.record(
-                "onboarding.preprovision_notice_content_missing",
-                event_id=event_id,
-                user_id=user_id,
-                trace_id=trace_id,
-            )
-            return None
-        except ValueError:
-            self._audit.record(
-                "onboarding.preprovision_notice_scope_unavailable",
-                event_id=event_id,
-                user_id=user_id,
-                trace_id=trace_id,
-            )
-            return None
-
     def _busy_hint_for(self, conversation) -> RenderedContent:
         """按话题当前占用任务的真实阶段选文案（Issue #465，rc22 S-3）。
 
@@ -1080,234 +880,6 @@ class EventPipeline:
                 error=f"{type(error).__name__}: {error}",
                 trace_id=message.trace_id,
             )
-
-    def _handle_memory_command(
-        self,
-        tx,
-        message: InboundMessage,
-        user,
-        conversation,
-        memory_command: MemoryCommand,
-        deferred: list[RenderedContent],
-    ) -> Outcome:
-        """``/memory`` 命令面：查/登记/删除/清空当前用户的记忆（Issue #357 S-H3-3，
-        D1 显式登记范围）。调用点放在忙碌判定之前，与 ``/stop`` 同一姿态——见
-        「第 6 步的延伸」调用处注释。三个写操作（remember/forget/clear）各自记一条
-        审计（``command.memory_remember``/``command.memory_forget``/
-        ``command.memory_clear``），与既有 ``command.new``/``command.stop`` 同一
-        姿态；``list`` 与格式不对的用法提示是只读/无副作用操作，不单独记审计。
-
-        ``remember`` 在真正写库之前先过一遍 ``config.content.validate_user_visible_
-        text`` 安全校验（Trace #373 H3 批 codex 外审②修复③）：与 worker 注入路径
-        （``adapters/postgres_user_memory.PostgresUserMemoryReader._is_entry_safe``）
-        和 ``/memory list`` 展示路径（``_render_memory_list``）复用同一道检查器，
-        撞线（协议词、看起来像系统指令的多行文本）时**直接拒绝登记**并回执
-        ``memory.remember_unsafe`` 说明原因，不写库、不记 ``command.memory_remember``
-        审计——此前登记侧没有这道校验，用户会先收到「已登记，下一次提问开始生效」的
-        回执，实际这条记忆在每次注入时都被注入侧静默跳过、永远不生效，回执与事实
-        不符。
-        """
-
-        if memory_command.kind is MemoryCommandKind.LIST:
-            entries = tx.list_user_memory(user_id=user.user_id)
-            deferred.append(self._render_memory_list(entries))
-            tx.mark_handled_as(event_id=message.event_id, handled_as=HandledAs.COMMAND)
-            return Outcome(handled_as=HandledAs.COMMAND)
-
-        if memory_command.kind is MemoryCommandKind.CLEAR:
-            count = tx.clear_user_memory(user_id=user.user_id)
-            deferred.append(self._texts.catalog.text("memory.cleared", count=count))
-            self._audit.record(
-                "command.memory_clear",
-                event_id=message.event_id,
-                user_id=user.user_id,
-                conversation_id=conversation.conversation_id,
-                cleared_count=count,
-                trace_id=message.trace_id,
-            )
-            tx.mark_handled_as(event_id=message.event_id, handled_as=HandledAs.COMMAND)
-            return Outcome(handled_as=HandledAs.COMMAND)
-
-        if memory_command.kind is MemoryCommandKind.FORGET:
-            # 短序号解析需要先查一次当前用户的记忆列表（rc22 B-8-1，#439
-            # TOP-10）：与随后的 tx.forget_user_memory 同一个数据库事务、同一个
-            # 连接，中途不会有别的写者插队——见 _resolve_forget_target_id 文档
-            # 「forget 时刻的同一确定性排序」这条口径的成立依据。
-            entries = tx.list_user_memory(user_id=user.user_id)
-            target_id = self._resolve_forget_target_id(memory_command, entries)
-            forgotten_entry = (
-                tx.forget_user_memory(user_id=user.user_id, memory_id=target_id)
-                if target_id is not None
-                else None
-            )
-            deferred.append(self._render_forget_receipt(forgotten_entry))
-            if forgotten_entry is not None:
-                # 未命中（不存在/不属于本人/序号越界）不审计为一次「删除」事件——
-                # 结构上没有发生任何写操作，与 forget_user_memory 的跨用户零生效
-                # 同一条纪律（不产生「有人尝试删了别人一条记忆」这样的误导性事实）。
-                self._audit.record(
-                    "command.memory_forget",
-                    event_id=message.event_id,
-                    user_id=user.user_id,
-                    conversation_id=conversation.conversation_id,
-                    memory_id=forgotten_entry.memory_id,
-                    trace_id=message.trace_id,
-                )
-            tx.mark_handled_as(event_id=message.event_id, handled_as=HandledAs.COMMAND)
-            return Outcome(handled_as=HandledAs.COMMAND)
-
-        if memory_command.kind is MemoryCommandKind.REMEMBER:
-            # 登记前先过一遍与注入侧同一道安全校验（Trace #373 H3 批 codex 外审②
-            # 修复③）：此前只有 worker 注入路径（``adapters/postgres_user_memory.
-            # PostgresUserMemoryReader._is_entry_safe``）与 ``/memory list`` 展示
-            # 路径复用了 ``validate_user_visible_text``，登记路径本身没有——用户
-            # 登记一条撞线内容（协议词、看起来像系统指令的多行文本）会先收到
-            # ``memory.remembered``「已登记，下一次提问开始生效」的回执，实际
-            # 这条记忆在每一次注入时都会被静默跳过、永远不生效，回执与事实不符。
-            # 这里在真正写库之前拒绝，回执明确告诉用户「没有登记成功、为什么」，
-            # 不产生「说了成功但其实没生效」的落差。检查内容同注入侧：
-            # ``f"{memory_key}\n{memory_value}"`` 一起校验（同一次撞线判定，不
-            # 分别校验两个字段——理由同 ``_is_entry_safe`` 的调用形状）。
-            try:
-                validate_user_visible_text(
-                    f"{memory_command.memory_key}\n{memory_command.memory_value}"
-                )
-            except ContentSafetyError:
-                deferred.append(self._texts.catalog.text("memory.remember_unsafe"))
-                tx.mark_handled_as(event_id=message.event_id, handled_as=HandledAs.COMMAND)
-                return Outcome(handled_as=HandledAs.COMMAND)
-
-            memory_id = tx.remember_user_memory(
-                user_id=user.user_id,
-                memory_type=memory_command.memory_type,
-                memory_key=memory_command.memory_key,
-                memory_value=memory_command.memory_value,
-            )
-            if memory_id is None:
-                deferred.append(self._texts.catalog.text("memory.limit_exceeded"))
-            else:
-                deferred.append(self._texts.catalog.text("memory.remembered"))
-                self._audit.record(
-                    "command.memory_remember",
-                    event_id=message.event_id,
-                    user_id=user.user_id,
-                    conversation_id=conversation.conversation_id,
-                    memory_id=memory_id,
-                    memory_type=memory_command.memory_type,
-                    trace_id=message.trace_id,
-                )
-            tx.mark_handled_as(event_id=message.event_id, handled_as=HandledAs.COMMAND)
-            return Outcome(handled_as=HandledAs.COMMAND)
-
-        # NONE：以 /memory 开头但子命令形状不对——用法提示，不算错误也不审计
-        # （与合法但空操作的 list 同一姿态：读多写少，不是需要留痕的业务决定）。
-        deferred.append(self._texts.catalog.text("memory.usage_help"))
-        tx.mark_handled_as(event_id=message.event_id, handled_as=HandledAs.COMMAND)
-        return Outcome(handled_as=HandledAs.COMMAND)
-
-    def _render_memory_list(self, entries: list[UserMemoryEntry]) -> RenderedContent:
-        """把 ``/memory list`` 查到的记忆渲染成用户可见文本。
-
-        **短序号取代裸 id 展示**（rc22 B-8-1，#439 TOP-10）：此前每一行末尾都
-        带一个 ``mem_`` 前缀的裸 ULID（``id: mem_01ARZ...``）供 ``/memory
-        forget`` 引用——这是全仓库唯一波及普通用户的裸 ULID 展示面，对不熟悉
-        内部标识格式的用户不友好。这里改成按 ``entries`` 顺序从 1 开始编号的
-        短序号，``/memory forget <序号>`` 同样可以引用（原始 ``mem_`` id 仍然
-        兼容，见 ``commands.parse_memory_command`` 文档）。序号顺序与
-        ``forget`` 时刻 ``tx.list_user_memory`` 返回的顺序能对上，**不是靠两处
-        约定一致**，而是两处调用的是同一个 ``ORDER BY created_at ASC`` 查询
-        （``adapters/postgres_conversation/_transaction.py`` 的
-        ``list_user_memory``），结构上没有第二个排序键可以漂移。
-
-        每一行单独过一次内容安全校验（``content.toml`` 的 ``_validate_user_visible_
-        text``）：``memory_key``/``memory_value`` 是用户自己写入的自由文本，结构上
-        无法保证它不会撞上协议泄漏词表（``mcp__``/``trace_id`` 等，见该文件文档）。
-        单条撞线时替换成不回显内容的安全占位行，不让**一条**记忆的内容让整个
-        ``/memory list`` 崩掉——那会让用户永久看不到自己登记过的其余记忆，除非先
-        盲猜是哪一条、用 ``/memory forget`` 删掉。
-        """
-
-        catalog = self._texts.catalog
-        if not entries:
-            return catalog.text("memory.list_empty")
-        lines: list[str] = []
-        for serial, entry in enumerate(entries, start=1):
-            type_label = catalog.text(f"memory.type_label.{entry.memory_type}").text
-            try:
-                rendered_entry = catalog.text(
-                    "memory.list_entry",
-                    serial=serial,
-                    type_label=type_label,
-                    memory_key=entry.memory_key,
-                    memory_value=entry.memory_value,
-                )
-            except ContentSafetyError:
-                rendered_entry = catalog.text(
-                    "memory.list_entry_unsafe",
-                    serial=serial,
-                    type_label=type_label,
-                )
-            lines.append(rendered_entry.text)
-        return catalog.text("memory.list", entries="\n".join(lines))
-
-    def _resolve_forget_target_id(
-        self, memory_command: MemoryCommand, entries: list[UserMemoryEntry]
-    ) -> str | None:
-        """把 ``/memory forget`` 的入参（短序号或原始 ``mem_`` id）解析成要传给
-        ``tx.forget_user_memory`` 的具体 id（rc22 B-8-1，#439 TOP-10）。
-
-        序号解析用的是**本次调用内、真正执行删除之前**这一次 ``list_user_
-        memory`` 的查询结果——它与随后的 ``tx.forget_user_memory`` 共享同一个
-        数据库事务、同一个连接，中途不会有别的写者插队。``/memory list`` 展示
-        的序号和这里解析用的序号，只要两次查询之间用户自己的记忆集合没有变化，
-        指向的就是同一条记录；如果确实变化了（这次 forget 之前，用户又
-        remember/forget 了别的条目），这里按**当刻重新排序**解析，不去猜测
-        用户上一次看到的是哪一份快照——调用方（``_handle_memory_command``）在
-        回执里回显被删条目的实际内容（``_render_forget_receipt``），让用户能
-        自行核对删的是不是自己想删的那一条，这是覆盖这个「列表与删除之间
-        记忆集合变化」边缘情形取的口径，不是缺陷。
-
-        传入完整 ``mem_`` id 时原样透传，不在这里做存在性/归属预检查——那仍然
-        只由 ``forget_user_memory`` 自己的 ``WHERE ... AND user_id`` 结构性把关
-        （跨用户传入他人 id 时哪怕在 ``entries`` 里也找不到，因为 ``entries``
-        本身就已经是「按 user_id 过滤」的结果），保持这条路径与新增短序号解析
-        之前完全一致的行为，不因为新增能力改变旧路径的判定顺序。
-        """
-
-        if memory_command.memory_serial is not None:
-            index = memory_command.memory_serial - 1
-            if 0 <= index < len(entries):
-                return entries[index].memory_id
-            return None
-        return memory_command.memory_id
-
-    def _render_forget_receipt(self, entry: UserMemoryEntry | None) -> RenderedContent:
-        """``/memory forget`` 的回执（rc22 B-8-1，#439 TOP-10）：命中时回显被删
-        条目的实际内容，供用户自行核对删的是不是那一条——短序号解析存在「列表
-        与删除之间记忆集合变化」的边缘情形（见 ``_resolve_forget_target_id``
-        文档），回显内容是这个口径下用户唯一能自校验的手段。未命中（不存在/
-        不属于本人/序号越界，三者不区分，理由同既有 ``memory.forget_not_
-        found`` 文案）沿用既有拒绝文案。
-
-        被删内容本身撞上安全校验时（同 ``_render_memory_list`` 的道理：
-        ``memory_key``/``memory_value`` 是用户自由文本，无法结构性保证不撞协议
-        泄漏词表）退化成不回显内容的安全占位回执——「删除成功」这个正向结果
-        不能反过来让内容安全校验失效。
-        """
-
-        catalog = self._texts.catalog
-        if entry is None:
-            return catalog.text("memory.forget_not_found")
-        type_label = catalog.text(f"memory.type_label.{entry.memory_type}").text
-        try:
-            return catalog.text(
-                "memory.forgotten",
-                type_label=type_label,
-                memory_key=entry.memory_key,
-                memory_value=entry.memory_value,
-            )
-        except ContentSafetyError:
-            return catalog.text("memory.forgotten_unsafe", type_label=type_label)
 
     def _try_admin_route(
         self, tx, message: InboundMessage, deferred: list[RenderedContent]
@@ -1392,9 +964,7 @@ class EventPipeline:
 
         # 抢占与入队同事务：抢不到即忙碌（`V-会话-01`）；抢到之后任何失败都会让
         # 抢占随事务一起回滚，话题不会永久忙碌（`V-队列-02`）。
-        if not tx.claim_conversation(
-            conversation_id=conversation.conversation_id, task_id=task_id
-        ):
+        if not tx.claim_conversation(conversation_id=conversation.conversation_id, task_id=task_id):
             # 竞态分支（Issue #465 不覆盖，理由同 `/new` 的同类竞态注释）：抢占它
             # 的任务同样是本次事务从未读到的一条，保留"处理中"默认文案。
             deferred.append(self._texts.busy_hint_content())
@@ -1484,12 +1054,3 @@ class EventPipeline:
             resumed_session=resumed,
             target_worker_version=version,
         )
-
-
-def _as_content(catalog: ContentCatalog, key: str, value: str) -> RenderedContent:
-    """把兼容旧注入口的字符串包成可追溯内容；默认值仍来自目录。"""
-
-    configured = catalog.text(key)
-    if value == configured.text:
-        return configured
-    return RenderedContent(key=key, version=catalog.version, text=value)
