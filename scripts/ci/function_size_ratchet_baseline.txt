@@ -189,5 +189,4 @@
 69	src/lingxi/core/permission/metric_translation.py::build_company_function_metric_map
 71	src/lingxi/core/permission/notification.py::PermissionNoticeDispatcher.notify
 66	src/lingxi/core/permission/position_override.py::expand_position_scope
-193	src/lingxi/core/permission/publish.py::publish_claim
 97	src/lingxi/core/permission/targeted_recompute.py::TargetedPermissionRecompute.recompute_and_publish

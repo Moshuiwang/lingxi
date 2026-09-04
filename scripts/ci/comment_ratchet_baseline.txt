@@ -147,7 +147,6 @@
 6	docstring_over	src/lingxi/core/permission/metric_translation.py
 3	docstring_over	src/lingxi/core/permission/notification.py
 1	docstring_over	src/lingxi/core/permission/position_override.py
-6	docstring_over	src/lingxi/core/permission/publish.py
 1	docstring_over	src/lingxi/core/permission/role_function.py
 1	docstring_over	src/lingxi/core/permission/table_access_token_supply.py
 2	docstring_over	src/lingxi/core/permission/targeted_recompute.py
@@ -238,7 +237,6 @@
 1	hash_block_over	src/lingxi/core/mcp_naming.py
 1	hash_block_over	src/lingxi/core/permission/metric_translation.py
 2	hash_block_over	src/lingxi/core/permission/notification.py
-6	hash_block_over	src/lingxi/core/permission/publish.py
 2	hash_block_over	src/lingxi/core/permission/targeted_recompute.py
 1	provenance	src/lingxi/adapters/admin_metric_alias_map_file.py
 1	provenance	src/lingxi/adapters/admin_post_callback.py
@@ -402,7 +400,6 @@
 9	provenance	src/lingxi/core/permission/metric_translation.py
 21	provenance	src/lingxi/core/permission/notification.py
 2	provenance	src/lingxi/core/permission/position_override.py
-13	provenance	src/lingxi/core/permission/publish.py
 1	provenance	src/lingxi/core/permission/publish_row.py
 1	provenance	src/lingxi/core/permission/role_function.py
 10	provenance	src/lingxi/core/permission/table_access_token_supply.py
