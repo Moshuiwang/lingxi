@@ -16,7 +16,9 @@
 
 from __future__ import annotations
 
+import ast
 import unittest
+from pathlib import Path
 
 from lingxi.config.content import REQUIRED_TEXT_KEYS, ContentSafetyError, default_content_catalog
 from lingxi.core.permission.notification import (
@@ -505,6 +507,56 @@ class DispatcherTest(unittest.TestCase):
                 "backoff_seconds",
             },
         )
+
+
+def _references_to(module_path: Path, symbol: str) -> tuple[str, ...]:
+    """一个模块里对某个名字的全部**引用点**（import 与取值），按行号排序。
+
+    走 AST 而不是文本匹配：docstring 与注释里交叉引用这个名字是正常写法，不是调用
+    点；文本匹配会把它们一起判红，那种判据没人维持得住。函数定义本身也不算引用。
+    """
+    tree = ast.parse(module_path.read_text(encoding="utf-8"))
+    hits: list[str] = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ImportFrom) and any(alias.name == symbol for alias in node.names):
+            hits.append(f"{module_path.name}:{node.lineno}")
+        elif isinstance(node, ast.Name) and node.id == symbol:
+            hits.append(f"{module_path.name}:{node.lineno}")
+        elif isinstance(node, ast.Attribute) and node.attr == symbol:
+            hits.append(f"{module_path.name}:{node.lineno}")
+    return tuple(sorted(hits))
+
+
+class UntranslatedFunctionLabelStaticReconciliationTests(unittest.TestCase):
+    """静态对账（Issue #605 完成标准 2）：用户可见正文里不会再出现内部职能标签。
+
+    立论是一条机械事实：``publish_row.serialize_permissions`` 是全仓库唯一会产出
+    「值列表是职能标签」的权限文本入口，而 :func:`describe_scope` 把权限文本的值
+    **原样**拼进用户正文。因此"用户正文里不会出现职能标签"的判据就是：``src/lingxi/``
+    里除定义它的那个模块之外，没有任何地方再引用它。**边界如实**：这条判据挡的是
+    这个已知入口，挡不住有人另写一份职能标签文本再送进渲染。
+    """
+
+    SOURCE_ROOT = Path(__file__).parents[1] / "src" / "lingxi"
+    DEFINING_MODULE = SOURCE_ROOT / "core" / "permission" / "publish_row.py"
+    SYMBOL = "serialize_permissions"
+
+    def test_nothing_outside_the_defining_module_still_serializes_function_labels(self) -> None:
+        offenders: list[str] = []
+        for path in sorted(self.SOURCE_ROOT.rglob("*.py")):
+            if path == self.DEFINING_MODULE:
+                continue
+            offenders.extend(_references_to(path, self.SYMBOL))
+        self.assertEqual(
+            offenders,
+            [],
+            "未翻译的职能标签序列化入口不得再有调用点：" + ", ".join(offenders),
+        )
+
+    def test_the_detector_really_fires_on_the_defining_module(self) -> None:
+        """反向对照：上一条不是恒真的空判据——同一个探测器在定义处确实命中。"""
+
+        self.assertNotEqual(_references_to(self.DEFINING_MODULE, self.SYMBOL), ())
 
 
 if __name__ == "__main__":  # pragma: no cover
