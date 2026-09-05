@@ -692,6 +692,20 @@ class SameSourceStaticTest(unittest.TestCase):
             _call_names(ast.parse(SCRIPT.read_text(encoding="utf-8"))).count("build_target"), 1
         )
 
+    def test_the_dispatcher_is_wired_to_the_content_source_the_process_actually_uses(
+        self,
+    ) -> None:
+        """审计里的 ``content_digest`` 只有接上真实内容目录才有意义。
+
+        ``build_dispatcher`` 是 I/O 装配、没有单测覆盖；这条静态断言钉住"摘要确实取自
+        本进程在用的那一份内容"。接线一旦掉了，摘要会安静地退回版本号——配了宿主机
+        覆盖文件时就再也分不出这个人收到的是哪一版字，而运行时看不出任何异常。
+        """
+        source = SCRIPT.read_text(encoding="utf-8")
+        self.assertIn("default_content_source()", source)
+        self.assertIn("catalog=source.catalog", source)
+        self.assertIn("content_digest=source.digest", source)
+
     def test_the_script_never_imports_a_feishu_sdk_directly(self) -> None:
         """出站只走 adapters；脚本自己不碰协议细节。"""
         source = SCRIPT.read_text(encoding="utf-8")
