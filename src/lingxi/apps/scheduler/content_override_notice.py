@@ -22,8 +22,10 @@ from lingxi.apps.scheduler.config import SchedulerConfig
 #: 误判成同一逻辑投递。
 CONTENT_OVERRIDE_UUID_PREFIX = "lingxi-content-"
 
+#: 前缀与 ``core/alerting.py`` 的运行告警同型：管理群里同一类"系统在说话"的消息
+#: 必须长得一样，管理员据此一眼分辨这是系统告警而不是某个人在发言。
 _ALERT_TEXT = (
-    "灵犀提醒：宿主机上的用户可见文案覆盖文件未通过校验，已被整份忽略，"
+    "[BI Plus 运行告警] 宿主机上的用户可见文案覆盖文件未通过校验，已被整份忽略，"
     "用户看到的仍是随镜像发布的那一版文案（不影响任何在跑的服务）。"
     "原因码：{reason}。请用 `python -m lingxi.config.content_check <文件>` "
     "校验后重新放置，并重启相关服务。"

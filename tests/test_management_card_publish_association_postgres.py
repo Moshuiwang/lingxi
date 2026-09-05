@@ -399,12 +399,54 @@ class PublishAssociationPortTests(ManagementCardReuseAssociationTestCase):
             )
         )
 
-    def test_a_card_without_any_action_cannot_prove_supersession(self) -> None:
-        self.assertTrue(
+    def test_a_card_without_any_action_refuses_the_callback(self) -> None:
+        """否定断言：查不到当前操作时失败关闭。
+
+        一张连"现在是哪一次操作"都答不出来的卡，没有任何依据接受一条迟到回调的
+        回写——那条回调只能是孤儿。
+        """
+        self.assertFalse(
             self.store.is_current_card_action(
                 message_id="om_without_actions", pending_action_id=self.action_a
             )
         )
+
+    def test_a_missing_judgement_input_still_answers_yes(self) -> None:
+        """参数缺失是调用方没给判据，不是库里没有答案——旧调用方行为不变。"""
+        self.assertTrue(
+            self.store.is_current_card_action(message_id=MESSAGE_ID, pending_action_id="")
+        )
+        self.assertTrue(
+            self.store.is_current_card_action(message_id="", pending_action_id=self.action_a)
+        )
+
+
+class OrphanCallbackTests(ManagementCardReuseAssociationTestCase):
+    """卡上一条 ``pending_action`` 都查不到时，迟到回调一个字都不回写。"""
+
+    def test_a_late_callback_on_a_card_without_any_action_writes_nothing(self) -> None:
+        self.store.update_state(
+            message_id=MESSAGE_ID, state="dispatching", dispatch_status="publishing"
+        )
+        reporter, refresher = self.build_reporter()
+        orphan = SimpleNamespace(id=new_id("pac"), origin_card_message_id=MESSAGE_ID)
+
+        reporter.on_completed(orphan)
+
+        self.assertEqual(self.card_state(), ("dispatching", "publishing"))
+        self.assertEqual(refresher.calls, [])
+
+    def test_a_late_failure_on_such_a_card_cannot_downgrade_it_either(self) -> None:
+        self.store.update_state(
+            message_id=MESSAGE_ID, state="dispatching", dispatch_status="publishing"
+        )
+        reporter, refresher = self.build_reporter()
+        orphan = SimpleNamespace(id=new_id("pac"), origin_card_message_id=MESSAGE_ID)
+
+        reporter.on_failed(orphan, None)
+
+        self.assertEqual(self.card_state(), ("dispatching", "publishing"))
+        self.assertEqual(refresher.calls, [])
 
 
 class ExistingSettlementRulesStillHoldTests(ManagementCardReuseAssociationTestCase):

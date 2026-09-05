@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import io
 import logging
+import os
 import tempfile
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
@@ -21,6 +22,8 @@ from lingxi.config.content_check import EXIT_OK, EXIT_REJECTED, EXIT_USAGE
 from lingxi.config.content_check import main as content_check_main
 from lingxi.config.content_override import (
     CONTENT_OVERRIDE_PATH_ENV,
+    MAX_OVERRIDE_BYTES,
+    REASON_INVALID_PATH,
     REASON_INVALID_TOML,
     REASON_INVALID_VALUE,
     REASON_PLACEHOLDER_MISMATCH,
@@ -306,6 +309,23 @@ class ContentCheckCommandTest(unittest.TestCase):
         self.assertEqual(code, EXIT_REJECTED)
         self.assertNotIn("预计剩余 3 分钟", out + err)
 
+    def test_a_relative_path_is_rejected_with_the_runtime_reason(self) -> None:
+        """否定断言：相对路径在运行时与校验命令里是同一个结论、同一个原因码。"""
+        out, err = io.StringIO(), io.StringIO()
+        with redirect_stdout(out), redirect_stderr(err):
+            code = content_check_main(["runtime/content.override.toml"])
+        self.assertEqual(code, EXIT_REJECTED)
+        self.assertIn(REASON_INVALID_PATH, err.getvalue())
+
+    def test_the_absolute_path_is_printed_on_success_and_on_rejection(self) -> None:
+        """运维据此确认"校验的和进程要读的是同一个文件"。"""
+        code, out, _ = self._run(GOOD_OVERRIDE, name="printed.toml")
+        self.assertEqual(code, EXIT_OK)
+        self.assertIn(str(self.directory / "printed.toml"), out)
+        code, out, _ = self._run("[texts\n", name="bad-print.toml")
+        self.assertEqual(code, EXIT_REJECTED)
+        self.assertIn(str(self.directory / "bad-print.toml"), out)
+
     def test_a_missing_file_and_a_wrong_argument_count_are_usage_errors(self) -> None:
         code, _, _ = self._run(None, name="absent.toml")
         self.assertEqual(code, EXIT_USAGE)
@@ -431,6 +451,79 @@ class RejectionErrorTest(unittest.TestCase):
         error = ContentOverrideError(REASON_UNSAFE_TEXT)
         self.assertEqual(error.reason, REASON_UNSAFE_TEXT)
         self.assertIn(REASON_UNSAFE_TEXT, str(error))
+
+
+class OverridePathShapeTest(unittest.TestCase):
+    """路径与文件形态的判据：必须绝对、必须普通文件、有大小上限，软链允许。"""
+
+    def setUp(self) -> None:
+        self.directory = Path(self.enterContext(tempfile.TemporaryDirectory()))
+
+    def _rejection(self, path: Path) -> str | None:
+        with self.assertLogs("lingxi.config.content_override", level=logging.ERROR):
+            source = load_content_source(path)
+        return source.rejection
+
+    def test_a_relative_path_is_refused_without_echoing_it(self) -> None:
+        """否定断言：相对路径的含义取决于工作目录，三个进程会读到不同的文件。"""
+        with self.assertRaises(ContentOverrideError) as raised:
+            parse_override_path("runtime/content.override.toml")
+        self.assertEqual(raised.exception.reason, REASON_INVALID_PATH)
+        self.assertNotIn("runtime/content.override.toml", str(raised.exception))
+
+    def test_a_directory_is_not_a_content_file(self) -> None:
+        target = self.directory / "as-a-directory"
+        target.mkdir()
+        self.assertEqual(self._rejection(target), REASON_INVALID_PATH)
+
+    def test_a_fifo_is_refused_instead_of_blocking_the_start_up(self) -> None:
+        """否定断言：打开一个 FIFO 会把进程启动挂在那里，先看形态再读。"""
+        target = self.directory / "as-a-fifo"
+        os.mkfifo(target)
+        self.assertEqual(self._rejection(target), REASON_INVALID_PATH)
+
+    def test_a_file_over_the_size_limit_is_refused(self) -> None:
+        target = self.directory / "huge.toml"
+        target.write_bytes(b"#" * (MAX_OVERRIDE_BYTES + 1))
+        self.assertEqual(self._rejection(target), REASON_INVALID_PATH)
+
+    def test_a_file_exactly_at_the_size_limit_is_still_accepted(self) -> None:
+        padding = MAX_OVERRIDE_BYTES - len(GOOD_OVERRIDE.encode("utf-8")) - 1
+        target = _write(self.directory, GOOD_OVERRIDE + "#" + "x" * padding, "at-limit.toml")
+        self.assertEqual(target.stat().st_size, MAX_OVERRIDE_BYTES)
+        self.assertIsNone(load_content_source(target).rejection)
+
+    def test_a_symlink_to_a_regular_file_is_accepted(self) -> None:
+        """运维用软链切版本是既有做法，形态判据不该误伤它。"""
+        real = _write(self.directory, GOOD_OVERRIDE, "real.toml")
+        link = self.directory / "current.toml"
+        link.symlink_to(real)
+        source = load_content_source(link)
+        self.assertIsNone(source.rejection)
+        self.assertNotEqual(source.override_keys, ())
+
+
+class RuntimeWordingTest(unittest.TestCase):
+    """管理员与用户看得到的运行时文案里没有内部项目名。"""
+
+    def test_the_override_alert_carries_the_shared_run_alert_prefix(self) -> None:
+        from lingxi.apps.scheduler.content_override_notice import _ALERT_TEXT
+
+        self.assertTrue(_ALERT_TEXT.startswith("[BI Plus 运行告警]"))
+
+    def test_no_runtime_source_file_carries_the_internal_project_name(self) -> None:
+        """否定断言：内部项目中文名一个字都不该出现在 ``src/`` 里。"""
+        root = Path(__file__).parents[1] / "src" / "lingxi"
+        wanted = {".py", ".toml", ".json", ".txt", ".md"}
+        offenders = [
+            str(path.relative_to(root))
+            for path in sorted(root.rglob("*"))
+            if path.is_file()
+            and path.suffix in wanted
+            and "__pycache__" not in path.parts
+            and "灵犀" in path.read_text(encoding="utf-8", errors="ignore")
+        ]
+        self.assertEqual(offenders, [])
 
 
 if __name__ == "__main__":

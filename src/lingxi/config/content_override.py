@@ -17,9 +17,10 @@ from __future__ import annotations
 import hashlib
 import logging
 import os
+import stat
 import tomllib
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from functools import lru_cache
 from pathlib import Path
 
@@ -40,6 +41,11 @@ logger = logging.getLogger(__name__)
 #: 同一份文件，要么都配同一个值、要么都不配。
 CONTENT_OVERRIDE_PATH_ENV = "LINGXI_CONTENT_OVERRIDE_PATH"
 
+#: 覆盖文件的大小上限。整份文案目录本身只有几十 KB，256 KB 已经宽出一个数量级；
+#: 设上限是因为这条路径由宿主机文件决定，指错到一个巨大文件时进程会在启动阶段把它
+#: 整个读进内存。
+MAX_OVERRIDE_BYTES = 262144
+
 REASON_INVALID_PATH = "invalid_path"
 REASON_UNREADABLE = "unreadable"
 REASON_INVALID_TOML = "invalid_toml"
@@ -53,9 +59,13 @@ REASON_UNSAFE_TEXT = "unsafe_text"
 class ContentOverrideError(ContentError):
     """外置覆盖文件被整份拒绝；``reason`` 是分类原因码，消息里没有文件正文。"""
 
-    def __init__(self, reason: str) -> None:
-        """记下分类原因码，供日志、管理群告警与校验命令共用同一套口径。"""
-        super().__init__(f"外置文案覆盖文件被整份拒绝：{reason}")
+    def __init__(self, reason: str, detail: str = "") -> None:
+        """记下分类原因码，供日志、管理群告警与校验命令共用同一套口径。
+
+        ``detail`` 只放不含取值的补充说明（例如"必须是绝对路径"），供人当场知道
+        该怎么改；文件正文与环境变量取值一律不进消息。
+        """
+        super().__init__(f"外置文案覆盖文件被整份拒绝：{reason}{detail}")
         self.reason = reason
 
 
@@ -74,16 +84,27 @@ class ContentSource:
 def parse_override_path(raw: str | None) -> Path | None:
     """解释 :data:`CONTENT_OVERRIDE_PATH_ENV`：未配置或空白即 ``None``（零变化）。
 
-    取值含空白字符时拒绝，只报变量名、不回显取到的值（同
+    取值含空白字符、或不是绝对路径时拒绝，只报变量名、不回显取到的值（同
     ``adapters/company_function_metric_map_file.parse_metric_map_path`` 先例）。
-    文件是否存在、内容是否合法不在这里判定。
+    **必须绝对**：相对路径的含义取决于进程的工作目录，三个常驻进程与运维手里的校验
+    命令各自在不同目录下跑，同一个取值会指到不同的文件。文件是否存在、形态与内容是否
+    合法不在这里判定。
     """
     value = (raw or "").strip()
     if not value:
         return None
     if any(character.isspace() for character in value):
-        raise ValueError(f"环境变量 {CONTENT_OVERRIDE_PATH_ENV} 不得包含空白字符（不回显取到的值）")
-    return Path(value)
+        raise ContentOverrideError(
+            REASON_INVALID_PATH,
+            f"（环境变量 {CONTENT_OVERRIDE_PATH_ENV} 不得包含空白字符，不回显取到的值）",
+        )
+    path = Path(value)
+    if not path.is_absolute():
+        raise ContentOverrideError(
+            REASON_INVALID_PATH,
+            f"（环境变量 {CONTENT_OVERRIDE_PATH_ENV} 必须是绝对路径，不回显取到的值）",
+        )
+    return path
 
 
 def read_override_document(path: Path) -> tuple[Mapping[str, object], bytes] | None:
@@ -91,7 +112,22 @@ def read_override_document(path: Path) -> tuple[Mapping[str, object], bytes] | N
 
     "文件不存在"与"文件坏了"必须分开：前者是运维删文件回滚后的正常状态，后者
     要告警。二者混成一种状态会让回滚每次都刷一条假告警，真告警随之被无视。
+
+    **先看形态再读**：目录、FIFO 与设备文件都不是一份文案，其中 FIFO 一旦打开就会
+    把启动阻塞在那里；超过 :data:`MAX_OVERRIDE_BYTES` 的文件同样整份拒绝，不把它读
+    进内存。``stat`` 跟随符号链接，因此指向普通文件的软链是允许的（运维用软链切换
+    版本是既有做法）。
     """
+    try:
+        info = path.stat()
+    except FileNotFoundError:
+        return None
+    except OSError as error:
+        raise ContentOverrideError(REASON_UNREADABLE) from error
+    if not stat.S_ISREG(info.st_mode):
+        raise ContentOverrideError(REASON_INVALID_PATH, "（不是一个普通文件）")
+    if info.st_size > MAX_OVERRIDE_BYTES:
+        raise ContentOverrideError(REASON_INVALID_PATH, f"（超过 {MAX_OVERRIDE_BYTES} 字节上限）")
     try:
         raw = path.read_bytes()
     except FileNotFoundError:
@@ -236,12 +272,15 @@ def default_content_source() -> ContentSource:
     """
     try:
         path = parse_override_path(os.environ.get(CONTENT_OVERRIDE_PATH_ENV))
-    except ValueError:
+    except ContentOverrideError as error:
         logger.error(
-            "环境变量 %s 取值不合法，按镜像内文案运行（不回显取到的值）",
+            "环境变量 %s 取值不合法，按镜像内文案运行（不回显取到的值）reason=%s",
             CONTENT_OVERRIDE_PATH_ENV,
+            error.reason,
         )
-        return load_content_source(None)
+        # 带上拒绝原因：变量配错了与文件写坏了对运维是同一件事（用户看到的仍是镜像
+        # 内文案），因此走同一条管理群告警，不静默。
+        return replace(load_content_source(None), rejection=error.reason)
     return load_content_source(path)
 
 
@@ -271,6 +310,7 @@ def log_content_source(process: str) -> ContentSource:
 
 __all__ = [
     "CONTENT_OVERRIDE_PATH_ENV",
+    "MAX_OVERRIDE_BYTES",
     "ContentOverrideError",
     "ContentSource",
     "apply_override_document",

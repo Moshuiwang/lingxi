@@ -485,8 +485,9 @@ class PostgresManagementCardContextStore:
         """这条操作是否仍是该管理卡最新的一次操作。
 
         管理卡收口后可以被复用，迟到的旧回调不得覆盖后一次操作的卡片状态，也不得
-        把它重新打开。查不到任何关联操作时按「无法证明已被取代」处理，保持旧调用方
-        与内存兼容实现的既有行为。
+        把它重新打开。**查不到任何关联操作时失败关闭**：一张连"当前是哪一次操作"都
+        答不出来的卡，没有任何依据接受一条迟到回调的回写——那条回调只能是孤儿。
+        参数缺失仍返回 ``True``，那是调用方没有给出判据、不是库里没有答案。
         """
         if not message_id or not pending_action_id:
             return True
@@ -496,7 +497,9 @@ class PostgresManagementCardContextStore:
         ):
             cursor.execute(_CURRENT_CARD_ACTION_SQL, (message_id,))
             row = cursor.fetchone()
-        return row is None or str(row[0]) == pending_action_id
+        if row is None:
+            return False
+        return str(row[0]) == pending_action_id
 
     def settle_published_contexts(self) -> tuple[str, ...]:
         """把已被发布消费面读回一致的管理卡置为 ``effective``。

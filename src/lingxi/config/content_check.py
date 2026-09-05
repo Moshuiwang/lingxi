@@ -12,10 +12,11 @@
 from __future__ import annotations
 
 import sys
-from pathlib import Path
 
 from lingxi.config.content import ContentCatalog
 from lingxi.config.content_override import (
+    MAX_OVERRIDE_BYTES,
+    REASON_INVALID_PATH,
     REASON_INVALID_TOML,
     REASON_INVALID_VALUE,
     REASON_PLACEHOLDER_MISMATCH,
@@ -25,6 +26,7 @@ from lingxi.config.content_override import (
     REASON_UNSAFE_TEXT,
     ContentOverrideError,
     apply_override_document,
+    parse_override_path,
     read_override_document,
 )
 
@@ -33,6 +35,10 @@ EXIT_REJECTED = 1
 EXIT_USAGE = 2
 
 _REASON_HELP = {
+    REASON_INVALID_PATH: (
+        "路径本身不合格：必须是绝对路径、必须指向一个普通文件（目录、FIFO、设备文件"
+        f"都不行），且不超过 {MAX_OVERRIDE_BYTES} 字节。"
+    ),
     REASON_UNREADABLE: "文件读不出来（权限或 I/O 错误）。",
     REASON_INVALID_TOML: "不是合法的 UTF-8 TOML，解析失败。",
     REASON_UNKNOWN_SECTION: "只允许一个 [texts] 表；meta、cards 与其它顶层键不可外置。",
@@ -51,7 +57,17 @@ def main(argv: list[str] | None = None) -> int:
     if len(arguments) != 1:
         print(_USAGE, file=sys.stderr)
         return EXIT_USAGE
-    path = Path(arguments[0])
+    try:
+        path = parse_override_path(arguments[0])
+    except ContentOverrideError as error:
+        print(f"路径不合格：{arguments[0]}", file=sys.stderr)
+        return _report_rejection(error)
+    if path is None:
+        print(_USAGE, file=sys.stderr)
+        return EXIT_USAGE
+    # 路径先落地再判内容：合格与被拒都先打印这一条绝对路径，运维据此确认"校验的和
+    # 进程要读的是同一个文件"。
+    print(f"校验文件：{path}")
     catalog = ContentCatalog.from_file()
     try:
         parsed = read_override_document(path)
