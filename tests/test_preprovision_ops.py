@@ -88,6 +88,14 @@ def _plan(position_name: str = "A国家总经理", company_scope: str = "1011"):
     )
 
 
+def _multi_company_plan(company_scope: str = "1011、1012"):
+    return TOOL.build_row_plan(
+        TOOL.RosterRow(email="a@b.com", position_name="A国家总经理", company_scope=company_scope),
+        role_function_map=ROLE_MAP,
+        company_function_metric_map=COMPANY_MAP,
+    )
+
+
 class RosterParsingTest(unittest.TestCase):
     """名单形态写错一律**整份拒绝**（当场拒、零写入），不逐人跳过。"""
 
@@ -173,6 +181,109 @@ class RosterParsingTest(unittest.TestCase):
             set(items[0].plan.pairs),
             {("1011", "sub_new_count"), ("1011", "exchange_rate"), ("1012", "sub_new_count")},
         )
+
+
+class MultiCompanyScopeTest(unittest.TestCase):
+    """#587：名单一行可以写多个公司（顿号分隔），展开成「每公司 × 该职位职能的指标全集」。
+
+    多公司只在名单层拆分，展开函数本身仍然只认单个公司或「全部」——那个纯函数同时服务
+    管理卡表单，见 `tests/test_admin_position_card.py` 的回归用例。
+    """
+
+    def _plan_for(self, company_scope: str):
+        return TOOL.plan_preprovision(
+            (
+                TOOL.RosterRow(
+                    email="a@b.com", position_name="A国家总经理", company_scope=company_scope
+                ),
+            ),
+            role_function_map=ROLE_MAP,
+            company_function_metric_map=COMPANY_MAP,
+        )[0].plan
+
+    def test_two_companies_expand_to_the_union_of_both_company_metric_sets(self) -> None:
+        plan = self._plan_for("1011、1012")
+
+        self.assertEqual(plan.company_scope, "1011、1012")
+        self.assertEqual(
+            plan.pairs,
+            (("1011", "sub_new_count"), ("1011", "exchange_rate"), ("1012", "sub_new_count")),
+        )
+
+    def test_an_unknown_company_inside_a_multi_scope_rejects_the_whole_roster(self) -> None:
+        """一个公司名写错就整份拒绝：不放行同一行里写对的那个公司，也不放行其余人。"""
+
+        rows = (
+            TOOL.RosterRow(email="a@b.com", position_name="A国家总经理", company_scope="1011"),
+            TOOL.RosterRow(
+                email="c@d.com", position_name="A国家总经理", company_scope="1011、9999"
+            ),
+        )
+        with self.assertRaises(TOOL.RosterError):
+            TOOL.plan_preprovision(
+                rows, role_function_map=ROLE_MAP, company_function_metric_map=COMPANY_MAP
+            )
+
+    def test_a_single_company_scope_is_untouched_by_multi_company_support(self) -> None:
+        plan = self._plan_for("1011")
+
+        self.assertEqual(plan.company_scope, "1011")
+        self.assertEqual(plan.pairs, (("1011", "sub_new_count"), ("1011", "exchange_rate")))
+
+    def test_the_all_companies_scope_is_untouched_by_multi_company_support(self) -> None:
+        plan = self._plan_for("全部")
+
+        self.assertEqual(plan.company_scope, "*")
+        self.assertEqual(
+            set(plan.pairs),
+            {("1011", "sub_new_count"), ("1011", "exchange_rate"), ("1012", "sub_new_count")},
+        )
+
+    def test_a_repeated_company_is_counted_once(self) -> None:
+        """同一个公司写两遍是重复、不是歧义：去重后当作只写了一次，不额外拒绝。"""
+
+        plan = self._plan_for("1011、1011")
+
+        self.assertEqual(plan.company_scope, "1011")
+        self.assertEqual(plan.pairs, (("1011", "sub_new_count"), ("1011", "exchange_rate")))
+
+    def test_an_empty_segment_is_rejected_outright(self) -> None:
+        """空段有两种读法（手滑多打一个顿号 / 某个公司名被删空），授权范围不同，不猜。"""
+
+        for company_scope in ("1011、、1012", "、1011", "1011、", "1011、 、1012"):
+            with self.subTest(company_scope=company_scope):
+                with self.assertRaises(TOOL.RosterError):
+                    self._plan_for(company_scope)
+
+    def test_mixing_the_all_scope_with_a_specific_company_is_rejected_outright(self) -> None:
+        """「全部」与具体公司混写的两种读法里有一种是扩权方向，一律拒绝。"""
+
+        for company_scope in ("全部、1011", "1011、全部", "*、1011", "1011、all"):
+            with self.subTest(company_scope=company_scope):
+                with self.assertRaises(TOOL.RosterError):
+                    self._plan_for(company_scope)
+
+    def test_the_dry_run_line_counts_every_company_in_the_scope(self) -> None:
+        """逐人条数按多公司累加，末尾计数与逐人行一致。"""
+
+        items = TOOL.plan_preprovision(
+            (
+                TOOL.RosterRow(
+                    email="a@b.com", position_name="A国家总经理", company_scope="1011、1012"
+                ),
+                TOOL.RosterRow(email="c@d.com", position_name="A国家总经理", company_scope="1012"),
+            ),
+            role_function_map=ROLE_MAP,
+            company_function_metric_map=COMPANY_MAP,
+        )
+        rendered = io.StringIO()
+        with redirect_stdout(rendered):
+            TOOL.print_plan(items)
+        printed = rendered.getvalue()
+
+        self.assertIn("公司范围=1011、1012 将获得 3 条公司×指标", printed)
+        self.assertIn("公司范围=1012 将获得 1 条公司×指标", printed)
+        self.assertIn("合计将预授权 4 条公司×指标", printed)
 
 
 class PlanCarriesTheAuditReasonTest(unittest.TestCase):
@@ -433,6 +544,39 @@ class CommandLineWritePolarityTest(unittest.TestCase):
         self.assertEqual(self.started, [])
         self.assertIn("名单不可用", err)
 
+    def test_a_multi_company_row_prints_the_accumulated_count_and_writes_nothing(self) -> None:
+        """#587 dry-run：多公司行的条数按公司累加，末尾合计跟着累加，且仍然零写入。"""
+
+        code, out, _ = self._run(
+            self._argv(
+                "email,position,company_scope\n"
+                "a@b.com,A国家总经理,1011、1012\n"
+                "c@d.com,A国家财务总监,1012\n"
+            )
+        )
+        self.assertEqual(code, 0)
+        self.assertEqual(self.started, [], "dry-run 必须一次都不调用开通入口")
+        self.assertIn("公司范围=1011、1012 将获得 3 条公司×指标", out)
+        self.assertIn("合计将预授权 5 条公司×指标", out)
+
+    def test_an_unknown_company_inside_a_multi_scope_writes_nothing_and_exits_two(self) -> None:
+        """#587：多公司里有一个写错 → 退出码 2、开通入口一次都没被调用（整份零写入）。"""
+
+        code, _, err = self._run(
+            [
+                *self._argv(
+                    "email,position,company_scope\n"
+                    "a@b.com,A国家总经理,1011\n"
+                    "c@d.com,A国家总经理,1011、不存在的公司\n"
+                ),
+                "--apply",
+            ]
+        )
+        self.assertEqual(code, 2)
+        self.assertEqual(self.started, [])
+        self.assertEqual(self.shutdowns, [], "名单在装配之前就被拒，不该起开通执行器线程池")
+        self.assertIn("名单不可用", err)
+
     def test_an_unregistered_initiator_is_rejected_before_anything_runs(self) -> None:
         self._patch(TOOL, "initiated_by_is_registered_admin", lambda lookup, open_id: False)
         code, _, err = self._run([*self._argv(self.ROSTER), "--apply"])
@@ -519,6 +663,36 @@ class SyntheticPendingActionTest(unittest.TestCase):
             self.assertIn("A国家总经理", params)
             self.assertIn("1011", params)
             self.assertIn(PREPROVISION_OVERRIDE_REASON, params)
+
+    def test_a_multi_company_grant_is_one_group_one_pending_action(self) -> None:
+        """#587：多公司仍是**一笔**——一条 pending_action、一个组 ID、每行带同一份范围原文。
+
+        拆成多笔就撤不干净（管理卡上会出现两个项），而多公司名单存在的理由之一正是
+        「可整组撤销」。
+        """
+
+        cursor = _FakeCursor()
+        report = _apply_position_grant_locked(
+            cursor,
+            user_id="usr_1",
+            target_open_id="ou_target",
+            plan=_multi_company_plan(),
+            now=datetime(2026, 9, 3, tzinfo=UTC),
+            initiated_by_open_id="ou_admin",
+        )
+
+        self.assertEqual(report.imported, 3)
+        self.assertEqual(len(cursor.statements("INSERT INTO pending_action")), 1)
+        rows = cursor.statements("INSERT INTO local_permission_override")
+        self.assertEqual(len(rows), 3)
+        self.assertEqual(len({row[1][-1] for row in rows}), 1, "多公司的全部行共享同一个组 ID")
+        self.assertEqual(
+            {params[3] for _sql, params in rows},
+            {"1011", "1012"},
+            "两个公司都真的落了行，不是只落了第一个",
+        )
+        for _sql, params in rows:
+            self.assertIn("1011、1012", params, "每一行都带名单原文的公司范围")
 
     def test_an_already_active_key_is_not_written_again(self) -> None:
         cursor = _FakeCursor(

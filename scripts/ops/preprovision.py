@@ -55,6 +55,7 @@
 email,position,company_scope
 zhang.san@example.com,A国家总经理,1011
 li.si@example.com,A国家财务总监,全部
+wang.wu@example.com,A国家总经理,1011、1012
 ```
 
 - `email`：该员工的邮箱，按 `account_match.normalize_email` 归一（大小写与首尾空白
@@ -64,7 +65,11 @@ li.si@example.com,A国家财务总监,全部
   唯一索引加上之后**无法自愈**）。
 - `position`：银河职位，必须精确命中 `config/galaxy_role_function_map.toml` 的角色名，
   不做前缀、同义词或模糊匹配。
-- `company_scope`：单个公司键，或「全部」/`*`/`all` 表示全部公司。
+- `company_scope`：一个公司键；用顿号「、」连写的多个公司键；或「全部」/`*`/`all`
+  表示全部公司。**一人多公司在名单层拆开、逐个走同一个展开函数再合并**，得到「每个
+  公司 × 该职位职能的指标全集」，并成**一笔**预授权（同一个组 ID，管理卡上仍是一个
+  可整组撤销的项）。分隔符只认顿号，理由与拒绝空段、拒绝「全部」混写具体公司一起写在
+  :func:`split_company_scope`。
 
 **整份拒绝（退出码 2、零写入）的四种情形**——它们全是「名单本身写错了」，而不是
 「这个人开通失败了」，在任何一行落库之前就能判定，因此不逐人跳过：
@@ -72,9 +77,9 @@ li.si@example.com,A国家财务总监,全部
 1. 表头不是恰好这三列、或某行字段数不对；
 2. 任一字段为空白；
 3. 同一邮箱出现两行（导出/编辑本身有歧义，不猜哪一行为准，同 #441 姿态）；
-4. 任一行的职位或公司范围展开失败（职位不在角色映射、公司范围不是当前可用公司、
-   或某公司×职能没配指标）。第 4 条是选择「职位＋公司范围」形态的**全部意义**：
-   名单上没有一列会静默出错的自由文本。
+4. 任一行的职位或公司范围展开失败（职位不在角色映射、公司范围写法不合法、其中任一个
+   公司不是当前可用公司、或某公司×职能没配指标）。第 4 条是选择「职位＋公司范围」形态
+   的**全部意义**：名单上没有一列会静默出错的自由文本。
 
 ## 输出：`--dry-run` 清单与 `--apply`
 
@@ -134,8 +139,10 @@ from lingxi.core.identity.preprovision import (
 )
 from lingxi.core.permission.account_match import normalize_email
 from lingxi.core.permission.position_override import (
+    ALL_COMPANIES_SCOPE,
     PREPROVISION_PENDING_ACTION_REASON,
     PositionGrantPlan,
+    PositionPermissionExpansion,
     build_preprovision_grant_plan,
     expand_position_scope,
 )
@@ -149,6 +156,12 @@ ORIGIN_PREPROVISION = _CHAIN_ORIGIN_PREPROVISION
 
 #: 名单 CSV 的表头，必须逐字相等（多一列少一列都算名单写错）。
 ROSTER_COLUMNS = ("email", "position", "company_scope")
+
+#: 一人多公司在 `company_scope` 里的分隔符：顿号，与产品负责人核对名单时本来的写法一致。
+COMPANY_SCOPE_SEPARATOR = "、"
+
+#: 「全部公司」除 ``ALL_COMPANIES_SCOPE`` 之外的两种别名，与展开函数的判据逐字一致。
+ALL_COMPANIES_SCOPE_ALIASES = frozenset({"all", "全部"})
 
 #: 逐人结果分类。前两类来自开通链的终态，后两类是本脚本自己的判定。
 OUTCOME_PROVISIONED = "provisioned"
@@ -276,6 +289,95 @@ def load_roster(path: Path) -> tuple[RosterRow, ...]:
     return tuple(rows)
 
 
+def _is_all_companies_scope(scope: str) -> bool:
+    """这一段是不是「全部公司」——判据逐字同展开函数，不另立一套。"""
+
+    return scope == ALL_COMPANIES_SCOPE or scope.casefold() in ALL_COMPANIES_SCOPE_ALIASES
+
+
+def split_company_scope(company_scope: str) -> tuple[str, ...]:
+    """把名单一行的公司范围拆成公司键序列；重复的公司只算一次。
+
+    **只认顿号一个分隔符**：逗号在 CSV 里已经是列分隔符，空格、斜杠、分号各自在公司名
+    里都可能是正文，多认一个就多一种「以为写了两个公司、实际被当成一个不存在的公司名」
+    的错法——而那种错法今天恰好会被「公司范围不是当前可用公司」挡住，明天新增一个含该
+    符号的公司名就会静默生效。
+
+    两类写法整份拒绝而不是替产品负责人猜：**空段**（``甲、、乙``、首尾顿号）既可能是
+    手滑多打一个顿号，也可能是某个公司名被整段删掉了，两种读法给出的授权范围不同；
+    **「全部」与具体公司混写**同样有两种读法，且其中一种是扩权方向，不猜。
+    """
+
+    segments = [segment.strip() for segment in company_scope.split(COMPANY_SCOPE_SEPARATOR)]
+    if any(not segment for segment in segments):
+        raise RosterError(
+            f"公司范围「{company_scope}」有空段：顿号之间必须是一个公司，不接受连续顿号或首尾顿号"
+        )
+    companies = tuple(dict.fromkeys(segments))
+    if len(companies) > 1 and any(_is_all_companies_scope(item) for item in companies):
+        raise RosterError(
+            f"公司范围「{company_scope}」把「全部」与具体公司混写：两种范围含义不同，"
+            "不猜以哪一个为准"
+        )
+    return companies
+
+
+def _merge_expansions(
+    expansions: Sequence[PositionPermissionExpansion],
+) -> PositionPermissionExpansion:
+    """把同一个人、同一职位下的多个单公司展开并成一个。
+
+    ``company_scope`` 保留去重后的顿号原文：它会逐行落到
+    ``local_permission_override.company_scope``，是事后回答「这笔授权当初照名单哪一行
+    发出去的」的唯一依据，也是管理卡上那一个授权项显示的范围。
+    """
+
+    first = expansions[0]
+    return PositionPermissionExpansion(
+        position_name=first.position_name,
+        function=first.function,
+        company_scope=COMPANY_SCOPE_SEPARATOR.join(item.company_scope for item in expansions),
+        companies=tuple(
+            dict.fromkeys(company for item in expansions for company in item.companies)
+        ),
+        pairs=tuple(dict.fromkeys(pair for item in expansions for pair in item.pairs)),
+    )
+
+
+def build_row_plan(
+    row: RosterRow,
+    *,
+    role_function_map: Mapping[str, str],
+    company_function_metric_map: Mapping[str, Mapping[str, Sequence[str]]],
+) -> PositionGrantPlan:
+    """把一行名单（可能写了多个公司）冻结成**一笔**预授权计划。
+
+    多公司在这里逐个走展开函数再合并，而**不是**把顿号教给展开函数：那个纯函数同时
+    服务管理卡表单那条路径，而管理卡一次就是一个公司或「全部」——把多公司语义放进去
+    等于顺手给管理卡也加了一种没人裁定过的输入形态。
+
+    合并成一笔而不是一人多笔：一笔的全部行共享同一个组 ID，管理卡因此渲染成一个可整组
+    撤销的项；拆成多笔既撤不干净，也躲不过「第二笔到达时此人已 active、按甲案不应用」。
+    """
+
+    available_companies = tuple(
+        key for key in company_function_metric_map if key != ALL_COMPANIES_SCOPE
+    )
+    expansions = tuple(
+        expand_position_scope(
+            position_name=row.position_name,
+            company_scope=company,
+            role_function_map=role_function_map,
+            company_function_metric_map=company_function_metric_map,
+            available_companies=available_companies,
+        )
+        for company in split_company_scope(row.company_scope)
+    )
+    if len(expansions) == 1:
+        return build_preprovision_grant_plan(expansions[0])
+    return build_preprovision_grant_plan(_merge_expansions(expansions))
+
+
 def plan_preprovision(
     rows: Iterable[RosterRow],
     *,
@@ -287,6 +389,8 @@ def plan_preprovision(
     展开复用管理卡那条路径的同一个纯函数
     (:func:`~lingxi.core.permission.position_override.expand_position_scope`)，
     不另写一套——职位与公司范围在本仓库只有一个判据，多一份拷贝就多一处会漂移的口径。
+    一人多公司由 :func:`build_row_plan` 在名单层拆成多次调用再合并，那个纯函数本身
+    仍然只认单个公司或「全部」。
 
     为什么是整份拒绝而不是逐人跳过：这一步发生在任何写入之前，失败的原因全部是「名单
     这一行写错了」。放行其余行等于让一份已知有错的名单产生部分结果，而产品负责人手上
@@ -297,14 +401,11 @@ def plan_preprovision(
     items: list[PreprovisionItem] = []
     for row in rows:
         try:
-            expansion = expand_position_scope(
-                position_name=row.position_name,
-                company_scope=row.company_scope,
+            plan = build_row_plan(
+                row,
                 role_function_map=role_function_map,
                 company_function_metric_map=company_function_metric_map,
-                available_companies=tuple(key for key in company_function_metric_map if key != "*"),
             )
-            plan = build_preprovision_grant_plan(expansion)
         except (ValueError, TypeError, KeyError) as error:
             raise RosterError(
                 f"{row.email} 的职位/公司范围无法展开（职位={row.position_name}"
