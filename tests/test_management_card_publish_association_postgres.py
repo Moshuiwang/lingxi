@@ -329,6 +329,84 @@ class HistoryPublishCannotReportNewActionTests(ManagementCardReuseAssociationTes
         self.assertEqual(self.card_state(), ("effective", "effective"))
 
 
+class PublishAssociationPortTests(ManagementCardReuseAssociationTestCase):
+    """关联规则的端口级断言：观察器读到的必须是本次操作自己的发布状态。"""
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.action_a = self.seed_executed_action(
+            created_at=self.now - timedelta(minutes=31),
+            decided_at=self.now - timedelta(minutes=30),
+        )
+        self.seed_outbox(
+            permission_version=1,
+            created_at=self.now - timedelta(minutes=29),
+            published_at=self.now - timedelta(minutes=28),
+        )
+        self.action_b = self.seed_executed_action(
+            created_at=self.now - timedelta(minutes=2),
+            decided_at=self.now - timedelta(minutes=1),
+        )
+
+    def test_action_b_reads_none_while_only_action_a_has_published(self) -> None:
+        self.assertIsNone(
+            self.store.latest_publish_state_for_action(
+                message_id=MESSAGE_ID, pending_action_id=self.action_b
+            )
+        )
+
+    def test_action_b_reads_its_own_pending_and_then_published_row(self) -> None:
+        outbox_id = self.seed_outbox(
+            permission_version=2, created_at=self.now, status="pending", published_at=None
+        )
+        self.assertEqual(
+            self.store.latest_publish_state_for_action(
+                message_id=MESSAGE_ID, pending_action_id=self.action_b
+            ),
+            "pending",
+        )
+
+        self.execute(
+            "UPDATE publish_outbox SET status = 'published', published_at = now() WHERE id = %s",
+            (outbox_id,),
+        )
+        self.assertEqual(
+            self.store.latest_publish_state_for_action(
+                message_id=MESSAGE_ID, pending_action_id=self.action_b
+            ),
+            "published",
+        )
+
+    def test_action_id_from_another_card_is_never_answered(self) -> None:
+        self.assertIsNone(
+            self.store.latest_publish_state_for_action(
+                message_id="om_someone_else", pending_action_id=self.action_b
+            )
+        )
+        self.assertIsNone(
+            self.store.latest_publish_state_for_action(message_id=MESSAGE_ID, pending_action_id="")
+        )
+
+    def test_only_the_newest_action_counts_as_the_current_one(self) -> None:
+        self.assertTrue(
+            self.store.is_current_card_action(
+                message_id=MESSAGE_ID, pending_action_id=self.action_b
+            )
+        )
+        self.assertFalse(
+            self.store.is_current_card_action(
+                message_id=MESSAGE_ID, pending_action_id=self.action_a
+            )
+        )
+
+    def test_a_card_without_any_action_cannot_prove_supersession(self) -> None:
+        self.assertTrue(
+            self.store.is_current_card_action(
+                message_id="om_without_actions", pending_action_id=self.action_a
+            )
+        )
+
+
 class ExistingSettlementRulesStillHoldTests(ManagementCardReuseAssociationTestCase):
     """既有规则的回归：无变化、每日批恢复、重复回调、重启恢复窗口都不受关联收紧影响。"""
 

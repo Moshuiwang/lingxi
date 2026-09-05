@@ -254,7 +254,8 @@ class RecomputeResultReporter:
         """把一次后台结果落成卡片的持久状态并更新视觉；失败只记审计。
 
         取消后即使重算线程晚到，也不能把已经关闭的管理卡重新打开：关闭是持久状态，
-        后台结果只允许推进仍然可见的卡片。
+        后台结果只允许推进仍然可见的卡片。同一张卡收口后还能继续操作，因此迟到的
+        旧回调也只能推进它自己那一次操作对应的卡片状态。
         """
         origin_message_id = getattr(pending, "origin_card_message_id", None)
         if not origin_message_id:
@@ -262,6 +263,8 @@ class RecomputeResultReporter:
         try:
             context = self._context_store.lookup_context(message_id=origin_message_id)
             if context is None or context.state == "closed":
+                return
+            if not self._is_current_action(pending, origin_message_id):
                 return
             status = self._status_lookup(context.identifier)
             if status is None:
@@ -286,6 +289,25 @@ class RecomputeResultReporter:
                 error=type(error).__name__,
                 pending_action_id=getattr(pending, "id", ""),
             )
+
+    def _is_current_action(self, pending: Any, origin_message_id: str) -> bool:
+        """这次回调是否仍属于该卡当前的操作；不是就整条回写路径放弃。
+
+        管理卡在一次操作收口后可以被复用，上一次操作的迟到结果既不能把新操作说成
+        已生效，也不能把它降级成未完成——新操作自己的观察与每日批会收口。端口没有
+        这个能力时（旧测试替身）按"无法证明已被取代"处理。
+        """
+        is_current = getattr(self._context_store, "is_current_card_action", None)
+        pending_action_id = getattr(pending, "id", "")
+        if not callable(is_current) or not pending_action_id:
+            return True
+        if is_current(message_id=origin_message_id, pending_action_id=pending_action_id) is False:
+            self._audit.record(
+                "admin.card_callback.management_card_superseded",
+                pending_action_id=pending_action_id,
+            )
+            return False
+        return True
 
     @staticmethod
     def _status_texts(
@@ -320,7 +342,7 @@ class RecomputeResultReporter:
         """轮询发布状态；超时按「未完成」收口，交给每日批纠正。"""
         deadline = time.monotonic() + MANAGEMENT_PUBLISH_OBSERVE_SECONDS
         while time.monotonic() < deadline:
-            publish_state = self._read_publish_state(origin_message_id)
+            publish_state = self._read_publish_state(pending, origin_message_id)
             if publish_state == "published":
                 self._refresh(pending, complete=True)
                 return
@@ -330,11 +352,12 @@ class RecomputeResultReporter:
             threading.Event().wait(MANAGEMENT_PUBLISH_POLL_SECONDS)
         self._refresh(pending, complete=False)
 
-    def _read_publish_state(self, origin_message_id: str) -> str | None:
-        """读一次发布状态；瞬时读失败只记审计，由下一轮重试。"""
+    def _read_publish_state(self, pending: Any, origin_message_id: str) -> str | None:
+        """读一次**本次操作**的发布状态；瞬时读失败只记审计，由下一轮重试。"""
         try:
-            return self._context_store.latest_publish_state_for_message(
-                message_id=origin_message_id
+            return self._context_store.latest_publish_state_for_action(
+                message_id=origin_message_id,
+                pending_action_id=getattr(pending, "id", ""),
             )
         except Exception as error:
             self._audit.record(
