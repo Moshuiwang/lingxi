@@ -35,9 +35,10 @@ ON CONFLICT (dedupe_key)` 命中已经 `delivered` 的行时**一行不写、一
 同为不按九十天删除的当前状态）、内容键与版本、样式、结果与错误码。用户触发删除仍然
 成立：`user_id` 上的 `ON DELETE CASCADE` 让账号删除编排一并带走属于他的记录。
 
-`content_version` 兼作审计需要的 `content_digest`：`content.lock.toml` 已经把版本号与
-整份内容目录的 sha256 绑定（`check_content_version.py` 判红），另算一份哈希只会多一处
-会漂移的事实。
+`content_version` 是**发布版本号**，不是内容摘要：宿主机外置文案覆盖文件不改版本号、
+只换正文，因此审计里的 `content_digest` 由发送编排另外给（镜像内 + 覆盖文件合成的
+sha256 前 12 位），这张表不为它加列——记录回答的是"发的是哪一版内容键"，"那一刻进程
+在用哪一份字"属于运行审计。
 
 ## 不授任何表权限
 
@@ -103,6 +104,9 @@ CREATE INDEX outreach_message_user_idx ON outreach_message (user_id)
 
 -- created_at / dedupe_key / purpose 一经写入不可改：它们是幂等键与"这一条是不是正式
 -- 送达"的锚点，改写任一项都等于伪造历史。与 0066 的同型触发器一个理由。
+-- 已送达之后，送达时间、平台回读标识与收件人同样冻结：这三项合起来就是"这张卡什么
+-- 时候、以哪条平台消息、发给了谁"这件不可撤回的事实，改写它们等于把双通道核对的
+-- 依据抹掉。终态之后允许改的只剩 attempts 与 last_error 这类过程列。
 CREATE OR REPLACE FUNCTION outreach_message_freeze_anchors() RETURNS TRIGGER
 LANGUAGE plpgsql
 AS $$
@@ -116,8 +120,19 @@ BEGIN
     IF NEW.purpose IS DISTINCT FROM OLD.purpose THEN
         RAISE EXCEPTION '不允许把预检记录改写成正式送达';
     END IF;
-    IF OLD.status = 'delivered' AND NEW.status <> 'delivered' THEN
-        RAISE EXCEPTION '已送达的发送记录不允许退回其它状态';
+    IF OLD.status = 'delivered' THEN
+        IF NEW.status <> 'delivered' THEN
+            RAISE EXCEPTION '已送达的发送记录不允许退回其它状态';
+        END IF;
+        IF NEW.delivered_at IS DISTINCT FROM OLD.delivered_at THEN
+            RAISE EXCEPTION '已送达的发送记录不允许改写送达时间';
+        END IF;
+        IF NEW.message_id IS DISTINCT FROM OLD.message_id THEN
+            RAISE EXCEPTION '已送达的发送记录不允许改写平台回读标识';
+        END IF;
+        IF NEW.recipient_open_id IS DISTINCT FROM OLD.recipient_open_id THEN
+            RAISE EXCEPTION '已送达的发送记录不允许改写收件人';
+        END IF;
     END IF;
     RETURN NEW;
 END;

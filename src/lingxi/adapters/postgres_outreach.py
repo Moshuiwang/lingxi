@@ -26,8 +26,10 @@ from lingxi.core.outreach.dispatch import ReservedRecord
 
 logger = logging.getLogger(__name__)
 
-#: 认领一条记录：新行直接算第一次尝试；已存在且**未送达**的行递增尝试次数并回到
-#: ``pending``（这是重试）；已送达的行落进 ``WHERE`` 之外，什么都不返回。
+#: 认领一条记录：新行直接算第一次尝试；已存在且**未送达、且收件人没变**的行递增
+#: 尝试次数、回到 ``pending``，并把内容版本与样式刷成这一次真正要发的那一版（重试
+#: 发的是现在这份内容，记录却留着上一次的版本，回查就成了假账）。已送达的行、以及
+#: 记着另一个收件人的行都落进 ``WHERE`` 之外，一行不改、什么都不返回。
 _RESERVE_SQL = """
 INSERT INTO outreach_message
      (id, recipient_open_id, user_id, purpose, content_key, content_version,
@@ -36,12 +38,20 @@ VALUES (%(id)s, %(open_id)s, %(user)s, %(purpose)s, %(content_key)s,
         %(content_version)s, %(card_style)s, %(dedupe)s, 1)
 ON CONFLICT (dedupe_key) DO UPDATE
    SET attempts = outreach_message.attempts + 1,
-       status = 'pending'
+       status = 'pending',
+       content_version = EXCLUDED.content_version,
+       card_style = EXCLUDED.card_style
  WHERE outreach_message.status <> 'delivered'
-RETURNING id, status, attempts
+   AND outreach_message.recipient_open_id = EXCLUDED.recipient_open_id
+RETURNING id, status, attempts, recipient_open_id
 """
 
-_EXISTING_SQL = "SELECT id, status, attempts FROM outreach_message WHERE dedupe_key = %s"
+_EXISTING_SQL = (
+    "SELECT id, status, attempts, recipient_open_id FROM outreach_message WHERE dedupe_key = %s"
+)
+
+#: 真发之前重读一次状态：装配与发送之间这个人可能已被停用。只取两列，不重跑定位链。
+_STATE_AT_SEND_SQL = "SELECT provisioning_state, account_state FROM app_user WHERE id = %s"
 
 _DELIVERED_KEYS_SQL = (
     "SELECT dedupe_key FROM outreach_message WHERE dedupe_key = ANY(%s) AND status = 'delivered'"
@@ -116,7 +126,8 @@ class PostgresOutreachStore:
 
         已经 ``delivered`` 的键**一行都不改**（``ON CONFLICT DO UPDATE`` 带 ``WHERE``
         守卫），因此同一份名单重跑既不新增记录也不再发一次；返回的状态让调用方
-        直接跳过。
+        直接跳过。记着另一个收件人的键同样一行不改，返回记录里那个 open_id，由调用方
+        拒发。
         """
         parameters = {
             "id": new_id("omr"),
@@ -138,18 +149,30 @@ class PostgresOutreachStore:
         if row is None:  # 既没插进去也查不到：不当成"可以发"，让调用方看见异常
             raise LookupError("发送记录认领失败：既未新建也未查到既有记录")
         return ReservedRecord(
-            record_id=str(row[0]), dedupe_key=dedupe_key, status=str(row[1]), attempts=int(row[2])
+            record_id=str(row[0]),
+            dedupe_key=dedupe_key,
+            status=str(row[1]),
+            attempts=int(row[2]),
+            recipient_open_id=str(row[3]),
         )
 
-    def mark_delivered(self, record_id: str, *, message_id: str | None) -> None:
-        """记成已送达（终态），并留下平台回读标识供双通道核对。"""
-        self._execute(
+    def mark_delivered(self, record_id: str, *, message_id: str | None) -> bool:
+        """记成已送达（终态），并留下平台回读标识供双通道核对。
+
+        带 ``status <> 'delivered'`` 守卫并核对影响行数：一条已经是终态（或已被账号
+        删除带走）的记录不再改写，返回 ``False`` 让调用方留一条审计。**不抛**——卡片
+        此时已经发出去了，把"记账没改到行"抛成异常会让它被读成一次投递失败。
+        """
+        updated = self._execute(
             "UPDATE outreach_message"
             "   SET status = 'delivered', delivered_at = now(), message_id = %s,"
             "       last_error = NULL"
-            " WHERE id = %s",
+            " WHERE id = %s AND status <> 'delivered'",
             (message_id, record_id),
         )
+        if not updated:
+            logger.error("发送记录已是终态或已不存在，未改写 记录=%s", record_id)
+        return updated
 
     def mark_failed(self, record_id: str, *, error: str) -> None:
         """记一次失败与错误码；这一条仍可重试（下一次 ``reserve`` 会递增尝试次数）。
@@ -187,12 +210,14 @@ class PostgresOutreachStore:
             rows = cursor.fetchall()
         return tuple(_row_to_view(row) for row in rows)
 
-    def _execute(self, sql: str, parameters: tuple[Any, ...]) -> None:
+    def _execute(self, sql: str, parameters: tuple[Any, ...]) -> bool:
+        """执行一条写，返回是否真的改到了行。"""
         with (
             connect(self._dsn, timeouts=self._timeouts) as connection,
             connection.cursor() as cursor,
         ):
             cursor.execute(sql, parameters)
+            return cursor.rowcount > 0
 
 
 def _row_to_view(row: Any) -> OutreachRecordView:
@@ -249,6 +274,25 @@ class PostgresOutreachSubjects:
             permissions=str(user_row[4]) if user_row[4] else None,
             roster_names=names,
         )
+
+    def state_for(self, user_id: str) -> tuple[str | None, str | None]:
+        """真发之前重读这个人的开通与账号状态（一次短查询）。
+
+        与 :meth:`facts_for` 分开：那一条是"这个人该不该在名单里"的定位链，这一条只
+        回答"就在按下发送的这一刻，他还是不是 active"。查不到人时返回两个 ``None``，
+        由调用方按不可发送处理。
+        """
+        if not (user_id or "").strip():
+            raise ValueError("用户标识不能为空")
+        with (
+            connect(self._dsn, timeouts=self._timeouts) as connection,
+            connection.cursor() as cursor,
+        ):
+            cursor.execute(_STATE_AT_SEND_SQL, (user_id,))
+            row = cursor.fetchone()
+        if row is None:
+            return None, None
+        return (str(row[0]) if row[0] else None, str(row[1]) if row[1] else None)
 
 
 __all__ = [

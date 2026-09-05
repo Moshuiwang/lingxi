@@ -31,6 +31,7 @@ SKIP_NO_PERMISSIONS = "no_published_permissions"
 SKIP_UNREADABLE_PERMISSIONS = "permissions_unreadable"
 SKIP_NO_METRICS = "no_metrics"
 SKIP_AMBIGUOUS_NAME = "roster_name_ambiguous"
+SKIP_COMPANY_NAME_MISSING = "company_name_missing"
 
 
 @dataclass(frozen=True)
@@ -100,7 +101,7 @@ def plan_outreach(
 ) -> AudiencePlan:
     """把一个人的库内事实装配成欢迎卡取值，或给出不发的原因。
 
-    ``company_names`` 是编号→中文名（查不到的编号不必出现，展示时退回编号）；
+    ``company_names`` 是编号→中文名（查不到中文名的人整条跳过，见 :func:`_build_plan`）；
     ``total_company_count`` 是当前可用公司总数，只在通配范围下用来把「全部公司」
     说成一个数字。
     """
@@ -152,7 +153,14 @@ def _build_plan(
 
     :class:`WelcomeAudience` 自己会对说不清楚的范围失败关闭；这里把那个异常翻成
     一条跳过原因，不让一个人的资料缺失打断整批。
+
+    公司编号查不到中文名的人**整条跳过**，不回落显示编号：编号是内部标识，把它印在
+    一张欢迎卡上既不是这个人看得懂的东西，也说不清楚他的范围到底是什么。判据覆盖他
+    范围里的每一个公司，包括会被折叠成计数的那些——连范围都说不全时不发。
     """
+    missing = tuple(key for key in company_ids if not company_names.get(key))
+    if missing:
+        return _skip(facts, SKIP_COMPANY_NAME_MISSING, active=True)
     try:
         audience = WelcomeAudience(
             display_name=display_name,
@@ -178,6 +186,7 @@ __all__ = [
     "ACTIVE_PROVISIONING_STATE",
     "ENABLED_ACCOUNT_STATE",
     "SKIP_AMBIGUOUS_NAME",
+    "SKIP_COMPANY_NAME_MISSING",
     "SKIP_NOT_ACTIVE",
     "SKIP_NOT_FOUND",
     "SKIP_NO_METRICS",

@@ -15,6 +15,7 @@ import unittest
 from lingxi.config.content import default_content_catalog
 from lingxi.core.outreach.audience import (
     SKIP_AMBIGUOUS_NAME,
+    SKIP_COMPANY_NAME_MISSING,
     SKIP_NO_METRICS,
     SKIP_NO_OPEN_ID,
     SKIP_NO_PERMISSIONS,
@@ -45,9 +46,12 @@ def _facts(**overrides) -> SubjectFacts:
     return SubjectFacts(**base)
 
 
-def _plan(facts: SubjectFacts):
+def _plan(facts: SubjectFacts, *, company_names: dict[str, str] | None = None):
     return plan_outreach(
-        facts, company_names={"1011": "尼日利亚"}, total_company_count=43, catalog=CATALOG
+        facts,
+        company_names={"1011": "尼日利亚"} if company_names is None else company_names,
+        total_company_count=43,
+        catalog=CATALOG,
     )
 
 
@@ -125,6 +129,40 @@ class NotSendableTest(unittest.TestCase):
         }
         for reason in reasons:
             self.assertNotIn("王晋", str(reason))
+
+
+class CompanyNameMissingTest(unittest.TestCase):
+    """公司中文名查不到的人整条跳过，不回落显示编号。"""
+
+    def test_a_company_without_a_chinese_name_skips_the_person(self) -> None:
+        """否定断言：编号是内部标识，不能印在一张给用户看的欢迎卡上。"""
+        plan = _plan(_facts(), company_names={})
+        self.assertFalse(plan.sendable)
+        self.assertEqual(plan.skip_reason, SKIP_COMPANY_NAME_MISSING)
+        self.assertTrue(plan.active)
+
+    def test_one_missing_name_among_several_still_skips(self) -> None:
+        facts = _facts(permissions='{"1011": ["充值金额"], "9999": ["充值金额"]}')
+        plan = _plan(facts, company_names={"1011": "尼日利亚"})
+        self.assertEqual(plan.skip_reason, SKIP_COMPANY_NAME_MISSING)
+
+    def test_a_folded_long_list_is_judged_by_the_same_rule(self) -> None:
+        """连范围都说不全的人不发，即使那张卡只会显示"N 家公司"。"""
+        ids = [str(1010 + index) for index in range(6)]
+        permissions = "{" + ", ".join(f'"{key}": ["充值金额"]' for key in ids) + "}"
+        names = {key: f"公司{key}" for key in ids[:-1]}
+        self.assertEqual(
+            _plan(_facts(permissions=permissions), company_names=names).skip_reason,
+            SKIP_COMPANY_NAME_MISSING,
+        )
+
+    def test_the_wildcard_scope_never_needs_a_company_name(self) -> None:
+        plan = _plan(_facts(permissions='{"*": ["充值金额"]}'), company_names={})
+        self.assertTrue(plan.sendable)
+
+    def test_the_skip_reason_carries_no_company_number(self) -> None:
+        plan = _plan(_facts(), company_names={})
+        self.assertNotIn("1011", str(plan.skip_reason))
 
 
 if __name__ == "__main__":

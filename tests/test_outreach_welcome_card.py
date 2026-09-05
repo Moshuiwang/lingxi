@@ -66,7 +66,9 @@ class ExampleScopeRuleTest(unittest.TestCase):
         self.assertIn("最近七天尼日利亚的充值金额是多少", sections[3])
 
     def test_several_companies_use_the_shared_word_instead_of_a_company_name(self) -> None:
-        audience = _audience(company_ids=("1011", "1012"), company_names={"1011": "尼日利亚"})
+        audience = _audience(
+            company_ids=("1011", "1012"), company_names={"1011": "尼日利亚", "1012": "肯尼亚"}
+        )
         self.assertEqual(example_company_word(audience, catalog=CATALOG), "各公司")
         self.assertIn(
             "最近七天各公司的充值金额是多少", welcome_sections(audience, catalog=CATALOG)[3]
@@ -76,10 +78,15 @@ class ExampleScopeRuleTest(unittest.TestCase):
         audience = _audience(company_ids=(), all_companies=True)
         self.assertEqual(example_company_word(audience, catalog=CATALOG), "各公司")
 
-    def test_an_unknown_company_id_falls_back_to_the_id_itself(self) -> None:
-        """查不到中文名就原样显示编号，不渲染成一个空白公司名。"""
+    def test_an_unknown_company_id_is_refused_instead_of_showing_the_number(self) -> None:
+        """否定断言：查不到中文名不回落编号。
+
+        编号是内部标识；把「9999」印在一张给用户看的卡上既看不懂，也说不清范围。
+        装配层（``core/outreach/audience``）据此把这个人整条跳过。
+        """
         audience = _audience(company_ids=("9999",), company_names={})
-        self.assertEqual(example_company_word(audience, catalog=CATALOG), "9999")
+        with self.assertRaises(ValueError):
+            example_company_word(audience, catalog=CATALOG)
 
     def test_the_second_example_uses_the_second_metric(self) -> None:
         sections = welcome_sections(_audience(), catalog=CATALOG)
@@ -100,8 +107,11 @@ class LongListRuleTest(unittest.TestCase):
 
     def test_five_companies_are_still_listed_one_by_one(self) -> None:
         ids = ("1011", "1012", "1013", "1014", "1015")
-        audience = _audience(company_ids=ids, company_names={})
-        self.assertEqual(company_scope_text(audience, catalog=CATALOG), "、".join(ids))
+        names = {key: f"公司{key}" for key in ids}
+        audience = _audience(company_ids=ids, company_names=names)
+        self.assertEqual(
+            company_scope_text(audience, catalog=CATALOG), "、".join(names[key] for key in ids)
+        )
 
     def test_six_companies_fold_into_a_count(self) -> None:
         ids = ("1011", "1012", "1013", "1014", "1015", "1016")

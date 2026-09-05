@@ -68,8 +68,8 @@ class WelcomeAudience:
     """一个人的取值输入：姓名取花名册原文，范围取**合成后**权限。
 
     ``company_ids``/``all_companies`` 与 ``metric_names`` 都来自同一份已经发布出去
-    的权限文档，不在这里另算一遍；``company_names`` 是编号→中文名，查不到的编号
-    原样展示编号，不渲染成空白。
+    的权限文档，不在这里另算一遍；``company_names`` 是编号→中文名，查不到就失败
+    关闭（见 :meth:`company_label`），装配层据此把这个人整条跳过。
     """
 
     display_name: str
@@ -99,8 +99,16 @@ class WelcomeAudience:
         return self.company_label(self.company_ids[0])
 
     def company_label(self, company_id: str) -> str:
-        """中文名优先，查不到就原样展示编号。"""
-        return self.company_names.get(company_id) or company_id
+        """公司的中文名；查不到**不回落编号**，直接失败关闭。
+
+        编号是内部标识：把「15」印在一张给用户看的欢迎卡上，既不是他看得懂的东西，
+        也说不清他的范围。装配层（``core/outreach/audience``）会先判掉这种人并给出
+        ``company_name_missing``，这里是同一条规则的最后一道。
+        """
+        name = self.company_names.get(company_id)
+        if not name:
+            raise ValueError("公司中文名查不到：不回落编号，这个人不发欢迎卡")
+        return name
 
 
 @dataclass(frozen=True)

@@ -44,9 +44,10 @@
 ## 输入：名单 CSV，至少一列 `email`
 
 沿用 `preprovision.py` 的名单文件即可（多出来的 `position`/`company_scope` 列被忽略）。
-**整份拒绝（退出码 2、零发送）的三种情形**——它们全是「名单本身写错了」：表头没有
-`email` 列；某行的邮箱为空白；同一邮箱出现两行（归一后比对，导出/编辑本身有歧义，
-不猜哪一行为准）。
+**整份拒绝（退出码 2、零发送）的五种情形**——它们全是「名单本身写错了」：表头没有
+`email` 列；表头归一后有重复列（`email,email` 这种写法里"哪一列才是邮箱"没有答案）；
+某一行的字段数与表头列数不等（对不上就不知道哪一格是邮箱）；某行的邮箱为空白；同一
+邮箱出现两行（归一后比对，导出/编辑本身有歧义，不猜哪一行为准）。
 
 ## 四档运行
 
@@ -65,7 +66,10 @@
 新增列**——它是"这一次运行是谁按下的"，属于运行审计，不是那条消息本身的属性。
 dry-run 与 `--list` 不要求它：这两档不发送任何东西。
 
-退出码：`0` 跑完（逐人结果看清单），`2` 什么都没做（名单、配置或收件人闸门不合格）。
+退出码：`0` 跑完（逐人结果看清单），`2` **什么都没做**（名单、参数、配置或收件人闸门
+不合格），`3` **发出去了但收尾没做干净**（卡片飞书已经收下却没能记成已送达，或者这一批
+攒下的告警没投递出去）。`3` 与 `2` 必须分开：把"已经发出去了"报成"什么都没做"会让人
+原样重跑，而对已经收到卡片的人重跑不是无害的。
 """
 
 from __future__ import annotations
@@ -79,10 +83,17 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from lingxi.core.outreach.audience import AudiencePlan, SubjectFacts, plan_outreach
+from lingxi.core.outreach.audience import (
+    ACTIVE_PROVISIONING_STATE,
+    ENABLED_ACCOUNT_STATE,
+    AudiencePlan,
+    SubjectFacts,
+    plan_outreach,
+)
 from lingxi.core.outreach.dispatch import (
     OutreachOutcome,
     OutreachPurpose,
+    OutreachRecordingError,
     OutreachTarget,
     outreach_dedupe_key,
 )
@@ -95,6 +106,14 @@ EMAIL_COLUMN = "email"
 
 #: `--to admin` 的字面量：从登记表里取那位管理员，不写死任何 open_id。
 TO_ADMIN = "admin"
+
+#: 发送前重读状态没通过的跳过原因。与装配阶段的 `not_active` 分开登记：装配时还是
+#: active、真要发的时候不是了，这是两件不同的事，清单上必须能分辨。
+SKIP_NOT_ACTIVE_AT_SEND = "not_active_at_send"
+
+#: 卡片已经送达飞书、却没能记成已送达时的逐人状态。它**不是** failed：算成失败会让
+#: 人原样重跑，而这个人已经收到卡片了。
+STATUS_DELIVERED_NOT_RECORDED = "delivered_not_recorded"
 
 
 class RosterError(ValueError):
@@ -124,40 +143,76 @@ class PersonResult:
 
 
 def load_recipients(path: Path) -> tuple[str, ...]:
-    """读名单 CSV，返回归一后的邮箱。表头缺列、空白邮箱、重复邮箱一律整份拒绝。
+    """读名单 CSV，返回归一后的邮箱。表头、字段数或邮箱有一项说不清楚就整份拒绝。
+
+    用 ``csv.reader`` 而不是 ``DictReader``：后者把重复表头折成一个键（后一列静默
+    覆盖前一列），又把多出来的字段塞进一个 ``None`` 键，两种形态都让"这一格是不是
+    邮箱"变成猜测。逐行字段数与表头列数严格相等，是"按列取值"能成立的前提。
+    """
+    with path.open("r", encoding="utf-8-sig", newline="") as stream:
+        rows = list(csv.reader(stream))
+    if not rows:
+        raise RosterError("名单为空：连表头都没有")
+    header = rows[0]
+    return _normalized_emails(header, rows[1:], _email_column_index(header))
+
+
+def _email_column_index(header: Sequence[str]) -> int:
+    """定位 ``email`` 列；归一后重复的表头整份拒绝。
+
+    归一取「去首尾空白 + casefold」：``Email`` 与 ``email `` 是同一列。两列同名时
+    "哪一列为准"没有答案，按后一列取值会把收件人静默换成另一个人。
+    """
+    columns = [(name or "").strip().casefold() for name in header]
+    duplicates = sorted({name for name in columns if columns.count(name) > 1})
+    if duplicates:
+        shown = "、".join(name or "(空列名)" for name in duplicates)
+        raise RosterError(f"名单表头归一后有重复列：{shown}；不猜哪一列为准，整份拒绝")
+    if EMAIL_COLUMN not in columns:
+        raise RosterError(f"名单表头必须包含 {EMAIL_COLUMN} 列，实际是 {','.join(columns)}")
+    return columns.index(EMAIL_COLUMN)
+
+
+def _normalized_emails(
+    header: Sequence[str], rows: Sequence[Sequence[str]], index: int
+) -> tuple[str, ...]:
+    """逐行取邮箱并归一；字段数、空白与重复任一不合格都整份拒绝。
 
     重复按**归一后的邮箱**判定：`Zhang.San@Example.com` 与 `zhang.san@example.com `
     是同一个人的两行，按原文比对会被放过，随后同一个人被发两次。
     """
-    with path.open("r", encoding="utf-8-sig", newline="") as stream:
-        reader = csv.DictReader(stream)
-        if reader.fieldnames is None:
-            raise RosterError("名单为空：连表头都没有")
-        columns = [(name or "").strip() for name in reader.fieldnames]
-        if EMAIL_COLUMN not in columns:
-            raise RosterError(f"名单表头必须包含 {EMAIL_COLUMN} 列，实际是 {','.join(columns)}")
-        index = columns.index(EMAIL_COLUMN)
-        emails: list[str] = []
-        seen: dict[str, int] = {}
-        for number, row in enumerate(reader, start=2):
-            raw = (row.get(reader.fieldnames[index]) or "").strip()
-            if not raw and not any((value or "").strip() for value in row.values()):
-                continue
-            if not raw:
-                raise RosterError(f"第 {number} 行的 {EMAIL_COLUMN} 是空白")
-            normalized = normalize_email(raw)
-            if not normalized:
-                raise RosterError(f"第 {number} 行的邮箱归一后为空")
-            if normalized in seen:
-                raise RosterError(
-                    f"第 {number} 行与第 {seen[normalized]} 行是同一个邮箱：名单本身有歧义，"
-                    "不猜哪一行为准，整份拒绝"
-                )
-            seen[normalized] = number
-            emails.append(normalized)
+    emails: list[str] = []
+    seen: dict[str, int] = {}
+    for number, row in enumerate(rows, start=2):
+        if not any((cell or "").strip() for cell in row):
+            continue
+        if len(row) != len(header):
+            raise RosterError(
+                f"第 {number} 行有 {len(row)} 个字段、表头是 {len(header)} 列："
+                "对不上时无法确定哪一格是邮箱，整份拒绝"
+            )
+        normalized = _normalized_email(row[index], number)
+        if normalized in seen:
+            raise RosterError(
+                f"第 {number} 行与第 {seen[normalized]} 行是同一个邮箱：名单本身有歧义，"
+                "不猜哪一行为准，整份拒绝"
+            )
+        seen[normalized] = number
+        emails.append(normalized)
     if not emails:
         raise RosterError("名单没有任何数据行")
     return tuple(emails)
+
+
+def _normalized_email(raw: str, number: int) -> str:
+    """一格邮箱的归一；空白与归一后为空都是名单错误，不是一个可以跳过的人。"""
+    value = (raw or "").strip()
+    if not value:
+        raise RosterError(f"第 {number} 行的 {EMAIL_COLUMN} 是空白")
+    normalized = normalize_email(value)
+    if not normalized:
+        raise RosterError(f"第 {number} 行的邮箱归一后为空")
+    return normalized
 
 
 def build_recipients(
@@ -195,8 +250,9 @@ def build_target(
     """把一个装配结果变成一次发送的收件人。
 
     **两档只差收件人与幂等键主体，取值（``audience``）逐字节相同**：预检发给管理员、
-    幂等键带上本次运行号（产品负责人要按样式反复预检，钉死成一次就把定稿路径堵上）；
-    正式发送发给本人、幂等键是 ``user_id``。
+    幂等键带上本次运行号**与被预检的那个人**（一次预检多行名单要发出多张卡，只按运行
+    号折叠会让第二个人起就被当成"此前已送达"、一张也发不出来）；正式发送发给本人、
+    幂等键是 ``user_id``。
     """
     assert recipient.plan.audience is not None  # 调用方已筛掉不可发送的人
     if purpose is OutreachPurpose.PRECHECK:
@@ -204,7 +260,7 @@ def build_target(
             raise ValueError("预检必须指明收件的管理员")
         return OutreachTarget(
             recipient_open_id=admin_open_id,
-            subject=f"{admin_open_id}:{run_id}",
+            subject=f"{admin_open_id}:{run_id}:{apply_subject(recipient.facts)}",
             audience=recipient.plan.audience,
         )
     return OutreachTarget(
@@ -257,11 +313,13 @@ def run_outreach(
     purpose: OutreachPurpose,
     admin_open_id: str | None,
     run_id: str,
+    state_at_send: Callable[[str], tuple[str | None, str | None]] | None = None,
 ) -> list[PersonResult]:
     """**唯一的发送点**：预检与正式发送共用这一条路径，只差 ``purpose`` 与收件人。
 
     逐人失败关闭：任何异常只让这一个人计入 ``failed_<异常类型名>``，其余人照常继续。
-    异常正文不记录（可能带邮箱、姓名）。
+    异常正文不记录（可能带邮箱、姓名）。给出 ``state_at_send`` 时，正式发送在每个人
+    真发之前重读一次他的状态。
     """
     results: list[PersonResult] = []
     for recipient in recipients:
@@ -271,15 +329,47 @@ def run_outreach(
             )
             continue
         try:
+            stale = _state_gate(recipient, purpose=purpose, state_at_send=state_at_send)
+            if stale is not None:
+                results.append(PersonResult(recipient.plan.email, "skipped", stale))
+                continue
             target = build_target(
                 recipient, purpose=purpose, admin_open_id=admin_open_id, run_id=run_id
             )
             outcome = dispatcher.deliver(target, purpose=purpose)
+        except OutreachRecordingError as error:
+            results.append(
+                PersonResult(recipient.plan.email, STATUS_DELIVERED_NOT_RECORDED, error.message_id)
+            )
+            continue
         except Exception as error:  # noqa: BLE001 - 逐人失败关闭，见方法文档
             results.append(PersonResult(recipient.plan.email, f"failed_{type(error).__name__}"))
             continue
         results.append(_classify(recipient.plan.email, outcome))
     return results
+
+
+def _state_gate(
+    recipient: Recipient,
+    *,
+    purpose: OutreachPurpose,
+    state_at_send: Callable[[str], tuple[str | None, str | None]] | None,
+) -> str | None:
+    """真发之前重读一次这个人的状态；返回跳过原因，``None`` 表示可以发。
+
+    读名单、装配取值与真正发出去之间隔着一段时间，人在这段时间里可能被停用——发出去
+    的卡片不可撤回，因此判据在发送那一刻再取一次。预检不做这道闸：收件人是管理员
+    本人。读不出来时上抛，由逐人失败关闭接住：分不清"已停用"与"读不到"时不发送。
+    """
+    if purpose is not OutreachPurpose.APPLY or state_at_send is None:
+        return None
+    user_id = recipient.facts.user_id
+    if not user_id:
+        return SKIP_NOT_ACTIVE_AT_SEND
+    provisioning, account = state_at_send(user_id)
+    if provisioning == ACTIVE_PROVISIONING_STATE and account == ENABLED_ACCOUNT_STATE:
+        return None
+    return SKIP_NOT_ACTIVE_AT_SEND
 
 
 def _classify(email: str, outcome: OutreachOutcome) -> PersonResult:
@@ -302,9 +392,10 @@ def print_results(results: Sequence[PersonResult], *, purpose: OutreachPurpose) 
     already = sum(1 for item in results if item.status == "already_delivered")
     failed = sum(1 for item in results if item.status.startswith("failed"))
     skipped = sum(1 for item in results if item.status == "skipped")
+    unrecorded = sum(1 for item in results if item.status == STATUS_DELIVERED_NOT_RECORDED)
     print(
         f"{label}完成：送达 {delivered}、此前已送达 {already}、失败 {failed}、"
-        f"跳过 {skipped}（共 {len(results)} 人）。"
+        f"跳过 {skipped}、已送达但未记账 {unrecorded}（共 {len(results)} 人）。"
     )
     if purpose is OutreachPurpose.PRECHECK:
         print("预检记录标记为 precheck，不算正式送达；正式发送仍需 --apply。")
@@ -384,6 +475,13 @@ def resolve_admin_registry_lookup(dsn: str) -> Any:
     return PostgresAdminRegistryLookup(dsn)
 
 
+def resolve_state_at_send(dsn: str) -> Callable[[str], tuple[str | None, str | None]]:
+    """真发前重读状态的查询口；单独成函数是给单测一个注入点。"""
+    from lingxi.adapters.postgres_outreach import PostgresOutreachSubjects
+
+    return PostgresOutreachSubjects(dsn).state_for
+
+
 def initiated_by_is_registered_admin(lookup: Any, open_id: str) -> bool:
     """``--initiated-by`` 必须是一位生效的已登记管理员。
 
@@ -422,16 +520,22 @@ def build_dispatcher(config: Any, dsn: str, *, initiated_by: str) -> Any:
     ``send_outcome_callback`` 进入告警状态机。**只 flush dispatcher、不调
     ``AlertingDuty.run_once()``**：那个方法还会检查心跳，而本脚本是 `docker exec`
     起的第二个进程，替常驻进程判定心跳只会制造假告警。
+
+    内容目录与它的摘要在这里一次读齐：审计里的 ``content_digest`` 必须是**真正拿去
+    渲染的那一份内容**的摘要，配了宿主机覆盖文件时它与 ``content_version`` 不再相等，
+    追溯"这个人到底收到的是哪一版字"只能看它。
     """
     from lingxi.adapters.feishu_user_card import FeishuUserCards
     from lingxi.adapters.postgres_outreach import PostgresOutreachStore
     from lingxi.apps.scheduler.alerting_assembly import build_alerting_duty
     from lingxi.apps.scheduler.audit import StructuredLogAuditSink
+    from lingxi.config.content_override import default_content_source
     from lingxi.core.outreach.dispatch import OutreachDispatcher
 
     audit = StructuredLogAuditSink()
     # 告警那一侧拿不带发起人的原始出口：告警是系统故障事实，不属于某一次人工发起。
     alerting = build_alerting_duty(config, audit=audit)
+    source = default_content_source()
     dispatcher = OutreachDispatcher(
         sender=FeishuUserCards(
             base_url=config.feishu_base_url,
@@ -441,6 +545,8 @@ def build_dispatcher(config: Any, dsn: str, *, initiated_by: str) -> Any:
         store=PostgresOutreachStore(dsn),
         audit=_AuditWithInitiator(audit, initiated_by=initiated_by),
         send_outcome=alerting.send_outcome_callback(),
+        catalog=source.catalog,
+        content_digest=source.digest,
     )
     return dispatcher, alerting
 
@@ -489,7 +595,9 @@ def _build_parser() -> argparse.ArgumentParser:
         help=f"预检收件人：{TO_ADMIN}（从登记表取唯一一位生效管理员）或显式 ou_…",
     )
     parser.add_argument("--list", action="store_true", help="回查发送记录，不发送任何东西")
-    parser.add_argument("--limit", type=int, default=200, help="--list 回查多少条（默认 200）")
+    parser.add_argument(
+        "--limit", type=_positive_limit, default=200, help="--list 回查多少条（默认 200）"
+    )
     parser.add_argument(
         "--company-function-metric-map",
         type=Path,
@@ -497,6 +605,21 @@ def _build_parser() -> argparse.ArgumentParser:
         help="覆盖随包发布的公司+职能→指标名映射文件",
     )
     return parser
+
+
+def _positive_limit(value: str) -> int:
+    """``--limit`` 只接受正整数。
+
+    ``0`` 与负数不是"回查零条"，是把参数写错了：让它退化成一次空清单，人会以为库里
+    真的没有记录。argparse 的类型校验直接把它收口成退出码 2 的参数错误。
+    """
+    try:
+        number = int(value)
+    except ValueError as error:
+        raise argparse.ArgumentTypeError("--limit 必须是正整数") from error
+    if number < 1:
+        raise argparse.ArgumentTypeError(f"--limit 必须是正整数，收到 {number}")
+    return number
 
 
 def _reject_conflicting_modes(arguments: argparse.Namespace) -> str | None:
@@ -523,7 +646,11 @@ def _reject_initiator(dsn: str, initiated_by: str) -> str | None:
     闸放在读名单之前、任何一次发送之前：一次连责任人都填不对的运行，它发出去的
     消息同样不该存在。登记表读不出来一律失败关闭——分辨不出"这个人不是管理员"与
     "库暂时读不到"时，放行的那一侧是不可撤回的。
+
+    入口自己再 ``strip`` 一次：一个纯空白的取值必须在**读库之前**被挡住，靠"连库连
+    不上顺带失败"是拿运气当闸。
     """
+    initiated_by = (initiated_by or "").strip()
     if not initiated_by:
         return "--initiated-by 不能为空白，未做任何操作。"
     try:
@@ -589,15 +716,53 @@ def _send(
         purpose=purpose,
         admin_open_id=admin_open_id,
         run_id=new_id("prk"),
+        state_at_send=resolve_state_at_send(dsn),
     )
     # 谁建谁清：把这一批攒下的告警真的投出去，再让本进程退出。
-    alerting.dispatcher.run_once()
+    alert_error = _flush_alerts(alerting)
     print_results(results, purpose=purpose)
     print(
         f"发起人（落进每条审计行的 initiated_by）：{initiated_by}。"
         "本清单不落库（仓库没有 audit_event 表），请自行保存；记录回查用 --list。"
     )
-    return 0
+    return _exit_code(results, alert_error=alert_error)
+
+
+def _flush_alerts(alerting: Any) -> str | None:
+    """把这一批攒下的告警真的投出去；返回失败的异常类型名，``None`` 表示投出去了。
+
+    告警投递失败**不改变"卡片已经发出去"这件事**，因此不能让它把整次运行退化成名单
+    错误那一档退出码——那会让人以为一条都没发、原样重跑。
+    """
+    try:
+        alerting.dispatcher.run_once()
+    except Exception as error:  # noqa: BLE001 - 告警投递失败不改变发送结论
+        return type(error).__name__
+    return None
+
+
+def _exit_code(results: Sequence[PersonResult], *, alert_error: str | None) -> int:
+    """收口退出码：``0`` 跑完，``3`` 发出去了但收尾没做干净。
+
+    两种收尾不干净都要指名道姓地说清下一步：已送达未记账的人按 ``message_id`` 人工
+    核对，告警没投出去要说明发送本身不受影响。
+    """
+    unrecorded = [item for item in results if item.status == STATUS_DELIVERED_NOT_RECORDED]
+    delivered = sum(1 for item in results if item.status == "delivered")
+    failed = sum(1 for item in results if item.status.startswith("failed"))
+    for item in unrecorded:
+        print(
+            f"{item.email} 的卡片飞书已经收下（message_id={item.detail or '-'}），"
+            "但记账失败：先 --list 核对再重跑，不要当成未发送。",
+            file=sys.stderr,
+        )
+    if alert_error is not None:
+        print(
+            f"已发送 {delivered} 条 / 失败 {failed} 条；仅告警投递失败：{alert_error}。"
+            "发送本身不受影响，不必重跑名单。",
+            file=sys.stderr,
+        )
+    return 3 if unrecorded or alert_error is not None else 0
 
 
 def main(argv: list[str] | None = None) -> int:

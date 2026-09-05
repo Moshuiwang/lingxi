@@ -172,6 +172,82 @@ class OutreachRecordPostgresTest(unittest.TestCase):
         self.store.mark_delivered(record.record_id, message_id="om_real")
         self.assertEqual(self.store.delivered_dedupe_keys([DEDUPE]), frozenset({DEDUPE}))
 
+    def test_a_retry_refreshes_the_content_version_and_style_on_the_same_row(self) -> None:
+        """重试发的是**现在**这一版内容；记录留着上一次的版本，回查就成了假账。"""
+        first = self.store.reserve(**_reserve_kwargs())
+        self.store.mark_failed(first.record_id, error="feishu_code_230013")
+        self.store.reserve(**_reserve_kwargs(content_version="2026-09-06", card_style="field_list"))
+        with connect(self.dsn) as connection, connection.cursor() as cursor:
+            cursor.execute(
+                "SELECT content_version, card_style FROM outreach_message WHERE dedupe_key = %s",
+                (DEDUPE,),
+            )
+            row = cursor.fetchone()
+        self.assertEqual((row[0], row[1]), ("2026-09-06", "field_list"))
+
+    def test_a_claim_for_another_recipient_changes_nothing_and_reports_the_old_one(self) -> None:
+        """否定断言：同一个去重键换了收件人时一行不改，由调用方拒发。"""
+        first = self.store.reserve(**_reserve_kwargs())
+        self.store.mark_failed(first.record_id, error="feishu_code_230013")
+
+        claimed = self.store.reserve(**_reserve_kwargs(recipient_open_id="ou_someone_else"))
+
+        self.assertEqual(claimed.record_id, first.record_id)
+        self.assertEqual(claimed.recipient_open_id, OPEN_ID)
+        self.assertEqual(self._row()[:2], (STATUS_FAILED, 1))
+        self.assertEqual(self._count(), 1)
+
+    def test_marking_delivered_twice_reports_no_op_the_second_time(self) -> None:
+        """已是终态的行不再改写；返回 ``False`` 让调用方留审计，而不是抛异常。"""
+        record = self.store.reserve(**_reserve_kwargs())
+        self.assertTrue(self.store.mark_delivered(record.record_id, message_id="om_real"))
+        self.assertFalse(self.store.mark_delivered(record.record_id, message_id="om_other"))
+        self.assertEqual(self._row()[2], "om_real")
+
+    def test_marking_an_absent_record_delivered_is_a_no_op(self) -> None:
+        self.assertFalse(self.store.mark_delivered("omr_not_there", message_id="om_real"))
+
+    def test_the_database_freezes_the_delivery_time_of_a_delivered_row(self) -> None:
+        """否定断言：送达时间是双通道核对的依据，事后改不得。"""
+        record = self.store.reserve(**_reserve_kwargs())
+        self.store.mark_delivered(record.record_id, message_id="om_real")
+        with self.assertRaises(Exception):
+            with connect(self.dsn) as connection, connection.cursor() as cursor:
+                cursor.execute(
+                    "UPDATE outreach_message SET delivered_at = now() + interval '1 day'"
+                    " WHERE dedupe_key = %s",
+                    (DEDUPE,),
+                )
+
+    def test_the_database_freezes_the_platform_id_of_a_delivered_row(self) -> None:
+        record = self.store.reserve(**_reserve_kwargs())
+        self.store.mark_delivered(record.record_id, message_id="om_real")
+        with self.assertRaises(Exception):
+            with connect(self.dsn) as connection, connection.cursor() as cursor:
+                cursor.execute(
+                    "UPDATE outreach_message SET message_id = 'om_forged' WHERE dedupe_key = %s",
+                    (DEDUPE,),
+                )
+
+    def test_the_database_freezes_the_recipient_of_a_delivered_row(self) -> None:
+        """否定断言：改掉收件人等于伪造"这张卡发给了谁"。"""
+        record = self.store.reserve(**_reserve_kwargs())
+        self.store.mark_delivered(record.record_id, message_id="om_real")
+        with self.assertRaises(Exception):
+            with connect(self.dsn) as connection, connection.cursor() as cursor:
+                cursor.execute(
+                    "UPDATE outreach_message SET recipient_open_id = 'ou_other'"
+                    " WHERE dedupe_key = %s",
+                    (DEDUPE,),
+                )
+
+    def test_a_pending_row_still_accepts_the_normal_bookkeeping(self) -> None:
+        """冻结只在终态之后生效：未送达的行照常记账，否则重试无从进行。"""
+        record = self.store.reserve(**_reserve_kwargs())
+        self.store.mark_failed(record.record_id, error="feishu_code_230013")
+        self.assertTrue(self.store.mark_delivered(record.record_id, message_id="om_real"))
+        self.assertEqual(self._row()[0], STATUS_DELIVERED)
+
     def test_the_lookback_returns_facts_without_any_body_text(self) -> None:
         """完成标准 6：回查能回答发给谁 / 内容键＋版本 / 何时 / 结果，正文不在其中。"""
         record = self.store.reserve(**_reserve_kwargs())
