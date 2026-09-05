@@ -42,6 +42,7 @@ from lingxi.apps.scheduler.config import (
     SchedulerConfig,
     _Secret,
 )
+from lingxi.apps.scheduler.content_override_notice import notify_content_override_rejection
 from lingxi.apps.scheduler.credential_rotation import (
     SAVE_RETRY_BACKOFF_SECONDS,
     CredentialRotationLoop,
@@ -173,7 +174,11 @@ def main(argv: list[str] | None = None) -> int:
         print(f"lingxi-scheduler 启动失败：{error}", file=sys.stderr)
         return 2
     try:
-        alerting_duty = build_alerting_duty(config, audit=StructuredLogAuditSink())
+        audit = StructuredLogAuditSink()
+        # 内容目录（含可选的宿主机外置覆盖）在装配前读一次并记一行来源事实；被拒
+        # 时这里发出唯一那条管理群告警，理由见 content_override_notice 模块文档。
+        notify_content_override_rejection(config, audit=audit)
+        alerting_duty = build_alerting_duty(config, audit=audit)
         loop = build_loop(
             config,
             alerting_duty=alerting_duty,

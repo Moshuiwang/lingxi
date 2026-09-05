@@ -30,6 +30,7 @@ from lingxi.adapters.postgres_content_capture import PostgresContentCaptureWrite
 from lingxi.adapters.postgres_conversation import PostgresTaskQueue, PostgresTaskQueueListener
 from lingxi.adapters.postgres_user_memory import PostgresUserMemoryReader
 from lingxi.apps.liveness import touch_liveness
+from lingxi.config.content_override import log_content_source
 from lingxi.core.execution.audit import redact_free_text
 from lingxi.core.ids import is_ulid, new_ulid
 
@@ -289,6 +290,20 @@ def _run_queue_mode(
     if dsn is None:
         return EXIT_CONFIG_ERROR
 
+    # 内容目录（含可选的宿主机外置覆盖）在领第一个任务之前读一次并记一行来源
+    # 事实；管理群告警只由 scheduler 发，理由见
+    # `apps/scheduler/content_override_notice.py`。
+    source = log_content_source("worker-queue")
+    _log(
+        err,
+        config.trace_id,
+        "info",
+        "worker.queue.content_catalog",
+        content_version=source.catalog.version,
+        content_digest=source.digest,
+        override_keys=len(source.override_keys),
+        rejected=source.rejection,
+    )
     _log(
         err,
         config.trace_id,

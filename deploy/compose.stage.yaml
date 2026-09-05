@@ -91,6 +91,16 @@ services:
           cpus: "${LINGXI_GATEWAY_CPU_LIMIT:-0.5}"
           memory: ${LINGXI_GATEWAY_MEM_LIMIT:-512M}
           pids: ${LINGXI_GATEWAY_PIDS_LIMIT:-256}
+    volumes:
+      # 运行时配置目录只读挂载（Issue #585）。补上它之前，gateway 是三个常驻进程里
+      # 唯一看不到宿主机 runtime-config 的那一个（曾登记为「已知边界」）：给两边配了
+      # LINGXI_COMPANY_FUNCTION_METRIC_MAP_PATH 会让 gateway「配了却读不到」、管理动作
+      # 全部失败关闭；用户可见文案外置同理，gateway 渲染的那些句子会与另外两个进程
+      # 不一致。插值变量沿用 scheduler 那一个（一台宿主机一个 runtime-config 目录，
+      # 三个服务共用同一份文件），挂目录不挂单文件的理由见 scheduler 与 worker-queue
+      # 的同名卷注释。只读：gateway 没有任何理由写它。未配置任何指向该目录的环境变量
+      # 时这条挂载没有副作用。
+      - ${LINGXI_SCHEDULER_RUNTIME_CONFIG_DIR:-/opt/lingxi/runtime-config}:/etc/lingxi/runtime:ro
 
   worker:
     env_file:
