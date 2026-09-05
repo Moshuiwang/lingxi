@@ -59,6 +59,12 @@
   `core/outreach/dispatch.outreach_dedupe_key`），重试沿用同一去重键。
 - `--list`：回查「发给谁 / 内容键＋版本 / 何时 / 结果」。**正文不打印，也不在库里**。
 
+**两条真发路径必须带 `--initiated-by <责任人 open_id>`**（判据同 `preprovision.py`：
+`admin_registry` 里一位生效的已登记管理员，缺失、非 active 或登记表读不出来一律
+退出码 2、零发送）。发起人落进每一条审计行的 `initiated_by`，**不进 `outreach_message`
+新增列**——它是"这一次运行是谁按下的"，属于运行审计，不是那条消息本身的属性。
+dry-run 与 `--list` 不要求它：这两档不发送任何东西。
+
 退出码：`0` 跑完（逐人结果看清单），`2` 什么都没做（名单、配置或收件人闸门不合格）。
 """
 
@@ -371,7 +377,45 @@ def resolve_admin_open_id(dsn: str, requested: str) -> str:
     return requested
 
 
-def build_dispatcher(config: Any, dsn: str) -> Any:
+def resolve_admin_registry_lookup(dsn: str) -> Any:
+    """读 ``admin_registry`` 的只读查询对象；单独成函数是给单测一个注入点。"""
+    from lingxi.adapters.admin_registry import PostgresAdminRegistryLookup
+
+    return PostgresAdminRegistryLookup(dsn)
+
+
+def initiated_by_is_registered_admin(lookup: Any, open_id: str) -> bool:
+    """``--initiated-by`` 必须是一位生效的已登记管理员。
+
+    判据**复用** :func:`lingxi.core.admin.registry.is_authorized_admin` 这条既有的
+    默认拒绝谓词（条目不存在、非 active、三类角色没有全部授予，一律不是管理员），
+    与 ``scripts/ops/preprovision.py`` 的同名闸逐字一致：管理员身份在本仓库只有
+    一个判据，两个脚本都只是它的调用点。
+    """
+    from lingxi.core.admin.registry import is_authorized_admin
+
+    return is_authorized_admin(lookup.active_entry(open_id=open_id))
+
+
+class _AuditWithInitiator:
+    """给每一条审计行补上发起人。
+
+    ``outreach_message`` **不为此新增列**：发起人是"这一次运行是谁按下的"，属于
+    运行审计，不是那条消息本身的属性——把它写进记录表会让同一个人被不同管理员重跑
+    时产生两种真相。审计出口是结构化日志（仓库没有 ``audit_event`` 表）。
+    """
+
+    def __init__(self, inner: Any, *, initiated_by: str) -> None:
+        """包住真实审计出口，记下本次运行的发起人。"""
+        self._inner = inner
+        self._initiated_by = initiated_by
+
+    def record(self, action: str, /, **fields: object) -> None:
+        """转发一条审计，附带 ``initiated_by``。"""
+        self._inner.record(action, initiated_by=self._initiated_by, **fields)
+
+
+def build_dispatcher(config: Any, dsn: str, *, initiated_by: str) -> Any:
     """装出发送编排：真实出站口 + 真实记录口 + 结构化审计 + 既有告警接线。
 
     告警走 ``build_alerting_duty``（与常驻 scheduler 同一装配），发送失败经
@@ -386,6 +430,7 @@ def build_dispatcher(config: Any, dsn: str) -> Any:
     from lingxi.core.outreach.dispatch import OutreachDispatcher
 
     audit = StructuredLogAuditSink()
+    # 告警那一侧拿不带发起人的原始出口：告警是系统故障事实，不属于某一次人工发起。
     alerting = build_alerting_duty(config, audit=audit)
     dispatcher = OutreachDispatcher(
         sender=FeishuUserCards(
@@ -394,7 +439,7 @@ def build_dispatcher(config: Any, dsn: str) -> Any:
             app_secret=config.feishu_app_secret,
         ),
         store=PostgresOutreachStore(dsn),
-        audit=audit,
+        audit=_AuditWithInitiator(audit, initiated_by=initiated_by),
         send_outcome=alerting.send_outcome_callback(),
     )
     return dispatcher, alerting
@@ -422,6 +467,14 @@ def _build_parser() -> argparse.ArgumentParser:
         "roster", type=Path, nargs="?", help="名单 CSV，至少一列 email；--list 时不需要"
     )
     parser.add_argument("--dsn", default=None, help="PostgreSQL DSN；缺省读 LINGXI_POSTGRES_DSN")
+    parser.add_argument(
+        "--initiated-by",
+        default=None,
+        dest="initiated_by_open_id",
+        help="本次发送的责任人飞书 open_id，落进每一条审计行；必须是 admin_registry 里"
+        "一位生效的已登记管理员，否则整次运行拒绝、零发送。--precheck / --apply 两条"
+        "真发路径必填；dry-run 与 --list 不要求",
+    )
     parser.add_argument(
         "--apply", action="store_true", help="真正按名单发送；不传时（默认）只出清单、零发送"
     )
@@ -455,8 +508,35 @@ def _reject_conflicting_modes(arguments: argparse.Namespace) -> str | None:
         return f"--precheck 必须同时给出 --to（{TO_ADMIN} 或 ou_…）。"
     if arguments.to and not arguments.precheck:
         return "--to 只在 --precheck 时有意义。"
+    if (arguments.apply or arguments.precheck) and not (
+        arguments.initiated_by_open_id or ""
+    ).strip():
+        return "--precheck / --apply 必须同时给出 --initiated-by <责任人 open_id>。"
     if not arguments.list and arguments.roster is None:
         return "缺少名单 CSV。"
+    return None
+
+
+def _reject_initiator(dsn: str, initiated_by: str) -> str | None:
+    """责任人闸：返回拒绝理由，``None`` 表示这位发起人合格。
+
+    闸放在读名单之前、任何一次发送之前：一次连责任人都填不对的运行，它发出去的
+    消息同样不该存在。登记表读不出来一律失败关闭——分辨不出"这个人不是管理员"与
+    "库暂时读不到"时，放行的那一侧是不可撤回的。
+    """
+    if not initiated_by:
+        return "--initiated-by 不能为空白，未做任何操作。"
+    try:
+        authorized = initiated_by_is_registered_admin(
+            resolve_admin_registry_lookup(dsn), initiated_by
+        )
+    except Exception as error:  # noqa: BLE001 - 登记表读不出来一律 fail-closed
+        return f"管理员登记表不可读，未做任何操作：{type(error).__name__}"
+    if not authorized:
+        return (
+            "--initiated-by 给出的 open_id 不是一位生效的已登记管理员"
+            "（admin_registry 里没有 active 条目，或三类角色没有全部授予），未做任何操作。"
+        )
     return None
 
 
@@ -490,14 +570,19 @@ def _prepare(arguments: argparse.Namespace, dsn: str) -> tuple[Any, tuple[Recipi
 
 
 def _send(
-    arguments: argparse.Namespace, config: Any, dsn: str, recipients: Sequence[Recipient]
+    arguments: argparse.Namespace,
+    config: Any,
+    dsn: str,
+    recipients: Sequence[Recipient],
+    *,
+    initiated_by: str,
 ) -> int:
     """预检或正式发送。两档共用同一条 :func:`run_outreach`。"""
     from lingxi.core.ids import new_id
 
     purpose = OutreachPurpose.PRECHECK if arguments.precheck else OutreachPurpose.APPLY
     admin_open_id = resolve_admin_open_id(dsn, arguments.to) if arguments.precheck else None
-    dispatcher, alerting = build_dispatcher(config, dsn)
+    dispatcher, alerting = build_dispatcher(config, dsn, initiated_by=initiated_by)
     results = run_outreach(
         recipients,
         dispatcher=dispatcher,
@@ -508,7 +593,10 @@ def _send(
     # 谁建谁清：把这一批攒下的告警真的投出去，再让本进程退出。
     alerting.dispatcher.run_once()
     print_results(results, purpose=purpose)
-    print("本清单不落库（仓库没有 audit_event 表），请自行保存；记录回查用 --list。")
+    print(
+        f"发起人（落进每条审计行的 initiated_by）：{initiated_by}。"
+        "本清单不落库（仓库没有 audit_event 表），请自行保存；记录回查用 --list。"
+    )
     return 0
 
 
@@ -526,6 +614,11 @@ def main(argv: list[str] | None = None) -> int:
 
     if arguments.list:
         return _run_listing(dsn, arguments.limit)
+
+    initiated_by = (arguments.initiated_by_open_id or "").strip()
+    if (arguments.apply or arguments.precheck) and (gate := _reject_initiator(dsn, initiated_by)):
+        print(gate, file=sys.stderr)
+        return 2
 
     try:
         config, recipients = _prepare(arguments, dsn)
@@ -545,7 +638,7 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     try:
-        return _send(arguments, config, dsn, recipients)
+        return _send(arguments, config, dsn, recipients, initiated_by=initiated_by)
     except RuntimeError as error:  # 收件人闸门不合格：整次运行拒绝，零发送
         print(f"未做任何操作：{error}", file=sys.stderr)
         return 2

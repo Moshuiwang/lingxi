@@ -255,6 +255,92 @@ class DryRunTest(unittest.TestCase):
         self.assertIn("跳过=not_active", buffer.getvalue())
 
 
+class FakeRegistryLookup:
+    """假登记表：按 open_id 返回条目；``None`` 表示没有 active 条目。"""
+
+    def __init__(self, entries: dict[str, Any]) -> None:
+        self.calls: list[str] = []
+        self._entries = entries
+
+    def active_entry(self, *, open_id: str) -> Any:
+        self.calls.append(open_id)
+        return self._entries.get(open_id)
+
+
+def _registry_entry(*, roles: frozenset[Any], status: str = "active") -> Any:
+    from lingxi.core.admin.registry import AdminRegistryEntry
+
+    return AdminRegistryEntry(
+        feishu_open_id=ADMIN_OPEN_ID, label="化名管理员", roles=roles, entry_status=status
+    )
+
+
+def _all_roles() -> frozenset[Any]:
+    from lingxi.core.admin.registry import AdminRole
+
+    return frozenset(AdminRole)
+
+
+class InitiatorGateTest(unittest.TestCase):
+    """责任人闸：两条真发路径必须带一位生效的已登记管理员。"""
+
+    def test_a_registered_active_admin_passes(self) -> None:
+        lookup = FakeRegistryLookup({ADMIN_OPEN_ID: _registry_entry(roles=_all_roles())})
+        self.assertTrue(TOOL.initiated_by_is_registered_admin(lookup, ADMIN_OPEN_ID))
+        self.assertEqual(lookup.calls, [ADMIN_OPEN_ID])
+
+    def test_an_unknown_open_id_is_refused(self) -> None:
+        """否定断言：默认拒绝——不在名单里的未知对象必须被挡住。"""
+        lookup = FakeRegistryLookup({})
+        self.assertFalse(TOOL.initiated_by_is_registered_admin(lookup, "ou_nobody"))
+
+    def test_a_partially_granted_admin_is_refused(self) -> None:
+        """否定断言：三类角色没有全部授予的人不是管理员（判据来自 core，不在这里另写）。"""
+        from lingxi.core.admin.registry import AdminRole
+
+        lookup = FakeRegistryLookup(
+            {ADMIN_OPEN_ID: _registry_entry(roles=frozenset({AdminRole.OPS_ADMIN}))}
+        )
+        self.assertFalse(TOOL.initiated_by_is_registered_admin(lookup, ADMIN_OPEN_ID))
+
+    def test_a_revoked_entry_is_refused(self) -> None:
+        lookup = FakeRegistryLookup(
+            {ADMIN_OPEN_ID: _registry_entry(roles=_all_roles(), status="revoked")}
+        )
+        self.assertFalse(TOOL.initiated_by_is_registered_admin(lookup, ADMIN_OPEN_ID))
+
+    def test_a_blank_initiator_is_refused_before_any_lookup(self) -> None:
+        self.assertIsNotNone(TOOL._reject_initiator("postgresql://unused", "   "))
+
+    def test_an_unreadable_registry_fails_closed(self) -> None:
+        """否定断言：分辨不出"不是管理员"与"库读不到"时，不放行——发出去不可撤回。"""
+
+        def explode(_dsn: str) -> Any:
+            raise RuntimeError("库炸了")
+
+        original = TOOL.resolve_admin_registry_lookup
+        TOOL.resolve_admin_registry_lookup = explode
+        try:
+            rejection = TOOL._reject_initiator("postgresql://unused", ADMIN_OPEN_ID)
+        finally:
+            TOOL.resolve_admin_registry_lookup = original
+        self.assertIsNotNone(rejection)
+        self.assertIn("管理员登记表不可读", rejection or "")
+
+    def test_the_audit_wrapper_adds_the_initiator_to_every_row(self) -> None:
+        """发起人落审计；``outreach_message`` 不为此新增列。"""
+        rows: list[tuple[str, dict]] = []
+
+        class _Sink:
+            def record(self, action: str, /, **fields: object) -> None:
+                rows.append((action, dict(fields)))
+
+        TOOL._AuditWithInitiator(_Sink(), initiated_by=ADMIN_OPEN_ID).record(
+            "outreach.delivered", status="delivered"
+        )
+        self.assertEqual(rows[0][1]["initiated_by"], ADMIN_OPEN_ID)
+
+
 class ModeGuardTest(unittest.TestCase):
     """互斥开关与写入极性。"""
 
@@ -268,10 +354,42 @@ class ModeGuardTest(unittest.TestCase):
         self.assertFalse(arguments.list)
 
     def test_apply_and_precheck_together_are_refused(self) -> None:
-        self.assertIsNotNone(self._reject(["roster.csv", "--apply", "--precheck", "--to", "admin"]))
+        self.assertIsNotNone(
+            self._reject(
+                [
+                    "roster.csv",
+                    "--apply",
+                    "--precheck",
+                    "--to",
+                    "admin",
+                    "--initiated-by",
+                    ADMIN_OPEN_ID,
+                ]
+            )
+        )
 
     def test_precheck_without_a_recipient_is_refused(self) -> None:
         self.assertIsNotNone(self._reject(["roster.csv", "--precheck"]))
+
+    def test_apply_without_an_initiator_is_refused(self) -> None:
+        """否定断言：没有责任人就不许真发。"""
+        rejection = self._reject(["roster.csv", "--apply"])
+        self.assertIsNotNone(rejection)
+        self.assertIn("--initiated-by", rejection or "")
+
+    def test_precheck_without_an_initiator_is_refused(self) -> None:
+        rejection = self._reject(["roster.csv", "--precheck", "--to", "admin"])
+        self.assertIsNotNone(rejection)
+        self.assertIn("--initiated-by", rejection or "")
+
+    def test_a_blank_initiator_does_not_count_as_given(self) -> None:
+        rejection = self._reject(["roster.csv", "--apply", "--initiated-by", "   "])
+        self.assertIsNotNone(rejection)
+
+    def test_the_two_read_only_modes_do_not_require_an_initiator(self) -> None:
+        """dry-run 与 --list 不发送任何东西，因此不要求责任人。"""
+        self.assertIsNone(self._reject(["roster.csv"]))
+        self.assertIsNone(self._reject(["--list"]))
 
     def test_a_roster_is_required_unless_listing(self) -> None:
         self.assertIsNotNone(self._reject([]))

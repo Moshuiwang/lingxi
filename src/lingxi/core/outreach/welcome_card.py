@@ -4,9 +4,10 @@
 全部写「各公司」）、长列表设上限（公司超过五个折叠成计数）、姓名取花名册原文。
 它们决定的是**说什么**，与卡片长什么样无关。
 
-样式（D-1）在真机预检看到渲染之前不定稿，因此**唯一的样式切换点**是
-:func:`build_card_payload` 与 :data:`DEFAULT_WELCOME_CARD_STYLE`：改判甲→乙／丙
-只改这一个常量，文案、取值规则、发送编排、记录一行都不用动。
+样式（D-1）由产品负责人看过真机样卡后定稿为**乙＝字段列表**；甲与丙仍可用枚举
+切换。**唯一的样式切换点**是 :func:`build_card_payload` 与
+:data:`DEFAULT_WELCOME_CARD_STYLE`：改判只改这一个常量，文案、取值规则、发送编排、
+记录一行都不用动。
 """
 
 from __future__ import annotations
@@ -48,7 +49,10 @@ FOOTNOTE_MARKDOWN = "<font color='grey'>{footnote}</font>"
 
 
 class WelcomeCardStyle(str, Enum):
-    """D-1 的三个候选样式。默认甲，改判只动 :data:`DEFAULT_WELCOME_CARD_STYLE`。"""
+    """D-1 的三个候选样式。
+
+    默认乙（产品负责人裁定的定稿样式），改判只动 :data:`DEFAULT_WELCOME_CARD_STYLE`。
+    """
 
     HEADER_MARKDOWN = "header_markdown"
     FIELD_LIST = "field_list"
