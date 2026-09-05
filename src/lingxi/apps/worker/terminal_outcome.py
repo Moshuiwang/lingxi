@@ -1,7 +1,7 @@
 """终态收口的低敏结构化审计事件。
 
 **严禁**记录正文内容、用户标识、提示词、模型输出片段或工具入参正文；只记分类性的失败
-码与签名、终态种类、出口安全的布尔与原因码、几个计数，以及提示词版本摘要。
+码与签名、终态种类、出口安全的布尔与原因码、几个计数，以及提示词与内容目录两个版本摘要。
 
 为什么必须由装配层注入出口而不是直接调标准库日志：本服务是纯组装对象，不知道自己会被
 哪个进程入口装配，也不该假设日志已经配过 handler——真实队列 worker 刻意不调用日志初始化，
@@ -17,6 +17,7 @@ from typing import Any
 from lingxi.apps.worker.report_extraction import _cap_log_token, sanitize_failure_signature
 from lingxi.apps.worker.service_ports import TerminalOutcomeCallback
 from lingxi.apps.worker.task_processing import TerminalDecision, TurnOutcome
+from lingxi.config.content_override import content_digest
 
 logger = logging.getLogger("lingxi.apps.worker.service")
 
@@ -96,6 +97,10 @@ class TerminalOutcomeAudit:
             "denied_tool_names": tuple(capped_tool_names),
             "tool_result_count": outcome.tool_result_count,
             "system_prompt_digest": system_prompt_digest,
+            # 本进程实际在用的内容目录摘要（镜像内 + 可选外置覆盖合成）。用户
+            # 反馈"这句话不对"时，靠它把用户当时看到的那一版文案定位到具体文件
+            # 内容；`content_version` 只描述镜像内那一份，外置覆盖不改它。
+            "content_digest": content_digest(),
             "truncated": (
                 code_truncated or signature_truncated or reasons_truncated or names_truncated
             ),

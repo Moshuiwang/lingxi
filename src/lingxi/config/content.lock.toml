@@ -2,8 +2,8 @@
 # 由 scripts/ci/check_content_version.py 生成与校验，请不要手工编辑。
 # 改完 content.toml 的文案后：先递增 [meta] version，再运行
 #   python3 scripts/ci/check_content_version.py --refresh
-version = "2026-09-03-3"
-digest = "sha256:a9d1c719698001a818544547d42c6ed2a5c8354671e75d45b7df77f5e51b3b00"
+version = "2026-09-05"
+digest = "sha256:d33bd0df714627f4f68f2ead38eabd2c2631fe1dfd8268926577588458a57058"
 
 # 用过的旧版本标识，不得复用：同一个版本号对应两批文案会让落库的追溯依据失效。
 retired_versions = [
@@ -38,6 +38,7 @@ retired_versions = [
   "2026-09-01-2",
   "2026-09-03",
   "2026-09-03-2",
+  "2026-09-03-3",
 ]
 
 # 每条用户可见文案的短摘要，用于在门禁失败时指出具体是哪几个键变了。
@@ -98,6 +99,22 @@ retired_versions = [
 "texts.onboarding.stalled" = "1e38f737f519eda2"
 "texts.onboarding.sync_timeout" = "332dedd2c0cff9e1"
 "texts.onboarding.syncing" = "224868e8a7c923cf"
+"texts.outreach.welcome.company_scope_all" = "5f5b033fecffcf44"
+"texts.outreach.welcome.company_scope_folded" = "ca035d89a76b4df4"
+"texts.outreach.welcome.company_word_multi" = "14cbe1f6e452b0c7"
+"texts.outreach.welcome.contact_body" = "477034532a756c6c"
+"texts.outreach.welcome.contact_heading" = "292825b7f8c8b7f6"
+"texts.outreach.welcome.example_document" = "2607ee7a32342485"
+"texts.outreach.welcome.example_last_month" = "44ae0bc8f4f4c230"
+"texts.outreach.welcome.example_recent" = "734c8b56cbf2631a"
+"texts.outreach.welcome.examples_heading" = "596d9bb87cc039bf"
+"texts.outreach.welcome.field_company" = "e06ff957ed48e868"
+"texts.outreach.welcome.field_metric" = "b87e67c7dae03991"
+"texts.outreach.welcome.footnote" = "f4db3a6bd38b6d32"
+"texts.outreach.welcome.greeting" = "1287b76575bd93e2"
+"texts.outreach.welcome.intro" = "7b7cfed49d1de150"
+"texts.outreach.welcome.scope_heading" = "f9110fa7211dc50b"
+"texts.outreach.welcome.title" = "12ead526d7ff0e3d"
 "texts.permission.all_companies" = "a6c7411df8878f06"
 "texts.permission.management_account_not_enabled" = "956961fbeeb86fb5"
 "texts.permission.management_correction_summary" = "c97549ca40ba2eb1"

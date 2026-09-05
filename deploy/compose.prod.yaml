@@ -65,6 +65,11 @@ services:
           # 同 scheduler（报告 R6-D4）：无默认值，漏配即渲染失败。
           memory: ${LINGXI_GATEWAY_MEM_LIMIT:?prod gateway memory must be set in deploy/.env.prod; see deploy/README.md}
           pids: ${LINGXI_GATEWAY_PIDS_LIMIT:-512}
+    volumes:
+      # 运行时配置目录只读挂载（Issue #585），结构与 stage 覆盖一致，说明见
+      # compose.stage.yaml 同名 service 的卷注释。未配置任何指向该目录的环境变量时
+      # 这条挂载没有副作用，gateway 照读随镜像发布的映射表与文案。
+      - ${LINGXI_SCHEDULER_RUNTIME_CONFIG_DIR:-/opt/lingxi/runtime-config}:/etc/lingxi/runtime:ro
 
   worker:
     env_file:

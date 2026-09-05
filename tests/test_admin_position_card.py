@@ -125,6 +125,44 @@ class PositionExpansionTests(unittest.TestCase):
         missing_reason = parse_admin_command("/admin grant_position u@example.com A运营 c1")
         self.assertEqual(missing_reason.kind, AdminCommandKind.UNKNOWN)
 
+    def test_the_shared_expansion_still_refuses_a_multi_company_scope(self) -> None:
+        """#587 回归：预开通名单的「一人多公司」落在名单层，这个共用纯函数**不变**。
+
+        管理卡表单提交的 ``company_scope`` 走的正是本函数；它一旦学会顿号，管理卡就
+        跟着多出一种没人裁定过的输入形态。这条用例是那个边界的守卫：把多公司解析搬进
+        本函数会让它变红。
+        """
+
+        with self.assertRaises(ValueError):
+            expand_position_scope(
+                position_name="A运营",
+                company_scope="c1、c2",
+                role_function_map={"A运营": "运营"},
+                company_function_metric_map={"c1": {"运营": ["m1"]}, "c2": {"运营": ["m2"]}},
+                available_companies=["c1", "c2"],
+            )
+
+    def test_a_single_company_scope_expands_exactly_as_before(self) -> None:
+        """管理卡路径的正向回归：单公司提交逐字得到该公司的职能指标全集。"""
+
+        expansion = expand_position_scope(
+            position_name="A运营",
+            company_scope="c1",
+            role_function_map={"A运营": "运营"},
+            company_function_metric_map={"c1": {"运营": ["m2", "m1"]}, "c2": {"运营": ["m1"]}},
+            available_companies=["c1", "c2"],
+        )
+
+        self.assertEqual(expansion.company_scope, "c1")
+        self.assertEqual(expansion.companies, ("c1",))
+        self.assertEqual(expansion.pairs, (("c1", "m2"), ("c1", "m1")))
+
+    def test_the_card_command_never_accepts_a_multi_company_scope(self) -> None:
+        """管理卡表单的字符集门本身也挡住顿号：这条路径连提交都提交不出多公司。"""
+
+        command = parse_admin_command("/admin grant_position u@example.com A运营 c1、c2 原因")
+        self.assertEqual(command.kind, AdminCommandKind.UNKNOWN)
+
     def test_permission_group_id_is_a_closed_revoke_target_shape(self) -> None:
         command = parse_admin_command(
             "/admin revoke_permission lpg_01M1C90YDGMTY567GDTZZJ4C5E 管理卡撤销"

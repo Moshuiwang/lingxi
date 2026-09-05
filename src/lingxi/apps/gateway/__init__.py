@@ -27,6 +27,7 @@ from typing import Any
 
 from lingxi.adapters.feishu_longconn import TerminationReason
 from lingxi.adapters.postgres import close_idle_connections
+from lingxi.config.content_override import log_content_source
 from lingxi.core.conversation.ports import OnboardingRunner
 
 from .alerting import LogOnlyAlertSender, build_alerting_duty
@@ -299,6 +300,11 @@ def main(argv: list[str] | None = None, env: Mapping[str, str] | None = None) ->
 
 def _run(config: GatewayConfig) -> int:
     """装配两条循环与长连接，跑到停机，再在预算内收尾。"""
+    # 内容目录（含可选的宿主机外置覆盖）在装配前读一次并记一行来源事实；不在
+    # 这里读，覆盖文件的加载会推迟到第一个用户请求，运维重启后无法从启动日志
+    # 确认读到了哪一版。管理群告警只由 scheduler 发，理由见
+    # `apps/scheduler/content_override_notice.py`。
+    log_content_source("gateway")
     stop_event = threading.Event()
     shutdown = _ShutdownClock()
     install_signal_handlers(stop_event, on_stop=shutdown.mark_requested)

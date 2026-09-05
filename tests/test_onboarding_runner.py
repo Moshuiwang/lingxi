@@ -17,6 +17,7 @@ from collections.abc import Mapping, Sequence
 from datetime import UTC, datetime
 from typing import Any
 
+from lingxi.config.content import default_content_catalog
 from lingxi.core.conversation.ports import RETRYABLE_REASONS, OnboardingState
 from lingxi.core.identity.first_contact import (
     EmploymentStatus,
@@ -1286,6 +1287,79 @@ class PublishTranslationTests(unittest.TestCase):
         self.assertEqual(facts["state"], "internal_error")
         self.assertEqual(facts["failure_reason"], "permission_translation_unavailable")
         self.assertEqual(parts["decisions"].rows, [], "映射整体为空时同样零写入")
+
+
+class AlreadyActiveNoticeTranslationTests(unittest.TestCase):
+    """「已激活重认领」分支（已开通的人再次触发开通链）发出的正文里，职能位必须是
+    用户读得懂的指标中文名，不是内部职能标签（Issue #605）。
+
+    这条分支在续行前复核处提前收口，走的**不是** `_publish` 那条已经接了翻译层的
+    路，因此需要自己的用例。默认夹具 `METRIC_TRANSLATION_MAP` 是恒等翻译，"翻译过"
+    与"原样透传未翻译标签"产出逐字节相同、无法区分，所以本类一律用翻译结果**明确
+    不同于**职能标签的映射，否则断言什么都证明不了。
+    """
+
+    #: 职能标签"销售分析"翻成一个绝不会与它混淆的指标名。
+    DISTINCT_TRANSLATION_MAP: Mapping[str, Mapping[str, Sequence[str]]] = {
+        "88": {"销售分析": ("日活万人",)},
+    }
+
+    @staticmethod
+    def _run_already_active(**overrides: Any) -> tuple[dict[str, Any], Any]:
+        return run_once(
+            users=FakeUsers(UserProvisioningStatus("enabled", "active", 3)),
+            provisioning=FakeProvisioning(ProvisioningResult.already_provisioned(USER_ID)),
+            **overrides,
+        )
+
+    def test_the_rendered_notice_carries_metric_names_and_no_function_label(self) -> None:
+        """核心正向：把这条分支的占位取值真的送进内容目录渲染一次，断言用户会读到的
+        那句话里只有指标名、一个职能标签原文都没有。断言渲染后的正文而不是占位字典，
+        是因为"用户看到什么"才是这张卡的判据。"""
+
+        parts, _ = self._run_already_active(metric_translation_map=self.DISTINCT_TRANSLATION_MAP)
+
+        self.assertEqual(parts["notifier"].keys(), [KEY_COMPLETED])
+        key, values = parts["notifier"].terminal()[1], parts["notifier"].terminal()[2]
+        self.assertEqual(values, {"company_name": "88", "function_name": "日活万人"})
+        rendered = default_content_catalog().text(key, **values).text
+        self.assertIn("日活万人", rendered)
+        self.assertNotIn("销售分析", rendered, "用户正文里不得残留未翻译的职能标签")
+        self.assertEqual(parts["decisions"].rows, [], "已 active 的人仍不得重复发布")
+        self.assertEqual(parts["environment"].calls, [], "已 active 的人仍不得重复建环境")
+        self.assertIn("onboarding.already_active", parts["audit"].actions())
+
+    def test_the_metric_names_come_from_the_shared_translation_function(self) -> None:
+        """同口径：这条分支的取值与 `translate_company_functions`（每日重算、`_publish`
+        共用的同一个函数）的产出逐字节一致，不是本分支自己拼的第二套翻译。"""
+
+        parts, _ = self._run_already_active(metric_translation_map=self.DISTINCT_TRANSLATION_MAP)
+
+        expected = translate_company_functions(
+            companies=("88",),
+            functions=("销售分析",),
+            all_companies=False,
+            mapping=self.DISTINCT_TRANSLATION_MAP,
+        )
+        self.assertEqual(expected, {"88": ("日活万人",)})
+        self.assertEqual(
+            parts["notifier"].terminal()[2]["function_name"], "、".join(expected["88"])
+        )
+
+    def test_an_uncovered_combination_fails_closed_instead_of_showing_the_raw_label(self) -> None:
+        """否定用例：翻译查不到这个人的组合时**不回落成职能标签**——宁可让他收到内部
+        故障终态，也不发一句他读不懂的"开通完成"。同时仍不重复发布、不重复建环境。"""
+
+        parts, _ = self._run_already_active(
+            metric_translation_map={"77": {"销售分析": ("日活万人",)}}
+        )
+
+        self.assertEqual(parts["notifier"].terminal()[1], KEY_INTERNAL_ERROR)
+        self.assertNotIn(KEY_COMPLETED, parts["notifier"].keys())
+        facts = parts["audit"].facts("onboarding.result")
+        self.assertEqual(facts["failure_reason"], "permission_translation_uncovered")
+        self.assertEqual(parts["decisions"].rows, [], "收口时一条发布意图都不排")
+        self.assertEqual(parts["environment"].calls, [])
 
 
 class ThreadingTests(unittest.TestCase):

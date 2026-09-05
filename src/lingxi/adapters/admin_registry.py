@@ -90,6 +90,29 @@ class PostgresAdminRegistryLookup:
             return None
         return admin_registry_entry_from_row(row)
 
+    def active_entries(self) -> tuple[AdminRegistryEntry, ...]:
+        """列出全部 active 登记，按 open_id 排序。
+
+        供受控运行脚本回答"把预检卡发给哪位管理员"。**不判定授权**：条目是不是
+        一位真正的管理员仍由 ``core.admin.registry.is_authorized_admin`` 决定，
+        这里只负责把行取回来，避免同一条默认拒绝谓词出现第二份实现。
+        """
+        with (
+            connect(self._dsn, timeouts=self._timeouts) as connection,
+            connection.cursor() as cursor,
+        ):
+            cursor.execute(
+                """
+                SELECT feishu_open_id, label, permission_admin_granted,
+                       ops_admin_granted, super_admin_granted, entry_status
+                  FROM admin_registry
+                 WHERE entry_status = 'active'
+                 ORDER BY feishu_open_id
+                """
+            )
+            rows = cursor.fetchall()
+        return tuple(admin_registry_entry_from_row(row) for row in rows)
+
 
 class PostgresAdminQueries:
     """``AdminQueries`` 端口的真实实现：只读 ``app_user``/``inbound_event``/``local_permission_override``。

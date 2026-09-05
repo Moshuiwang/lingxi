@@ -683,3 +683,80 @@ docker compose --env-file deploy/.env.prod \
 | 3 | 名单 stdin 投放后对容器用户可读 | 12.1 的 `wc -l` 回读 | 行数 = 名单数据行数 + 1（表头） |
 | 4 | `--initiated-by` 是生效管理员 | 由 ① dry-run 自查（不是则退出 2、零写入） | dry-run 正常打印清单与计数 |
 | 5 | 专用授权令牌不在 5 分钟续期间隔内（§12.2） | scheduler 日志最近一条「专用授权续期成功」的时刻 | 距今 ≥ 5 分钟 |
+
+## 十三、#586 主动告知（欢迎卡）执行姿势（生产；体验批 Trace #606 补入）
+
+> **前提与去留**：本节只在「产品负责人裁定本次窗口要主动告知已开通的人」时执行，执行时点在 §十二
+> 的预开通完成、名单内的人 `provisioning_state=active` 之后。**证据边界如实**：本节写的姿势只有
+> 本机用例证据，**stage 真发预检与生产真人送达都还没有做**；`docs/当前能力.md` 2026-09-05 体验批条
+> 未回填之前，不得把「用户会收到欢迎卡」当成已具备的能力宣告。**发出去的卡片不可撤回**，因此逐批
+> 单字放行、先预检后真发。
+
+姿势与 §十二 逐字同构（名单经 stdin 投放、脚本本体经 stdin 执行，容器内不落文件、不改任何生产
+文件），只换脚本与参数。**名单可以直接沿用 §12.1 投放的那一份**（本脚本只读 `email` 列，多出来的
+`position`/`company_scope` 被忽略）；容器重建后 `/tmp` 清空，须按 §12.1 重新投放。
+
+**与专用授权令牌无关**：本脚本不启动 `build_loop`、不消费在职实时回读的一次性续期凭据，因此
+**不占用 §12.2 那条「5 分钟最小续期间隔、当日 100 次」的配额**，不必挑续期窗口。它只读库、渲染、
+发一条消息、写一行记录。
+
+四档按顺序走，`<管理员>` 是一位登记在案且当前有效的管理员 `open_id`（`--initiated-by` 缺失或不是
+有效管理员一律退出码 2、零发送；`--precheck` 与 `--apply` 都要求它）：
+
+```bash
+cd /home/bi-ai-deploy/projects/lingxi
+
+# ① dry-run（默认即 dry-run：不带 --apply / --precheck 就是零发送）
+docker compose --env-file deploy/.env.prod \
+  -f deploy/compose.yaml -f deploy/compose.prod.yaml \
+  exec -T scheduler python -B - /tmp/roster.csv --initiated-by <管理员> \
+  < scripts/ops/outreach.py
+
+# ② 预检：同一张卡真发到管理员本人私聊，产品负责人看真机渲染后定稿
+docker compose --env-file deploy/.env.prod \
+  -f deploy/compose.yaml -f deploy/compose.prod.yaml \
+  exec -T scheduler python -B - /tmp/roster.csv \
+    --precheck --to <管理员> --initiated-by <管理员> \
+  < scripts/ops/outreach.py
+
+# ③ 真发：产品负责人逐行核对 ① 的清单并单字放行之后
+docker compose --env-file deploy/.env.prod \
+  -f deploy/compose.yaml -f deploy/compose.prod.yaml \
+  exec -T scheduler python -B - /tmp/roster.csv --apply --initiated-by <管理员> \
+  < scripts/ops/outreach.py
+
+# ④ 回查：发给谁 / 内容键＋版本 / 何时 / 结果（正文不在库里，也不打印）
+docker compose --env-file deploy/.env.prod \
+  -f deploy/compose.yaml -f deploy/compose.prod.yaml \
+  exec -T scheduler python -B - --list \
+  < scripts/ops/outreach.py
+```
+
+判读与纪律：
+
+- **dry-run 逐人打印**内容键、姓名、公司范围折叠结果、指标数、是否已激活、是否已发过，末尾计数。
+  这一档结构上根本不构造出站口，**零发送、零写入**。
+- **参数写全称**：脚本已关闭前缀缩写（`allow_abbrev=False`），`--ap` 这类前缀会被拒绝而不是当成
+  `--apply` 执行——对一个「传了就真发、且消息不可撤回」的开关，手滑半个词不等于授权执行。
+- **只对已激活且账号未停用的人发**，判据是状态不是时间；经迟到就绪恢复才激活的人由**下一次
+  `--apply`** 自然捞到，不必手工挑时间重跑。装配之后、每个人真发之前还会再读一次他的状态，
+  这中间被停用的人当场跳过（清单上写 `not_active_at_send`）。
+- **同一时刻只跑一份名单**：不得并发两次 `--apply`（也不要一边 `--apply` 一边另开一个窗口跑
+  第二份名单）。幂等靠数据库那一行，两个进程同时认领同一个人时谁也不知道对方发到哪一步了；
+  平台侧的去重 uuid 是最后一道，不是第一道。
+- **隔得久的重跑先 `--list`**：看有没有停在 `pending` 的记录。`pending` 的含义是"记录已经落下、
+  还没确认送达"——它可能已经发出去了，只是记账没做完（那一档退出码是 3，不是 2）。先核对再重跑。
+- **预检用 1–2 人的精简名单**：预检会按名单逐人各发一张卡到管理员私聊，整份名单预检会把管理员
+  的私聊刷满，也吃掉机器人私聊的投递预算。定稿看渲染只需要一两个代表性的人（一个单公司、一个
+  多公司）。
+- **`--initiated-by` 是自报身份**：这道闸挡的是误操作（随手填一个不是管理员的 open_id 就跑不
+  起来），**挡不住冒认**——能在容器里执行这条命令的人本来就能填任何一个有效管理员的 open_id。
+  与 §十二 预开通那道同名闸同一性质。
+- **退出码**：`0` 跑完（逐人结果看清单）；`2` **什么都没做**（名单、参数、配置或收件人闸门不
+  合格）；`3` **发出去了但收尾没做干净**（卡片飞书已经收下却没记成已送达，或这一批的告警没投
+  出去）。看到 `3` 的正确动作是先 `--list` 核对，不是当成零发送直接重跑。
+- **失败逐人关闭**：某个人发送失败只让他自己计入失败，落一条 `failed` 记录并按既有通道通知管理群，
+  名单里其余的人照常继续；原样重跑即重试，**重试沿用同一去重键**，飞书侧仍然只有一条消息。
+- **幂等**：同一份名单重跑**零新增发送**（已 `delivered` 的人直接跳过）。因此「不确定上次跑到哪里」
+  时的正确动作是原样重跑，不是挑人重发。
+- **`--list` 不需要名单**，也不发送任何东西；清单本身不落库，需要留档请自行保存输出。

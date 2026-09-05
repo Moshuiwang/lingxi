@@ -186,6 +186,25 @@ REQUIRED_TEXT_KEYS: tuple[str, ...] = (
     # 给已判定出失败段的 /admin 命令，带段名与实际分段数。
     "admin.unknown_command",
     "admin.unknown_command_detail",
+    # 主动告知的欢迎卡。整张卡按段落拆键，是为了让样式（标题栏／
+    # 字段列表／纯 markdown）在文案一个字都不改的前提下切换；审计里代表这张卡的
+    # 内容键是它们共同的前缀，见 ``core/outreach/welcome_card.WELCOME_CONTENT_KEY``。
+    "outreach.welcome.title",
+    "outreach.welcome.greeting",
+    "outreach.welcome.intro",
+    "outreach.welcome.scope_heading",
+    "outreach.welcome.field_company",
+    "outreach.welcome.field_metric",
+    "outreach.welcome.examples_heading",
+    "outreach.welcome.example_recent",
+    "outreach.welcome.example_last_month",
+    "outreach.welcome.example_document",
+    "outreach.welcome.contact_heading",
+    "outreach.welcome.contact_body",
+    "outreach.welcome.footnote",
+    "outreach.welcome.company_word_multi",
+    "outreach.welcome.company_scope_all",
+    "outreach.welcome.company_scope_folded",
 )
 
 REQUIRED_CARD_KEYS: tuple[str, ...] = (
@@ -404,6 +423,36 @@ class ContentCatalog:
             button_labels=labels,
         )
 
+    def text_template(self, key: str) -> str | None:
+        """取某个文案键的模板原文；键未登记时返回 ``None``。
+
+        外置覆盖文件要拿镜像内同键的原文比对占位符集合，需要一个只读单键的
+        入口，而不是把内部模板映射整份暴露出去。
+        """
+        template = self._texts.get(key)
+        return None if template is None else template.template
+
+    def with_text_overrides(self, overrides: Mapping[str, str]) -> ContentCatalog:
+        """把一批外置正文叠加到 ``texts`` 上并返回新目录；本实例不变。
+
+        **只换正文**：版本、卡片与键集合原样保留，外置文件因此在结构上不可能
+        新增键、改 ``meta.version`` 或动卡片。每条覆盖仍走 ``_make_template``
+        的占位符合法性与内容安全两道校验，且占位符集合必须与镜像内同键完全
+        相等——否则抛错，由调用方整份丢弃、退回镜像内文案。
+        """
+        texts = dict(self._texts)
+        for key, value in overrides.items():
+            base = self._texts.get(key)
+            if base is None:
+                raise ContentValidationError(f"外置文案键 {key} 未在镜像内登记")
+            if not isinstance(value, str):
+                raise ContentValidationError(f"外置文案键 {key} 的值必须是文本")
+            template = _make_template(key, value)
+            if template.variables != base.variables:
+                _raise_variable_mismatch(base.variables, template.variables)
+            texts[key] = template
+        return ContentCatalog(version=self.version, texts=texts, cards=self._cards)
+
     def text_keys(self) -> tuple[str, ...]:
         """目录中全部文本模板的键。"""
         return tuple(self._texts)
@@ -554,8 +603,24 @@ def _validate_user_visible_text(
 
 @lru_cache(maxsize=1)
 def default_content_catalog() -> ContentCatalog:
-    """加载当前制品的唯一内容版本；失败时不返回降级目录。"""
-    return ContentCatalog.from_file()
+    """加载当前制品的内容版本，并叠加宿主机外置覆盖文件（配置了才有）。
+
+    镜像内目录本身仍然失败关闭，不返回降级目录；外置覆盖则相反——写坏了整份
+    忽略、退回镜像内文案，理由与判据见 :mod:`lingxi.config.content_override`。
+    延迟导入是为了避开两个模块之间的环形引用。
+    """
+    from lingxi.config.content_override import default_content_source
+
+    return default_content_source().catalog
+
+
+def text_placeholders(key: str, template: str) -> frozenset[str]:
+    """一段文案模板的占位符集合；占位写法不合法时抛 ``ContentValidationError``。
+
+    外置覆盖文件的占位符比对必须与镜像内目录用**同一个**解析器，否则两处判据
+    迟早分叉，出现"校验命令说合法、进程判不合法"这类无法自证的状态。
+    """
+    return _template_variables(template, key)
 
 
 def validate_user_visible_text(text: str, *, internal_terms: Sequence[str] = ()) -> str:
@@ -578,5 +643,6 @@ __all__ = [
     "REQUIRED_CARD_KEYS",
     "REQUIRED_TEXT_KEYS",
     "default_content_catalog",
+    "text_placeholders",
     "validate_user_visible_text",
 ]

@@ -59,6 +59,17 @@ ON CONFLICT (message_id) DO UPDATE SET
 """
 
 
+#: 一张管理卡在收口后可以继续操作，因此同一个 message_id 下会累积多条
+#: pending_action。关联必须钉死**当前那一次**操作（按登记时间取最新的一条），
+#: 否则上一次操作的历史 published 行会让这一次被误判成已生效。
+_CURRENT_CARD_ACTION_SQL = """
+    SELECT current_action.id
+      FROM pending_action AS current_action
+     WHERE current_action.origin_card_message_id = %s
+     ORDER BY current_action.created_at DESC, current_action.id DESC
+     LIMIT 1
+"""
+
 #: 把已被发布消费面读回一致的管理卡置为 effective：daily_batch_published 只在
 #: reason 属于每日批时为真，previous_state='incomplete' 且命中每日批才把
 #: daily_correction_pending 置真（供每日汇总补一句），其余收口路径不计入汇总。
@@ -70,7 +81,13 @@ WITH latest_published AS (
            o.reason
       FROM management_card_context c
       JOIN pending_action pa
-        ON pa.origin_card_message_id = c.message_id
+        ON pa.id = (
+               SELECT current_action.id
+                 FROM pending_action AS current_action
+                WHERE current_action.origin_card_message_id = c.message_id
+                ORDER BY current_action.created_at DESC, current_action.id DESC
+                LIMIT 1
+           )
       JOIN app_user u
         ON u.feishu_open_id = pa.target_open_id
       JOIN publish_outbox o
@@ -422,14 +439,18 @@ class PostgresManagementCardContextStore:
             )
             return cursor.rowcount == 1
 
-    def latest_publish_state_for_message(self, *, message_id: str) -> str | None:
-        """读取管理卡关联操作对应的最新权限发布状态。
+    def latest_publish_state_for_action(
+        self, *, message_id: str, pending_action_id: str
+    ) -> str | None:
+        """读取**这一次**管理操作对应的最新权限发布状态。
 
         该查询只用于 gateway 的短暂状态观察：``published`` 才能显示「已生效」，
         ``pending/publishing`` 保持等待，``failed`` 才进入诚实的未完成态。它不改变
-        outbox，也不把「已经排入 outbox」误当成外部表已读回一致。
+        outbox，也不把「已经排入 outbox」误当成外部表已读回一致。关联条件钉死本次
+        pending action：同一张卡可以在收口后继续操作，只按卡片消息关联会让上一次
+        操作的历史发布把这一次误报成已生效。
         """
-        if not message_id:
+        if not message_id or not pending_action_id:
             return None
         with (
             connect(self._dsn, timeouts=self._timeouts) as connection,
@@ -441,7 +462,8 @@ class PostgresManagementCardContextStore:
                   FROM pending_action pa
                   JOIN app_user u ON u.feishu_open_id = pa.target_open_id
                   JOIN publish_outbox o ON o.user_id = u.id
-                 WHERE pa.origin_card_message_id = %s
+                 WHERE pa.id = %(pending_action_id)s
+                   AND pa.origin_card_message_id = %(message_id)s
                    -- 只接受这次确认之后创建的发布意图；管理员此前同一用户的
                    -- 旧 outbox 即使后来成功，也不能把本次管理卡误报成已生效。
                    AND o.created_at >= pa.decided_at
@@ -454,10 +476,30 @@ class PostgresManagementCardContextStore:
                  ORDER BY o.permission_version DESC, o.created_at DESC, o.id DESC
                  LIMIT 1
                 """,
-                (message_id,),
+                {"message_id": message_id, "pending_action_id": pending_action_id},
             )
             row = cursor.fetchone()
         return str(row[0]) if row is not None else None
+
+    def is_current_card_action(self, *, message_id: str, pending_action_id: str) -> bool:
+        """这条操作是否仍是该管理卡最新的一次操作。
+
+        管理卡收口后可以被复用，迟到的旧回调不得覆盖后一次操作的卡片状态，也不得
+        把它重新打开。**查不到任何关联操作时失败关闭**：一张连"当前是哪一次操作"都
+        答不出来的卡，没有任何依据接受一条迟到回调的回写——那条回调只能是孤儿。
+        参数缺失仍返回 ``True``，那是调用方没有给出判据、不是库里没有答案。
+        """
+        if not message_id or not pending_action_id:
+            return True
+        with (
+            connect(self._dsn, timeouts=self._timeouts) as connection,
+            connection.cursor() as cursor,
+        ):
+            cursor.execute(_CURRENT_CARD_ACTION_SQL, (message_id,))
+            row = cursor.fetchone()
+        if row is None:
+            return False
+        return str(row[0]) == pending_action_id
 
     def settle_published_contexts(self) -> tuple[str, ...]:
         """把已被发布消费面读回一致的管理卡置为 ``effective``。
@@ -465,8 +507,9 @@ class PostgresManagementCardContextStore:
         返回本次从 ``incomplete`` 补齐的消息 ID，供每日批发一条汇总；从
         ``submitted``/``dispatching`` 正常收口的上下文不会计入汇总。把
         ``submitted`` 纳入是为了覆盖 gateway 在确认已提交、但尚未来得及把原管理卡
-        刷成 ``dispatching`` 时重启的恢复窗口；关联条件以确认时间为下界，避免把
-        该管理员操作之前的旧发布误认成这次操作已完成。
+        刷成 ``dispatching`` 时重启的恢复窗口。关联规则与
+        :meth:`latest_publish_state_for_action` 完全一致：只认这张卡当前那一次操作，
+        并以它的确认时间为下界，历史操作与更早的发布都不能让这一次收口。
         """
         with (
             connect(self._dsn, timeouts=self._timeouts) as connection,

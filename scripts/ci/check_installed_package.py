@@ -49,6 +49,12 @@ REQUIRED_MODULES = (
     "lingxi.apps.healthcheck.__main__",
     "lingxi.config",
     "lingxi.config.content",
+    # 用户可见文案的宿主机外置覆盖（Issue #585）：`content.py` 的
+    # `default_content_catalog` 函数内 import 它，因此每个渲染文案的进程都会加载；
+    # `content_check` 是配套的离线校验命令（`python -m lingxi.config.content_check`），
+    # 不进任何进程闭包，但必须随制品发布——运维在容器里跑它校验覆盖文件。
+    "lingxi.config.content_override",
+    "lingxi.config.content_check",
     "lingxi.core",
     "lingxi.core.alerting",
     "lingxi.core.conversation",
@@ -289,6 +295,9 @@ REQUIRED_MODULES = (
     "lingxi.apps.scheduler.retention",
     "lingxi.apps.scheduler.roster_audit",
     "lingxi.apps.scheduler.daily_report",
+    # 外置文案覆盖被拒时的唯一一条管理群告警出口（Issue #585）：进程入口
+    # `apps/scheduler/__init__.py` 模块级 import，scheduler 起来时必然已装入。
+    "lingxi.apps.scheduler.content_override_notice",
     # 内测每日通报的段落组装/渲染纯函数，从 `daily_report.py` 拆出来把它压回文件
     # 体量棘轮阈值以内（本批可读性重构）——不是 `__init__.py` 直接 import，而是被
     # `daily_report.py` 模块级 import，因此同样在 scheduler 进程起来时必然已装入。
@@ -506,6 +515,17 @@ REQUIRED_MODULES = (
     "lingxi.core.permission.targeted_recompute",
     "lingxi.adapters.postgres_targeted_recompute_lookup",
     "lingxi.adapters.postgres_permission_recompute_trigger",
+    # 主动发送能力（Issue #586）：组卡取值规则、收件人装配与发送编排在 core，
+    # 面向用户 open_id 的卡片出站与发送记录读写在 adapters。调用方是随 scheduler
+    # 镜像发布的 `scripts/ops/outreach.py`（同 preprovision 那条受控运行脚本的
+    # 形态，不是常驻进程），因此没有任何进程会模块级 import 它们——"本地测试全绿
+    # 但 wheel 里没有这个模块"正是 V-部署-10 要挡的形状。
+    "lingxi.core.outreach",
+    "lingxi.core.outreach.welcome_card",
+    "lingxi.core.outreach.audience",
+    "lingxi.core.outreach.dispatch",
+    "lingxi.adapters.feishu_user_card",
+    "lingxi.adapters.postgres_outreach",
 )
 
 # 源码树里仍保留的 Bot-Test / 历史受控验证资产。它们不是正式用户路径的漏项，但正式
@@ -673,6 +693,8 @@ PROCESS_RUNTIME_IMPORTS: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {
             "lingxi.adapters.postgres_content_capture_retention",
             "lingxi.apps.scheduler.roster_audit",
             "lingxi.apps.scheduler.daily_report",
+            # 理由见 REQUIRED_MODULES 同名条目：进程入口模块级 import 它。
+            "lingxi.apps.scheduler.content_override_notice",
             # 理由见 REQUIRED_MODULES 同名条目：`daily_report.py` 模块级 import 它。
             "lingxi.apps.scheduler.daily_report_sections",
             "lingxi.apps.scheduler.loop",
@@ -775,6 +797,9 @@ PROCESS_RUNTIME_IMPORTS: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {
             "lingxi.core.admin.views",
             "lingxi.config",
             "lingxi.config.content",
+            # 理由见 REQUIRED_MODULES 同名条目：`content.py` 的
+            # `default_content_catalog` 函数内 import 它，渲染第一句文案就会加载。
+            "lingxi.config.content_override",
             "lingxi.adapters",
             "lingxi.adapters.delegated_credentials",
             # `delegated_credentials.py` 自身 import 了 `delegated_subject_lookup`
@@ -919,6 +944,9 @@ PROCESS_RUNTIME_IMPORTS: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {
             # 读取口，但它模块级 import 了同一个 adapter。渲染文案随之一并进闭包。
             "lingxi.config",
             "lingxi.config.content",
+            # 理由见 REQUIRED_MODULES 同名条目：`content.py` 的
+            # `default_content_catalog` 函数内 import 它，渲染第一句文案就会加载。
+            "lingxi.config.content_override",
             "lingxi.core.identity.first_contact",
             "lingxi.core.identity.org_snapshot",
             "lingxi.core.identity.identifiers",
@@ -984,6 +1012,9 @@ PROCESS_RUNTIME_IMPORTS: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {
             "lingxi.adapters.postgres_conversation._transaction",
             "lingxi.config",
             "lingxi.config.content",
+            # 理由见 REQUIRED_MODULES 同名条目：`content.py` 的
+            # `default_content_catalog` 函数内 import 它，渲染第一句文案就会加载。
+            "lingxi.config.content_override",
             "lingxi.core",
             "lingxi.core.alerting",
             "lingxi.core.conversation",
@@ -1069,6 +1100,9 @@ PROCESS_RUNTIME_IMPORTS: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {
             "lingxi.apps.healthcheck.__main__",
             "lingxi.config",
             "lingxi.config.content",
+            # 理由见 REQUIRED_MODULES 同名条目：`content.py` 的
+            # `default_content_catalog` 函数内 import 它，渲染第一句文案就会加载。
+            "lingxi.config.content_override",
             "lingxi.adapters",
             "lingxi.adapters.feishu_events",
             "lingxi.adapters.feishu_longconn",

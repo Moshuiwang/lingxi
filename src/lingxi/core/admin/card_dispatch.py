@@ -596,12 +596,19 @@ class ManagementCardContextStore:
             self._entries[message_id] = (updated, expires_at)
             return True
 
-    # 内存兼容实现没有可观测的发布 outbox，以下四个方法只是保留生产适配器的
+    # 内存兼容实现没有可观测的发布 outbox，以下五个方法只是保留生产适配器的
     # 可选观测面，让 gateway 测试与旧调用方能不带分支地注入本类。
-    def latest_publish_state_for_message(self, *, message_id: str) -> str | None:
+    def latest_publish_state_for_action(
+        self, *, message_id: str, pending_action_id: str
+    ) -> str | None:
         """内存实现没有发布 outbox 可观测，恒返回 ``None``。"""
-        del message_id
+        del message_id, pending_action_id
         return None
+
+    def is_current_card_action(self, *, message_id: str, pending_action_id: str) -> bool:
+        """内存实现不持有 pending action，无法证明这次操作已被取代，恒返回 ``True``。"""
+        del message_id, pending_action_id
+        return True
 
     def settle_published_contexts(self) -> tuple[str, ...]:
         """内存实现没有待结算的发布上下文，恒返回空元组。"""

@@ -64,7 +64,7 @@ from lingxi.core.permission.publish_row import (
     aggregate_permission,
     build_translated_publish_row,
     parse_permissions,
-    serialize_permissions,
+    serialize_translated_permissions,
 )
 
 logger = logging.getLogger("lingxi.core.identity.onboarding_runner")
@@ -295,9 +295,15 @@ class OnboardingSteps:
             # "上一次结论没送到、被重新认领"的收敛出口，不通知就等于把它烧掉。
 
             # 范围用本轮已经算出来的那一份，**不重新聚合一次外部权限**：它与即将发布的
-            # 那一版同源，不会凭空编出一个用户没有的范围。
+            # 那一版同源，不会凭空编出一个用户没有的范围。**先过翻译层再渲染**：职能位
+            # 必须是用户读得懂的指标名，与正常收口路径逐字同口径；翻译失败按本侧故障
+            # 收口，**绝不回落成职能标签**——把内部标签发给用户，等于让他读完通知仍然
+            # 不知道自己能查什么。
             self._audit.record("onboarding.already_active", user=user_id, trace_id=trace_id)
-            return self._completed(serialize_permissions(aggregate))
+            galaxy_map = self._translate_galaxy(user_id, aggregate)
+            if isinstance(galaxy_map, _Terminal):
+                return galaxy_map
+            return self._completed(serialize_translated_permissions(galaxy_map))
         return None
 
     # ---- 6. 令牌 + 用户环境 ---------------------------------------------
