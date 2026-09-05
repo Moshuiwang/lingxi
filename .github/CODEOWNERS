@@ -1,0 +1,4 @@
+# Trace 开工合同文件的合并须产品负责人本人批准（Issue #620）。
+# 本文件配合 main 规则集的「Require review from Code Owners」生效；只覆盖合同文件，
+# 任务表 / 验收与其他文档不受影响。
+docs/traces/**/合同.md @Moshuiwang
