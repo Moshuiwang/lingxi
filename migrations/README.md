@@ -11,7 +11,7 @@
 | 当前事实 | 值 |
 | --- | --- |
 | 基线 revision（链首） | `20260806_baseline` |
-| head revision | `0087_preprovision_seams` |
+| head revision | `0088_outreach_message` |
 | 配置文件 | 仓库根目录 `alembic.ini` |
 | revision 目录 | `migrations/alembic/versions/` |
 | 连接串环境变量 | `LINGXI_MIGRATION_DSN`（缺失即失败，无默认值） |
@@ -614,6 +614,25 @@ Issue #541 / rc25 S-8a。`app_user` 新增三列，全部服务同一件事：**
 
 三列都可空、都不进任何对外发布内容、都不参与九十天擦除。downgrade 删除三列
 （有损但不删除业务行）。
+
+## `0088_outreach_message`（主动发送的发送记录）
+
+Issue #586。新表 `outreach_message`：一张主动发出的卡片发给了谁、发的哪一张卡的哪一版
+内容、什么样式、什么时候、结果如何。它同时是**幂等锚点**——`dedupe_key`（内容键 + 用途
++ 收件人）唯一约束加上 `ON CONFLICT ... DO UPDATE ... WHERE status <> 'delivered'` 的
+守卫，让同一份名单重跑既不新增记录也不再发一次；重试沿用同一个 `dedupe_key`，出站
+适配器据此折出同一个平台去重 `uuid`，飞书侧仍然只有一条消息。
+
+- **为什么不复用 `onboarding_completion_notice`**：那张表每一列都绑死在一种通知上
+  （`permission_version` 非空、两个占位变量列、去重键语义是「同一用户同一版权限」），
+  而主动发送是通用能力；两者的重试语义也不同（那张是常驻 outbox 到期自动重发，这张
+  由 ops 脚本再跑一次触发）。
+- **不做九十天到期**：删掉一条已送达记录等于让下一次 `--apply` 对同一个人重发一张
+  欢迎卡，正是本表要堵的事。按数据库设计第九节「当前状态与历史内容分开」归入当前
+  状态；表里没有姓名、邮箱与卡片正文，`user_id` 上的 `ON DELETE CASCADE` 让账号删除
+  编排带走属于他的记录。
+- `BEFORE UPDATE` 触发器冻结 `created_at`/`dedupe_key`/`purpose`，并拒绝把已送达的行
+  退回其它状态。downgrade 删表与触发器函数，真实可执行。
 
 ## `0054_retention_cleanup` 的三条越界边界（保留清理）
 

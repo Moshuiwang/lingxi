@@ -186,6 +186,25 @@ REQUIRED_TEXT_KEYS: tuple[str, ...] = (
     # 给已判定出失败段的 /admin 命令，带段名与实际分段数。
     "admin.unknown_command",
     "admin.unknown_command_detail",
+    # 主动告知的欢迎卡。整张卡按段落拆键，是为了让样式（标题栏／
+    # 字段列表／纯 markdown）在文案一个字都不改的前提下切换；审计里代表这张卡的
+    # 内容键是它们共同的前缀，见 ``core/outreach/welcome_card.WELCOME_CONTENT_KEY``。
+    "outreach.welcome.title",
+    "outreach.welcome.greeting",
+    "outreach.welcome.intro",
+    "outreach.welcome.scope_heading",
+    "outreach.welcome.field_company",
+    "outreach.welcome.field_metric",
+    "outreach.welcome.examples_heading",
+    "outreach.welcome.example_recent",
+    "outreach.welcome.example_last_month",
+    "outreach.welcome.example_document",
+    "outreach.welcome.contact_heading",
+    "outreach.welcome.contact_body",
+    "outreach.welcome.footnote",
+    "outreach.welcome.company_word_multi",
+    "outreach.welcome.company_scope_all",
+    "outreach.welcome.company_scope_folded",
 )
 
 REQUIRED_CARD_KEYS: tuple[str, ...] = (

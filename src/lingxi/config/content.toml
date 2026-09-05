@@ -1,5 +1,5 @@
 [meta]
-version = "2026-09-03-3"
+version = "2026-09-05"
 
 [texts]
 "onboarding.checking" = "已收到，正在核对你的身份和银河权限，请稍候。无需重复发送。"
@@ -312,6 +312,43 @@ version = "2026-09-03-3"
 # {segment_count} 是分段计数，同样不回显原文。
 "admin.unknown_command" = "未识别的管理命令，请发送 /admin help 查看可用命令。"
 "admin.unknown_command_detail" = "这条管理命令没有完全看懂：{hint}（实际收到 {segment_count} 段参数）。请发送 /admin help 查看正确格式后重发。"
+
+# 主动告知的欢迎卡（Issue #586）。逐字文案由产品负责人 2026-09-04 批准，**样式待定**：
+# D-1 要在真机预检看到渲染后才定稿（甲＝标题栏＋markdown 分段＋无按钮，乙＝字段列表，
+# 丙＝纯 markdown 无标题栏）。因此这里按段落拆键、不写成一整段 body——样式换了这些字
+# 一个都不用改，改判只落在 core/outreach/welcome_card.py 的一个纯函数上。
+#
+# 卡片标题：批准文案本身没有标题行，标题栏是样式带来的位置，因此只写一句不含任何新
+# 承诺的欢迎语。
+"outreach.welcome.title" = "欢迎使用 BI Plus"
+"outreach.welcome.greeting" = "你好，{name}。"
+"outreach.welcome.intro" = "我是 BI Plus，四达时代的经营数据助手。你可以直接用中文问我经营数据，我会按你的权限范围取数作答，也能把结果整理成飞书文档发给你。"
+# 四个字段标题。字段列表样式把它们放进左列，markdown 分段样式把它们与取值用冒号拼成
+# 一行——两种读法共用同一份字，冒号是标点、留在代码里。
+"outreach.welcome.scope_heading" = "你当前可用范围"
+"outreach.welcome.field_company" = "公司"
+"outreach.welcome.field_metric" = "指标"
+"outreach.welcome.examples_heading" = "可以这样开始"
+# 两条示例都用**这个人自己**的指标名，不写死「充值金额」：批准的取值规则要求示例随
+# 范围变，而一条他没有权限的指标同样会让他问出拿不到的结果——与「单一公司却说各公司」
+# 是同一类错误。批准文案里的示例「最近七天尼日利亚的充值金额是多少」正是本模板在
+# 「单公司 + 充值金额」下的取值。
+"outreach.welcome.example_recent" = "最近七天{company_word}的{metric_name}是多少"
+"outreach.welcome.example_last_month" = "上个月{company_word}的{metric_name}是多少"
+"outreach.welcome.example_document" = "把上面的结果整理成一份文档"
+"outreach.welcome.contact_heading" = "遇到问题"
+# 联系方式不放可点击链接（#541 裁定，理由见该 Issue）：飞书 open_id 按应用隔离，
+# 裸 openId 会解析到别的应用；个人邀请链接带账号 token 且会过期。
+"outreach.welcome.contact_body" = "结果不对或用不起来，请联系王志鹏（wangzp@startimes.com.cn）。反馈时请附上截图、你提问的原话、以及大致时间，这样定位最快。"
+# 批准文案里这一行前面标着「（脚注）」，那是排版位置的标注、不是要显示给用户的字：
+# 卡片里真出现「（脚注）」两个字会被读成漏删的编辑标记。位置由样式承担（永远排在
+# 最后一段），字面不带标注。
+"outreach.welcome.footnote" = "本条由 BI Plus 主动发送，你可以直接开始提问。"
+# 三条取值规则里的两个展示词。公司位在通配（全非）与超过上限时都不能把编号列表
+# 直接给用户看，两种情形的读法不同，因此是两条不同的话，不是一条带参数的话。
+"outreach.welcome.company_word_multi" = "各公司"
+"outreach.welcome.company_scope_all" = "全部公司（{count} 家）"
+"outreach.welcome.company_scope_folded" = "{count} 家公司"
 
 [cards."query.status"]
 title = "正在查询"

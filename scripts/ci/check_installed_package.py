@@ -515,6 +515,17 @@ REQUIRED_MODULES = (
     "lingxi.core.permission.targeted_recompute",
     "lingxi.adapters.postgres_targeted_recompute_lookup",
     "lingxi.adapters.postgres_permission_recompute_trigger",
+    # 主动发送能力（Issue #586）：组卡取值规则、收件人装配与发送编排在 core，
+    # 面向用户 open_id 的卡片出站与发送记录读写在 adapters。调用方是随 scheduler
+    # 镜像发布的 `scripts/ops/outreach.py`（同 preprovision 那条受控运行脚本的
+    # 形态，不是常驻进程），因此没有任何进程会模块级 import 它们——"本地测试全绿
+    # 但 wheel 里没有这个模块"正是 V-部署-10 要挡的形状。
+    "lingxi.core.outreach",
+    "lingxi.core.outreach.welcome_card",
+    "lingxi.core.outreach.audience",
+    "lingxi.core.outreach.dispatch",
+    "lingxi.adapters.feishu_user_card",
+    "lingxi.adapters.postgres_outreach",
 )
 
 # 源码树里仍保留的 Bot-Test / 历史受控验证资产。它们不是正式用户路径的漏项，但正式
