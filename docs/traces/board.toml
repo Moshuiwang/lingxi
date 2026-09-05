@@ -1,0 +1,64 @@
+# 看板证据源配置（本仓库；Trace #606 体验批起草，trace-kit #17 S-4 / S-8 定稿，2026-09-05）。
+# 用法：python3 <trace-kit 插件>/scripts/board.py --repo-root <本仓库根> --config docs/traces/board.toml（插件 ≥ v0.2.1）
+# schema / 解析规则 / 缺省值：trace-kit plugin/scripts/boardlib/config.py 模块 docstring；示例：plugin/templates/board.toml。
+# 约定：命令只读、单条扁平、显式 timeout、不加 timeout 前缀（引擎按 timeout 杀整个进程组）；ssh 一律 -n。
+# 状态：trace-kit #17 S-8 试穿已在 tz 用本文件跑通（预发空输出→「无容器」、生产 tag 比对、healthy 计数）；改命令请同步核对插件版本。
+
+[trace]
+number = 606
+branch = "batch/606-ux"
+
+[repo]
+slug = "Moshuiwang/lingxi"
+
+[orchestrator]
+tmux_session = "TZ-server"
+window_pattern = "^ux-b[0-9]+$"
+
+[release]
+workflow = "Main Publish"
+
+# 预发：镜像列表第一行最后一个冒号后的 tag（预期形如 20260903-d67f772a3a6f）；== 已发布 tag → 预发已升级。
+[stages.staging]
+label = "预发"
+command = "ssh -n biai-stage 'docker ps --format \"{{.Image}}\"'"
+parse = "regex:(?m)^\\S+:([^:\\s]+)$"
+timeout = 20
+
+# 生产：同上，经部署账号取；== 已发布 tag → 已上生产。
+[stages.production]
+label = "生产"
+command = "ssh -n biplus-prod 'sudo -u bi-ai-deploy docker ps --format \"{{.Image}}\"'"
+parse = "regex:(?m)^\\S+:([^:\\s]+)$"
+timeout = 20
+
+# 完整门禁：Epic Full 在批次分支上的 run 里，作业「Epic Full / gate」未被 skipped 的次数（进行中也计）；上限 5（合同）。
+[budget.full_gate]
+label = "完整门禁"
+cap = 5
+command = "gh run list -R Moshuiwang/lingxi --workflow 'Epic Full' --branch batch/606-ux --limit 30 --json databaseId --jq '.[].databaseId' | xargs -r -P 4 -I{} gh api repos/Moshuiwang/lingxi/actions/runs/{}/jobs --jq '[.jobs[] | select(.name == \"Epic Full / gate\" and .conclusion != \"skipped\")] | length' | awk '{s += $1} END {print s + 0}'"
+parse = "int"
+timeout = 25
+
+# 纯文档路由：同一批 run 里「Epic Full / gate」被 skipped 的次数；无上限，只计数。
+[budget.docs_only]
+label = "纯文档路由"
+command = "gh run list -R Moshuiwang/lingxi --workflow 'Epic Full' --branch batch/606-ux --limit 30 --json databaseId --jq '.[].databaseId' | xargs -r -P 4 -I{} gh api repos/Moshuiwang/lingxi/actions/runs/{}/jobs --jq '[.jobs[] | select(.name == \"Epic Full / gate\" and .conclusion == \"skipped\")] | length' | awk '{s += $1} END {print s + 0}'"
+parse = "int"
+timeout = 25
+
+# PR 数：批次分支上的 PR（含已关闭）；合同上限 1。
+[budget.pr_count]
+label = "PR"
+cap = 1
+command = "gh pr list -R Moshuiwang/lingxi --head batch/606-ux --state all --json number --jq 'length'"
+parse = "int"
+timeout = 25
+
+# 生产 healthy 容器数：docker ps 状态列里含「(healthy)」的行数（预期 3；精确匹配括号，unhealthy 不计）。
+[[evidence]]
+key = "prod_healthy"
+label = "生产 healthy"
+command = "ssh -n biplus-prod 'sudo -u bi-ai-deploy docker ps --format \"{{.Status}}\"'"
+parse = "count:\\(healthy\\)"
+timeout = 25
