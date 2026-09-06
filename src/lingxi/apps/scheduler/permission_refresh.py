@@ -66,12 +66,13 @@ from lingxi.apps.scheduler.permission_refresh_ports import (
 )
 from lingxi.core.identity.roster_audit import ArchivedIdentity
 from lingxi.core.permission.account_match import MATCHED, match_galaxy_account
-from lingxi.core.permission.legacy_diff import missing_all_scope_metrics
+from lingxi.core.permission.decision_chain import (
+    AllScopeBackfill,
+    LocalOverrideDecisionSource,
+)
 from lingxi.core.permission.local_override import (
     LocalOverrideReadError,
-    LocalPermissionOverrideEntry,
     ResolvedLocalOverrides,
-    resolve_local_overrides,
 )
 from lingxi.core.permission.merge_sources import (
     REASON_LOCAL_OVERRIDE_READ_FAILED,
@@ -124,13 +125,26 @@ class PermissionRefreshDuty:
         self._decisions = sources.decisions
         self._publish_history = sources.publish_history
         self._token_ciphers = sources.token_ciphers
-        self._local_overrides = sources.local_overrides
-        self._legacy_all_scope = sources.legacy_all_scope
         self._role_function_map = role_function_map
         self._metric_translation_map = metric_translation_map
         self._audit = audit
         # 时钟注入：跨轮判重与"今天"的用例要能自己决定日期，不能靠等到明天。
         self._clock = clock or (lambda: datetime.now(_UTC))
+        self._local_override_source = LocalOverrideDecisionSource(
+            reader=sources.local_overrides,
+            on_read_failed=self._audit_local_override_read_failure,
+            metric_translation_map=metric_translation_map,
+            clock=self._clock,
+            backfill=(
+                None
+                if sources.legacy_all_scope is None
+                else AllScopeBackfill(
+                    expander=sources.legacy_all_scope,
+                    on_failed=self._audit_all_scope_refresh_failure,
+                    on_succeeded=self._audit_all_scope_refreshed,
+                )
+            ),
+        )
         # 与同一进程内的其他职责共享停止标志：一次信号让所有职责停止领取新工作。
         self._stop = threading.Event() if stop is None else stop
         self._completed_on: date | None = None
@@ -562,88 +576,44 @@ class PermissionRefreshDuty:
         )
 
     def _resolve_local_overrides(self, user_id: str) -> ResolvedLocalOverrides | None:
-        """读这个人当前生效的本地覆盖条目。**未装配**返回 ``None``，**读不出来一律抛**。
-
-        两种状态刻意不同：未装配是部署事实（合并按"没有本地源"处理，静默）；读取失败是
-        故障，一旦也返回 ``None`` 就与"确实没有本地覆盖"坍缩成同一件事，而合并对此恒等
-        ——一次数据库抖动会产出一份少了本地补授却看起来完整的权限决定。读失败本身记一条
-        ``local_override_skipped``，调用方随后按跳过出口再记一条 ``user_skipped``。
+        """读这个人当前生效的本地覆盖。判据在共用的决定链来源里，这里只接线。
 
         Raises:
             LocalOverrideReadError: 本地覆盖来源读取失败。
         """
-        if self._local_overrides is None:
-            return None
-        entries = self._read_local_override_entries(user_id)
-        entries = self._expand_legacy_all_scope(user_id, entries)
-        return resolve_local_overrides(user_id=user_id, entries=entries)
+        return self._local_override_source.resolve(user_id)
 
-    def _read_local_override_entries(
-        self, user_id: str
-    ) -> tuple[LocalPermissionOverrideEntry, ...]:
-        """读一次本地覆盖条目；**读不出来一律审计后抛**。
+    def _audit_local_override_read_failure(self, user_id: str, error: Exception) -> None:
+        """读不出来：响亮记一条本职责自己的审计。
 
-        本方法是这条来源的**唯一**读取口：合并前的首次读取与补行之后的重读都走这里，
-        因此两次读取的失败姿态天然一致。曾经不一致过——重读失败原地 ``return entries``
-        照旧发布，于是刚给「全部」组补进的那条指标不在本轮的权限决定里，产出的仍然是
-        一份少了本地补授、看起来却完整的决定，正是首次读取要消灭的那件事。
-
-        Raises:
-            LocalOverrideReadError: 本地覆盖来源读取失败。
+        与另外两条链共用判据、各留各的事件名——运维从审计一眼看出是哪条链读失败的。
+        本方法记的是 ``local_override_skipped``；调用方随后按跳过出口再记一条
+        ``user_skipped``，两条各记各的，缺一条运维就断链。
         """
-        try:
-            return tuple(self._local_overrides.effective_entries(user_id=user_id))
-        except Exception as error:  # 读不出来只跳过这个人，不带走整轮
-            self._audit.record(
-                "permission_refresh.local_override_skipped",
-                user=user_id,
-                reason=REASON_LOCAL_OVERRIDE_READ_FAILED,
-            )
-            logger.error(
-                "本地权限覆盖读取失败，本轮该用户跳过 user=%s error=%s",
-                user_id,
-                type(error).__name__,
-            )
-            raise LocalOverrideReadError() from error
+        self._audit.record(
+            "permission_refresh.local_override_skipped",
+            user=user_id,
+            reason=REASON_LOCAL_OVERRIDE_READ_FAILED,
+        )
+        logger.error(
+            "本地权限覆盖读取失败，本轮该用户跳过 user=%s error=%s",
+            user_id,
+            type(error).__name__,
+        )
 
-    def _expand_legacy_all_scope(
-        self, user_id: str, entries: tuple[LocalPermissionOverrideEntry, ...]
-    ) -> tuple[LocalPermissionOverrideEntry, ...]:
-        """给「全部」组随当前映射补齐新指标。
+    def _audit_all_scope_refresh_failure(self, user_id: str, error: Exception) -> None:
+        """「全部」组补行失败：只留痕，本轮按既有行照常发布。"""
+        self._audit.record(
+            "permission_refresh.legacy_all_scope_refresh_failed",
+            user=user_id,
+            error=type(error).__name__,
+        )
 
-        缺才补、同组标识、撤销过的组不参与（只看生效条目）；补行成功后重读一次条目让本轮
-        合并直接带上新行。**补行失败与重读失败刻意不同**：补行失败只审计、本轮按既有行照常
-        发布（这一轮的决定并不因此缺内容）；重读失败则与首次读取同姿态抛出——这一刻库里
-        已经多了一条本轮读不到的补行，照旧发布等于用不完整的信息提交权限决定。
-
-        Raises:
-            LocalOverrideReadError: 补行之后的重读失败。
-        """
-        if self._legacy_all_scope is None:
-            return entries
-        missing = missing_all_scope_metrics(entries, self._metric_translation_map)
-        if not missing:
-            return entries
-        added_total = 0
-        for group_id, metrics in missing.items():
-            try:
-                added = self._legacy_all_scope.expand_all_scope_group(
-                    user_id=user_id, group_id=group_id, metrics=metrics, now=self._clock()
-                )
-            except Exception as error:  # 补行失败不影响本轮既有合并
-                self._audit.record(
-                    "permission_refresh.legacy_all_scope_refresh_failed",
-                    user=user_id,
-                    error=type(error).__name__,
-                )
-                continue
-            self._audit.record(
-                "permission_refresh.legacy_all_scope_refreshed", user=user_id, added=added
-            )
-            added_total += added
-        if added_total == 0:
-            return entries
-        return self._read_local_override_entries(user_id)
+    def _audit_all_scope_refreshed(self, user_id: str, added: int) -> None:
+        """「全部」组补行成功：留下实际新增的行数。"""
+        self._audit.record(
+            "permission_refresh.legacy_all_scope_refreshed", user=user_id, added=added
+        )
 
     def _revoke(
         self,

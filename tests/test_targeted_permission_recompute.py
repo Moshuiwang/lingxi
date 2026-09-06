@@ -496,7 +496,7 @@ class LegacyAllScopeRecomputeTests(unittest.TestCase):
         """**补行之后的重读失败**：与首次读取同姿态收敛成 ``SKIPPED``，一条决定都不落。
 
         库里此刻已经多了一条本次读不到的指标，照旧发布就是用不完整的信息提交权限决定。
-        变异锚点：把 ``_expand_legacy_all_scope`` 末尾的重读改回 ``return entries``
+        变异锚点：把决定链 ``_complete_all_scope`` 末尾的重读改回 ``return entries``
         → 本用例变红。
         """
 

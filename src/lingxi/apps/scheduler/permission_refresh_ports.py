@@ -15,7 +15,7 @@ from typing import Any, Protocol
 
 from lingxi.core.identity.roster_audit import ArchivedIdentity
 from lingxi.core.identity.roster_snapshot import StoredSnapshotFacts
-from lingxi.core.permission.local_override import LocalPermissionOverrideEntry
+from lingxi.core.permission.decision_chain import AllScopeExpander, LocalOverrideReader
 from lingxi.core.permission.merge_sources import REASON_LOCAL_OVERRIDE_READ_FAILED
 
 _UTC = UTC
@@ -205,29 +205,12 @@ class _DecisionStore(Protocol):
     ) -> _Decision: ...
 
 
-class _LegacyAllScopeExpander(Protocol):
-    """「全部」组的补行口。
-
-    新指标进入映射后，每日重算把缺项按同组标识追加成行；未装配时行为与接线前逐字节一致。
-    """
-
-    def expand_all_scope_group(
-        self, *, user_id: str, group_id: str, metrics: Sequence[str], now: datetime
-    ) -> int: ...
-
-
-class _LocalOverrideReader(Protocol):
-    """本地权限覆盖的按用户读取口。
-
-    本协议只认纯类型的覆盖条目，不认数据库分配的行标识：本职责只需要「这个用户当前生效的
-    覆盖条目有哪些」，不需要收回单条覆盖的能力。
-
-    未装配与读取失败在调用方眼里是**不同**的两件事：前者静默按「没有本地源」处理（部署事实，
-    不告警）；后者响亮审计。但结果都是「这一轮或这个用户跳过本地源」——不整轮失败、不静默
-    吞掉异常。
-    """
-
-    def effective_entries(self, *, user_id: str) -> Sequence[LocalPermissionOverrideEntry]: ...
+# 「全部」组的补行口与本地覆盖的按用户读取口：形状由决定链定义，三入口共用一份，
+# 这里只保留本模块沿用的名字。两个口都只认纯类型的覆盖条目、不认数据库行标识——
+# 本职责要的是「这个用户当前生效的覆盖条目有哪些」，不需要收回单条覆盖的能力。
+# 未装配与读取失败在调用方眼里是**不同**的两件事，判据见决定链模块。
+_LegacyAllScopeExpander = AllScopeExpander
+_LocalOverrideReader = LocalOverrideReader
 
 
 @dataclass(frozen=True)
