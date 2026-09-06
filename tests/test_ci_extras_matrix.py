@@ -70,7 +70,7 @@ class CiMatrixReconciliationTest(unittest.TestCase):
         self.assertEqual([], failures)
 
     def test_matrix_leg_for_an_undeclared_extra_is_reported(self) -> None:
-        """反向：矩阵里有制品没声明的组，那条腿必然失败，应提前报出来。"""
+        """反向：矩阵里有制品没声明的组，那条矩阵路径必然失败，应提前报出来。"""
 
         failures = CHECKER.check_ci_matrix(
             {"scheduler"},

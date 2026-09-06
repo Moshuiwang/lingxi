@@ -735,7 +735,7 @@ RESET SESSION AUTHORIZATION;
 scheme 决定，少了它干净环境跑 `upgrade` 会报 `No module named 'psycopg'`。
 传递闭包实测为五项：SQLAlchemy、Mako、MarkupSafe、greenlet、typing-extensions
 （`psycopg-binary` 不在此列，它来自 `psycopg[binary]` 的直接声明）。
-`CI / extras (migrate)` 那条矩阵腿在干净虚拟环境里证明它单独装得上、且驱动真的能导入。
+`CI / extras (migrate)` 那条矩阵路径在干净虚拟环境里证明它单独装得上、且驱动真的能导入。
 
 ## 测试资产（`migrations/testing/*.sql`）
 

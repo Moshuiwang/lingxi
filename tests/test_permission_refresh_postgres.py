@@ -975,7 +975,7 @@ class GalaxySnapshotReaderTest(PermissionRefreshPostgresTestCase):
     def test_a_batch_superseded_between_selection_and_read_is_rejected(self) -> None:
         """读取期间**一次新导入完成**：手里这份行是上一批的，整轮失败关闭。
 
-        这是复核判据从「A 仍 complete 未过期」改成「A 仍是**当前**批次」要挡的那条腿：
+        这是复核判据从「A 仍 complete 未过期」改成「A 仍是**当前**批次」要挡的那个环节：
         旧批次转 ``superseded`` 之后它本身仍然 complete、仍然未过期，旧判据一路放行，
         于是用刚被取代的权限覆盖新权限——而外部发布表没有版本号，谁也发现不了。
         """

@@ -584,7 +584,7 @@ PROCESS_RUNTIME_IMPORTS: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {
         # 运行时检查只用 find_spec 定位它；静态闭包仍必须把这个真正的启动入口登记。
         # 花名册审计日报（#52）的两个 adapter 由 `build_loop` **在函数内** import。
         # 函数内 import 意味着"进程能起来"证明不了"这两个模块装得上"——正是 #29 之后
-        # 建立的防漂移机制在这里的缺口：不列进来，extras 那条干净环境的腿永远不会红。
+        # 建立的防漂移机制在这里的缺口：不列进来，extras 那条干净环境的路径永远不会红。
         (
             "lingxi",
             "lingxi.apps",
@@ -605,7 +605,7 @@ PROCESS_RUNTIME_IMPORTS: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {
             # 的全文件级 NonBlockingTest 否定扫描连坐命中合法的通知退避 `sleep`）。
             "lingxi.apps.scheduler.permission_readiness_assembly",
             # 首次开通编排（Epic D / S-D-02）：`build_loop` 在函数内 import 本模块与
-            # 它的适配器，因此必须显式登记——不列进来，extras 那条干净环境的腿永远
+            # 它的适配器，因此必须显式登记——不列进来，extras 那条干净环境的路径永远
             # 不会红（与本文件其余「函数内 import」条目同一条理由）。
             "lingxi.apps.scheduler.onboarding",
             "lingxi.core.identity.onboarding_config",
@@ -1352,7 +1352,7 @@ PROCESS_RUNTIME_IMPORTS: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {
     #
     # psycopg 与 alembic 并列，不是冗余：alembic 自己不依赖任何驱动，驱动由 URL 的
     # scheme 决定。少了它，`upgrade head` 在干净环境里报 ModuleNotFoundError，而
-    # 这条矩阵腿是唯一会在干净环境里跑的检查（外审实测出的缺口）。
+    # 这条矩阵路径是唯一会在干净环境里跑的检查（外审实测出的缺口）。
     "migrate": ((), ("alembic", "psycopg")),
 }
 
@@ -1738,7 +1738,7 @@ def check_ci_matrix(declared: set[str], workflow_text: str | None) -> list[str]:
         )
     for name in sorted(matrix - declared):
         failures.append(
-            f"extra `{name}`：ci.yml 矩阵里有，但已安装制品没有声明它，那条矩阵腿必然失败。"
+            f"extra `{name}`：ci.yml 矩阵里有，但已安装制品没有声明它，那条矩阵路径必然失败。"
         )
     return failures
 
