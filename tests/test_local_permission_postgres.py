@@ -952,8 +952,7 @@ class AllScopeExpandVsRevocationTests(LocalPermissionOverridePostgresTestCase):
         """真库交错：读 ``effective_entries`` → 管理员整组撤销 → 补齐迟到落库。
 
         缺项用的是重算侧真正调用的 ``missing_all_scope_metrics``，不是手写的常量——
-        复现的就是 ``permission_refresh._expand_legacy_all_scope`` /
-        ``targeted_recompute._expand_legacy_all_scope`` 的形状。
+        复现的就是三入口共用的 ``decision_chain._complete_all_scope`` 的形状。
         """
 
         from lingxi.core.permission.legacy_diff import missing_all_scope_metrics
@@ -1053,6 +1052,188 @@ class AllScopeExpandVsRevocationTests(LocalPermissionOverridePostgresTestCase):
         self.assertEqual(
             len(self.store.effective_entries(user_id=TARGET_USER_ID)), 1, "撤销没成，组仍然生效"
         )
+
+
+class DecisionChainStaleComputeTests(LocalPermissionOverridePostgresTestCase):
+    """受控交错：过时的一次计算不得盖掉后来的决定（IN-05）。
+
+    上一类停在补齐这一步自己零写入；这一类把**整段**「读取来源 → 检查完整性」放进
+    真实交错里跑：决定链先在真库上读到条目、算出缺项，管理员在这中间把整组撤销，补齐
+    才拿到锁落库。四条判据：撤销这个较新决定在库里是终局的（组不复活、新指标一行都不
+    插）；那一轮的链一个字节都不往库里写；**那一轮交出的就是撤销之后的事实**（撤销
+    当轮生效，不用等下一轮）；下一轮同样是撤销之后的事实。
+
+    第三条曾经不成立——补行口报告零新增时链会退回首次读到的旧条目，于是撤销掉的指标
+    被这一轮重新提交成一次权限决定，用户在下一轮之前实际持有已经收回的权限（每日重算
+    一天一轮，最长约一天）。**残留边界**：本类关掉的是锁等待撑开的那个无界窗口；重读
+    到提交之间的毫秒窗口仍在，见 ``decision_chain.py`` 模块文档同名登记。
+    """
+
+    MAPPING = {"88": {"职能": ("m1", "m2")}}
+
+    def _chain(self, store):
+        """按真实装配的形状接一条决定链：读取口要包成条目读回口，补行口是同一个 store。"""
+        from lingxi.adapters.postgres_local_permission import LocalOverrideEntryReader
+        from lingxi.core.permission.decision_chain import (
+            AllScopeBackfill,
+            LocalOverrideDecisionSource,
+        )
+
+        trace: list[tuple[str, object]] = []
+        source = LocalOverrideDecisionSource(
+            reader=LocalOverrideEntryReader(store),
+            on_read_failed=lambda user, error: trace.append(("read_failed", type(error).__name__)),
+            metric_translation_map=self.MAPPING,
+            clock=self._now,
+            backfill=AllScopeBackfill(
+                expander=store,
+                on_failed=lambda user, error: trace.append(("expand_failed", type(error).__name__)),
+                on_succeeded=lambda user, added: trace.append(("expanded", added)),
+            ),
+        )
+        return source, trace
+
+    def _import_group(self, *metrics: str):
+        report = self.store.import_legacy_plan(
+            user_id=TARGET_USER_ID,
+            target_open_id=TARGET_USER_ID,
+            plan=self._plan(all_scope=metrics),
+            now=self._now(),
+        )
+        ids = tuple(
+            row[0]
+            for row in self.query(
+                "SELECT id FROM local_permission_override"
+                " WHERE permission_group_id = %s ORDER BY id",
+                (report.group_id,),
+            )
+        )
+        return report.group_id, ids
+
+    def _patient_store(self) -> PostgresLocalPermissionOverrideStore:
+        from lingxi.adapters.postgres import PostgresTimeouts
+
+        return PostgresLocalPermissionOverrideStore(
+            self._dsn,
+            timeouts=PostgresTimeouts(
+                connect_timeout_seconds=5, statement_timeout_seconds=5, lock_timeout_seconds=5
+            ),
+        )
+
+    def _wait_until_someone_waits_on_a_lock(self) -> None:
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline:
+            waiting = self.query(
+                "SELECT count(*) FROM pg_stat_activity"
+                " WHERE datname = current_database() AND wait_event_type = 'Lock'"
+            )[0][0]
+            if waiting:
+                return
+            time.sleep(0.02)
+        self.fail("决定链的补齐没有停在锁上：本用例要验证的交错前提根本没成立")
+
+    def _run_chain_across_a_revocation(self):
+        """让一条决定链停在补齐的行锁上，撤销先提交，再让它继续。"""
+        from lingxi.core.permission.legacy_diff import missing_all_scope_metrics
+
+        group_id, ids = self._import_group("m1")
+        entries = tuple(item.entry for item in self.store.effective_entries(user_id=TARGET_USER_ID))
+        self.assertEqual(
+            missing_all_scope_metrics(entries, self.MAPPING),
+            {group_id: ("m2",)},
+            "前提：这一轮确实算出了一条缺项，交错才有意义",
+        )
+
+        source, trace = self._chain(self._patient_store())
+        outcome: dict[str, object] = {}
+
+        def run_chain() -> None:
+            try:
+                outcome["resolved"] = source.resolve(TARGET_USER_ID)
+            except Exception as error:  # 交主线程断言，不让线程静默死掉
+                outcome["error"] = error
+
+        revoke_pending = self.add_pending_action(pending_id=new_id("pac"))
+        worker = threading.Thread(target=run_chain)
+        with connect(self._dsn) as holder, holder.cursor() as cursor:
+            cursor.execute("SELECT id FROM app_user WHERE id = %s FOR UPDATE", (TARGET_USER_ID,))
+            worker.start()
+            self._wait_until_someone_waits_on_a_lock()
+            self.assertTrue(
+                _revoke_group_locked(
+                    cursor,
+                    permission_group_id=group_id,
+                    revoked_pending_action_id=revoke_pending,
+                    moment=self._now(),
+                    expected_override_ids=ids,
+                )
+            )
+        worker.join(timeout=30)
+
+        self.assertFalse(worker.is_alive(), "决定链没有在撤销提交后收口")
+        self.assertIsNone(outcome.get("error"), f"决定链异常退出：{outcome.get('error')!r}")
+        return source, trace, outcome
+
+    def test_the_revocation_wins_and_the_group_never_comes_back(self) -> None:
+        """较新决定是终局的：撤销之后到达的补齐一行都不插，组不复活。"""
+
+        _source, trace, _outcome = self._run_chain_across_a_revocation()
+
+        self.assertEqual(trace, [("expanded", 0)], "补行口报告零新增，且没有走失败分支")
+        self.assertEqual(self.store.effective_entries(user_id=TARGET_USER_ID), ())
+        self.assertEqual(
+            self.query("SELECT count(*) FROM local_permission_override WHERE metric_name = 'm2'")[
+                0
+            ][0],
+            0,
+            "被撤销的组不得因为一条新指标而复活出一行",
+        )
+
+    def test_the_stale_round_writes_nothing_at_all(self) -> None:
+        """那一轮的链一个字节都不往库里写：连合成的确认记录都不留。"""
+
+        self._run_chain_across_a_revocation()
+
+        self.assertEqual(
+            self.query(
+                "SELECT count(*) FROM pending_action WHERE reason = %s",
+                ("legacy_all_scope_refresh",),
+            )[0][0],
+            0,
+        )
+
+    def test_the_stale_round_itself_computes_the_facts_after_the_revocation(self) -> None:
+        """**本轮**就交出撤销之后的事实：撤销先提交，过时那一轮不再算出旧内容。
+
+        这是 `E-1⑤` 的落点。接上真实提交口跑过的顺序是：撤销触发的定向重算先落地
+        （``publish_outbox`` 的第一版，空权限），随后这一轮提交第二版又把 ``m1``
+        发了回去。判据落在链交出的结果上——它必须是撤销之后的事实，那样第二版与第
+        一版逐字段相同、根本不会排出新意图。
+
+        变异锚点：把 ``_complete_all_scope`` 的 ``added_total == 0`` 提前返回加回去
+        → 本用例变红（算出的仍是撤销前那份 ``m1``）。
+        """
+
+        _source, _trace, outcome = self._run_chain_across_a_revocation()
+
+        resolved = outcome.get("resolved")
+        self.assertIsNotNone(resolved, "读得出来的空集不是「未装配」")
+        self.assertEqual(
+            (resolved.grants, resolved.suppressions),
+            (frozenset(), frozenset()),
+            "撤销已经提交，这一轮就不该再算出被收回的指标",
+        )
+
+    def test_the_next_round_computes_the_facts_after_the_revocation(self) -> None:
+        """过时不跨轮存活：撤销之后重新开始的一轮交出的同样是空集。"""
+
+        source, _trace, _outcome = self._run_chain_across_a_revocation()
+
+        resolved = source.resolve(TARGET_USER_ID)
+
+        self.assertIsNotNone(resolved, "读得出来的空集不是「未装配」")
+        assert resolved is not None
+        self.assertEqual((resolved.grants, resolved.suppressions), (frozenset(), frozenset()))
 
 
 if __name__ == "__main__":  # pragma: no cover

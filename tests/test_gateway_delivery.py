@@ -287,6 +287,57 @@ class _RecordDeliveryProgressFailsOnce:
         self._queue.record_delivery_progress(**kwargs)
 
 
+class _PerTaskCursorFailure:
+    """代理真实 ``PostgresTaskQueue``：**按 task_id** 决定这一条候选怎么坏。
+
+    ``advance_then_raise`` 里的任务第一次推进游标成功、第二次抛；
+    ``raise_immediately`` 里的任务第一次推进游标就抛（真正的零进展）。按 id 而不是
+    按调用次序分派，是为了让用例不依赖候选发现查询实际返回的顺序。
+    """
+
+    def __init__(
+        self, queue: Any, *, advance_then_raise: set[str], raise_immediately: set[str]
+    ) -> None:
+        self._queue = queue
+        self._advance_then_raise = advance_then_raise
+        self._raise_immediately = raise_immediately
+        self.calls: dict[str, int] = {}
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._queue, name)
+
+    def record_delivery_progress(self, *, task_id: str, **kwargs: object) -> None:
+        seen = self.calls.get(task_id, 0) + 1
+        self.calls[task_id] = seen
+        if task_id in self._raise_immediately:
+            raise RuntimeError("simulated transient database error")
+        if task_id in self._advance_then_raise and seen >= 2:
+            raise RuntimeError("simulated transient database error")
+        self._queue.record_delivery_progress(task_id=task_id, **kwargs)
+
+
+class _RaisesOnNthCursorAdvance:
+    """代理真实 ``PostgresTaskQueue``：第 ``fail_on_call`` 次推进游标时抛。
+
+    用来把"这一轮有没有进展"的两半分开造：``fail_on_call=1`` 是真正的零进展
+    （一次游标都没推进就抛），``fail_on_call=2`` 是"已经推进过、之后才抛"。
+    """
+
+    def __init__(self, queue: Any, *, fail_on_call: int) -> None:
+        self._queue = queue
+        self._fail_on_call = fail_on_call
+        self.calls = 0
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._queue, name)
+
+    def record_delivery_progress(self, **kwargs: object) -> None:
+        self.calls += 1
+        if self.calls == self._fail_on_call:
+            raise RuntimeError("simulated transient database error")
+        self._queue.record_delivery_progress(**kwargs)
+
+
 @unittest.skipUnless(os.environ.get("LINGXI_POSTGRES_DSN") and psycopg_available(), SKIP_REASON)
 class DeliveryConsumerTestCase(unittest.TestCase):
     @classmethod
@@ -338,6 +389,17 @@ class DeliveryConsumerTestCase(unittest.TestCase):
                 reply_to_message_id,content_expires_at)
                VALUES (%s,%s,'usr-1',%s,'问题','running','stable','worker-1',now(),1,%s,now())""",
             (task_id, conversation_id, f"event-{task_id}", reply_to_message_id),
+        )
+
+    def expire_retry_backoff(self, task_id: str) -> None:
+        """把这条任务的重试退避时刻拨到过去，表示"退避窗口已经过去了"。
+
+        退避时刻是库里的 ``timestamptz``，不受注入时钟影响；真库用例表示时间流逝
+        的既有手法就是直接改这类时间列（见 ``QueueDelayHintTests`` 的 ``created_at``）。
+        """
+        self.execute(
+            "UPDATE task SET delivery_retry_after = now() - interval '1 second' WHERE id = %s",
+            (task_id,),
         )
 
     def start_task(self, task_id: str) -> None:
@@ -565,22 +627,20 @@ class CardFailureFallsBackToTextTests(DeliveryConsumerTestCase):
         self.assertEqual(row[2], "msg-text-1")
 
     def test_text_fallback_failure_keeps_task_pending_for_retry(self) -> None:
-        """文本兜底同步捕获到明确失败：清预留位、不确认送达，下一轮可以重试。
+        """文本兜底同步捕获到明确失败：清预留位、不确认送达，退避过后可以重试。
 
-        独立审核 P2-4 修复后，明确失败带有退避——这里用受控时钟把时间拨过退避
-        窗口，验证的仍然是"下一轮重试"这件事本身，不测退避的具体时长。
+        明确失败带有退避，退避时刻**落在库里**；这里把它拨到过去来表示"时间过
+        去了"（同 ``QueueDelayHintTests`` 用 ``created_at`` 表示排队时长的手法），
+        验证的仍然是"下一轮重试"这件事本身，不测退避的具体时长。
         """
 
         self.seed_running_task(task_id="tsk-1", conversation_id="cnv-1")
         self.start_task("tsk-1")
         self.finish_task("tsk-1")
 
-        clock = [0.0]
         cards = RecordingCards(fail_at=1)  # create 本身就失败，直接走文本通道
         texts = RecordingText(fail=True)
-        consumer = DeliveryConsumer(
-            queue=self.queue, cards=cards, texts=texts, monotonic=lambda: clock[0]
-        )
+        consumer = DeliveryConsumer(queue=self.queue, cards=cards, texts=texts)
         consumer.run_once()
 
         row = self.query(
@@ -590,12 +650,12 @@ class CardFailureFallsBackToTextTests(DeliveryConsumerTestCase):
         self.assertIsNone(row[1], "明确失败必须清空预留位，允许下一轮重试")
         self.assertIsNone(row[2])
 
-        # 退避窗口内立即重试一次：不应该产生新的外发尝试（P2-4：无退避会打平台限流）。
-        consumer.run_once()
+        # 退避窗口内立即重试一次：不应该产生新的外发尝试（无退避会打平台限流）。
+        self.assertEqual(consumer.run_once(), 0, "退避窗口内连候选名额都不该占")
         self.assertEqual(len(texts.calls), 1, "退避窗口内不应该再次尝试外发")
 
-        # 时钟拨过退避窗口 + 文本发送恢复正常：下一轮应当成功重试并确认送达。
-        clock[0] += DeliveryConsumer.DEFAULT_FALLBACK_BACKOFF_CAP_SECONDS
+        # 退避时刻拨到过去 + 文本发送恢复正常：下一轮应当成功重试并确认送达。
+        self.expire_retry_backoff("tsk-1")
         texts.fail = False
         consumer.run_once()
         row = self.query("SELECT status FROM task WHERE id='tsk-1'")[0]
@@ -1357,10 +1417,6 @@ class QueueDelayHintTests(DeliveryConsumerTestCase):
         self.assertEqual(len(texts.calls), 2)
 
 
-if __name__ == "__main__":  # pragma: no cover
-    unittest.main()
-
-
 class TerminalReceiptRequiredBeforeConfirmTests(DeliveryConsumerTestCase):
     """IN-03（`V-投递-03`／`V-投递-04`）：**只有本次终态的有效回执**才允许确认送达。
 
@@ -1473,6 +1529,9 @@ class TerminalReceiptRequiredBeforeConfirmTests(DeliveryConsumerTestCase):
         )
         self._assert_not_delivered()
 
+        # 上一轮的明确失败已经写下一段退避；这里把它拨到过去，好让本用例真正跑到
+        # "第二轮拿着旧标识"的那半个窗口——本用例要钉的是回执判据，不是退避。
+        self.expire_retry_backoff("tsk-1")
         spy = _ConfirmDeliverySpy(self.queue)
         processed = DeliveryConsumer(queue=spy, cards=cards, texts=texts).run_once()
 
@@ -1484,23 +1543,23 @@ class TerminalReceiptRequiredBeforeConfirmTests(DeliveryConsumerTestCase):
         )
         self._assert_not_delivered()
 
-    def test_a_backoff_window_with_no_outbound_attempt_is_never_confirmed(self) -> None:
+    def test_a_backoff_window_produces_no_attempt_and_no_confirmation(self) -> None:
         """**安全重试分支的否定面**：退避窗口内这一轮**一次外发都没发生**，
         同样不得确认——旧实现里这条路径返回 ``RETRY_LATER``，照样走去确认。
+        退避落库之后这一轮更进一步：这个任务连候选名额都不占。
         """
 
         self._seed_task_with_terminal()
-        clock = [0.0]
         cards = RecordingCards(fail_at=1)  # create 就被拒，直接走文本通道
         texts = RecordingText(fail=True)
-        consumer = DeliveryConsumer(
-            queue=self.queue, cards=cards, texts=texts, monotonic=lambda: clock[0]
-        )
+        spy = _ConfirmDeliverySpy(self.queue)
+        consumer = DeliveryConsumer(queue=spy, cards=cards, texts=texts)
         consumer.run_once()
         self.assertEqual(len(texts.calls), 1)
 
-        consumer.run_once()  # 退避未到期：不抢预留位、不外发
+        self.assertEqual(consumer.run_once(), 0, "退避窗口内不得占用候选名额")
         self.assertEqual(len(texts.calls), 1, "退避窗口内不得产生新的外发尝试")
+        self.assertEqual(spy.calls, [], "一次外发都没发生的轮次不得发起确认")
         self._assert_not_delivered()
 
     def test_an_in_flight_card_terminal_is_never_retried_automatically(self) -> None:
@@ -1561,7 +1620,7 @@ class TerminalReceiptRequiredBeforeConfirmTests(DeliveryConsumerTestCase):
         self._assert_not_delivered()
 
         # 之后每一轮都抢不到预留位：既不重投，也不会悄悄改走文本通道。
-        clock[0] += DeliveryConsumer.DEFAULT_FALLBACK_BACKOFF_CAP_SECONDS * 10
+        clock[0] += DeliveryConsumer.DEFAULT_RETRY_BACKOFF_CAP_SECONDS * 10
         self.assertEqual(consumer.run_once(), 0, "预留位卡住的任务不进入正常候选")
         self.assertEqual(len(cards.update_calls), 0, "绝不自动重投同一个 sequence")
         self.assertEqual(texts.calls, [])
@@ -1634,3 +1693,146 @@ class TerminalReceiptRequiredBeforeConfirmTests(DeliveryConsumerTestCase):
             ),
             "card",
         )
+
+
+class ThrowAfterProgressDoesNotBackOffTests(DeliveryConsumerTestCase):
+    """抛穿不等于零进展（IN-06）。
+
+    「单任务异常不带走整轮」那条隔离 handler 里一律记一档退避，用的是**候选时刻**
+    读到的 ``retry_attempts``。可推进游标的写回本身会把退避两列清零，因此一条
+    "已经推进过、之后才抛"的任务会被拿旧档位重新记一次退避——最多让一次正在推进的
+    投递白等一个退避窗口（上限 300 秒）。判据改成「本轮确实零进展才记退避」。
+
+    变异锚点：把 ``run_once`` 里的 ``if not self._advanced_this_task:`` 去掉 →
+    ``test_a_throw_after_the_cursor_advanced_records_no_backoff`` 变红。
+    """
+
+    def _seed_started_and_progress(self) -> None:
+        self.seed_running_task(task_id="tsk-1", conversation_id="cnv-1")
+        self.start_task("tsk-1")
+        self.queue.append_delivery_event(
+            task_id="tsk-1",
+            worker_id="worker-1",
+            event_type="progress",
+            idempotency_key="tsk-1:a1:progress:1",
+            elapsed_seconds=3,
+        )
+        # 候选时刻已经累了几档退避：判据错的话会在这个旧值上继续往上加。
+        self.execute("UPDATE task SET delivery_retry_attempts = 5 WHERE id = 'tsk-1'")
+
+    def _run(self, *, fail_on_call: int) -> None:
+        clock = [0.0]
+        failing = _RaisesOnNthCursorAdvance(self.queue, fail_on_call=fail_on_call)
+        consumer = DeliveryConsumer(
+            queue=failing,
+            cards=RecordingCards(),
+            texts=RecordingText(),
+            monotonic=lambda: clock[0],
+        )
+        consumer.run_once()
+
+    def test_a_throw_after_the_cursor_advanced_records_no_backoff(self) -> None:
+        """建卡这一步已经推进过游标（退避两列刚被清零），随后抛：不得再记退避。"""
+
+        self._seed_started_and_progress()
+
+        self._run(fail_on_call=2)
+
+        self.assertEqual(
+            self.scalar("SELECT delivery_retry_attempts FROM task WHERE id='tsk-1'"),
+            0,
+            "推进游标那一步已经把档位清零，抛穿不得拿候选时刻的旧值再记一档",
+        )
+        self.assertIsNone(
+            self.scalar("SELECT delivery_retry_after FROM task WHERE id='tsk-1'"),
+            "已经在推进的投递不该被罚等一个退避窗口",
+        )
+
+    def test_a_throw_before_any_progress_still_records_backoff(self) -> None:
+        """对照：这一轮一次游标都没推进就抛 → 照旧按退避让路，名额不白占。"""
+
+        self._seed_started_and_progress()
+
+        self._run(fail_on_call=1)
+
+        self.assertEqual(
+            self.scalar("SELECT delivery_retry_attempts FROM task WHERE id='tsk-1'"),
+            6,
+            "真正的零进展仍然要在候选时刻的档位上继续往上记",
+        )
+        self.assertIsNotNone(self.scalar("SELECT delivery_retry_after FROM task WHERE id='tsk-1'"))
+
+    def test_a_zero_progress_task_still_backs_off_after_another_task_advanced(self) -> None:
+        """跨任务不变量：同一轮里前面那条推进过，后面这条**真零进展**仍必须记退避。
+
+        「本轮有没有进展」是**每条候选各算各的**。标志位如果不在每条候选开头重置，
+        排在推进过的那条之后的真零进展任务就漏记退避、继续每轮占名额，IN-06 的公平性
+        修复破一半。单任务用例看不见这条泄漏——它要两条候选同轮才成立。
+
+        **不假设候选顺序**：角色按 ``list_pending_delivery_tasks`` 实读回来的次序分派
+        （最后一条当零进展），因此该查询将来改排序也不会让本用例失去判别力。
+
+        变异锚点：删掉 ``_process_task`` 开头那句 ``self._advanced_this_task = False``
+        → 本用例变红（最后那条的退避档位停在候选时刻的旧值、退避时刻仍为空）。
+        """
+
+        for index in range(1, 4):
+            task_id = f"tsk-{index}"
+            self.seed_running_task(task_id=task_id, conversation_id=f"cnv-{index}")
+            self.start_task(task_id)
+            self.queue.append_delivery_event(
+                task_id=task_id,
+                worker_id="worker-1",
+                event_type="progress",
+                idempotency_key=f"{task_id}:a1:progress:1",
+                elapsed_seconds=3,
+            )
+            # 候选时刻已经累了几档退避：判据错的话会在这个旧值上继续往上加。
+            # `created_at` 不碰——库里有触发器禁止改任务创建时间，次序只能实读。
+            self.execute("UPDATE task SET delivery_retry_attempts = 5 WHERE id = %s", (task_id,))
+
+        order = [task.task_id for task in self.queue.list_pending_delivery_tasks(limit=10)]
+        self.assertEqual(len(order), 3, "前提：三条都进候选，跨任务泄漏才有地方发生")
+        *earlier, last = order
+
+        failing = _PerTaskCursorFailure(
+            self.queue, advance_then_raise=set(earlier), raise_immediately={last}
+        )
+        consumer = DeliveryConsumer(
+            queue=failing,
+            cards=RecordingCards(),
+            texts=RecordingText(),
+            monotonic=lambda: 0.0,
+        )
+        consumer.run_once()
+
+        processed = list(failing.calls)
+        self.assertGreater(
+            processed.index(last),
+            0,
+            "前提不成立：零进展那条被排在了最前面，这一轮根本没有推进过的任务可供泄漏，"
+            "本用例失去判别力——次序若真的变了，要改的是角色分派，不是把断言放宽",
+        )
+        self.assertEqual(
+            self.scalar("SELECT delivery_retry_attempts FROM task WHERE id=%s", (last,)),
+            6,
+            "排在推进过的任务之后的真零进展任务，仍然要按候选时刻的档位记退避",
+        )
+        self.assertIsNotNone(
+            self.scalar("SELECT delivery_retry_after FROM task WHERE id=%s", (last,)),
+            "真零进展没记退避＝它下一轮照旧占名额，公平性修复破一半",
+        )
+        for task_id in earlier:
+            with self.subTest(task_id=task_id):
+                self.assertEqual(
+                    self.scalar("SELECT delivery_retry_attempts FROM task WHERE id=%s", (task_id,)),
+                    0,
+                    "推进过的那条：档位已被写回清零，不得再记一档",
+                )
+                self.assertIsNone(
+                    self.scalar("SELECT delivery_retry_after FROM task WHERE id=%s", (task_id,))
+                )
+
+
+if __name__ == "__main__":  # pragma: no cover
+    unittest.main()

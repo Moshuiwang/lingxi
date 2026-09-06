@@ -56,6 +56,13 @@ from lingxi.core.admin.pending_action import (
 )
 from lingxi.core.admin.views import AdminUserStatusView
 
+#: 确认/取消端口抛出预期之外的异常时给管理员的 toast。刻意**不**说"未执行"、也不说
+#: "请重试"：走到这一句时业务动作可能**已经提交**（最典型的是提交之后那次纯展示性质
+#: 的回读出故障；真实实现已在 ``adapters/postgres_pending_action`` 就地降级为事务内
+#: 快照，走不到这里）。说成"未执行"会诱发第二次点击，去撞合同「同一项待确认操作最多
+#: 成功执行一次」那道行锁；让异常直接穿透 ``handle()`` 更坏——管理员什么应答都拿不到。
+_RESULT_UNKNOWN_TOAST = "操作结果暂时无法确认，请勿重复点击；稍后查看卡片上的最终状态。"
+
 
 class AdminCardCallbackHandler(_ManagementCardCallbackMixin):
     """``card.action.trigger`` 事件的唯一处理入口。见模块文档。
@@ -132,11 +139,12 @@ class AdminCardCallbackHandler(_ManagementCardCallbackMixin):
     ) -> dict[str, Any] | tuple[_Outcome, PendingAction]:
         """校验 ``decision`` 合法性，调用 ``confirm()``/``cancel()``。
 
-        把两类可重试的数据库故障统一转成一句「系统繁忙」toast。两类故障
-        事务均已整体回滚，pending_action 与目标账号均未改变——这次
-        点击结构上"没有发生过"，管理员可以直接重新点击重试，因此不更新卡片、
-        不带 ``card``；分开记审计动作名与文案便于事后区分。找不到对应的待
-        确认操作（含伪造回调）同样在这里判定，只记审计。
+        把两类可重试的数据库故障统一转成一句「系统繁忙」toast。两类故障事务均已
+        整体回滚，pending_action 与目标账号均未改变——这次点击结构上"没有发生过"，
+        管理员可以直接重新点击重试，因此不更新卡片、不带 ``card``；分开记审计动作名
+        与文案便于事后区分。找不到对应的待确认操作（含伪造回调）同样在这里判定，
+        只记审计。**其余任何异常一律不按"未执行"处理**：那两句只有"事务确实整体回滚
+        了"才配得上，剩下的异常**结果不明**，见 :data:`_RESULT_UNKNOWN_TOAST`。
         """
         if decision not in (DECISION_CONFIRM, DECISION_CANCEL):
             self._audit.record("admin.card_callback.unknown_decision", trace_id=trace_id)
@@ -166,6 +174,14 @@ class AdminCardCallbackHandler(_ManagementCardCallbackMixin):
                 classification=error.classification,
             )
             return _toast_error("系统繁忙，请稍后重试")
+        except Exception as error:  # 见方法文档：结果不明不得说成未执行
+            self._audit.record(
+                "admin.card_callback.decision_result_unknown",
+                pending_action_id=pending_action_id,
+                trace_id=trace_id,
+                error=type(error).__name__,
+            )
+            return _toast_error(_RESULT_UNKNOWN_TOAST)
 
         if outcome.pending is None:
             self._audit.record(

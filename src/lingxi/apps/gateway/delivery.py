@@ -63,9 +63,8 @@ class _FallbackOutcome(Enum):
     """``DeliveryConsumer._send_fallback`` 的结果分类。
 
     只有 ``SENT`` 才意味着这一条终态真的落到了文本通道上（并因此带回一枚
-    终态回执）；``RETRY_LATER``（退避未到期、预留位没抢到、明确失败）与
-    ``UNCERTAIN`` 都不推进游标、都不允许确认送达，区别只在告警口径与是否
-    进入重试退避。
+    终态回执）；``RETRY_LATER``（预留位没抢到、明确失败）与 ``UNCERTAIN``
+    都不推进游标、都不允许确认送达，区别只在告警口径与是否进入重试退避。
     """
 
     SENT = "sent"
@@ -86,14 +85,25 @@ class _CardFinishOutcome(Enum):
 
 
 class DeliveryConsumer:
-    """一轮读若干候选任务、逐个驱动到底；异常按任务隔离，一个任务失败不带走整轮。"""
+    """一轮读若干候选任务、逐个驱动到底；异常按任务隔离，一个任务失败不带走整轮。
 
-    # uncertain 告警与文本兜底重试原来完全没有退避，默认 `poll_interval=1.0s`
+    **一轮零进展的任务要让出名额**：候选按 ``created_at`` 取前若干个，一条持续失败
+    的老任务不让路就会每轮占满整批、把批量上限之外的健康用户永远挡在候选之外。因此
+    "没成交"与"抛穿"两种零进展轮次都把下次可再试的时刻写回数据库（见
+    :meth:`_record_retry_backoff`），由候选发现查询过滤——扩大批量上限不是修复，
+    那只是把"前 N 名"换成更大的 N。
+    """
+
+    # uncertain 告警与外发重试原来完全没有退避，默认 `poll_interval=1.0s`
     # 下会变成每秒一次的告警/外发洪流。这两个默认值把它们收敛到"仍然会被
     # 看见，但不再洪泛"——具体数值不是硬性产品承诺，可按需调。
     DEFAULT_ALERT_MIN_INTERVAL_SECONDS = 300.0
-    DEFAULT_FALLBACK_BACKOFF_BASE_SECONDS = 2.0
-    DEFAULT_FALLBACK_BACKOFF_CAP_SECONDS = 300.0
+    DEFAULT_RETRY_BACKOFF_BASE_SECONDS = 2.0
+    DEFAULT_RETRY_BACKOFF_CAP_SECONDS = 300.0
+    # 指数退避的档位上限。退避档位现在跨进程重启保持有效，一条持续失败的任务
+    # 累积的次数不再自动清零；不封顶时 `2 ** attempts` 会涨成一个大整数，与
+    # 浮点秒数相乘直接溢出。封在这里，退避时长本身仍由 cap 决定。
+    MAX_RETRY_BACKOFF_EXPONENT = 30
     # 连续多少轮循环级异常才上报。一次瞬时错误下一轮就会自己好，为它告警只会
     # 让真信号被噪音淹没；"连着几轮都失败"才意味着投递能力已经实际停摆。取 3：
     # 默认 1 秒轮询下约 3 秒即报，同时把单点抖动挡在告警之外，数值可按需调。
@@ -119,8 +129,8 @@ class DeliveryConsumer:
         uncertain_limit: int = 50,
         monotonic: Callable[[], float] = time.monotonic,
         alert_min_interval_seconds: float = DEFAULT_ALERT_MIN_INTERVAL_SECONDS,
-        fallback_backoff_base_seconds: float = DEFAULT_FALLBACK_BACKOFF_BASE_SECONDS,
-        fallback_backoff_cap_seconds: float = DEFAULT_FALLBACK_BACKOFF_CAP_SECONDS,
+        retry_backoff_base_seconds: float = DEFAULT_RETRY_BACKOFF_BASE_SECONDS,
+        retry_backoff_cap_seconds: float = DEFAULT_RETRY_BACKOFF_CAP_SECONDS,
         loop_failure_alert_threshold: int = DEFAULT_LOOP_FAILURE_ALERT_THRESHOLD,
         queue_delay_hint_seconds: float = DEFAULT_QUEUE_DELAY_HINT_SECONDS,
         queue_delay_hint_limit: int = DEFAULT_QUEUE_DELAY_HINT_LIMIT,
@@ -139,19 +149,18 @@ class DeliveryConsumer:
         self._uncertain_limit = uncertain_limit
         self._monotonic = monotonic
         self._alert_min_interval_seconds = alert_min_interval_seconds
-        self._fallback_backoff_base_seconds = fallback_backoff_base_seconds
-        self._fallback_backoff_cap_seconds = fallback_backoff_cap_seconds
+        self._retry_backoff_base_seconds = retry_backoff_base_seconds
+        self._retry_backoff_cap_seconds = retry_backoff_cap_seconds
         self._loop_failure_alert_threshold = loop_failure_alert_threshold
         self._queue_delay_hint_seconds = queue_delay_hint_seconds
         self._queue_delay_hint_limit = queue_delay_hint_limit
-        # 进程内、非持久化状态：只用来给告警与外发重试限速，重启后清零属于可接受
-        # 的降级（重启本身就已经是一次重新评估的机会）。
+        # 进程内、非持久化状态：**只**给告警节流用。重启后清零是可接受的降级——
+        # 重启本身就是一次重新评估的机会。外发重试退避不在这里：它有意落库、
+        # 跨重启保留（迁移 0090），清零会让一条正在退避的任务立刻重新占名额。
         self._last_alerted_at: dict[tuple[str, str], float] = {}
-        # 退避簿记按任务分键。**只有文本兜底这一条通道有退避**：卡片终态通道没有
-        # 平台去重键，结果不明时一律保留预留位转人工核对，从来不产生"退避之后再投
-        # 一次"的动作，因此这里不留一个空转的第二条通道假装它在工作。
-        self._fallback_attempts: dict[str, int] = {}
-        self._fallback_next_attempt_at: dict[str, float] = {}
+        # 当前这一条候选本轮有没有推进过消费游标（见 `_advance_delivery_cursor`）。
+        # 单条循环、逐个任务处理，因此一个标志就够，不需要按任务分桶。
+        self._advanced_this_task = False
         # 已经发过排队提示的任务 id：同一姿态的进程内、非持久化状态——只用来
         # 避免同一个任务每轮轮询都重发一次提示。每轮与当前候选集合取交集
         # 自然收缩（见 `_notify_stale_queued`），不会无界增长。
@@ -177,24 +186,43 @@ class DeliveryConsumer:
         self._last_alerted_at[key] = now
         self._alert(kind, task_id)
 
-    def _fallback_backoff_ready(self, task_id: str) -> bool:
-        """文本兜底这条通道的这个任务是否过了退避窗口，可以再产生一次外发尝试。"""
-        deadline = self._fallback_next_attempt_at.get(task_id)
-        return deadline is None or self._monotonic() >= deadline
+    def _advance_delivery_cursor(self, **fields: Any) -> None:
+        """推进消费游标，并记下"这一轮确实有进展"。
 
-    def _record_fallback_attempt_failed(self, task_id: str) -> None:
-        """记一次没有成交的文本兜底尝试，指数退避（有上限）。"""
-        attempts = self._fallback_attempts.get(task_id, 0) + 1
-        self._fallback_attempts[task_id] = attempts
-        backoff = min(
-            self._fallback_backoff_base_seconds * (2 ** (attempts - 1)),
-            self._fallback_backoff_cap_seconds,
-        )
-        self._fallback_next_attempt_at[task_id] = self._monotonic() + backoff
+        三处推进游标的地方都走这一个口。写回本身会把退避两列清零（这条通道刚被证明
+        是通的），因此"推进过"与"该不该记退避"是同一件事的两面：`run_once` 的隔离
+        handler 据此区分真正的零进展与"推进过、之后才抛"。
+        """
+        self._queue.record_delivery_progress(**fields)
+        self._advanced_this_task = True
 
-    def _clear_fallback_backoff(self, task_id: str) -> None:
-        self._fallback_attempts.pop(task_id, None)
-        self._fallback_next_attempt_at.pop(task_id, None)
+    def _record_retry_backoff(self, task: Any) -> None:
+        """记一次"这一轮完全没有进展"，把下次可以再试的时刻**写回数据库**。
+
+        退避落库才谈得上公平：候选发现查询按它过滤，一条正在退避的任务在窗口内
+        根本不进候选，不会每轮占掉一个名额却零进展，健康任务因此排得上。写回失败
+        只降级这一件事——最坏结果是这条任务下一轮照旧进候选，与本机制加入之前
+        一致；它不放宽任何一道防重复的闸，因此不会变成重复投递。
+        """
+        try:
+            # 取值一并纳入 try：本方法只在"单任务异常不带走整轮"那条不变量的隔离
+            # handler 里被调用，那里不允许留任何无保护语句——一条读不出字段的候选
+            # 会把整轮带走，而这一段本来就是降级路径。
+            attempts = task.retry_attempts + 1
+            delay = min(
+                self._retry_backoff_base_seconds
+                * (2 ** min(attempts - 1, self.MAX_RETRY_BACKOFF_EXPONENT)),
+                self._retry_backoff_cap_seconds,
+            )
+            self._queue.record_delivery_retry(
+                task_id=task.task_id, attempts=attempts, delay_seconds=delay
+            )
+        except Exception as error:  # 见方法文档：只降级退避本身
+            logger.error(
+                "投递重试退避写回失败，该任务下一轮照常进入候选 task_id=%s error=%s",
+                task.task_id,
+                type(error).__name__,
+            )
 
     def _note_loop_failure(self, error: BaseException, *, stage: str) -> None:
         """记一次循环级异常：计数、结构化日志，连续到阈值就上报。
@@ -275,6 +303,13 @@ class DeliveryConsumer:
                     task.task_id,
                     type(error).__name__,
                 )
+                # 一轮抛穿＝这个名额白占了。同样按退避让路，否则一条每轮都抛的
+                # 任务会一直排在 `ORDER BY created_at` 的最前面，把批量上限之外
+                # 的健康任务挡在候选之外。**但抛穿不等于零进展**：游标已经推进过
+                # 才抛的那种，退避两列刚被清零，再拿候选时刻读到的旧档位记一次，
+                # 会让一条正在推进的投递白等最多一个退避窗口。
+                if not self._advanced_this_task:
+                    self._record_retry_backoff(task)
         if loop_healthy:
             # 单个任务的失败**不**计入循环级连续计数：它有自己的日志与告警路径，
             # 而且循环本身仍然健康——把两者混在一起会让"某个任务一直失败"伪装成
@@ -365,6 +400,7 @@ class DeliveryConsumer:
         return tuple(snapshots)
 
     def _process_task(self, task: Any) -> None:
+        self._advanced_this_task = False
         events = self._queue.read_delivery_events(
             task_id=task.task_id, after_sequence=task.consumed_sequence
         )
@@ -414,8 +450,8 @@ class DeliveryConsumer:
         （本轮没有任何未消费事件、任务已在 ``awaiting_delivery``、投递标识已落库）。
         后者成立是因为消费游标只在某条通道**确定受理**终态之后才会越过那条事件，它
         让"已送达但确认没成功"的任务下一轮仍会被重新确认。其余一切情况都没有回执：
-        两条通道都失败、退避窗口内一次外发都没发生、预留位没抢到、结果不明——这些
-        轮次里 ``stream.message_id`` 可能只是建进度卡那一轮的旧值（`V-投递-03`）。
+        两条通道都失败、预留位没抢到、结果不明——这些轮次里 ``stream.message_id``
+        可能只是建进度卡那一轮的旧值（`V-投递-03`）。
         """
         fresh = stream.terminal_receipt
         if fresh is not None:
@@ -449,7 +485,7 @@ class DeliveryConsumer:
                     type(error).__name__,
                 )
                 return False
-        self._queue.record_delivery_progress(
+        self._advance_delivery_cursor(
             task_id=task.task_id,
             consumed_sequence=event.sequence,
             card_id=stream.card_id,
@@ -472,7 +508,7 @@ class DeliveryConsumer:
             query_step=query_step,
         )
         try:
-            self._queue.record_delivery_progress(
+            self._advance_delivery_cursor(
                 task_id=task.task_id,
                 consumed_sequence=event.sequence,
                 card_sequence=stream.sequence,
@@ -567,12 +603,11 @@ class DeliveryConsumer:
         if stream.fallback_needed:
             outcome = self._send_fallback(task, stream, content)
             if outcome is not _FallbackOutcome.SENT:
-                # 预留位没抢到、退避未到期（这一轮一次外发都没发生），或外发
-                # 同步捕获到明确失败：这一轮不推进游标，terminal 事件下一轮
-                # 重新处理。
+                # 预留位没抢到，或外发同步捕获到明确失败：这一轮不推进游标，
+                # terminal 事件下一轮（退避窗口过后）重新处理。
                 return
 
-        self._queue.record_delivery_progress(
+        self._advance_delivery_cursor(
             task_id=task.task_id,
             consumed_sequence=event.sequence,
             card_id=stream.card_id,
@@ -584,11 +619,9 @@ class DeliveryConsumer:
     def _send_fallback(
         self, task: Any, stream: CardStream, content: RenderedContent
     ) -> _FallbackOutcome:
-        if not self._fallback_backoff_ready(task.task_id):
-            # 明确失败原来是"清预留位、下一轮原样重试"，默认 1 秒轮询下等于
-            # 对飞书出站接口每秒重试一次。这里不改变"最终会重试"这个语义，
-            # 只是不在退避窗口内再去抢预留位、不产生新的外发尝试。
-            return _FallbackOutcome.RETRY_LATER
+        # 退避窗口本身不在这里判：这个任务能被读成本轮候选，就已经说明窗口过了
+        # （`list_pending_delivery_tasks` 按 `delivery_retry_after` 过滤）。判据
+        # 只留一处，才不会出现"库里说可以试、进程内的旧簿记说不行"这种分歧。
         if not self._queue.reserve_dispatch(task_id=task.task_id, kind="text_send"):
             return _FallbackOutcome.RETRY_LATER
         try:
@@ -596,7 +629,7 @@ class DeliveryConsumer:
         except DeliveryRejectedError as error:
             # 明确失败（白名单）：清预留位，下一轮按退避重试。
             self._queue.clear_dispatch_reservation(task_id=task.task_id)
-            self._record_fallback_attempt_failed(task.task_id)
+            self._record_retry_backoff(task)
             self._alert_deduped("fallback_send_failed:" + type(error).__name__, task.task_id)
             return _FallbackOutcome.RETRY_LATER
         except Exception as error:  # 结果不明（白名单反转）：服务端可能
@@ -611,7 +644,6 @@ class DeliveryConsumer:
                 type(error).__name__,
             )
             return _FallbackOutcome.UNCERTAIN
-        self._clear_fallback_backoff(task.task_id)
         return _FallbackOutcome.SENT
 
     def _maybe_confirm(self, task: Any, receipt: TerminalReceipt) -> None:

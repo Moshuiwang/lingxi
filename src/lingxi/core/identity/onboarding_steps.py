@@ -50,10 +50,13 @@ from lingxi.core.identity.org_snapshot import DirectoryAvailability, SnapshotMem
 from lingxi.core.identity.provisioning import ProvisioningRejection, ProvisioningRequest
 from lingxi.core.identity.stock_token_source import ADOPTABLE, DECRYPT_FAILED, StockTokenLookup
 from lingxi.core.permission.account_match import MATCHED, match_galaxy_account
+from lingxi.core.permission.decision_chain import (
+    LocalOverrideDecisionSource,
+    LocalOverrideReader,
+)
 from lingxi.core.permission.local_override import (
     LocalOverrideReadError,
     ResolvedLocalOverrides,
-    resolve_local_overrides,
 )
 from lingxi.core.permission.mcp_readiness_base import ReadinessBinding, ReadinessOutcome
 from lingxi.core.permission.merge_sources import (
@@ -98,7 +101,6 @@ class OnboardingSteps:
         self._roster = sources.roster
         self._galaxy = sources.galaxy
         self._email_bindings = sources.email_bindings
-        self._local_overrides = sources.local_overrides
         self._stock_tokens = sources.stock_tokens
         self._legacy_importer = sources.legacy_importer
 
@@ -128,6 +130,8 @@ class OnboardingSteps:
         self._sleep = runtime.sleep
         self._clock = runtime.clock or (lambda: datetime.now(_UTC))
         self._should_stop = runtime.should_stop or (lambda: False)
+
+        self._local_override_source = self._build_local_override_source(sources.local_overrides)
 
         self._lock = threading.Lock()
         self._running: dict[str, str] = {}
@@ -538,34 +542,46 @@ class OnboardingSteps:
                 OnboardingState.NOT_AUTHORIZED, KEY_SUSPENDED, reason="account_not_enabled"
             )
 
-    def _resolve_local_overrides(self, user_id: str) -> ResolvedLocalOverrides | None:
-        """读这个人当前生效的本地覆盖条目。**未装配**返回 ``None``，**读不出来一律抛**。
+    def _build_local_override_source(
+        self, reader: LocalOverrideReader | None
+    ) -> LocalOverrideDecisionSource:
+        """接线本地覆盖这条来源。
 
-        两种状态的返回值刻意不同：未装配是部署事实（合并按"没有本地源"处理，静默），
-        读取失败是故障。都返回 ``None`` 的话，两者在合并入口坍缩成同一件事，而合并对
-        "没有本地源"恒等——一次数据库抖动就会给这个人建出一行少了管理员特批的发布内容，
-        且看起来完全正常。抛出让两个调用点（零银河闸、发布步）各自写出收敛出口。
+        **开通链不接补齐口**：它建的是新行，「全部」组的补齐只发生在每日重算与定向
+        重算两条链上。
+        """
+        return LocalOverrideDecisionSource(
+            reader=reader,
+            on_read_failed=self._audit_local_override_read_failure,
+            metric_translation_map=self._metric_translation_map,
+            clock=self._clock,
+        )
+
+    def _resolve_local_overrides(self, user_id: str) -> ResolvedLocalOverrides | None:
+        """读这个人当前生效的本地覆盖。判据在共用的决定链来源里，这里只接线。
+
+        抛出让两个调用点（零银河闸、发布步）各自写出自己的收敛出口。
 
         Raises:
             LocalOverrideReadError: 本地覆盖来源读取失败。
         """
-        if self._local_overrides is None:
-            return None
-        try:
-            entries = tuple(self._local_overrides.effective_entries(user_id=user_id))
-        except Exception as error:
-            self._audit.record(
-                "onboarding.local_override_skipped",
-                user=user_id,
-                reason=REASON_LOCAL_OVERRIDE_READ_FAILED,
-            )
-            logger.error(
-                "本地权限覆盖读取失败，本次开通不再推进 user=%s error=%s",
-                user_id,
-                type(error).__name__,
-            )
-            raise LocalOverrideReadError() from error
-        return resolve_local_overrides(user_id=user_id, entries=entries)
+        return self._local_override_source.resolve(user_id)
+
+    def _audit_local_override_read_failure(self, user_id: str, error: Exception) -> None:
+        """读不出来：响亮记一条开通链自己的审计，两个调用点据此各自收敛。
+
+        与另外两条链共用判据、各留各的事件名——运维从审计一眼看出是哪条链读失败的。
+        """
+        self._audit.record(
+            "onboarding.local_override_skipped",
+            user=user_id,
+            reason=REASON_LOCAL_OVERRIDE_READ_FAILED,
+        )
+        logger.error(
+            "本地权限覆盖读取失败，本次开通不再推进 user=%s error=%s",
+            user_id,
+            type(error).__name__,
+        )
 
     def _await_published(self, outbox_id: str) -> _Terminal | None:
         """等发布意图真的被写出去并逐字段读回一致。

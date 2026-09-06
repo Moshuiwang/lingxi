@@ -47,6 +47,7 @@ class _FakeTask:
     card_seq: int = 0
     message_id: str | None = None
     fallback_text: bool = False
+    retry_attempts: int = 0
     # 不是 ``awaiting_delivery``：这一轮不会走到 ``confirm_delivery``，本文件也就
     # 不需要为它准备任何返回值——要断言的是"这个任务被处理到了"，不是投递结果。
     status: str = "running"
