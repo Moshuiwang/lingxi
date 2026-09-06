@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import importlib.util
 import io
+import re
 import subprocess
 import sys
 import tempfile
@@ -75,6 +76,12 @@ class ExemptionListOnlyShrinksTest(unittest.TestCase):
             "否则任何人都能靠往清单里加文件绕过门禁。确实要放宽，"
             "必须同时改 PINNED_EXEMPTIONS 并在 PR 正文写明裁定依据。",
         )
+
+    def test_the_exemption_mapping_is_read_only(self) -> None:
+        """运行期改不动：否则 `__main__` 里加一条豁免就能骗过 import 期的钉住快照。"""
+
+        with self.assertRaises(TypeError):
+            GATE.EXEMPT_FILES["docs/README.md"] = "运行期塞进来的豁免"
 
     def test_every_exemption_carries_a_reason(self) -> None:
         for path, reason in GATE.EXEMPT_FILES.items():
@@ -178,14 +185,19 @@ class WiringTest(unittest.TestCase):
     #: 路径两个入口都要挂，少一个就等于给它留了最常走的那条入口。
     WIRED_ENTRY_POINTS = ("verify_docs.sh", "verify_repository.sh")
 
+    #: 必须是一条真正会执行的调用行——`assertIn` 那种子串判定连 `# python3 …`
+    #: 这样注释掉的写法都算通过（外审 2026-09-06 实测），因此按行首锚定整行匹配。
+    INVOCATION = re.compile(r"^python3 scripts/ci/check_docs_wording\.py$", re.MULTILINE)
+
     def test_both_gate_entry_points_invoke_the_check(self) -> None:
         for name in self.WIRED_ENTRY_POINTS:
             with self.subTest(entry_point=name):
                 text = (REPO_ROOT / "scripts" / "ci" / name).read_text(encoding="utf-8")
-                self.assertIn(
-                    "python3 scripts/ci/check_docs_wording.py",
+                self.assertRegex(
                     text,
-                    f"{name} 不再调用用词门禁：少挂一个入口，那条路径上的改动就再也扫不到",
+                    self.INVOCATION,
+                    f"{name} 里没有一条会真正执行的用词门禁调用（注释掉也算没有）："
+                    "少挂一个入口，那条路径上的改动就再也扫不到",
                 )
 
 

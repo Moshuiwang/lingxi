@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import subprocess
 import sys
+import types
 from collections.abc import Mapping, Sequence
 from pathlib import Path
 
@@ -34,8 +35,10 @@ REPLACEMENT_HINT = (
     f"「代码{BANNED_CHARACTER}证据」这类用「代码侧证据」。逐句读上下文选词，不要机械全局替换。"
 )
 
-# 豁免清单：路径 → 理由。**精确到文件，不接受目录通配。**
-EXEMPT_FILES: Mapping[str, str] = {
+# 豁免清单：路径 → 理由。**精确到文件，不接受目录通配。**外层包一层只读映射：
+# 否则 `__main__` 里一句 `EXEMPT_FILES[...] = ...` 就能在运行期加一条豁免，而钉住
+# 测试是 import 期读的清单，看不见这次扩容（外审 2026-09-06 实测的绕过路径）。
+_EXEMPT_FILES: Mapping[str, str] = {
     "docs/traces/469-rc22打磨与体验批/合同.md": (
         "产品负责人 2026-09-06 裁定「已经收口的 trace 合同文件不用改了」——历史批准记录不改写"
     ),
@@ -47,6 +50,15 @@ EXEMPT_FILES: Mapping[str, str] = {
     "docs/traces/630-清仓批一/验收.md": "同上：本批验收标准正文即在讨论这个被禁词",
     "docs/技术设计/代码规范.md": "替换表所在处——不写出被禁的词，这张表就没有意义",
 }
+
+EXEMPT_FILES: Mapping[str, str] = types.MappingProxyType(_EXEMPT_FILES)
+
+
+# 已知边界（外审 2026-09-06 实测，明确接受，不构成绕过许可）：按 UTF-8 字节匹配，
+# 因此非 UTF-8 编码（UTF-16/32、GB18030）里的该字扫不到，反过来那些编码的合法
+# 文本也可能偶然含这串字节而被误伤；`read_bytes` 跟随符号链接，读的是目标内容；
+# 本机运行时列的是索引、读的是工作区，暂存后又改回干净内容能骗过本机（CI 是干净
+# 检出，拦得住）。三者都要刻意操纵才能触发，本仓库全部文本是 UTF-8。
 
 
 def tracked_files(root: Path) -> list[str] | None:
