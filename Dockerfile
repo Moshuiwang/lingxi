@@ -33,8 +33,10 @@ FROM python@sha256:4766d8b510c428e595d74b9cc5bbb2fae8e26316fffb4adc89908d79aacd5
 # （scheduler/worker/gateway/migrate）都 `FROM base`，只需构建一次、被四者共用；
 # `-x '/site-packages/'` 排除本阶段仅有的 pip 自带包——它会被各 build-* 阶段的
 # `COPY --from=build-*` 整体替换掉，编译了也白费。`--invalidation-mode
-# unchecked-hash` 与下方各 build-* 阶段的写法一致：按源码哈希而非 mtime 判断
-# 缓存是否失效，不破坏 V-部署-06 的"两次构建等价"。
+# unchecked-hash` 与下方各 build-* 阶段的写法一致：`.pyc` 头里内嵌源码哈希而不是
+# mtime，运行期不再回头校验源码（PEP 552 的 unchecked 即"信任缓存、不校验"）。
+# 选它是因为镜像内源码不会变，而它让产物与构建时刻、检出路径无关——`image_manifest.py`
+# 逐条比 `.pyc` 内容哈希，换成 timestamp 模式会让 V-部署-06 的"两次构建等价"必红。
 #
 # 本机实测（Docker `--read-only` 容器，同一份 digest 基础镜像，非生产内核/架构，
 # 仅作相对比较）：30 次调用 `python3 -c "import argparse,pathlib,logging,
