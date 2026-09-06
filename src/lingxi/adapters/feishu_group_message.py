@@ -22,6 +22,11 @@ from collections.abc import Callable, Mapping
 from typing import Any
 
 from lingxi.adapters.feishu_directory import urllib_transport
+from lingxi.core.delivery.ports import (
+    DeliveryOperation,
+    DeliveryVerdict,
+    classify_delivery_response,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -135,6 +140,32 @@ class FeishuGroupMessages:
         # 改动前完全一致（花名册日报的既有调用点不用改一行）。
         self._uuid_prefix = uuid_prefix
 
+    @staticmethod
+    def _assert_accepted(response: Any) -> None:
+        """按「通知」这一档裁定发送响应：成功码 + 必要标识 ``message_id`` 都要有。
+
+        判定规则集中在 ``core.delivery.ports.DELIVERY_OPERATIONS``，与投递链路
+        共用同一张表。**码缺失不再算成功**：旧写法把 ``code`` 缺失（空响应、
+        HTTP 5xx 带空体）当成放行，于是一次什么都没发出去的调用也会被记成
+        "已发送"。缺 ``message_id`` 同样落"结果不明"：消息可能已经发出，不得
+        据此记成功，也不得当成确定没发生（本接口请求体带 ``uuid`` 去重键，
+        按同一 ``dedupe_key`` 重投不会产生第二条消息）。
+        """
+        if not isinstance(response, Mapping):
+            raise FeishuGroupMessageError("invalid_response_shape", definite=False)
+        data = response.get("data")
+        message_id = data.get("message_id") if isinstance(data, Mapping) else None
+        outcome = classify_delivery_response(
+            operation=DeliveryOperation.NOTICE_SEND,
+            code=response.get("code"),
+            identifier=message_id,
+        )
+        if outcome.verdict is DeliveryVerdict.ACCEPTED:
+            return
+        if outcome.verdict is DeliveryVerdict.REJECTED:
+            raise FeishuGroupMessageError(f"feishu_code_{response.get('code')}")
+        raise FeishuGroupMessageError(outcome.reason, definite=False)
+
     def _notify_send(self, operation: str, succeeded: bool) -> None:
         """把结果交给告警逻辑；告警回调失败不能改变发送语义。"""
         if self._on_send_outcome is None:
@@ -156,13 +187,17 @@ class FeishuGroupMessages:
             body={"app_id": self._app_id, "app_secret": self._app_secret},
         )
         if not isinstance(response, Mapping):
-            raise FeishuGroupMessageError("invalid_response_shape")
+            raise FeishuGroupMessageError("invalid_response_shape", definite=False)
         code = response.get("code")
-        if code not in (None, 0, "0"):
+        if code is None:
+            # fail-closed：真实成功响应一定带 ``code=0``，码缺失（空响应、
+            # HTTP 5xx 带空体）既不是成功也不是拒绝，必须落"结果不明"。
+            raise FeishuGroupMessageError("missing_code", definite=False)
+        if code not in (0, "0"):
             raise FeishuGroupMessageError(f"feishu_code_{code}")
         token = response.get("tenant_access_token")
         if not isinstance(token, str) or not token:
-            raise FeishuGroupMessageError("missing_tenant_access_token")
+            raise FeishuGroupMessageError("missing_tenant_access_token", definite=False)
         return token
 
     def send_text(self, *, chat_id: str, text: str, dedupe_key: str) -> None:
@@ -188,11 +223,7 @@ class FeishuGroupMessages:
                 },
                 token=token,
             )
-            if not isinstance(response, Mapping):
-                raise FeishuGroupMessageError("invalid_response_shape")
-            code = response.get("code")
-            if code not in (None, 0, "0"):
-                raise FeishuGroupMessageError(f"feishu_code_{code}")
+            self._assert_accepted(response)
         except Exception:
             self._notify_send("message_final", False)
             raise
