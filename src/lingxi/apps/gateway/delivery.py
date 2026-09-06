@@ -5,10 +5,10 @@
 
 **重复投递防线**：建卡、终态卡片更新+关闭、文本兜底发送三类外部调用，外发前都必须
 先提交"外发前预留位"，调用有明确结果后立即清空。**只有服务端明确拒绝**才清空、允许
-下一轮重试；其余一切异常都归结果不明，绝不清空，统一转 ``uncertain`` 交给人工核对。
-唯一例外是平台回「仍在发送」且该操作带平台侧幂等/顺序键（只有卡片流式更新与关闭）：
-重投不产生第二份可见内容，清预留位、退避后自动重投。**确认送达的唯一前提是"本次终态
-的有效回执"**，判据见 :meth:`DeliveryConsumer._terminal_receipt`。
+下一轮重试；其余一切异常（含平台回「仍在发送」）都归结果不明，绝不清空，统一转
+``uncertain`` 交给人工核对——**这三类外发一个平台去重键都没有**（CardKit 的 ``sequence``
+是操作序号不是去重键），没有键的重投是在赌"上一次没送到"，赌错就是用户收到第二份完整
+答案。**确认送达的唯一前提是"本次终态的有效回执"**，见 :meth:`._terminal_receipt`。
 
 过程流式正文靠重放 outbox 历史事件重建，没有跨轮次进程内状态；CardKit 10 分钟自动关闭
 窗口靠提前收口文案缓解；三条循环级查询各自异常隔离、连续失败达阈值才上报。
@@ -48,11 +48,6 @@ AlertCallback = Callable[[str, str], None]
 # 会被上报当作 ``trace_id``。用一个固定、符合安全格式的占位标识，让这类告警
 # 在管理群里仍然认得出来源，而不是退化成一条没有任何出处的裸告警。
 LOOP_ALERT_TRACE_ID = "gateway-delivery-loop"
-
-# 退避簿记的通道名。两条通道各自独立计数：文本兜底的明确失败与终态卡片"仍在
-# 发送"的重投是两件事，共用一份计数会让其中一条把另一条压住。
-_CHANNEL_TEXT_FALLBACK = "text_fallback"
-_CHANNEL_CARD_FINISH = "card_finish"
 
 
 def _default_alert(kind: str, task_id: str) -> None:
@@ -152,10 +147,11 @@ class DeliveryConsumer:
         # 进程内、非持久化状态：只用来给告警与外发重试限速，重启后清零属于可接受
         # 的降级（重启本身就已经是一次重新评估的机会）。
         self._last_alerted_at: dict[tuple[str, str], float] = {}
-        # 退避簿记按 ``(通道, 任务)`` 分键：文本兜底与终态卡片重投各自独立计数，
-        # 一条通道的退避不该压住另一条。
-        self._fallback_attempts: dict[tuple[str, str], int] = {}
-        self._fallback_next_attempt_at: dict[tuple[str, str], float] = {}
+        # 退避簿记按任务分键。**只有文本兜底这一条通道有退避**：卡片终态通道没有
+        # 平台去重键，结果不明时一律保留预留位转人工核对，从来不产生"退避之后再投
+        # 一次"的动作，因此这里不留一个空转的第二条通道假装它在工作。
+        self._fallback_attempts: dict[str, int] = {}
+        self._fallback_next_attempt_at: dict[str, float] = {}
         # 已经发过排队提示的任务 id：同一姿态的进程内、非持久化状态——只用来
         # 避免同一个任务每轮轮询都重发一次提示。每轮与当前候选集合取交集
         # 自然收缩（见 `_notify_stale_queued`），不会无界增长。
@@ -181,44 +177,24 @@ class DeliveryConsumer:
         self._last_alerted_at[key] = now
         self._alert(kind, task_id)
 
-    def _backoff_ready(self, channel: str, task_id: str) -> bool:
-        """这条通道的这个任务是否已经过了退避窗口，可以再产生一次外发尝试。"""
-        deadline = self._fallback_next_attempt_at.get((channel, task_id))
+    def _fallback_backoff_ready(self, task_id: str) -> bool:
+        """文本兜底这条通道的这个任务是否过了退避窗口，可以再产生一次外发尝试。"""
+        deadline = self._fallback_next_attempt_at.get(task_id)
         return deadline is None or self._monotonic() >= deadline
 
-    def _record_attempt_failed(self, channel: str, task_id: str) -> None:
-        """记一次没有成交的外发尝试，指数退避（有上限）。"""
-        key = (channel, task_id)
-        attempts = self._fallback_attempts.get(key, 0) + 1
-        self._fallback_attempts[key] = attempts
+    def _record_fallback_attempt_failed(self, task_id: str) -> None:
+        """记一次没有成交的文本兜底尝试，指数退避（有上限）。"""
+        attempts = self._fallback_attempts.get(task_id, 0) + 1
+        self._fallback_attempts[task_id] = attempts
         backoff = min(
             self._fallback_backoff_base_seconds * (2 ** (attempts - 1)),
             self._fallback_backoff_cap_seconds,
         )
-        self._fallback_next_attempt_at[key] = self._monotonic() + backoff
-
-    def _clear_backoff(self, channel: str, task_id: str) -> None:
-        key = (channel, task_id)
-        self._fallback_attempts.pop(key, None)
-        self._fallback_next_attempt_at.pop(key, None)
-
-    def _fallback_backoff_ready(self, task_id: str) -> bool:
-        return self._backoff_ready(_CHANNEL_TEXT_FALLBACK, task_id)
-
-    def _record_fallback_attempt_failed(self, task_id: str) -> None:
-        self._record_attempt_failed(_CHANNEL_TEXT_FALLBACK, task_id)
+        self._fallback_next_attempt_at[task_id] = self._monotonic() + backoff
 
     def _clear_fallback_backoff(self, task_id: str) -> None:
-        self._clear_backoff(_CHANNEL_TEXT_FALLBACK, task_id)
-
-    def _card_finish_backoff_ready(self, task_id: str) -> bool:
-        return self._backoff_ready(_CHANNEL_CARD_FINISH, task_id)
-
-    def _record_card_finish_attempt_failed(self, task_id: str) -> None:
-        self._record_attempt_failed(_CHANNEL_CARD_FINISH, task_id)
-
-    def _clear_card_finish_backoff(self, task_id: str) -> None:
-        self._clear_backoff(_CHANNEL_CARD_FINISH, task_id)
+        self._fallback_attempts.pop(task_id, None)
+        self._fallback_next_attempt_at.pop(task_id, None)
 
     def _note_loop_failure(self, error: BaseException, *, stage: str) -> None:
         """记一次循环级异常：计数、结构化日志，连续到阈值就上报。
@@ -526,10 +502,6 @@ class DeliveryConsumer:
         """
         if stream.card_id is None or stream.fallback_needed:
             return _CardFinishOutcome.CONTINUE
-        if not self._card_finish_backoff_ready(task.task_id):
-            # 上一轮拿到的是"仍在发送"这类可安全重投的不明结论，退避窗口还没到期：
-            # 这一轮不抢预留位、不产生新的外发尝试。
-            return _CardFinishOutcome.HALT
         if not self._queue.reserve_dispatch(task_id=task.task_id, kind="card_finish"):
             # 抢不到：要么上一轮处理到一半崩溃（uncertain，本轮不碰），要么任务
             # 状态发生了竞态。两种情况都不该再调用 finish()。
@@ -548,7 +520,6 @@ class DeliveryConsumer:
                 type(error).__name__,
             )
             return _CardFinishOutcome.HALT
-        self._clear_card_finish_backoff(task.task_id)
         if stream.fallback_needed:
             self._queue.clear_dispatch_reservation(task_id=task.task_id)
         return _CardFinishOutcome.CONTINUE
@@ -556,29 +527,22 @@ class DeliveryConsumer:
     def _handle_uncertain_card_finish(
         self, task: Any, error: DeliveryUncertainError
     ) -> _CardFinishOutcome:
-        """终态卡片更新拿到"结果不明"：按**是否持有平台幂等键**决定还能不能重投。
+        """终态卡片更新拿到"结果不明"：**一律保留预留位**，转人工核对并告警。
 
-        ``retry_safe`` 为真只发生在平台明确回「仍在发送」（``230049``）且该操作
-        带整卡级 ``sequence`` 顺序键的组合上：重投同一份终态正文不会产生第二份
-        用户可见内容，因此清预留位、退避后自动重试，比把任务停在人工核对队列里
-        更贴近用户预期。**其余一切不明一律保留预留位**——没有幂等键的重投是在赌
-        "上一次没送到"，赌错就是重复交付。两种分支都不确认送达、都不推进游标。
+        **卡片通道没有"可安全重投"这一档**，与 :meth:`_send_fallback` 同姿态：CardKit 的
+        整卡级 ``sequence`` 是操作序号不是去重键（同一序号重投会被判成落后序号拒绝、随即
+        降级到文本通道，而卡片里很可能已经有那份答案，用户于是收到第二份完整答案），请求
+        体里也没有 ``uuid``——见 ``core.delivery.ports`` 的 ``card_update``/``card_close``。
+        因此不清预留位、不推进游标、不确认送达：任务此后每轮都抢不到预留位，停在
+        ``awaiting_delivery``，由 ``expire_undelivered_terminals`` 在二十四小时后收敛成
+        "投递已过期，请重新提问"。这是常态出口，只写日志等于把一件要人来看的事埋掉，必须告警。
         """
-        if not error.retry_safe:
-            logger.error(
-                "终态卡片更新结果不明，转入 uncertain 等待人工核对 task_id=%s reason=%s",
-                task.task_id,
-                error.reason,
-            )
-            return _CardFinishOutcome.HALT
-        self._queue.clear_dispatch_reservation(task_id=task.task_id)
-        self._record_card_finish_attempt_failed(task.task_id)
-        logger.info(
-            "终态卡片仍在发送，退避后按平台顺序键安全重投 task_id=%s reason=%s",
+        logger.error(
+            "终态卡片更新结果不明，转入 uncertain 等待人工核对 task_id=%s reason=%s",
             task.task_id,
             error.reason,
         )
-        self._alert_deduped("card_finish_in_flight:" + error.reason, task.task_id)
+        self._alert_deduped("card_finish_uncertain:" + error.reason, task.task_id)
         return _CardFinishOutcome.HALT
 
     def _handle_terminal(self, task: Any, stream: CardStream, event: Any) -> None:

@@ -476,8 +476,24 @@ class TargetedPermissionRecompute:
         """
         if self._local_overrides is None:
             return None
+        entries = self._read_local_override_entries(user_id)
+        entries = self._expand_legacy_all_scope(user_id, entries)
+        return resolve_local_overrides(user_id=user_id, entries=entries)
+
+    def _read_local_override_entries(
+        self, user_id: str
+    ) -> tuple[LocalPermissionOverrideEntry, ...]:
+        """读一次本地覆盖条目；**读不出来一律审计后抛**。
+
+        与每日批 ``permission_refresh._read_local_override_entries`` 同一语义：这条来源
+        只有这一个读取口，合并前的首次读取与补行之后的重读都走它，两次失败的姿态因此
+        天然一致（重读失败曾经原地退回旧条目照旧发布，等于用不完整的信息提交权限决定）。
+
+        Raises:
+            LocalOverrideReadError: 本地覆盖来源读取失败。
+        """
         try:
-            entries = tuple(self._local_overrides.effective_entries(user_id=user_id))
+            return tuple(self._local_overrides.effective_entries(user_id=user_id))
         except Exception as error:  # 读不出来只跳过这次重算，不产出半份结果
             self._audit.record(
                 "permission_targeted_recompute.local_override_skipped",
@@ -485,8 +501,6 @@ class TargetedPermissionRecompute:
                 reason=SKIP_LOCAL_OVERRIDE_READ_FAILED,
             )
             raise LocalOverrideReadError() from error
-        entries = self._expand_legacy_all_scope(user_id, entries)
-        return resolve_local_overrides(user_id=user_id, entries=entries)
 
     def _expand_legacy_all_scope(
         self, user_id: str, entries: tuple[LocalPermissionOverrideEntry, ...]
@@ -494,7 +508,11 @@ class TargetedPermissionRecompute:
         """「2.0 迁移导入·全部」组随当前映射补齐新指标。
 
         与每日批 ``permission_refresh._expand_legacy_all_scope`` 同一语义：缺才补、
-        同组 ID、只看生效条目；补行或重读失败只审计、不影响本次既有结果。
+        同组 ID、只看生效条目；补行失败只审计、本次按既有行照常算，重读失败与首次读取
+        同姿态抛出（库里已经多了一条本次读不到的补行，照旧发布就是半份结果）。
+
+        Raises:
+            LocalOverrideReadError: 补行之后的重读失败。
         """
         if self._legacy_all_scope is None:
             return entries
@@ -522,10 +540,7 @@ class TargetedPermissionRecompute:
             added_total += added
         if added_total == 0:
             return entries
-        try:
-            return tuple(self._local_overrides.effective_entries(user_id=user_id))
-        except Exception:
-            return entries
+        return self._read_local_override_entries(user_id)
 
     def _skip(
         self, user_id: str, *, mode: str, reason: str, **extra: object

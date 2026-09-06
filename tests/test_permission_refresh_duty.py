@@ -291,6 +291,10 @@ class FakeLocalOverrides:
 
     ``entries`` 按用户登记条目；``fail_for`` 里的用户读取时直接抛异常，供
     :class:`LocalOverrideMergeTest` 钉住"读取失败只降级、不整用户/整轮失败"。
+
+    ``fail_after_calls`` 让**前 N 次读取正常、之后每一次都失败**：一轮里这条来源被读
+    两次（合并前的首次读取，以及「全部」组补行之后的重读），只有这个开关能单独造出
+    "首次读到了、补行之后重读失败"那半个窗口。
     """
 
     def __init__(
@@ -298,15 +302,19 @@ class FakeLocalOverrides:
         entries: dict[str, tuple[LocalPermissionOverrideEntry, ...]] | None = None,
         *,
         fail_for: set[str] | None = None,
+        fail_after_calls: int | None = None,
     ) -> None:
         self._entries = entries or {}
         self._fail_for = fail_for or set()
+        self._fail_after_calls = fail_after_calls
         self.calls: list[str] = []
 
     def effective_entries(self, *, user_id: str) -> tuple[LocalPermissionOverrideEntry, ...]:
         self.calls.append(user_id)
         if user_id in self._fail_for:
             raise RuntimeError("注入的本地覆盖读取失败")
+        if self._fail_after_calls is not None and len(self.calls) > self._fail_after_calls:
+            raise RuntimeError("注入的本地覆盖重读失败")
         return self._entries.get(user_id, ())
 
 
@@ -1189,6 +1197,53 @@ class LegacyAllScopeRefreshTest(unittest.TestCase):
 
         row = parts["decisions"].calls[0]["row"]
         self.assertEqual(json.loads(row.permissions), {"*": [METRIC_NAME]})
+
+    def test_a_reread_failure_after_a_successful_append_publishes_nothing(self) -> None:
+        """**补行之后的重读失败**：库里已经多了一条本轮读不到的指标，一条发布意图都不许排。
+
+        这半个窗口曾经是 ``return entries``——补行成功、重读失败，于是本轮照旧按只含旧指标
+        的条目发布一份"看起来完整"的权限决定，正是首次读取那道闸要消灭的东西。变异锚点：
+        把 ``_expand_legacy_all_scope`` 末尾的重读改回 ``return entries`` → 本用例变红。
+        """
+
+        overrides = FakeLocalOverrides(
+            {USER_ONE: (_all_scope_entry(metric_name=METRIC_NAME),)}, fail_after_calls=1
+        )
+        expander = FakeLegacyAllScope(overrides=overrides)
+        duty, parts = build_duty(
+            identities=(identity(),), local_overrides=overrides, legacy_all_scope=expander
+        )
+
+        duty.run_once()
+
+        self.assertEqual(
+            parts["audit"].fields_for("permission_refresh.legacy_all_scope_refreshed"),
+            [{"user": USER_ONE, "added": 1}],
+            "补行这一步确实成功了——本用例造的正是它成功之后的那次重读失败",
+        )
+        self.assertEqual(parts["decisions"].calls, [], "重读失败的这一轮零权限决定")
+
+    def test_a_reread_failure_is_distinguishable_in_the_audit(self) -> None:
+        """跳过的原因必须能在审计里读出来，否则运维只看到"这个人今天没动"、原因断链。"""
+
+        overrides = FakeLocalOverrides(
+            {USER_ONE: (_all_scope_entry(metric_name=METRIC_NAME),)}, fail_after_calls=1
+        )
+        expander = FakeLegacyAllScope(overrides=overrides)
+        duty, parts = build_duty(
+            identities=(identity(),), local_overrides=overrides, legacy_all_scope=expander
+        )
+
+        duty.run_once()
+
+        self.assertEqual(
+            parts["audit"].fields_for("permission_refresh.local_override_skipped"),
+            [{"user": USER_ONE, "reason": REASON_LOCAL_OVERRIDE_READ_FAILED}],
+        )
+        skipped = parts["audit"].fields_for("permission_refresh.user_skipped")
+        self.assertEqual(len(skipped), 1)
+        self.assertEqual(skipped[0]["user"], USER_ONE)
+        self.assertEqual(skipped[0]["reason"], REASON_LOCAL_OVERRIDE_READ_FAILED)
 
     def test_expander_failure_is_audited_and_the_round_continues_with_existing_rows(self) -> None:
         overrides = FakeLocalOverrides({USER_ONE: (_all_scope_entry(metric_name=METRIC_NAME),)})

@@ -150,10 +150,10 @@ class PostgresCarrierRetention:
     ) -> int:
         """脱敏过了九十天上限的 ``pending_action`` 行，返回处置行数。
 
-        三列 ``open_id`` 擦成 ``'redacted:' || id``、``payload`` 擦成 ``'{}'``、
-        ``content_redacted_at`` 置为判定时刻；``decided_by_open_id`` 本来就是 NULL 的
-        保持 NULL（没有内容可擦，写一个脱敏值只会凭空造出"有人决策过"的假象）。
-        脱敏值逐行唯一的理由见 :data:`REDACTED_OPEN_ID_PREFIX`。
+        三列 ``open_id`` 擦成 ``'redacted:' || id``（逐行唯一见
+        :data:`REDACTED_OPEN_ID_PREFIX`）、``payload`` **只在真有内容时**擦成 ``'{}'``
+        （条件为什么不能只判 NULL 见语句里的注释）、``content_redacted_at`` 置为判定时刻；
+        ``decided_by_open_id`` 本来就是 NULL 的保持 NULL（写脱敏值等于凭空造出"有人决策过"）。
 
         **保留行**：``local_permission_override.pending_action_id`` 是 NOT NULL 外键，
         删整行会把一条现行本地权限覆盖的成立依据带走。
@@ -171,8 +171,14 @@ class PostgresCarrierRetention:
                            decided_by_open_id =
                                CASE WHEN decided_by_open_id IS NULL
                                     THEN NULL ELSE %(prefix)s || id END,
+                           -- payload 只在真有内容时才擦：0073 的
+                           -- pending_action_payload_matches_action_type 是双向等价，
+                           -- 非权限类动作必须保持空白。只判 IS NULL 会把空串/纯空格的
+                           -- suspend_user 行擦成 '{}' 而违反 CHECK；这是一条批量 UPDATE，
+                           -- 一行违约会让同批合法的到期行一起回滚，坏行每轮又被重新选中，
+                           -- 于是这一面永远收不走任何东西。空白 payload 没有可识别内容。
                            payload =
-                               CASE WHEN payload IS NULL THEN NULL ELSE %(payload)s END,
+                               CASE WHEN BTRIM(payload) <> '' THEN %(payload)s ELSE payload END,
                            content_redacted_at = %(now)s
                      WHERE id IN (
                            SELECT id FROM pending_action

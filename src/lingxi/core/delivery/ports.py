@@ -169,8 +169,10 @@ class DeliveryOperationSpec:
     ``required_identifier`` 是**响应里必须回读到**的字段名；``None`` 表示这个
     接口本来就不回读新标识（流式更新与关闭寻址的是调用方已经持有的 ``card_id``），
     此时"码成功"就是全部证据。``platform_idempotency_key`` 记的是请求里带没带
-    平台侧的去重/顺序键——它是**唯一**可以据以自动重投的依据：没有键的重投等于
-    "赌一次没送达"，赌错就是重复交付。
+    平台侧的**去重键**——它是**唯一**可以据以自动重投的依据：没有键的重投等于
+    "赌一次没送达"，赌错就是重复交付。**顺序键不是去重键**：严格递增的操作序号
+    （CardKit 的 ``sequence``）只能保证"晚到的旧序号会被拒绝"，不能保证"同一份
+    内容重投一次仍然只产生一份可见结果"，因此不许登记在这一列里。
     """
 
     operation: DeliveryOperation
@@ -200,18 +202,21 @@ DELIVERY_OPERATIONS: dict[DeliveryOperation, DeliveryOperationSpec] = {
         required_identifier="message_id",
         platform_idempotency_key=None,
     ),
-    # 流式增量更新：不回读新标识，寻址靠调用方已持有的 card_id；整卡级
-    # ``sequence`` 是平台侧的顺序键，重投同一份正文不会产生第二条可见内容。
+    # 流式增量更新：不回读新标识，寻址靠调用方已持有的 card_id。**没有幂等键**——
+    # 整卡级 ``sequence`` 是严格递增的**操作序号**，不是平台去重键：拿同一个序号重投
+    # 会被 CardKit 当作落后序号直接拒绝（消费侧随即降级到文本通道，而卡片上很可能
+    # 已经有答案了，用户于是收到第二份完整答案），换一个更大的序号重投则是真的再写
+    # 一次正文。请求体里也没有 ``uuid``。因此"仍在发送"时一律不自动重投。
     DeliveryOperation.CARD_UPDATE: DeliveryOperationSpec(
         operation=DeliveryOperation.CARD_UPDATE,
         required_identifier=None,
-        platform_idempotency_key="sequence",
+        platform_idempotency_key=None,
     ),
-    # 关闭流式：同上。
+    # 关闭流式：与 update 共用同一个 ``sequence`` 计数器，同样不是幂等键。
     DeliveryOperation.CARD_CLOSE: DeliveryOperationSpec(
         operation=DeliveryOperation.CARD_CLOSE,
         required_identifier=None,
-        platform_idempotency_key="sequence",
+        platform_idempotency_key=None,
     ),
     # 文本兜底发送：响应带 data.message_id 才算发出去了，**请求体没有 uuid**
     # ——这是全表唯一"既要拿标识、又完全没有幂等键"的操作，任何形式的自动重投

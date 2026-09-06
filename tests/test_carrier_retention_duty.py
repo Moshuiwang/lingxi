@@ -186,7 +186,12 @@ class DutyBehaviourTest(unittest.TestCase):
         self.assertEqual(carriers.calls, [])
 
     def test_failure_is_closed_and_the_audit_carries_only_the_exception_type(self) -> None:
-        """失败不被吞掉：原样上抛，审计只留表名与异常类型，不留异常正文。"""
+        """失败不被吞掉：原样上抛，审计只留表名与异常类型，不留异常正文。
+
+        **同一轮里其余三面照常执行**：四张表之间没有依赖，一面上的一条坏行不得把另外
+        三张表的九十天清理一起拖住（`V-保留-30`）。这条纪律与旧写法完全相反——旧写法
+        把"前一面失败就整轮停"钉成了正确行为，真库上因此出现过"第四面一轮都没跑过"。
+        """
 
         audit = RecordingAudit()
         carriers = FakeCarriers(fails="redact_expired_pending_actions")
@@ -197,16 +202,57 @@ class DutyBehaviourTest(unittest.TestCase):
                 duty.run_once()
 
         self.assertEqual(
-            [action for action, _ in audit.entries], ["carrier_retention.sweep_failed"]
+            [action for action, _ in audit.entries],
+            ["carrier_retention.sweep_failed", "carrier_retention.partial"],
+            "只剩 sweep_failed 时，运维分不出「跑了但部分失败」与「根本没跑」",
         )
         fields = audit.entries[0][1]
         self.assertEqual(fields, {"table": "pending_action", "error": "RuntimeError"})
         self.assertNotIn("不该进审计", repr(audit.entries))
         self.assertNotIn("不该进审计", "\n".join(logs.output))
-        self.assertNotIn(
-            "purge_expired_queue_failure_notices",
+        self.assertEqual(
             carriers.calls,
-            "前一面失败时本轮后面几面不再执行——下一轮从各自的水位继续",
+            [
+                "redact_expired_task_prompts",
+                "purge_expired_inbound_events",
+                "redact_expired_pending_actions",
+                "purge_expired_queue_failure_notices",
+            ],
+            "一面失败不阻断其余面本轮执行",
+        )
+
+    def test_a_partial_round_still_reports_what_the_other_faces_processed(self) -> None:
+        """部分失败那一轮的审计要带上其余三面**真实处置了多少**，失败的那一面记 0。"""
+
+        audit = RecordingAudit()
+        carriers = FakeCarriers(
+            counts={
+                "redact_expired_task_prompts": 3,
+                "purge_expired_inbound_events": 5,
+                "purge_expired_queue_failure_notices": 7,
+            },
+            fails="redact_expired_pending_actions",
+        )
+        duty = ExpiredCarrierRetentionDuty(carriers=carriers, audit=audit)
+
+        with self.assertLogs("lingxi.apps.scheduler.retention", level="ERROR"):
+            with self.assertRaises(RuntimeError):
+                duty.run_once()
+
+        partial = [
+            fields for action, fields in audit.entries if action == "carrier_retention.partial"
+        ]
+        self.assertEqual(
+            partial,
+            [
+                {
+                    "failed_faces": 1,
+                    "task_prompts_redacted": 3,
+                    "inbound_events_purged": 5,
+                    "pending_actions_redacted": 0,
+                    "queue_failure_notices_purged": 7,
+                }
+            ],
         )
 
     def test_a_round_that_found_nothing_still_records_the_completed_audit(self) -> None:
@@ -718,13 +764,21 @@ class RealDatabaseTest(unittest.TestCase):
         self.assertEqual(self._retention().redact_expired_task_prompts(now=now), 1)
         self.assertEqual(self._fetch("SELECT prompt FROM task WHERE id = 'tsk_fail'"), [("",)])
 
-    def test_one_failing_face_does_not_stop_the_others_from_the_next_round(self) -> None:
-        """一面失败不让其余三面的内容永远留下：下一轮四面都收干净。"""
+    def test_one_failing_face_does_not_stop_the_others_in_the_same_round(self) -> None:
+        """一面失败不让其余三面的内容永远留下（`V-保留-30`）。
+
+        **两条断言，都走 ``run_once`` 这条真实路径**：锁住 ``task`` 的那一轮里，另外
+        三面在**同一轮**就已经收干净了（旧写法在这里会整轮停下，第四面一条都没跑）；
+        解锁后的下一轮把剩下的那一面收走，且这一轮记的是 ``completed``，不再是
+        ``partial``——"跑了但部分失败"与"这一轮全好了"在审计里可分辨。
+        """
 
         import psycopg
 
         now = datetime.now(UTC)
         self._seed_all_four(now, age=timedelta(days=91), tag="partial")
+        audit = RecordingAudit()
+        duty = ExpiredCarrierRetentionDuty(carriers=self._retention(), audit=audit)
 
         blocker = psycopg.connect(self._dsn, autocommit=False)
         self.addCleanup(blocker.close)
@@ -732,16 +786,82 @@ class RealDatabaseTest(unittest.TestCase):
             with blocker.cursor() as cursor:
                 cursor.execute("SET lock_timeout = '5s'")
                 cursor.execute("LOCK TABLE task IN ACCESS EXCLUSIVE MODE")
-            duty = ExpiredCarrierRetentionDuty(carriers=self._retention(), audit=RecordingAudit())
             with self.assertRaises(psycopg.errors.Error):
                 duty.run_once()
         finally:
             blocker.rollback()
 
-        processed = self._sweep_all(now)
         self.assertEqual(
-            processed,
-            {"task": 1, "inbound_event": 1, "pending_action": 1, "queue_failure_notice": 1},
+            [action for action, _ in audit.entries],
+            ["carrier_retention.sweep_failed", "carrier_retention.partial"],
+        )
+        self.assertEqual(
+            audit.entries[1][1],
+            {
+                "failed_faces": 1,
+                "task_prompts_redacted": 0,
+                "inbound_events_purged": 1,
+                "pending_actions_redacted": 1,
+                "queue_failure_notices_purged": 1,
+            },
+            "锁只挡住 task 这一面，其余三面同一轮就该收干净",
+        )
+        self.assertEqual(
+            self._fetch("SELECT prompt FROM task WHERE id = 'tsk_partial'"), [("用户问题原文",)]
+        )
+
+        report = duty.run_once()
+        self.assertEqual(report.task_prompts_redacted, 1, "解锁后的下一轮把剩下那一面收走")
+        self.assertEqual(report.inbound_events_purged, 0, "另外三面上一轮已经收干净了")
+        self.assertEqual(audit.entries[-1][0], "carrier_retention.completed")
+        self.assertEqual(self._fetch("SELECT prompt FROM task WHERE id = 'tsk_partial'"), [("",)])
+
+    def test_a_blank_payload_row_does_not_take_the_whole_batch_down(self) -> None:
+        """``payload`` 是空串或纯空格的 ``suspend_user`` 行**不能**违反 CHECK。
+
+        ``pending_action_payload_matches_action_type``（迁移 ``0073``）是双向等价：非权限
+        类动作必须保持空白。把这类行的 ``payload`` 擦成 ``'{}'`` 会违约，而脱敏是一条
+        批量 ``UPDATE``——同一批里合法的到期行会**跟着一起回滚**，坏行每一轮都被重新
+        选中，于是这一面永远收不走任何东西；再加上四面若顺序求值，第四面
+        ``queue_failure_notice`` 一轮都跑不到。变异锚点：把 ``payload`` 那一支改回
+        ``CASE WHEN payload IS NULL`` → 本用例变红。
+        """
+
+        now = datetime.now(UTC)
+        moment = now - timedelta(days=91)
+        self._seed_all_four(now, age=timedelta(days=91), tag="blankok")
+        for suffix, blank in (("empty", ""), ("spaces", "   ")):
+            self._seed_pending_action(
+                f"pac_blank_{suffix}",
+                created_at=moment,
+                action_type="suspend_user",
+                payload=blank,
+                target_suffix=f"_blank_{suffix}",
+            )
+
+        audit = RecordingAudit()
+        report = ExpiredCarrierRetentionDuty(carriers=self._retention(), audit=audit).run_once()
+
+        self.assertEqual(report.pending_actions_redacted, 3, "坏行与合法行都在同一批里收走")
+        self.assertEqual(report.queue_failure_notices_purged, 1, "第四面照常执行，不被前一面带走")
+        self.assertEqual(audit.entries[-1][0], "carrier_retention.completed")
+        self.assertEqual(
+            sorted(
+                self._fetch(
+                    "SELECT id, payload, target_open_id FROM pending_action "
+                    "WHERE id IN ('pac_blank_empty', 'pac_blank_spaces') ORDER BY id"
+                )
+            ),
+            [
+                ("pac_blank_empty", "", "redacted:pac_blank_empty"),
+                ("pac_blank_spaces", "   ", "redacted:pac_blank_spaces"),
+            ],
+            "空白 payload 本来就没有可识别内容，保持原样；另三列照常脱敏",
+        )
+        self.assertEqual(
+            self._fetch("SELECT payload FROM pending_action WHERE id = 'pac_blankok'"),
+            [("{}",)],
+            "有内容的 payload 仍然要擦",
         )
 
     # ---- 第五组：旧备份恢复后按原始写入时间 --------------------------------

@@ -574,8 +574,25 @@ class PermissionRefreshDuty:
         """
         if self._local_overrides is None:
             return None
+        entries = self._read_local_override_entries(user_id)
+        entries = self._expand_legacy_all_scope(user_id, entries)
+        return resolve_local_overrides(user_id=user_id, entries=entries)
+
+    def _read_local_override_entries(
+        self, user_id: str
+    ) -> tuple[LocalPermissionOverrideEntry, ...]:
+        """读一次本地覆盖条目；**读不出来一律审计后抛**。
+
+        本方法是这条来源的**唯一**读取口：合并前的首次读取与补行之后的重读都走这里，
+        因此两次读取的失败姿态天然一致。曾经不一致过——重读失败原地 ``return entries``
+        照旧发布，于是刚给「全部」组补进的那条指标不在本轮的权限决定里，产出的仍然是
+        一份少了本地补授、看起来却完整的决定，正是首次读取要消灭的那件事。
+
+        Raises:
+            LocalOverrideReadError: 本地覆盖来源读取失败。
+        """
         try:
-            entries = tuple(self._local_overrides.effective_entries(user_id=user_id))
+            return tuple(self._local_overrides.effective_entries(user_id=user_id))
         except Exception as error:  # 读不出来只跳过这个人，不带走整轮
             self._audit.record(
                 "permission_refresh.local_override_skipped",
@@ -588,8 +605,6 @@ class PermissionRefreshDuty:
                 type(error).__name__,
             )
             raise LocalOverrideReadError() from error
-        entries = self._expand_legacy_all_scope(user_id, entries)
-        return resolve_local_overrides(user_id=user_id, entries=entries)
 
     def _expand_legacy_all_scope(
         self, user_id: str, entries: tuple[LocalPermissionOverrideEntry, ...]
@@ -597,7 +612,12 @@ class PermissionRefreshDuty:
         """给「全部」组随当前映射补齐新指标。
 
         缺才补、同组标识、撤销过的组不参与（只看生效条目）；补行成功后重读一次条目让本轮
-        合并直接带上新行。补行或重读失败都只审计，不影响本轮既有结果。
+        合并直接带上新行。**补行失败与重读失败刻意不同**：补行失败只审计、本轮按既有行照常
+        发布（这一轮的决定并不因此缺内容）；重读失败则与首次读取同姿态抛出——这一刻库里
+        已经多了一条本轮读不到的补行，照旧发布等于用不完整的信息提交权限决定。
+
+        Raises:
+            LocalOverrideReadError: 补行之后的重读失败。
         """
         if self._legacy_all_scope is None:
             return entries
@@ -623,10 +643,7 @@ class PermissionRefreshDuty:
             added_total += added
         if added_total == 0:
             return entries
-        try:
-            return tuple(self._local_overrides.effective_entries(user_id=user_id))
-        except Exception:  # 重读失败：新行下一轮自然生效
-            return entries
+        return self._read_local_override_entries(user_id)
 
     def _revoke(
         self,

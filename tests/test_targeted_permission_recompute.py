@@ -492,6 +492,41 @@ class LegacyAllScopeRecomputeTests(unittest.TestCase):
             json.loads(call["row"].permissions), {"*": sorted({METRIC_NAME, METRIC_NAME_TWO})}
         )
 
+    def test_a_reread_failure_after_a_successful_append_skips_without_publishing(self) -> None:
+        """**补行之后的重读失败**：与首次读取同姿态收敛成 ``SKIPPED``，一条决定都不落。
+
+        库里此刻已经多了一条本次读不到的指标，照旧发布就是用不完整的信息提交权限决定。
+        变异锚点：把 ``_expand_legacy_all_scope`` 末尾的重读改回 ``return entries``
+        → 本用例变红。
+        """
+
+        overrides = FakeLocalOverrides(
+            {USER_ONE: (_all_scope_entry(metric_name=METRIC_NAME),)}, fail_after_calls=1
+        )
+        expander = FakeLegacyAllScope(overrides=overrides)
+        recompute, parts = build_recompute(
+            identities=(identity(),),
+            published_users={USER_ONE},
+            local_overrides=overrides,
+            legacy_all_scope=expander,
+        )
+
+        outcome = recompute.recompute_and_publish(user_id=USER_ONE)
+
+        self.assertEqual(
+            parts["audit"].fields_for("permission_targeted_recompute.legacy_all_scope_refreshed"),
+            [{"user": USER_ONE, "added": 1}],
+            "补行这一步确实成功了——造的正是它成功之后的那次重读失败",
+        )
+        self.assertEqual(outcome.kind, RecomputeKind.SKIPPED)
+        self.assertEqual(outcome.reason, SKIP_LOCAL_OVERRIDE_READ_FAILED)
+        self.assertEqual(parts["decisions"].calls, [], "重读失败时零权限决定")
+        self.assertEqual(
+            parts["audit"].fields_for("permission_targeted_recompute.local_override_skipped"),
+            [{"user": USER_ONE, "reason": SKIP_LOCAL_OVERRIDE_READ_FAILED}],
+            "跳过原因要能在审计里读出来，否则断链",
+        )
+
     def test_unrepresentable_suppression_skips_without_publishing_or_revoking(self) -> None:
         overrides = FakeLocalOverrides(
             {

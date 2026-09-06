@@ -23,6 +23,12 @@ from postgres_schema import ensure_production_schema, psycopg_available, reset_p
 from lingxi.adapters.postgres_conversation import PostgresTaskQueue
 from lingxi.apps.gateway.delivery import DeliveryConsumer
 from lingxi.config.content import default_content_catalog
+from lingxi.core.delivery.ports import (
+    DELIVERY_OPERATIONS,
+    DeliveryOperation,
+    DeliveryVerdict,
+    classify_delivery_response,
+)
 from lingxi.core.execution.card_stream import (
     CardCreated,
     DeliveryRejectedError,
@@ -33,6 +39,27 @@ from lingxi.core.execution.card_stream import (
 #: 拒绝，判成任何一侧都会出事（判成功＝把没落地的消息记成已送达；判拒绝＝清预留位
 #: 后改走另一条通道，原来那条随后真的送达，用户收到两份）。
 IN_FLIGHT_CODE = 230049
+
+
+def _in_flight_error(operation: DeliveryOperation, label: str) -> DeliveryUncertainError:
+    """把一次「仍在发送」响应翻成消费侧看到的异常，**裁定全部交给真实规则表**。
+
+    与 ``adapters/feishu_delivery._verdict`` 同一条判定路径：``retry_safe`` 取自
+    :data:`DELIVERY_OPERATIONS` 里该操作登记的平台去重键，本文件自己不下任何裁定。
+    这一点是被真实教训换来的——早先的假传输层直接硬写 ``retry_safe=True``，于是把
+    规则表整个绕开：把 ``card_update`` 那一行的键改掉，端到端用例照样全绿，那条
+    "安全重投"用例证明的只是它自己注入的信念。
+    """
+
+    outcome = classify_delivery_response(operation=operation, code=IN_FLIGHT_CODE)
+    assert outcome.verdict is DeliveryVerdict.UNCERTAIN, "230049 必须裁定为结果不明"
+    return DeliveryUncertainError(
+        f"{label}结果不明（{outcome.reason}）",
+        reason=outcome.reason,
+        code=IN_FLIGHT_CODE,
+        retry_safe=outcome.retry_safe,
+    )
+
 
 SKIP_REASON = (
     "跳过：未设置 LINGXI_POSTGRES_DSN，Gateway 投递消费的数据库约束类断言未验证"
@@ -147,8 +174,11 @@ class RaisingCardsMidCreate:
 
 class InFlightTerminalCards:
     """``create`` 正常成功；终态 ``update`` 头 ``in_flight_updates`` 次拿到平台
-    「仍在发送」（``230049``）——结果不明，但该操作带整卡级 ``sequence`` 顺序键，
-    重投不会产生第二份可见内容，因此登记为可安全重投。
+    「仍在发送」（``230049``）。
+
+    **本类只模拟平台回了哪个码**，能不能安全重投一律由真实的
+    ``classify_delivery_response`` 按 ``DELIVERY_OPERATIONS`` 判（见
+    :func:`_in_flight_error`）。
     """
 
     def __init__(self, *, in_flight_updates: int = 1) -> None:
@@ -164,12 +194,7 @@ class InFlightTerminalCards:
     def update(self, **kwargs: object) -> None:
         if self._remaining > 0:
             self._remaining -= 1
-            raise DeliveryUncertainError(
-                "卡片流式更新结果不明（in_flight）",
-                reason="in_flight",
-                code=IN_FLIGHT_CODE,
-                retry_safe=True,
-            )
+            raise _in_flight_error(DeliveryOperation.CARD_UPDATE, "卡片流式更新")
         self.update_calls.append(kwargs)
 
     def close(self, **kwargs: object) -> None:
@@ -177,21 +202,14 @@ class InFlightTerminalCards:
 
 
 class InFlightText:
-    """文本兜底每次都拿到「仍在发送」。文本发送请求体**没有**任何平台幂等键，
-    因此这条通道的"仍在发送"永远登记为**不可**安全重投（``retry_safe=False``）。
-    """
+    """文本兜底每次都拿到「仍在发送」。同样只模拟平台回了哪个码，裁定交给真实规则表。"""
 
     def __init__(self) -> None:
         self.calls: list[dict] = []
 
     def send_text(self, **kwargs: object) -> str:
         self.calls.append(kwargs)
-        raise DeliveryUncertainError(
-            "发送投递文本结果不明（in_flight）",
-            reason="in_flight",
-            code=IN_FLIGHT_CODE,
-            retry_safe=False,
-        )
+        raise _in_flight_error(DeliveryOperation.TEXT_SEND, "发送投递文本")
 
 
 class _ConfirmDeliveryFailsOnce:
@@ -1431,6 +1449,41 @@ class TerminalReceiptRequiredBeforeConfirmTests(DeliveryConsumerTestCase):
         )
         self._assert_not_delivered()
 
+    def test_a_later_round_with_unconsumed_events_never_confirms_with_a_stale_id(self) -> None:
+        """**应用层第一道闸**（``saw_unconsumed_events``）：本轮读到了未消费事件、却
+        没能取得本次终态的回执 → 一律不确认。
+
+        这半个窗口只有**第二轮及以后**才暴露：第一轮建进度卡拿到的 ``msg-card-1``
+        已经落库，于是从第二轮起任务快照本身就带着一枚"看起来能用"的旧标识，
+        ``task.message_id is None`` 那道兜底判据再也挡不住它。变异锚点：删掉
+        ``_terminal_receipt`` 里的 ``saw_unconsumed_events`` 判据 → 第二轮会拿这枚
+        旧标识去确认一条从未送到用户的答案（库级闸随后仍会挡下，但消费侧已经做出
+        了错误裁定），本用例变红。
+        """
+
+        self._seed_task_with_terminal()
+        cards = RecordingCards(fail_at=2)  # create 成功并落库 msg-card-1，终态 update 被拒
+        texts = RecordingText(fail=True)
+        DeliveryConsumer(queue=self.queue, cards=cards, texts=texts).run_once()
+
+        self.assertEqual(
+            self.scalar("SELECT delivery_message_id FROM task WHERE id='tsk-1'"),
+            "msg-card-1",
+            "第二轮的任务快照从这一刻起就带着一枚旧标识",
+        )
+        self._assert_not_delivered()
+
+        spy = _ConfirmDeliverySpy(self.queue)
+        processed = DeliveryConsumer(queue=spy, cards=cards, texts=texts).run_once()
+
+        self.assertEqual(processed, 1, "这一轮确实处理了这个任务，不是空转")
+        self.assertEqual(
+            spy.calls,
+            [],
+            "本轮仍有未消费的终态事件、仍然没有回执，消费侧连这次确认调用都不该发起",
+        )
+        self._assert_not_delivered()
+
     def test_a_backoff_window_with_no_outbound_attempt_is_never_confirmed(self) -> None:
         """**安全重试分支的否定面**：退避窗口内这一轮**一次外发都没发生**，
         同样不得确认——旧实现里这条路径返回 ``RETRY_LATER``，照样走去确认。
@@ -1450,20 +1503,43 @@ class TerminalReceiptRequiredBeforeConfirmTests(DeliveryConsumerTestCase):
         self.assertEqual(len(texts.calls), 1, "退避窗口内不得产生新的外发尝试")
         self._assert_not_delivered()
 
-    def test_an_in_flight_card_terminal_retries_safely_and_never_falls_back(self) -> None:
-        """**安全重试分支**：终态卡片更新拿到 ``230049``「仍在发送」。
+    def test_an_in_flight_card_terminal_is_never_retried_automatically(self) -> None:
+        """**在途不重投分支**：终态卡片更新拿到 ``230049``「仍在发送」。
 
         不得判成明确拒绝（那会清预留位并改发一条文本终态，而卡片随后很可能真的
-        更新成功，用户收到两份）；也不得判成已送达。该操作带整卡级 ``sequence``
-        顺序键，重投不会产生第二份可见内容，因此清预留位、退避后自动重投。
+        更新成功，用户收到两份）；也不得判成已送达；**更不得自动重投**——CardKit 的
+        整卡级 ``sequence`` 是严格递增的操作序号，不是平台去重键：这条路径上
+        ``card_seq`` 根本没有推进（HALT 不落进度），重投用的是同一个序号，会被平台
+        判成落后序号直接拒绝、随即降级到文本通道，而卡片里已经有那份答案了，用户
+        于是收到第二份完整答案。因此保留预留位、转人工核对，最终由到期收敛路径
+        （``expire_undelivered_terminals``）在二十四小时后收成"投递已过期"。
+
+        变异锚点：把 ``core.delivery.ports`` 里 ``card_update``/``card_close`` 的
+        ``platform_idempotency_key`` 改回 ``"sequence"`` → 本用例变红（裁定不再由
+        本文件硬写，见 :func:`_in_flight_error`）。
         """
+
+        # 本用例的前提直接取自规则表，不靠本文件复述：卡片这两次外发**没有登记任何
+        # 平台去重键**。消费侧现在无条件保留预留位（不再按 ``retry_safe`` 分支），
+        # 因此这条前提只能在这里显式核对——否则改了规则表，下面那些行为断言会毫无
+        # 反应地继续全绿，正是这次修复要消灭的那种假绿。
+        for operation in (DeliveryOperation.CARD_UPDATE, DeliveryOperation.CARD_CLOSE):
+            self.assertIsNone(
+                DELIVERY_OPERATIONS[operation].platform_idempotency_key,
+                f"{operation.value} 一旦被登记成带去重键，下面这些「绝不重投」断言就不再成立",
+            )
 
         self._seed_task_with_terminal()
         clock = [0.0]
+        alerts: list[tuple[str, str]] = []
         cards = InFlightTerminalCards(in_flight_updates=1)
         texts = RecordingText()
         consumer = DeliveryConsumer(
-            queue=self.queue, cards=cards, texts=texts, monotonic=lambda: clock[0]
+            queue=self.queue,
+            cards=cards,
+            texts=texts,
+            monotonic=lambda: clock[0],
+            on_alert=lambda kind, task_id: alerts.append((kind, task_id)),
         )
         consumer.run_once()
 
@@ -1472,27 +1548,28 @@ class TerminalReceiptRequiredBeforeConfirmTests(DeliveryConsumerTestCase):
             self.scalar("SELECT fallback_text FROM task WHERE id='tsk-1'"),
             "「仍在发送」不是明确失败，不得把任务永久降级到文本通道",
         )
-        self.assertIsNone(
+        self.assertEqual(
             self.scalar("SELECT dispatch_reserved_kind FROM task WHERE id='tsk-1'"),
-            "带平台顺序键的操作可以安全重投，预留位应当清空",
+            "card_finish",
+            "没有平台去重键的通道遇到结果不明必须保留预留位，交人工核对",
+        )
+        self.assertEqual(
+            alerts,
+            [("card_finish_uncertain:in_flight", "tsk-1")],
+            "不可重投是这条分支的常态出口，必须告警，不能只写一行日志",
         )
         self._assert_not_delivered()
 
-        consumer.run_once()  # 退避未到期：不产生新的外发尝试
-        self.assertEqual(len(cards.update_calls), 0)
-
-        clock[0] += DeliveryConsumer.DEFAULT_FALLBACK_BACKOFF_CAP_SECONDS
-        consumer.run_once()
-        self.assertEqual(len(cards.update_calls), 1, "退避到期后按顺序键安全重投一次")
-        self.assertEqual(self.scalar("SELECT status FROM task WHERE id='tsk-1'"), "succeeded")
+        # 之后每一轮都抢不到预留位：既不重投，也不会悄悄改走文本通道。
+        clock[0] += DeliveryConsumer.DEFAULT_FALLBACK_BACKOFF_CAP_SECONDS * 10
+        self.assertEqual(consumer.run_once(), 0, "预留位卡住的任务不进入正常候选")
+        self.assertEqual(len(cards.update_calls), 0, "绝不自动重投同一个 sequence")
+        self.assertEqual(texts.calls, [])
         self.assertEqual(
-            self.scalar(
-                "SELECT platform_message_id FROM task_delivery_event "
-                "WHERE task_id='tsk-1' AND event_type='terminal'"
-            ),
-            "msg-card-1",
-            "重投成功后确认用的是承载这张卡片的那条消息",
+            [task.reserved_kind for task in self.queue.list_uncertain_delivery_tasks()],
+            ["card_finish"],
         )
+        self._assert_not_delivered()
 
     def test_an_in_flight_text_fallback_is_never_retried_automatically(self) -> None:
         """**不明分支**：文本兜底拿到「仍在发送」。

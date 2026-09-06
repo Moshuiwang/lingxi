@@ -476,8 +476,7 @@ class ExpiredCarrierRetentionDuty:
     # **不并进** :class:`PermissionRetentionSweepDuty`：那条职责叫「权限链到期清理」，
     # 这四张表与权限发布链无关；更要紧的是那条职责的删除面有一条钉住测试守着，把新载体
     # 塞进去等于亲手拆掉一条正确的防线。
-    # 四面**按顺序**跑，前一面失败时后面几面本轮不再执行：一次调用就是一个事务，已经
-    # 完成那几面不会回退，下一轮从各自的水位继续，两条都是幂等的。
+    # 四面**互相独立**，收敛姿态见 :meth:`run_once`。
     name = "载体到期清理"
 
     def __init__(
@@ -502,25 +501,54 @@ class ExpiredCarrierRetentionDuty:
         self._stop.set()
 
     def run_once(self) -> CarrierRetentionReport | None:
-        """已经在停止中就一条都不处置。返回 ``None`` 表示本轮未执行。"""
+        """已经在停止中就一条都不处置。返回 ``None`` 表示本轮未执行。
+
+        四面各跑一次、**互不阻断**：四张表之间没有依赖，一次调用就是一个事务、已完成的
+        不会回退；"前一面失败就整轮停"会让一张表上的一条坏行把另外三张表的九十天清理一起
+        拖住，正是这条职责要防的事故。有面失败时先落一条 ``carrier_retention.partial``
+        审计——只剩 ``sweep_failed`` 的话，运维分不出"跑了但部分失败"与"这条职责根本没
+        起来"——再把**第一个**异常原样抛出（失败关闭），由上层职责隔离降级这一轮。
+        """
         if self._stop.is_set():
             return None
-        report = CarrierRetentionReport(
-            task_prompts_redacted=self._sweep("task", self._carriers.redact_expired_task_prompts),
-            inbound_events_purged=self._sweep(
-                "inbound_event", self._carriers.purge_expired_inbound_events
+        counts: dict[str, int] = {}
+        failures: list[BaseException] = []
+        for table, field, call in (
+            ("task", "task_prompts_redacted", self._carriers.redact_expired_task_prompts),
+            (
+                "inbound_event",
+                "inbound_events_purged",
+                self._carriers.purge_expired_inbound_events,
             ),
-            pending_actions_redacted=self._sweep(
-                "pending_action", self._carriers.redact_expired_pending_actions
+            (
+                "pending_action",
+                "pending_actions_redacted",
+                self._carriers.redact_expired_pending_actions,
             ),
-            queue_failure_notices_purged=self._sweep(
-                "queue_failure_notice", self._carriers.purge_expired_queue_failure_notices
+            (
+                "queue_failure_notice",
+                "queue_failure_notices_purged",
+                self._carriers.purge_expired_queue_failure_notices,
             ),
-        )
-        self._audit.record("carrier_retention.completed", **report.audit_facts())
+        ):
+            try:
+                counts[field] = self._sweep(table, call)
+            except Exception as error:  # 这一面失败不带走其余三面
+                failures.append(error)
+        report = CarrierRetentionReport(**counts)
+        if failures:
+            self._audit.record(
+                "carrier_retention.partial",
+                failed_faces=len(failures),
+                **report.audit_facts(),
+            )
+        else:
+            self._audit.record("carrier_retention.completed", **report.audit_facts())
         if report.total:
             # 一轮什么都没到期时不打日志：这条职责每分钟跑一次。
             logger.info("%s", report.summary())
+        if failures:
+            raise failures[0]
         return report
 
     def _sweep(self, table: str, call: Callable[[], int]) -> int:

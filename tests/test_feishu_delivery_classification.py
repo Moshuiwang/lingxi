@@ -726,13 +726,15 @@ class EmptyResponseIsResultUnknownTests(_ClassificationTestCase):
 class InFlightCodeIsResultUnknownTests(_ClassificationTestCase):
     """``230049``「仍在发送」：改判为"结果不明"，并带上**是否可安全重投**的依据。
 
-    可安全重投**只**取决于该操作请求里带没带平台侧的幂等/顺序键（登记在
-    ``core.delivery.ports.DELIVERY_OPERATIONS``）：卡片流式更新与关闭带整卡级
-    ``sequence``，重投不产生第二份可见内容；建卡、卡片发送、文本发送三者请求体
-    里什么键都没有，重投就是赌"上一次没送到"。
+    可安全重投**只**取决于该操作请求里带没带平台侧的**去重键**（登记在
+    ``core.delivery.ports.DELIVERY_OPERATIONS``）：投递侧五类外发一个都没有——
+    CardKit 的整卡级 ``sequence`` 是严格递增的**操作序号**，不是去重键（同一个序号
+    重投会被判成落后序号直接拒绝、随即降级到文本通道，而卡片上很可能已经有那份
+    答案，用户于是收到第二份完整答案）；建卡、卡片发送、文本发送请求体里更是什么
+    键都没有。带 ``uuid`` 去重键的只有通知/日报那条通道。
     """
 
-    def test_card_update_in_flight_is_unknown_and_retry_safe(self) -> None:
+    def test_card_update_in_flight_is_unknown_and_never_retry_safe(self) -> None:
         client = _FakeClient(content=_in_flight())
         card_transport, _ = self._transports(client)
 
@@ -742,9 +744,12 @@ class InFlightCodeIsResultUnknownTests(_ClassificationTestCase):
         )
         self.assertEqual(error.reason, "in_flight")
         self.assertEqual(error.code, 230049)
-        self.assertTrue(error.retry_safe, "整卡级 sequence 是平台顺序键，重投不会重复交付")
+        self.assertFalse(
+            error.retry_safe,
+            "sequence 是操作序号不是去重键：重投同一个序号会被拒并降级成第二份完整答案",
+        )
 
-    def test_card_close_in_flight_is_unknown_and_retry_safe(self) -> None:
+    def test_card_close_in_flight_is_unknown_and_never_retry_safe(self) -> None:
         client = _FakeClient(settings=_in_flight())
         card_transport, _ = self._transports(client)
 
@@ -752,7 +757,7 @@ class InFlightCodeIsResultUnknownTests(_ClassificationTestCase):
             lambda: card_transport.close(card_id="card-1", sequence=3, card=_card()),
             DeliveryUncertainError,
         )
-        self.assertTrue(error.retry_safe)
+        self.assertFalse(error.retry_safe)
 
     def test_text_send_in_flight_is_unknown_and_never_retry_safe(self) -> None:
         client = _FakeClient(reply=_in_flight())
