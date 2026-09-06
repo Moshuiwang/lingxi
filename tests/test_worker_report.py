@@ -141,7 +141,9 @@ class EffectiveFailureContextTooLongTest(unittest.TestCase):
 
         resolved = _resolve_effective_failure(None, stream)
 
-        self.assertEqual(resolved, {"code": "context_too_long", "message": "agent_context_too_long"})
+        self.assertEqual(
+            resolved, {"code": "context_too_long", "message": "agent_context_too_long"}
+        )
 
     def test_result_subtype_path_still_detects_context_too_long(self) -> None:
         """回归：改动前就存在、且仍然生效的另一条识别路径不能被顺手改坏。"""
@@ -151,7 +153,9 @@ class EffectiveFailureContextTooLongTest(unittest.TestCase):
 
         resolved = _resolve_effective_failure(None, stream)
 
-        self.assertEqual(resolved, {"code": "context_too_long", "message": "agent_context_too_long"})
+        self.assertEqual(
+            resolved, {"code": "context_too_long", "message": "agent_context_too_long"}
+        )
 
     def test_unrelated_errors_do_not_trigger_context_too_long(self) -> None:
         _audit, stream = _recorder_after(
@@ -221,9 +225,7 @@ class BuildReportSdkErrorProjectionTest(unittest.TestCase):
             "[+3 more errors omitted]",
         ]
 
-        report = self._build(
-            result_event=_result_event(is_error=True, errors=already_bounded)
-        )
+        report = self._build(result_event=_result_event(is_error=True, errors=already_bounded))
 
         errors = report["turn"]["sdk_result_errors"]
         self.assertEqual(errors, already_bounded)

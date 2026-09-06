@@ -529,7 +529,10 @@ def _claude_agent_sdk_available() -> bool:
 # import 真实 SDK 会在收集阶段就 ModuleNotFoundError，表现成一堆 ERROR 而不是
 # 清晰的 skip，与代码框架"全量套件须可在无外部依赖机器上运行"的承诺冲突。
 CLAUDE_AGENT_SDK_SKIP_REASON = (
-    "跳过：未安装 claude_agent_sdk（worker extras），真实 SDK 字段契约未核对"
+    "跳过：本机未装 claude_agent_sdk（worker extras）。CI 的 gate 作业会先装好"
+    "worker extras 再跑到这一组，字段契约在那里确实被核对；这组测试本身能否"
+    "被执行到，另由 scripts/ci/check_agent_sdk_binding.py 在 CI 里无条件核对"
+    "同一组字段（该脚本无 skipUnless），不依赖这里能否跑到"
 )
 
 
