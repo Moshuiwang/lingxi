@@ -22,6 +22,12 @@ python3 scripts/ci/check_contract_attribution.py
 # 开工必读集体量预算（产品负责人 2026-08-24）：代码框架 + 验证与门禁合计字节数
 # 设硬上限，超限即红——防膨胀的结构性门禁，与代码体量棘轮同一思路。
 python3 scripts/ci/check_docs_size_budget.py
+# 用词门禁（Issue #597，产品负责人 2026-09-05「看不懂」）：正式文件禁用英文行话的
+# 逐字直译——扫 `git ls-files` 全仓、按原始字节匹配，命中即红。放在纯文档路径里，
+# 是因为这类词最先出现在 docs/ 与合同正文，纯文档 PR 是它们唯一可能被改动的入口。
+# 豁免按文件路径精确列举、每条带理由（不用目录通配），且由
+# tests/test_docs_wording_gate.py 钉住成只减不增：加一个文件即红。
+python3 scripts/ci/check_docs_wording.py
 
 whitespace_files=$(git grep -Il -E '[[:blank:]]+$' -- . ':!.tmp/**' || true)
 if [[ -n "${whitespace_files}" ]]; then
