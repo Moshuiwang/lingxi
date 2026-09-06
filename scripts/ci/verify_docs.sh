@@ -23,8 +23,9 @@ python3 scripts/ci/check_contract_attribution.py
 # 设硬上限，超限即红——防膨胀的结构性门禁，与代码体量棘轮同一思路。
 python3 scripts/ci/check_docs_size_budget.py
 # 用词门禁（Issue #597，产品负责人 2026-09-05「看不懂」）：正式文件禁用英文行话的
-# 逐字直译——扫 `git ls-files` 全仓、按原始字节匹配，命中即红。放在纯文档路径里，
-# 是因为这类词最先出现在 docs/ 与合同正文，纯文档 PR 是它们唯一可能被改动的入口。
+# 逐字直译——扫 `git ls-files` 全仓、按原始字节匹配，命中即红。**同时挂在
+# verify_repository.sh**：docs 作业只在 docs_changed=true 时触发，纯代码 PR 跑不到
+# 这里，而该词的存量主要住在 ci.yml、tests/ 与 scripts/ 里；两处都挂才没有盲区。
 # 豁免按文件路径精确列举、每条带理由（不用目录通配），且由
 # tests/test_docs_wording_gate.py 钉住成只减不增：加一个文件即红。
 python3 scripts/ci/check_docs_wording.py

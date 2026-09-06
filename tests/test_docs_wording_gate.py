@@ -170,6 +170,25 @@ class FailClosedScanSurfaceTest(unittest.TestCase):
             self.assertIsNone(GATE.tracked_files(Path(raw)))
 
 
+class WiringTest(unittest.TestCase):
+    """两条门禁入口都必须调用本检查——只挂一条就有盲区。"""
+
+    #: docs 作业只在 docs_changed=true 时触发，纯代码 PR（只改 .py/.yml）跑不到它；
+    #: 被禁词的存量恰恰主要住在 ci.yml、tests/ 与 scripts/ 里。因此文档路径与代码
+    #: 路径两个入口都要挂，少一个就等于给它留了最常走的那条入口。
+    WIRED_ENTRY_POINTS = ("verify_docs.sh", "verify_repository.sh")
+
+    def test_both_gate_entry_points_invoke_the_check(self) -> None:
+        for name in self.WIRED_ENTRY_POINTS:
+            with self.subTest(entry_point=name):
+                text = (REPO_ROOT / "scripts" / "ci" / name).read_text(encoding="utf-8")
+                self.assertIn(
+                    "python3 scripts/ci/check_docs_wording.py",
+                    text,
+                    f"{name} 不再调用用词门禁：少挂一个入口，那条路径上的改动就再也扫不到",
+                )
+
+
 class RealRepositoryTest(unittest.TestCase):
     """脚本本身与整个仓库的现状：命令行入口真跑一次，退出码必须为 0。"""
 
