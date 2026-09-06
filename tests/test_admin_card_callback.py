@@ -627,6 +627,115 @@ class TransientFailureTests(unittest.TestCase):
         )
 
 
+class UnknownResultTests(unittest.TestCase):
+    """确认/取消端口抛出预期之外的异常（Issue #650，IN-09）：**结果不明 ≠ 未执行**。
+
+    上面两类「系统繁忙」toast 是在邀请管理员再点一次，只有"事务确实整体回滚了"
+    才配得上那句话。剩下的异常里最危险的一种是"事务已经提交、之后的展示回读才
+    出问题"：权限已经改掉，异常却让管理员什么应答也拿不到（旧行为，直接从
+    ``handle()`` 逃逸）或被告知可以重试（把已执行说成未执行）。真实实现已在
+    ``adapters/postgres_pending_action._refresh_after_commit`` 就地降级，本组是
+    不依赖某一个具体实现的纵深。
+    """
+
+    EXPECTED_TOAST = "操作结果暂时无法确认，请勿重复点击；稍后查看卡片上的最终状态。"
+
+    def test_an_unexpected_store_failure_does_not_escape_from_handle(self) -> None:
+        pending_actions = _FakePendingActions()
+        pending_actions.set_confirm_result(RuntimeError("提交之后回读 pending_action 失败"))
+        cards = _FakeCardTransport()
+        group = _FakeGroupNotifier()
+        handler, audit = _build_handler(
+            pending_actions=pending_actions, confirm_cards=cards, group_notifier=group
+        )
+
+        outcome = handler.handle(
+            operator_open_id="ou_admin",
+            pending_action_id="pac_result_unknown",
+            decision=DECISION_CONFIRM,
+            trace_id="trc_unknown_1",
+        )
+
+        self.assertEqual(outcome["toast"]["type"], "error")
+        self.assertEqual(outcome["toast"]["content"], self.EXPECTED_TOAST)
+        self.assertNotIn("card", outcome)
+        self.assertEqual(cards.update_calls, [], "结果不明时不擅自把卡片改成终态")
+        self.assertEqual(group.sent, [], "结果不明时不广播一个自己都不确定的结论")
+        unknown_records = [
+            fields
+            for action, fields in audit.records
+            if action == "admin.card_callback.decision_result_unknown"
+        ]
+        self.assertEqual(len(unknown_records), 1)
+        self.assertEqual(unknown_records[0]["error"], "RuntimeError")
+        self.assertEqual(unknown_records[0]["trace_id"], "trc_unknown_1")
+
+    def test_the_toast_neither_claims_not_executed_nor_invites_a_retry(self) -> None:
+        """回归防线：这句 toast 不得被改回"系统繁忙请重试"那一类措辞。
+
+        两句「系统繁忙」的产品含义是"这次点击结构上没有发生过"；结果不明的这条
+        分支恰恰不成立那个前提，合同「同一项待确认操作最多成功执行一次」靠行锁
+        兜住重复点击，但没有理由主动去撞它。
+        """
+
+        pending_actions = _FakePendingActions()
+        pending_actions.set_cancel_result(ValueError("端口实现自己坏了"))
+        handler, audit = _build_handler(pending_actions=pending_actions)
+
+        outcome = handler.handle(
+            operator_open_id="ou_admin",
+            pending_action_id="pac_result_unknown_2",
+            decision=DECISION_CANCEL,
+            trace_id="trc_unknown_2",
+        )
+
+        content = outcome["toast"]["content"]
+        self.assertEqual(content, self.EXPECTED_TOAST)
+        self.assertNotEqual(content, "系统繁忙请重试")
+        self.assertNotEqual(content, "系统繁忙，请稍后重试")
+        self.assertNotIn("未执行", content)
+        self.assertNotIn("重试", content)
+        self.assertIn(
+            "admin.card_callback.decision_result_unknown", [action for action, _ in audit.records]
+        )
+
+    def test_the_two_retryable_branches_keep_their_own_wording(self) -> None:
+        """否定断言：新增的兜底分支不得把两类"确实已回滚"的故障一并吞掉。
+
+        它们仍然要走各自的审计动作名与各自的 toast——那两条对管理员的含义是
+        "可以直接重新点击"，与结果不明是两件事。
+        """
+
+        for error, expected_toast, expected_action in (
+            (
+                PendingActionAuditWriteFailedError("审计写入失败"),
+                "系统繁忙请重试",
+                "admin.card_callback.audit_write_failed",
+            ),
+            (
+                PendingActionTransientFailureError("LockNotAvailable"),
+                "系统繁忙，请稍后重试",
+                "admin.card_callback.transient_failure",
+            ),
+        ):
+            with self.subTest(error=type(error).__name__):
+                pending_actions = _FakePendingActions()
+                pending_actions.set_confirm_result(error)
+                handler, audit = _build_handler(pending_actions=pending_actions)
+
+                outcome = handler.handle(
+                    operator_open_id="ou_admin",
+                    pending_action_id="pac_still_retryable",
+                    decision=DECISION_CONFIRM,
+                    trace_id="trc_unknown_3",
+                )
+
+                actions = [action for action, _ in audit.records]
+                self.assertEqual(outcome["toast"]["content"], expected_toast)
+                self.assertIn(expected_action, actions)
+                self.assertNotIn("admin.card_callback.decision_result_unknown", actions)
+
+
 class BestEffortSideEffectFailureTests(unittest.TestCase):
     """卡片视觉更新失败、群通知失败都不影响已经落库的业务结果——两者是尽力而为
     的展示层副作用，不是本次点击是否"发生过"的判据。"""
