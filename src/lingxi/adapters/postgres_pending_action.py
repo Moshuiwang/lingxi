@@ -16,7 +16,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Protocol
@@ -35,7 +35,6 @@ from lingxi.core.admin.pending_action import (
     CancelDecision,
     ConfirmDecision,
     PendingAction,
-    PendingActionAuditWriteFailedError,
     PendingActionStatus,
     PendingActionTransientFailureError,
     PendingActionType,
@@ -66,6 +65,32 @@ _UPDATE_TERMINAL_STATUS_SQL = (
     " decided_at = %s, decided_by_open_id = %s"
     " WHERE id = %s AND status = 'pending'"
 )
+
+
+def _committed_terminal_snapshot(
+    pending: PendingAction,
+    *,
+    terminal_status: PendingActionStatus,
+    reason: str | None,
+    decided_at: datetime,
+    decided_by_open_id: str,
+) -> PendingAction:
+    """把 :data:`_UPDATE_TERMINAL_STATUS_SQL` 这一次写入投影到内存快照上。
+
+    四个参数与那条 SQL 的 ``SET`` 子句逐列对应，改一处必须改另一处；那条语句只
+    允许从 ``pending`` 出发写一次，投影因此与提交后的真实行一致。**为什么需要它**：
+    确认/取消提交之后还要在事务之外回读一次才能把终态交还给调用方，而那次回读会
+    失败（连接被杀、会话池打满、只读切换）。没有这份事务内快照，一次纯展示性质的
+    回读故障就会把"权限已经改掉"说成"操作未执行"，管理员据此重复点击，正好去撞
+    合同「管理员处理入口与安全确认」「同一项待确认操作最多成功执行一次」那道行锁。
+    """
+    return replace(
+        pending,
+        status=terminal_status,
+        reason=reason,
+        decided_at=decided_at,
+        decided_by_open_id=decided_by_open_id,
+    )
 
 
 class AuditSink(Protocol):
@@ -388,12 +413,12 @@ class PostgresPendingActionStore(_ExecutionMixin):
         既有性质）。角色核对同样在这个事务、这个连接内完成（见
         :meth:`_lock_admin_registry_entry`），消除 TOCTOU 窗口；数据库瞬时
         故障转译为 ``PendingActionTransientFailureError``；执行体是
-        :meth:`_confirm_locked`。
+        :meth:`_confirm_locked`；提交之后的展示刷新见 :meth:`_refresh_after_commit`。
         """
         from psycopg.errors import OperationalError
 
         try:
-            pending, decision = self._confirm_locked(
+            committed, decision = self._confirm_locked(
                 pending_action_id=pending_action_id,
                 clicker_open_id=clicker_open_id,
                 now=now,
@@ -401,22 +426,60 @@ class PostgresPendingActionStore(_ExecutionMixin):
         except OperationalError as error:
             raise PendingActionTransientFailureError(type(error).__name__) from error
 
-        if pending is None:
+        if committed is None:
             return ConfirmOutcome(decision=decision, pending=None)
-        refreshed = self.get(pending_action_id=pending_action_id)
-        assert refreshed is not None
-        return ConfirmOutcome(decision=decision, pending=refreshed)
+        return ConfirmOutcome(decision=decision, pending=self._refresh_after_commit(committed))
+
+    def _refresh_after_commit(self, committed: PendingAction) -> PendingAction:
+        """提交之后的展示刷新：读得到就用最新一行，读不到就用事务内快照。
+
+        **只更新展示，不决定结果**：调用它时事务已经提交——业务动作要么已经执行，
+        要么这次点击本来就没有改变任何状态。因此这里任何故障都不许向上抛：一旦抛
+        出，调用方（``core/admin/card_callback.py``）会把它当成"这次点击结构上没有
+        发生过"，给管理员一句「系统繁忙请重试」，而真实情况是权限已经改掉了。降级
+        快照与这次回读的差别只在"提交之后还有没有别人再改过这一行"，终态四列本事务
+        已经写定、其余列本次根本没碰，足够管理员判断这次点击做成了什么。
+        """
+        try:
+            refreshed = self.get(pending_action_id=committed.id)
+        except Exception as error:  # 见方法文档：展示刷新不得推翻已提交的结论
+            self._record_readback_degraded(committed, classification=type(error).__name__)
+            return committed
+        if refreshed is None:
+            # 结构上不该发生（刚提交的行）。真出现了也不能回报"查无此行"——那会
+            # 让调用方把已经执行的动作说成"操作不存在或已失效"。
+            self._record_readback_degraded(committed, classification="row_disappeared")
+            return committed
+        return refreshed
+
+    def _record_readback_degraded(self, committed: PendingAction, *, classification: str) -> None:
+        """记一条"已提交、展示回读降级"的审计。
+
+        审计出口自身故障同样吞掉：它和被吞掉的回读故障是同一类外部依赖，让它
+        把已经提交的结论重新变成一个异常，等于绕过 :meth:`_refresh_after_commit`
+        这道防线。运维侧仍可凭 ``pending_action`` 行本身还原真实终态。
+        """
+        try:
+            self._audit.record(
+                "admin.pending_action.post_commit_readback_degraded",
+                pending_action_id=committed.id,
+                action_type=committed.action_type.value,
+                status=committed.status.value,
+                classification=classification,
+            )
+        except Exception:  # 见方法文档
+            return
 
     def _confirm_locked(
         self, *, pending_action_id: str, clicker_open_id: str, now: datetime | None
     ) -> tuple[PendingAction | None, ConfirmDecision]:
-        """:meth:`confirm` 的事务体本身。
+        """:meth:`confirm` 的事务体本身。不对外暴露，不是任何协议的一部分。
 
         拆成独立方法只是为了让 :meth:`confirm` 能在外层包一层不影响这里任何
-        缩进的 ``try/except OperationalError``。不单独对外暴露，不是任何
-        协议的一部分。
+        缩进的 ``try/except OperationalError``。第一个返回值是**提交之后这一行
+        应有的样子**而非锁定时读到的原始行，理由见 :func:`_committed_terminal_snapshot`。
         """
-        pending: PendingAction | None = None
+        committed: PendingAction | None = None
         decision: ConfirmDecision
         with connect(self._dsn, timeouts=self._timeouts) as connection:
             with connection.transaction():
@@ -446,6 +509,7 @@ class PostgresPendingActionStore(_ExecutionMixin):
                         current_account_state=current_account_state,
                     )
 
+                    committed = pending
                     if pending is not None and decision.terminal_status is not None:
                         if decision.ok:
                             decision = self._execute_confirm_decision(
@@ -457,7 +521,7 @@ class PostgresPendingActionStore(_ExecutionMixin):
                                 target_user_id=target_user_id,
                                 moment=moment,
                             )
-                        self._finalize_confirm_decision(
+                        committed = self._finalize_confirm_decision(
                             cursor,
                             pending=pending,
                             decision=decision,
@@ -465,7 +529,7 @@ class PostgresPendingActionStore(_ExecutionMixin):
                             moment=moment,
                         )
 
-        return pending, decision
+        return committed, decision
 
     def cancel(
         self,
@@ -482,11 +546,12 @@ class PostgresPendingActionStore(_ExecutionMixin):
         本方法风险面更小（不涉及清送达正文那组容易撞锁序的写入），但
         ``pending_action``/``app_user`` 的 ``FOR UPDATE`` 本身仍可能撞上并发
         持锁超过 ``lock_timeout``，同一姿态兜底，不留一个不对称的缺口。
+        提交之后的展示刷新同样走 :meth:`_refresh_after_commit`，理由见那里。
         """
         from psycopg.errors import OperationalError
 
         try:
-            pending, decision = self._cancel_locked(
+            committed, decision = self._cancel_locked(
                 pending_action_id=pending_action_id,
                 clicker_open_id=clicker_open_id,
                 now=now,
@@ -494,17 +559,18 @@ class PostgresPendingActionStore(_ExecutionMixin):
         except OperationalError as error:
             raise PendingActionTransientFailureError(type(error).__name__) from error
 
-        if pending is None:
+        if committed is None:
             return CancelOutcome(decision=decision, pending=None)
-        refreshed = self.get(pending_action_id=pending_action_id)
-        assert refreshed is not None
-        return CancelOutcome(decision=decision, pending=refreshed)
+        return CancelOutcome(decision=decision, pending=self._refresh_after_commit(committed))
 
     def _cancel_locked(
         self, *, pending_action_id: str, clicker_open_id: str, now: datetime | None
     ) -> tuple[PendingAction | None, CancelDecision]:
-        """:meth:`cancel` 的事务体本身，拆分理由与 :meth:`_confirm_locked` 相同。"""
-        pending: PendingAction | None = None
+        """:meth:`cancel` 的事务体本身，拆分理由与 :meth:`_confirm_locked` 相同。
+
+        同样返回"提交之后这一行应有的样子"，而不是锁定时读到的原始行。
+        """
+        committed: PendingAction | None = None
         decision: CancelDecision
         with connect(self._dsn, timeouts=self._timeouts) as connection:
             with connection.transaction():
@@ -522,36 +588,14 @@ class PostgresPendingActionStore(_ExecutionMixin):
                         pending=pending, clicker_open_id=clicker_open_id, now=moment
                     )
 
+                    committed = pending
                     if pending is not None and decision.terminal_status is not None:
-                        try:
-                            self._audit.record(
-                                "admin.pending_action.cancelled",
-                                pending_action_id=pending.id,
-                                action_type=pending.action_type.value,
-                                outcome=decision.kind.value,
-                                initiated_by=pending.initiated_by_open_id,
-                                clicker=clicker_open_id,
-                            )
-                        except Exception as error:  # 见 confirm() 同一姿态
-                            raise PendingActionAuditWriteFailedError(
-                                "取消操作的审计写入失败，事务已回滚，操作未执行"
-                            ) from error
-
-                        cursor.execute(
-                            _UPDATE_TERMINAL_STATUS_SQL,
-                            (
-                                decision.terminal_status.value,
-                                decision.reason,
-                                moment,
-                                clicker_open_id,
-                                pending.id,
-                            ),
+                        committed = self._finalize_cancel_decision(
+                            cursor,
+                            pending=pending,
+                            decision=decision,
+                            clicker_open_id=clicker_open_id,
+                            moment=moment,
                         )
-                        if cursor.rowcount != 1:
-                            # 锁失效场景下的纵深防线，与 confirm() 同一姿态。
-                            raise RuntimeError(
-                                "待确认操作状态在本事务持锁期间被改变，预期影响 1 行，"
-                                f"实际 {cursor.rowcount} 行"
-                            )
 
-        return pending, decision
+        return committed, decision

@@ -31,11 +31,11 @@ from lingxi.adapters.postgres_conversation import _Transaction
 from lingxi.adapters.postgres_local_permission import PostgresLocalPermissionOverrideStore
 from lingxi.adapters.postgres_pending_action import (
     TARGET_HAS_PENDING_ACTION_CODE,
-    PendingActionAuditWriteFailedError,
     PostgresPendingActionStore,
 )
 from lingxi.core.admin.pending_action import (
     ConfirmResultKind,
+    PendingActionAuditWriteFailedError,
     PendingActionStatus,
     PendingActionTransientFailureError,
     PendingActionType,
@@ -1468,6 +1468,219 @@ class TransientFailureRealDbTests(PendingActionPostgresTestCase):
         self.assertEqual(self.current_account_state(TARGET_OPEN_ID), "enabled")
         rows = self.query("SELECT status FROM pending_action WHERE id = %s", (pending_id,))
         self.assertEqual(rows[0][0], "pending")
+
+
+class _AuditFailingOnAction:
+    """只在某一个审计动作名上抛错的审计器（本文件专用测试装置）。
+
+    ``_RecordingAudit(raise_error=True)`` 是"整条审计出口都坏掉"，会让事务体里
+    的那次审计写入先失败、整个事务回滚，测不到"事务已经提交、之后才出问题"。
+    这里只让指定的那一个动作名抛错，其余照常记录。
+    """
+
+    def __init__(self, *, failing_action: str) -> None:
+        self.records: list[tuple[str, dict]] = []
+        self._failing_action = failing_action
+
+    def record(self, action: str, /, **fields: object) -> None:
+        if action == self._failing_action:
+            raise RuntimeError(f"模拟审计出口对 {action} 落库失败")
+        self.records.append((action, dict(fields)))
+
+
+class PostCommitReadbackFailureRealDbTests(PendingActionPostgresTestCase):
+    """事务已提交、随后回读故障（Issue #650，IN-09）：**不得把已执行说成未执行**。
+
+    ``confirm()``/``cancel()`` 的事务体提交之后，还要在事务之外再回读一次
+    ``pending_action`` 才能把终态交还给调用方。那次回读会失败——连接被杀、
+    会话池打满、只读切换——而它**不在** ``try/except OperationalError`` 的保护
+    范围内（那一层只包事务体，故意如此：``PendingActionTransientFailureError``
+    对调用方的含义是"这次点击结构上没有发生过、可以直接重试"）。
+
+    修复前这类故障一路穿过 ``core/admin/card_callback.py``（那里只捕两种已知
+    错误）从 ``handle()`` 逃逸：管理员既拿不到应答帧、也拿不到终态卡，卡片停在
+    还能再点的原状，而权限**已经改掉了**。合同「管理员处理入口与安全确认」要求
+    同一项待确认操作最多成功执行一次、终态后卡片不可再操作，把已执行说成未执行
+    正是在诱发那第二次点击。
+
+    注入方式是给 store 实例挂一个"第一次 ``get()`` 抛错"的钩子。这是**测试
+    装置**，不是环境夹具，不登记进 ``scripts/acceptance_fixtures.py``。
+    """
+
+    def fail_next_get(self, error: BaseException) -> dict[str, int]:
+        """让 ``self.store`` 的下一次 ``get()`` 抛 ``error``，之后恢复正常。
+
+        只打第一次：``confirm()``/``cancel()`` 提交后那一次回读正好是第一次，
+        随后测试自己还要用同一个 store 再点一次、核对真实终态。
+        """
+
+        original = self.store.get
+        state = {"calls": 0}
+
+        def failing_get(*, pending_action_id: str):
+            state["calls"] += 1
+            if state["calls"] == 1:
+                raise error
+            return original(pending_action_id=pending_action_id)
+
+        self.store.get = failing_get  # type: ignore[method-assign]
+        return state
+
+    def audit_actions(self) -> list[str]:
+        return [action for action, _ in self.audit.records]
+
+    def test_confirm_returns_the_committed_terminal_state_when_the_readback_fails(self) -> None:
+        import psycopg
+
+        self.add_target_user(account_state="enabled")
+        pending_id = self.prepare_and_deliver(action_type=PendingActionType.SUSPEND_USER)
+        calls = self.fail_next_get(psycopg.OperationalError("模拟提交后连接已断开"))
+
+        result = self.store.confirm(pending_action_id=pending_id, clicker_open_id=ADMIN_OPEN_ID)
+
+        self.assertEqual(calls["calls"], 1, "确认提交后确实尝试了那次回读")
+        self.assertTrue(result.decision.ok, "回读故障不得推翻已经提交的决定")
+        assert result.pending is not None
+        self.assertEqual(
+            result.pending.status,
+            PendingActionStatus.EXECUTED,
+            "返回的必须是事务内已知的终态，不是锁定时读到的 pending",
+        )
+        self.assertEqual(result.pending.decided_by_open_id, ADMIN_OPEN_ID)
+        self.assertIsNotNone(result.pending.decided_at)
+        self.assertEqual(result.pending.id, pending_id)
+        self.assertEqual(result.pending.card_id, "cardkit_test", "卡片编号仍在，终态卡换得掉")
+
+        # 真库侧：动作确实执行了，快照说的就是数据库里的事实。
+        self.assertEqual(self.current_account_state(), "suspended")
+        rows = self.query(
+            "SELECT status, decided_by_open_id FROM pending_action WHERE id = %s", (pending_id,)
+        )
+        self.assertEqual(rows[0][0], "executed")
+        self.assertEqual(rows[0][1], ADMIN_OPEN_ID)
+        self.assertIn("admin.pending_action.post_commit_readback_degraded", self.audit_actions())
+
+    def test_cancel_returns_the_committed_terminal_state_when_the_readback_fails(self) -> None:
+        import psycopg
+
+        self.add_target_user(account_state="enabled")
+        pending_id = self.prepare_and_deliver(action_type=PendingActionType.SUSPEND_USER)
+        calls = self.fail_next_get(psycopg.OperationalError("模拟提交后连接已断开"))
+
+        result = self.store.cancel(pending_action_id=pending_id, clicker_open_id=ADMIN_OPEN_ID)
+
+        self.assertEqual(calls["calls"], 1)
+        self.assertTrue(result.decision.ok)
+        assert result.pending is not None
+        self.assertEqual(result.pending.status, PendingActionStatus.CANCELLED)
+        self.assertEqual(result.pending.reason, "cancelled_by_admin")
+        self.assertEqual(result.pending.decided_by_open_id, ADMIN_OPEN_ID)
+        self.assertIsNotNone(result.pending.decided_at)
+
+        self.assertEqual(self.current_account_state(), "enabled", "取消不改变任何业务状态")
+        rows = self.query("SELECT status, reason FROM pending_action WHERE id = %s", (pending_id,))
+        self.assertEqual(rows[0][0], "cancelled")
+        self.assertEqual(rows[0][1], "cancelled_by_admin")
+        self.assertIn("admin.pending_action.post_commit_readback_degraded", self.audit_actions())
+
+    def test_clicking_again_after_a_degraded_confirm_does_not_execute_a_second_time(self) -> None:
+        """回读降级之后管理员再点一次：返回既有结果，业务动作不重做。"""
+
+        import psycopg
+
+        self.add_target_user(account_state="enabled")
+        pending_id = self.prepare_and_deliver(action_type=PendingActionType.SUSPEND_USER)
+        self.fail_next_get(psycopg.OperationalError("模拟提交后连接已断开"))
+
+        first = self.store.confirm(pending_action_id=pending_id, clicker_open_id=ADMIN_OPEN_ID)
+        second = self.store.confirm(pending_action_id=pending_id, clicker_open_id=ADMIN_OPEN_ID)
+
+        self.assertTrue(first.decision.ok)
+        self.assertFalse(second.decision.ok, "第二次是幂等重放，不是第二次执行")
+        assert second.pending is not None
+        self.assertEqual(second.pending.status, PendingActionStatus.EXECUTED)
+        self.assertEqual(self.current_account_state(), "suspended", "只翻转一次")
+        confirmed_outcomes = [
+            fields["outcome"]
+            for action, fields in self.audit.records
+            if action == "admin.pending_action.confirmed"
+        ]
+        self.assertEqual(confirmed_outcomes, ["execute"], "业务动作只落一次审计")
+        executed_rows = self.query(
+            "SELECT count(*) FROM pending_action WHERE id = %s AND status = 'executed'",
+            (pending_id,),
+        )
+        self.assertEqual(executed_rows[0][0], 1)
+
+    def test_clicking_again_after_a_degraded_cancel_changes_nothing(self) -> None:
+        import psycopg
+
+        self.add_target_user(account_state="enabled")
+        pending_id = self.prepare_and_deliver(action_type=PendingActionType.SUSPEND_USER)
+        self.fail_next_get(psycopg.OperationalError("模拟提交后连接已断开"))
+
+        first = self.store.cancel(pending_action_id=pending_id, clicker_open_id=ADMIN_OPEN_ID)
+        second = self.store.confirm(pending_action_id=pending_id, clicker_open_id=ADMIN_OPEN_ID)
+
+        self.assertTrue(first.decision.ok)
+        self.assertFalse(second.decision.ok, "已取消的操作不得再被确认执行")
+        assert second.pending is not None
+        self.assertEqual(second.pending.status, PendingActionStatus.CANCELLED)
+        self.assertEqual(self.current_account_state(), "enabled")
+        self.assertNotIn("admin.pending_action.confirmed", self.audit_actions())
+
+    def test_a_broken_audit_sink_does_not_turn_a_committed_confirm_into_a_failure(self) -> None:
+        """降级审计自己也写不进去时，已提交的结论仍然如实返回。
+
+        回读故障与审计出口故障是同一类外部依赖，让后者把已经提交的决定重新变成
+        一个异常，等于绕过整道防线。
+        """
+
+        import psycopg
+
+        self.audit = _AuditFailingOnAction(
+            failing_action="admin.pending_action.post_commit_readback_degraded"
+        )
+        self.store = PostgresPendingActionStore(self._dsn, audit=self.audit, metric_map_path=None)
+        self.add_target_user(account_state="enabled")
+        pending_id = self.prepare_and_deliver(action_type=PendingActionType.SUSPEND_USER)
+        self.fail_next_get(psycopg.OperationalError("模拟提交后连接已断开"))
+
+        result = self.store.confirm(pending_action_id=pending_id, clicker_open_id=ADMIN_OPEN_ID)
+
+        self.assertTrue(result.decision.ok)
+        assert result.pending is not None
+        self.assertEqual(result.pending.status, PendingActionStatus.EXECUTED)
+        self.assertEqual(self.current_account_state(), "suspended")
+
+    def test_a_readback_that_finds_no_row_is_not_reported_as_not_found(self) -> None:
+        """回读返回 ``None``（``python -O`` 下旧 assert 被剥掉后的等价情形）。
+
+        旧实现里 ``assert refreshed is not None`` 一旦在 ``-O`` 下被剥掉，
+        ``ConfirmOutcome.pending`` 就会变成 ``None``，而调用方对 ``pending is
+        None`` 的解读是"操作不存在或已失效"——同样是把已执行说成没发生。
+        """
+
+        self.add_target_user(account_state="enabled")
+        pending_id = self.prepare_and_deliver(action_type=PendingActionType.SUSPEND_USER)
+
+        def get_returns_nothing(*, pending_action_id: str):
+            return None
+
+        self.store.get = get_returns_nothing  # type: ignore[method-assign]
+
+        result = self.store.confirm(pending_action_id=pending_id, clicker_open_id=ADMIN_OPEN_ID)
+
+        self.assertTrue(result.decision.ok)
+        assert result.pending is not None, "已执行的动作不得回报成查无此行"
+        self.assertEqual(result.pending.status, PendingActionStatus.EXECUTED)
+        self.assertEqual(self.current_account_state(), "suspended")
+        degraded = [
+            fields
+            for action, fields in self.audit.records
+            if action == "admin.pending_action.post_commit_readback_degraded"
+        ]
+        self.assertEqual([entry["classification"] for entry in degraded], ["row_disappeared"])
 
 
 class LocalPermissionGrantSuppressRealDbTests(PendingActionPostgresTestCase):
