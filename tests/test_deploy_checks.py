@@ -1475,9 +1475,9 @@ class CandidateSummaryRoutingTest(unittest.TestCase):
 
 
 class RealWorkflowTest(unittest.TestCase):
-    """真实 ci.yml 的两腿构建必须走同一条路径（验收微验 P1）。
+    """真实 ci.yml 的 A、B 两条构建路径必须走同一套命令（验收微验 P1）。
 
-    A 腿走 build_image.sh、B 腿裸 docker build 时，A 带上来源标签而 B 是 unknown；
+    A 路径走 build_image.sh、B 路径裸 docker build 时，A 带上来源标签而 B 是 unknown；
     等价步骤逐字段比 .Config（Labels 就在里面）必然不一致，等价检查恒红，
     而 publish needs 着 image——整条发布路径被自己堵死。
     """
@@ -1521,8 +1521,8 @@ class RealWorkflowTest(unittest.TestCase):
         self.assertEqual(
             bare_builds,
             [],
-            "image job 里出现了裸 docker build；两腿都必须走 scripts/ci/build_image.sh，"
-            "否则构建参数会在两腿之间漂移（来源标签就是这么漂的）",
+            "image job 里出现了裸 docker build；两条路径都必须走 scripts/ci/build_image.sh，"
+            "否则构建参数会在两条路径之间漂移（来源标签就是这么漂的）",
         )
         self.assertEqual(image_job.count("scripts/ci/build_image.sh"), 2)
 

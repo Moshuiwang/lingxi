@@ -236,7 +236,7 @@ class _RecordingDeliveryStore:
         self.body_degraded: list[tuple[str, str]] = []
         self._unnotified = list(unnotified)
 
-    # -- run_once 需要的循环级方法（只服务补发通知这条腿，其余返回空） --------
+    # -- run_once 需要的循环级方法（只服务补发通知这个环节，其余返回空） -------
 
     def fail_exhausted_pending(self) -> int:
         return 0

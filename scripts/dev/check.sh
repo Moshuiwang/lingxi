@@ -22,7 +22,7 @@
 #   full  等价于 Epic Full / gate**这一个作业**（不是整个 Epic Full）：extras 组合
 #         现读自 .github/workflows/ci.yml，起一次性 postgres:16-alpine（trust 认证、
 #         lingxi_test 库）真库，跑完自动清理；同样不跑 Node 校验，也不含
-#         Epic Full / extras 六条干净环境腿与 Epic Full / image 的双路径可复现构建、
+#         Epic Full / extras 六条干净环境路径与 Epic Full / image 的双路径可复现构建、
 #         部署契约、compose 结构核对——那些仍只在 CI 里跑。
 #
 # **extras 组合、shellcheck 版本、Python 版本、真库参数不在本脚本里硬编码**：全部由
