@@ -729,15 +729,13 @@ PROCESS_RUNTIME_IMPORTS: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {
             # 证明不了"这个模块装得上"）。
             "lingxi.core.permission.metric_translation",
             "lingxi.adapters.company_function_metric_map_file",
-            # 四源聚合集中合并（Issue #319 S-P-3）：`permission_refresh.py` 与
-            # `onboarding_runner.py` 都模块级 import 本地覆盖的纯逻辑
-            # （`resolve_local_overrides`）与合并纯函数（`merge_permission_sources`），
+            # 四源聚合集中合并（Issue #319 S-P-3）：本地覆盖那条来源的读取与完整性
+            # 检查现在由 `core/permission/decision_chain.py` 承担，三个合并入口共用
+            # 它一份；`permission_refresh.py` 与 `onboarding_runner.py` 模块级 import
+            # 决定链与合并纯函数（`merge_permission_sources`），
             # `_build_permission_refresh_duty`/`_build_onboarding_duty` 各自函数内
-            # import 真实的 Postgres 读取口——这是 `local_override`/
-            # `postgres_local_permission` 这两个模块**第一次**有真实进程调用方（S-P-1a
-            # 落地时随制品发布但装配前不在任何进程闭包里，见 REQUIRED_MODULES 同名
-            # 注释；那条注释现在已经过期，S-P-3 之后它们确实在 scheduler 的运行时
-            # 闭包里了）。
+            # import 真实的 Postgres 读取口。`local_override` 仍在闭包里——决定链
+            # 模块级 import 它的条目类型、异常与解析纯函数。
             "lingxi.core.permission.local_override",
             "lingxi.adapters.postgres_local_permission",
             "lingxi.adapters.postgres_local_permission_import",

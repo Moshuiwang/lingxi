@@ -154,8 +154,9 @@ class DeliveryConsumer:
         self._loop_failure_alert_threshold = loop_failure_alert_threshold
         self._queue_delay_hint_seconds = queue_delay_hint_seconds
         self._queue_delay_hint_limit = queue_delay_hint_limit
-        # 进程内、非持久化状态：只用来给告警与外发重试限速，重启后清零属于可接受
-        # 的降级（重启本身就已经是一次重新评估的机会）。
+        # 进程内、非持久化状态：**只**给告警节流用。重启后清零是可接受的降级——
+        # 重启本身就是一次重新评估的机会。外发重试退避不在这里：它有意落库、
+        # 跨重启保留（迁移 0090），清零会让一条正在退避的任务立刻重新占名额。
         self._last_alerted_at: dict[tuple[str, str], float] = {}
         # 当前这一条候选本轮有没有推进过消费游标（见 `_advance_delivery_cursor`）。
         # 单条循环、逐个任务处理，因此一个标志就够，不需要按任务分桶。

@@ -287,6 +287,35 @@ class _RecordDeliveryProgressFailsOnce:
         self._queue.record_delivery_progress(**kwargs)
 
 
+class _PerTaskCursorFailure:
+    """代理真实 ``PostgresTaskQueue``：**按 task_id** 决定这一条候选怎么坏。
+
+    ``advance_then_raise`` 里的任务第一次推进游标成功、第二次抛；
+    ``raise_immediately`` 里的任务第一次推进游标就抛（真正的零进展）。按 id 而不是
+    按调用次序分派，是为了让用例不依赖候选发现查询实际返回的顺序。
+    """
+
+    def __init__(
+        self, queue: Any, *, advance_then_raise: set[str], raise_immediately: set[str]
+    ) -> None:
+        self._queue = queue
+        self._advance_then_raise = advance_then_raise
+        self._raise_immediately = raise_immediately
+        self.calls: dict[str, int] = {}
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._queue, name)
+
+    def record_delivery_progress(self, *, task_id: str, **kwargs: object) -> None:
+        seen = self.calls.get(task_id, 0) + 1
+        self.calls[task_id] = seen
+        if task_id in self._raise_immediately:
+            raise RuntimeError("simulated transient database error")
+        if task_id in self._advance_then_raise and seen >= 2:
+            raise RuntimeError("simulated transient database error")
+        self._queue.record_delivery_progress(task_id=task_id, **kwargs)
+
+
 class _RaisesOnNthCursorAdvance:
     """代理真实 ``PostgresTaskQueue``：第 ``fail_on_call`` 次推进游标时抛。
 
@@ -1732,6 +1761,77 @@ class ThrowAfterProgressDoesNotBackOffTests(DeliveryConsumerTestCase):
             "真正的零进展仍然要在候选时刻的档位上继续往上记",
         )
         self.assertIsNotNone(self.scalar("SELECT delivery_retry_after FROM task WHERE id='tsk-1'"))
+
+    def test_a_zero_progress_task_still_backs_off_after_another_task_advanced(self) -> None:
+        """跨任务不变量：同一轮里前面那条推进过，后面这条**真零进展**仍必须记退避。
+
+        「本轮有没有进展」是**每条候选各算各的**。标志位如果不在每条候选开头重置，
+        排在推进过的那条之后的真零进展任务就漏记退避、继续每轮占名额，IN-06 的公平性
+        修复破一半。单任务用例看不见这条泄漏——它要两条候选同轮才成立。
+
+        **不假设候选顺序**：角色按 ``list_pending_delivery_tasks`` 实读回来的次序分派
+        （最后一条当零进展），因此该查询将来改排序也不会让本用例失去判别力。
+
+        变异锚点：删掉 ``_process_task`` 开头那句 ``self._advanced_this_task = False``
+        → 本用例变红（最后那条的退避档位停在候选时刻的旧值、退避时刻仍为空）。
+        """
+
+        for index in range(1, 4):
+            task_id = f"tsk-{index}"
+            self.seed_running_task(task_id=task_id, conversation_id=f"cnv-{index}")
+            self.start_task(task_id)
+            self.queue.append_delivery_event(
+                task_id=task_id,
+                worker_id="worker-1",
+                event_type="progress",
+                idempotency_key=f"{task_id}:a1:progress:1",
+                elapsed_seconds=3,
+            )
+            # 候选时刻已经累了几档退避：判据错的话会在这个旧值上继续往上加。
+            # `created_at` 不碰——库里有触发器禁止改任务创建时间，次序只能实读。
+            self.execute("UPDATE task SET delivery_retry_attempts = 5 WHERE id = %s", (task_id,))
+
+        order = [task.task_id for task in self.queue.list_pending_delivery_tasks(limit=10)]
+        self.assertEqual(len(order), 3, "前提：三条都进候选，跨任务泄漏才有地方发生")
+        *earlier, last = order
+
+        failing = _PerTaskCursorFailure(
+            self.queue, advance_then_raise=set(earlier), raise_immediately={last}
+        )
+        consumer = DeliveryConsumer(
+            queue=failing,
+            cards=RecordingCards(),
+            texts=RecordingText(),
+            monotonic=lambda: 0.0,
+        )
+        consumer.run_once()
+
+        processed = list(failing.calls)
+        self.assertGreater(
+            processed.index(last),
+            0,
+            "前提不成立：零进展那条被排在了最前面，这一轮根本没有推进过的任务可供泄漏，"
+            "本用例失去判别力——次序若真的变了，要改的是角色分派，不是把断言放宽",
+        )
+        self.assertEqual(
+            self.scalar("SELECT delivery_retry_attempts FROM task WHERE id=%s", (last,)),
+            6,
+            "排在推进过的任务之后的真零进展任务，仍然要按候选时刻的档位记退避",
+        )
+        self.assertIsNotNone(
+            self.scalar("SELECT delivery_retry_after FROM task WHERE id=%s", (last,)),
+            "真零进展没记退避＝它下一轮照旧占名额，公平性修复破一半",
+        )
+        for task_id in earlier:
+            with self.subTest(task_id=task_id):
+                self.assertEqual(
+                    self.scalar("SELECT delivery_retry_attempts FROM task WHERE id=%s", (task_id,)),
+                    0,
+                    "推进过的那条：档位已被写回清零，不得再记一档",
+                )
+                self.assertIsNone(
+                    self.scalar("SELECT delivery_retry_after FROM task WHERE id=%s", (task_id,))
+                )
 
 
 if __name__ == "__main__":  # pragma: no cover

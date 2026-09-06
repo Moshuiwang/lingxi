@@ -110,10 +110,10 @@ class _ReadEventsFailsForOneTask:
         return self._queue.read_delivery_events(task_id=task_id, after_sequence=after_sequence)
 
 
-#: 本文件构造的用例统一用一个**很长**的退避基数，而不是生产默认的 2 秒。理由是防
+#: 本文件构造的用例统一用一个**很长**的退避基数，而不是随包发布的默认值 2 秒。理由是防
 #: 假红：这些用例要断言"退避窗口内不进候选"，而一轮要处理二十几个任务，机器一忙就
-#: 可能在断言之前把 2 秒窗口跑过去，于是变成一条会时序偶发变红的用例。生产默认值
-#: 本身另有一条独立断言钉住，不靠这里。
+#: 可能在断言之前把 2 秒窗口跑过去，于是变成一条会时序偶发变红的用例。随包发布的
+#: 默认值本身另有一条独立断言钉住，不靠这里。
 LONG_BACKOFF_BASE_SECONDS = 30.0
 
 
@@ -130,8 +130,12 @@ class DeliverySchedulingFairnessTests(DeliveryConsumerTestCase):
             **kwargs,
         )
 
-    def test_the_shipped_backoff_defaults_are_what_production_runs(self) -> None:
-        """生产默认值单独钉一条：本文件其余用例为了不假红用的是加长基数。"""
+    def test_the_shipped_backoff_defaults_are_the_declared_ones(self) -> None:
+        """随包发布的默认值单独钉一条：本文件其余用例为了不假红用的是加长基数。
+
+        只陈述**这一版代码里声明的默认值**——它有没有在生产跑过，不是这条用例能
+        证明的事。
+        """
         self.assertEqual(DeliveryConsumer.DEFAULT_RETRY_BACKOFF_BASE_SECONDS, 2.0)
         self.assertEqual(DeliveryConsumer.DEFAULT_RETRY_BACKOFF_CAP_SECONDS, 300.0)
 
