@@ -47,6 +47,53 @@ REDACTED_PAYLOAD = "{}"
 REDACTED_OPEN_ID_PREFIX = "redacted:"
 
 
+#: 待确认操作的到期脱敏语句。放在模块层而不是方法体里：逐列的"为什么"要写清楚，塞进
+#: 方法里会让一个只做「校验参数 → 执行一条语句 → 记条数」的方法看起来很长。
+_REDACT_PENDING_ACTIONS_SQL = """
+UPDATE pending_action
+       -- 三列 open_id 擦成「前缀 || id」，逐行唯一的理由见 REDACTED_OPEN_ID_PREFIX；
+       -- decided_by_open_id 本来是 NULL 的保持 NULL——没有内容可擦，写一个脱敏值
+       -- 等于凭空造出「有人决策过」。
+   SET target_open_id = %(prefix)s || id,
+       initiated_by_open_id = %(prefix)s || id,
+       decided_by_open_id =
+           CASE WHEN decided_by_open_id IS NULL THEN NULL ELSE %(prefix)s || id END,
+       -- 仍停在 pending 且早过确认窗口的旧行**同批**结清成 expired。确认窗口是分钟级，
+       -- 一条九十天前的待确认动作留在 pending 本身就不对；更要紧的是
+       -- core.admin.pending_action.decide_confirm 的 not_initiator 判据排在 expired
+       -- **之前**且零业务变更——脱敏改掉 initiated_by_open_id 之后，发起人再点三个月前
+       -- 那张仍留在聊天记录里的卡只会永远得到「不是发起人」，那行**再也不会**转成
+       -- expired，V-管理-30 承诺的「已过期 → 首次发现即转终态」就此不成立。
+       -- decided_at 必须一起写（0068 的 CHECK：终态必须带 decided_at），取本轮判定时刻，
+       -- 与 card_send_failed 那条系统侧终态同一姿态；decided_by_open_id 保持 NULL——
+       -- 没有人做过这个决定。reason 沿用既有的 expired 原因码，不新造。
+       status =
+           CASE WHEN status = 'pending' AND confirm_deadline_at <= %(now)s
+                THEN 'expired' ELSE status END,
+       reason =
+           CASE WHEN status = 'pending' AND confirm_deadline_at <= %(now)s
+                THEN 'expired' ELSE reason END,
+       decided_at =
+           CASE WHEN status = 'pending' AND confirm_deadline_at <= %(now)s
+                THEN %(now)s ELSE decided_at END,
+       -- payload **只在真有内容时**才擦：0073 的
+       -- pending_action_payload_matches_action_type 是双向等价约束，非权限类动作必须
+       -- 保持空白。只判 IS NULL 会把空串/纯空格的 suspend_user 行擦成 '{}' 而违反
+       -- CHECK；这是一条批量 UPDATE，一行违约会让同批合法的到期行一起回滚，坏行每轮
+       -- 又被重新选中，于是这一面永远收不走任何东西。空白 payload 没有可识别内容。
+       payload =
+           CASE WHEN BTRIM(payload) <> '' THEN %(payload)s ELSE payload END,
+       content_redacted_at = %(now)s
+ WHERE id IN (
+       SELECT id FROM pending_action
+        WHERE retention_expires_at <= %(now)s
+          AND content_redacted_at IS NULL
+        ORDER BY retention_expires_at
+        LIMIT %(limit)s
+ )
+"""
+
+
 def _checked_moment(now: datetime | None) -> datetime:
     """到期判定时间必须带时区，否则在任何 ``DELETE``/``UPDATE`` 之前就拒绝。
 
@@ -150,13 +197,9 @@ class PostgresCarrierRetention:
     ) -> int:
         """脱敏过了九十天上限的 ``pending_action`` 行，返回处置行数。
 
-        三列 ``open_id`` 擦成 ``'redacted:' || id``（逐行唯一见
-        :data:`REDACTED_OPEN_ID_PREFIX`）、``payload`` **只在真有内容时**擦成 ``'{}'``
-        （条件为什么不能只判 NULL 见语句里的注释）、``content_redacted_at`` 置为判定时刻；
-        ``decided_by_open_id`` 本来就是 NULL 的保持 NULL（写脱敏值等于凭空造出"有人决策过"）。
-
-        **保留行**：``local_permission_override.pending_action_id`` 是 NOT NULL 外键，
-        删整行会把一条现行本地权限覆盖的成立依据带走。
+        逐列的处置与各自的理由随 :data:`_REDACT_PENDING_ACTIONS_SQL` 里的注释；这里只
+        说**为什么保留行**：``local_permission_override.pending_action_id`` 是 NOT NULL
+        外键，删整行会把一条现行本地权限覆盖的成立依据带走。
         """
         moment = _checked_moment(now)
         batch = _checked_limit(limit)
@@ -164,30 +207,7 @@ class PostgresCarrierRetention:
             with connection.transaction():
                 cursor = connection.cursor()
                 cursor.execute(
-                    """
-                    UPDATE pending_action
-                       SET target_open_id = %(prefix)s || id,
-                           initiated_by_open_id = %(prefix)s || id,
-                           decided_by_open_id =
-                               CASE WHEN decided_by_open_id IS NULL
-                                    THEN NULL ELSE %(prefix)s || id END,
-                           -- payload 只在真有内容时才擦：0073 的
-                           -- pending_action_payload_matches_action_type 是双向等价，
-                           -- 非权限类动作必须保持空白。只判 IS NULL 会把空串/纯空格的
-                           -- suspend_user 行擦成 '{}' 而违反 CHECK；这是一条批量 UPDATE，
-                           -- 一行违约会让同批合法的到期行一起回滚，坏行每轮又被重新选中，
-                           -- 于是这一面永远收不走任何东西。空白 payload 没有可识别内容。
-                           payload =
-                               CASE WHEN BTRIM(payload) <> '' THEN %(payload)s ELSE payload END,
-                           content_redacted_at = %(now)s
-                     WHERE id IN (
-                           SELECT id FROM pending_action
-                            WHERE retention_expires_at <= %(now)s
-                              AND content_redacted_at IS NULL
-                            ORDER BY retention_expires_at
-                            LIMIT %(limit)s
-                     )
-                    """,
+                    _REDACT_PENDING_ACTIONS_SQL,
                     {
                         "prefix": REDACTED_OPEN_ID_PREFIX,
                         "payload": REDACTED_PAYLOAD,
