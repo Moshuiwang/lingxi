@@ -50,7 +50,6 @@ from lingxi.apps.scheduler.permission_refresh_ports import (
     STAGE_TRANSLATE,
     TRIGGER_GRANT,
     TRIGGER_REVOKE,
-    LocalOverrideReadError,
     PermissionRefreshReport,
     PermissionRefreshSources,
     _AuditSink,
@@ -69,6 +68,7 @@ from lingxi.core.identity.roster_audit import ArchivedIdentity
 from lingxi.core.permission.account_match import MATCHED, match_galaxy_account
 from lingxi.core.permission.legacy_diff import missing_all_scope_metrics
 from lingxi.core.permission.local_override import (
+    LocalOverrideReadError,
     LocalPermissionOverrideEntry,
     ResolvedLocalOverrides,
     resolve_local_overrides,
@@ -402,7 +402,17 @@ class PermissionRefreshDuty:
         不这么做的话，空字典会让渲染函数抛错，被记成一条不可分辨的通用失败——审计上完全
         看不出"这个人是被本地抑制清空的"。
         """
-        local = self._resolve_local_overrides(identity.app_user_id)
+        try:
+            local = self._resolve_local_overrides(identity.app_user_id)
+        except LocalOverrideReadError:
+            # 读不出来 ≠ 这个人没有本地覆盖。合并对"没有本地源"恒等，照常发布会产出
+            # 一份**少了本地补授、也少了本地抑制**的完整权限决定并落进发布队列——一次
+            # 数据库抖动因此变成一次冒充完整结果的越权/欠权发布。本轮跳过这个人：不发布、
+            # 不撤权，发布表保持现状，下一轮重新算。
+            self._skip(
+                tally, identity, STAGE_AGGREGATE, SKIP_LOCAL_OVERRIDE_READ_FAILED, revoked=False
+            )
+            return
         merged = merge_permission_sources(
             galaxy=company_metrics,
             local=local,
@@ -445,13 +455,14 @@ class PermissionRefreshDuty:
             return
 
         try:
-            local = self._resolve_local_overrides(identity.app_user_id, raise_on_failure=True)
+            local = self._resolve_local_overrides(identity.app_user_id)
         except LocalOverrideReadError:
             # 读取失败＝本轮跳过这个人：银河贡献恒为空，本地授权是否读到直接决定"发布
             # 还是撤权"这件事本身。把读失败折叠成"没有本地授权"，会让一次纯粹的数据库
-            # 抖动变成真的撤权并同事务清空已送达正文——不可逆。读取口已经记过一条跳过
-            # 审计，这里只补计数。
-            tally.count(SKIP_LOCAL_OVERRIDE_READ_FAILED)
+            # 抖动变成真的撤权并同事务清空已送达正文——不可逆。
+            self._skip(
+                tally, identity, STAGE_AGGREGATE, SKIP_LOCAL_OVERRIDE_READ_FAILED, revoked=False
+            )
             return
 
         # 通配标志现在是必填关键字参数（默认值曾是一次真实漏接的根因）——这条分支的银河
@@ -550,37 +561,33 @@ class PermissionRefreshDuty:
             blocked.account_state,
         )
 
-    def _resolve_local_overrides(
-        self, user_id: str, *, raise_on_failure: bool = False
-    ) -> ResolvedLocalOverrides | None:
-        """读这个人当前生效的本地覆盖条目。未装配与读取失败都返回 ``None``，但审计姿态不同。
+    def _resolve_local_overrides(self, user_id: str) -> ResolvedLocalOverrides | None:
+        """读这个人当前生效的本地覆盖条目。**未装配**返回 ``None``，**读不出来一律抛**。
 
-        **未装配**是部署事实，不告警；**读取失败**响亮记一条跳过审计，异常本身不冒泡——一个人的
-        本地覆盖读不出来不得带走他当轮的银河权限发布，更不能带走整轮。提前捕获是为了把「翻译
-        失败」与「本地覆盖读取失败」两种原因分开审计。
+        两种状态刻意不同：未装配是部署事实（合并按"没有本地源"处理，静默）；读取失败是
+        故障，一旦也返回 ``None`` 就与"确实没有本地覆盖"坍缩成同一件事，而合并对此恒等
+        ——一次数据库抖动会产出一份少了本地补授却看起来完整的权限决定。这里响亮记一条
+        审计，调用方不该再重复记。
 
-        ``raise_on_failure=True`` 时读取失败改为抛出：零银河那条分支上本地源是否读到直接决定
-        「发布还是撤权」，读取失败绝不能被无声折叠成「没有本地授权」进而触发撤权（同事务清已
-        送达正文，不可逆）。两种情形都已经在这里记过审计，调用方不该再重复记一条。
+        Raises:
+            LocalOverrideReadError: 本地覆盖来源读取失败。
         """
         if self._local_overrides is None:
             return None
         try:
             entries = tuple(self._local_overrides.effective_entries(user_id=user_id))
-        except Exception as error:  # 本地源读取失败只降级，不整轮/整人失败
+        except Exception as error:  # 读不出来只跳过这个人，不带走整轮
             self._audit.record(
                 "permission_refresh.local_override_skipped",
                 user=user_id,
                 reason=REASON_LOCAL_OVERRIDE_READ_FAILED,
             )
             logger.error(
-                "本地权限覆盖读取失败，本轮该用户跳过本地源 user=%s error=%s",
+                "本地权限覆盖读取失败，本轮该用户跳过 user=%s error=%s",
                 user_id,
                 type(error).__name__,
             )
-            if raise_on_failure:
-                raise LocalOverrideReadError() from error
-            return None
+            raise LocalOverrideReadError() from error
         entries = self._expand_legacy_all_scope(user_id, entries)
         return resolve_local_overrides(user_id=user_id, entries=entries)
 

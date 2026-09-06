@@ -16,6 +16,8 @@
 from __future__ import annotations
 
 import os
+import threading
+import time
 import unittest
 from datetime import UTC, datetime, timedelta
 
@@ -25,6 +27,7 @@ from lingxi.adapters.postgres import connect
 from lingxi.adapters.postgres_local_permission import (
     DuplicateActiveOverrideError,
     PostgresLocalPermissionOverrideStore,
+    _revoke_group_locked,
 )
 from lingxi.core.ids import new_id
 from lingxi.core.permission.local_override import OverrideDirection, resolve_local_overrides
@@ -95,6 +98,28 @@ class LocalPermissionOverridePostgresTestCase(unittest.TestCase):
         )
         return pending_id
 
+    def _plan(self, pairs=(), all_scope=(), *, explicit: bool = False):
+        from lingxi.core.permission.legacy_diff import (
+            SHAPE_ALL_SCOPE_EXPLICIT,
+            SHAPE_FULL_WILDCARD,
+            SHAPE_SPECIFIC,
+            LegacyImportPlan,
+        )
+
+        shape = SHAPE_SPECIFIC
+        if all_scope:
+            shape = SHAPE_ALL_SCOPE_EXPLICIT if explicit else SHAPE_FULL_WILDCARD
+        return LegacyImportPlan(
+            shape=shape,
+            pairs=tuple(pairs),
+            all_scope_metrics=tuple(all_scope),
+            skipped_reasons=(),
+            unmapped_companies_kept=0,
+        )
+
+    def _now(self):
+        return datetime(2026, 9, 2, 8, 0, tzinfo=UTC)
+
     def insert_override(
         self,
         *,
@@ -163,28 +188,6 @@ class LegacyImportPostgresTests(LocalPermissionOverridePostgresTestCase):
     """``import_legacy_plan``/``expand_all_scope_group``（rc25 S-1，Issue #540）的真库断言：
     同事务合成终态 ``pending_action`` + 行、幂等 ``already_present``、「全部」组可整组撤销、
     新指标补行不复活撤销过的指标。"""
-
-    def _plan(self, pairs=(), all_scope=(), *, explicit: bool = False):
-        from lingxi.core.permission.legacy_diff import (
-            SHAPE_ALL_SCOPE_EXPLICIT,
-            SHAPE_FULL_WILDCARD,
-            SHAPE_SPECIFIC,
-            LegacyImportPlan,
-        )
-
-        shape = SHAPE_SPECIFIC
-        if all_scope:
-            shape = SHAPE_ALL_SCOPE_EXPLICIT if explicit else SHAPE_FULL_WILDCARD
-        return LegacyImportPlan(
-            shape=shape,
-            pairs=tuple(pairs),
-            all_scope_metrics=tuple(all_scope),
-            skipped_reasons=(),
-            unmapped_companies_kept=0,
-        )
-
-    def _now(self):
-        return datetime(2026, 9, 2, 8, 0, tzinfo=UTC)
 
     def test_specific_pairs_and_the_all_scope_group_land_in_one_transaction(self) -> None:
         from lingxi.core.permission.legacy_diff import (
@@ -856,6 +859,200 @@ class EntryStatusConsistencyCheckTests(LocalPermissionOverridePostgresTestCase):
                    VALUES (%s, %s, 'grant', '1011', '   ', 'x', %s, %s)""",
                 (new_id("lpo"), TARGET_USER_ID, ADMIN_OPEN_ID, pending_id),
             )
+
+
+class AllScopeExpandVsRevocationTests(LocalPermissionOverridePostgresTestCase):
+    """撤销之后到达的「全部」组补齐**必须零写入**（IN-02，Issue #646）。
+
+    缺项是在**另一条独立连接**上读 ``effective_entries`` 算出来的（每日重算与定向重算
+    都是这个形状），读完到补齐落库之间，管理员完全可能把整组撤销掉。**新**指标从来没在
+    这个组里出现过，因此不被"同组同指标任何状态已有行都不再插入"那道判据拦住——修复前
+    它被直接插成 ``active``，一个已经被整组收回的授权就此复活成一条生效权限。
+
+    修复有两半，本类分别取证：补齐前在同一事务里复核这个组还有没有生效授权依据（前两条
+    用例），以及把补齐与整组撤销序列化到同一把 ``app_user`` 行锁上（后两条用例）——只加
+    一次读检查而不解决锁序列化，撤销仍可能在检查与插入之间提交。
+    """
+
+    #: 「全部」组补齐用的翻译映射：``m1`` 已在组里，``m2`` 是"映射新增、组里还缺"的那条。
+    MAPPING = {"88": {"职能": ("m1", "m2")}}
+
+    def _import_group(self, *metrics: str):
+        """建一个「全部」组，返回 ``(组 ID, 组内全部行 ID)``。"""
+        report = self.store.import_legacy_plan(
+            user_id=TARGET_USER_ID,
+            target_open_id=TARGET_USER_ID,
+            plan=self._plan(all_scope=metrics),
+            now=self._now(),
+        )
+        ids = tuple(
+            row[0]
+            for row in self.query(
+                "SELECT id FROM local_permission_override"
+                " WHERE permission_group_id = %s ORDER BY id",
+                (report.group_id,),
+            )
+        )
+        return report.group_id, ids
+
+    def _revoke_whole_group(self, group_id: str, ids: tuple[str, ...]) -> None:
+        self.assertTrue(
+            self.store.revoke_group(
+                permission_group_id=group_id,
+                revoked_pending_action_id=self.add_pending_action(pending_id=new_id("pac")),
+                expected_override_ids=ids,
+            )
+        )
+
+    def _refresh_pending_actions(self) -> int:
+        """补齐路径合成的终态 ``pending_action`` 条数——零写入连它都不该建。"""
+        return self.query(
+            "SELECT count(*) FROM pending_action WHERE reason = %s",
+            ("legacy_all_scope_refresh",),
+        )[0][0]
+
+    def _patient_store(self) -> PostgresLocalPermissionOverrideStore:
+        """锁等待放宽到上限的 store：并发用例要让补齐**停在锁上**而不是当场超时。"""
+        from lingxi.adapters.postgres import PostgresTimeouts
+
+        return PostgresLocalPermissionOverrideStore(
+            self._dsn,
+            timeouts=PostgresTimeouts(
+                connect_timeout_seconds=5, statement_timeout_seconds=5, lock_timeout_seconds=5
+            ),
+        )
+
+    def _wait_until_someone_waits_on_a_lock(self) -> None:
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline:
+            waiting = self.query(
+                "SELECT count(*) FROM pg_stat_activity"
+                " WHERE datname = current_database() AND wait_event_type = 'Lock'"
+            )[0][0]
+            if waiting:
+                return
+            time.sleep(0.02)
+        self.fail("并发的补齐没有停在锁上：本用例要验证的序列化前提根本没成立")
+
+    def test_an_already_revoked_group_is_never_expanded(self) -> None:
+        """整组已撤销 → ``expand_all_scope_group`` 零写入（不只是不补旧指标，新指标也不补）。"""
+
+        group_id, ids = self._import_group("m1")
+        self._revoke_whole_group(group_id, ids)
+
+        added = self.store.expand_all_scope_group(
+            user_id=TARGET_USER_ID, group_id=group_id, metrics=("m1", "m2"), now=self._now()
+        )
+
+        self.assertEqual(added, 0, "组已整体撤销，一行都不补")
+        self.assertEqual(self.store.effective_entries(user_id=TARGET_USER_ID), ())
+        self.assertEqual(self._refresh_pending_actions(), 0, "零写入连合成的确认记录都不建")
+
+    def test_a_revocation_between_the_read_and_the_expand_writes_nothing(self) -> None:
+        """真库交错：读 ``effective_entries`` → 管理员整组撤销 → 补齐迟到落库。
+
+        缺项用的是重算侧真正调用的 ``missing_all_scope_metrics``，不是手写的常量——
+        复现的就是 ``permission_refresh._expand_legacy_all_scope`` /
+        ``targeted_recompute._expand_legacy_all_scope`` 的形状。
+        """
+
+        from lingxi.core.permission.legacy_diff import missing_all_scope_metrics
+
+        group_id, ids = self._import_group("m1")
+
+        # 1）重算在独立连接上读当前生效条目，算出"映射有、组里缺"的指标。
+        entries = tuple(item.entry for item in self.store.effective_entries(user_id=TARGET_USER_ID))
+        missing = missing_all_scope_metrics(entries, self.MAPPING)
+        self.assertEqual(missing, {group_id: ("m2",)}, "前提：这一轮确实算出了一条缺项")
+
+        # 2）管理员在这中间把整组撤销掉。
+        self._revoke_whole_group(group_id, ids)
+
+        # 3）补齐迟到落库。
+        added = self.store.expand_all_scope_group(
+            user_id=TARGET_USER_ID, group_id=group_id, metrics=missing[group_id], now=self._now()
+        )
+
+        self.assertEqual(added, 0, "撤销之后到达的补齐不得产生任何生效权限")
+        self.assertEqual(self.store.effective_entries(user_id=TARGET_USER_ID), ())
+        self.assertEqual(
+            self.query("SELECT count(*) FROM local_permission_override WHERE metric_name = 'm2'")[
+                0
+            ][0],
+            0,
+            "被撤销的组不得因为一条新指标而复活出一行",
+        )
+        self.assertEqual(self._refresh_pending_actions(), 0)
+
+    def test_a_concurrent_expand_waits_for_the_revocation_and_then_writes_nothing(self) -> None:
+        """真并发：撤销事务已持有目标用户行锁时，补齐必须等它、并在它之后判定零写入。
+
+        撤销走的是确认卡执行那条路径的形状（先锁 ``app_user`` 行、再在同一事务里翻转
+        组内生效行）。补齐在另一条连接上并发发起：它先停在同一把行锁上，撤销提交后才
+        继续，此时组里已经没有生效授权依据 → 一行都不补。
+        """
+
+        group_id, ids = self._import_group("m1")
+        patient = self._patient_store()
+        outcome: dict[str, object] = {}
+
+        def expand() -> None:
+            try:
+                outcome["added"] = patient.expand_all_scope_group(
+                    user_id=TARGET_USER_ID,
+                    group_id=group_id,
+                    metrics=("m1", "m2"),
+                    now=self._now(),
+                )
+            except Exception as error:  # 记下来交主线程断言，不让线程静默死掉
+                outcome["error"] = error
+
+        revoke_pending = self.add_pending_action(pending_id=new_id("pac"))
+        worker = threading.Thread(target=expand)
+        with connect(self._dsn) as holder, holder.cursor() as cursor:
+            cursor.execute("SELECT id FROM app_user WHERE id = %s FOR UPDATE", (TARGET_USER_ID,))
+            worker.start()
+            self._wait_until_someone_waits_on_a_lock()
+            self.assertTrue(
+                _revoke_group_locked(
+                    cursor,
+                    permission_group_id=group_id,
+                    revoked_pending_action_id=revoke_pending,
+                    moment=self._now(),
+                    expected_override_ids=ids,
+                )
+            )
+        worker.join(timeout=30)
+
+        self.assertFalse(worker.is_alive(), "并发补齐没有在撤销提交后收口")
+        self.assertIsNone(outcome.get("error"), f"并发补齐异常退出：{outcome.get('error')!r}")
+        self.assertEqual(outcome.get("added"), 0, "撤销赢了这把锁之后，补齐一行都不写")
+        self.assertEqual(self.store.effective_entries(user_id=TARGET_USER_ID), ())
+
+    def test_revoke_group_takes_the_same_user_lock_the_expand_takes(self) -> None:
+        """否定断言：``revoke_group`` 必须真的去拿目标用户那把行锁。
+
+        补齐拿的是 ``app_user`` 行锁，而 ``revoke_group`` 修复前只锁组内生效行——两把
+        锁互不序列化，撤销可以在补齐"复核组还有效"与"插入新行"之间提交。这里用一条独立
+        连接先占住 ``app_user`` 行：``revoke_group`` 必须因此等到锁超时，证明它确实在
+        同一把锁上排队。修复前它会径直成功。
+        """
+
+        from psycopg.errors import LockNotAvailable
+
+        group_id, ids = self._import_group("m1")
+        revoke_pending = self.add_pending_action(pending_id=new_id("pac"))
+        with connect(self._dsn) as holder, holder.cursor() as cursor:
+            cursor.execute("SELECT id FROM app_user WHERE id = %s FOR UPDATE", (TARGET_USER_ID,))
+            with self.assertRaises(LockNotAvailable):
+                self.store.revoke_group(
+                    permission_group_id=group_id,
+                    revoked_pending_action_id=revoke_pending,
+                    expected_override_ids=ids,
+                )
+        self.assertEqual(
+            len(self.store.effective_entries(user_id=TARGET_USER_ID)), 1, "撤销没成，组仍然生效"
+        )
 
 
 if __name__ == "__main__":  # pragma: no cover

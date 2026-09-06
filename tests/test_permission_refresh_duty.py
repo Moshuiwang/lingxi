@@ -1303,22 +1303,32 @@ class LocalOverrideMergeTest(unittest.TestCase):
         row = parts["decisions"].calls[0]["row"]
         self.assertEqual(row.permissions, f'{{"{COMPANY_ID_TWO}":["{METRIC_NAME_TWO}"]}}')
 
-    def test_read_failure_skips_local_source_and_audits(self) -> None:
-        """读取失败：该用户本轮跳过本地源并响亮审计，不整轮失败、不静默——发布仍然
-        照常进行（只是不含本地覆盖），不计入 ``report.failed``。"""
+    def test_read_failure_skips_the_user_and_publishes_nothing(self) -> None:
+        """读不出来 ≠ 合法空（IN-01，Issue #646）。
+
+        本用例此前逐字钉住的是**错误行为**：「读取失败仍照常发布、只是不含本地覆盖、
+        ``report.failed == 0``」。合并对"没有本地源"恒等，因此那条路径产出的是一份
+        **少了本地补授、也少了本地抑制**却与完整结果逐字节同形的权限决定，被 record_decision
+        落进发布队列——一次数据库抖动冒充了一次完整重算。修复后：一条发布意图都不排、
+        也不撤权，记一条可分辨的跳过并计入本轮跳过统计。
+        """
 
         overrides = FakeLocalOverrides(fail_for={USER_ONE})
         duty, parts = build_duty(identities=(identity(),), local_overrides=overrides)
 
         report = duty.run_once()
 
-        row = parts["decisions"].calls[0]["row"]
-        self.assertEqual(row.permissions, f'{{"{COMPANY_ID}":["{METRIC_NAME}"]}}')
-        self.assertEqual(report.failed, 0, "本地覆盖读取失败不得记成整用户失败")
-        self.assertIn("permission_refresh.local_override_skipped", parts["audit"].actions())
+        self.assertEqual(parts["decisions"].calls, [], "读不出本地源时一条发布意图都不排")
+        self.assertEqual((report.enqueued, report.revoked), (0, 0), "既不发布也不撤权")
+        self.assertEqual(report.failed, 0, "这是一条可分辨的跳过，不是未归类的技术故障")
+        self.assertEqual(report.incomplete, 1, "计入跳过统计，不是静默放过")
+        self.assertEqual(report.reasons.get(REASON_LOCAL_OVERRIDE_READ_FAILED), 1)
         fields = parts["audit"].fields_for("permission_refresh.local_override_skipped")[0]
         self.assertEqual(fields["user"], USER_ONE)
         self.assertEqual(fields["reason"], REASON_LOCAL_OVERRIDE_READ_FAILED)
+        skipped = parts["audit"].fields_for("permission_refresh.user_skipped")[0]
+        self.assertEqual(skipped["user"], USER_ONE)
+        self.assertEqual(skipped["reason"], REASON_LOCAL_OVERRIDE_READ_FAILED)
 
     def test_wildcard_admin_skips_both_grant_and_suppress_with_audit(self) -> None:
         """通配角 v1（编排者裁定）：``all_companies=True`` 时本地授权与抑制**整体

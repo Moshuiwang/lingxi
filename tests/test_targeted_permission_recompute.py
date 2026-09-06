@@ -49,6 +49,7 @@ from lingxi.core.permission.local_override import LocalPermissionOverrideEntry, 
 from lingxi.core.permission.targeted_recompute import (
     SKIP_ACCOUNT_NOT_ENABLED,
     SKIP_ARCHIVED_IDENTITY_INCOMPLETE,
+    SKIP_LOCAL_OVERRIDE_READ_FAILED,
     SKIP_MATCH_FAILED,
     SKIP_METRIC_TRANSLATION_UNAVAILABLE,
     SKIP_MISSING_PERSONNEL_ID,
@@ -407,6 +408,61 @@ class RecomputeAndPublishGrantTests(unittest.TestCase):
             parts["audit"].actions(),
             "有限指标通配这一支恒不登记跳过原因（模块文档「通配角 v2」）",
         )
+
+
+class LocalOverrideReadFailureTests(unittest.TestCase):
+    """本地覆盖读不出来时定向重算**一个字节都不写**（IN-01，Issue #646）。
+
+    本模块此前**一条读取失败用例都没有**，而它恰恰是 #615 R2 在真库上复现的那一处：
+    读失败被折叠成"没有本地源"，合并对此恒等，于是产出一份少了本地补授的完整权限决定
+    并落进 ``publish_outbox``。本类从三个方向钉住修复：既不发布也不撤权、原因码可分辨、
+    以及"读得出来的合法空集"仍然照常走完（证明判据是"读没读到"而不是"结果空不空"）。
+    """
+
+    def test_a_read_failure_publishes_nothing_and_revokes_nothing(self) -> None:
+        recompute, parts = build_recompute(
+            identities=(identity(),),
+            published_users={USER_ONE},  # 有足迹：读失败若被当成合法空集就会走撤权出口
+            local_overrides=FakeLocalOverrides(fail_for={USER_ONE}),
+        )
+
+        outcome = recompute.recompute_and_publish(user_id=USER_ONE)
+
+        self.assertEqual(outcome.kind, RecomputeKind.SKIPPED)
+        self.assertEqual(outcome.reason, SKIP_LOCAL_OVERRIDE_READ_FAILED)
+        self.assertEqual(parts["decisions"].calls, [], "读不出本地源时零权限决定")
+
+    def test_the_skip_reason_is_distinguishable_in_the_audit(self) -> None:
+        recompute, parts = build_recompute(
+            identities=(identity(),), local_overrides=FakeLocalOverrides(fail_for={USER_ONE})
+        )
+
+        recompute.recompute_and_publish(user_id=USER_ONE)
+
+        self.assertEqual(
+            parts["audit"].fields_for("permission_targeted_recompute.local_override_skipped"),
+            [{"user": USER_ONE, "reason": SKIP_LOCAL_OVERRIDE_READ_FAILED}],
+        )
+        skipped = parts["audit"].fields_for("permission_targeted_recompute.skipped")
+        self.assertEqual(
+            [fields["reason"] for fields in skipped], [SKIP_LOCAL_OVERRIDE_READ_FAILED]
+        )
+
+    def test_a_readable_empty_set_still_publishes(self) -> None:
+        """对照否定断言：判据是"读没读到"，不是"读到的结果空不空"。
+
+        同一个人、同一份银河输入，本地覆盖**读得出来但是空的**时照常发布——如果修复
+        把"合法空集"也一起挡掉，这条会红。
+        """
+
+        recompute, parts = build_recompute(
+            identities=(identity(),), local_overrides=FakeLocalOverrides({USER_ONE: ()})
+        )
+
+        outcome = recompute.recompute_and_publish(user_id=USER_ONE)
+
+        self.assertEqual(outcome.kind, RecomputeKind.ENQUEUED)
+        self.assertEqual(len(parts["decisions"].calls), 1)
 
 
 class LegacyAllScopeRecomputeTests(unittest.TestCase):
