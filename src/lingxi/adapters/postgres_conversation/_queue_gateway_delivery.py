@@ -14,6 +14,31 @@ from ._dataclasses import (
     UncertainDeliveryTask,
 )
 
+# 候选发现查询。`delivery_retry_after` 这一条过滤是「调度公平性」的落点：一个刚
+# 刚外发失败、正在退避的任务在窗口内根本不进候选，因此不会每轮都占掉一个名额却
+# 零进展，批量上限之外的健康任务也就不会被它挤住。`NULL` ＝ 没有待还的退避，是
+# 绝大多数任务的常态；时间比较交给数据库的 `now()`，不引入消费进程的本地时钟。
+_LIST_PENDING_DELIVERY_SQL = """
+    SELECT t.id, t.conversation_id, c.feishu_chat_id, c.feishu_thread_id,
+           t.reply_to_message_id, t.status, t.card_id, t.card_seq,
+           t.delivery_message_id, t.fallback_text, t.delivery_consumed_sequence,
+           t.delivery_retry_attempts
+      FROM task AS t
+      JOIN conversation AS c ON c.id = t.conversation_id
+     WHERE t.status IN ('running', 'awaiting_delivery')
+       AND t.dispatch_reserved_kind IS NULL
+       AND (t.delivery_retry_after IS NULL OR t.delivery_retry_after <= now())
+       AND (
+            EXISTS (
+                SELECT 1 FROM task_delivery_event AS e
+                 WHERE e.task_id = t.id AND e.sequence > t.delivery_consumed_sequence
+            )
+            OR (t.status = 'awaiting_delivery' AND t.delivery_message_id IS NOT NULL)
+       )
+     ORDER BY t.created_at
+     LIMIT %s
+"""
+
 
 class _GatewayDeliveryMixin:
     # 这一组方法服务的是「读 outbox、驱动 CardKit/文本、记消费进度」这一条 Gateway
@@ -24,10 +49,11 @@ class _GatewayDeliveryMixin:
         """列出本轮需要处理的任务。
 
         还有未消费的 outbox 事件，或已经拿到 ``delivery_message_id`` 但尚未
-        确认送达。**不含** ``dispatch_reserved_kind`` 非空的任务——那些是崩溃
-        恢复后 outcome 不明的任务，必须被上层单独识别为 ``uncertain``。只读
-        查询，不加锁：外发前预留位（``reserve_dispatch``）才是真正的并发
-        互斥点，这里允许多个候选同时被读到，抢占失败的一方在预留时自然让路。
+        确认送达。**不含**两类不该占名额的任务：``dispatch_reserved_kind`` 非空
+        （崩溃恢复后 outcome 不明，必须被上层单独识别为 ``uncertain``）与仍在
+        重试退避窗口内的（见 :meth:`record_delivery_retry`）。只读查询，不加锁：
+        外发前预留位（``reserve_dispatch``）才是真正的并发互斥点，这里允许多个
+        候选同时被读到，抢占失败的一方在预留时自然让路。
         """
         # gateway 投递循环每 poll_interval 都会跑这条发现查询，空转时也不例外
         # ——走 `_run_polling_operation`（默认逐字节等价于原来的 `connect(...)`，
@@ -35,27 +61,7 @@ class _GatewayDeliveryMixin:
 
         def _list_pending(connection: Any) -> list[PendingDeliveryTask]:
             with connection.cursor() as cursor:
-                cursor.execute(
-                    """
-                    SELECT t.id, t.conversation_id, c.feishu_chat_id, c.feishu_thread_id,
-                           t.reply_to_message_id, t.status, t.card_id, t.card_seq,
-                           t.delivery_message_id, t.fallback_text, t.delivery_consumed_sequence
-                      FROM task AS t
-                      JOIN conversation AS c ON c.id = t.conversation_id
-                     WHERE t.status IN ('running', 'awaiting_delivery')
-                       AND t.dispatch_reserved_kind IS NULL
-                       AND (
-                            EXISTS (
-                                SELECT 1 FROM task_delivery_event AS e
-                                 WHERE e.task_id = t.id AND e.sequence > t.delivery_consumed_sequence
-                            )
-                            OR (t.status = 'awaiting_delivery' AND t.delivery_message_id IS NOT NULL)
-                       )
-                     ORDER BY t.created_at
-                     LIMIT %s
-                    """,
-                    (limit,),
-                )
+                cursor.execute(_LIST_PENDING_DELIVERY_SQL, (limit,))
                 return [
                     PendingDeliveryTask(
                         task_id=row[0],
@@ -69,6 +75,7 @@ class _GatewayDeliveryMixin:
                         message_id=row[8],
                         fallback_text=row[9],
                         consumed_sequence=row[10],
+                        retry_attempts=row[11],
                     )
                     for row in cursor.fetchall()
                 ]
@@ -211,6 +218,29 @@ class _GatewayDeliveryMixin:
                 (task_id,),
             )
 
+    def record_delivery_retry(self, *, task_id: str, attempts: int, delay_seconds: float) -> None:
+        """记一次"这一轮没有成交、过 ``delay_seconds`` 秒之后再试"。
+
+        写的两列只影响 :meth:`list_pending_delivery_tasks` 什么时候愿意把这条
+        任务再选进候选，**不放宽任何一道防重复的闸**：能不能再外发一次仍然只看
+        外发前预留位，能不能确认送达仍然只看消费游标与本次终态的回执。落库而不
+        是留在消费进程内存里，是因为候选选择发生在数据库里——留在进程里就只能在
+        "已经被选中之后"短路，那个名额已经花掉了；顺带让退避跨进程重启保持有效。
+        """
+        with (
+            connect(self._dsn, timeouts=self._timeouts) as connection,
+            connection.cursor() as cursor,
+        ):
+            cursor.execute(
+                """
+                UPDATE task
+                   SET delivery_retry_attempts = %s,
+                       delivery_retry_after = now() + make_interval(secs => %s)
+                 WHERE id = %s
+                """,
+                (attempts, delay_seconds, task_id),
+            )
+
     def record_delivery_progress(
         self,
         *,
@@ -221,14 +251,15 @@ class _GatewayDeliveryMixin:
         card_sequence: int | None = None,
         fallback_text: bool = False,
     ) -> None:
-        """把一次已经明确知道结果的外发进度写回，总是清空预留位。
+        """把一次已经明确知道结果的外发进度写回，总是清空预留位与重试退避。
 
         调用这个方法本身就意味着调用方已经拿到了确定的结果（成功，或同步
-        捕获的失败）。``card_id``/``message_id``/``card_sequence`` 用
-        ``COALESCE`` 只增不减：
-        一旦写入就不会被后续调用误置回 ``NULL``；``consumed_sequence`` 用
-        ``GREATEST`` 防止乱序调用把游标往回拨；``fallback_text`` 一旦置真就不会
-        被置回假（`V-卡片-03`：首次失败后永久走文本通道）。
+        捕获的失败）并且消费游标要往前走，因此累计的退避档位一并归零——这条
+        通道刚刚被证明是通的。``card_id``/``message_id``/``card_sequence`` 用
+        ``COALESCE`` 只增不减：一旦写入就不会被后续调用误置回 ``NULL``；
+        ``consumed_sequence`` 用 ``GREATEST`` 防止乱序调用把游标往回拨；
+        ``fallback_text`` 一旦置真就不会被置回假（`V-卡片-03`：首次失败后
+        永久走文本通道）。
         """
         with (
             connect(self._dsn, timeouts=self._timeouts) as connection,
@@ -242,7 +273,9 @@ class _GatewayDeliveryMixin:
                        delivery_message_id = COALESCE(%s, delivery_message_id),
                        card_seq = COALESCE(%s, card_seq),
                        fallback_text = fallback_text OR %s,
-                       dispatch_reserved_kind = NULL
+                       dispatch_reserved_kind = NULL,
+                       delivery_retry_attempts = 0,
+                       delivery_retry_after = NULL
                  WHERE id = %s
                 """,
                 (

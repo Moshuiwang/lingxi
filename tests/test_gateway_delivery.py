@@ -340,6 +340,17 @@ class DeliveryConsumerTestCase(unittest.TestCase):
             (task_id, conversation_id, f"event-{task_id}", reply_to_message_id),
         )
 
+    def expire_retry_backoff(self, task_id: str) -> None:
+        """把这条任务的重试退避时刻拨到过去，表示"退避窗口已经过去了"。
+
+        退避时刻是库里的 ``timestamptz``，不受注入时钟影响；真库用例表示时间流逝
+        的既有手法就是直接改这类时间列（见 ``QueueDelayHintTests`` 的 ``created_at``）。
+        """
+        self.execute(
+            "UPDATE task SET delivery_retry_after = now() - interval '1 second' WHERE id = %s",
+            (task_id,),
+        )
+
     def start_task(self, task_id: str) -> None:
         self.queue.append_delivery_event(
             task_id=task_id,
@@ -565,22 +576,20 @@ class CardFailureFallsBackToTextTests(DeliveryConsumerTestCase):
         self.assertEqual(row[2], "msg-text-1")
 
     def test_text_fallback_failure_keeps_task_pending_for_retry(self) -> None:
-        """文本兜底同步捕获到明确失败：清预留位、不确认送达，下一轮可以重试。
+        """文本兜底同步捕获到明确失败：清预留位、不确认送达，退避过后可以重试。
 
-        独立审核 P2-4 修复后，明确失败带有退避——这里用受控时钟把时间拨过退避
-        窗口，验证的仍然是"下一轮重试"这件事本身，不测退避的具体时长。
+        明确失败带有退避，退避时刻**落在库里**；这里把它拨到过去来表示"时间过
+        去了"（同 ``QueueDelayHintTests`` 用 ``created_at`` 表示排队时长的手法），
+        验证的仍然是"下一轮重试"这件事本身，不测退避的具体时长。
         """
 
         self.seed_running_task(task_id="tsk-1", conversation_id="cnv-1")
         self.start_task("tsk-1")
         self.finish_task("tsk-1")
 
-        clock = [0.0]
         cards = RecordingCards(fail_at=1)  # create 本身就失败，直接走文本通道
         texts = RecordingText(fail=True)
-        consumer = DeliveryConsumer(
-            queue=self.queue, cards=cards, texts=texts, monotonic=lambda: clock[0]
-        )
+        consumer = DeliveryConsumer(queue=self.queue, cards=cards, texts=texts)
         consumer.run_once()
 
         row = self.query(
@@ -590,12 +599,12 @@ class CardFailureFallsBackToTextTests(DeliveryConsumerTestCase):
         self.assertIsNone(row[1], "明确失败必须清空预留位，允许下一轮重试")
         self.assertIsNone(row[2])
 
-        # 退避窗口内立即重试一次：不应该产生新的外发尝试（P2-4：无退避会打平台限流）。
-        consumer.run_once()
+        # 退避窗口内立即重试一次：不应该产生新的外发尝试（无退避会打平台限流）。
+        self.assertEqual(consumer.run_once(), 0, "退避窗口内连候选名额都不该占")
         self.assertEqual(len(texts.calls), 1, "退避窗口内不应该再次尝试外发")
 
-        # 时钟拨过退避窗口 + 文本发送恢复正常：下一轮应当成功重试并确认送达。
-        clock[0] += DeliveryConsumer.DEFAULT_FALLBACK_BACKOFF_CAP_SECONDS
+        # 退避时刻拨到过去 + 文本发送恢复正常：下一轮应当成功重试并确认送达。
+        self.expire_retry_backoff("tsk-1")
         texts.fail = False
         consumer.run_once()
         row = self.query("SELECT status FROM task WHERE id='tsk-1'")[0]
@@ -1473,6 +1482,9 @@ class TerminalReceiptRequiredBeforeConfirmTests(DeliveryConsumerTestCase):
         )
         self._assert_not_delivered()
 
+        # 上一轮的明确失败已经写下一段退避；这里把它拨到过去，好让本用例真正跑到
+        # "第二轮拿着旧标识"的那半个窗口——本用例要钉的是回执判据，不是退避。
+        self.expire_retry_backoff("tsk-1")
         spy = _ConfirmDeliverySpy(self.queue)
         processed = DeliveryConsumer(queue=spy, cards=cards, texts=texts).run_once()
 
@@ -1484,23 +1496,23 @@ class TerminalReceiptRequiredBeforeConfirmTests(DeliveryConsumerTestCase):
         )
         self._assert_not_delivered()
 
-    def test_a_backoff_window_with_no_outbound_attempt_is_never_confirmed(self) -> None:
+    def test_a_backoff_window_produces_no_attempt_and_no_confirmation(self) -> None:
         """**安全重试分支的否定面**：退避窗口内这一轮**一次外发都没发生**，
         同样不得确认——旧实现里这条路径返回 ``RETRY_LATER``，照样走去确认。
+        退避落库之后这一轮更进一步：这个任务连候选名额都不占。
         """
 
         self._seed_task_with_terminal()
-        clock = [0.0]
         cards = RecordingCards(fail_at=1)  # create 就被拒，直接走文本通道
         texts = RecordingText(fail=True)
-        consumer = DeliveryConsumer(
-            queue=self.queue, cards=cards, texts=texts, monotonic=lambda: clock[0]
-        )
+        spy = _ConfirmDeliverySpy(self.queue)
+        consumer = DeliveryConsumer(queue=spy, cards=cards, texts=texts)
         consumer.run_once()
         self.assertEqual(len(texts.calls), 1)
 
-        consumer.run_once()  # 退避未到期：不抢预留位、不外发
+        self.assertEqual(consumer.run_once(), 0, "退避窗口内不得占用候选名额")
         self.assertEqual(len(texts.calls), 1, "退避窗口内不得产生新的外发尝试")
+        self.assertEqual(spy.calls, [], "一次外发都没发生的轮次不得发起确认")
         self._assert_not_delivered()
 
     def test_an_in_flight_card_terminal_is_never_retried_automatically(self) -> None:
@@ -1561,7 +1573,7 @@ class TerminalReceiptRequiredBeforeConfirmTests(DeliveryConsumerTestCase):
         self._assert_not_delivered()
 
         # 之后每一轮都抢不到预留位：既不重投，也不会悄悄改走文本通道。
-        clock[0] += DeliveryConsumer.DEFAULT_FALLBACK_BACKOFF_CAP_SECONDS * 10
+        clock[0] += DeliveryConsumer.DEFAULT_RETRY_BACKOFF_CAP_SECONDS * 10
         self.assertEqual(consumer.run_once(), 0, "预留位卡住的任务不进入正常候选")
         self.assertEqual(len(cards.update_calls), 0, "绝不自动重投同一个 sequence")
         self.assertEqual(texts.calls, [])
