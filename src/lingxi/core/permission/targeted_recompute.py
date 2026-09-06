@@ -26,6 +26,7 @@ from lingxi.core.identity.roster_audit import ArchivedIdentity
 from lingxi.core.permission.account_match import MATCHED, match_galaxy_account
 from lingxi.core.permission.legacy_diff import missing_all_scope_metrics
 from lingxi.core.permission.local_override import (
+    LocalOverrideReadError,
     LocalPermissionOverrideEntry,
     ResolvedLocalOverrides,
     resolve_local_overrides,
@@ -339,7 +340,14 @@ class TargetedPermissionRecompute:
             return translated
         company_metrics, cause, aggregate = translated
 
-        local = self._resolve_local_overrides(user_id)
+        try:
+            local = self._resolve_local_overrides(user_id)
+        except LocalOverrideReadError:
+            # 本地源读不出来时**不落任何权限决定**：合并对"没有本地源"恒等，照常算下去
+            # 会把一份少了本地补授的结果当成"现在应得的权限"发布出去——而这条入口正是
+            # 管理员刚做完本地权限动作时跑的，产出的恰恰是那次动作看不见的结果。
+            # 跳过是常态出口：发布表保持现状，管理员可重试，每日重算也会再算一次。
+            return self._skip(user_id, mode="recompute", reason=SKIP_LOCAL_OVERRIDE_READ_FAILED)
         # `all_companies=True` 有两个独立成因（国家层面通配，或持有
         # `ADMIN_FULL_ACCESS_FUNCTION`），只有后者是「真全指标通配」——
         # `merge_permission_sources` 自己不猜测，调用方必须显式声明。零银河分支
@@ -456,25 +464,43 @@ class TargetedPermissionRecompute:
         return TargetedRecomputeOutcome(kind=kind, cleared_events=decision.cleared_events)
 
     def _resolve_local_overrides(self, user_id: str) -> ResolvedLocalOverrides | None:
-        """读取本地覆盖；失败只降级为没有本地源，不整次调用失败。
+        """读取本地覆盖。**未装配**返回 ``None``，**读不出来一律抛**。
 
-        ``None`` 对合并恒等，响亮记一条审计。本模块两条业务路径的银河/既有发布
-        内容都已经确定要不要发布，本地源读取失败不改变这件事本身，只是让合并
-        少了本地这一份。
+        两种状态的返回值刻意不同：未装配是部署事实，对合并恒等且静默；读取失败是故障，
+        若也返回 ``None`` 就与"这个人确实没有本地覆盖"在合并入口坍缩成同一件事，产出
+        一份少了本地补授却看起来完整的权限决定。响亮记一条审计后抛出，由调用方决定
+        怎么收敛。
+
+        Raises:
+            LocalOverrideReadError: 本地覆盖来源读取失败。
         """
         if self._local_overrides is None:
             return None
+        entries = self._read_local_override_entries(user_id)
+        entries = self._expand_legacy_all_scope(user_id, entries)
+        return resolve_local_overrides(user_id=user_id, entries=entries)
+
+    def _read_local_override_entries(
+        self, user_id: str
+    ) -> tuple[LocalPermissionOverrideEntry, ...]:
+        """读一次本地覆盖条目；**读不出来一律审计后抛**。
+
+        与每日批 ``permission_refresh._read_local_override_entries`` 同一语义：这条来源
+        只有这一个读取口，合并前的首次读取与补行之后的重读都走它，两次失败的姿态因此
+        天然一致（重读失败曾经原地退回旧条目照旧发布，等于用不完整的信息提交权限决定）。
+
+        Raises:
+            LocalOverrideReadError: 本地覆盖来源读取失败。
+        """
         try:
-            entries = tuple(self._local_overrides.effective_entries(user_id=user_id))
-        except Exception:  # 本地源读取失败只降级，不带走整次调用
+            return tuple(self._local_overrides.effective_entries(user_id=user_id))
+        except Exception as error:  # 读不出来只跳过这次重算，不产出半份结果
             self._audit.record(
                 "permission_targeted_recompute.local_override_skipped",
                 user=user_id,
                 reason=SKIP_LOCAL_OVERRIDE_READ_FAILED,
             )
-            return None
-        entries = self._expand_legacy_all_scope(user_id, entries)
-        return resolve_local_overrides(user_id=user_id, entries=entries)
+            raise LocalOverrideReadError() from error
 
     def _expand_legacy_all_scope(
         self, user_id: str, entries: tuple[LocalPermissionOverrideEntry, ...]
@@ -482,7 +508,11 @@ class TargetedPermissionRecompute:
         """「2.0 迁移导入·全部」组随当前映射补齐新指标。
 
         与每日批 ``permission_refresh._expand_legacy_all_scope`` 同一语义：缺才补、
-        同组 ID、只看生效条目；补行或重读失败只审计、不影响本次既有结果。
+        同组 ID、只看生效条目；补行失败只审计、本次按既有行照常算，重读失败与首次读取
+        同姿态抛出（库里已经多了一条本次读不到的补行，照旧发布就是半份结果）。
+
+        Raises:
+            LocalOverrideReadError: 补行之后的重读失败。
         """
         if self._legacy_all_scope is None:
             return entries
@@ -510,10 +540,7 @@ class TargetedPermissionRecompute:
             added_total += added
         if added_total == 0:
             return entries
-        try:
-            return tuple(self._local_overrides.effective_entries(user_id=user_id))
-        except Exception:
-            return entries
+        return self._read_local_override_entries(user_id)
 
     def _skip(
         self, user_id: str, *, mode: str, reason: str, **extra: object

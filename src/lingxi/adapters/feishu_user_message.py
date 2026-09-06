@@ -22,6 +22,11 @@ from collections.abc import Callable, Mapping
 from typing import Any
 
 from lingxi.adapters.feishu_group_message import delivery_uuid
+from lingxi.core.delivery.ports import (
+    DeliveryOperation,
+    DeliveryVerdict,
+    classify_delivery_response,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -52,6 +57,31 @@ class FeishuUserMessageError(RuntimeError):
         super().__init__(f"飞书用户消息发送失败：{code}")
         self.code = code
         self.definite = definite if definite is not None else code.startswith("feishu_code_")
+
+
+def _assert_notice_accepted(response: Any) -> None:
+    """按「通知」这一档裁定发送响应：成功码 + 必要标识 ``message_id`` 都要有。
+
+    判定规则集中在 ``core.delivery.ports.DELIVERY_OPERATIONS``，与其它外发通道
+    共用同一张表。**码缺失不再算成功**：旧写法把 ``code`` 缺失（空响应）放行，
+    于是"没有有效凭据、飞书返回空体"这种情况也会被上层记成已通知。缺
+    ``message_id`` 同样落"结果不明"——消息可能已经发出去，不得据此记已通知，也
+    不得当成确定没发生（本通道请求体带 ``uuid`` 去重键，重投不会产生第二条）。
+    """
+    if not isinstance(response, Mapping):
+        raise FeishuUserMessageError("invalid_response_shape", definite=False)
+    data = response.get("data")
+    message_id = data.get("message_id") if isinstance(data, Mapping) else None
+    outcome = classify_delivery_response(
+        operation=DeliveryOperation.NOTICE_SEND,
+        code=response.get("code"),
+        identifier=message_id,
+    )
+    if outcome.verdict is DeliveryVerdict.ACCEPTED:
+        return
+    if outcome.verdict is DeliveryVerdict.REJECTED:
+        raise FeishuUserMessageError(f"feishu_code_{response.get('code')}")
+    raise FeishuUserMessageError(outcome.reason, definite=False)
 
 
 def validate_user_open_id(value: str, *, label: str = "用户 open_id") -> str:
@@ -175,13 +205,17 @@ class FeishuUserMessages:
             body={"app_id": self._app_id, "app_secret": self._app_secret},
         )
         if not isinstance(response, Mapping):
-            raise FeishuUserMessageError("invalid_response_shape")
+            raise FeishuUserMessageError("invalid_response_shape", definite=False)
         code = response.get("code")
-        if code not in (None, 0, "0"):
+        if code is None:
+            # fail-closed：真实成功响应一定带 ``code=0``，码缺失（空响应、
+            # HTTP 5xx 带空体）既不是成功也不是拒绝，必须落"结果不明"。
+            raise FeishuUserMessageError("missing_code", definite=False)
+        if code not in (0, "0"):
             raise FeishuUserMessageError(f"feishu_code_{code}")
         token = response.get("tenant_access_token")
         if not isinstance(token, str) or not token:
-            raise FeishuUserMessageError("missing_tenant_access_token")
+            raise FeishuUserMessageError("missing_tenant_access_token", definite=False)
         return token
 
     def send_text(self, *, open_id: str, text: str, dedupe_key: str) -> None:
@@ -212,11 +246,7 @@ class FeishuUserMessages:
             },
             token=token,
         )
-        if not isinstance(response, Mapping):
-            raise FeishuUserMessageError("invalid_response_shape")
-        code = response.get("code")
-        if code not in (None, 0, "0"):
-            raise FeishuUserMessageError(f"feishu_code_{code}")
+        _assert_notice_accepted(response)
         # 只记「发过了」。open_id 与通知正文都不进日志：正文里是这个人的权限范围。
         logger.info("权限变化通知已发送 字符数=%s", len(text))
 

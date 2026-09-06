@@ -36,7 +36,11 @@ import unittest
 from typing import Any
 
 from lingxi.config.content import default_content_catalog
-from lingxi.core.execution.card_stream import CardCreated, DeliveryRejectedError
+from lingxi.core.execution.card_stream import (
+    CardCreated,
+    DeliveryRejectedError,
+    DeliveryUncertainError,
+)
 
 # --------------------------------------------------------------------------------------
 # 桩 SDK：只提供 adapters.feishu_delivery 真正用到的 builder 与模型
@@ -640,3 +644,167 @@ class UnexpectedExceptionTests(_ClassificationTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+def _empty_body() -> _Response:
+    """飞书返回空响应体（``{}``、或 HTTP 5xx 带空体）时 SDK 解析出的形状。
+
+    ``code`` 为 ``None``、``success()`` 为假、``data`` 为 ``None``——旧实现只看
+    ``success()``，于是把它判成"服务端明确拒绝"，消费侧据此清预留位、改走另一条
+    通道；而那次外发很可能已经在服务端生效，用户收到两份结果。
+    """
+
+    return _Response(ok=False, code=None, msg="", log_id="log-empty", data=None)
+
+
+def _in_flight() -> _Response:
+    """平台明确回「仍在发送」（``230049``）：既不是完成也不是拒绝。"""
+
+    return _Response(ok=False, code=230049, msg="still sending", log_id="log-in-flight")
+
+
+class EmptyResponseIsResultUnknownTests(_ClassificationTestCase):
+    """空响应（``code`` 缺失）在**五个外发点各一条**：一律"结果不明"，绝不是明确拒绝。
+
+    与 ``adapters/feishu_sheets_delivery.py`` 的 ``_data()`` 同一条 fail-closed 规则
+    ——真实成功响应一定带 ``code=0``，码缺失既不能当成功也不能当拒绝。
+    """
+
+    def test_create_empty_body_is_result_unknown(self) -> None:
+        client = _FakeClient(create=_empty_body())
+        card_transport, _ = self._transports(client)
+
+        self.assert_result_unknown(
+            lambda: card_transport.create(
+                chat_id="oc-1", thread_id=None, reply_to_message_id="om-in-1", card=_card()
+            ),
+            DeliveryUncertainError,
+        )
+        self.assertEqual(len(client.reply.calls), 0, "建卡结果不明时不得继续发消息")
+
+    def test_card_reply_empty_body_is_result_unknown(self) -> None:
+        client = _FakeClient(create=_created(), reply=_empty_body())
+        card_transport, _ = self._transports(client)
+
+        self.assert_result_unknown(
+            lambda: card_transport.create(
+                chat_id="oc-1", thread_id=None, reply_to_message_id="om-in-1", card=_card()
+            ),
+            DeliveryUncertainError,
+        )
+
+    def test_stream_update_empty_body_is_result_unknown(self) -> None:
+        client = _FakeClient(content=_empty_body())
+        card_transport, _ = self._transports(client)
+
+        self.assert_result_unknown(
+            lambda: card_transport.update(card_id="card-1", sequence=2, card=_card()),
+            DeliveryUncertainError,
+        )
+
+    def test_stream_close_empty_body_is_result_unknown(self) -> None:
+        client = _FakeClient(settings=_empty_body())
+        card_transport, _ = self._transports(client)
+
+        self.assert_result_unknown(
+            lambda: card_transport.close(card_id="card-1", sequence=3, card=_card()),
+            DeliveryUncertainError,
+        )
+
+    def test_text_send_empty_body_is_result_unknown(self) -> None:
+        client = _FakeClient(reply=_empty_body())
+        _, text_transport = self._transports(client)
+
+        self.assert_result_unknown(
+            lambda: text_transport.send_text(
+                chat_id="oc-1", thread_id=None, reply_to_message_id="om-in-1", text="查询完成"
+            ),
+            DeliveryUncertainError,
+        )
+
+
+class InFlightCodeIsResultUnknownTests(_ClassificationTestCase):
+    """``230049``「仍在发送」：改判为"结果不明"，并带上**是否可安全重投**的依据。
+
+    可安全重投**只**取决于该操作请求里带没带平台侧的**去重键**（登记在
+    ``core.delivery.ports.DELIVERY_OPERATIONS``）：投递侧五类外发一个都没有——
+    CardKit 的整卡级 ``sequence`` 是严格递增的**操作序号**，不是去重键（同一个序号
+    重投会被判成落后序号直接拒绝、随即降级到文本通道，而卡片上很可能已经有那份
+    答案，用户于是收到第二份完整答案）；建卡、卡片发送、文本发送请求体里更是什么
+    键都没有。带 ``uuid`` 去重键的只有通知/日报那条通道。
+    """
+
+    def test_card_update_in_flight_is_unknown_and_never_retry_safe(self) -> None:
+        client = _FakeClient(content=_in_flight())
+        card_transport, _ = self._transports(client)
+
+        error = self.assert_result_unknown(
+            lambda: card_transport.update(card_id="card-1", sequence=2, card=_card()),
+            DeliveryUncertainError,
+        )
+        self.assertEqual(error.reason, "in_flight")
+        self.assertEqual(error.code, 230049)
+        self.assertFalse(
+            error.retry_safe,
+            "sequence 是操作序号不是去重键：重投同一个序号会被拒并降级成第二份完整答案",
+        )
+
+    def test_card_close_in_flight_is_unknown_and_never_retry_safe(self) -> None:
+        client = _FakeClient(settings=_in_flight())
+        card_transport, _ = self._transports(client)
+
+        error = self.assert_result_unknown(
+            lambda: card_transport.close(card_id="card-1", sequence=3, card=_card()),
+            DeliveryUncertainError,
+        )
+        self.assertFalse(error.retry_safe)
+
+    def test_text_send_in_flight_is_unknown_and_never_retry_safe(self) -> None:
+        client = _FakeClient(reply=_in_flight())
+        _, text_transport = self._transports(client)
+
+        error = self.assert_result_unknown(
+            lambda: text_transport.send_text(
+                chat_id="oc-1", thread_id=None, reply_to_message_id="om-in-1", text="查询完成"
+            ),
+            DeliveryUncertainError,
+        )
+        self.assertEqual(error.reason, "in_flight")
+        self.assertFalse(
+            error.retry_safe,
+            "文本发送请求体没有 uuid，自动重投会让用户收到两条一模一样的答案",
+        )
+
+    def test_card_create_in_flight_is_unknown_and_never_retry_safe(self) -> None:
+        client = _FakeClient(create=_in_flight())
+        card_transport, _ = self._transports(client)
+
+        error = self.assert_result_unknown(
+            lambda: card_transport.create(
+                chat_id="oc-1", thread_id=None, reply_to_message_id="om-in-1", card=_card()
+            ),
+            DeliveryUncertainError,
+        )
+        self.assertFalse(error.retry_safe, "建卡没有幂等键，重投会建出第二张卡")
+        self.assertEqual(len(client.reply.calls), 0)
+
+    def test_card_reply_in_flight_is_unknown_and_never_retry_safe(self) -> None:
+        client = _FakeClient(create=_created(), reply=_in_flight())
+        card_transport, _ = self._transports(client)
+
+        error = self.assert_result_unknown(
+            lambda: card_transport.create(
+                chat_id="oc-1", thread_id=None, reply_to_message_id="om-in-1", card=_card()
+            ),
+            DeliveryUncertainError,
+        )
+        self.assertFalse(error.retry_safe, "卡片发送走的 reply 接口请求体里没有 uuid")
+
+
+class DeliveryUncertainTypeBoundaryTests(unittest.TestCase):
+    """白名单成立的第二个前提：两类异常之间不得有任何继承关系。"""
+
+    def test_uncertain_and_rejected_are_disjoint(self) -> None:
+        self.assertFalse(issubclass(DeliveryUncertainError, DeliveryRejectedError))
+        self.assertFalse(issubclass(DeliveryRejectedError, DeliveryUncertainError))
+        self.assertTrue(issubclass(DeliveryUncertainError, Exception))

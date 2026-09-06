@@ -119,3 +119,180 @@ def resolve_delivered_outcome(*, terminal_kind: str, error_kind: str | None) -> 
         raise ValueError(f"未知的投递终态分类：{terminal_kind!r}") from error
     default = _TERMINAL_TO_OUTCOME[kind]
     return ResolvedOutcome(status=default.status, error_kind=error_kind or default.error_kind)
+
+
+class DeliveryOperation(str, Enum):
+    """会产生"用户可见外发"的操作分档。
+
+    分档的意义在于：**「成功」在不同操作上要看的东西不一样**。建卡拿到
+    ``card_id`` 才算数，发消息拿到 ``message_id`` 才算数，而流式更新/关闭本身
+    不回读任何新标识——把它们混成一条"响应成功就算成功"的通用规则，就会出现
+    「服务端返回空响应也被记成已送达」（`V-投递-03`）。
+    """
+
+    CARD_CREATE = "card_create"
+    CARD_REPLY = "card_reply"
+    CARD_UPDATE = "card_update"
+    CARD_CLOSE = "card_close"
+    TEXT_SEND = "text_send"
+    DOCUMENT_WRITE = "document_write"
+    NOTICE_SEND = "notice_send"
+
+
+class DeliveryVerdict(str, Enum):
+    """一次外发响应的三种裁定，与消费侧的三条处置路径一一对应。
+
+    ``ACCEPTED`` 才允许记为已送达；``REJECTED`` 才允许清预留位、重试或降级；
+    ``UNCERTAIN`` 一律保留"不明"，不得记成功、也不得当成"确定没发生"。
+    """
+
+    ACCEPTED = "accepted"
+    REJECTED = "rejected"
+    UNCERTAIN = "uncertain"
+
+
+#: 飞书业务错误码里表示"这次调用被完整受理"的取值。``"0"`` 与 ``0`` 都出现过
+#: （不同接口的 JSON 里一个是数字一个是字符串），两种都收。
+DELIVERY_SUCCESS_CODES: frozenset[object] = frozenset({0, "0"})
+
+#: 「仍在发送」——服务端已经收下这次外发并且**还在处理**，既不是完成也不是拒绝。
+#: 判成明确拒绝会让消费侧清预留位并改走另一条通道，而原来那一条随后很可能真的
+#: 送达，用户于是收到两份同样的结果；判成成功则会把一条尚未落地的消息记成已送达。
+#: 因此它只能落 ``UNCERTAIN``（`V-投递-03`）。
+DELIVERY_IN_FLIGHT_CODES: frozenset[object] = frozenset({230049, "230049"})
+
+
+@dataclass(frozen=True)
+class DeliveryOperationSpec:
+    """一个操作的「成功要看哪个码 + 哪个必要标识 + 不明时能否安全重投」。
+
+    ``required_identifier`` 是**响应里必须回读到**的字段名；``None`` 表示这个
+    接口本来就不回读新标识（流式更新与关闭寻址的是调用方已经持有的 ``card_id``），
+    此时"码成功"就是全部证据。``platform_idempotency_key`` 记的是请求里带没带
+    平台侧的**去重键**——它是**唯一**可以据以自动重投的依据：没有键的重投等于
+    "赌一次没送达"，赌错就是重复交付。**顺序键不是去重键**：严格递增的操作序号
+    （CardKit 的 ``sequence``）只能保证"晚到的旧序号会被拒绝"，不能保证"同一份
+    内容重投一次仍然只产生一份可见结果"，因此不许登记在这一列里。
+    """
+
+    operation: DeliveryOperation
+    required_identifier: str | None
+    platform_idempotency_key: str | None
+
+    @property
+    def retry_safe_when_in_flight(self) -> bool:
+        """在途（``230049``）时能否自动重投而不会造成重复交付。"""
+        return self.platform_idempotency_key is not None
+
+
+#: 按操作分档的成功码 / 必要标识表。新增一个外发操作必须在这里登记一行，
+#: 否则 :func:`classify_delivery_response` 会响亮失败，而不是套用某条通用规则。
+DELIVERY_OPERATIONS: dict[DeliveryOperation, DeliveryOperationSpec] = {
+    # CardKit 建卡：响应带 data.card_id 才能证明卡片真的建出来了。请求体没有
+    # 任何去重键，重投会建出第二张卡。
+    DeliveryOperation.CARD_CREATE: DeliveryOperationSpec(
+        operation=DeliveryOperation.CARD_CREATE,
+        required_identifier="card_id",
+        platform_idempotency_key=None,
+    ),
+    # 把已建好的卡片作为回复消息发出：响应带 data.message_id 才算发出去了。
+    # ``im/v1/messages/:id/reply`` 的请求体没有 uuid，重投会多一条消息。
+    DeliveryOperation.CARD_REPLY: DeliveryOperationSpec(
+        operation=DeliveryOperation.CARD_REPLY,
+        required_identifier="message_id",
+        platform_idempotency_key=None,
+    ),
+    # 流式增量更新：不回读新标识，寻址靠调用方已持有的 card_id。**没有幂等键**——
+    # 整卡级 ``sequence`` 是严格递增的**操作序号**，不是平台去重键：拿同一个序号重投
+    # 会被 CardKit 当作落后序号直接拒绝（消费侧随即降级到文本通道，而卡片上很可能
+    # 已经有答案了，用户于是收到第二份完整答案），换一个更大的序号重投则是真的再写
+    # 一次正文。请求体里也没有 ``uuid``。因此"仍在发送"时一律不自动重投。
+    DeliveryOperation.CARD_UPDATE: DeliveryOperationSpec(
+        operation=DeliveryOperation.CARD_UPDATE,
+        required_identifier=None,
+        platform_idempotency_key=None,
+    ),
+    # 关闭流式：与 update 共用同一个 ``sequence`` 计数器，同样不是幂等键。
+    DeliveryOperation.CARD_CLOSE: DeliveryOperationSpec(
+        operation=DeliveryOperation.CARD_CLOSE,
+        required_identifier=None,
+        platform_idempotency_key=None,
+    ),
+    # 文本兜底发送：响应带 data.message_id 才算发出去了，**请求体没有 uuid**
+    # ——这是全表唯一"既要拿标识、又完全没有幂等键"的操作，任何形式的自动重投
+    # 都可能让用户收到两条一模一样的答案。
+    DeliveryOperation.TEXT_SEND: DeliveryOperationSpec(
+        operation=DeliveryOperation.TEXT_SEND,
+        required_identifier="message_id",
+        platform_idempotency_key=None,
+    ),
+    # 文档/表格写入：按接口各自的回读标识逐个校验（建文档要 document_id、建表
+    # 要 spreadsheet_token……），这里只登记"码必须显式成功"这条共同前提。
+    DeliveryOperation.DOCUMENT_WRITE: DeliveryOperationSpec(
+        operation=DeliveryOperation.DOCUMENT_WRITE,
+        required_identifier=None,
+        platform_idempotency_key=None,
+    ),
+    # 权限变化通知 / 管理群日报：请求体带 ``uuid`` 去重键，同一 dedupe_key 重投
+    # 不会产生第二条消息，因此在途时可以安全重投。
+    DeliveryOperation.NOTICE_SEND: DeliveryOperationSpec(
+        operation=DeliveryOperation.NOTICE_SEND,
+        required_identifier="message_id",
+        platform_idempotency_key="uuid",
+    ),
+}
+
+
+@dataclass(frozen=True)
+class DeliveryResponseOutcome:
+    """一次外发响应的裁定结果。``reason`` 是可搜的短码，不含任何正文或凭据。"""
+
+    verdict: DeliveryVerdict
+    reason: str
+    retry_safe: bool = False
+
+    @property
+    def accepted(self) -> bool:
+        """是否可以据此记为"平台已受理"。"""
+        return self.verdict is DeliveryVerdict.ACCEPTED
+
+
+_IDENTIFIER_NOT_GIVEN = object()
+
+
+def classify_delivery_response(
+    *,
+    operation: DeliveryOperation,
+    code: object,
+    identifier: object = _IDENTIFIER_NOT_GIVEN,
+) -> DeliveryResponseOutcome:
+    """按操作分档裁定一次外发响应，**fail-closed**。
+
+    判定顺序是刻意的：``code`` 缺失（空响应 ``{}``、HTTP 5xx 带空体）先于一切
+    ——它既不是成功也不是拒绝，真实成功响应一定带 ``code=0``。其次是「仍在发送」
+    这个在途码。再判明确拒绝。最后才在码成功的前提下核这个操作的必要标识：
+    码成功但缺标识仍然是"不明"，因为服务端可能已经把东西发出去了，我们只是拿
+    不到回执（`V-投递-03`：不得记为已送达，也不得自动重发）。
+    """
+    spec = DELIVERY_OPERATIONS.get(operation)
+    if spec is None:
+        raise ValueError(f"未登记的投递操作分档：{operation!r}")
+    if code is None:
+        return DeliveryResponseOutcome(verdict=DeliveryVerdict.UNCERTAIN, reason="missing_code")
+    if code in DELIVERY_IN_FLIGHT_CODES:
+        return DeliveryResponseOutcome(
+            verdict=DeliveryVerdict.UNCERTAIN,
+            reason="in_flight",
+            retry_safe=spec.retry_safe_when_in_flight,
+        )
+    if code not in DELIVERY_SUCCESS_CODES:
+        return DeliveryResponseOutcome(verdict=DeliveryVerdict.REJECTED, reason="rejected")
+    if spec.required_identifier is not None:
+        if identifier is _IDENTIFIER_NOT_GIVEN:
+            raise ValueError(f"{operation.value} 必须核对 {spec.required_identifier} 才能裁定")
+        if not isinstance(identifier, str) or not identifier:
+            return DeliveryResponseOutcome(
+                verdict=DeliveryVerdict.UNCERTAIN,
+                reason=f"missing_{spec.required_identifier}",
+            )
+    return DeliveryResponseOutcome(verdict=DeliveryVerdict.ACCEPTED, reason="accepted")

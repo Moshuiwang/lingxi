@@ -215,6 +215,10 @@ REQUIRED_MODULES = (
     # `ContentCaptureRecord`，那个类会把整个 `core.execution` 拉进 scheduler 的
     # import 闭包，而 scheduler 没有任何理由背上 worker 的执行层。
     "lingxi.adapters.postgres_content_capture_retention",
+    # 四个内容载体（task.prompt / inbound_event / pending_action /
+    # queue_failure_notice）的九十天到期处置：同样由 lingxi-scheduler 的清理职责在
+    # 函数内 import，制品少了它这条清理职责会在第一轮就抛 ImportError。
+    "lingxi.adapters.postgres_carrier_retention",
     # 年份接地护栏第二层（Issue #326 批次 5 卡 E）：纯逻辑判定在 core，由
     # apps/worker/service.py 模块级 import（见下面 PROCESS_RUNTIME_IMPORTS 的
     # worker 闭包）——"本地测试全绿但 wheel 里没有这个模块"同样是 V-部署-10
@@ -691,6 +695,9 @@ PROCESS_RUNTIME_IMPORTS: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {
             # `role_function_map_file` 一节同一条理由——函数内 import 也是进程真实
             # 依赖，制品少了它这条清理职责会在第一轮就抛 ImportError。
             "lingxi.adapters.postgres_content_capture_retention",
+            # 四个内容载体的九十天到期处置：`_build_carrier_retention_duty` 函数内
+            # import，与上一条同一理由。
+            "lingxi.adapters.postgres_carrier_retention",
             "lingxi.apps.scheduler.roster_audit",
             "lingxi.apps.scheduler.daily_report",
             # 理由见 REQUIRED_MODULES 同名条目：进程入口模块级 import 它。

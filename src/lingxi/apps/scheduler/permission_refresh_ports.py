@@ -21,14 +21,6 @@ from lingxi.core.permission.merge_sources import REASON_LOCAL_OVERRIDE_READ_FAIL
 _UTC = UTC
 
 
-class LocalOverrideReadError(RuntimeError):
-    """本地覆盖读取失败的内部标记：本轮跳过这个人，不落撤权、不清已送达正文。
-
-    银河贡献恒为空的那条分支上，读取失败**不能**被无声折叠成"没有本地授权"——那会把
-    一次读故障说成一次撤权。
-    """
-
-
 #: 写进发布意图 ``reason`` 列的原因码。它回答"这条意图是谁排的"，与首次开通那条
 #: （``first_onboarding``）区分开，让运维能一眼看出某次外部写入来自每日刷新。
 PERMISSION_REFRESH_REASON = "daily_permission_refresh"

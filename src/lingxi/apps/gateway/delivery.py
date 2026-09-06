@@ -1,17 +1,17 @@
 """Gateway 投递消费循环：读 outbox、驱动 CardKit 流式卡片与文本兜底。
 
 只消费已经**提交**的 ``task_delivery_event``；纯规则（终态分类）住在
-``core.delivery.ports``，卡片顺序/限流/失败回退住在
-``core.execution.card_stream``，本模块只负责把三者接起来。
+``core.delivery.ports``，卡片顺序/限流/失败回退住在 ``core.execution.card_stream``。
 
-**重复投递防线**：建卡、终态卡片更新+关闭、文本兜底发送三类外部调用，外发前
-都必须先提交"外发前预留位"，调用有明确结果后立即清空。**只有服务端明确
-拒绝**才清空、允许下一轮重试；其余一切异常都归结果不明，绝不清空，统一转
-``uncertain`` 交给人工核对——不能因猜错"是否已送达"而重放已经成功的外发。
+**重复投递防线**：建卡、终态卡片更新+关闭、文本兜底发送三类外部调用，外发前都必须
+先提交"外发前预留位"，调用有明确结果后立即清空。**只有服务端明确拒绝**才清空、允许
+下一轮重试；其余一切异常（含平台回「仍在发送」）都归结果不明，绝不清空，统一转
+``uncertain`` 交给人工核对——**这三类外发一个平台去重键都没有**（CardKit 的 ``sequence``
+是操作序号不是去重键），没有键的重投是在赌"上一次没送到"，赌错就是用户收到第二份完整
+答案。**确认送达的唯一前提是"本次终态的有效回执"**，见 :meth:`._terminal_receipt`。
 
-过程流式正文靠重放 outbox 历史事件重建，没有跨轮次进程内状态；CardKit 10
-分钟自动关闭窗口靠提前收口文案缓解；三条循环级查询各自异常隔离、连续失败
-达阈值才上报，让"投递能力悄悄停摆"变成一定会被看见的信号。
+过程流式正文靠重放 outbox 历史事件重建，没有跨轮次进程内状态；CardKit 10 分钟自动关闭
+窗口靠提前收口文案缓解；三条循环级查询各自异常隔离、连续失败达阈值才上报。
 """
 
 from __future__ import annotations
@@ -31,8 +31,10 @@ from lingxi.core.execution.card_stream import (
     CardStream,
     CardTransport,
     DeliveryRejectedError,
+    DeliveryUncertainError,
     ProgressStepSnapshot,
     SendOutcomeCallback,
+    TerminalReceipt,
     TextTransport,
     decode_progress_action,
 )
@@ -60,9 +62,10 @@ def _default_alert(kind: str, task_id: str) -> None:
 class _FallbackOutcome(Enum):
     """``DeliveryConsumer._send_fallback`` 的结果分类。
 
-    "结果不明"单独区分开，因为它决定 `_handle_terminal` 之后能不能安全尝试
-    `_maybe_confirm`（见该方法文档）；`RETRY_LATER` 的几种成因（退避未到期、
-    预留位没抢到、明确失败）都不影响这一点。
+    只有 ``SENT`` 才意味着这一条终态真的落到了文本通道上（并因此带回一枚
+    终态回执）；``RETRY_LATER``（退避未到期、预留位没抢到、明确失败）与
+    ``UNCERTAIN`` 都不推进游标、都不允许确认送达，区别只在告警口径与是否
+    进入重试退避。
     """
 
     SENT = "sent"
@@ -71,15 +74,14 @@ class _FallbackOutcome(Enum):
 
 
 class _CardFinishOutcome(Enum):
-    """``DeliveryConsumer._finish_card_channel`` 的三态结果。
+    """``DeliveryConsumer._finish_card_channel`` 的两态结果。
 
-    ``EARLY_TRUE``/``EARLY_FALSE`` 要求调用方立即用该值从 `_handle_terminal`
-    返回；``CONTINUE`` 表示卡片终态处理完毕（或本来就不适用），继续走文本
-    兜底与游标推进那一段。
+    ``HALT`` 要求调用方立即从 `_handle_terminal` 返回（预留位没抢到、或终态
+    卡片更新结果不明）；``CONTINUE`` 表示卡片终态处理完毕（或本来就不适用），
+    继续走文本兜底与游标推进那一段。
     """
 
-    EARLY_TRUE = "early_true"
-    EARLY_FALSE = "early_false"
+    HALT = "halt"
     CONTINUE = "continue"
 
 
@@ -145,6 +147,9 @@ class DeliveryConsumer:
         # 进程内、非持久化状态：只用来给告警与外发重试限速，重启后清零属于可接受
         # 的降级（重启本身就已经是一次重新评估的机会）。
         self._last_alerted_at: dict[tuple[str, str], float] = {}
+        # 退避簿记按任务分键。**只有文本兜底这一条通道有退避**：卡片终态通道没有
+        # 平台去重键，结果不明时一律保留预留位转人工核对，从来不产生"退避之后再投
+        # 一次"的动作，因此这里不留一个空转的第二条通道假装它在工作。
         self._fallback_attempts: dict[str, int] = {}
         self._fallback_next_attempt_at: dict[str, float] = {}
         # 已经发过排队提示的任务 id：同一姿态的进程内、非持久化状态——只用来
@@ -173,10 +178,12 @@ class DeliveryConsumer:
         self._alert(kind, task_id)
 
     def _fallback_backoff_ready(self, task_id: str) -> bool:
+        """文本兜底这条通道的这个任务是否过了退避窗口，可以再产生一次外发尝试。"""
         deadline = self._fallback_next_attempt_at.get(task_id)
         return deadline is None or self._monotonic() >= deadline
 
     def _record_fallback_attempt_failed(self, task_id: str) -> None:
+        """记一次没有成交的文本兜底尝试，指数退避（有上限）。"""
         attempts = self._fallback_attempts.get(task_id, 0) + 1
         self._fallback_attempts[task_id] = attempts
         backoff = min(
@@ -378,7 +385,6 @@ class DeliveryConsumer:
             initial_progress_history=self._prior_progress_history(task),
         )
 
-        confirm_safe = True
         for event in events:
             if event.event_type == "started":
                 if not self._handle_started(task, stream, event):
@@ -389,17 +395,40 @@ class DeliveryConsumer:
             elif event.event_type in ("progress", "safely_releasable_answer"):
                 self._handle_progress(task, stream, event)
             elif event.event_type == "terminal":
-                confirm_safe = self._handle_terminal(task, stream, event)
+                self._handle_terminal(task, stream, event)
                 # terminal 是该任务在 outbox 里唯一一条终态事件（重复终态被
                 # 拒绝），处理完不会再有后续事件需要看。
                 break
 
-        if confirm_safe:
-            self._maybe_confirm(task, stream)
-        # confirm_safe 为假只发生在"结果不明"分支：此时 `stream.message_id`
-        # 可能只是更早建卡时拿到、与这一轮终态结果无关的旧值，用它确认送达
-        # 会把一个应该转 `uncertain` 的任务提前误标成已确认，而预留位却还
-        # 留着，变成一个无人再看得到的孤儿。
+        receipt = self._terminal_receipt(task, stream, saw_unconsumed_events=bool(events))
+        if receipt is not None:
+            self._maybe_confirm(task, receipt)
+
+    def _terminal_receipt(
+        self, task: Any, stream: CardStream, *, saw_unconsumed_events: bool
+    ) -> TerminalReceipt | None:
+        """算出"这一条终态确实已经落到某条通道"的回执；拿不出证据就返回 ``None``。
+
+        只有两条来源：**本轮现场取得**（``stream.terminal_receipt``——终态卡片更新
+        成功，或文本兜底真的拿回 ``message_id``），以及**更早一轮已取得、只差确认**
+        （本轮没有任何未消费事件、任务已在 ``awaiting_delivery``、投递标识已落库）。
+        后者成立是因为消费游标只在某条通道**确定受理**终态之后才会越过那条事件，它
+        让"已送达但确认没成功"的任务下一轮仍会被重新确认。其余一切情况都没有回执：
+        两条通道都失败、退避窗口内一次外发都没发生、预留位没抢到、结果不明——这些
+        轮次里 ``stream.message_id`` 可能只是建进度卡那一轮的旧值（`V-投递-03`）。
+        """
+        fresh = stream.terminal_receipt
+        if fresh is not None:
+            return fresh
+        if saw_unconsumed_events:
+            # 本轮确实读到过未消费事件，却没能取得回执：终态没有落地（或者根本
+            # 还没走到终态）。这一轮不确认，等下一轮重新处理同一条事件。
+            return None
+        if task.status != "awaiting_delivery" or task.message_id is None:
+            return None
+        return TerminalReceipt(
+            kind="text" if task.fallback_text else "card", message_id=task.message_id
+        )
 
     def _handle_started(self, task: Any, stream: CardStream, event: Any) -> bool:
         """返回是否可以继续处理本轮的后续事件（`False` 表示预留位没抢到）。"""
@@ -476,31 +505,53 @@ class DeliveryConsumer:
         if not self._queue.reserve_dispatch(task_id=task.task_id, kind="card_finish"):
             # 抢不到：要么上一轮处理到一半崩溃（uncertain，本轮不碰），要么任务
             # 状态发生了竞态。两种情况都不该再调用 finish()。
-            return _CardFinishOutcome.EARLY_TRUE
+            return _CardFinishOutcome.HALT
         try:
             if event.terminal_kind == TerminalKind.SUCCESS.value:
                 stream.finish(result=event.content or "", elapsed_seconds=elapsed)
             else:
                 stream.finish(failure=content, elapsed_seconds=elapsed)
+        except DeliveryUncertainError as error:
+            return self._handle_uncertain_card_finish(task, error)
         except Exception as error:  # 白名单反转：只吞掉明确失败
             logger.error(
                 "终态卡片更新结果不明，转入 uncertain 等待人工核对 task_id=%s error=%s",
                 task.task_id,
                 type(error).__name__,
             )
-            return _CardFinishOutcome.EARLY_FALSE
+            return _CardFinishOutcome.HALT
         if stream.fallback_needed:
             self._queue.clear_dispatch_reservation(task_id=task.task_id)
         return _CardFinishOutcome.CONTINUE
 
-    def _handle_terminal(self, task: Any, stream: CardStream, event: Any) -> bool:
+    def _handle_uncertain_card_finish(
+        self, task: Any, error: DeliveryUncertainError
+    ) -> _CardFinishOutcome:
+        """终态卡片更新拿到"结果不明"：**一律保留预留位**，转人工核对并告警。
+
+        **卡片通道没有"可安全重投"这一档**，与 :meth:`_send_fallback` 同姿态：CardKit 的
+        整卡级 ``sequence`` 是操作序号不是去重键（同一序号重投会被判成落后序号拒绝、随即
+        降级到文本通道，而卡片里很可能已经有那份答案，用户于是收到第二份完整答案），请求
+        体里也没有 ``uuid``——见 ``core.delivery.ports`` 的 ``card_update``/``card_close``。
+        因此不清预留位、不推进游标、不确认送达：任务此后每轮都抢不到预留位，停在
+        ``awaiting_delivery``，由 ``expire_undelivered_terminals`` 在二十四小时后收敛成
+        "投递已过期，请重新提问"。这是常态出口，只写日志等于把一件要人来看的事埋掉，必须告警。
+        """
+        logger.error(
+            "终态卡片更新结果不明，转入 uncertain 等待人工核对 task_id=%s reason=%s",
+            task.task_id,
+            error.reason,
+        )
+        self._alert_deduped("card_finish_uncertain:" + error.reason, task.task_id)
+        return _CardFinishOutcome.HALT
+
+    def _handle_terminal(self, task: Any, stream: CardStream, event: Any) -> None:
         """处理这一轮的终态事件。
 
-        返回值是"这一轮结束后尝试 `_maybe_confirm` 是否安全"——只有"结果
-        不明"分支返回 ``False``：此时 ``stream.message_id`` 可能只是更早
-        建卡时拿到、与这一轮终态结果无关的旧值，`_maybe_confirm` 用它确认
-        送达会把一个应该转 ``uncertain`` 的任务提前误标成已确认（见
-        `_process_task` 的调用点）。其余所有分支都返回 ``True``。
+        **不再返回"能不能确认"**：能不能确认只看有没有本次终态的回执，由
+        :meth:`_terminal_receipt` 统一裁定。这里只负责把终态推给卡片通道、
+        必要时推给文本兜底，并且只在某条通道**确定受理**之后才推进消费游标
+        ——游标越过终态事件这件事本身，就是"终态已落地"的持久化证据。
         """
         content = RenderedContent(
             key="delivery.terminal", version=self._catalog.version, text=event.content or ""
@@ -508,18 +559,18 @@ class DeliveryConsumer:
         elapsed = event.elapsed_seconds or 0
 
         card_outcome = self._finish_card_channel(task, stream, event, content, elapsed)
-        if card_outcome is _CardFinishOutcome.EARLY_TRUE:
-            return True
-        if card_outcome is _CardFinishOutcome.EARLY_FALSE:
-            return False
+        if card_outcome is not _CardFinishOutcome.CONTINUE:
+            # 预留位没抢到，或终态卡片更新结果不明：两种情况都不推进游标，
+            # terminal 事件下一轮重新评估。
+            return
 
         if stream.fallback_needed:
             outcome = self._send_fallback(task, stream, content)
             if outcome is not _FallbackOutcome.SENT:
-                # 预留位没抢到、退避未到期，或外发同步捕获到明确失败：这一轮不
-                # 推进游标，terminal 事件下一轮重新处理。只有 `UNCERTAIN` 时
-                # `_maybe_confirm` 才不安全——见本方法文档。
-                return outcome is not _FallbackOutcome.UNCERTAIN
+                # 预留位没抢到、退避未到期（这一轮一次外发都没发生），或外发
+                # 同步捕获到明确失败：这一轮不推进游标，terminal 事件下一轮
+                # 重新处理。
+                return
 
         self._queue.record_delivery_progress(
             task_id=task.task_id,
@@ -529,7 +580,6 @@ class DeliveryConsumer:
             card_sequence=stream.sequence,
             fallback_text=stream.fallback_needed,
         )
-        return True
 
     def _send_fallback(
         self, task: Any, stream: CardStream, content: RenderedContent
@@ -551,7 +601,10 @@ class DeliveryConsumer:
             return _FallbackOutcome.RETRY_LATER
         except Exception as error:  # 结果不明（白名单反转）：服务端可能
             # 已经受理并投递——不清预留位、不进入重试退避（那等于"下一轮原样
-            # 重试"，会造成重复投递）。转入既有 uncertain 告警路径。
+            # 重试"，会造成重复投递）。转入既有 uncertain 告警路径。**文本通道
+            # 没有"可安全重投"这一档**：请求体里没有任何平台幂等键（见
+            # ``core.delivery.ports`` 的 ``text_send`` 一行），因此这里不区分
+            # ``DeliveryUncertainError.retry_safe``，一律保留预留位转人工核对。
             logger.error(
                 "文本兜底发送结果不明，转入 uncertain 等待人工核对 task_id=%s error=%s",
                 task.task_id,
@@ -561,23 +614,23 @@ class DeliveryConsumer:
         self._clear_fallback_backoff(task.task_id)
         return _FallbackOutcome.SENT
 
-    def _maybe_confirm(self, task: Any, stream: CardStream) -> None:
-        """终态已经落到某个通道且任务处于 ``awaiting_delivery`` 时尝试确认送达。
+    def _maybe_confirm(self, task: Any, receipt: TerminalReceipt) -> None:
+        """凭**本次终态的回执**确认送达。
 
-        ``task.status`` 是本轮开始时的快照；只有它已经是 ``awaiting_delivery``
-        才说明这一轮（或更早一轮）真的处理过 terminal 事件——Worker 写终态
-        事件与转 ``awaiting_delivery`` 在同一事务提交，因此二者在任意读取
-        时刻都一致，不需要额外判断"是不是刚处理完 terminal"。这也让"已拿到
-        message_id 但 confirm_delivery 没成功"的任务在没有新事件时依然重试。
+        调用方已经用 :meth:`_terminal_receipt` 拿到了回执；这里只再核一次任务
+        状态快照——``task.status`` 是本轮开始时读到的值，只有它已经是
+        ``awaiting_delivery`` 才说明 Worker 真的写过终态事件（写事件与转状态在
+        同一事务提交）。回执里的 ``message_id`` 与 ``kind`` 一律取自回执本身，
+        不再回头去读 ``stream``：那正是旧实现把建进度卡时的旧标识当成终态凭据
+        的入口。
         """
-        if task.status != "awaiting_delivery" or stream.message_id is None:
+        if task.status != "awaiting_delivery":
             return
-        kind = "text" if stream.fallback_needed else "card"
         try:
             confirmed = self._queue.confirm_delivery(
                 task_id=task.task_id,
-                platform_message_kind=kind,
-                platform_message_id=stream.message_id,
+                platform_message_kind=receipt.kind,
+                platform_message_id=receipt.message_id,
             )
         except Exception as error:  # 记录后交给下一轮重试
             logger.error(

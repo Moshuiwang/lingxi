@@ -354,12 +354,17 @@ class LarkDocxDelivery:
 
         这是本模块唯一判定"飞书明确拒绝"的位置，刻意不做静默降级——一旦
         这里改成"记日志后继续"，所有写操作都会在飞书拒绝的情况下被上层
-        误判为成功。
+        误判为成功。**fail-closed**：``code`` 缺失（空响应、``HTTP 500 + {}``）
+        不再当成功放行——真实成功响应均带 ``code=0``，缺码一律判「结果不明」，
+        与 ``feishu_sheets_delivery`` 的同名方法同一条规则。各接口各自的必要
+        回读标识由调用处逐个核对，见 ``core.delivery.ports`` 的分档表。
         """
         if not isinstance(response, Mapping):
             raise FeishuDocxDeliveryError("invalid_response_shape", definite=False)
         code = response.get("code")
-        if code not in (None, 0, "0"):
+        if code is None:
+            raise FeishuDocxDeliveryError("missing_code", definite=False)
+        if code not in (0, "0"):
             raise FeishuDocxDeliveryError(_safe_feishu_code(code), definite=True)
         data = response.get("data")
         return data if isinstance(data, Mapping) else {}

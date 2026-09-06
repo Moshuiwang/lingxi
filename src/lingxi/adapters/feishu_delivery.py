@@ -1,17 +1,17 @@
 """飞书出站：CardKit 流式卡片与投递文本兜底。
 
-与 ``adapters/feishu_outbound.py`` 的加表情/简单回复分开成独立模块：这里
-需要拿到并透传 ``message_id`` 作为 ``confirm_delivery`` 的
-``platform_message_id``，两者失败语义不同，不共用同一个类。
+与 ``adapters/feishu_outbound.py`` 的加表情/简单回复分开成独立模块：这里需要拿到并
+透传 ``message_id`` 作为 ``confirm_delivery`` 的 ``platform_message_id``，两者失败
+语义不同，不共用同一个类。
 
-**下面几个方法按白名单分类外发结果，不捕获任何未预期异常，都是刻意的**：
-只有 ``response.success()`` 为假时才显式抛出 ``DeliveryRejectedError``；响应
-成功但缺失可回读标识时显式抛 ``LookupError``；其余一律不捕获、原样向上
-传播，判定为"结果不明"。
+**分类不看 SDK 的 ``response.success()``，改由 :func:`_verdict` 按操作分档核成功码与
+必要回读标识**（表见 ``core.delivery.ports``）：空响应解析出 ``code=None``、
+``success()`` 为假，旧写法据此判"明确拒绝"、消费侧改走另一条通道，而那次外发很可能
+已经生效——缺码是"结果不明"。拒绝抛 ``DeliveryRejectedError``、不明抛
+``DeliveryUncertainError``（缺标识沿用 ``LookupError``），未预期异常原样传播。
 
-**卡片 JSON 2.0 载荷形状未经真实发送验证（证据等级 L1）**，留给 L4a。
-``reply_to_message_id`` 理论上可为空但两个类都不用 ``chat_id``/
-``thread_id`` 兜底（已知限制，未消除，上游总会填好这个字段）。
+**卡片 JSON 2.0 载荷形状未经真实发送验证（L1）**，留给 L4a；
+``reply_to_message_id`` 可为空但两个类都不用 ``chat_id``/``thread_id`` 兜底（已知限制，未消除）。
 """
 
 from __future__ import annotations
@@ -20,7 +20,16 @@ import json
 from typing import Any
 
 from lingxi.config.content import RenderedCard
-from lingxi.core.execution.card_stream import CardCreated, DeliveryRejectedError
+from lingxi.core.delivery.ports import (
+    DeliveryOperation,
+    DeliveryVerdict,
+    classify_delivery_response,
+)
+from lingxi.core.execution.card_stream import (
+    CardCreated,
+    DeliveryRejectedError,
+    DeliveryUncertainError,
+)
 
 # 卡片模板里唯一的可流式更新元素；标题与正文合并渲染进它的 content（见模块说明）。
 _STATUS_ELEMENT_ID = "lingxi_status"
@@ -55,6 +64,48 @@ def _card_payload(card: RenderedCard) -> dict[str, Any]:
     }
 
 
+def _readback(response: Any, field: str) -> Any:
+    """从响应里取该操作的必要回读标识；``data`` 缺失时返回 ``None``（判为缺标识）。"""
+    data = getattr(response, "data", None)
+    if data is None:
+        return None
+    return getattr(data, field, None)
+
+
+def _verdict(response: Any, *, operation: DeliveryOperation, field: str | None, label: str) -> None:
+    """按操作分档裁定一次 SDK 响应；只在"明确拒绝"与"结果不明"两种情况下抛错。
+
+    ``label`` 只用于人读的错误消息（"建卡"/"卡片发送"……），不参与判定。
+    ``field`` 是该操作的必要回读标识字段名；不回读新标识的操作传 ``None``。
+
+    **缺标识仍抛 ``LookupError``**：这是既有契约（"响应本身表示成功，但拿不到
+    可回读标识"），消费侧与 ``DeliveryUncertainError`` 一视同仁地当作"不明"，
+    这里不为了统一类型而改动一条已经被用例钉死的分界。
+    """
+    identifier = _readback(response, field) if field is not None else None
+    outcome = classify_delivery_response(
+        operation=operation,
+        code=response.code,
+        **({"identifier": identifier} if field is not None else {}),
+    )
+    if outcome.verdict is DeliveryVerdict.ACCEPTED:
+        return
+    detail = f"code={response.code} msg={response.msg} log_id={response.get_log_id()}"
+    if outcome.verdict is DeliveryVerdict.REJECTED:
+        raise DeliveryRejectedError(
+            f"{label}失败：{detail}", code=response.code, log_id=response.get_log_id()
+        )
+    if field is not None and outcome.reason == f"missing_{field}":
+        raise LookupError(f"{label}响应缺少可回读标识 {field}：{detail}")
+    raise DeliveryUncertainError(
+        f"{label}结果不明（{outcome.reason}）：{detail}",
+        reason=outcome.reason,
+        code=response.code,
+        log_id=response.get_log_id(),
+        retry_safe=outcome.retry_safe,
+    )
+
+
 def build_client(*, app_id: str, app_secret: str, timeout_seconds: float) -> Any:
     """构造官方 SDK 客户端。
 
@@ -83,21 +134,9 @@ def _create_card(client: Any, card: RenderedCard) -> str:
         .build()
     )
     create_response = client.cardkit.v1.card.create(create_request)
-    if not create_response.success():
-        raise DeliveryRejectedError(
-            f"建卡失败：code={create_response.code} msg={create_response.msg} "
-            f"log_id={create_response.get_log_id()}",
-            code=create_response.code,
-            log_id=create_response.get_log_id(),
-        )
-    if create_response.data is None or not create_response.data.card_id:
-        # 结果不明：响应本身表示成功，但拿不到可回读标识——不能确定服务端是否
-        # 真的建好了卡片，不属于 DeliveryRejectedError。
-        raise LookupError(
-            "建卡响应缺少可回读标识 card_id："
-            f"code={create_response.code} msg={create_response.msg} "
-            f"log_id={create_response.get_log_id()}"
-        )
+    _verdict(
+        create_response, operation=DeliveryOperation.CARD_CREATE, field="card_id", label="建卡"
+    )
     return create_response.data.card_id
 
 
@@ -121,20 +160,9 @@ def _reply_with_card(
         .build()
     )
     send_response = client.im.v1.message.reply(send_request)
-    if not send_response.success():
-        raise DeliveryRejectedError(
-            f"卡片发送失败：code={send_response.code} msg={send_response.msg} "
-            f"log_id={send_response.get_log_id()}",
-            code=send_response.code,
-            log_id=send_response.get_log_id(),
-        )
-    if send_response.data is None or not send_response.data.message_id:
-        # 结果不明：同上，响应成功但缺可回读标识。
-        raise LookupError(
-            "卡片发送响应缺少可回读标识 message_id："
-            f"code={send_response.code} msg={send_response.msg} "
-            f"log_id={send_response.get_log_id()}"
-        )
+    _verdict(
+        send_response, operation=DeliveryOperation.CARD_REPLY, field="message_id", label="卡片发送"
+    )
     return send_response.data.message_id
 
 
@@ -188,13 +216,9 @@ class LarkCardTransport:
             .build()
         )
         response = self._client.cardkit.v1.card_element.content(request)
-        if not response.success():
-            raise DeliveryRejectedError(
-                f"卡片流式更新失败：code={response.code} msg={response.msg} "
-                f"log_id={response.get_log_id()}",
-                code=response.code,
-                log_id=response.get_log_id(),
-            )
+        _verdict(
+            response, operation=DeliveryOperation.CARD_UPDATE, field=None, label="卡片流式更新"
+        )
 
     def close(self, *, card_id: str, sequence: int, card: RenderedCard) -> None:
         """把 ``streaming_mode`` 关闭。
@@ -222,13 +246,7 @@ class LarkCardTransport:
             .build()
         )
         response = self._client.cardkit.v1.card.settings(request)
-        if not response.success():
-            raise DeliveryRejectedError(
-                f"卡片关闭流式失败：code={response.code} msg={response.msg} "
-                f"log_id={response.get_log_id()}",
-                code=response.code,
-                log_id=response.get_log_id(),
-            )
+        _verdict(response, operation=DeliveryOperation.CARD_CLOSE, field=None, label="卡片关闭流式")
 
 
 def _settings_to_dict(settings: Any) -> dict[str, Any]:
@@ -275,17 +293,10 @@ class LarkDeliveryText:
             .build()
         )
         response = self._client.im.v1.message.reply(request)
-        if not response.success():
-            raise DeliveryRejectedError(
-                f"发送投递文本失败：code={response.code} msg={response.msg} "
-                f"log_id={response.get_log_id()}",
-                code=response.code,
-                log_id=response.get_log_id(),
-            )
-        if response.data is None or not response.data.message_id:
-            # 结果不明：响应成功但缺可回读标识 message_id。
-            raise LookupError(
-                "发送投递文本响应缺少可回读标识 message_id："
-                f"code={response.code} msg={response.msg} log_id={response.get_log_id()}"
-            )
+        _verdict(
+            response,
+            operation=DeliveryOperation.TEXT_SEND,
+            field="message_id",
+            label="发送投递文本",
+        )
         return response.data.message_id
