@@ -81,6 +81,8 @@ class PendingDeliveryTask:
     ``card_id``/``card_seq``/``message_id``/``fallback_text`` 是上一轮（或崩溃前）
     持久化的进度，供 :class:`~lingxi.core.execution.card_stream.CardStream` 以
     ``initial_*`` 恢复，不从零建卡（`V-卡片-01`、状态合同第 7 条）。
+    ``retry_attempts`` 是已经累计的、连续没有成交的外发尝试次数，用来算下一次退避
+    要等多久；能被读到就说明退避窗口已经过去（否则这一行根本不会进候选）。
     """
 
     task_id: str
@@ -94,6 +96,7 @@ class PendingDeliveryTask:
     message_id: str | None
     fallback_text: bool
     consumed_sequence: int
+    retry_attempts: int
 
 
 @dataclass(frozen=True)
