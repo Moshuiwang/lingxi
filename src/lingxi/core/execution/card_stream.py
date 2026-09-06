@@ -1,17 +1,17 @@
 """问数卡片的顺序、限流与失败回退。
 
-不依赖飞书 SDK：卡片适配器只实现 ``CardTransport``，L2 用内存假实现验证序号、
-话题隔离和失败回退，L4a 再验证 CardKit 的真实字段与投递效果。
+不依赖飞书 SDK：卡片适配器只实现 ``CardTransport``，L2 用内存假实现验证序号、话题
+隔离和失败回退，L4a 再验证 CardKit 的真实字段与投递效果。
 
-**支持从持久化状态恢复（resume）**：崩溃重启后不重新建卡，``initial_*`` 参数
-把上一次持久化的 card_id/sequence/message_id/fallback_needed 传回来接着走，
-不产生第二张有效卡片（`V-卡片-01`）。正文是"已走过的步骤名"追加式列表，同一
-状态连续出现只原地刷新用时；``initial_progress_history`` 让这份累积状态同样
-能跨轮询 resume。同一步骤身份持续过久会被明示为"停滞"。
+**支持从持久化状态恢复（resume）**：崩溃重启后不重新建卡，``initial_*`` 参数把上一
+次持久化的 card_id/sequence/message_id/fallback_needed 传回来接着走，不产生第二张
+有效卡片（`V-卡片-01`）。正文是"已走过的步骤名"追加式列表，同一状态连续出现只原地
+刷新用时；同一步骤身份持续过久会被明示为"停滞"。
 
 **「明确失败」与「结果不明」判别用白名单**：三处外发调用只认 ``DeliveryRejectedError``
-为"明确失败"，其余异常一律归"结果不明"、原样 ``raise``、不降级不重试。终态
-**关闭**失败不受此规则约束：更新已成功时仅关闭失败不构成结果丢失。
+为"明确失败"，其余异常一律归"结果不明"、原样 ``raise``、不降级不重试；终态**关闭**
+失败例外（更新已成功时不构成结果丢失）。**终态回执**只在终态卡片更新成功、或文本兜底
+真的拿回 ``message_id`` 时登记，它是调用方确认送达的唯一凭据。
 """
 
 from __future__ import annotations
@@ -191,6 +191,48 @@ class DeliveryRejectedError(Exception):
         self.message = message
         self.log_id = log_id
         super().__init__(message or f"服务端明确拒绝：code={code} log_id={log_id}")
+
+
+class DeliveryUncertainError(Exception):
+    """服务端**没有**给出可判定的结论：结果不明，既不算送达也不算未发生。
+
+    与 :class:`DeliveryRejectedError` 是互斥的两类，刻意不共用继承链——消费侧
+    的 ``except DeliveryRejectedError`` 一旦把它也吞进去，"不明"就会退化成
+    "明确失败"，随之而来的清预留位、改走另一条通道就是重复投递。``retry_safe``
+    只在**该操作持有平台侧幂等键**时才为真（见 ``core.delivery.ports``）：为真
+    表示重投不会产生第二份用户可见内容，允许消费侧退避后自动重试；为假只能保留
+    预留位转人工核对。默认为假，落在最保守的一侧。
+    """
+
+    def __init__(
+        self,
+        message: str = "",
+        *,
+        reason: str,
+        code: int | str | None = None,
+        log_id: str | None = None,
+        retry_safe: bool = False,
+    ) -> None:
+        """``reason`` 是可搜的短码（``missing_code``/``in_flight``/``missing_*``）。"""
+        self.reason = reason
+        self.code = code
+        self.log_id = log_id
+        self.retry_safe = retry_safe
+        super().__init__(message or f"投递结果不明：reason={reason} code={code} log_id={log_id}")
+
+
+@dataclass(frozen=True)
+class TerminalReceipt:
+    """**本次终态**已经被某条通道受理的回执。
+
+    只有它能证明"这一条终态真的落到了用户会话里"：``kind`` 是落地的通道
+    （``card``/``text``），``message_id`` 是那条通道上可回读的平台消息标识。
+    没有回执就不允许确认送达——建进度卡那一轮拿到的旧 ``message_id`` 与这次
+    终态没有关系，用它确认等于把一个还没送出去的答案记成已送达（`V-投递-03`）。
+    """
+
+    kind: str
+    message_id: str
 
 
 class CardTransport(Protocol):
@@ -376,6 +418,16 @@ class CardStream:
             )
         self._rate_limiter = rate_limiter or CardRateLimiter()
         self._on_send_outcome = on_send_outcome
+        # 本次终态的回执。**刻意不接受 ``initial_*`` 恢复**：它是"这一轮真的把
+        # 终态送出去了"的现场证据，从持久化状态里"恢复"出来就等于凭空造证据。
+        # 跨轮次的等价证据由调用方从已落库的消费游标推导（见
+        # ``apps/gateway/delivery.DeliveryConsumer._terminal_receipt``）。
+        self._terminal_receipt: TerminalReceipt | None = None
+
+    @property
+    def terminal_receipt(self) -> TerminalReceipt | None:
+        """本轮已经取得的终态回执；没有取得时为 ``None``。"""
+        return self._terminal_receipt
 
     @property
     def fallback_needed(self) -> bool:
@@ -634,6 +686,14 @@ class CardStream:
             # 通道重复投递。原样抛给调用方，不降级、不清预留位、不重试。
             raise
 
+        # 终态正文这一刻已经确定写进卡片，可以据此确认送达。回执用的是建卡那一步
+        # 回读到的 ``message_id``——卡片终态更新接口本身不回读新标识（见
+        # ``core.delivery.ports.DELIVERY_OPERATIONS`` 的 ``card_update`` 一行），
+        # 承载这条终态的平台消息就是那张卡片所在的那条消息。**拿不到它就没有
+        # 回执**：宁可让这次终态留在"不明"，也不拿一个空标识去确认。
+        if self._message_id:
+            self._terminal_receipt = TerminalReceipt(kind="card", message_id=self._message_id)
+
         self._sequence += 1
         try:
             self._before_external()
@@ -676,6 +736,11 @@ class CardStream:
             # 不重试。
             raise
         self._message_id = message_id
+        if message_id:
+            # 拿不到可回读标识就没有回执：真实 adapter 在这种形状下已经抛
+            # ``LookupError``，这里再挡一层，防止注入的传输层返回空串时凭一个
+            # 空标识确认送达。
+            self._terminal_receipt = TerminalReceipt(kind="text", message_id=message_id)
         self._notify_send("message_final", True)
         return message_id
 

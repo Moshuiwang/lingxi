@@ -166,10 +166,14 @@ class AdapterOutcomeTests(unittest.TestCase):
 
         def transport(_method: str, url: str, **_kwargs: object) -> dict[str, object]:
             if url.endswith("tenant_access_token/internal"):
-                return {"tenant_access_token": "token"}
+                # 真实响应带 ``code=0``：码缺失现在一律判"结果不明"（fail-closed），
+                # 假响应必须与真实形状同口径，否则测的是一个不存在的成功形状。
+                return {"code": 0, "tenant_access_token": "token"}
             if fail_message[0]:
                 raise TimeoutError("transport")
-            return {"code": 0}
+            # 「通知」这一档的必要回读标识是 ``data.message_id``（见
+            # ``core.delivery.ports.DELIVERY_OPERATIONS``）。
+            return {"code": 0, "data": {"message_id": "om_fake_1"}}
 
         sender = FeishuGroupMessages(
             base_url="https://open.feishu.test/open-apis",

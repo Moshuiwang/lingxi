@@ -23,8 +23,14 @@ from typing import Any
 from lingxi.core.identity.onboarding_ports import EmailBindingSource, _AuditSink
 from lingxi.core.identity.onboarding_terminal import _internal, _not_authorized, _Terminal
 from lingxi.core.permission.account_match import normalize_email
-from lingxi.core.permission.local_override import ResolvedLocalOverrides
-from lingxi.core.permission.merge_sources import merge_permission_sources
+from lingxi.core.permission.local_override import (
+    LocalOverrideReadError,
+    ResolvedLocalOverrides,
+)
+from lingxi.core.permission.merge_sources import (
+    REASON_LOCAL_OVERRIDE_READ_FAILED,
+    merge_permission_sources,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -89,14 +95,24 @@ def reject_zero_galaxy_without_local_grant(
 ) -> _Terminal | None:
     """零银河权限用户提前查一次**本地授权**，避免为注定被拒绝的人签发令牌、建环境。
 
-    合并结果非空（管理员兜底赋权）→ 返回 ``None`` 放行，``_publish`` 会再做一次
-    同样的合并并真正结算发布行；合并结果仍为空 → 在这里（早于
-    ``_issue_token``/``_create_environment``）就返回"无可用银河权限"终态。不能放在
-    ``_publish``：那里需要已签发的令牌，结构上排在令牌签发之后。**不翻译**：
-    ``aggregate.granted`` 为假时 ``companies``/``functions`` 恒为空，银河这一侧
-    贡献直接是 ``{}``，也因此不受 ``publish_allowed`` 闸门约束。
+    合并结果非空（管理员兜底赋权）→ 返回 ``None`` 放行，``_publish`` 会再做一次同样的
+    合并并真正结算发布行；仍为空 → 在这里（早于令牌签发与环境创建）就返回"无可用银河
+    权限"终态。**不翻译**：``aggregate.granted`` 为假时银河这一侧贡献直接是 ``{}``。
+
+    **本地覆盖读不出来时收敛到本侧故障**（``LX-ONBOARD-001``），不是"无可用银河权限"：
+    这条分支上本地授权是唯一的兜底来源，把读故障当成"查过了、他没有"等于用一次数据库
+    抖动否认一份管理员确实批过的权限。
     """
-    local = resolve_local_overrides(user_id)
+    try:
+        local = resolve_local_overrides(user_id)
+    except LocalOverrideReadError:
+        audit.record(
+            "onboarding.publish_gate_closed",
+            user=user_id,
+            reason=REASON_LOCAL_OVERRIDE_READ_FAILED,
+            trace_id=trace_id,
+        )
+        return _internal(REASON_LOCAL_OVERRIDE_READ_FAILED)
     # ``full_access_wildcard`` 是必填关键字参数——这条分支 ``galaxy`` 恒为空
     # 字典，取值对结果没有作用面，仍必须显式传参（无默认值的结构性要求）。
     merged = merge_permission_sources(galaxy={}, local=local, full_access_wildcard=True)

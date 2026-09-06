@@ -12,6 +12,7 @@ Claude Agent SDK 的地方。本文件用桩模块顶替 SDK，锁住三件事�
 from __future__ import annotations
 
 import asyncio
+import importlib.util
 import sys
 import types
 import unittest
@@ -98,6 +99,14 @@ class StubSystemMessage:
 
 
 class StubResultMessage:
+    """与真实 ``claude_agent_sdk.ResultMessage``（0.2.128）字段对齐的桩。
+
+    真实 dataclass 没有 ``error`` 单数字段——那是本仓库此前的读取错误（见
+    ``adapters/claude_agent_session.py`` 的 IN-10/#650 修复）。真实字段是
+    ``errors: list[str] | None`` 与 ``api_error_status: int | None``，这里只
+    构造本模块用得到的子集，不追求覆盖 dataclass 全部字段。
+    """
+
     def __init__(
         self,
         subtype="success",
@@ -107,7 +116,8 @@ class StubResultMessage:
         usage=None,
         num_turns=None,
         terminal_reason=None,
-        error=None,
+        errors=None,
+        api_error_status=None,
     ) -> None:
         self.subtype = subtype
         self.is_error = is_error
@@ -118,8 +128,10 @@ class StubResultMessage:
             self.num_turns = num_turns
         if terminal_reason is not None:
             self.terminal_reason = terminal_reason
-        if error is not None:
-            self.error = error
+        if errors is not None:
+            self.errors = errors
+        if api_error_status is not None:
+            self.api_error_status = api_error_status
 
 
 class _StubSDK(unittest.TestCase):
@@ -419,6 +431,70 @@ class MessageNormalisationTest(_StubSDK):
         self.assertEqual(events[0]["terminal_reason"], "max_turns")
         self.assertNotIn("result", events[0])
 
+    def test_result_message_errors_and_api_error_status_are_carried_when_present(self) -> None:
+        """IN-10/#650：真实字段是 ``errors``/``api_error_status``，不是 ``error``。"""
+        from lingxi.adapters.claude_agent_session import normalize_message
+
+        events = normalize_message(
+            StubResultMessage(
+                is_error=True,
+                errors=["rate limited, retrying", "still rate limited"],
+                api_error_status=429,
+            )
+        )
+
+        self.assertEqual(events[0]["errors"], ["rate limited, retrying", "still rate limited"])
+        self.assertEqual(events[0]["api_error_status"], 429)
+
+    def test_result_message_without_errors_field_produces_no_errors_key(self) -> None:
+        """``errors``/``api_error_status`` 为 ``None``（或字段不存在）时不写入事件——
+        与其它"配了才传"的观测字段（usage/num_turns 等）同一约定。"""
+        from lingxi.adapters.claude_agent_session import normalize_message
+
+        events = normalize_message(StubResultMessage(errors=None, api_error_status=None))
+
+        self.assertNotIn("errors", events[0])
+        self.assertNotIn("api_error_status", events[0])
+
+    def test_result_message_empty_or_non_string_errors_produce_no_errors_key(self) -> None:
+        from lingxi.adapters.claude_agent_session import normalize_message
+
+        empty = normalize_message(StubResultMessage(errors=[]))
+        self.assertNotIn("errors", empty[0])
+
+        only_non_strings = normalize_message(StubResultMessage(errors=[None, 42, ""]))
+        self.assertNotIn("errors", only_non_strings[0])
+
+    def test_result_message_overlong_error_item_is_truncated_with_a_visible_marker(self) -> None:
+        """单条错误文本超过 500 字符时截断并留下可见标记，不做无界透传。"""
+        from lingxi.adapters.claude_agent_session import (
+            _MAX_RESULT_ERROR_ITEM_CHARS,
+            normalize_message,
+        )
+
+        oversized = "x" * (_MAX_RESULT_ERROR_ITEM_CHARS + 100)
+        events = normalize_message(StubResultMessage(errors=[oversized]))
+
+        kept = events[0]["errors"][0]
+        self.assertEqual(len(kept), _MAX_RESULT_ERROR_ITEM_CHARS + len("…[TRUNCATED]"))
+        self.assertTrue(kept.endswith("…[TRUNCATED]"))
+        self.assertTrue(kept.startswith("x" * _MAX_RESULT_ERROR_ITEM_CHARS))
+
+    def test_result_message_too_many_errors_are_capped_with_a_visible_marker(self) -> None:
+        """条数超过上限时截断并追加一条可见的"省略了几条"标记，不静默丢弃。"""
+        from lingxi.adapters.claude_agent_session import (
+            _MAX_RESULT_ERROR_ITEMS,
+            normalize_message,
+        )
+
+        many = [f"error-{i}" for i in range(_MAX_RESULT_ERROR_ITEMS + 5)]
+        events = normalize_message(StubResultMessage(errors=many))
+
+        kept = events[0]["errors"]
+        self.assertEqual(len(kept), _MAX_RESULT_ERROR_ITEMS)
+        self.assertEqual(kept[:-1], many[: _MAX_RESULT_ERROR_ITEMS - 1])
+        self.assertIn("omitted", kept[-1])
+
     def test_every_normalised_kind_is_one_the_core_recorder_knows(self) -> None:
         """适配器产出的事件种类必须与 core 记账端的约定完全一致。
 
@@ -443,6 +519,121 @@ class MessageNormalisationTest(_StubSDK):
 
         self.assertEqual(normalize_message(StubSystemMessage()), ())
         self.assertEqual(normalize_message(object()), ())
+
+
+def _claude_agent_sdk_available() -> bool:
+    return importlib.util.find_spec("claude_agent_sdk") is not None
+
+
+# 与 tests/test_document_delivery.py 同款门控：未装 worker extras 的机器上直接
+# import 真实 SDK 会在收集阶段就 ModuleNotFoundError，表现成一堆 ERROR 而不是
+# 清晰的 skip，与代码框架"全量套件须可在无外部依赖机器上运行"的承诺冲突。
+CLAUDE_AGENT_SDK_SKIP_REASON = (
+    "跳过：本机未装 claude_agent_sdk（worker extras）。CI 的 gate 作业会先装好"
+    "worker extras 再跑到这一组，字段契约在那里确实被核对；这组测试本身能否"
+    "被执行到，另由 scripts/ci/check_agent_sdk_binding.py 在 CI 里无条件核对"
+    "同一组字段（该脚本无 skipUnless），不依赖这里能否跑到"
+)
+
+
+def _real_result_message(**overrides):
+    """按固定版 0.2.128 的真实 ``ResultMessage`` 必填字段构造一个默认实例。
+
+    真实 dataclass（``claude_agent_sdk/types.py``）里 ``subtype``/``duration_ms``/
+    ``duration_api_ms``/``is_error``/``num_turns``/``session_id`` 没有默认值，
+    必须显式给出；``errors``/``api_error_status`` 等可选字段按各测试用例覆盖。
+    """
+    from claude_agent_sdk import ResultMessage
+
+    fields = {
+        "subtype": "success",
+        "duration_ms": 100,
+        "duration_api_ms": 80,
+        "is_error": False,
+        "num_turns": 1,
+        "session_id": "session-real",
+    }
+    fields.update(overrides)
+    return ResultMessage(**fields)
+
+
+@unittest.skipUnless(_claude_agent_sdk_available(), CLAUDE_AGENT_SDK_SKIP_REASON)
+class RealResultMessageContractTest(unittest.TestCase):
+    """用**真实** ``claude_agent_sdk.ResultMessage``（本仓库 worker extras 固定的
+    0.2.128）核对 IN-10/#650 的字段名假设。
+
+    全仓此前没有任何测试真正 ``import`` 过这个真实类型——本文件与
+    ``check_agent_sdk_binding.py`` 都只核对 ``ClaudeAgentOptions``/``HookMatcher``
+    这一侧，``ResultMessage`` 的字段名完全靠桩模块假设，而桩模块的假设（单数
+    ``error``）恰恰与真实 dataclass 分岔了两个版本却没有任何测试发现。这里补
+    上这条：直接用真实 dataclass 构造离线契约样例，不连接网络、不调用模型。
+    """
+
+    def test_errors_with_values_are_bounded_and_carried(self) -> None:
+        from lingxi.adapters.claude_agent_session import normalize_message
+
+        message = _real_result_message(
+            is_error=True, errors=["boom", "boom again"], api_error_status=None
+        )
+
+        events = normalize_message(message)
+
+        self.assertEqual(events[0]["errors"], ["boom", "boom again"])
+        self.assertNotIn("api_error_status", events[0])
+
+    def test_errors_none_produces_no_errors_key(self) -> None:
+        from lingxi.adapters.claude_agent_session import normalize_message
+
+        events = normalize_message(_real_result_message(errors=None))
+
+        self.assertNotIn("errors", events[0])
+
+    def test_errors_overlong_and_overcount_are_bounded_with_visible_markers(self) -> None:
+        from lingxi.adapters.claude_agent_session import (
+            _MAX_RESULT_ERROR_ITEM_CHARS,
+            _MAX_RESULT_ERROR_ITEMS,
+            normalize_message,
+        )
+
+        many_long = [
+            f"e{i}:" + "y" * _MAX_RESULT_ERROR_ITEM_CHARS
+            for i in range(_MAX_RESULT_ERROR_ITEMS + 3)
+        ]
+        events = normalize_message(_real_result_message(is_error=True, errors=many_long))
+
+        kept = events[0]["errors"]
+        self.assertEqual(len(kept), _MAX_RESULT_ERROR_ITEMS)
+        self.assertTrue(kept[0].endswith("…[TRUNCATED]"))
+        self.assertIn("omitted", kept[-1])
+
+    def test_api_error_status_none_produces_no_key(self) -> None:
+        from lingxi.adapters.claude_agent_session import normalize_message
+
+        events = normalize_message(_real_result_message(api_error_status=None))
+
+        self.assertNotIn("api_error_status", events[0])
+
+    def test_api_error_status_429_is_carried(self) -> None:
+        from lingxi.adapters.claude_agent_session import normalize_message
+
+        events = normalize_message(_real_result_message(is_error=True, api_error_status=429))
+
+        self.assertEqual(events[0]["api_error_status"], 429)
+
+    def test_api_error_status_529_is_carried(self) -> None:
+        from lingxi.adapters.claude_agent_session import normalize_message
+
+        events = normalize_message(_real_result_message(is_error=True, api_error_status=529))
+
+        self.assertEqual(events[0]["api_error_status"], 529)
+
+    def test_real_dataclass_has_no_singular_error_field(self) -> None:
+        """钉住这次要修的 bug 的前提事实：真实类型上不存在单数 ``error``。"""
+        message = _real_result_message()
+
+        self.assertFalse(hasattr(message, "error"))
+        self.assertTrue(hasattr(message, "errors"))
+        self.assertTrue(hasattr(message, "api_error_status"))
 
 
 class SingleTurnSessionTest(_StubSDK):

@@ -153,14 +153,18 @@ def _resolve_effective_failure(
     """给定显式失败与流侧信号，推断出真正生效的失败原因。
 
     SDK 有时不通过 ``failure`` 显式报错，而是把"上下文过长"编码进
-    ``result_subtype`` 或 ``result_error`` 的自由文本里；两条路径任一命中都
+    ``result_subtype`` 或 ``result_errors`` 的自由文本里；两条路径任一命中都
     改写为统一的 ``context_too_long``，否则沿用调用方传入的 ``failure``。
+
+    ``result_errors`` 是真实 SDK 字段 ``ResultMessage.errors`` 的收窄结果；
+    此前这里读的是同名单数、不存在的 ``error`` 字段，恒为 ``None``，这条
+    识别分支在真实 SDK 下从未真正生效，现已改读真实字段重新生效。
     """
     if failure:
         return dict(failure)
-    result_error = (stream.result_error or "").casefold()
-    context_error = "context" in result_error and any(
-        marker in result_error for marker in ("long", "length", "limit", "window")
+    combined_errors = " ".join(stream.result_errors or ()).casefold()
+    context_error = "context" in combined_errors and any(
+        marker in combined_errors for marker in ("long", "length", "limit", "window")
     )
     if (
         stream.result_subtype
@@ -293,6 +297,8 @@ def _build_turn_section(
         "sdk_terminal_reason": redact_free_text(stream.terminal_reason)
         if stream.terminal_reason
         else None,
+        "sdk_result_errors": _project_result_errors(stream.result_errors),
+        "sdk_api_error_status": stream.api_error_status,
         "termination_state": ctx.termination_state,
         "termination_reason": ctx.termination_reason,
         "guard_triggered": ctx.guard_triggered,
@@ -361,6 +367,18 @@ def _project_sheet_request(sheet_request: SheetRequest | None) -> dict[str, Any]
     if sheet_request is None:
         return None
     return {"title": sheet_request.title, "rows": [list(row) for row in sheet_request.rows]}
+
+
+def _project_result_errors(errors: Iterable[str] | None) -> list[str] | None:
+    """把 SDK 终止消息的错误列表投影为可以离开进程的形式。
+
+    ``TurnStreamRecorder`` 已经做过条数/长度的防御性收紧（见该类文档），这里
+    只做离开进程前的最后一道自由文本脱敏——与 ``sdk_result_subtype``/
+    ``sdk_terminal_reason`` 走的是同一条"出口"路径（见本文件头模块文档）。
+    """
+    if not errors:
+        return None
+    return [redact_free_text(item) for item in errors]
 
 
 def config_error_report(*, trace_id: str, message: str) -> dict[str, Any]:

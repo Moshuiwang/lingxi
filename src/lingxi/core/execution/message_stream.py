@@ -28,6 +28,17 @@ _USAGE_TOKEN_FIELDS: tuple[str, ...] = (
     "cache_creation_input_tokens",
     "cache_read_input_tokens",
 )
+# 独立于 ``adapters/claude_agent_session.py`` 的第二道防御性上限：适配器已经
+# 按条数/长度截断过一次，这里再夹一次，避免适配器一侧的上限被后续改动放宽或
+# 跳过时，本层仍然兜住"不把无界列表继续往下传"——历史上单条 ``error`` 字段
+# 就是两层各自独立截断一次（各自独立测试覆盖，见两个模块的文件头）。这里
+# 不重建"可见截断标记"：那是适配器一侧的职责，本层只保证不超限。
+_MAX_RESULT_ERRORS_KEPT = 10
+# 适配器单条上限是 500，超长时会在其后**追加**可见标记（最长再加 12 字符）；
+# 这里的上限要留出这段余量，否则本层会在正常流程里把适配器留下的可见标记从
+# 中间切断，"截断了"这件事反而不可见，与"截断要留可见标记"的要求自相矛盾。
+# 600 只需要大于两者之和，不需要与适配器的常量数值一致（见下方属性文档）。
+_MAX_RESULT_ERROR_CHARS = 600
 
 
 class TurnStreamRecorder:
@@ -54,7 +65,8 @@ class TurnStreamRecorder:
             "reason": "no_result_message",
         }
         self._agent_turns: int | None = None
-        self._result_error: str | None = None
+        self._result_errors: tuple[str, ...] | None = None
+        self._api_error_status: int | None = None
         self._session_id: str | None = None
 
     @property
@@ -91,9 +103,27 @@ class TurnStreamRecorder:
         return self._terminal_reason
 
     @property
-    def result_error(self) -> str | None:
-        """SDK 终止消息携带的错误文本，已按长度截断。"""
-        return self._result_error
+    def result_errors(self) -> tuple[str, ...] | None:
+        """SDK 终止消息携带的错误列表（真实字段 ``ResultMessage.errors``）。
+
+        已做条数与单条长度的防御性再收紧；真正生成"可见截断标记"的上限在
+        ``adapters/claude_agent_session.py`` 读取 SDK 消息时就已经应用，这里
+        是第二道独立防线。离开进程前的自由文本脱敏在 ``apps/worker/report.py``
+        的出口统一处理（与 ``result_subtype``/``terminal_reason`` 同一条路径），
+        这里保存的仍是未脱敏原文，只在进程内部使用（如识别"上下文过长"）。
+        """
+        return self._result_errors
+
+    @property
+    def api_error_status(self) -> int | None:
+        """SDK 终止消息报告的失败 API 调用 HTTP 状态码（如 429/529）。
+
+        真实字段 ``ResultMessage.api_error_status``：仅当 ``is_error`` 为真且
+        ``subtype`` 为 ``"success"``（CLI 侧一种历史命名）时才有意义，其余情况
+        为 ``None``。SDK 自身文档注明该字段"可安全记录（不含消息正文）"，因此
+        这里只做类型收窄，不需要脱敏。
+        """
+        return self._api_error_status
 
     @property
     def tool_result_count(self) -> int:
@@ -146,8 +176,22 @@ class TurnStreamRecorder:
                 event.get("usage"),
                 source=event.get("usage_source", "sdk"),
             )
-            error = event.get("error")
-            self._result_error = error[:500] if isinstance(error, str) else None
+            errors = event.get("errors")
+            if isinstance(errors, list) and errors:
+                kept = tuple(
+                    item[:_MAX_RESULT_ERROR_CHARS]
+                    for item in errors[:_MAX_RESULT_ERRORS_KEPT]
+                    if isinstance(item, str) and item
+                )
+                self._result_errors = kept or None
+            else:
+                self._result_errors = None
+            api_error_status = event.get("api_error_status")
+            self._api_error_status = (
+                api_error_status
+                if isinstance(api_error_status, int) and not isinstance(api_error_status, bool)
+                else None
+            )
             session_id = event.get("session_id")
             if isinstance(session_id, str) and session_id:
                 self._session_id = session_id

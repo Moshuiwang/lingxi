@@ -215,6 +215,10 @@ REQUIRED_MODULES = (
     # `ContentCaptureRecord`，那个类会把整个 `core.execution` 拉进 scheduler 的
     # import 闭包，而 scheduler 没有任何理由背上 worker 的执行层。
     "lingxi.adapters.postgres_content_capture_retention",
+    # 四个内容载体（task.prompt / inbound_event / pending_action /
+    # queue_failure_notice）的九十天到期处置：同样由 lingxi-scheduler 的清理职责在
+    # 函数内 import，制品少了它这条清理职责会在第一轮就抛 ImportError。
+    "lingxi.adapters.postgres_carrier_retention",
     # 年份接地护栏第二层（Issue #326 批次 5 卡 E）：纯逻辑判定在 core，由
     # apps/worker/service.py 模块级 import（见下面 PROCESS_RUNTIME_IMPORTS 的
     # worker 闭包）——"本地测试全绿但 wheel 里没有这个模块"同样是 V-部署-10
@@ -241,6 +245,9 @@ REQUIRED_MODULES = (
     "lingxi.core.permission.local_override",
     "lingxi.core.permission.position_override",
     "lingxi.adapters.postgres_local_permission",
+    # 本地覆盖这条来源的读取与完整性检查（权威决定链前两段）：每日重算、定向重算
+    # 与首聊开通三个入口都模块级 import 它，随它们同一条发布理由。
+    "lingxi.core.permission.decision_chain",
     # 存量差集导入/职位范围预授权的落库细节，从 `postgres_local_permission.py`
     # 按体量棘轮纯移动拆出（#592 可读性批）；`postgres_local_permission.py`
     # 顶层 import 它，随它同一条发布理由，见下面 scheduler/gateway 闭包同名注释。
@@ -691,6 +698,9 @@ PROCESS_RUNTIME_IMPORTS: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {
             # `role_function_map_file` 一节同一条理由——函数内 import 也是进程真实
             # 依赖，制品少了它这条清理职责会在第一轮就抛 ImportError。
             "lingxi.adapters.postgres_content_capture_retention",
+            # 四个内容载体的九十天到期处置：`_build_carrier_retention_duty` 函数内
+            # import，与上一条同一理由。
+            "lingxi.adapters.postgres_carrier_retention",
             "lingxi.apps.scheduler.roster_audit",
             "lingxi.apps.scheduler.daily_report",
             # 理由见 REQUIRED_MODULES 同名条目：进程入口模块级 import 它。
@@ -719,19 +729,18 @@ PROCESS_RUNTIME_IMPORTS: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {
             # 证明不了"这个模块装得上"）。
             "lingxi.core.permission.metric_translation",
             "lingxi.adapters.company_function_metric_map_file",
-            # 四源聚合集中合并（Issue #319 S-P-3）：`permission_refresh.py` 与
-            # `onboarding_runner.py` 都模块级 import 本地覆盖的纯逻辑
-            # （`resolve_local_overrides`）与合并纯函数（`merge_permission_sources`），
+            # 四源聚合集中合并（Issue #319 S-P-3）：本地覆盖那条来源的读取与完整性
+            # 检查现在由 `core/permission/decision_chain.py` 承担，三个合并入口共用
+            # 它一份；`permission_refresh.py` 与 `onboarding_runner.py` 模块级 import
+            # 决定链与合并纯函数（`merge_permission_sources`），
             # `_build_permission_refresh_duty`/`_build_onboarding_duty` 各自函数内
-            # import 真实的 Postgres 读取口——这是 `local_override`/
-            # `postgres_local_permission` 这两个模块**第一次**有真实进程调用方（S-P-1a
-            # 落地时随制品发布但装配前不在任何进程闭包里，见 REQUIRED_MODULES 同名
-            # 注释；那条注释现在已经过期，S-P-3 之后它们确实在 scheduler 的运行时
-            # 闭包里了）。
+            # import 真实的 Postgres 读取口。`local_override` 仍在闭包里——决定链
+            # 模块级 import 它的条目类型、异常与解析纯函数。
             "lingxi.core.permission.local_override",
             "lingxi.adapters.postgres_local_permission",
             "lingxi.adapters.postgres_local_permission_import",
             "lingxi.core.permission.merge_sources",
+            "lingxi.core.permission.decision_chain",
             # 存量差集导入纯逻辑（rc25 S-1）：`onboarding_runner`/`permission_refresh`/
             # `postgres_local_permission` 模块级 import；开通链两步编排随 runner 进闭包。
             "lingxi.core.permission.legacy_diff",
@@ -1214,6 +1223,7 @@ PROCESS_RUNTIME_IMPORTS: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {
             "lingxi.adapters.postgres_local_permission_import",
             "lingxi.core.permission.local_override",
             "lingxi.core.permission.position_override",
+            "lingxi.core.permission.decision_chain",
             # 管理员写动作确认执行成功后的定向单用户权限重算+发布（Issue #438）：
             # `card_callback_handler` 装配处在函数内 import
             # `PermissionRecomputeAdapter`（`adapters/postgres_permission_

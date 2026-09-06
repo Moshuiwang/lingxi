@@ -11,7 +11,7 @@
 | 当前事实 | 值 |
 | --- | --- |
 | 基线 revision（链首） | `20260806_baseline` |
-| head revision | `0088_outreach_message` |
+| head revision | `0090_delivery_retry_backoff` |
 | 配置文件 | 仓库根目录 `alembic.ini` |
 | revision 目录 | `migrations/alembic/versions/` |
 | 连接串环境变量 | `LINGXI_MIGRATION_DSN`（缺失即失败，无默认值） |
@@ -633,6 +633,59 @@ Issue #586。新表 `outreach_message`：一张主动发出的卡片发给了谁
   编排带走属于他的记录。
 - `BEFORE UPDATE` 触发器冻结 `created_at`/`dedupe_key`/`purpose`，并拒绝把已送达的行
   退回其它状态。downgrade 删表与触发器函数，真实可执行。
+
+## `0089_carrier_retention`（四个内容载体的到期清理接线）
+
+Trace [#643](https://github.com/Moshuiwang/lingxi/issues/643) IN-04（工作卡
+[#648](https://github.com/Moshuiwang/lingxi/issues/648)）。**不新建任何表**，补的是四个
+既有载体上「九十天上限执行不下去」的那一小块：`pending_action` 新增
+`retention_expires_at`（触发器固定 `created_at + 2160 小时`）与 `content_redacted_at`
+（脱敏水位，兼作幂等判据与部分索引条件），另外三张表（`task`、`inbound_event`、
+`queue_failure_notice`）各补一条到期扫描索引。清理职责在
+`apps/scheduler/retention.py` 的 `ExpiredCarrierRetentionDuty`，语句在
+`adapters/postgres_carrier_retention.py`。
+
+- **`pending_action` 是脱敏保留行，不是删整行**：`0068` 文件尾把「清空整行还是仅脱敏
+  身份列」留成了口子，本 revision 取脱敏。合同原文是「删除**或**不可逆脱敏」，两条路
+  都兑现承诺；而 `local_permission_override.pending_action_id` 是 **NOT NULL** 外键，
+  删整行会把一条现行本地权限覆盖的成立依据一并带走。
+- **三列 `open_id` 的脱敏值带行标识**（`'redacted:' || id`）而不是一个常量：
+  `pending_action_single_pending_target_idx` 是 `target_open_id` 上
+  `WHERE status = 'pending'` 的部分唯一索引，多条到期但仍停在 `pending` 的行如果被脱敏
+  成同一个值就会撞唯一索引，把一次本该静默完成的合规动作变成每轮都失败。
+- **`payload` 擦成 `'{}'` 而不是置空**：`0073` 的
+  `pending_action_payload_matches_action_type` 要求本地权限三类动作必须携带非空白
+  `payload`，置 NULL 或空串会违反 CHECK。与 `publish_outbox.payload` 的既有做法同型。
+- **不进 `0054` 的受限清理函数**：那条 `SECURITY DEFINER` 函数与 `BEFORE DELETE` 双条件
+  防线只挂在两张父表上；本批走应用层小批量语句，未动函数、属主授权面与任何角色的
+  删除权限（同 `V-保留-26` 的 `innertest_content_capture` 先例）。
+- `downgrade` 删除本 revision 建的两列、一个函数、一个触发器与四条索引，真实可执行
+  （本机 PostgreSQL 16 前滚 / 回滚往返两次通过）。**`content_redacted_at` 上的信息会丢**：
+  回滚前已脱敏的行重新前滚后会被再脱敏一次——脱敏是幂等的（内容早已不在），不构成
+  数据破坏。
+
+## `0090_delivery_retry_backoff`（投递重试退避落库）
+
+Trace [#643](https://github.com/Moshuiwang/lingxi/issues/643) IN-06（工作卡
+[#649](https://github.com/Moshuiwang/lingxi/issues/649)）。`task` 上新增
+`delivery_retry_attempts`（指数退避的档位，非负）与 `delivery_retry_after`
+（在这个时刻之前不要把这条任务再选进候选，可空）。消费侧在
+`adapters/postgres_conversation/_queue_gateway_delivery.py` 与
+`apps/gateway/delivery.py`。
+
+- **为什么必须落库**：Gateway 投递候选查询按 `ORDER BY created_at LIMIT n` 取任务，
+  而"这条任务刚失败、要等几秒再试"此前只活在消费进程的内存字典里。候选查询看不见
+  它，于是一条持续失败的老任务每轮都排在最前面、被选中、立刻返回"稍后重试"，零进展
+  却占掉一个名额；批量上限之外的健康用户因此永远轮不到。
+- **不放宽任何一道防重复的闸**：两列只决定"什么时候允许再尝试一次"。能不能再外发
+  仍只看 `dispatch_reserved_kind`，能不能确认送达仍只看 `delivery_consumed_sequence`
+  与本次终态的回执，本 revision 一个字都没动它们。
+- **重启行为随之改变（有意）**：退避此前随进程重启清零，一批正在退避的任务会在重启
+  那一刻同时涌回候选；落库之后重启不再重置档位。
+- **不加索引**：新增的只是一条过滤谓词，扫描面仍由既有的状态过滤决定；候选集本身是
+  小集合，为它单开索引的收益抵不上写放大。
+- `downgrade` 直接 `DROP COLUMN` 两列，真实可执行。回滚后正在退避的任务会立刻重新
+  成为候选，与本 revision 之前的行为一致，没有需要回填的历史值。
 
 ## `0054_retention_cleanup` 的三条越界边界（保留清理）
 
