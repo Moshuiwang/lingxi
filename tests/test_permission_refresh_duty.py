@@ -71,7 +71,15 @@ from lingxi.core.permission.publish_row import (
 )
 
 REPOSITORY_ROOT = pathlib.Path(__file__).parents[1]
-DUTY_SOURCE = REPOSITORY_ROOT / "src" / "lingxi" / "apps" / "scheduler" / "permission_refresh.py"
+#: 本职责的实现现在分两个文件：编排在 ``permission_refresh.py``，本地覆盖这条来源的
+#: 读取与完整性检查在三条链共用的 ``core/permission/decision_chain.py``。下面所有
+#: 「源码里不许出现 X」的否定断言必须同时扫这两份——只扫前一份的话，把实现搬进后一份
+#: 就能让每一条断言变成永远为真的空判定，而它们钉的正是"这条链上不许有通知出口、
+#: 不许有旁路开关、不许自己算版本"这些不变式。
+DUTY_SOURCES = (
+    REPOSITORY_ROOT / "src" / "lingxi" / "apps" / "scheduler" / "permission_refresh.py",
+    REPOSITORY_ROOT / "src" / "lingxi" / "core" / "permission" / "decision_chain.py",
+)
 
 
 def code_without_docstrings(path: pathlib.Path) -> str:
@@ -103,9 +111,16 @@ def code_without_docstrings(path: pathlib.Path) -> str:
 
 
 def duty_code() -> str:
-    """每日权限重算职责的代码正文（不含文档字符串与注释）。"""
+    """每日权限重算职责的代码正文（不含文档字符串与注释），含它搬出去的那一段。
 
-    return code_without_docstrings(DUTY_SOURCE)
+    :data:`DUTY_SOURCES` 里每一份都必须真的存在——拆分时改错路径会让扫描面静默变空，
+    那时否定断言全部恒真、什么都挡不住。
+    """
+
+    for path in DUTY_SOURCES:
+        if not path.is_file():
+            raise AssertionError(f"否定断言的扫描面缺文件，判定会静默失真：{path}")
+    return "\n".join(code_without_docstrings(path) for path in DUTY_SOURCES)
 
 
 TODAY = datetime(2026, 8, 17, 3, 0, tzinfo=UTC)

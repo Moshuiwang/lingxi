@@ -24,12 +24,15 @@ from typing import Any, Protocol
 
 from lingxi.core.identity.roster_audit import ArchivedIdentity
 from lingxi.core.permission.account_match import MATCHED, match_galaxy_account
-from lingxi.core.permission.legacy_diff import missing_all_scope_metrics
+from lingxi.core.permission.decision_chain import (
+    AllScopeBackfill,
+    AllScopeExpander,
+    LocalOverrideDecisionSource,
+    LocalOverrideReader,
+)
 from lingxi.core.permission.local_override import (
     LocalOverrideReadError,
-    LocalPermissionOverrideEntry,
     ResolvedLocalOverrides,
-    resolve_local_overrides,
 )
 from lingxi.core.permission.merge_sources import merge_permission_sources
 from lingxi.core.permission.metric_translation import (
@@ -160,23 +163,6 @@ class _DecisionStore(Protocol):
     ) -> _Decision: ...
 
 
-class _LocalOverrideReader(Protocol):
-    def effective_entries(self, *, user_id: str) -> Sequence[LocalPermissionOverrideEntry]: ...
-
-
-class _LegacyAllScopeExpander(Protocol):
-    """「2.0 迁移导入·全部」组的补行口。
-
-    与 ``apps/scheduler/permission_refresh.py`` 的同名协议各自独立一份。
-    """
-
-    def expand_all_scope_group(
-        self, *, user_id: str, group_id: str, metrics: Sequence[str], now: datetime
-    ) -> int:
-        """给该组补齐 ``metrics`` 里缺的指标；返回实际新增的行数。"""
-        ...
-
-
 class AuditSink(Protocol):
     """审计出口。"""
 
@@ -204,9 +190,9 @@ class TargetedPermissionRecompute:
         role_function_map: Mapping[str, str],
         metric_translation_map: Mapping[str, Mapping[str, Sequence[str]]],
         audit: AuditSink,
-        local_overrides: _LocalOverrideReader | None = None,
+        local_overrides: LocalOverrideReader | None = None,
         clock: Callable[[], datetime] | None = None,
-        legacy_all_scope: _LegacyAllScopeExpander | None = None,
+        legacy_all_scope: AllScopeExpander | None = None,
         revocation_identities: _RevocationIdentityLookup | None = None,
     ) -> None:
         """接线身份/花名册/银河/决定存储/发布历史/审计等协作者与可选覆盖项。"""
@@ -221,9 +207,22 @@ class TargetedPermissionRecompute:
         self._role_function_map = role_function_map
         self._metric_translation_map = metric_translation_map
         self._audit = audit
-        self._local_overrides = local_overrides
-        self._legacy_all_scope = legacy_all_scope
         self._clock = clock or (lambda: datetime.now(UTC))
+        self._local_override_source = LocalOverrideDecisionSource(
+            reader=local_overrides,
+            on_read_failed=self._audit_local_override_read_failure,
+            metric_translation_map=metric_translation_map,
+            clock=self._clock,
+            backfill=(
+                None
+                if legacy_all_scope is None
+                else AllScopeBackfill(
+                    expander=legacy_all_scope,
+                    on_failed=self._audit_all_scope_refresh_failure,
+                    on_succeeded=self._audit_all_scope_refreshed,
+                )
+            ),
+        )
 
     # ------------------------------------------------------------------
     # 停用：不管银河怎么说，立刻清空（模块文档「为什么是两个方法」）
@@ -464,83 +463,39 @@ class TargetedPermissionRecompute:
         return TargetedRecomputeOutcome(kind=kind, cleared_events=decision.cleared_events)
 
     def _resolve_local_overrides(self, user_id: str) -> ResolvedLocalOverrides | None:
-        """读取本地覆盖。**未装配**返回 ``None``，**读不出来一律抛**。
-
-        两种状态的返回值刻意不同：未装配是部署事实，对合并恒等且静默；读取失败是故障，
-        若也返回 ``None`` 就与"这个人确实没有本地覆盖"在合并入口坍缩成同一件事，产出
-        一份少了本地补授却看起来完整的权限决定。响亮记一条审计后抛出，由调用方决定
-        怎么收敛。
+        """读取本地覆盖。判据在共用的决定链来源里，这里只接线。
 
         Raises:
             LocalOverrideReadError: 本地覆盖来源读取失败。
         """
-        if self._local_overrides is None:
-            return None
-        entries = self._read_local_override_entries(user_id)
-        entries = self._expand_legacy_all_scope(user_id, entries)
-        return resolve_local_overrides(user_id=user_id, entries=entries)
+        return self._local_override_source.resolve(user_id)
 
-    def _read_local_override_entries(
-        self, user_id: str
-    ) -> tuple[LocalPermissionOverrideEntry, ...]:
-        """读一次本地覆盖条目；**读不出来一律审计后抛**。
+    def _audit_local_override_read_failure(self, user_id: str, _error: Exception) -> None:
+        """读不出来：响亮记一条本入口自己的审计，由调用方决定怎么收敛。
 
-        与每日批 ``permission_refresh._read_local_override_entries`` 同一语义：这条来源
-        只有这一个读取口，合并前的首次读取与补行之后的重读都走它，两次失败的姿态因此
-        天然一致（重读失败曾经原地退回旧条目照旧发布，等于用不完整的信息提交权限决定）。
-
-        Raises:
-            LocalOverrideReadError: 本地覆盖来源读取失败。
+        与另外两条链共用判据、各留各的事件名——运维从审计一眼看出是哪条链读失败的。
         """
-        try:
-            return tuple(self._local_overrides.effective_entries(user_id=user_id))
-        except Exception as error:  # 读不出来只跳过这次重算，不产出半份结果
-            self._audit.record(
-                "permission_targeted_recompute.local_override_skipped",
-                user=user_id,
-                reason=SKIP_LOCAL_OVERRIDE_READ_FAILED,
-            )
-            raise LocalOverrideReadError() from error
+        self._audit.record(
+            "permission_targeted_recompute.local_override_skipped",
+            user=user_id,
+            reason=SKIP_LOCAL_OVERRIDE_READ_FAILED,
+        )
 
-    def _expand_legacy_all_scope(
-        self, user_id: str, entries: tuple[LocalPermissionOverrideEntry, ...]
-    ) -> tuple[LocalPermissionOverrideEntry, ...]:
-        """「2.0 迁移导入·全部」组随当前映射补齐新指标。
+    def _audit_all_scope_refresh_failure(self, user_id: str, error: Exception) -> None:
+        """「全部」组补行失败：只留痕，本次按既有行照常算。"""
+        self._audit.record(
+            "permission_targeted_recompute.legacy_all_scope_refresh_failed",
+            user=user_id,
+            error=type(error).__name__,
+        )
 
-        与每日批 ``permission_refresh._expand_legacy_all_scope`` 同一语义：缺才补、
-        同组 ID、只看生效条目；补行失败只审计、本次按既有行照常算，重读失败与首次读取
-        同姿态抛出（库里已经多了一条本次读不到的补行，照旧发布就是半份结果）。
-
-        Raises:
-            LocalOverrideReadError: 补行之后的重读失败。
-        """
-        if self._legacy_all_scope is None:
-            return entries
-        missing = missing_all_scope_metrics(entries, self._metric_translation_map)
-        if not missing:
-            return entries
-        added_total = 0
-        for group_id, metrics in missing.items():
-            try:
-                added = self._legacy_all_scope.expand_all_scope_group(
-                    user_id=user_id, group_id=group_id, metrics=metrics, now=self._clock()
-                )
-            except Exception as error:
-                self._audit.record(
-                    "permission_targeted_recompute.legacy_all_scope_refresh_failed",
-                    user=user_id,
-                    error=type(error).__name__,
-                )
-                continue
-            self._audit.record(
-                "permission_targeted_recompute.legacy_all_scope_refreshed",
-                user=user_id,
-                added=added,
-            )
-            added_total += added
-        if added_total == 0:
-            return entries
-        return self._read_local_override_entries(user_id)
+    def _audit_all_scope_refreshed(self, user_id: str, added: int) -> None:
+        """「全部」组补行成功：留下实际新增的行数。"""
+        self._audit.record(
+            "permission_targeted_recompute.legacy_all_scope_refreshed",
+            user=user_id,
+            added=added,
+        )
 
     def _skip(
         self, user_id: str, *, mode: str, reason: str, **extra: object
