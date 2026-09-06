@@ -60,6 +60,9 @@ SELECT %s, t.id, u.feishu_open_id, %s, %s, %s, %s
  WHERE t.id = %s
 """
 
+# 第二道闸，见 :meth:`_QueueOutboxMixin.confirm_delivery` 的「回执判据」一段：
+# 游标必须已经越过终态事件（``delivery_consumed_sequence >= e.sequence``），且要
+# 确认的标识必须就是随游标一起落库的那一个（``delivery_message_id = %s``）。
 _CONFIRM_DELIVERY_LOOKUP_SQL = """
 SELECT t.conversation_id, e.terminal_kind, e.error_kind, e.agent_session_id
   FROM task AS t
@@ -67,6 +70,9 @@ SELECT t.conversation_id, e.terminal_kind, e.error_kind, e.agent_session_id
     ON e.task_id = t.id AND e.event_type = 'terminal'
  WHERE t.id = %s AND t.status = 'awaiting_delivery'
    AND e.platform_received_at IS NULL
+   AND t.delivery_consumed_sequence >= e.sequence
+   AND t.delivery_message_id IS NOT NULL
+   AND t.delivery_message_id = %s
  FOR UPDATE OF t
 """
 
@@ -628,19 +634,23 @@ class _OutboxMixin:
     ) -> bool:
         """记录 ``platform_received`` 并收口投递：解析业务终态、释放话题。
 
-        业务终态完全来自写终态事件时记录的 ``terminal_kind``/``error_kind``——
-        投递确认成功不改写业务结果（`V-投递-04`）。返回值只有两种合法含义：
-        ``True`` 表示三条写入（事件确认、任务收敛、会话回写）已经全部提交；
-        ``False`` 表示第一步查询就没找到可确认的东西，没有任何写入发生。
-        ``conversation`` 更新失败不属于这两种含义中的任何一种，见
-        :meth:`_release_conversation_after_confirm`。
+        业务终态只来自写终态事件时的记录，投递确认不改写它（`V-投递-04`）；
+        ``conversation`` 回写失败见 :meth:`_release_conversation_after_confirm`。
+        ``True``＝三条写入全部提交，``False``＝第一步查询没找到可确认的东西、一行
+        都没写。**回执判据**：消费游标必须已经越过终态事件（游标只在某条通道确定
+        受理之后才推进），且 ``platform_message_id`` 必须就是那一刻随游标一起落库
+        的那一个，不能是任意历史消息（例如建进度卡时拿到的旧标识）。任一条不满足
+        即 ``False``——宁可下一轮重来，也不把没送出去的答案记成已送达（`V-投递-03`）。
         """
         if platform_message_kind not in ("card", "text"):
             raise ValueError("platform_message_kind 只能是 card 或 text")
+        if not isinstance(platform_message_id, str) or not platform_message_id:
+            # 空标识没有任何回读价值：拿它确认等于把"拿不到回执"写成"已送达"。
+            raise ValueError("platform_message_id 不能为空")
         with connect(self._dsn, timeouts=self._timeouts) as connection:
             with connection.transaction():
                 cursor = connection.cursor()
-                cursor.execute(_CONFIRM_DELIVERY_LOOKUP_SQL, (task_id,))
+                cursor.execute(_CONFIRM_DELIVERY_LOOKUP_SQL, (task_id, platform_message_id))
                 row = cursor.fetchone()
                 if row is None:
                     return False

@@ -73,6 +73,23 @@ class DeliveryOutboxTestCase(unittest.TestCase):
 
     # -- 小工具 -----------------------------------------------------------
 
+    def record_gateway_receipt(self, *, task_id: str, message_id: str) -> None:
+        """模拟 Gateway 已经把这条终态送到某条通道，并落库了消费游标与回执标识。
+
+        ``confirm_delivery`` 要求库里留有"这一条终态确实被某条通道受理"的痕迹
+        （消费游标越过终态事件 + 落库的投递标识就是要确认的那一个），否则一律
+        返回 ``False``、不写任何一行。真实链路里这一步由
+        ``apps/gateway/delivery.py`` 在终态外发成交之后写入；本文件的用例直接
+        调 ``confirm_delivery``，因此要显式把这个前提补上。
+        """
+        sequence = self.scalar(
+            "SELECT sequence FROM task_delivery_event WHERE task_id=%s AND event_type='terminal'",
+            (task_id,),
+        )
+        self.queue.record_delivery_progress(
+            task_id=task_id, consumed_sequence=sequence, message_id=message_id
+        )
+
     def query(self, sql: str, parameters: tuple = ()) -> list[tuple]:
         with self._connection.cursor() as cursor:
             cursor.execute(sql, parameters)
@@ -446,6 +463,7 @@ class DeliveryResolutionTests(DeliveryOutboxTestCase):
             content="答案",
             agent_session_id="sess-new",
         )
+        self.record_gateway_receipt(task_id="tsk-1", message_id="card-1")
         confirmed = self.queue.confirm_delivery(
             task_id="tsk-1",
             platform_message_kind="card",
@@ -485,6 +503,7 @@ class DeliveryResolutionTests(DeliveryOutboxTestCase):
             content="答案",
             agent_session_id="sess-new",
         )
+        self.record_gateway_receipt(task_id="tsk-1", message_id="card-1")
 
         confirmed = self.queue.confirm_delivery(
             task_id="tsk-1",
@@ -522,6 +541,7 @@ class DeliveryResolutionTests(DeliveryOutboxTestCase):
             error_kind="session_failed",
             content="失败提示",
         )
+        self.record_gateway_receipt(task_id="tsk-1", message_id="msg-1")
         self.queue.confirm_delivery(
             task_id="tsk-1",
             platform_message_kind="text",
@@ -550,6 +570,7 @@ class DeliveryResolutionTests(DeliveryOutboxTestCase):
             error_kind=None,
             content="答案",
         )
+        self.record_gateway_receipt(task_id="tsk-1", message_id="c1")
         self.assertTrue(
             self.queue.confirm_delivery(
                 task_id="tsk-1", platform_message_kind="card", platform_message_id="c1"
@@ -567,6 +588,98 @@ class DeliveryResolutionTests(DeliveryOutboxTestCase):
             ),
             "c1",
         )
+
+    def test_confirm_delivery_refuses_a_message_id_that_is_not_this_terminal_receipt(self) -> None:
+        """IN-03 否定用例：拿一条**任意历史消息**的标识来确认，必须一行都不写。
+
+        真实缺陷形状是建进度卡那一轮拿到的 ``delivery_message_id`` 被当成终态
+        回执用掉；这里直接在最后一道闸上证伪——库里落的回执是 ``om-terminal``，
+        用 ``om-progress`` 来确认必须返回 ``False``，任务不得收敛、话题不得释放、
+        ``platform_received_at`` 必须保持 ``NULL``。
+        """
+
+        self.seed_running_task(task_id="tsk-1", conversation_id="cnv-1")
+        self.queue.write_terminal_event(
+            task_id="tsk-1",
+            worker_id="worker-1",
+            terminal_kind="success",
+            error_kind=None,
+            content="答案",
+        )
+        self.record_gateway_receipt(task_id="tsk-1", message_id="om-terminal")
+
+        self.assertFalse(
+            self.queue.confirm_delivery(
+                task_id="tsk-1",
+                platform_message_kind="card",
+                platform_message_id="om-progress",
+            )
+        )
+        self.assertEqual(
+            self.scalar("SELECT status FROM task WHERE id='tsk-1'"), "awaiting_delivery"
+        )
+        self.assertEqual(
+            self.scalar("SELECT running_task_id FROM conversation WHERE id='cnv-1'"), "tsk-1"
+        )
+        self.assertIsNone(
+            self.scalar(
+                "SELECT platform_received_at FROM task_delivery_event WHERE task_id='tsk-1'"
+            )
+        )
+
+    def test_confirm_delivery_refuses_before_the_terminal_event_has_been_consumed(self) -> None:
+        """IN-03 否定用例：消费游标还没越过终态事件（这条终态一次都没送出去），
+        即使标识对得上也不得确认——这正是"卡片终态更新与文本兜底都失败"之后
+        旧实现会走到的那一步。
+        """
+
+        self.seed_running_task(task_id="tsk-1", conversation_id="cnv-1")
+        self.queue.write_terminal_event(
+            task_id="tsk-1",
+            worker_id="worker-1",
+            terminal_kind="success",
+            error_kind=None,
+            content="答案",
+        )
+        # 只落了建进度卡那一轮的标识，游标停在终态事件之前。
+        self.queue.record_delivery_progress(
+            task_id="tsk-1", consumed_sequence=0, message_id="om-progress"
+        )
+
+        self.assertFalse(
+            self.queue.confirm_delivery(
+                task_id="tsk-1",
+                platform_message_kind="card",
+                platform_message_id="om-progress",
+            )
+        )
+        self.assertEqual(
+            self.scalar("SELECT status FROM task WHERE id='tsk-1'"), "awaiting_delivery"
+        )
+        self.assertEqual(
+            self.scalar("SELECT running_task_id FROM conversation WHERE id='cnv-1'"), "tsk-1"
+        )
+        self.assertIsNone(
+            self.scalar(
+                "SELECT platform_received_at FROM task_delivery_event WHERE task_id='tsk-1'"
+            )
+        )
+
+    def test_confirm_delivery_rejects_an_empty_platform_message_id(self) -> None:
+        """空标识没有任何回读价值：拿它确认等于把"拿不到回执"写成"已送达"。"""
+
+        self.seed_running_task(task_id="tsk-1", conversation_id="cnv-1")
+        self.queue.write_terminal_event(
+            task_id="tsk-1",
+            worker_id="worker-1",
+            terminal_kind="success",
+            error_kind=None,
+            content="答案",
+        )
+        with self.assertRaises(ValueError):
+            self.queue.confirm_delivery(
+                task_id="tsk-1", platform_message_kind="card", platform_message_id=""
+            )
 
     def test_confirm_delivery_rolls_back_entirely_when_the_conversation_write_conflicts(
         self,
@@ -586,6 +699,7 @@ class DeliveryResolutionTests(DeliveryOutboxTestCase):
             content="答案正文",
             agent_session_id="sess-9",
         )
+        self.record_gateway_receipt(task_id="tsk-1", message_id="om-1")
         # 模拟竞态：conversation 已经不再指向这个任务了（例如被别的路径改动）。
         self.execute("UPDATE conversation SET running_task_id='tsk-other' WHERE id='cnv-1'")
 
@@ -610,6 +724,7 @@ class DeliveryResolutionTests(DeliveryOutboxTestCase):
         # 重试（假设调用方在竞态解除后重试）仍然可以正常成功：这不是把任务卡死，
         # 只是不允许静默的半提交。
         self.execute("UPDATE conversation SET running_task_id='tsk-1' WHERE id='cnv-1'")
+        self.record_gateway_receipt(task_id="tsk-1", message_id="om-2")
         self.assertTrue(
             self.queue.confirm_delivery(
                 task_id="tsk-1",
@@ -804,6 +919,7 @@ class SessionRetentionCleanupTests(DeliveryOutboxTestCase):
             error_kind=None,
             content="已送达的答案",
         )
+        self.record_gateway_receipt(task_id=task_id, message_id="c-" + task_id)
         self.queue.confirm_delivery(
             task_id=task_id, platform_message_kind="card", platform_message_id="c-" + task_id
         )
@@ -999,6 +1115,7 @@ class LockOrderingDeadlockTests(DeliveryOutboxTestCase):
             error_kind=None,
             content="已送达的答案",
         )
+        self.record_gateway_receipt(task_id=task_id, message_id="c-" + task_id)
         self.queue.confirm_delivery(
             task_id=task_id, platform_message_kind="card", platform_message_id="c-" + task_id
         )

@@ -38,7 +38,13 @@ class FakeTransport:
     def __init__(self, *, token_response=None, send_response=None, error=None) -> None:
         self.calls: list[dict] = []
         self._token_response = token_response or {"code": 0, "tenant_access_token": "t-fake"}
-        self._send_response = send_response if send_response is not None else {"code": 0}
+        # 真实成功响应带 ``data.message_id``：这是「通知」这一档的必要回读标识
+        # （见 ``core.delivery.ports.DELIVERY_OPERATIONS``），缺它一律判"结果不明"。
+        self._send_response = (
+            send_response
+            if send_response is not None
+            else {"code": 0, "data": {"message_id": "om-fake-1"}}
+        )
         self._error = error
 
     def __call__(self, method, url, *, body=None, token=None, **kwargs):
@@ -176,6 +182,34 @@ class SendTest(unittest.TestCase):
 
         self.assertEqual(caught.exception.code, "feishu_code_230002")
         self.assertTrue(caught.exception.definite)
+
+    def test_an_empty_response_body_is_not_success_and_not_a_definite_rejection(self) -> None:
+        """IN-03：飞书只回一个空体（``{}``、HTTP 5xx 带空体）。
+
+        旧写法 ``if code not in (None, 0, "0")`` 把**码缺失**当成放行——调用方
+        据此把一条从未发出的通知记成已发送。真实成功响应一定带 ``code=0``，
+        码缺失既不是成功也不是拒绝：必须落"结果不明"（``definite=False``），
+        让调用方按同一 ``dedupe_key`` 安全重投，而不是当成"已经发过了"。
+        """
+
+        transport = FakeTransport(send_response={})
+
+        with self.assertRaises(FeishuUserMessageError) as caught:
+            _messages(transport).send_text(open_id=OPEN_ID, text=TEXT, dedupe_key="k")
+
+        self.assertEqual(caught.exception.code, "missing_code")
+        self.assertFalse(caught.exception.definite, "码缺失不是飞书明确拒绝")
+
+    def test_a_response_without_message_id_is_result_unknown(self) -> None:
+        """码成功但缺必要回读标识 ``message_id``：同样不得当成已发送。"""
+
+        for response in ({"code": 0}, {"code": 0, "data": {}}, {"code": 0, "data": {"x": 1}}):
+            with self.subTest(response=response):
+                transport = FakeTransport(send_response=response)
+                with self.assertRaises(FeishuUserMessageError) as caught:
+                    _messages(transport).send_text(open_id=OPEN_ID, text=TEXT, dedupe_key="k")
+                self.assertEqual(caught.exception.code, "missing_message_id")
+                self.assertFalse(caught.exception.definite)
 
     def test_a_transport_failure_is_indeterminate(self) -> None:
         error = FeishuUserMessageError("transport_error", definite=False)

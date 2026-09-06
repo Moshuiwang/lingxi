@@ -889,7 +889,7 @@ class GroupSenderTest(unittest.TestCase):
             calls.append({"method": method, "url": url, "body": body, "token": token})
             if "tenant_access_token" in url:
                 return {"code": 0, "tenant_access_token": "t-fake"}
-            return {"code": 0, "msg": "ok"}
+            return {"code": 0, "msg": "ok", "data": {"message_id": "om-fake-1"}}
 
         sender = FeishuGroupMessages(
             base_url="https://open.feishu.cn/open-apis",
@@ -1020,7 +1020,7 @@ class DeliveryIdempotenceTest(unittest.TestCase):
             if "tenant_access_token" in url:
                 return {"code": 0, "tenant_access_token": "t-fake"}
             bodies.append(body)
-            return {"code": 0, "msg": "ok"}
+            return {"code": 0, "msg": "ok", "data": {"message_id": "om-fake-1"}}
 
         sender = self._sender(transport)
         sender.send_text(chat_id=FAKE_CHAT_ID, text="第一次", dedupe_key="2026-08-06")
@@ -1044,7 +1044,7 @@ class DeliveryIdempotenceTest(unittest.TestCase):
                 state["first"] = False
                 # 飞书已经收下了，只是我们没听见回音。
                 raise TimeoutError("响应回程超时")
-            return {"code": 0, "msg": "ok"}
+            return {"code": 0, "msg": "ok", "data": {"message_id": "om-fake-1"}}
 
         sender = self._sender(transport)
         with self.assertRaises(TimeoutError):
