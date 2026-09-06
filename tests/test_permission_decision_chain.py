@@ -130,7 +130,9 @@ class CompletenessStageTests(unittest.TestCase):
     """检查完整性这一段：缺才补、补失败只留痕、重读失败照抛。
 
     变异锚点：把 :meth:`LocalOverrideDecisionSource._complete_all_scope` 末尾的重读改回
-    ``return entries`` → ``test_a_successful_backfill_is_reread_into_this_round`` 变红。
+    ``return entries``、或把 ``added_total == 0`` 的提前返回加回去 →
+    ``test_a_successful_backfill_is_reread_into_this_round`` 与
+    ``test_a_zero_row_backfill_still_rereads_so_a_revocation_wins_this_round`` 变红。
     """
 
     def _all_scope_reader(self) -> refresh.FakeLocalOverrides:
@@ -192,7 +194,11 @@ class CompletenessStageTests(unittest.TestCase):
         self.assertEqual(len(reader.calls), 1, "没有缺项就不重读")
 
     def test_a_backfill_failure_only_leaves_a_trace_and_keeps_computing(self) -> None:
-        """补行失败与重读失败刻意不同：这一次的决定并不因为补不进去而缺内容。"""
+        """补行失败与重读失败刻意不同：这一次的决定并不因为补不进去而缺内容。
+
+        补行失败仍然重读——判据是"这一轮有没有缺项"，不是"补行成没成功"：补不进去
+        的那一刻，这个组照样可能已经被撤销了。
+        """
 
         reader = self._all_scope_reader()
         expander = refresh.FakeLegacyAllScope(error=RuntimeError("注入的补行失败"))
@@ -206,28 +212,39 @@ class CompletenessStageTests(unittest.TestCase):
         self.assertEqual(
             sorted(metric for _company, metric in resolved.grants), [refresh.METRIC_NAME]
         )
-        self.assertEqual(len(reader.calls), 1, "一行都没补进去就不重读")
+        self.assertEqual(len(reader.calls), 2, "有缺项就必重读，补行成败不影响这一步")
 
-    def test_a_zero_row_backfill_does_not_trigger_a_reread(self) -> None:
-        """补行口报告"一行都没新增"（例如整组此刻已被撤销）：不重读，也不多写。"""
+    def test_a_zero_row_backfill_still_rereads_so_a_revocation_wins_this_round(self) -> None:
+        """补行口报告"一行都没新增"最常见的成因就是整组刚被撤销：**必须重读**。
+
+        这条用例此前钉的是"零新增不重读"，那正是让撤销掉的指标被过时结论重新发布
+        出去的那半步。这里的补行口在报告 0 的同时把组撤掉（真实交错的形状），重读
+        之后本轮算出空集——撤销当轮生效，不用等下一轮。
+        """
 
         reader = self._all_scope_reader()
 
-        class _NothingAdded:
-            calls: list[str] = []
+        class _RevokedWhileExpanding:
+            """报告零新增，并在同一时刻把这个组从来源里撤掉。"""
+
+            def __init__(self) -> None:
+                self.calls: list[str] = []
 
             def expand_all_scope_group(self, *, user_id, group_id, metrics, now) -> int:
                 self.calls.append(user_id)
+                reader._entries[user_id] = ()
                 return 0
 
-        expander = _NothingAdded()
+        expander = _RevokedWhileExpanding()
         source, recorder = build_source(reader=reader, expander=expander)
 
-        source.resolve(USER)
+        resolved = source.resolve(USER)
 
         self.assertEqual(expander.calls, [USER])
         self.assertEqual(recorder.expanded, [(USER, 0)])
-        self.assertEqual(len(reader.calls), 1, "零新增不重读")
+        self.assertEqual(len(reader.calls), 2, "零新增也必须重读，否则拿的是撤销前的事实")
+        assert resolved is not None
+        self.assertEqual(resolved.grants, frozenset(), "本轮就算出撤销之后的事实")
 
     def test_a_reread_failure_after_a_successful_backfill_raises(self) -> None:
         reader = refresh.FakeLocalOverrides(

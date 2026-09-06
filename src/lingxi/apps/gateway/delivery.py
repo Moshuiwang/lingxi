@@ -157,6 +157,9 @@ class DeliveryConsumer:
         # 进程内、非持久化状态：只用来给告警与外发重试限速，重启后清零属于可接受
         # 的降级（重启本身就已经是一次重新评估的机会）。
         self._last_alerted_at: dict[tuple[str, str], float] = {}
+        # 当前这一条候选本轮有没有推进过消费游标（见 `_advance_delivery_cursor`）。
+        # 单条循环、逐个任务处理，因此一个标志就够，不需要按任务分桶。
+        self._advanced_this_task = False
         # 已经发过排队提示的任务 id：同一姿态的进程内、非持久化状态——只用来
         # 避免同一个任务每轮轮询都重发一次提示。每轮与当前候选集合取交集
         # 自然收缩（见 `_notify_stale_queued`），不会无界增长。
@@ -182,6 +185,16 @@ class DeliveryConsumer:
         self._last_alerted_at[key] = now
         self._alert(kind, task_id)
 
+    def _advance_delivery_cursor(self, **fields: Any) -> None:
+        """推进消费游标，并记下"这一轮确实有进展"。
+
+        三处推进游标的地方都走这一个口。写回本身会把退避两列清零（这条通道刚被证明
+        是通的），因此"推进过"与"该不该记退避"是同一件事的两面：`run_once` 的隔离
+        handler 据此区分真正的零进展与"推进过、之后才抛"。
+        """
+        self._queue.record_delivery_progress(**fields)
+        self._advanced_this_task = True
+
     def _record_retry_backoff(self, task: Any) -> None:
         """记一次"这一轮完全没有进展"，把下次可以再试的时刻**写回数据库**。
 
@@ -190,13 +203,16 @@ class DeliveryConsumer:
         只降级这一件事——最坏结果是这条任务下一轮照旧进候选，与本机制加入之前
         一致；它不放宽任何一道防重复的闸，因此不会变成重复投递。
         """
-        attempts = task.retry_attempts + 1
-        delay = min(
-            self._retry_backoff_base_seconds
-            * (2 ** min(attempts - 1, self.MAX_RETRY_BACKOFF_EXPONENT)),
-            self._retry_backoff_cap_seconds,
-        )
         try:
+            # 取值一并纳入 try：本方法只在"单任务异常不带走整轮"那条不变量的隔离
+            # handler 里被调用，那里不允许留任何无保护语句——一条读不出字段的候选
+            # 会把整轮带走，而这一段本来就是降级路径。
+            attempts = task.retry_attempts + 1
+            delay = min(
+                self._retry_backoff_base_seconds
+                * (2 ** min(attempts - 1, self.MAX_RETRY_BACKOFF_EXPONENT)),
+                self._retry_backoff_cap_seconds,
+            )
             self._queue.record_delivery_retry(
                 task_id=task.task_id, attempts=attempts, delay_seconds=delay
             )
@@ -288,8 +304,11 @@ class DeliveryConsumer:
                 )
                 # 一轮抛穿＝这个名额白占了。同样按退避让路，否则一条每轮都抛的
                 # 任务会一直排在 `ORDER BY created_at` 的最前面，把批量上限之外
-                # 的健康任务挡在候选之外。
-                self._record_retry_backoff(task)
+                # 的健康任务挡在候选之外。**但抛穿不等于零进展**：游标已经推进过
+                # 才抛的那种，退避两列刚被清零，再拿候选时刻读到的旧档位记一次，
+                # 会让一条正在推进的投递白等最多一个退避窗口。
+                if not self._advanced_this_task:
+                    self._record_retry_backoff(task)
         if loop_healthy:
             # 单个任务的失败**不**计入循环级连续计数：它有自己的日志与告警路径，
             # 而且循环本身仍然健康——把两者混在一起会让"某个任务一直失败"伪装成
@@ -380,6 +399,7 @@ class DeliveryConsumer:
         return tuple(snapshots)
 
     def _process_task(self, task: Any) -> None:
+        self._advanced_this_task = False
         events = self._queue.read_delivery_events(
             task_id=task.task_id, after_sequence=task.consumed_sequence
         )
@@ -464,7 +484,7 @@ class DeliveryConsumer:
                     type(error).__name__,
                 )
                 return False
-        self._queue.record_delivery_progress(
+        self._advance_delivery_cursor(
             task_id=task.task_id,
             consumed_sequence=event.sequence,
             card_id=stream.card_id,
@@ -487,7 +507,7 @@ class DeliveryConsumer:
             query_step=query_step,
         )
         try:
-            self._queue.record_delivery_progress(
+            self._advance_delivery_cursor(
                 task_id=task.task_id,
                 consumed_sequence=event.sequence,
                 card_sequence=stream.sequence,
@@ -586,7 +606,7 @@ class DeliveryConsumer:
                 # terminal 事件下一轮（退避窗口过后）重新处理。
                 return
 
-        self._queue.record_delivery_progress(
+        self._advance_delivery_cursor(
             task_id=task.task_id,
             consumed_sequence=event.sequence,
             card_id=stream.card_id,

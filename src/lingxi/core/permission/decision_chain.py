@@ -1,17 +1,17 @@
 """权威决定链上「本地覆盖」这条来源：读取与完整性检查，三个入口共用一份。
 
-真实权限 =（银河 ∪ 本地授权）− 本地抑制。这条链分四段：**读取来源**（本模块）
-→ **检查完整性**（本模块：「全部」组随当前映射补齐缺项，补完重读）→ **计算**
-（:func:`~lingxi.core.permission.local_override.resolve_local_overrides` 与
-:func:`~lingxi.core.permission.merge_sources.merge_permission_sources`）→
-**提交**（``record_decision``：版本推进、账号状态复核与用户行锁都在那一层）。
+真实权限 =（银河 ∪ 本地授权）− 本地抑制。四段职责：**读取来源**与**检查完整性**
+在本模块；**计算**在 ``local_override.resolve_local_overrides`` 与
+``merge_sources.merge_permission_sources``；**提交**在 ``record_decision``（版本
+推进、账号状态复核与用户行锁都在那一层）。前两段此前三处各一份拷贝，"读不出来时
+怎么收敛"曾因此不一致，收拢之后判据只剩一份。
 
-前两段此前在每日重算、定向重算、首聊开通里各有一份拷贝，判据一致全靠人工对齐
-——"读不出来时怎么收敛"曾因此三处不同。收拢之后判据只有一份。
+**入口特有的东西不进来**：身份从哪里查、留痕事件叫什么名字、失败时通知谁、收敛到
+哪个终态，全部留在各自入口；本模块不认识任何事件名，也不持有发送端口。
 
-**入口特有的东西不进来**：身份从哪里查、留痕事件叫什么名字、失败时通知谁、
-收敛到哪个终态，全部留在各自入口。本模块只在"发生了什么"时回调，不认识任何
-一个事件名，也不持有任何发送端口。
+**如实登记的残留边界**：完整性检查的无条件重读只关掉了"补齐停在行锁上"撑开的无界
+窗口；重读到提交之间仍有毫秒级窗口，此间提交的撤销仍可能被这一轮的旧结论盖过一轮。
+彻底关掉它要在提交事务内复核来源代次，属设计改动，不在本模块职责里。
 """
 
 from __future__ import annotations
@@ -121,12 +121,12 @@ class LocalOverrideDecisionSource:
     def _complete_all_scope(
         self, user_id: str, entries: tuple[LocalPermissionOverrideEntry, ...]
     ) -> tuple[LocalPermissionOverrideEntry, ...]:
-        """给「全部」组随当前映射补齐新指标，补成功后重读一次条目。
+        """给「全部」组随当前映射补齐新指标，**只要有缺项就重读一次条目**。
 
-        缺才补、同组标识、撤销过的组不参与（只看生效条目）。**补行失败与重读失败
-        刻意不同**：补行失败只留痕、本次按既有条目照常算（这一次的决定并不因此缺
-        内容）；重读失败与首次读取同姿态抛出——库里已经多了一条本次读不到的补行，
-        照旧发布等于用不完整的信息提交权限决定。
+        缺才补、同组标识、撤销过的组不参与。补行失败只留痕、不抛。**重读无条件**：
+        补行口报告"一行都没新增"最常见的成因，恰恰是这个组在首次读取之后被整组撤销
+        了；退回旧条目等于拿撤销之前的事实提交权限决定，把已收回的指标重新发布出去。
+        代价是有缺项时每人每轮多读一次。重读失败照抛，这一轮不发布这个人。
 
         Raises:
             LocalOverrideReadError: 补齐之后的重读失败。
@@ -136,18 +136,12 @@ class LocalOverrideDecisionSource:
         missing = missing_all_scope_metrics(entries, self._metric_translation_map)
         if not missing:
             return entries
-        added_total = 0
         for group_id, metrics in missing.items():
-            added = self._expand_one_group(user_id, group_id, metrics)
-            if added is None:
-                continue
-            added_total += added
-        if added_total == 0:
-            return entries
+            self._expand_one_group(user_id, group_id, metrics)
         return self.read_entries(user_id)
 
-    def _expand_one_group(self, user_id: str, group_id: str, metrics: Sequence[str]) -> int | None:
-        """补一个组；失败回调入口留痕并返回 ``None``，本次按既有条目继续。"""
+    def _expand_one_group(self, user_id: str, group_id: str, metrics: Sequence[str]) -> None:
+        """补一个组；失败只回调入口留痕，本次照常继续（补不进去不等于算不出来）。"""
         assert self._backfill is not None  # 调用点已判过
         try:
             added = self._backfill.expander.expand_all_scope_group(
@@ -155,9 +149,8 @@ class LocalOverrideDecisionSource:
             )
         except Exception as error:
             self._backfill.on_failed(user_id, error)
-            return None
+            return
         self._backfill.on_succeeded(user_id, added)
-        return added
 
 
 __all__ = [

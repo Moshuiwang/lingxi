@@ -1059,13 +1059,14 @@ class DecisionChainStaleComputeTests(LocalPermissionOverridePostgresTestCase):
 
     上一类停在补齐这一步自己零写入；这一类把**整段**「读取来源 → 检查完整性」放进
     真实交错里跑：决定链先在真库上读到条目、算出缺项，管理员在这中间把整组撤销，补齐
-    才拿到锁落库。三条判据：撤销这个较新决定在库里是终局的（组不复活、新指标一行都不
-    插）；那一轮的链一个字节都不往库里写；撤销之后重新开始的一轮交出的是撤销之后的
-    事实（空集）——过时不会跨轮存活。
+    才拿到锁落库。四条判据：撤销这个较新决定在库里是终局的（组不复活、新指标一行都不
+    插）；那一轮的链一个字节都不往库里写；**那一轮交出的就是撤销之后的事实**（撤销
+    当轮生效，不用等下一轮）；下一轮同样是撤销之后的事实。
 
-    **本类刻意不断言那一轮交出的集合是什么**：读取与补齐之间那个窗口里，本轮的计算
-    结果仍来自撤销前那次读取，这是这条链既有的形状（收拢没有改变它，改变它会改变
-    用户可见的发布内容，属产品取舍）。真正的承诺是上面三条：不复活、不写入、不跨轮。
+    第三条曾经不成立——补行口报告零新增时链会退回首次读到的旧条目，于是撤销掉的指标
+    被这一轮重新提交成一次权限决定，用户在下一轮之前实际持有已经收回的权限（每日重算
+    一天一轮，最长约一天）。**残留边界**：本类关掉的是锁等待撑开的那个无界窗口；重读
+    到提交之间的毫秒窗口仍在，见 ``decision_chain.py`` 模块文档同名登记。
     """
 
     MAPPING = {"88": {"职能": ("m1", "m2")}}
@@ -1201,8 +1202,30 @@ class DecisionChainStaleComputeTests(LocalPermissionOverridePostgresTestCase):
             0,
         )
 
+    def test_the_stale_round_itself_computes_the_facts_after_the_revocation(self) -> None:
+        """**本轮**就交出撤销之后的事实：撤销先提交，过时那一轮不再算出旧内容。
+
+        这是 `E-1⑤` 的落点。接上真实提交口跑过的顺序是：撤销触发的定向重算先落地
+        （``publish_outbox`` 的第一版，空权限），随后这一轮提交第二版又把 ``m1``
+        发了回去。判据落在链交出的结果上——它必须是撤销之后的事实，那样第二版与第
+        一版逐字段相同、根本不会排出新意图。
+
+        变异锚点：把 ``_complete_all_scope`` 的 ``added_total == 0`` 提前返回加回去
+        → 本用例变红（算出的仍是撤销前那份 ``m1``）。
+        """
+
+        _source, _trace, outcome = self._run_chain_across_a_revocation()
+
+        resolved = outcome.get("resolved")
+        self.assertIsNotNone(resolved, "读得出来的空集不是「未装配」")
+        self.assertEqual(
+            (resolved.grants, resolved.suppressions),
+            (frozenset(), frozenset()),
+            "撤销已经提交，这一轮就不该再算出被收回的指标",
+        )
+
     def test_the_next_round_computes_the_facts_after_the_revocation(self) -> None:
-        """过时不跨轮存活：撤销之后重新开始的一轮交出的是空集，不是撤销前那份。"""
+        """过时不跨轮存活：撤销之后重新开始的一轮交出的同样是空集。"""
 
         source, _trace, _outcome = self._run_chain_across_a_revocation()
 
