@@ -470,22 +470,24 @@ class RealDatabaseTest(unittest.TestCase):
         action_type: str = "local_permission_grant",
         payload: str | None = '{"company_id":"c1","metric_name":"营收"}',
         target_suffix: str = "",
+        card_delivered: bool = False,
     ) -> None:
         decided_at = None if status == "pending" else created_at
         decided_by = None if status == "pending" else "ou_admin_decider"
         self._execute(
             """INSERT INTO pending_action
                  (id, action_type, target_open_id, target_state_snapshot,
-                  initiated_by_open_id, status, payload, created_at,
+                  initiated_by_open_id, status, card_delivered, payload, created_at,
                   confirm_deadline_at, decided_at, decided_by_open_id,
                   retention_expires_at)
-               VALUES (%s, %s, %s, 'active', %s, %s, %s, %s, %s, %s, %s, %s)""",
+               VALUES (%s, %s, %s, 'active', %s, %s, %s, %s, %s, %s, %s, %s, %s)""",
             (
                 action_id,
                 action_type,
                 f"ou_target_carrier{target_suffix}",
                 "ou_admin_initiator",
                 status,
+                card_delivered,
                 payload,
                 created_at,
                 created_at + timedelta(minutes=10),
@@ -579,7 +581,9 @@ class RealDatabaseTest(unittest.TestCase):
 
         ``pending_action_single_pending_target_idx`` 是 ``target_open_id`` 上
         ``WHERE status = 'pending'`` 的唯一索引。脱敏成同一个常量会让整批失败——一次
-        本该静默完成的合规动作变成每轮都失败的告警。
+        本该静默完成的合规动作变成每轮都失败的告警。同一批还会把这些过窗旧行转出
+        ``pending``（见 :meth:`test_an_expired_pending_row_is_settled_not_left_pending`），
+        因此逐行唯一现在是**双保险**而不是唯一防线；两条都断言，任何一条塌掉都看得见。
         """
 
         now = datetime.now(UTC)
@@ -597,20 +601,86 @@ class RealDatabaseTest(unittest.TestCase):
         redacted = self._retention().redact_expired_pending_actions(now=now)
 
         self.assertEqual(redacted, 3)
-        values = sorted(
-            row[0]
-            for row in self._fetch(
-                "SELECT target_open_id FROM pending_action WHERE status = 'pending'"
+        self.assertEqual(
+            self._fetch(
+                "SELECT target_open_id, status, payload FROM pending_action "
+                "WHERE id IN ('pac_pending_0', 'pac_pending_1', 'pac_pending_2') ORDER BY id"
+            ),
+            [
+                ("redacted:pac_pending_0", "expired", None),
+                ("redacted:pac_pending_1", "expired", None),
+                ("redacted:pac_pending_2", "expired", None),
+            ],
+            "脱敏值逐行唯一；同批还把过窗旧行转出 pending（payload 保持 NULL）",
+        )
+
+    def test_an_expired_pending_row_is_settled_not_left_pending(self) -> None:
+        """脱敏不得把一张过窗旧卡永久钉在 ``pending``（`V-管理-30` 的跨链矛盾）。
+
+        ``decide_confirm`` 的核对顺序是 not_initiator **在前**、expired 在后，而
+        not_initiator 是零业务变更分支。脱敏一旦改掉 ``initiated_by_open_id``，真正的
+        发起人再点三个月前那张仍留在聊天记录里的卡，拿到的就是「不是发起人」而不是
+        「已过期」，而且那行**再也不会**转成 ``expired``——`V-管理-30` 承诺的"已过期 →
+        首次发现即转终态"就此不成立。修法是清理时同批把过窗旧行结清成 ``expired``。
+
+        变异锚点：去掉 SQL 里 ``status``/``reason``/``decided_at`` 那三支 CASE →
+        本用例变红。
+        """
+
+        from lingxi.adapters.postgres_pending_action import PostgresPendingActionStore
+        from lingxi.core.admin.pending_action import ConfirmResultKind, decide_confirm
+
+        now = datetime.now(UTC)
+        moment = now - timedelta(days=91)
+        self._seed_pending_action(
+            "pac_stale",
+            created_at=moment,
+            status="pending",
+            action_type="suspend_user",
+            payload=None,
+            target_suffix="_stale",
+            card_delivered=True,
+        )
+        store = PostgresPendingActionStore(self._dsn, audit=RecordingAudit(), metric_map_path=None)
+
+        def confirm_by_initiator():
+            pending = store.get(pending_action_id="pac_stale")
+            return decide_confirm(
+                pending=pending,
+                clicker_open_id="ou_admin_initiator",
+                now=now,
+                # 核对链在这一步之前就返回了，这两个参数取值对结论没有作用面。
+                registry_entry=None,
+                current_account_state=None,
             )
-        )
+
         self.assertEqual(
-            values, ["redacted:pac_pending_0", "redacted:pac_pending_1", "redacted:pac_pending_2"]
+            confirm_by_initiator().kind,
+            ConfirmResultKind.EXPIRE,
+            "脱敏之前：发起人点这张过窗的卡本来就该拿到「已过期」",
         )
-        # suspend_user 的 payload 必须保持 NULL（0073 的双向等价 CHECK）。
+
+        self.assertEqual(self._retention().redact_expired_pending_actions(now=now), 1)
+
+        (row,) = self._fetch(
+            """SELECT target_open_id, initiated_by_open_id, status, reason,
+                      decided_at IS NOT NULL, decided_by_open_id
+                 FROM pending_action WHERE id = 'pac_stale'"""
+        )
+        self.assertEqual(row[0], "redacted:pac_stale")
+        self.assertEqual(row[1], "redacted:pac_stale", "三列 open_id 照常脱敏")
+        self.assertEqual(row[2], "expired", "过窗旧行同批结清，不再永久停在 pending")
+        self.assertEqual(row[3], "expired", "沿用既有过期原因码，不新造")
+        self.assertTrue(row[4], "0068 的 CHECK：终态必须带 decided_at")
+        self.assertIsNone(row[5], "没有人做过这个决定，不得凭空写一个决定人")
+
+        decision = confirm_by_initiator()
         self.assertEqual(
-            self._fetch("SELECT DISTINCT payload FROM pending_action WHERE status = 'pending'"),
-            [(None,)],
+            decision.kind,
+            ConfirmResultKind.ALREADY_TERMINAL,
+            "脱敏之后：发起人点同一张卡仍要拿到「已过期」，不是「不是发起人」",
         )
+        self.assertEqual(decision.message, "该操作已经过期。")
 
     # ---- 第二组：边界时间 --------------------------------------------------
 

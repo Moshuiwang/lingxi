@@ -584,9 +584,11 @@ class PermissionRefreshDuty:
         return self._local_override_source.resolve(user_id)
 
     def _audit_local_override_read_failure(self, user_id: str, error: Exception) -> None:
-        """读不出来：响亮记一条本职责自己的审计，调用方不该再重复记。
+        """读不出来：响亮记一条本职责自己的审计。
 
         与另外两条链共用判据、各留各的事件名——运维从审计一眼看出是哪条链读失败的。
+        本方法记的是 ``local_override_skipped``；调用方随后按跳过出口再记一条
+        ``user_skipped``，两条各记各的，缺一条运维就断链。
         """
         self._audit.record(
             "permission_refresh.local_override_skipped",

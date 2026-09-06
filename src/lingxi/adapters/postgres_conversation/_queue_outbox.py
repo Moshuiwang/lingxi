@@ -60,7 +60,7 @@ SELECT %s, t.id, u.feishu_open_id, %s, %s, %s, %s
  WHERE t.id = %s
 """
 
-# 第二道闸，见 :meth:`_QueueOutboxMixin.confirm_delivery` 的「回执判据」一段：
+# 第二道闸，见 :meth:`_OutboxMixin.confirm_delivery` 的「回执判据」一段：
 # 游标必须已经越过终态事件（``delivery_consumed_sequence >= e.sequence``），且要
 # 确认的标识必须就是随游标一起落库的那一个（``delivery_message_id = %s``）。
 _CONFIRM_DELIVERY_LOOKUP_SQL = """
