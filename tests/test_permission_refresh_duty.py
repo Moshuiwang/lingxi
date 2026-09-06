@@ -1125,7 +1125,7 @@ class LegacyAllScopeRefreshTest(unittest.TestCase):
     """「2.0 迁移导入·全部」组随映射补齐新指标（rc25 S-1 方案 E）+ 本地 ``"*"`` 组的
     发布形状 + 抑制不可表示时的 fail-closed（`V-权限-15` 本地 ``"*"`` 组扩展）。
 
-    变异锚点：把 `_expand_legacy_all_scope` 改成直接 ``return entries`` →
+    变异锚点：把决定链的 `_complete_all_scope` 改成直接 ``return entries`` →
     ``test_a_new_mapped_metric_is_appended_to_the_group_and_published`` 变红。"""
 
     def test_a_new_mapped_metric_is_appended_to_the_group_and_published(self) -> None:
@@ -1218,7 +1218,7 @@ class LegacyAllScopeRefreshTest(unittest.TestCase):
 
         这半个窗口曾经是 ``return entries``——补行成功、重读失败，于是本轮照旧按只含旧指标
         的条目发布一份"看起来完整"的权限决定，正是首次读取那道闸要消灭的东西。变异锚点：
-        把 ``_expand_legacy_all_scope`` 末尾的重读改回 ``return entries`` → 本用例变红。
+        把决定链 ``_complete_all_scope`` 末尾的重读改回 ``return entries`` → 本用例变红。
         """
 
         overrides = FakeLocalOverrides(

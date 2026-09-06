@@ -952,8 +952,7 @@ class AllScopeExpandVsRevocationTests(LocalPermissionOverridePostgresTestCase):
         """真库交错：读 ``effective_entries`` → 管理员整组撤销 → 补齐迟到落库。
 
         缺项用的是重算侧真正调用的 ``missing_all_scope_metrics``，不是手写的常量——
-        复现的就是 ``permission_refresh._expand_legacy_all_scope`` /
-        ``targeted_recompute._expand_legacy_all_scope`` 的形状。
+        复现的就是三入口共用的 ``decision_chain._complete_all_scope`` 的形状。
         """
 
         from lingxi.core.permission.legacy_diff import missing_all_scope_metrics
