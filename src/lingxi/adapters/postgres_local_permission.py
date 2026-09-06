@@ -323,10 +323,13 @@ class PostgresLocalPermissionOverrideStore:
     ) -> bool:
         """事务性收回一笔职位+范围授权的全部展开行。
 
-        ``expected_override_ids`` 是管理卡展示时看到的完整行集合。函数在同一
-        事务中先对该组当前生效行加行锁，再核对集合完全一致，最后一次性翻转所有
-        行；因此并发新授权不会被误伤，且组已发生漂移时整个操作原子失败。历史
-        ``permission_group_id IS NULL`` 行仍由 :meth:`revoke` 按行收回。
+        ``expected_override_ids`` 是管理卡展示时看到的完整行集合。函数在同一事务中
+        先对该组当前生效行加行锁，再核对集合完全一致，最后一次性翻转所有行；组已发生
+        漂移时整个操作原子失败。历史无组行仍由 :meth:`revoke` 按行收回。
+
+        **先锁目标用户那一行**：此前只有确认卡执行那条路径真的持有该锁——只锁组内生效
+        行拦不住「全部」组补齐（它锁的是 ``app_user`` 行），撤销刚提交之后到达的补齐会
+        把新指标插成生效，撤销过的组因此复活。锁次序与补齐一致，不制造互相等待。
         """
         if not permission_group_id or not expected_override_ids:
             return False
@@ -335,6 +338,7 @@ class PostgresLocalPermissionOverrideStore:
             connect(self._dsn, timeouts=self._timeouts) as connection,
             connection.cursor() as cursor,
         ):
+            _lock_group_owner(cursor, permission_group_id=permission_group_id)
             return _revoke_group_locked(
                 cursor,
                 permission_group_id=permission_group_id,
@@ -415,14 +419,14 @@ class PostgresLocalPermissionOverrideStore:
     def expand_all_scope_group(
         self, *, user_id: str, group_id: str, metrics: Sequence[str], now: datetime
     ) -> int:
-        """新指标进入映射后给「全部」组补缺行。
+        """新指标进入映射后给「全部」组补缺行；返回实际新增行数。
 
         调用方是每日重算与定向重算，缺项由
-        ``core/permission/legacy_diff.missing_all_scope_metrics`` 算出。只加
-        不减；同组同指标**任何状态**（含 ``revoked``）已有行都不再插入——
-        管理员单独撤销过的指标不复活。合成一条已终态 ``pending_action``，
-        目标 open_id 从 ``app_user`` 现读；用户不存在或一行都没新增时零
-        写入。返回实际新增行数。
+        ``core/permission/legacy_diff.missing_all_scope_metrics`` 算出。只加不减；
+        同组同指标**任何状态**（含 ``revoked``）已有行都不再插入——管理员单独撤销
+        过的指标不复活。**整组已经没有生效授权依据时零写入**（见
+        :func:`_expand_all_scope_group_locked`）。用户不存在或一行都没新增时同样零
+        写入，连合成的 ``pending_action`` 都不留。
         """
         wanted = tuple(dict.fromkeys(metric for metric in metrics if metric))
         if not group_id or not wanted:
@@ -431,47 +435,9 @@ class PostgresLocalPermissionOverrideStore:
             connect(self._dsn, timeouts=self._timeouts) as connection,
             connection.cursor() as cursor,
         ):
-            cursor.execute(
-                "SELECT feishu_open_id FROM app_user WHERE id = %s FOR UPDATE", (user_id,)
+            return _expand_all_scope_group_locked(
+                cursor, user_id=user_id, group_id=group_id, wanted=wanted, now=now
             )
-            row = cursor.fetchone()
-            if row is None or not row[0]:
-                return 0
-            target_open_id = str(row[0])
-            cursor.execute(
-                "SELECT metric_name FROM local_permission_override"
-                " WHERE user_id = %s AND permission_group_id = %s AND company_id = %s",
-                (user_id, group_id, ALL_COMPANIES_KEY),
-            )
-            seen = {str(item[0]) for item in cursor.fetchall()}
-            missing = [metric for metric in wanted if metric not in seen]
-            if not missing:
-                return 0
-            pending_id = _insert_synthetic_pending_action(
-                cursor,
-                target_open_id=target_open_id,
-                initiated_by_open_id=LEGACY_IMPORT_ACTOR,
-                reason=ALL_SCOPE_REFRESH_REASON,
-                moment=now,
-                payload={
-                    "legacy_all_scope_refresh": {
-                        "permission_group_id": group_id,
-                        "all_scope_metrics": list(missing),
-                    },
-                    "reason": IMPORT_REASON,
-                },
-            )
-            added = _insert_all_scope_group_rows(
-                cursor,
-                user_id=user_id,
-                group_id=group_id,
-                missing=missing,
-                pending_id=pending_id,
-                now=now,
-            )
-            if added == 0:
-                cursor.execute("DELETE FROM pending_action WHERE id = %s", (pending_id,))
-            return added
 
     def import_position_grant(
         self,
@@ -623,6 +589,85 @@ def _revoke_locked(
     return cursor.rowcount == 1
 
 
+def _expand_all_scope_group_locked(
+    cursor, *, user_id: str, group_id: str, wanted: tuple[str, ...], now: datetime
+) -> int:
+    """在调用方的事务里补齐「全部」组的缺项；返回实际新增行数。
+
+    先锁 ``app_user`` 行、再复核这个组**此刻还有没有生效授权依据**，两步缺一不可：
+    缺项是在另一条独立连接上读 ``effective_entries`` 算出来的，读完到这里之间管理员
+    完全可能把整组撤销掉；而新指标从来没在组里出现过，不被"任何状态已有行都不插"
+    那道判据拦住，会被直接插成 ``active``——一个已经被整组收回的授权就此复活。行锁
+    让本函数与整组撤销串行（见 :func:`_revoke_group_locked`），复核让撤销先提交的
+    那一侧零写入。
+    """
+    cursor.execute("SELECT feishu_open_id FROM app_user WHERE id = %s FOR UPDATE", (user_id,))
+    row = cursor.fetchone()
+    if row is None or not row[0]:
+        return 0
+    target_open_id = str(row[0])
+    cursor.execute(
+        "SELECT id FROM local_permission_override"
+        " WHERE user_id = %s AND permission_group_id = %s AND company_id = %s"
+        "   AND direction = 'grant' AND entry_status = 'active'"
+        " ORDER BY id FOR UPDATE",
+        (user_id, group_id, ALL_COMPANIES_KEY),
+    )
+    if not cursor.fetchall():
+        return 0  # 整组已被撤销（或从来不存在）：一行都不补
+    cursor.execute(
+        "SELECT metric_name FROM local_permission_override"
+        " WHERE user_id = %s AND permission_group_id = %s AND company_id = %s",
+        (user_id, group_id, ALL_COMPANIES_KEY),
+    )
+    seen = {str(item[0]) for item in cursor.fetchall()}
+    missing = [metric for metric in wanted if metric not in seen]
+    if not missing:
+        return 0
+    pending_id = _insert_synthetic_pending_action(
+        cursor,
+        target_open_id=target_open_id,
+        initiated_by_open_id=LEGACY_IMPORT_ACTOR,
+        reason=ALL_SCOPE_REFRESH_REASON,
+        moment=now,
+        payload={
+            "legacy_all_scope_refresh": {
+                "permission_group_id": group_id,
+                "all_scope_metrics": list(missing),
+            },
+            "reason": IMPORT_REASON,
+        },
+    )
+    added = _insert_all_scope_group_rows(
+        cursor, user_id=user_id, group_id=group_id, missing=missing, pending_id=pending_id, now=now
+    )
+    if added == 0:
+        cursor.execute("DELETE FROM pending_action WHERE id = %s", (pending_id,))
+    return added
+
+
+def _lock_group_owner(cursor, *, permission_group_id: str) -> None:
+    """锁定这个授权组所属用户的 ``app_user`` 行，供整组撤销与「全部」组补齐串行。
+
+    组按构造只属于一个用户，仍按查到的全部用户逐个锁（按 ``id`` 排序，与其它路径
+    同一次序）：宁可多锁一行，也不靠"组一定只有一个用户"这条不变量去省一次锁。
+    组里一行都没有时不锁——``_revoke_group_locked`` 随后会因为集合对不上返回
+    ``False``。
+    """
+    cursor.execute(
+        "SELECT DISTINCT user_id FROM local_permission_override WHERE permission_group_id = %s",
+        (permission_group_id,),
+    )
+    owners = sorted({str(row[0]) for row in cursor.fetchall()})
+    if not owners:
+        return
+    placeholders = ", ".join("%s" for _ in owners)
+    cursor.execute(
+        f"SELECT id FROM app_user WHERE id IN ({placeholders}) ORDER BY id FOR UPDATE",
+        tuple(owners),
+    )
+
+
 def _revoke_group_locked(
     cursor,
     *,
@@ -633,10 +678,12 @@ def _revoke_group_locked(
 ) -> bool:
     """在调用方事务内锁定并收回一整个新职位授权组。
 
-    锁定后比较期望集合是并发安全的关键：如果另一笔确认已经为同组追加了行，
-    或组内某行已被先收回，返回 ``False``，调用方回滚整笔待确认操作，不会只收
-    回半组或把并发新授权带走。调用方应在同一事务中持有目标用户锁，以序列化
-    常规 grant/revoke；这里的集合比较则是数据库级纵深防线。
+    锁定后比较期望集合是并发安全的关键：另一笔确认已为同组追加了行、或组内某行已被
+    先收回时返回 ``False``，调用方回滚整笔待确认操作，不会只收回半组或把并发新授权
+    带走。**调用方必须在同一事务里先持有目标用户的 ``app_user`` 行锁**：只锁本组生效
+    行拦不住「全部」组补齐——它要插的新指标行此刻还不存在，不在这里的锁集合里；两个
+    调用点（确认卡执行分支与 :meth:`PostgresLocalPermissionOverrideStore.revoke_group`）
+    都已持有该锁。
     """
     if not permission_group_id or not expected_override_ids:
         return False

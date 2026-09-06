@@ -50,7 +50,11 @@ from lingxi.core.identity.org_snapshot import DirectoryAvailability, SnapshotMem
 from lingxi.core.identity.provisioning import ProvisioningRejection, ProvisioningRequest
 from lingxi.core.identity.stock_token_source import ADOPTABLE, DECRYPT_FAILED, StockTokenLookup
 from lingxi.core.permission.account_match import MATCHED, match_galaxy_account
-from lingxi.core.permission.local_override import ResolvedLocalOverrides, resolve_local_overrides
+from lingxi.core.permission.local_override import (
+    LocalOverrideReadError,
+    ResolvedLocalOverrides,
+    resolve_local_overrides,
+)
 from lingxi.core.permission.mcp_readiness_base import ReadinessBinding, ReadinessOutcome
 from lingxi.core.permission.merge_sources import (
     REASON_LOCAL_OVERRIDE_READ_FAILED,
@@ -465,7 +469,19 @@ class OnboardingSteps:
         Returns:
             合并结果；需要在这一步收口时返回终态。
         """
-        local = self._resolve_local_overrides(user_id)
+        try:
+            local = self._resolve_local_overrides(user_id)
+        except LocalOverrideReadError:
+            # 读不出来是**本侧故障**，不是"这个人没被特批过"。收敛到 ``LX-ONBOARD-001``
+            # 而不是「无可用银河权限」：后者会让一个其实有本地补授的人被告知去银河申请
+            # 权限，而真正该做的是等这次读故障过去重发一条消息。也绝不能继续合并——那会
+            # 给他建一行少了本地补授的发布内容，看起来完全正常。
+            self._audit.record(
+                "onboarding.publish_gate_closed",
+                user=user_id,
+                reason=REASON_LOCAL_OVERRIDE_READ_FAILED,
+            )
+            return _internal(REASON_LOCAL_OVERRIDE_READ_FAILED)
         merged = merge_permission_sources(
             galaxy=galaxy_map,
             local=local,
@@ -523,10 +539,15 @@ class OnboardingSteps:
             )
 
     def _resolve_local_overrides(self, user_id: str) -> ResolvedLocalOverrides | None:
-        """读这个人当前生效的本地覆盖条目。
+        """读这个人当前生效的本地覆盖条目。**未装配**返回 ``None``，**读不出来一律抛**。
 
-        未装配或读取失败时返回 ``None``，对合并函数恒等；读取失败额外响亮记一条跳过审计，
-        异常不冒泡——一次开通不该因为本地覆盖读不出来而整链失败。
+        两种状态的返回值刻意不同：未装配是部署事实（合并按"没有本地源"处理，静默），
+        读取失败是故障。都返回 ``None`` 的话，两者在合并入口坍缩成同一件事，而合并对
+        "没有本地源"恒等——一次数据库抖动就会给这个人建出一行少了管理员特批的发布内容，
+        且看起来完全正常。抛出让两个调用点（零银河闸、发布步）各自写出收敛出口。
+
+        Raises:
+            LocalOverrideReadError: 本地覆盖来源读取失败。
         """
         if self._local_overrides is None:
             return None
@@ -539,11 +560,11 @@ class OnboardingSteps:
                 reason=REASON_LOCAL_OVERRIDE_READ_FAILED,
             )
             logger.error(
-                "本地权限覆盖读取失败，本次开通跳过本地源 user=%s error=%s",
+                "本地权限覆盖读取失败，本次开通不再推进 user=%s error=%s",
                 user_id,
                 type(error).__name__,
             )
-            return None
+            raise LocalOverrideReadError() from error
         return resolve_local_overrides(user_id=user_id, entries=entries)
 
     def _await_published(self, outbox_id: str) -> _Terminal | None:
