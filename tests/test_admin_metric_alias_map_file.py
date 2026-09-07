@@ -20,15 +20,15 @@ class RealFileTests(unittest.TestCase):
         self.assertEqual(
             aliases,
             {
-                "新增订户数": "sub_new_count",
-                "充值订户数": "sub_recharge_count",
+                "新增用户数": "sub_new_count",
+                "充值用户数": "sub_recharge_count",
                 "充值金额": "sub_recharge_money",
-                "扣费订户数": "sub_deduction_count",
+                "扣费用户数": "sub_deduction_count",
                 "扣费金额": "sub_deduction_money",
-                "渠道市场份额": "channel_market_sharing",
-                "渠道费率": "channel_rate",
+                "收视市占率": "channel_market_sharing",
+                "收视率": "channel_rate",
                 "汇率": "exchange_rate",
-                "增值税率": "vat_rate",
+                "税率": "vat_rate",
             },
         )
 

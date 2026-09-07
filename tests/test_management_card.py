@@ -489,7 +489,7 @@ class ZeroInternalIdTests(unittest.TestCase):
         )
         display_names = FakeDisplayNames(
             company_labels={"1011": "壹壹测试公司（1011）"},
-            metric_labels={"sub_new_count": "新增订户数"},
+            metric_labels={"sub_new_count": "新增用户数"},
         )
         return render_management_card(
             _status(local_overrides=(override,), galaxy_source=summary),
@@ -510,7 +510,7 @@ class ZeroInternalIdTests(unittest.TestCase):
         银河来源段或下拉选项——那两处走不同的代码路径）。"""
 
         text = _visible_text(self._card())
-        self.assertIn("公司 壹壹测试公司（1011） · 指标 新增订户数", text)
+        self.assertIn("公司 壹壹测试公司（1011） · 指标 新增用户数", text)
 
     def test_mutation_dropping_the_display_names_translation_turns_the_assertion_red(
         self,
@@ -551,7 +551,7 @@ class ZeroInternalIdTests(unittest.TestCase):
             # 仍然正确展示翻译结果，因此不能用"全卡搜不到翻译结果"这种过粗的
             # 判据，必须精确核对被改坏的那一行本身）。
             self.assertIn("公司 1011 · 指标 sub_new_count", text)
-            self.assertNotIn("公司 壹壹测试公司（1011） · 指标 新增订户数", text)
+            self.assertNotIn("公司 壹壹测试公司（1011） · 指标 新增用户数", text)
         finally:
             management_card_module._override_row_elements = original
 
