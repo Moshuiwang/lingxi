@@ -270,6 +270,32 @@ class L1GateTest(unittest.TestCase):
         failures = self._run(paths)
         self.assertTrue(any("指标 token 形状" in failure for failure in failures), failures)
 
+    def test_an_example_preference_pointing_at_a_nameless_metric_is_rejected(self) -> None:
+        """否定断言：``[examples] prefer`` 指错指标必须当场判红。
+
+        它不会响亮失败——欢迎卡会安静地换一个指标补位，卡面看着正常，而产品负责人
+        挑好的开场白其实没生效。这类"看着对、其实没生效"只有门禁拦得住。
+        """
+        paths = self._paths(
+            '[meta]\nversion = "v1"\n[texts]\ngreeting = "hello"\n[cards]\nmain = "ok"\n',
+            'version = "v1"\ndigest = "sha256:bad"\nretired_versions = []\n[keys]\n',
+            '[aliases]\n"别名" = "sub_count"\n[examples]\nprefer = ["no_such_metric"]\n',
+        )
+        failures = self._run(paths)
+        self.assertTrue(any("没有中文名" in failure for failure in failures), failures)
+
+    def test_an_example_preference_naming_a_real_metric_is_accepted(self) -> None:
+        """反向对照：上一条不是恒真的——指向有中文名的指标时这条检查不出声。"""
+        paths = self._paths(
+            '[meta]\nversion = "v1"\n[texts]\ngreeting = "hello"\n[cards]\nmain = "ok"\n',
+            'version = "v1"\ndigest = "sha256:bad"\nretired_versions = []\n[keys]\n',
+            '[aliases]\n"别名" = "sub_count"\n[examples]\nprefer = ["sub_count"]\n',
+        )
+        failures = self._run(paths)
+        self.assertFalse(
+            [f for f in failures if "没有中文名" in f or "未登记顶层表" in f], failures
+        )
+
     def test_content_lock_mismatch_is_rejected(self) -> None:
         paths = self._paths(
             '[meta]\nversion = "v1"\n[texts]\ngreeting = "hello"\n[cards]\nmain = "ok"\n',
