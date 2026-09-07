@@ -78,11 +78,12 @@ import argparse
 import csv
 import os
 import sys
-from collections.abc import Callable, Iterable, Sequence
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from lingxi.config.metric_labels import default_metric_labels
 from lingxi.core.outreach.audience import (
     ACTIVE_PROVISIONING_STATE,
     ENABLED_ACCOUNT_STATE,
@@ -220,6 +221,7 @@ def build_recipients(
     *,
     facts_for: Callable[[str], SubjectFacts],
     company_names: dict[str, str],
+    metric_labels: Mapping[str, str],
     total_company_count: int,
 ) -> tuple[Recipient, ...]:
     """**唯一的数据装配点**：预检、正式发送与 dry-run 三档都从这里拿取值。
@@ -231,7 +233,10 @@ def build_recipients(
     for email in emails:
         facts = facts_for(email)
         plan = plan_outreach(
-            facts, company_names=company_names, total_company_count=total_company_count
+            facts,
+            company_names=company_names,
+            metric_labels=metric_labels,
+            total_company_count=total_company_count,
         )
         recipients.append(Recipient(facts=facts, plan=plan))
     return tuple(recipients)
@@ -691,6 +696,7 @@ def _prepare(arguments: argparse.Namespace, dsn: str) -> tuple[Any, tuple[Recipi
         load_recipients(arguments.roster),
         facts_for=PostgresOutreachSubjects(dsn).facts_for,
         company_names=company_names,
+        metric_labels=default_metric_labels(),
         total_company_count=total_company_count,
     )
     return config, recipients

@@ -70,6 +70,9 @@ class WelcomeAudience:
     ``company_ids``/``all_companies`` 与 ``metric_names`` 都来自同一份已经发布出去
     的权限文档，不在这里另算一遍；``company_names`` 是编号→中文名，查不到就失败
     关闭（见 :meth:`company_label`），装配层据此把这个人整条跳过。
+
+    ``metric_labels`` 是指标 ID→中文名，与公司名同一条纪律（见 :meth:`metric_label`）：
+    ``metric_names`` 里是 ``sub_recharge_money`` 这类内部标识，**一个字都不许进卡面**。
     """
 
     display_name: str
@@ -77,6 +80,7 @@ class WelcomeAudience:
     all_companies: bool
     metric_names: tuple[str, ...]
     company_names: Mapping[str, str]
+    metric_labels: Mapping[str, str]
     total_company_count: int
 
     def __post_init__(self) -> None:
@@ -109,6 +113,21 @@ class WelcomeAudience:
         if not name:
             raise ValueError("公司中文名查不到：不回落编号，这个人不发欢迎卡")
         return name
+
+    def metric_label(self, metric_name: str) -> str:
+        """指标的中文名；查不到**不回落 ID**，直接失败关闭。
+
+        判据与 :meth:`company_label` 同一条：``sub_recharge_money`` 是内部标识，印在
+        给用户看的卡上既读不懂、也说不清他能问什么。装配层会先判掉这种人并给出
+        ``metric_name_missing``，这里是同一条规则的最后一道。
+
+        与「当前可用范围」通知刻意不同（那条原样展示 ID）：不发通知比发一条说不全
+        范围的通知更糟，欢迎卡没有这个两难——主动告知晚一天没有任何用户损失。
+        """
+        label = self.metric_labels.get(metric_name)
+        if not label:
+            raise ValueError("指标中文名查不到：不回落内部 ID，这个人不发欢迎卡")
+        return label
 
 
 @dataclass(frozen=True)
@@ -163,8 +182,10 @@ def example_company_word(audience: WelcomeAudience, *, catalog: ContentCatalog) 
 
 
 def metric_names_text(audience: WelcomeAudience) -> str:
-    """规则二后半句：指标当前最多九个，全列，顿号分隔。"""
-    return SCOPE_SEPARATOR.join(audience.metric_names)
+    """规则二后半句：指标当前最多九个，全列，顿号分隔——**一律中文名**。"""
+    return SCOPE_SEPARATOR.join(
+        audience.metric_label(metric_name) for metric_name in audience.metric_names
+    )
 
 
 def _example_lines(audience: WelcomeAudience, *, catalog: ContentCatalog) -> tuple[str, ...]:
@@ -174,8 +195,10 @@ def _example_lines(audience: WelcomeAudience, *, catalog: ContentCatalog) -> tup
     重复的一句话。
     """
     company_word = example_company_word(audience, catalog=catalog)
-    first = audience.metric_names[0]
-    second = audience.metric_names[1] if len(audience.metric_names) > 1 else first
+    first = audience.metric_label(audience.metric_names[0])
+    second = audience.metric_label(
+        audience.metric_names[1] if len(audience.metric_names) > 1 else audience.metric_names[0]
+    )
     return (
         catalog.text(
             f"{WELCOME_CONTENT_KEY}.example_recent",

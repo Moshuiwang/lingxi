@@ -35,7 +35,11 @@ from lingxi.core.outreach.welcome_card import (
 
 CATALOG = default_content_catalog()
 ROSTER_NAME = "王晋 (Joshua Wang)"
-METRICS = ("充值金额", "日活用户数")
+METRICS = ("sub_recharge_money", "sub_new_count")
+#: 指标 ID→中文名。夹具刻意用**生产上的真实形状**（内部 snake_case ID）：
+#: 此前这里直接写中文，等于替被测代码把翻译做掉了，卡面漏出内部 ID 的缺陷
+#: 因此在全部用例里都看不见（2026-09-07 生产预检当场发现）。
+METRIC_LABELS = {"sub_recharge_money": "充值金额", "sub_new_count": "新增订户数"}
 
 
 def _audience(
@@ -44,6 +48,7 @@ def _audience(
     all_companies: bool = False,
     metric_names: tuple[str, ...] = METRICS,
     company_names: dict[str, str] | None = None,
+    metric_labels: dict[str, str] | None = None,
     total_company_count: int = 43,
 ) -> WelcomeAudience:
     return WelcomeAudience(
@@ -52,6 +57,7 @@ def _audience(
         all_companies=all_companies,
         metric_names=metric_names,
         company_names=company_names if company_names is not None else {"1011": "尼日利亚"},
+        metric_labels=METRIC_LABELS if metric_labels is None else metric_labels,
         total_company_count=total_company_count,
     )
 
@@ -90,10 +96,12 @@ class ExampleScopeRuleTest(unittest.TestCase):
 
     def test_the_second_example_uses_the_second_metric(self) -> None:
         sections = welcome_sections(_audience(), catalog=CATALOG)
-        self.assertIn("上个月尼日利亚的日活用户数是多少", sections[3])
+        self.assertIn("上个月尼日利亚的新增订户数是多少", sections[3])
 
     def test_one_metric_only_still_yields_two_distinct_examples(self) -> None:
-        sections = welcome_sections(_audience(metric_names=("充值金额",)), catalog=CATALOG)
+        sections = welcome_sections(
+            _audience(metric_names=("sub_recharge_money",)), catalog=CATALOG
+        )
         self.assertIn("最近七天尼日利亚的充值金额是多少", sections[3])
         self.assertIn("上个月尼日利亚的充值金额是多少", sections[3])
 
@@ -123,8 +131,26 @@ class LongListRuleTest(unittest.TestCase):
         self.assertEqual(company_scope_text(audience, catalog=CATALOG), "全部公司（43 家）")
 
     def test_every_metric_is_listed_separated_by_the_chinese_enumeration_comma(self) -> None:
-        nine = tuple(f"指标{index}" for index in range(9))
-        self.assertEqual(metric_names_text(_audience(metric_names=nine)), "、".join(nine))
+        nine = tuple(f"metric_{index}" for index in range(9))
+        labels = {metric_name: f"指标{index}" for index, metric_name in enumerate(nine)}
+        self.assertEqual(
+            metric_names_text(_audience(metric_names=nine, metric_labels=labels)),
+            "、".join(labels[metric_name] for metric_name in nine),
+        )
+
+    def test_a_metric_without_a_chinese_name_fails_closed_instead_of_showing_the_id(self) -> None:
+        """否定断言：查不到中文名不回落内部 ID——宁可不发，也不把它印上卡面。"""
+        audience = _audience(metric_names=("sub_recharge_money",), metric_labels={})
+        with self.assertRaises(ValueError):
+            metric_names_text(audience)
+
+    def test_the_examples_use_the_chinese_metric_name_not_the_internal_id(self) -> None:
+        """两条示例句都必须是人话；这一条钉住 2026-09-07 生产预检发现的那个缺陷。"""
+        sections = welcome_sections(_audience(), catalog=CATALOG)
+        self.assertIn("最近七天尼日利亚的充值金额是多少", sections[3])
+        self.assertIn("上个月尼日利亚的新增订户数是多少", sections[3])
+        self.assertNotIn("sub_recharge_money", "".join(sections))
+        self.assertNotIn("sub_new_count", "".join(sections))
 
 
 class RosterNameRuleTest(unittest.TestCase):
@@ -143,6 +169,7 @@ class RosterNameRuleTest(unittest.TestCase):
                 all_companies=False,
                 metric_names=METRICS,
                 company_names={},
+                metric_labels=METRIC_LABELS,
                 total_company_count=1,
             )
 
@@ -193,7 +220,7 @@ class CardShapeTest(unittest.TestCase):
             self.assertEqual(row["columns"][1]["weight"], FIELD_VALUE_WEIGHT)
         values = [row["columns"][1]["elements"][0]["content"] for row in rows]
         self.assertEqual(values[0], "尼日利亚")
-        self.assertEqual(values[1], "充值金额、日活用户数")
+        self.assertEqual(values[1], "充值金额、新增订户数")
 
     def test_the_footnote_is_the_last_element_and_rendered_as_secondary_text(self) -> None:
         elements = render_welcome_card(_audience(), catalog=CATALOG).payload["body"]["elements"]

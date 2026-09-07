@@ -51,7 +51,8 @@ TOOL = _load_script()
 EMAIL_A = "joshua.wang@example.invalid"
 EMAIL_B = "yiming.yi@example.invalid"
 COMPANY_NAMES = {"1011": "尼日利亚"}
-PERMISSIONS = '{"1011": ["充值金额", "日活用户数"]}'
+PERMISSIONS = '{"1011": ["sub_recharge_money", "sub_new_count"]}'
+METRIC_LABELS = {"sub_recharge_money": "充值金额", "sub_new_count": "新增订户数"}
 ADMIN_OPEN_ID = "ou_admin_fake_for_tests"
 
 
@@ -75,6 +76,7 @@ def _recipients(*facts: SubjectFacts) -> tuple[Any, ...]:
         tuple(by_email),
         facts_for=lambda email: by_email[email],
         company_names=COMPANY_NAMES,
+        metric_labels=METRIC_LABELS,
         total_company_count=43,
     )
 

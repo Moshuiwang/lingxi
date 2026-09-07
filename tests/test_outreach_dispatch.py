@@ -36,8 +36,9 @@ def _audience() -> WelcomeAudience:
         display_name="王晋 (Joshua Wang)",
         company_ids=("1011",),
         all_companies=False,
-        metric_names=("充值金额",),
+        metric_names=("sub_recharge_money",),
         company_names={"1011": "尼日利亚"},
+        metric_labels={"sub_recharge_money": "充值金额"},
         total_company_count=43,
     )
 
