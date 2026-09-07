@@ -31,6 +31,7 @@ from lingxi.adapters.postgres_local_permission import (
 )
 from lingxi.core.admin.pending_action import (
     PENDING_ACTION_TTL_SECONDS,
+    CancelDecision,
     ConfirmDecision,
     ConfirmResultKind,
     PendingAction,
@@ -828,6 +829,59 @@ class _ExecutionMixin:
             )
         return None
 
+    def _finalize_cancel_decision(
+        self,
+        cursor: Any,
+        *,
+        pending: PendingAction,
+        decision: CancelDecision,
+        clicker_open_id: str,
+        moment: datetime,
+    ) -> PendingAction:
+        """取消路径的落终态，与 :meth:`_finalize_confirm_decision` 逐条对称。
+
+        审计失败即整体回滚、影响行数不为 1 即响亮失败，返回值同样是"提交之后
+        这一行应有的样子"——三条都与确认路径同一姿态。
+        """
+        try:
+            self._audit.record(
+                "admin.pending_action.cancelled",
+                pending_action_id=pending.id,
+                action_type=pending.action_type.value,
+                outcome=decision.kind.value,
+                initiated_by=pending.initiated_by_open_id,
+                clicker=clicker_open_id,
+            )
+        except Exception as error:  # 见 confirm() 同一姿态
+            raise PendingActionAuditWriteFailedError(
+                "取消操作的审计写入失败，事务已回滚，操作未执行"
+            ) from error
+
+        from lingxi.adapters.postgres_pending_action import (
+            _UPDATE_TERMINAL_STATUS_SQL,
+            _committed_terminal_snapshot,
+        )
+
+        # 不用 assert：``python -O`` 会剥掉它，随后取 ``.value`` 只抛 AttributeError。
+        terminal_status = decision.terminal_status
+        if terminal_status is None:  # pragma: no cover - 调用点已保证
+            raise RuntimeError("取消决策没有终态，不该走到落终态这一步")
+        cursor.execute(
+            _UPDATE_TERMINAL_STATUS_SQL,
+            (terminal_status.value, decision.reason, moment, clicker_open_id, pending.id),
+        )
+        if cursor.rowcount != 1:
+            raise RuntimeError(
+                f"待确认操作状态在本事务持锁期间被改变，预期影响 1 行，实际 {cursor.rowcount} 行"
+            )
+        return _committed_terminal_snapshot(
+            pending,
+            terminal_status=terminal_status,
+            reason=decision.reason,
+            decided_at=moment,
+            decided_by_open_id=clicker_open_id,
+        )
+
     def _finalize_confirm_decision(
         self,
         cursor: Any,
@@ -836,11 +890,12 @@ class _ExecutionMixin:
         decision: ConfirmDecision,
         clicker_open_id: str,
         moment: datetime,
-    ) -> None:
+    ) -> PendingAction:
         """写审计并落终态状态；审计失败或行数异常都响亮失败。
 
         本方法从取得行锁到这里全程持有它，正常情况下不可能有别的事务在期间
-        把状态改离 ``'pending'``，不能静默当成"改成功了"。
+        把状态改离 ``'pending'``，不能静默当成"改成功了"。返回值是"这条 ``UPDATE`` 提交之后这一行应有的样子"：提交后那次回读会
+        失败，终态必须在事务内握全，见 ``postgres_pending_action._refresh_after_commit``。
         """
         try:
             self._audit.record(
@@ -856,13 +911,19 @@ class _ExecutionMixin:
                 "确认操作的审计写入失败，事务已回滚，操作未执行"
             ) from error
 
-        from lingxi.adapters.postgres_pending_action import _UPDATE_TERMINAL_STATUS_SQL
+        from lingxi.adapters.postgres_pending_action import (
+            _UPDATE_TERMINAL_STATUS_SQL,
+            _committed_terminal_snapshot,
+        )
 
-        assert decision.terminal_status is not None
+        # 不用 assert：``python -O`` 会剥掉它，随后取 ``.value`` 只抛 AttributeError。
+        terminal_status = decision.terminal_status
+        if terminal_status is None:  # pragma: no cover - 调用点已保证
+            raise RuntimeError("确认决策没有终态，不该走到落终态这一步")
         cursor.execute(
             _UPDATE_TERMINAL_STATUS_SQL,
             (
-                decision.terminal_status.value,
+                terminal_status.value,
                 decision.reason,
                 moment,
                 clicker_open_id,
@@ -873,3 +934,10 @@ class _ExecutionMixin:
             raise RuntimeError(
                 f"待确认操作状态在本事务持锁期间被改变，预期影响 1 行，实际 {cursor.rowcount} 行"
             )
+        return _committed_terminal_snapshot(
+            pending,
+            terminal_status=terminal_status,
+            reason=decision.reason,
+            decided_at=moment,
+            decided_by_open_id=clicker_open_id,
+        )

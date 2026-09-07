@@ -37,7 +37,7 @@ esac
 # 仓库前缀默认为空，构建出本地名字（lingxi-scheduler:...）。CI 与部署显式传 GHCR 前缀。
 registry=${LINGXI_IMAGE_REGISTRY:-}
 
-# 发布批次：默认取 UTC 当天。CI 可以传入以保证矩阵各腿拿到同一个批次号。
+# 发布批次：默认取 UTC 当天。CI 可以传入以保证矩阵各条路径拿到同一个批次号。
 batch=${LINGXI_IMAGE_BATCH:-$(date -u +%Y%m%d)}
 
 # 源码提交：优先用 CI 提供的 sha，本地回落到 git。

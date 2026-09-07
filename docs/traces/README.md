@@ -19,3 +19,7 @@
 - `[tracking]` Issue 正文 = 瘦指针：目标一句话 + 三件套链接 + 当前阶段一行 + 原正文折叠留档。
 - 产品负责人裁定评论、编排者交接评论、批次收口评论**仍发在该 Issue**；收口评论附任务表更新 commit 链接。
 - 缺陷、工作项、决策留痕照常走各自 Issue；产品事实照常写 `docs/` 正文。
+
+## 看板
+
+进度看板由 [trace-kit](https://github.com/Moshuiwang/trace-kit) 插件（≥ v0.2.1）的 `/trace-kit:board` 提供：在 tmux 里跑 `python3 <插件>/scripts/board.py --repo-root . --config docs/traces/board.toml`；本仓库只放证据源配置 `board.toml`（预发 / 生产镜像 tag、编排窗口名模式、预算计数），引擎与夹具都在 trace-kit（lingxi #577 子清单、trace-kit #17）。

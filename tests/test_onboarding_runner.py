@@ -972,12 +972,27 @@ class LocalOverrideMergeTests(unittest.TestCase):
 
         self.assertEqual(parts["decisions"].rows[0].permissions, '{"99":["销售分析"]}')
 
-    def test_read_failure_skips_local_source_and_audits(self) -> None:
+    def test_read_failure_halts_this_onboarding_with_a_distinguishable_fault(self) -> None:
+        """读不出来 ≠ 合法空（IN-01，Issue #646）。
+
+        本用例此前逐字钉住的是**错误行为**：「开通照常推进到发布、写出
+        ``{"88":["销售分析"]}``」——那是一份少了管理员特批的权限内容，用户拿到手时
+        看起来完全正常，没有任何一处会报错。修复后开通不推进到发布：收敛到本侧故障
+        终态（``LX-ONBOARD-001``），**不是** ``not_authorized``——把一次读故障说成
+        「你没有权限」会让一个其实已被特批的人被引去银河申请一个与此无关的权限。
+        """
+
         overrides = FakeLocalOverrides(fail_for={USER_ID})
         parts, result = run_once(local_overrides=overrides)
 
         self.assertIs(result.state, OnboardingState.STARTED)
-        self.assertEqual(parts["decisions"].rows[0].permissions, '{"88":["销售分析"]}')
+        self.assertEqual(parts["decisions"].rows, [], "读不出本地源时零发布意图")
+        self.assertEqual(parts["audit"].facts("onboarding.result")["state"], "internal_error")
+        self.assertEqual(
+            parts["audit"].facts("onboarding.result")["failure_reason"],
+            REASON_LOCAL_OVERRIDE_READ_FAILED,
+        )
+        self.assertEqual(parts["notifier"].terminal()[1], KEY_INTERNAL_ERROR)
         self.assertIn("onboarding.local_override_skipped", parts["audit"].actions())
         facts = parts["audit"].facts("onboarding.local_override_skipped")
         self.assertEqual(facts["user"], USER_ID)

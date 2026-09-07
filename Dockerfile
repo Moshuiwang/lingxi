@@ -20,6 +20,34 @@
 # 更新底座 = 改这一行 + 重跑镜像门禁，是一次有留痕的显式变更。
 FROM python@sha256:4766d8b510c428e595d74b9cc5bbb2fae8e26316fffb4adc89908d79aacd58a2 AS base
 
+# 标准库预编译字节码缓存（Issue #632，根因见 #600 codex 2026-09-06 核查）。
+#
+# 三个常驻服务只读根文件系统（`read_only: true`）+ 周期健康检查（gateway 23s /
+# worker 29s / scheduler 30s 一次）每次新起一个 Python 进程；本镜像原先只预编译
+# `site-packages`（见下方各 build-* 阶段），标准库顶层 `__pycache__` 为空。缺
+# 缓存时 CPython 每次都会尝试写 `.pyc`，只读文件系统以 EROFS 拒绝，每次失败留下
+# 一条 negative dentry；生产实测每次健康检查 `slab_reclaimable` 恰增 74,192 字节，
+# 长期表现为 `docker stats` 空闲容器线性上涨（`anon` 本身不变，不是内存泄漏）。
+#
+# 在这里（`base` 阶段、任何 `pip install` 之前）预编译标准库，四个交付目标
+# （scheduler/worker/gateway/migrate）都 `FROM base`，只需构建一次、被四者共用；
+# `-x '/site-packages/'` 排除本阶段仅有的 pip 自带包——它会被各 build-* 阶段的
+# `COPY --from=build-*` 整体替换掉，编译了也白费。`--invalidation-mode
+# unchecked-hash` 与下方各 build-* 阶段的写法一致：`.pyc` 头里内嵌源码哈希而不是
+# mtime，运行期不再回头校验源码（PEP 552 的 unchecked 即"信任缓存、不校验"）。
+# 选它是因为镜像内源码不会变，而它让产物与构建时刻、检出路径无关——`image_manifest.py`
+# 逐条比 `.pyc` 内容哈希，换成 timestamp 模式会让 V-部署-06 的"两次构建等价"必红。
+#
+# 本机实测（Docker `--read-only` 容器，同一份 digest 基础镜像，非生产内核/架构，
+# 仅作相对比较）：30 次调用 `python3 -c "import argparse,pathlib,logging,
+# dataclasses,ssl,asyncio"`（健康检查实际会导入的标准库集合）——现状（无缓存、
+# 每次写失败）均值约 714–722ms/进程；仅设 `PYTHONDONTWRITEBYTECODE=1`（只省失败
+# 写尝试的系统调用、不省编译）约 694ms，几乎无差异；预编译后（本行改动）约
+# 145ms，约为现状的 20%。镜像体积：标准库目录本机实测 28M → 42M（`site-packages`
+# 已排除），+14MB 一次、四个目标共享同一层，不是按目标数相乘。
+RUN python -m compileall -q -f --invalidation-mode unchecked-hash \
+      -x "/site-packages/" /usr/local/lib/python3.12
+
 # 日志走 stdout / stderr 且不缓冲（断言 V-部署-04）。缓冲会让容器日志在崩溃时丢掉
 # 最后一段——恰恰是最需要的那一段。
 ENV PYTHONUNBUFFERED=1 \

@@ -544,6 +544,14 @@ ls -la /var/log/lingxi                                  # 收集目录里开始�
 
 README 「主机读取身份」一节原写「把镜像包设为公开的代价是……源码本身不在镜像里」——**这一句不成立**。公开镜像里包含全部源码、用户可见文案版本文件、公司与职能到指标的映射 TOML 以及迁移 SQL。该表述已在 README 与 `Dockerfile` 的对应注释里更正；本次首发在知情前提下接受镜像公开。**2026-09-03 更新**：改回 private 不再是观察期项——产品负责人裁定保持原状，保持公开是有裁定的终态（原因见 README 同一节）。
 
+### 11.8 v2.2.0 升级实录（2026-09-05，Trace #606 块 Z-1；产品负责人整段预批，一次放行）
+
+- **序列与耗时**：步 0 工作副本 `fetch` + `checkout --detach 92d016be943e`（干净）→ 步 1 备份 `.env.prod` 为 `.env.prod.before-20260905-92d016be943e`（0600）、五值写入（`LINGXI_IMAGE_TAG` ＋ 四个 `*_IMAGE_DIGEST`，值由验收.md 制品栏取、不手敲，逐行回读逐字一致，键集合不变）→ 步 3 `--profile job run --rm migrate`（`0087_preprovision_seams → 0088_outreach_message`，退出 0）→ 步 4 `--profile mvp up -d`（三容器 Recreated → Started）→ 步 5 回读 → 步 6 观察 15 分钟三次采样 → 步 7 tag。19:13 起手，19:33 打 tag，共约 20 分钟。
+- **digest 写法**：四个 `*_IMAGE_DIGEST` 必须是 `@sha256:…` 形态（stage 演练时少写 `@` 当场修正）；运行镜像 `RepoDigests` 逐字对制品栏。
+- **与日志收集定时器的顺序**：`lingxi-log-collect.timer` 每 5 分钟一次，`up -d` 安排在一次收集之后再做，避免容器重建时刻的日志缺口。
+- **观察结果**：三容器 healthy、`RestartCount=0`、三容器错误计数 0、在途 0；内存 scheduler 42 → 42.7、worker-queue 30 → 31、gateway 181.8 → 183.6 MiB（升级前 141 / 231 / 237）。
+- **未做**：`LINGXI_CONTENT_OVERRIDE_PATH` 未配（D-3：生产默认不启用文案外置）；白名单未动；名单零写入。回滚点＝备份文件内的上一批 tag ＋ 四 digest（`20260904-c6fa5ac5f9ad`）。
+
 ## 十二、#541 预开通批量执行姿势（生产；rc25 补入）
 
 > **前提与去留**：本节只在「预开通名单（A-3）已到、且产品负责人裁定纳入本次窗口」时

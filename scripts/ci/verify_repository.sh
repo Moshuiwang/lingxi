@@ -143,6 +143,12 @@ python3 scripts/ci/check_contract_attribution.py
 # 开工必读集体量预算（产品负责人 2026-08-24）：代码框架 + 验证与门禁合计字节数
 # 设硬上限，超限即红——防膨胀的结构性门禁，与代码体量棘轮同一思路。
 python3 scripts/ci/check_docs_size_budget.py
+# 用词门禁（Issue #597）也接进代码路径，不只挂在 verify_docs.sh：`Story / docs` 与
+# `Epic Full / docs` 两个作业都以 docs_changed=true 触发，纯代码 PR（只改 .py/.yml）
+# 根本不会跑到它们。而这个被禁词的存量恰恰主要住在 ci.yml、tests/ 与 scripts/ 里——
+# 只挂文档路径等于给它留了一条它最常走的入口，与 check_docs_size_budget 等检查
+# 两处都挂是同一个理由。
+python3 scripts/ci/check_docs_wording.py
 # Issue #75：正式 PostgreSQL 连接必须走唯一工厂，迁移入口必须有独立且有限的连接参数。
 # 该检查登记在 #75 的共享位置；#76 的制品 / 进程依赖清单检查按编排者约定后续追加。
 python3 scripts/ci/check_db_timeouts.py

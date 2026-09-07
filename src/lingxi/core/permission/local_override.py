@@ -23,6 +23,18 @@ from enum import Enum
 from typing import Any
 
 
+class LocalOverrideReadError(RuntimeError):
+    """本地覆盖来源读不出来：这是**故障**，不是「这个人没有本地覆盖」。
+
+    三个合并调用点（每日重算、定向重算、首次开通）共用同一个异常类型。读取口一律
+    抛它、绝不返回空的 :class:`ResolvedLocalOverrides` 或 ``None``——合并对
+    ``local=None`` 恒等，把读失败折叠成"没有本地源"就会产出一份**少了本地补授**却
+    看起来完整的权限决定并落进发布队列。因此"不可读"在类型上没有任何取值能流进合并
+    函数：调用点必须自己写出收敛出口，不写就是异常继续上抛，不会静默降级。三条链的
+    收敛终态各不相同（身份来源与通知承诺本就不同），共用的只有这一条判据。
+    """
+
+
 class OverrideDirection(str, Enum):
     """迁移 ``0072`` ``direction`` 列的两个取值，字符串枚举与列值逐字对应。"""
 

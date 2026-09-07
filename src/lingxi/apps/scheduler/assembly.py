@@ -42,6 +42,7 @@ from lingxi.apps.scheduler.retention import (
     IDLE_CONVERSATION_SWEEP_AFTER,
     IdleConversationSweepDuty,
     RetentionCleanupDuty,
+    _build_carrier_retention_duty,
     _build_content_capture_retention_duty,
     _build_permission_retention_duty,
 )
@@ -200,16 +201,8 @@ def build_loop(
     stop = threading.Event()
     sink = audit if audit is not None else StructuredLogAuditSink()
 
-    holder, rotation, cleanup, idle_sweep, permission_retention, content_capture_retention = (
-        _build_rotation_and_cleanup_duties(config, stop, sink)
-    )
-    duties: list[Any] = [
-        rotation,
-        cleanup,
-        idle_sweep,
-        permission_retention,
-        content_capture_retention,
-    ]
+    holder, rotation, cleanups = _build_rotation_and_cleanup_duties(config, stop, sink)
+    duties: list[Any] = [rotation, *cleanups]
 
     supply = _build_roster_access_token_supply(config, sink, holder, rotation, roster_access_token)
     _wire_roster_audit_or_snapshot(
@@ -293,20 +286,10 @@ def _wire_permission_and_onboarding_pipeline(
 
 def _build_rotation_and_cleanup_duties(
     config: SchedulerConfig, stop: threading.Event, sink: AuditSink
-) -> tuple[DerivedAccessTokenHolder, CredentialRotationLoop, RetentionCleanupDuty, Any, Any, Any]:
-    """凭据轮换 + 三类清理：到期行/空闲会话/到期内容快照。
-
-    三类清理晚一轮都没有任何后果——到期时间不会因为清理迟到而后移（断言
-    `V-保留-16`），空闲会话清理本身也是幂等的。权限链到期清理排在前两类清理
-    之后、发布消费之前：一条 payload 已经过期的意图应当先被擦成 ``'{}'``，
-    再轮到发布面认领它并以 ``invalid`` 失败关闭，反过来会让一份早已过期的
-    权限在到期当轮还被写进外部表格一次。内测轮采集内容的到期删除与前面几条
-    清理同组，无条件装配：删自己库里的到期内容只需要连接串，生产该表恒空。
-    """
+) -> tuple[DerivedAccessTokenHolder, CredentialRotationLoop, tuple[Any, ...]]:
+    """凭据轮换 + 五条清理职责（顺序即注册顺序，理由见 :func:`_build_cleanup_duties`）。"""
     from lingxi.adapters.delegated_credentials import HostFileDelegatedCredentialVault
     from lingxi.adapters.feishu_directory import FeishuAuthorizationClient
-    from lingxi.adapters.postgres_conversation import PostgresTaskQueue
-    from lingxi.adapters.retention import RETENTION_CLEANUP_TIMEOUTS, PostgresRetentionCleaner
 
     # 派生短期令牌的进程内持有者：不落盘、不进日志与审计，重启即空。
     holder = DerivedAccessTokenHolder()
@@ -326,6 +309,20 @@ def _build_rotation_and_cleanup_duties(
         stop=stop,
         holder=holder,
     )
+    return holder, rotation, _build_cleanup_duties(config, stop, sink)
+
+
+def _build_cleanup_duties(
+    config: SchedulerConfig, stop: threading.Event, sink: AuditSink
+) -> tuple[Any, ...]:
+    """五类清理：到期行 / 空闲会话 / 权限链 / 内测采集 / 四个内容载体。
+
+    五类清理晚一轮都没有任何后果——到期时间不会因为清理迟到而后移（断言
+    `V-保留-16`），空闲会话清理本身也是幂等的。四条职责各管各的表，互不重叠。
+    """
+    from lingxi.adapters.postgres_conversation import PostgresTaskQueue
+    from lingxi.adapters.retention import RETENTION_CLEANUP_TIMEOUTS, PostgresRetentionCleaner
+
     cleanup = RetentionCleanupDuty(
         # 清理函数内部两张表各有 2s lock_timeout，不能沿用 scheduler 通用的 3s
         # statement_timeout；适配器专用覆盖要大于 2×2s 累计并留出删批余量。
@@ -337,9 +334,18 @@ def _build_rotation_and_cleanup_duties(
         idle_after=IDLE_CONVERSATION_SWEEP_AFTER,
         stop=stop,
     )
-    permission_retention = _build_permission_retention_duty(config, stop=stop, audit=sink)
-    content_capture_retention = _build_content_capture_retention_duty(config, stop=stop, audit=sink)
-    return holder, rotation, cleanup, idle_sweep, permission_retention, content_capture_retention
+    # 权限链到期清理排在前两类清理之后、发布消费之前：一条 payload 已经过期的意图
+    # 应当先被擦成 ``'{}'``，再轮到发布面认领它并以 ``invalid`` 失败关闭；反过来会让
+    # 一份早已过期的权限在到期当轮还被写进外部表格一次。
+    # 内测采集与四个内容载体这两条排在最后，都无条件装配：处置自己库里的到期内容
+    # 只需要连接串，没有任何可选前置。
+    return (
+        cleanup,
+        idle_sweep,
+        _build_permission_retention_duty(config, stop=stop, audit=sink),
+        _build_content_capture_retention_duty(config, stop=stop, audit=sink),
+        _build_carrier_retention_duty(config, stop=stop, audit=sink),
+    )
 
 
 def _build_roster_access_token_supply(

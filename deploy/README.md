@@ -182,7 +182,7 @@ echo "<LINGXI_GHCR_READ_TOKEN>" \
 `epic/*` 分支合并到 `main` 走的是一条常驻「跟踪 PR」（整个 Epic 期间只开一次，base 是
 `main`，head 是该 epic 分支；每个 Story 合入 epic 分支都会把它 `synchronize` 一次）。
 Issue #278 之前，这条跟踪 PR 的**每一次** synchronize 都会自动跑一遍 `Epic Full / image`
-（双腿共 8 次镜像构建，约 4 分钟）；Epic D 实测 5 次 synchronize 只有 1 次的镜像制品被
+（两条路径共 8 次镜像构建，约 4 分钟）；Epic D 实测 5 次 synchronize 只有 1 次的镜像制品被
 下面「PR 候选镜像下载」验收流程真正下载用过，其余全是陪跑。
 
 **Issue #278 之后**：跟踪 PR（head 为 `epic/**`、base 为 `main`）的**首次自动**

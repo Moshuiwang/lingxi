@@ -403,3 +403,180 @@ def _build_permission_retention_duty(
         audit=audit,
         stop=stop,
     )
+
+
+@dataclass(frozen=True)
+class CarrierRetentionReport:
+    """一轮四个载体处置的摘要。**只有计数，没有任何行内容**（同 ``V-保留-14``）。"""
+
+    #: 本轮 ``prompt`` 被擦成空串的 ``task`` 行数。
+    task_prompts_redacted: int = 0
+    #: 本轮被删掉的 ``inbound_event`` 行数。
+    inbound_events_purged: int = 0
+    #: 本轮被脱敏的 ``pending_action`` 行数。
+    pending_actions_redacted: int = 0
+    #: 本轮被删掉的 ``queue_failure_notice`` 行数。
+    queue_failure_notices_purged: int = 0
+
+    @property
+    def total(self) -> int:
+        """本轮跨四个载体处置的行数合计。"""
+        return (
+            self.task_prompts_redacted
+            + self.inbound_events_purged
+            + self.pending_actions_redacted
+            + self.queue_failure_notices_purged
+        )
+
+    def audit_facts(self) -> dict[str, int]:
+        """把计数字段展开成一份可以直接喂给审计记录的字典。"""
+        return {
+            "task_prompts_redacted": self.task_prompts_redacted,
+            "inbound_events_purged": self.inbound_events_purged,
+            "pending_actions_redacted": self.pending_actions_redacted,
+            "queue_failure_notices_purged": self.queue_failure_notices_purged,
+        }
+
+    def summary(self) -> str:
+        """写进日志的一行摘要。只有表名与计数，永远不取行内容。"""
+        return (
+            "载体到期清理："
+            f"task.prompt 脱敏 {self.task_prompts_redacted} 行，"
+            f"inbound_event 删除 {self.inbound_events_purged} 行，"
+            f"pending_action 脱敏 {self.pending_actions_redacted} 行，"
+            f"queue_failure_notice 删除 {self.queue_failure_notices_purged} 行"
+        )
+
+
+class _ExpiredCarrierProcessor(Protocol):
+    """四个内容载体到期处置的最小端口。
+
+    实现是
+    :class:`lingxi.adapters.postgres_carrier_retention.PostgresCarrierRetention`。
+    """
+
+    def redact_expired_task_prompts(self) -> int: ...
+
+    def purge_expired_inbound_events(self) -> int: ...
+
+    def redact_expired_pending_actions(self) -> int: ...
+
+    def purge_expired_queue_failure_notices(self) -> int: ...
+
+
+class ExpiredCarrierRetentionDuty:
+    """任务问题原文 / 入站事件 / 待确认操作 / 队列失败通知的九十天到期处置（IN-04）。
+
+    合同「数据保留与删除」把"任务问题"与"待确认操作参数"点名写进了九十天上限，这四个
+    载体此前**一个消费者都没有**：期限躺在没人读的列里，或者连列都还没有。处置方式与
+    分工见 :mod:`lingxi.adapters.postgres_carrier_retention`。**无条件装配**：处置自己
+    库里的到期内容只需要连接串。每轮四面各调一次、不循环到处置完；失败关闭。
+    """
+
+    # **不并进** :class:`PermissionRetentionSweepDuty`：那条职责叫「权限链到期清理」，
+    # 这四张表与权限发布链无关；更要紧的是那条职责的删除面有一条钉住测试守着，把新载体
+    # 塞进去等于亲手拆掉一条正确的防线。
+    # 四面**互相独立**，收敛姿态见 :meth:`run_once`。
+    name = "载体到期清理"
+
+    def __init__(
+        self,
+        *,
+        carriers: _ExpiredCarrierProcessor,
+        audit: AuditSink,
+        stop: threading.Event | None = None,
+    ) -> None:
+        """按注入的载体处置器装配一条载体到期清理职责实例。"""
+        self._carriers = carriers
+        self._audit = audit
+        self._stop = threading.Event() if stop is None else stop
+
+    @property
+    def stopping(self) -> bool:
+        """是否已收到停止信号。"""
+        return self._stop.is_set()
+
+    def request_stop(self) -> None:
+        """置位停止信号：本轮及之后不再领取新的到期批次。"""
+        self._stop.set()
+
+    def run_once(self) -> CarrierRetentionReport | None:
+        """已经在停止中就一条都不处置。返回 ``None`` 表示本轮未执行。
+
+        四面各跑一次、**互不阻断**：四张表之间没有依赖，一次调用就是一个事务、已完成的
+        不会回退；"前一面失败就整轮停"会让一张表上的一条坏行把另外三张表的九十天清理一起
+        拖住，正是这条职责要防的事故。有面失败时先落一条 ``carrier_retention.partial``
+        审计——只剩 ``sweep_failed`` 的话，运维分不出"跑了但部分失败"与"这条职责根本没
+        起来"——再把**第一个**异常原样抛出（失败关闭），由上层职责隔离降级这一轮。
+        """
+        if self._stop.is_set():
+            return None
+        counts: dict[str, int] = {}
+        failures: list[BaseException] = []
+        for table, field, call in (
+            ("task", "task_prompts_redacted", self._carriers.redact_expired_task_prompts),
+            (
+                "inbound_event",
+                "inbound_events_purged",
+                self._carriers.purge_expired_inbound_events,
+            ),
+            (
+                "pending_action",
+                "pending_actions_redacted",
+                self._carriers.redact_expired_pending_actions,
+            ),
+            (
+                "queue_failure_notice",
+                "queue_failure_notices_purged",
+                self._carriers.purge_expired_queue_failure_notices,
+            ),
+        ):
+            try:
+                counts[field] = self._sweep(table, call)
+            except Exception as error:  # 这一面失败不带走其余三面
+                failures.append(error)
+        report = CarrierRetentionReport(**counts)
+        if failures:
+            self._audit.record(
+                "carrier_retention.partial",
+                failed_faces=len(failures),
+                **report.audit_facts(),
+            )
+        else:
+            self._audit.record("carrier_retention.completed", **report.audit_facts())
+        if report.total:
+            # 一轮什么都没到期时不打日志：这条职责每分钟跑一次。
+            logger.info("%s", report.summary())
+        if failures:
+            raise failures[0]
+        return report
+
+    def _sweep(self, table: str, call: Callable[[], int]) -> int:
+        try:
+            return int(call())
+        except Exception as error:
+            # 只记表名与异常类型：异常正文可能带上被处置那一行的内容（这四张表里
+            # 有用户问题原文与身份标识）。
+            self._audit.record(
+                "carrier_retention.sweep_failed",
+                table=table,
+                error=type(error).__name__,
+            )
+            logger.error("载体到期清理失败 table=%s error=%s", table, type(error).__name__)
+            raise
+
+
+def _build_carrier_retention_duty(
+    config: SchedulerConfig,
+    *,
+    stop: threading.Event,
+    audit: AuditSink,
+) -> ExpiredCarrierRetentionDuty:
+    """装配载体到期清理职责。**总是装配**，理由见类文档。"""
+    from lingxi.adapters.postgres_carrier_retention import PostgresCarrierRetention
+
+    return ExpiredCarrierRetentionDuty(
+        carriers=PostgresCarrierRetention(config.postgres_dsn, timeouts=config.postgres_timeouts),
+        audit=audit,
+        stop=stop,
+    )

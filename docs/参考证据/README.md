@@ -13,5 +13,6 @@
 - [验证与门禁形成记录](验证与门禁形成记录.md)：PR #12、Agent SDK 真实链路和审查事故如何形成现行门禁；仅用于追溯原因，不定义当前规则或当前通过状态。
 - [员工旅程验收检查单](员工旅程验收检查单.md)：飞书私聊入口完整员工可见路径的逐点检查单，后续验收窗口配当次执行卡复用；每行给出可追溯的 `V-*` 断言与双通道观测要求。
 - [问数 MCP `list_metrics` 真实响应形状](问数MCP-list_metrics真实响应形状.md)：2026-08-19 对真实问数 MCP（`MCP Metric Query Server 1.27.2`）的第一次实测，`list_metrics` 的逐字返回形状、实测到的 9 个指标全集与无效令牌的拒绝形态；只测了 `list_metrics`，`query_metric`/`search_dimension` 未测。
+- [能力沿革记录](能力沿革记录.md)：[当前能力](../当前能力.md)此前按时间堆积的沿革条目，逐字搬移、按产品域索引（Issue [#598](https://github.com/Moshuiwang/lingxi/issues/598) 第二批「现值与沿革分离」）；只供追溯，**现值以[当前能力](../当前能力.md)为准**，本文不定义产品规则。
 
 已退场的一次性执行卡（2026-08-24 维护批，按本目录准入规则「一次性记录留 Issue / PR」处理；内容在 git 历史可追溯，入口留档：[MVP联合验收执行卡](https://github.com/Moshuiwang/lingxi/blob/256a905c5f370ab8c13f77c11a2cb6416badd6b2/docs/参考证据/MVP联合验收执行卡.md)、[专属云盘目录九步探针执行卡](https://github.com/Moshuiwang/lingxi/blob/256a905c5f370ab8c13f77c11a2cb6416badd6b2/docs/参考证据/专属云盘目录九步探针执行卡.md)、[专用授权凭据重建执行卡](https://github.com/Moshuiwang/lingxi/blob/256a905c5f370ab8c13f77c11a2cb6416badd6b2/docs/参考证据/专用授权凭据重建执行卡-20260820.md)）。

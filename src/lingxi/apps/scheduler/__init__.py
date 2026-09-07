@@ -73,7 +73,9 @@ from lingxi.apps.scheduler.permission_refresh import (
 )
 from lingxi.apps.scheduler.retention import (
     IDLE_CONVERSATION_SWEEP_AFTER,
+    CarrierRetentionReport,
     ContentCaptureRetentionDuty,
+    ExpiredCarrierRetentionDuty,
     IdleConversationSweepDuty,
     PermissionRetentionReport,
     PermissionRetentionSweepDuty,
@@ -104,6 +106,7 @@ __all__ = [
     "AlertPolicy",
     "AlertingDuty",
     "AuditSink",
+    "CarrierRetentionReport",
     "ContentCaptureRetentionDuty",
     "CredentialRotationLoop",
     "DEFAULT_FEISHU_BASE_URL",
@@ -114,6 +117,7 @@ __all__ = [
     "DEFAULT_STALLED_LEASE_SECONDS",
     "DEFAULT_STALLED_LIMIT",
     "DailyReportDuty",
+    "ExpiredCarrierRetentionDuty",
     "IDLE_CONVERSATION_SWEEP_AFTER",
     "IdleConversationSweepDuty",
     "LateReadinessRecoveryDuty",

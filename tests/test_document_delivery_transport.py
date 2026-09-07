@@ -236,7 +236,7 @@ class _RecordingDeliveryStore:
         self.body_degraded: list[tuple[str, str]] = []
         self._unnotified = list(unnotified)
 
-    # -- run_once 需要的循环级方法（只服务补发通知这条腿，其余返回空） --------
+    # -- run_once 需要的循环级方法（只服务补发通知这个环节，其余返回空） -------
 
     def fail_exhausted_pending(self) -> int:
         return 0
@@ -1770,6 +1770,49 @@ class RealNotifierWiringTest(unittest.TestCase):
         self.assertEqual(body["msg_type"], "text")
         self.assertIn("已生成", json.loads(body["content"])["text"])
         self.assertEqual(token, "t-fake-tenant-access-token")
+
+    def _assert_never_notified(self, send_response: Any) -> None:
+        """驱动一次 ``_send_ready_notice``，断言这次通知**没有**被记成已通知。"""
+        transport = _RecordingUserMessageTransport(
+            [_real_shape_tenant_token_response(), send_response]
+        )
+        store = _NoopNotifyStore()
+        alerts: list[tuple[str, str]] = []
+        consumer = DocumentDeliveryConsumer(
+            store=store,
+            docx=_SpyDocx(),
+            notifier=self._real_notifier(transport),
+            on_alert=lambda kind, task_id: alerts.append((kind, task_id)),
+        )
+
+        consumer._send_ready_notice(
+            request_id="tdd-ready-1",
+            task_id="tsk-ready-1",
+            requester_open_id=self.OPEN_ID,
+            document_id="doc-ready-1",
+        )
+
+        self.assertEqual(store.notified, [], "拿不到有效回执时绝不能记成已通知")
+        self.assertEqual(alerts, [("document_delivery_notice_failed", "tsk-ready-1")])
+
+    def test_an_empty_response_body_is_never_recorded_as_notified(self) -> None:
+        """IN-03 否定用例（#616 IF-R1）：飞书返回空响应体 ``{}``。
+
+        旧写法 ``if code not in (None, 0, "0")`` 把**码缺失**当成放行，于是
+        "没有有效凭据、飞书只回了一个空体"这种情形也会走到 ``mark_notified``，
+        一条从未发出的通知被永久记成已通知、补发路径下一轮直接跳过它。
+        """
+
+        self._assert_never_notified({})
+
+    def test_a_response_without_message_id_is_never_recorded_as_notified(self) -> None:
+        """码成功但缺必要回读标识 ``message_id``：消息可能已经发出，也可能没有。
+
+        既不得记成已通知，也不得当成确定没发生——本通道请求体带 ``uuid`` 去重键，
+        补发路径按同一 ``dedupe_key`` 重投不会产生第二条消息。
+        """
+
+        self._assert_never_notified({"code": 0, "msg": "success", "data": {}})
 
     def test_uncertain_terminal_notice_sends_through_the_real_adapter_without_error(self) -> None:
         transport = _RecordingUserMessageTransport(

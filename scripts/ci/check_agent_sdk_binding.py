@@ -79,13 +79,56 @@ def main() -> int:
         print(f"真实 SDK 冒烟：{failure}", file=sys.stderr)
         return 1
 
+    failure = check_result_message_error_fields()
+    if failure is not None:
+        print(f"真实 SDK 冒烟：{failure}", file=sys.stderr)
+        return 1
+
     version = getattr(claude_agent_sdk, "__version__", "未知")
     print(f"真实 SDK 冒烟：claude-agent-sdk {version} 可构造 {len(matchers)} 个事件的 hooks 配置")
     print(
         f"真实 SDK 冒烟：worker 入口可构造 ClaudeAgentOptions，消息类型齐备（{', '.join(MESSAGE_TYPE_NAMES)}）"
     )
+    print(
+        "真实 SDK 冒烟：ResultMessage 字段契约成立（errors/api_error_status 存在，"
+        "单数 error 不存在）"
+    )
     print("（本检查不覆盖「事件是否真的触发」，那一层只有 L4a 能答）")
     return 0
+
+
+def check_result_message_error_fields() -> str | None:
+    """IN-10（#650）保真读取的前提事实：真实 ``ResultMessage`` 必须有
+    ``errors``/``api_error_status`` 两个字段，且没有单数 ``error`` 字段。
+
+    ``adapters/claude_agent_session.py`` 读的正是这三个事实；桩测试只能证明
+    我们这一侧的假设没变，证明不了真实 dataclass 仍然长这样——本文件此前
+    从未真正 import 过 ``ResultMessage``，也正是本次 bug（读了一个不存在的
+    单数 ``error`` 字段、恒为 ``None``）此前一直没被任何检查发现的原因。
+    这里跑在 CI 里对该组"真实 SDK 契约样例"测试无条件生效，不依赖它们能否
+    因本机是否装了 worker extras 而被执行到（那组测试各自 ``skipUnless``）。
+    """
+    from claude_agent_sdk import ResultMessage
+
+    message = ResultMessage(
+        subtype="success",
+        duration_ms=0,
+        duration_api_ms=0,
+        is_error=False,
+        num_turns=0,
+        session_id="ci-smoke-session",
+    )
+    missing = [name for name in ("errors", "api_error_status") if not hasattr(message, name)]
+    if missing:
+        return f"ResultMessage 缺少字段 {missing}：SDK 版本或字段契约变了，IN-10 的保真读取已失效"
+    if hasattr(message, "error"):
+        return (
+            "ResultMessage 又出现了单数 error 字段："
+            "SDK 版本或字段契约变了，IN-10 的保真读取已失效"
+            "（这正是当初那个 bug 的前提假设，字段一旦回来，"
+            "我们的读取会静默对着错误的字段名）"
+        )
+    return None
 
 
 def check_worker_entry(expected_events: set[str]) -> str | None:

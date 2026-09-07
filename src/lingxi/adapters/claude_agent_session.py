@@ -348,6 +348,44 @@ _RESULT_OBSERVATION_FIELDS = (
     "usage_source",
 )
 
+# 真实 ``ResultMessage`` 没有 ``error`` 单数字段——那是本文件此前的读取错误
+# （恒读 ``None``）。真实字段是 ``errors: list[str] | None`` 与
+# ``api_error_status: int | None``。``errors`` 来自外部 CLI 进程，不能假设它
+# 守住任何上限；超出条数或单条长度都截断并留下可见标记，不做无界透传（与
+# V-审计-03 同一条纪律：不把外部载荷原样吞下）。
+_MAX_RESULT_ERROR_ITEMS = 10
+_MAX_RESULT_ERROR_ITEM_CHARS = 500
+_RESULT_ERROR_TRUNCATION_MARKER = "…[TRUNCATED]"
+
+
+def _bounded_result_errors(errors: Any) -> list[str] | None:
+    """把 ``ResultMessage.errors`` 收紧成有界列表：条数和单条长度都设上限。
+
+    真实链路观测到的形状通常只有 0~1 条重试期间的错误摘要，这里的上限是
+    防御性的，不是产品对"最多几条错误"的承诺。脱敏**不**在这一层做——本函数
+    与 subtype/terminal_reason 走的是同一条分层路径：这里只做"形状转换 +
+    防止无界透传"，模型可控自由文本离开进程前的脱敏统一收在
+    ``apps/worker/report.py`` 的出口。空列表、``None``、非字符串成员一律
+    归一为 ``None``（无有效错误可报）。
+    """
+    if not isinstance(errors, list) or not errors:
+        return None
+    kept = [item for item in errors if isinstance(item, str) and item]
+    if not kept:
+        return None
+    bounded = [
+        item
+        if len(item) <= _MAX_RESULT_ERROR_ITEM_CHARS
+        else item[:_MAX_RESULT_ERROR_ITEM_CHARS] + _RESULT_ERROR_TRUNCATION_MARKER
+        for item in kept
+    ]
+    if len(bounded) > _MAX_RESULT_ERROR_ITEMS:
+        # 留一个位置给可见的"还有几条被省略"标记，不悄悄砍掉尾部了事。
+        omitted = len(bounded) - (_MAX_RESULT_ERROR_ITEMS - 1)
+        bounded = bounded[: _MAX_RESULT_ERROR_ITEMS - 1]
+        bounded.append(f"[+{omitted} more errors omitted]")
+    return bounded
+
 
 def _result_event(message: Any) -> dict[str, Any]:
     """把一条 ``ResultMessage`` 收窄成只含观测字段的事件字典。
@@ -367,9 +405,12 @@ def _result_event(message: Any) -> dict[str, Any]:
     session_id = getattr(message, "session_id", None)
     if isinstance(session_id, str) and session_id:
         event["session_id"] = session_id
-    error_text = getattr(message, "error", None)
-    if isinstance(error_text, str) and error_text:
-        event["error"] = error_text[:500]
+    errors = _bounded_result_errors(getattr(message, "errors", None))
+    if errors is not None:
+        event["errors"] = errors
+    api_error_status = getattr(message, "api_error_status", None)
+    if isinstance(api_error_status, int) and not isinstance(api_error_status, bool):
+        event["api_error_status"] = api_error_status
     return event
 
 

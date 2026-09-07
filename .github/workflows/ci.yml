@@ -298,8 +298,8 @@ jobs:
       github.event_name != 'pull_request' || github.base_ref != 'main' ||
       (needs.classify.outputs.mode != 'docs' && needs.classify.outputs.risk_level != 'l1')
     runs-on: ubuntu-24.04
-    # migrate 腿在争抢下实测过 4m32s（此前 bot-test 腿也曾 5 分钟触顶，该 extra 已随
-    # #146 清退删除）。每条腿只做「干净环境装一个 extra + 导入校验」，8 分钟足够且
+    # migrate 路径在争抢下实测过 4m32s（此前 bot-test 路径也曾 5 分钟触顶，该 extra 已随
+    # #146 清退删除）。每条路径只做「干净环境装一个 extra + 导入校验」，8 分钟足够且
     # 仍能挡住真正的挂死。
     timeout-minutes: 8
     strategy:
@@ -323,7 +323,7 @@ jobs:
       - name: 配置 Python 运行时
         uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
-          # 与 gate 同一版本；此处不开 pip 缓存，三条矩阵腿的缓存键相同会互相抢占，
+          # 与 gate 同一版本；此处不开 pip 缓存，三条矩阵路径的缓存键相同会互相抢占，
           # 而这几个组都是小轮子，省下的时间不值那份噪声。
           python-version: '3.12'
 
@@ -367,7 +367,7 @@ jobs:
   #
   # 下面这行只掐掉这一种场景的**首次自动触发**：pull_request 目标是 main、来源分支
   # 是 epic/**、且既没有显式重跑也没有冻结候选触发标记。gate / extras 仍然每次都
-  # 跑——真正费时间、费算力的是这里的双腿八次镜像构建，不是那两个检查。直接 PR 到
+  # 跑——真正费时间、费算力的是这里两条路径的八次镜像构建，不是那两个检查。直接 PR 到
   # main 的普通改动（例如 fix/275 这类）**不受影响**，因为它们的 head_ref 不以
   # `epic/` 开头，走的还是原来的自动路径——这正是「PR 检查阶段的可复现性门保持
   # 不变」那部分。
@@ -437,14 +437,14 @@ jobs:
           echo "tag=${batch}-${short}" >> "${GITHUB_OUTPUT}"
           echo "不可变 tag：${batch}-${short}"
 
-      # **两腿必须走同一条构建路径，只有最终 tag 不同。**
+      # **A、B 两条路径必须走同一套构建命令，只有最终 tag 不同。**
       #
-      # 上一版 A 腿走 build_image.sh、B 腿是裸 `docker build`，于是 A 带上了来源标签
+      # 上一版 A 路径走 build_image.sh、B 路径是裸 `docker build`，于是 A 带上了来源标签
       # （LINGXI_SOURCE_COMMIT / LINGXI_SOURCE_TREE）而 B 的是 `unknown`。等价步骤要
-      # 逐字段比 `.Config`，而 Labels 就在 `.Config` 里——两腿**必然**不一致，等价检查
+      # 逐字段比 `.Config`，而 Labels 就在 `.Config` 里——两条路径**必然**不一致，等价检查
       # 恒红，publish 又 needs 着 image，于是整条发布路径被自己堵死。
       #
-      # 修法是让两腿共用 build_image.sh，而不是给 B 腿补一个 --build-arg：后者能让这次
+      # 修法是让两条路径共用 build_image.sh，而不是给 B 路径补一个 --build-arg：后者能让这次
       # 变绿，但下次再往构建里加任何一个参数，同样的漂移会重演一遍。构建方式只有一处
       # 定义，就没有"两处保持同步"这件事需要有人记得。
       - name: 构建四个镜像（构建 A）
@@ -459,8 +459,8 @@ jobs:
             docker tag "$(cat "${RUNNER_TEMP}/reference-${service}")" "lingxi-${service}:build-a"
           done
 
-      # 与 A 腿**逐字相同**的构建命令，只是工作目录不同、产出改打 :build-b。
-      # build_image.sh 会把两腿产出的镜像打上同一个 <批次>-<sha> tag；B 腿构建时那个
+      # 与 A 路径**逐字相同**的构建命令，只是工作目录不同、产出改打 :build-b。
+      # build_image.sh 会把两条路径产出的镜像打上同一个 <批次>-<sha> tag；B 路径构建时那个
       # tag 会指向 B 的镜像，而 A 的镜像已经另外打了 :build-a，不受影响。
       - name: 构建四个镜像（构建 B，独立目录、冷缓存）
         working-directory: build-b-second-independent-checkout
@@ -518,7 +518,7 @@ jobs:
         working-directory: build-a
         run: scripts/ci/verify_compose_structure.sh
 
-      # Issue #150：合并前把这次通过契约核对的四镜像（A 腿，与 B 腿内容级等价）
+      # Issue #150：合并前把这次通过契约核对的四镜像（A 路径，与 B 路径内容级等价）
       # 导出为可下载 artifact，并生成绑定 PR head SHA / Git tree / 构建输入的 manifest。
       # 只在真实 PR 触发时产出——workflow_dispatch 手动运行没有 PR 身份可绑定，不导出。
       #

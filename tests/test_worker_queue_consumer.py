@@ -3783,7 +3783,12 @@ class RealQueueTerminalTests(unittest.TestCase):
         self.assertEqual(self._event_count("tsk-q"), 2)
 
         # 闭环：Gateway 消费 outbox 后调用 confirm_delivery，业务终态才真正收敛
-        # 为 failed 并释放话题——不是这条收口路径自己直接释放。
+        # 为 failed 并释放话题——不是这条收口路径自己直接释放。确认前先补上
+        # Gateway 侧的回执落库（消费游标越过终态事件 + 落库这条终态的平台消息
+        # 标识）：``confirm_delivery`` 只认这一对证据，见其「回执判据」一段。
+        self.queue.record_delivery_progress(
+            task_id="tsk-q", consumed_sequence=2, message_id="om_fake_q"
+        )
         confirmed = self.queue.confirm_delivery(
             task_id="tsk-q", platform_message_kind="text", platform_message_id="om_fake_q"
         )

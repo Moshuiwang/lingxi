@@ -219,7 +219,7 @@ class GatewayTransaction(Protocol):
 
     `V-队列-01` 要求 ``inbound_event`` 插入、``conversation`` 抢占、``task`` 插入落在
     **同一事务**里，因此这些方法刻意只在事务对象上提供，拿不到"事务外顺手写一条"的入口。
-    这与代码框架第二节「写路径上 audit.record 必须接收调用方事务对象」是同一条约束。
+    这与代码框架第二节「写路径上 enqueue_publish 须接收调用方连接对象」是同一条约束。
     """
 
     def insert_inbound_event(
