@@ -81,7 +81,11 @@ def load_aliases(path: Path) -> tuple[dict[str, str] | None, list[str]]:
     if not isinstance(document, dict):
         return None, [f"L1 别名表顶层必须是表：{path}"]
     errors: list[str] = []
-    unknown = sorted(set(document) - {"aliases"})
+    # `examples` 是欢迎卡三条示例句各自优先使用哪个指标的登记（`prefer` 列表，按位置
+    # 对应三条句子、允许重复）。它与 `aliases` 同放一个文件：挑哪些指标当开场白、按
+    # 什么顺序展示，都是产品选择，放在一起意味着改一个文件就能同时改名字、顺序与
+    # 开场白，不必改代码。顶层表仍然是白名单——新长出来的结构必须先在这里登记。
+    unknown = sorted(set(document) - {"aliases", "examples"})
     if unknown:
         errors.append("L1 别名表出现未登记顶层表：" + "、".join(unknown))
     aliases = document.get("aliases")
@@ -100,7 +104,41 @@ def load_aliases(path: Path) -> tuple[dict[str, str] | None, list[str]]:
             )
             continue
         valid[key] = value
+
+    errors.extend(_example_preference_errors(document, valid))
     return (valid if not errors else None), errors
+
+
+def _example_preference_errors(
+    document: Mapping[str, object], aliases: Mapping[str, str]
+) -> list[str]:
+    """校验 ``[examples] prefer``：可以不写，写了就必须指向有中文名的真实指标。
+
+    指向一个没有中文名的指标不会响亮失败——欢迎卡会安静地换一个指标补位，卡面看着
+    正常，产品负责人以为自己挑的开场白生效了，其实没有。这类"看着对、其实没生效"的
+    配置只有在 CI 里当场判红才拦得住。
+    """
+    examples = document.get("examples")
+    if examples is None:
+        return []
+    if not isinstance(examples, Mapping):
+        return ["L1 别名表的 [examples] 必须是表"]
+    unknown = sorted(set(examples) - {"prefer"})
+    if unknown:
+        return ["L1 别名表 [examples] 出现未登记键：" + "、".join(unknown)]
+    prefer = examples.get("prefer")
+    if prefer is None:
+        return []
+    if not isinstance(prefer, list):
+        return ["L1 别名表 [examples] prefer 必须是列表"]
+    known = set(aliases.values())
+    errors: list[str] = []
+    for item in prefer:
+        if not isinstance(item, str) or not item:
+            errors.append("L1 别名表 [examples] prefer 的每一项必须是非空文本")
+        elif item not in known:
+            errors.append(f"L1 别名表 [examples] prefer 里的 {item!r} 在 [aliases] 里没有中文名")
+    return errors
 
 
 def _bound_names(node: ast.AST) -> set[str]:
