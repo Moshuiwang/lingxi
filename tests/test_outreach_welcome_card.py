@@ -99,7 +99,9 @@ class ExampleScopeRuleTest(unittest.TestCase):
         self.assertIn("上个月尼日利亚的新增订户数是多少", sections[3])
 
     def test_one_metric_only_still_yields_two_distinct_examples(self) -> None:
-        sections = welcome_sections(_audience(metric_names=("sub_recharge_money",)), catalog=CATALOG)
+        sections = welcome_sections(
+            _audience(metric_names=("sub_recharge_money",)), catalog=CATALOG
+        )
         self.assertIn("最近七天尼日利亚的充值金额是多少", sections[3])
         self.assertIn("上个月尼日利亚的充值金额是多少", sections[3])
 

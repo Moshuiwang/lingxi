@@ -75,9 +75,7 @@ class ShippedCatalogTest(unittest.TestCase):
 
     def test_no_shipped_chinese_name_is_itself_an_internal_id(self) -> None:
         """否定断言：别名列里填一个 snake_case 值等于什么都没翻译。"""
-        offenders = sorted(
-            label for label in default_metric_labels().values() if label.isascii()
-        )
+        offenders = sorted(label for label in default_metric_labels().values() if label.isascii())
         self.assertEqual(offenders, [])
 
 

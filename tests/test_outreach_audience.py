@@ -151,7 +151,9 @@ class CompanyNameMissingTest(unittest.TestCase):
         self.assertTrue(plan.active)
 
     def test_one_missing_name_among_several_still_skips(self) -> None:
-        facts = _facts(permissions='{"1011": ["sub_recharge_money"], "9999": ["sub_recharge_money"]}')
+        facts = _facts(
+            permissions='{"1011": ["sub_recharge_money"], "9999": ["sub_recharge_money"]}'
+        )
         plan = _plan(facts, company_names={"1011": "尼日利亚"})
         self.assertEqual(plan.skip_reason, SKIP_COMPANY_NAME_MISSING)
 
