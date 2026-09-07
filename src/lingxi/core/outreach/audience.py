@@ -32,6 +32,7 @@ SKIP_UNREADABLE_PERMISSIONS = "permissions_unreadable"
 SKIP_NO_METRICS = "no_metrics"
 SKIP_AMBIGUOUS_NAME = "roster_name_ambiguous"
 SKIP_COMPANY_NAME_MISSING = "company_name_missing"
+SKIP_METRIC_NAME_MISSING = "metric_name_missing"
 
 
 @dataclass(frozen=True)
@@ -96,14 +97,15 @@ def plan_outreach(
     facts: SubjectFacts,
     *,
     company_names: Mapping[str, str],
+    metric_labels: Mapping[str, str],
     total_company_count: int,
     catalog: ContentCatalog | None = None,
 ) -> AudiencePlan:
     """把一个人的库内事实装配成欢迎卡取值，或给出不发的原因。
 
-    ``company_names`` 是编号→中文名（查不到中文名的人整条跳过，见 :func:`_build_plan`）；
-    ``total_company_count`` 是当前可用公司总数，只在通配范围下用来把「全部公司」
-    说成一个数字。
+    ``company_names`` 是编号→中文名，``metric_labels`` 是指标 ID→中文名——**两者
+    查不到的人都整条跳过**，见 :func:`_build_plan`；``total_company_count`` 是当前
+    可用公司总数，只在通配范围下用来把「全部公司」说成一个数字。
     """
     if facts.user_id is None:
         return _skip(facts, SKIP_NOT_FOUND, active=False)
@@ -133,6 +135,7 @@ def plan_outreach(
         all_companies=all_companies,
         metrics=metrics,
         company_names=company_names,
+        metric_labels=metric_labels,
         total_company_count=total_company_count,
         catalog=catalog or default_content_catalog(),
     )
@@ -146,6 +149,7 @@ def _build_plan(
     all_companies: bool,
     metrics: tuple[str, ...],
     company_names: Mapping[str, str],
+    metric_labels: Mapping[str, str],
     total_company_count: int,
     catalog: ContentCatalog,
 ) -> AudiencePlan:
@@ -157,10 +161,16 @@ def _build_plan(
     公司编号查不到中文名的人**整条跳过**，不回落显示编号：编号是内部标识，把它印在
     一张欢迎卡上既不是这个人看得懂的东西，也说不清楚他的范围到底是什么。判据覆盖他
     范围里的每一个公司，包括会被折叠成计数的那些——连范围都说不全时不发。
+
+    指标同一条规则：``sub_recharge_money`` 这类内部 ID 查不到中文名的人**整条跳过**，
+    不回落展示 ID。判据覆盖他的每一个指标，不只是示例句会用到的头两个——「指标」字段
+    要把它们全列出来，漏一个都会把内部标识印上卡面。
     """
     missing = tuple(key for key in company_ids if not company_names.get(key))
     if missing:
         return _skip(facts, SKIP_COMPANY_NAME_MISSING, active=True)
+    if any(not metric_labels.get(metric_name) for metric_name in metrics):
+        return _skip(facts, SKIP_METRIC_NAME_MISSING, active=True)
     try:
         audience = WelcomeAudience(
             display_name=display_name,
@@ -168,6 +178,7 @@ def _build_plan(
             all_companies=all_companies,
             metric_names=metrics,
             company_names=dict(company_names),
+            metric_labels=dict(metric_labels),
             total_company_count=total_company_count,
         )
     except ValueError:
@@ -187,6 +198,7 @@ __all__ = [
     "ENABLED_ACCOUNT_STATE",
     "SKIP_AMBIGUOUS_NAME",
     "SKIP_COMPANY_NAME_MISSING",
+    "SKIP_METRIC_NAME_MISSING",
     "SKIP_NOT_ACTIVE",
     "SKIP_NOT_FOUND",
     "SKIP_NO_METRICS",

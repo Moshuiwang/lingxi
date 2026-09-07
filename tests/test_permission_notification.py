@@ -559,5 +559,37 @@ class UntranslatedFunctionLabelStaticReconciliationTests(unittest.TestCase):
         self.assertNotEqual(_references_to(self.DEFINING_MODULE, self.SYMBOL), ())
 
 
+class MetricNameIsShownInChineseTest(unittest.TestCase):
+    """职能位必须是人话（2026-09-07 生产预检发现：这里原样给出内部指标 ID）。
+
+    与公司位同一条回落姿势：查不到中文名时**原样展示 ID**，不因为一个说不全的
+    职能名就整条不发——不发这条通知比发一条说不全范围的通知更糟。欢迎卡刻意与此
+    相反（失败关闭、整条跳过），理由见 ``core/outreach/welcome_card.metric_label``。
+    """
+
+    def test_a_shipped_metric_id_is_rendered_as_its_chinese_name(self) -> None:
+        _, functions = describe_scope({"1011": ["sub_recharge_money"]})
+        self.assertEqual(functions, "充值金额")
+
+    def test_no_internal_snake_case_id_reaches_the_user(self) -> None:
+        """否定断言：本条钉住那个缺陷本身。"""
+        _, functions = describe_scope({"*": ["sub_recharge_money", "sub_new_count"]})
+        self.assertNotIn("sub_recharge_money", functions)
+        self.assertNotIn("sub_new_count", functions)
+        # 顺序仍由权限文档里的指标 ID 决定（``lookup_metrics`` 取并集后排序），
+        # 翻译只发生在展示这一步：确定、可复现，与文件行序和中文笔画都无关。
+        self.assertEqual(functions, "新增订户数、充值金额")
+
+    def test_a_metric_without_a_chinese_name_falls_back_to_the_id(self) -> None:
+        _, functions = describe_scope({"1011": ["not_in_the_alias_map"]}, metric_labels={})
+        self.assertEqual(functions, "not_in_the_alias_map")
+
+    def test_injected_labels_win_over_the_shipped_map(self) -> None:
+        _, functions = describe_scope(
+            {"1011": ["sub_recharge_money"]}, metric_labels={"sub_recharge_money": "注入的名字"}
+        )
+        self.assertEqual(functions, "注入的名字")
+
+
 if __name__ == "__main__":  # pragma: no cover
     unittest.main()

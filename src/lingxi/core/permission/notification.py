@@ -22,6 +22,7 @@ from enum import Enum
 from typing import Any, Protocol
 
 from lingxi.config.content import ContentCatalog, RenderedContent, default_content_catalog
+from lingxi.config.metric_labels import default_metric_labels
 from lingxi.core.permission.publish_row import (
     ALL_COMPANIES_KEY,
     lookup_metrics,
@@ -115,6 +116,7 @@ def describe_scope(
     *,
     catalog: ContentCatalog | None = None,
     company_names: CompanyNameResolver | None = None,
+    metric_labels: Mapping[str, str] | None = None,
 ) -> tuple[str, str]:
     """把一份权限文档说成「公司范围, 职能范围」两串展示文本。
 
@@ -122,8 +124,14 @@ def describe_scope(
     已经覆盖了它们，并列会让用户看到自相矛盾的范围。其余情况按键排序后经
     ``company_names``（非空时）翻译成「中文名（编号）」，查不到或未注入解析口
     时原样展示编号。职能位走 ``lookup_metrics`` 的 ``company_id=None`` 分支，
-    对全部键取并集是存在性判定而非范围判定，回退制不受影响。值原样透传，不做
-    大小写或全半角归一——这些字符串将来是逐字匹配的指标名。
+    对全部键取并集是存在性判定而非范围判定，回退制不受影响。
+
+    职能位按 ``metric_labels``（缺省取随包别名表
+    :func:`~lingxi.config.metric_labels.default_metric_labels`）换成中文名：
+    ``sub_recharge_money`` 这类内部 snake_case ID 是给系统看的，印进用户消息里
+    既读不懂也泄露内部标识。**查不到中文名的指标原样展示 ID**——与公司位同一条
+    回落姿势，理由也同一条：不发这条通知比发一条说不全范围的通知更糟。用于匹配的
+    仍然是文档里的原值，翻译只发生在展示这一步，不做大小写或全半角归一。
     """
     source = catalog or default_content_catalog()
     if ALL_COMPANIES_KEY in document:
@@ -145,7 +153,10 @@ def describe_scope(
         companies = SCOPE_SEPARATOR.join(
             _company_display(company_id, name_by_id.get(company_id)) for company_id in company_ids
         )
-    functions = SCOPE_SEPARATOR.join(lookup_metrics(document))
+    labels = default_metric_labels() if metric_labels is None else metric_labels
+    functions = SCOPE_SEPARATOR.join(
+        labels.get(metric_name, metric_name) for metric_name in lookup_metrics(document)
+    )
     return companies, functions
 
 

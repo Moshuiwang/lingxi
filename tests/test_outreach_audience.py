@@ -16,6 +16,7 @@ from lingxi.config.content import default_content_catalog
 from lingxi.core.outreach.audience import (
     SKIP_AMBIGUOUS_NAME,
     SKIP_COMPANY_NAME_MISSING,
+    SKIP_METRIC_NAME_MISSING,
     SKIP_NO_METRICS,
     SKIP_NO_OPEN_ID,
     SKIP_NO_PERMISSIONS,
@@ -29,7 +30,9 @@ from lingxi.core.outreach.audience import (
 CATALOG = default_content_catalog()
 EMAIL = "joshua.wang@example.invalid"
 NAMES = ("王晋 (Joshua Wang)",)
-PERMISSIONS = '{"1011": ["充值金额", "日活用户数"]}'
+PERMISSIONS = '{"1011": ["sub_recharge_money", "sub_new_count"]}'
+#: 见 tests/test_outreach_welcome_card.METRIC_LABELS：夹具用生产真实形状。
+METRIC_LABELS = {"sub_recharge_money": "充值金额", "sub_new_count": "新增订户数"}
 
 
 def _facts(**overrides) -> SubjectFacts:
@@ -46,10 +49,16 @@ def _facts(**overrides) -> SubjectFacts:
     return SubjectFacts(**base)
 
 
-def _plan(facts: SubjectFacts, *, company_names: dict[str, str] | None = None):
+def _plan(
+    facts: SubjectFacts,
+    *,
+    company_names: dict[str, str] | None = None,
+    metric_labels: dict[str, str] | None = None,
+):
     return plan_outreach(
         facts,
         company_names={"1011": "尼日利亚"} if company_names is None else company_names,
+        metric_labels=METRIC_LABELS if metric_labels is None else metric_labels,
         total_company_count=43,
         catalog=CATALOG,
     )
@@ -65,7 +74,7 @@ class SendableTest(unittest.TestCase):
         self.assertEqual(plan.metric_count, 2)
 
     def test_the_wildcard_scope_is_folded_for_the_dry_run_listing(self) -> None:
-        plan = _plan(_facts(permissions='{"*": ["充值金额"]}'))
+        plan = _plan(_facts(permissions='{"*": ["sub_recharge_money"]}'))
         self.assertTrue(plan.sendable)
         self.assertEqual(plan.company_scope, "全部公司（43 家）")
 
@@ -142,14 +151,14 @@ class CompanyNameMissingTest(unittest.TestCase):
         self.assertTrue(plan.active)
 
     def test_one_missing_name_among_several_still_skips(self) -> None:
-        facts = _facts(permissions='{"1011": ["充值金额"], "9999": ["充值金额"]}')
+        facts = _facts(permissions='{"1011": ["sub_recharge_money"], "9999": ["sub_recharge_money"]}')
         plan = _plan(facts, company_names={"1011": "尼日利亚"})
         self.assertEqual(plan.skip_reason, SKIP_COMPANY_NAME_MISSING)
 
     def test_a_folded_long_list_is_judged_by_the_same_rule(self) -> None:
         """连范围都说不全的人不发，即使那张卡只会显示"N 家公司"。"""
         ids = [str(1010 + index) for index in range(6)]
-        permissions = "{" + ", ".join(f'"{key}": ["充值金额"]' for key in ids) + "}"
+        permissions = "{" + ", ".join(f'"{key}": ["sub_recharge_money"]' for key in ids) + "}"
         names = {key: f"公司{key}" for key in ids[:-1]}
         self.assertEqual(
             _plan(_facts(permissions=permissions), company_names=names).skip_reason,
@@ -157,12 +166,36 @@ class CompanyNameMissingTest(unittest.TestCase):
         )
 
     def test_the_wildcard_scope_never_needs_a_company_name(self) -> None:
-        plan = _plan(_facts(permissions='{"*": ["充值金额"]}'), company_names={})
+        plan = _plan(_facts(permissions='{"*": ["sub_recharge_money"]}'), company_names={})
         self.assertTrue(plan.sendable)
 
     def test_the_skip_reason_carries_no_company_number(self) -> None:
         plan = _plan(_facts(), company_names={})
         self.assertNotIn("1011", str(plan.skip_reason))
+
+
+class MetricNameMissingTest(unittest.TestCase):
+    """指标中文名查不到的人整条跳过，与公司名同一条规则。
+
+    2026-09-07 生产预检发现欢迎卡把 ``sub_recharge_money`` 这类内部 ID 印上卡面；
+    产品负责人当场裁定"至少要有中文"，编排者按公司位的既有姿势定为失败关闭。
+    """
+
+    def test_a_metric_without_a_chinese_name_skips_the_person(self) -> None:
+        """否定断言：宁可漏发，也不把内部标识给用户看。"""
+        plan = _plan(_facts(), metric_labels={})
+        self.assertFalse(plan.sendable)
+        self.assertEqual(plan.skip_reason, SKIP_METRIC_NAME_MISSING)
+        self.assertTrue(plan.active)
+
+    def test_one_missing_name_among_several_still_skips(self) -> None:
+        """判据覆盖每一个指标，不只是示例句会用到的头两个。"""
+        plan = _plan(_facts(), metric_labels={"sub_recharge_money": "充值金额"})
+        self.assertEqual(plan.skip_reason, SKIP_METRIC_NAME_MISSING)
+
+    def test_the_skip_reason_carries_no_internal_metric_id(self) -> None:
+        plan = _plan(_facts(), metric_labels={})
+        self.assertNotIn("sub_recharge_money", str(plan.skip_reason))
 
 
 if __name__ == "__main__":

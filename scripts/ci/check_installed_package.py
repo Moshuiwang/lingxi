@@ -55,6 +55,10 @@ REQUIRED_MODULES = (
     # 不进任何进程闭包，但必须随制品发布——运维在容器里跑它校验覆盖文件。
     "lingxi.config.content_override",
     "lingxi.config.content_check",
+    # 指标 ID→中文名（Trace #606 热修）：`core/permission/notification.py` 在**模块级**
+    # import 它，随包别名表 `admin_metric_alias_map.toml` 也必须一起装进制品——漏了
+    # 它，"当前可用范围"通知会退回展示内部指标 ID，欢迎卡则整批跳过不发。
+    "lingxi.config.metric_labels",
     "lingxi.core",
     "lingxi.core.alerting",
     "lingxi.core.conversation",
