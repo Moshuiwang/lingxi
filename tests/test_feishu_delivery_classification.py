@@ -727,11 +727,11 @@ class InFlightCodeIsResultUnknownTests(_ClassificationTestCase):
     """``230049``「仍在发送」：改判为"结果不明"，并带上**是否可安全重投**的依据。
 
     可安全重投**只**取决于该操作请求里带没带平台侧的**去重键**（登记在
-    ``core.delivery.ports.DELIVERY_OPERATIONS``）：投递侧五类外发一个都没有——
+    ``core.delivery.ports.DELIVERY_OPERATIONS``）：投递侧六类外发一个都没有——
     CardKit 的整卡级 ``sequence`` 是严格递增的**操作序号**，不是去重键（同一个序号
     重投会被判成落后序号直接拒绝、随即降级到文本通道，而卡片上很可能已经有那份
-    答案，用户于是收到第二份完整答案）；建卡、卡片发送、文本发送请求体里更是什么
-    键都没有。带 ``uuid`` 去重键的只有通知/日报那条通道。
+    答案，用户于是收到第二份完整答案）；建卡、卡片发送、文本发送、文档写入请求体里
+    更是什么键都没有。带 ``uuid`` 去重键的只有通知/日报那条通道。
     """
 
     def test_card_update_in_flight_is_unknown_and_never_retry_safe(self) -> None:
