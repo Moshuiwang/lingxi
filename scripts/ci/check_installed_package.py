@@ -801,6 +801,10 @@ PROCESS_RUNTIME_IMPORTS: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {
             "lingxi.core.admin.views",
             "lingxi.config",
             "lingxi.config.content",
+            "lingxi.config.metric_labels",
+            # 指标 ID→中文名（Trace #606 热修）：`core/permission/notification.py` 在
+            # **模块级** import 它，凡是要把权限说成「当前可用范围」的进程都会加载；
+            # 随包别名表 admin_metric_alias_map.toml 也必须一起进制品。
             # 理由见 REQUIRED_MODULES 同名条目：`content.py` 的
             # `default_content_catalog` 函数内 import 它，渲染第一句文案就会加载。
             "lingxi.config.content_override",
@@ -1016,6 +1020,10 @@ PROCESS_RUNTIME_IMPORTS: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {
             "lingxi.adapters.postgres_conversation._transaction",
             "lingxi.config",
             "lingxi.config.content",
+            "lingxi.config.metric_labels",
+            # 指标 ID→中文名（Trace #606 热修）：`core/permission/notification.py` 在
+            # **模块级** import 它，凡是要把权限说成「当前可用范围」的进程都会加载；
+            # 随包别名表 admin_metric_alias_map.toml 也必须一起进制品。
             # 理由见 REQUIRED_MODULES 同名条目：`content.py` 的
             # `default_content_catalog` 函数内 import 它，渲染第一句文案就会加载。
             "lingxi.config.content_override",
@@ -1104,6 +1112,10 @@ PROCESS_RUNTIME_IMPORTS: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {
             "lingxi.apps.healthcheck.__main__",
             "lingxi.config",
             "lingxi.config.content",
+            "lingxi.config.metric_labels",
+            # 指标 ID→中文名（Trace #606 热修）：`core/permission/notification.py` 在
+            # **模块级** import 它，凡是要把权限说成「当前可用范围」的进程都会加载；
+            # 随包别名表 admin_metric_alias_map.toml 也必须一起进制品。
             # 理由见 REQUIRED_MODULES 同名条目：`content.py` 的
             # `default_content_catalog` 函数内 import 它，渲染第一句文案就会加载。
             "lingxi.config.content_override",
