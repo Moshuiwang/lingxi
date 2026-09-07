@@ -66,12 +66,15 @@ def load_metric_alias_map(path: Path | None = None) -> Mapping[str, str]:
 def reverse_metric_labels(aliases: Mapping[str, str]) -> Mapping[str, str]:
     """把「别名 → 指标 ID」翻成展示侧要的「指标 ID → 中文名」。
 
-    同一个 ID 有多个别名时取**排序后的第一个**，不是"文件里的最后一条"：字典序是
-    与文件行序无关的确定结果，编辑别名表时挪动行不会悄悄换掉用户看到的说法。
+    **保持文件里的先后**：返回映射的键序就是用户可见的展示顺序（欢迎卡「指标」字段
+    与示例句都按它排）。挑哪个指标先出现是产品选择，把它放在别名表里意味着改顺序
+    不必动代码；字典序会把这个选择夺走，换成一个与业务无关的排法。
+
+    同一个 ID 写了多个别名时取**文件里第一次出现的那个**，与顺序同一条依据。
     """
     labels: dict[str, str] = {}
-    for alias in sorted(aliases):
-        labels.setdefault(aliases[alias], alias)
+    for alias, metric_id in aliases.items():
+        labels.setdefault(metric_id, alias)
     return labels
 
 
@@ -86,7 +89,29 @@ def default_metric_labels() -> Mapping[str, str]:
     return MappingProxyType(dict(reverse_metric_labels(load_metric_alias_map())))
 
 
+@lru_cache(maxsize=1)
+def default_example_metrics() -> tuple[str, ...]:
+    """欢迎卡示例句优先使用的指标 ID（随包别名表 ``[examples] prefer``）。
+
+    读不到、格式不对或为空时返回空元组——调用方据此退回展示顺序，不会因为这份
+    可选配置缺失就发不出卡。
+    """
+    try:
+        with default_metric_alias_map_path().open("rb") as config_file:
+            document = tomllib.load(config_file)
+    except (OSError, tomllib.TOMLDecodeError):
+        return ()
+    examples = document.get("examples")
+    if not isinstance(examples, Mapping):
+        return ()
+    prefer = examples.get("prefer")
+    if not isinstance(prefer, list):
+        return ()
+    return tuple(item for item in prefer if isinstance(item, str) and item)
+
+
 __all__ = [
+    "default_example_metrics",
     "default_metric_alias_map_path",
     "default_metric_labels",
     "load_metric_alias_map",

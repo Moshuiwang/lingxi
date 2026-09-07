@@ -32,7 +32,7 @@ EMAIL = "joshua.wang@example.invalid"
 NAMES = ("王晋 (Joshua Wang)",)
 PERMISSIONS = '{"1011": ["sub_recharge_money", "sub_new_count"]}'
 #: 见 tests/test_outreach_welcome_card.METRIC_LABELS：夹具用生产真实形状。
-METRIC_LABELS = {"sub_recharge_money": "充值金额", "sub_new_count": "新增订户数"}
+METRIC_LABELS = {"sub_recharge_money": "充值金额", "sub_new_count": "新增用户数"}
 
 
 def _facts(**overrides) -> SubjectFacts:

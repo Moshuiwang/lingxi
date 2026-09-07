@@ -1,5 +1,5 @@
 [meta]
-version = "2026-09-05"
+version = "2026-09-07"
 
 [texts]
 "onboarding.checking" = "已收到，正在核对你的身份和银河权限，请稍候。无需重复发送。"
@@ -328,18 +328,25 @@ version = "2026-09-05"
 "outreach.welcome.scope_heading" = "你当前可用范围"
 "outreach.welcome.field_company" = "公司"
 "outreach.welcome.field_metric" = "指标"
+# 维度是**对所有人一样**的能力面（不随权限变），因此是固定文案而不是取值；公司位
+# 单列是因为它受权限约束，其余维度不受。改这一行等于改一次对用户的承诺：写进去的
+# 时间跨度与维度，用户会照着问。
+"outreach.welcome.field_dimension" = "维度"
+"outreach.welcome.dimension_body" = "时间（最近 3 年）、大区、城市"
 "outreach.welcome.examples_heading" = "可以这样开始"
-# 两条示例都用**这个人自己**的指标名，不写死「充值金额」：批准的取值规则要求示例随
-# 范围变，而一条他没有权限的指标同样会让他问出拿不到的结果——与「单一公司却说各公司」
-# 是同一类错误。批准文案里的示例「最近七天尼日利亚的充值金额是多少」正是本模板在
-# 「单公司 + 充值金额」下的取值。
-"outreach.welcome.example_recent" = "最近七天{company_word}的{metric_name}是多少"
-"outreach.welcome.example_last_month" = "上个月{company_word}的{metric_name}是多少"
-"outreach.welcome.example_document" = "把上面的结果整理成一份文档"
+# 三条示例都用**这个人自己**的指标名，不写死具体指标：取值规则要求示例随范围变，
+# 一条他没有权限的指标会让他问出拿不到的结果——与「单一公司却说各公司」是同一类错误。
+# 三句按**预估执行时间**由简到繁：一个现成读数 → 跨两个时间窗比一次 → 汇总加分析再
+# 落一份文档，让人先拿到一次快的成功，再知道它能做更重的事。
+# 第一句用「前天」而不是「昨天」：昨天的数据往往还没落库，让人第一次提问就扑空是最
+# 坏的开场。
+"outreach.welcome.example_recent" = "前天{company_word}的{metric_name}是多少"
+"outreach.welcome.example_last_month" = "本月累计{metric_name}是多少？环比上月有何变化？"
+"outreach.welcome.example_document" = "上一个自然周{company_word}的{metric_name}的环比变化按大区汇总，并分析值得关注的前三名和后三名，整理成飞书文档发给我"
 "outreach.welcome.contact_heading" = "遇到问题"
 # 联系方式不放可点击链接（#541 裁定，理由见该 Issue）：飞书 open_id 按应用隔离，
 # 裸 openId 会解析到别的应用；个人邀请链接带账号 token 且会过期。
-"outreach.welcome.contact_body" = "结果不对或用不起来，请联系王志鹏（wangzp@startimes.com.cn）。反馈时请附上截图、你提问的原话、以及大致时间，这样定位最快。"
+"outreach.welcome.contact_body" = "结果不对或用不起来，请联系王志鹏（wangzp@startimes.com.cn）。反馈时请附上截图。"
 # 批准文案里这一行前面标着「（脚注）」，那是排版位置的标注、不是要显示给用户的字：
 # 卡片里真出现「（脚注）」两个字会被读成漏删的编辑标记。位置由样式承担（永远排在
 # 最后一段），字面不带标注。

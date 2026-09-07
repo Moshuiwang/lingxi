@@ -578,7 +578,7 @@ class MetricNameIsShownInChineseTest(unittest.TestCase):
         self.assertNotIn("sub_new_count", functions)
         # 顺序仍由权限文档里的指标 ID 决定（``lookup_metrics`` 取并集后排序），
         # 翻译只发生在展示这一步：确定、可复现，与文件行序和中文笔画都无关。
-        self.assertEqual(functions, "新增订户数、充值金额")
+        self.assertEqual(functions, "新增用户数、充值金额")
 
     def test_a_metric_without_a_chinese_name_falls_back_to_the_id(self) -> None:
         _, functions = describe_scope({"1011": ["not_in_the_alias_map"]}, metric_labels={})

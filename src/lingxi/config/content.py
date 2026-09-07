@@ -195,6 +195,8 @@ REQUIRED_TEXT_KEYS: tuple[str, ...] = (
     "outreach.welcome.scope_heading",
     "outreach.welcome.field_company",
     "outreach.welcome.field_metric",
+    "outreach.welcome.field_dimension",
+    "outreach.welcome.dimension_body",
     "outreach.welcome.examples_heading",
     "outreach.welcome.example_recent",
     "outreach.welcome.example_last_month",

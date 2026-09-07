@@ -19,6 +19,7 @@ from lingxi.config.content import default_content_catalog
 from lingxi.core.outreach.welcome_card import (
     COMPANY_LIST_LIMIT,
     DEFAULT_WELCOME_CARD_STYLE,
+    EXAMPLE_BULLET,
     FIELD_LABEL_WEIGHT,
     FIELD_VALUE_WEIGHT,
     FOOTNOTE_MARKDOWN,
@@ -39,7 +40,7 @@ METRICS = ("sub_recharge_money", "sub_new_count")
 #: 指标 ID→中文名。夹具刻意用**生产上的真实形状**（内部 snake_case ID）：
 #: 此前这里直接写中文，等于替被测代码把翻译做掉了，卡面漏出内部 ID 的缺陷
 #: 因此在全部用例里都看不见（2026-09-07 生产预检当场发现）。
-METRIC_LABELS = {"sub_recharge_money": "充值金额", "sub_new_count": "新增订户数"}
+METRIC_LABELS = {"sub_new_count": "新增用户数", "sub_recharge_money": "充值金额"}
 
 
 def _audience(
@@ -69,7 +70,7 @@ class ExampleScopeRuleTest(unittest.TestCase):
         word = example_company_word(_audience(), catalog=CATALOG)
         self.assertEqual(word, "尼日利亚")
         sections = welcome_sections(_audience(), catalog=CATALOG)
-        self.assertIn("最近七天尼日利亚的充值金额是多少", sections[3])
+        self.assertIn("前天尼日利亚的新增用户数是多少", sections[3])
 
     def test_several_companies_use_the_shared_word_instead_of_a_company_name(self) -> None:
         audience = _audience(
@@ -77,7 +78,7 @@ class ExampleScopeRuleTest(unittest.TestCase):
         )
         self.assertEqual(example_company_word(audience, catalog=CATALOG), "各公司")
         self.assertIn(
-            "最近七天各公司的充值金额是多少", welcome_sections(audience, catalog=CATALOG)[3]
+            "前天各公司的新增用户数是多少", welcome_sections(audience, catalog=CATALOG)[3]
         )
 
     def test_all_companies_use_the_shared_word_too(self) -> None:
@@ -94,16 +95,35 @@ class ExampleScopeRuleTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             example_company_word(audience, catalog=CATALOG)
 
-    def test_the_second_example_uses_the_second_metric(self) -> None:
+    def test_each_example_takes_the_metric_the_alias_table_puts_at_that_position(self) -> None:
+        """三条句子按别名表 ``[examples] prefer`` **逐位**取指标，允许重复。"""
         sections = welcome_sections(_audience(), catalog=CATALOG)
-        self.assertIn("上个月尼日利亚的新增订户数是多少", sections[3])
+        self.assertIn("前天尼日利亚的新增用户数是多少", sections[3])
+        self.assertIn("本月累计新增用户数是多少？环比上月有何变化？", sections[3])
+        self.assertIn("上一个自然周尼日利亚的充值金额的环比变化按大区汇总", sections[3])
 
-    def test_one_metric_only_still_yields_two_distinct_examples(self) -> None:
-        sections = welcome_sections(
-            _audience(metric_names=("sub_recharge_money",)), catalog=CATALOG
+    def test_an_example_whose_preferred_metric_is_absent_falls_back(self) -> None:
+        """优先列表里他没有的那一条补位，不留空、也不印内部标识。"""
+        audience = _audience(
+            metric_names=("sub_recharge_money",),
+            metric_labels={"sub_recharge_money": "充值金额"},
         )
-        self.assertIn("最近七天尼日利亚的充值金额是多少", sections[3])
-        self.assertIn("上个月尼日利亚的充值金额是多少", sections[3])
+        sections = welcome_sections(audience, catalog=CATALOG)
+        self.assertIn("前天尼日利亚的充值金额是多少", sections[3])
+        self.assertNotIn("sub_", sections[3])
+
+    def test_one_metric_only_still_yields_three_distinct_examples(self) -> None:
+        """只有一个指标时三条句子仍各不相同：区别来自问法，不来自指标。"""
+        sections = welcome_sections(
+            _audience(
+                metric_names=("sub_recharge_money",),
+                metric_labels={"sub_recharge_money": "充值金额"},
+            ),
+            catalog=CATALOG,
+        )
+        lines = [line for line in sections[3].splitlines() if line.startswith(EXAMPLE_BULLET)]
+        self.assertEqual(len(lines), 3)
+        self.assertEqual(len(set(lines)), 3)
 
 
 class LongListRuleTest(unittest.TestCase):
@@ -145,10 +165,9 @@ class LongListRuleTest(unittest.TestCase):
             metric_names_text(audience)
 
     def test_the_examples_use_the_chinese_metric_name_not_the_internal_id(self) -> None:
-        """两条示例句都必须是人话；这一条钉住 2026-09-07 生产预检发现的那个缺陷。"""
+        """三条示例句都必须是人话；这一条钉住生产预检当场发现的那个缺陷。"""
         sections = welcome_sections(_audience(), catalog=CATALOG)
-        self.assertIn("最近七天尼日利亚的充值金额是多少", sections[3])
-        self.assertIn("上个月尼日利亚的新增订户数是多少", sections[3])
+        self.assertIn("前天尼日利亚的新增用户数是多少", sections[3])
         self.assertNotIn("sub_recharge_money", "".join(sections))
         self.assertNotIn("sub_new_count", "".join(sections))
 
@@ -204,7 +223,16 @@ class CardShapeTest(unittest.TestCase):
         elements = render_welcome_card(_audience(), catalog=CATALOG).payload["body"]["elements"]
         self.assertEqual(
             [element["tag"] for element in elements],
-            ["markdown", "hr", "column_set", "column_set", "column_set", "column_set", "markdown"],
+            [
+                "markdown",
+                "hr",
+                "column_set",
+                "column_set",
+                "column_set",
+                "column_set",
+                "column_set",
+                "markdown",
+            ],
         )
         self.assertIn(ROSTER_NAME, elements[0]["content"])
         self.assertIn("四达时代的经营数据助手", elements[0]["content"])
@@ -213,14 +241,17 @@ class CardShapeTest(unittest.TestCase):
         elements = render_welcome_card(_audience(), catalog=CATALOG).payload["body"]["elements"]
         rows = [element for element in elements if element["tag"] == "column_set"]
         labels = [row["columns"][0]["elements"][0]["content"] for row in rows]
-        self.assertEqual(labels, ["**公司**", "**指标**", "**可以这样开始**", "**遇到问题**"])
+        self.assertEqual(
+            labels, ["**公司**", "**指标**", "**维度**", "**可以这样开始**", "**遇到问题**"]
+        )
         for row in rows:
             self.assertEqual(row["flex_mode"], "none")
             self.assertEqual(row["columns"][0]["weight"], FIELD_LABEL_WEIGHT)
             self.assertEqual(row["columns"][1]["weight"], FIELD_VALUE_WEIGHT)
         values = [row["columns"][1]["elements"][0]["content"] for row in rows]
         self.assertEqual(values[0], "尼日利亚")
-        self.assertEqual(values[1], "充值金额、新增订户数")
+        # 指标按别名表的展示顺序排，不按权限文档里的顺序。
+        self.assertEqual(values[1], "新增用户数、充值金额")
 
     def test_the_footnote_is_the_last_element_and_rendered_as_secondary_text(self) -> None:
         elements = render_welcome_card(_audience(), catalog=CATALOG).payload["body"]["elements"]

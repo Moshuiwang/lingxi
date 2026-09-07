@@ -18,6 +18,7 @@ from enum import Enum
 from typing import Any
 
 from lingxi.config.content import ContentCatalog, default_content_catalog
+from lingxi.config.metric_labels import default_example_metrics
 
 #: 审计与记录里代表**整张欢迎卡**的内容键。卡片按段落拆成多个文案键（样式可换、
 #: 文案不动），但记录里必须有一个能一眼认出"发的是哪张卡"的键；取它们共同的前缀，
@@ -58,6 +59,12 @@ class WelcomeCardStyle(str, Enum):
     FIELD_LIST = "field_list"
     PLAIN_MARKDOWN = "plain_markdown"
 
+
+#: 三条示例句各自的内容键，顺序即卡上的先后（由简到繁）。
+EXAMPLE_KEYS = ("example_recent", "example_last_month", "example_document")
+
+#: 示例句条数。与 :data:`EXAMPLE_KEYS` 同长，:func:`example_metrics` 按它取指标。
+EXAMPLE_COUNT = len(EXAMPLE_KEYS)
 
 #: 产品负责人看过真机样卡后的定稿：乙＝标题栏＋字段列表（标题｜正文成对）＋无按钮。
 DEFAULT_WELCOME_CARD_STYLE = WelcomeCardStyle.FIELD_LIST
@@ -181,37 +188,67 @@ def example_company_word(audience: WelcomeAudience, *, catalog: ContentCatalog) 
     return catalog.text(_KEY_COMPANY_WORD_MULTI).text
 
 
+def ordered_metric_names(audience: WelcomeAudience) -> tuple[str, ...]:
+    """按展示顺序排这个人的指标。
+
+    顺序取自别名表里键的先后（``metric_labels`` 保持文件顺序）——挑哪个指标先给用户
+    看是产品选择。表里没有的排在最后并按自身排序，保证同一份权限每次渲染结果相同。
+    """
+    order = {metric_id: index for index, metric_id in enumerate(audience.metric_labels)}
+    fallback = len(order)
+    return tuple(sorted(audience.metric_names, key=lambda name: (order.get(name, fallback), name)))
+
+
 def metric_names_text(audience: WelcomeAudience) -> str:
-    """规则二后半句：指标当前最多九个，全列，顿号分隔——**一律中文名**。"""
+    """规则二后半句：指标当前最多九个，全列，顿号分隔——**一律中文名、按展示顺序**。"""
     return SCOPE_SEPARATOR.join(
-        audience.metric_label(metric_name) for metric_name in audience.metric_names
+        audience.metric_label(metric_name) for metric_name in ordered_metric_names(audience)
     )
+
+
+def example_metrics(audience: WelcomeAudience) -> tuple[str, ...]:
+    """三条示例句各用哪个指标：优先列表**按位置**对应三条句子，缺的用展示顺序补位。
+
+    允许两条句子落在同一个指标上——同一个指标的不同问法（某天的读数 vs 本月累计与
+    环比）是合理的产品选择，由别名表那份列表决定，不由本函数替产品拿主意。
+    优先列表里他没有的那一条自动补位——示例只能是他真问得出来的东西。
+    """
+    ordered = ordered_metric_names(audience)
+    held = set(audience.metric_names)
+    prefer = default_example_metrics()
+    picked: list[str] = []
+    for index in range(EXAMPLE_COUNT):
+        wanted = prefer[index] if index < len(prefer) else None
+        if wanted is not None and wanted in held:
+            picked.append(wanted)
+            continue
+        picked.append(next((name for name in ordered if name not in picked), ordered[0]))
+    return tuple(picked)
 
 
 def _example_lines(audience: WelcomeAudience, *, catalog: ContentCatalog) -> tuple[str, ...]:
-    """三条引导：两条按这个人自己的范围与指标取值，第三条固定。
+    """三条引导，**由简到繁**：一天的读数 → 环比分析 → 分区汇总并出文档。
 
-    第二条取第二个指标；只有一个指标时退回第一个——两句的时间范围不同，不会变成
-    重复的一句话。
+    「简繁」的判据是这一问大概要跑多久，不是句子长短：第一句取一个现成读数，第二句
+    要跨两个时间窗比一次，第三句要汇总再落一份文档。用意是让人先拿到一次快的成功，
+    再知道它能做更重的事。三句各取一个指标，见 :func:`example_metrics`。
     """
     company_word = example_company_word(audience, catalog=catalog)
-    first = audience.metric_label(audience.metric_names[0])
-    second = audience.metric_label(
-        audience.metric_names[1] if len(audience.metric_names) > 1 else audience.metric_names[0]
-    )
-    return (
-        catalog.text(
-            f"{WELCOME_CONTENT_KEY}.example_recent",
-            company_word=company_word,
-            metric_name=first,
-        ).text,
-        catalog.text(
-            f"{WELCOME_CONTENT_KEY}.example_last_month",
-            company_word=company_word,
-            metric_name=second,
-        ).text,
-        catalog.text(f"{WELCOME_CONTENT_KEY}.example_document").text,
-    )
+    picked = example_metrics(audience)
+    lines: list[str] = []
+    for key, metric_id in zip(EXAMPLE_KEYS, picked, strict=True):
+        content_key = f"{WELCOME_CONTENT_KEY}.{key}"
+        # 内容目录要求「调用方变量集合与模板集合相等」，而三条句子不必都提到公司位
+        # （「本月累计…」这类问法带上「各公司」反而累赘）。按模板自己声明的占位符传参，
+        # 文案因此可以逐条自由取舍，不必为了迁就调用方硬塞一个占位符。
+        template = catalog.text_template(content_key) or ""
+        candidates = {
+            "company_word": company_word,
+            "metric_name": audience.metric_label(metric_id),
+        }
+        variables = {name: value for name, value in candidates.items() if f"{{{name}}}" in template}
+        lines.append(catalog.text(content_key, **variables).text)
+    return tuple(lines)
 
 
 def welcome_greeting(audience: WelcomeAudience, *, catalog: ContentCatalog) -> str:
@@ -232,10 +269,12 @@ def welcome_lead(audience: WelcomeAudience, *, catalog: ContentCatalog) -> str:
 def welcome_fields(
     audience: WelcomeAudience, *, catalog: ContentCatalog | None = None
 ) -> tuple[tuple[str, str], ...]:
-    """四个「标题｜正文」字段：公司、指标、可以这样开始、遇到问题。
+    """五个「标题｜正文」字段：公司、指标、维度、可以这样开始、遇到问题。
 
     字段列表样式把标题放进左列、正文放进右列；markdown 分段样式用
     :data:`FIELD_SEPARATOR` 把两半拼成一行。两种读法共用同一份字。
+
+    维度是固定文案：它对所有人一样，不随这个人的权限变（公司位才受权限约束）。
     """
     source = catalog or default_content_catalog()
     key = WELCOME_CONTENT_KEY
@@ -248,6 +287,7 @@ def welcome_fields(
             company_scope_text(audience, catalog=source),
         ),
         (source.text(f"{key}.field_metric").text, metric_names_text(audience)),
+        (source.text(f"{key}.field_dimension").text, source.text(f"{key}.dimension_body").text),
         (source.text(f"{key}.examples_heading").text, examples),
         (source.text(f"{key}.contact_heading").text, source.text(f"{key}.contact_body").text),
     )
@@ -263,12 +303,13 @@ def welcome_sections(
     """
     source = catalog or default_content_catalog()
     key = WELCOME_CONTENT_KEY
-    company, metric, examples, contact = welcome_fields(audience, catalog=source)
+    company, metric, dimension, examples, contact = welcome_fields(audience, catalog=source)
     scope = "\n".join(
         (
             source.text(f"{key}.scope_heading").text,
             f"{company[0]}{FIELD_SEPARATOR}{company[1]}",
             f"{metric[0]}{FIELD_SEPARATOR}{metric[1]}",
+            f"{dimension[0]}{FIELD_SEPARATOR}{dimension[1]}",
         )
     )
     return (
@@ -403,7 +444,9 @@ __all__ = [
     "build_card_payload",
     "company_scope_text",
     "example_company_word",
+    "example_metrics",
     "metric_names_text",
+    "ordered_metric_names",
     "render_welcome_card",
     "welcome_fields",
     "welcome_greeting",

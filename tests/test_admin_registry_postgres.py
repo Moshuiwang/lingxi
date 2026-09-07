@@ -1166,7 +1166,7 @@ class DisplayNamesTests(AdminRegistryPostgresTestCase):
 
         queries = PostgresAdminQueries(self._dsn)
 
-        self.assertEqual(queries.metric_label(metric_id="sub_new_count"), "新增订户数")
+        self.assertEqual(queries.metric_label(metric_id="sub_new_count"), "新增用户数")
         self.assertEqual(queries.metric_label(metric_id="exchange_rate"), "汇率")
 
     def test_metric_label_falls_back_to_the_raw_id_when_no_alias_matches(self) -> None:
@@ -1222,7 +1222,7 @@ class DisplayNamesTests(AdminRegistryPostgresTestCase):
         self.assertEqual(
             result,
             {
-                "sub_new_count": "新增订户数",
+                "sub_new_count": "新增用户数",
                 "exchange_rate": "汇率",
                 "not_a_real_metric": "not_a_real_metric",
             },

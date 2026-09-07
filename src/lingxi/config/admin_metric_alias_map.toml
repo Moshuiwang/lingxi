@@ -35,12 +35,20 @@
 # "别名文本" = "真实指标ID"
 
 [aliases]
-"新增订户数" = "sub_new_count"
-"充值订户数" = "sub_recharge_count"
+# 顺序即用户可见的展示顺序（欢迎卡「指标」字段与示例句都按它排）。改顺序＝改展示，
+# 不必动代码。
+"新增用户数" = "sub_new_count"
+"充值用户数" = "sub_recharge_count"
 "充值金额" = "sub_recharge_money"
-"扣费订户数" = "sub_deduction_count"
+"扣费用户数" = "sub_deduction_count"
 "扣费金额" = "sub_deduction_money"
-"渠道市场份额" = "channel_market_sharing"
-"渠道费率" = "channel_rate"
+"收视率" = "channel_rate"
+"收视市占率" = "channel_market_sharing"
 "汇率" = "exchange_rate"
-"增值税率" = "vat_rate"
+"税率" = "vat_rate"
+
+# 欢迎卡三条示例句各自优先使用的指标，**按位置对应**三条句子；**允许重复**（两句
+# 讲同一个指标的不同问法是合理的产品选择）。这个人没有的那一条自动用展示顺序里还
+# 没用过的补位。写在这里而不是代码里：挑哪几个指标当开场白是产品选择，不是实现细节。
+[examples]
+prefer = ["sub_new_count", "sub_new_count", "sub_deduction_money"]

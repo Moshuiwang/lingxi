@@ -25,12 +25,14 @@ class ReverseDirectionTest(unittest.TestCase):
         labels = reverse_metric_labels({"充值金额": "sub_recharge_money"})
         self.assertEqual(labels, {"sub_recharge_money": "充值金额"})
 
-    def test_one_metric_with_several_aliases_always_renders_the_same_way(self) -> None:
-        """否定断言：不取"文件里的最后一条"——挪动行不该悄悄换掉用户看到的说法。"""
-        first = reverse_metric_labels({"乙别名": "m1", "甲别名": "m1"})
-        second = reverse_metric_labels({"甲别名": "m1", "乙别名": "m1"})
-        self.assertEqual(first, second)
-        self.assertEqual(first["m1"], min(("甲别名", "乙别名")))
+    def test_one_metric_with_several_aliases_takes_the_first_line_in_the_file(self) -> None:
+        """同一个 ID 写了多个别名时取文件里第一次出现的那个，与展示顺序同一条依据。"""
+        self.assertEqual(reverse_metric_labels({"乙别名": "m1", "甲别名": "m1"})["m1"], "乙别名")
+
+    def test_the_file_order_becomes_the_display_order(self) -> None:
+        """键序即用户可见的展示顺序——改别名表的行序就能改卡上的顺序，不必动代码。"""
+        labels = reverse_metric_labels({"甲": "m2", "乙": "m1", "丙": "m3"})
+        self.assertEqual(list(labels), ["m2", "m1", "m3"])
 
 
 class FailOpenTest(unittest.TestCase):
