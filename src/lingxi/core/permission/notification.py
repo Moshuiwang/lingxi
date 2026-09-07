@@ -120,18 +120,13 @@ def describe_scope(
 ) -> tuple[str, str]:
     """把一份权限文档说成「公司范围, 职能范围」两串展示文本。
 
-    公司位：出现全非通配键时一律按"全部公司"渲染，哪怕文档里还有别的键——通配
-    已经覆盖了它们，并列会让用户看到自相矛盾的范围。其余情况按键排序后经
-    ``company_names``（非空时）翻译成「中文名（编号）」，查不到或未注入解析口
-    时原样展示编号。职能位走 ``lookup_metrics`` 的 ``company_id=None`` 分支，
-    对全部键取并集是存在性判定而非范围判定，回退制不受影响。
-
-    职能位按 ``metric_labels``（缺省取随包别名表
-    :func:`~lingxi.config.metric_labels.default_metric_labels`）换成中文名：
-    ``sub_recharge_money`` 这类内部 snake_case ID 是给系统看的，印进用户消息里
-    既读不懂也泄露内部标识。**查不到中文名的指标原样展示 ID**——与公司位同一条
-    回落姿势，理由也同一条：不发这条通知比发一条说不全范围的通知更糟。用于匹配的
-    仍然是文档里的原值，翻译只发生在展示这一步，不做大小写或全半角归一。
+    公司位：出现全非通配键时一律按"全部公司"渲染——通配已覆盖其余键，并列会让用户
+    看到自相矛盾的范围。其余按键排序后经 ``company_names``（非空时）翻译成「中文名
+    （编号）」，查不到或未注入解析口时原样展示编号。
+    职能位走 ``lookup_metrics`` 的 ``company_id=None`` 分支（取并集是存在性判定而非
+    范围判定，回退制不受影响），再按 ``metric_labels``（缺省取随包别名表）换成中文
+    名——内部标识是给系统看的，印进用户消息里既读不懂也泄露内部结构。匹配仍用文档
+    原值，翻译只在展示这一步，不做大小写或全半角归一。
     """
     source = catalog or default_content_catalog()
     if ALL_COMPANIES_KEY in document:
@@ -153,6 +148,8 @@ def describe_scope(
         companies = SCOPE_SEPARATOR.join(
             _company_display(company_id, name_by_id.get(company_id)) for company_id in company_ids
         )
+    # 查不到中文名的指标原样展示标识，与公司位同一条回落姿势：不发这条通知，比发一条
+    # 说不全范围的通知更糟。欢迎卡刻意与此相反（失败关闭、整条跳过）。
     labels = default_metric_labels() if metric_labels is None else metric_labels
     functions = SCOPE_SEPARATOR.join(
         labels.get(metric_name, metric_name) for metric_name in lookup_metrics(document)

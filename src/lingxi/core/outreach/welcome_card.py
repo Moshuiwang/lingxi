@@ -117,15 +117,12 @@ class WelcomeAudience:
     def metric_label(self, metric_name: str) -> str:
         """指标的中文名；查不到**不回落 ID**，直接失败关闭。
 
-        判据与 :meth:`company_label` 逐字同一条，理由也同一条：``sub_recharge_money``
-        是内部标识，印在一张给用户看的欢迎卡上既读不懂、也说不清他能问什么。装配层
-        （``core/outreach/audience``）会先判掉这种人并给出 ``metric_name_missing``，
-        这里是同一条规则的最后一道。
+        判据与 :meth:`company_label` 同一条：``sub_recharge_money`` 是内部标识，印在
+        给用户看的卡上既读不懂、也说不清他能问什么。装配层会先判掉这种人并给出
+        ``metric_name_missing``，这里是同一条规则的最后一道。
 
-        **与「当前可用范围」通知刻意不同**：那条通知查不到中文名时原样展示 ID
-        （见 ``core/permission/notification.describe_scope``），因为不发通知比发一条
-        说不全范围的通知更糟；欢迎卡没有这个两难——不发就是不发，主动告知晚一天
-        没有任何用户损失。
+        与「当前可用范围」通知刻意不同（那条原样展示 ID）：不发通知比发一条说不全
+        范围的通知更糟，欢迎卡没有这个两难——主动告知晚一天没有任何用户损失。
         """
         label = self.metric_labels.get(metric_name)
         if not label:
