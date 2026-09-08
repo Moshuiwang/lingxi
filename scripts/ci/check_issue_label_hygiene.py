@@ -6,7 +6,7 @@
 和**不进状态链**的类别（`[tracking]` Trace、`[template]`／`长期参考`、`[board]`）。
 GitHub 本身不保证这条互斥；本脚本只做四件机械的事，把违反项列成一张待修正清单：
 
-1. 工作项类 Issue 的状态标签数（`待分诊`/`pre-ready`/`Ready`/`执行中`/`阻塞`/`待决策`）
+1. 工作项类 Issue 的状态标签数（`待分诊`/`pre-ready`/`Ready`/`执行中`/`待验收`/`观察中`/`阻塞`/`待决策`）
    不等于 1。
 2. `长期参考` 与任一状态标签共存（两者按新规则互斥，无论 Issue 属于哪个类别）。
 3. 带 `执行中` 标签、且最近一条领取留言写明的有效期已过（提示回收）——**有效期是自由
@@ -17,39 +17,28 @@ GitHub 本身不保证这条互斥；本脚本只做四件机械的事，把违�
 
 本检查**先只报不拦**：无论命中多少异常、或调用 `gh` 本身失败，退出码恒为 0——它是
 巡检工具，不是合并门禁；跑一段时间确认误报可控后再谈是否升级（#642 三、机器兜底）。
-需要本机已登录 `gh` 且能访问 GitHub API；不可用时打印原因并照常以 0 退出，不假装
-检查通过。
+本机通过 `LINGXI_GH_COMMAND` 指定已批准的 GitHub 身份入口绝对路径；Actions 使用
+作业原生 `gh`。不可用时打印原因并照常以 0 退出，不假装检查通过。
 """
 
 from __future__ import annotations
 
 import json
+import os
 import re
 import subprocess
 import sys
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from pathlib import Path
 
 REPOSITORY = "Moshuiwang/lingxi"
 
-STATE_LABELS = {"待分诊", "pre-ready", "Ready", "执行中", "阻塞", "待决策"}
+STATE_LABELS = {"待分诊", "pre-ready", "Ready", "执行中", "待验收", "观察中", "阻塞", "待决策"}
 LONG_TERM_REFERENCE_LABEL = "长期参考"
 TYPE_LABELS = {"变更", "缺陷", "维护", "研究", "ops", "documentation", "bug"}
 
-# 标题方括号字段 → 是否属于「工作项」（进状态链，恰好一个状态标签）。
-# `docs/协作约定.md`「Issue 标题字段」以英文为准（2026-08-06 起），但仓库里仍有
-# 早于该约定的中文方括号（如「[缺陷]」），一并识别，不因写法新旧漏检。
-WORK_ITEM_BRACKETS = {
-    "task",
-    "story",
-    "feature",
-    "bug",
-    "epic",
-    "research",
-    "decision",
-    "ops",
-    "缺陷",
-}
+# 未带标题前缀的旧 Issue 也按工作项检查；只有明确的三类入口排除状态链。
 NON_CHAIN_BRACKETS = {"tracking", "template", "board"}
 
 TITLE_BRACKET_PATTERN = re.compile(r"^\[([^\]]+)\]")
@@ -87,8 +76,15 @@ class Issue:
 
 
 def run_gh_json(args: list[str]) -> object:
+    command = os.environ.get("LINGXI_GH_COMMAND", "")
+    if command and not Path(command).is_absolute():
+        raise RuntimeError("LINGXI_GH_COMMAND 必须是已批准身份入口的绝对路径")
+    if not command:
+        if os.environ.get("GITHUB_ACTIONS") != "true":
+            raise RuntimeError("请设置 LINGXI_GH_COMMAND，不能回落个人 gh 登录")
+        command = "gh"
     result = subprocess.run(
-        ["gh", *args],
+        [command, *args],
         capture_output=True,
         text=True,
         timeout=60,
@@ -156,7 +152,7 @@ def check_state_label_count(issues: list[Issue]) -> list[str]:
     findings = []
     for issue in issues:
         bracket = issue.bracket
-        if bracket not in WORK_ITEM_BRACKETS:
+        if bracket in NON_CHAIN_BRACKETS:
             continue
         if issue.is_long_term_reference:
             continue  # 由 check_long_term_reference_conflict 单独报告，不重复计数
@@ -164,7 +160,7 @@ def check_state_label_count(issues: list[Issue]) -> list[str]:
         if count != 1:
             findings.append(
                 f"#{issue.number} 状态标签数={count}（{issue.state_labels or '无'}），"
-                f"工作项类（[{bracket}]）须恰好一个"
+                f"工作项类（{bracket or '无标题前缀'}）须恰好一个"
             )
     return findings
 
