@@ -471,7 +471,7 @@ step_cleanup() {
   run_or_print docker compose --env-file "${ENV_FILE}" \
     -f "${COMPOSE_BASE}" -f "${COMPOSE_STAGE_OVERLAY}" down
 
-  log "cleanup：受控触发夹具三面检查（用后撤除并回读，#147 现行方法的受控触发夹具合同；"
+  log "cleanup：受控触发夹具三面检查（用后撤除并回读，获批 Trace 的受控触发夹具合同；"
   log "  容器已 down，这一面自然为空，仍走同一函数保持判据一致）"
   if [[ "${CONFIRM_REAL_RUN}" == "1" ]]; then
     log "  夹具检查 1/3：宿主 shell 进程环境"
