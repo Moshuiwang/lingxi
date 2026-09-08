@@ -28,6 +28,16 @@ class ReleaseError(RuntimeError):
 
 
 def command(*args: str, input_text: str | None = None) -> str:
+    if args[0] == "gh":
+        entry = os.environ.get("LINGXI_GH_COMMAND")
+        if entry:
+            if not Path(entry).is_absolute():
+                raise ReleaseError("机器身份入口必须使用绝对路径")
+            args = (entry, *args[1:])
+        elif os.environ.get("GITHUB_ACTIONS") != "true":
+            raise ReleaseError(
+                "本机必须设置 LINGXI_GH_COMMAND 为已批准的机器身份入口，不使用个人登录"
+            )
     result = subprocess.run(args, input=input_text, capture_output=True, text=True, timeout=120)
     if result.returncode:
         # CLI 错误可能包含认证头或临时下载地址，日志只给命令名和退出码。

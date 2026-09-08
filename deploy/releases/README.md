@@ -37,7 +37,7 @@ main 持续研发，功能范围齐备时从明确提交创建 `release/X.Y`，�
 
 ## 选择部署版本
 
-发布者使用已有 GitHub 机器身份执行，只读查 Release 并生成不含凭据的镜像变量：
+发布者先将 `LINGXI_GH_COMMAND` 设置为本机已批准 GitHub 机器身份入口的绝对路径；缺失时拒绝执行，不能回落个人 gh 登录。GitHub Actions 内使用作业原生令牌。随后只读查 Release 并生成不含凭据的镜像变量：
 
 ```sh
 python3 scripts/ci/release_manifest.py resolve \

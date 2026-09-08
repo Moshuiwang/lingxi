@@ -7,7 +7,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "scripts/ci"))
@@ -51,6 +51,25 @@ def receipt(doc):
 
 
 class ReleaseManifestTests(unittest.TestCase):
+    def test_local_github_calls_require_explicit_machine_identity(self):
+        with (
+            patch.dict(os.environ, {"GITHUB_ACTIONS": "", "LINGXI_GH_COMMAND": ""}),
+            patch.object(release.subprocess, "run") as run,
+        ):
+            with self.assertRaises(release.ReleaseError):
+                release.command("gh", "api", "repos/example/repo")
+            run.assert_not_called()
+        with (
+            patch.dict(
+                os.environ, {"GITHUB_ACTIONS": "", "LINGXI_GH_COMMAND": "/approved/gh-machine"}
+            ),
+            patch.object(
+                release.subprocess, "run", return_value=Mock(returncode=0, stdout="{}")
+            ) as run,
+        ):
+            self.assertEqual(release.command("gh", "api", "repos/example/repo"), "{}")
+            self.assertEqual(run.call_args.args[0][0], "/approved/gh-machine")
+
     def test_complete_candidate_is_valid(self):
         release.validate_manifest(candidate(), "Moshuiwang/lingxi", prerelease=True)
 
