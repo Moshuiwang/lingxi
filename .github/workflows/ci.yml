@@ -4,6 +4,7 @@ on:
   pull_request:
     branches:
       - main
+      - 'release/**'
   # Story Fast 遇到部署、迁移、依赖或 CI 自身改动时复用同一份完整门禁，
   # 不在两个工作流里复制一套以后必然漂移的检查。
   workflow_call:
@@ -79,7 +80,8 @@ jobs:
     name: Epic Full / docs
     needs: [classify]
     if: >-
-      github.event_name == 'pull_request' && github.base_ref == 'main' &&
+      github.event_name == 'pull_request' &&
+      (github.base_ref == 'main' || startsWith(github.base_ref, 'release/')) &&
       needs.classify.outputs.docs_changed == 'true'
     runs-on: ubuntu-24.04
     timeout-minutes: 3
@@ -690,6 +692,7 @@ jobs:
           python3 scripts/ci/write_epic_candidate.py \
             --repository "${GITHUB_REPOSITORY}" \
             --pr-number "${{ github.event.pull_request.number }}" \
+            --base-ref "${{ github.base_ref }}" \
             --head-sha "${{ github.event.pull_request.head.sha }}" \
             --tested-sha "${GITHUB_SHA}" \
             --tree-sha "$(git rev-parse 'HEAD^{tree}')" \

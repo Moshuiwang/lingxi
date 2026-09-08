@@ -12,6 +12,7 @@ import argparse
 import io
 import json
 import os
+import re
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -40,16 +41,22 @@ class SafeRedirectHandler(urllib.request.HTTPRedirectHandler):
         return redirected
 
 
-def select_merged_pr(pulls: list[dict[str, Any]], commit_sha: str) -> dict[str, Any]:
+def select_merged_pr(
+    pulls: list[dict[str, Any]], commit_sha: str, base_ref: str = "main"
+) -> dict[str, Any]:
+    if base_ref != "main" and not re.fullmatch(r"release/[0-9]+\.[0-9]+", base_ref):
+        raise CandidateError("不支持的发布分支")
     eligible = [
         pr
         for pr in pulls
         if pr.get("merged_at")
-        and pr.get("base", {}).get("ref") == "main"
+        and pr.get("base", {}).get("ref") == base_ref
         and pr.get("merge_commit_sha") == commit_sha
     ]
     if len(eligible) != 1:
-        raise CandidateError(f"当前提交对应的已合并 main PR 数量为 {len(eligible)}，要求恰好 1")
+        raise CandidateError(
+            f"当前提交对应的已合并 {base_ref} PR 数量为 {len(eligible)}，要求恰好 1"
+        )
     return eligible[0]
 
 
@@ -64,6 +71,8 @@ def validate_document(
         "tree_sha": tree_sha,
         "run_id": run_id,
     }
+    if pr.get("base", {}).get("ref", "main") != "main":
+        expected["base_ref"] = pr["base"]["ref"]
     mismatches = [key for key, value in expected.items() if document.get(key) != value]
     if mismatches:
         raise CandidateError("候选证明与 main 不一致：" + "、".join(mismatches))
@@ -110,11 +119,11 @@ def read_candidate_from_zip(payload: bytes) -> dict[str, Any]:
 
 
 def verified_candidate(
-    reader: GitHubReader, *, repository: str, commit_sha: str, tree_sha: str
+    reader: GitHubReader, *, repository: str, commit_sha: str, tree_sha: str, base_ref: str = "main"
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     encoded_repo = urllib.parse.quote(repository, safe="/")
     pulls = reader.json(f"/repos/{encoded_repo}/commits/{commit_sha}/pulls")
-    pr = select_merged_pr(pulls, commit_sha)
+    pr = select_merged_pr(pulls, commit_sha, base_ref)
     artifact_name = f"epic-candidate-pr-{pr['number']}-{pr['head']['sha']}"
     encoded_head = urllib.parse.quote(pr["head"]["sha"], safe="")
 
@@ -174,6 +183,7 @@ def main() -> int:
     parser.add_argument("--repository", required=True)
     parser.add_argument("--commit-sha", required=True)
     parser.add_argument("--tree-sha", required=True)
+    parser.add_argument("--base-ref", default="main")
     parser.add_argument("--summary", type=Path)
     args = parser.parse_args()
 
@@ -185,9 +195,10 @@ def main() -> int:
         repository=args.repository,
         commit_sha=args.commit_sha,
         tree_sha=args.tree_sha,
+        base_ref=args.base_ref,
     )
     message = (
-        f"main 候选身份：通过（PR #{pr['number']}，Epic Full run {document['run_id']}，"
+        f"{args.base_ref} 候选身份：通过（PR #{pr['number']}，Epic Full run {document['run_id']}，"
         f"tree={args.tree_sha[:12]}）"
     )
     print(message)
