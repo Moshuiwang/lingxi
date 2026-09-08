@@ -1,5 +1,8 @@
 # 生产部署 Runbook（biplus-prod / Bot-Prod）
 
+> 新流程版本先按 [版本发布操作](releases/README.md) 使用 `release_manifest.py resolve --environment production` 核对正式发布资格与固定镜像，再执行下文部署。预发布版不得部署生产。切换前历史版本的回退继续按对应原始记录核对，不补造验收资格。
+
+
 > **定位声明**：本文件是未来 `biplus-prod` 生产部署的操作正文，写给到时执行部署的人照做；**它本身不构成执行授权**。任何一次真实生产执行（首次部署、后续升级、回滚、恢复演练）都必须先有一个独立的 `[ops]` Issue 完成开工前事实确认与授权，本文件只提供步骤、判据和边界，不替代那次授权。`[ops]` Issue 的产生方式（直接立项，或作为某个生产部署 Trace 的输出）按 [Issue #369](https://github.com/Moshuiwang/lingxi/issues/369) 的「建议去向」处理，本文件不预设具体路径。
 >
 > 本 Trace（#373 H2 批 S-H2-4）只交付这份 runbook 与配套决策记录，不执行任何生产操作，也不接触 `biplus-prod` 或 `Bot-Prod`。

@@ -12,7 +12,14 @@ SHA = re.compile(r"^[0-9a-f]{40}$")
 
 
 def candidate_document(
-    *, repository: str, pr_number: int, head_sha: str, tested_sha: str, tree_sha: str, run_id: int
+    *,
+    repository: str,
+    pr_number: int,
+    head_sha: str,
+    tested_sha: str,
+    tree_sha: str,
+    run_id: int,
+    base_ref: str = "main",
 ) -> dict[str, object]:
     if repository.count("/") != 1:
         raise ValueError("repository 必须是 owner/name")
@@ -25,8 +32,11 @@ def candidate_document(
     ):
         if not SHA.fullmatch(value):
             raise ValueError(f"{label} 不是 40 位小写 Git SHA")
+    if base_ref != "main" and not re.fullmatch(r"(?:release/[0-9]+\.[0-9]+|epic/.+)", base_ref):
+        raise ValueError("候选目标分支不受支持")
     return {
         "schema": 1,
+        **({"base_ref": base_ref} if base_ref != "main" else {}),
         "repository": repository,
         "pr_number": pr_number,
         "head_sha": head_sha,
@@ -44,6 +54,7 @@ def main() -> int:
     parser.add_argument("--tested-sha", required=True)
     parser.add_argument("--tree-sha", required=True)
     parser.add_argument("--run-id", type=int, required=True)
+    parser.add_argument("--base-ref", default="main")
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
 
@@ -54,6 +65,7 @@ def main() -> int:
         tested_sha=args.tested_sha,
         tree_sha=args.tree_sha,
         run_id=args.run_id,
+        base_ref=args.base_ref,
     )
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_text(

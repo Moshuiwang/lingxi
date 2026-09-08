@@ -2032,7 +2032,7 @@ def check_ci_workflow() -> list[str]:
             "story.yml 的 docs job 必须以 docs_changed=true 触发，确保 docs+L1 混合改动仍运行 verify_docs。"
         )
 
-    # `packages: write` 只能存在于 main push 工作流，且必须等待候选身份核对。
+    # 镜像写权限只在受保护维护分支合并后启用，PR 始终没有写权限。
     if "packages: write" in full or "packages: write" in story:
         failures.append("PR 工作流声明了 packages: write；PR 不得获得镜像仓库写权限。")
     publish_jobs = list(
@@ -2045,11 +2045,15 @@ def check_ci_workflow() -> list[str]:
             continue
         gated = re.search(
             r"^\s*if:.*github\.event_name\s*==\s*'push'", header, re.MULTILINE
-        ) and re.search(r"^\s*if:.*refs/heads/main", header, re.MULTILINE)
+        ) and re.search(
+            r"^\s*if:.*startsWith\(github.ref, 'refs/heads/release/'\).*github.ref_protected",
+            header,
+            re.MULTILINE,
+        )
         if not gated:
             failures.append(
                 f"publish.yml 的 job `{job_name}` 声明了 `packages: write`，但没有 "
-                "`if: github.event_name == 'push' && github.ref == 'refs/heads/main'` 限定。\n"
+                "受保护的 `refs/heads/release/` push 限定。\n"
                 "      同仓分支的 pull_request 会让这个 job 照样拿到写令牌——"
                 "改一行 workflow 就能在 PR 阶段推 / 覆盖 GHCR，绕过合并门禁。"
             )
