@@ -1,0 +1,58 @@
+name: Release Promotion
+
+on:
+  workflow_dispatch:
+    inputs:
+      candidate_tag:
+        description: 已验收的候选版本，例如 v2.4.0-rc.42
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  actions: read
+
+concurrency:
+  group: release-promotion
+  cancel-in-progress: false
+
+jobs:
+  candidate:
+    name: Release / acceptance check
+    if: github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main' && github.ref_protected
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: 核对候选与已审查验收记录
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          CANDIDATE_TAG: ${{ inputs.candidate_tag }}
+        run: |
+          python3 scripts/ci/release_manifest.py promote \
+            --repository "${GITHUB_REPOSITORY}" --tag "${CANDIDATE_TAG}" \
+            --output "${RUNNER_TEMP}/release-manifest.json"
+
+  promote:
+    name: Release / same images
+    if: github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main' && github.ref_protected
+    needs: [candidate]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: write
+      actions: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: 提升同一组镜像，不构建、不部署
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          CANDIDATE_TAG: ${{ inputs.candidate_tag }}
+        run: |
+          python3 scripts/ci/release_manifest.py promote \
+            --repository "${GITHUB_REPOSITORY}" --tag "${CANDIDATE_TAG}" \
+            --output "${RUNNER_TEMP}/release-manifest.json" --apply

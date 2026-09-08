@@ -178,6 +178,7 @@ python3 scripts/ci/check_installed_package.py --source-only
 # 生产 compose 零构建定义、镜像 tag 不可变、非 root。刻意不依赖 docker 与 YAML 库，
 # 这样一台没装 docker 的开发机也能跑出与 CI 相同的结论。
 python3 scripts/ci/check_deploy_contract.py
+python3 scripts/ci/check_release_flow.py
 
 # 半开状态守卫：有容器却没有 DSN 时，Python 真库断言会静默跳过、门禁却照样绿。
 # 这种「看起来跑了真库」的假信心必须直接失败（PR #48 独立复查发现）。

@@ -1153,7 +1153,7 @@ class PublishJobGuardTest(unittest.TestCase):
             steps:
               - run: python3 scripts/ci/verify_epic_candidate.py
           publish:
-            if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+            if: github.event_name == 'push' && startsWith(github.ref, 'refs/heads/release/') && github.ref_protected
             needs: [candidate]
             permissions:
               contents: read
@@ -1188,11 +1188,12 @@ class PublishJobGuardTest(unittest.TestCase):
 
     def test_publish_without_push_main_gate_is_caught(self) -> None:
         publish = self.PUBLISH.replace(
-            "if: github.event_name == 'push' && github.ref == 'refs/heads/main'", "if: always()"
+            "if: github.event_name == 'push' && startsWith(github.ref, 'refs/heads/release/') && github.ref_protected",
+            "if: always()",
         )
         failures = self._with_workflows(publish=publish)
         self.assertTrue(
-            any("packages: write" in f and "refs/heads/main" in f for f in failures), failures
+            any("packages: write" in f and "refs/heads/release/" in f for f in failures), failures
         )
 
     def test_publish_without_candidate_in_needs_is_caught(self) -> None:
