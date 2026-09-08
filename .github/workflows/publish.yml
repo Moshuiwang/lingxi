@@ -1,9 +1,9 @@
-name: Main Publish
+name: Release Candidate
 
 on:
   push:
     branches:
-      - main
+      - 'release/**'
     paths:
       - 'src/**'
       - 'tests/**'
@@ -22,12 +22,12 @@ permissions:
   contents: read
 
 concurrency:
-  group: main-publish-${{ github.ref }}
+  group: release-candidate-${{ github.ref }}
   cancel-in-progress: false
 
 jobs:
   candidate:
-    name: Main Publish / accepted candidate
+    name: Release / checked candidate
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     permissions:
@@ -46,18 +46,20 @@ jobs:
         run: |
           python3 scripts/ci/verify_epic_candidate.py \
             --repository "${GITHUB_REPOSITORY}" \
+            --base-ref "${GITHUB_REF_NAME}" \
             --commit-sha "${GITHUB_SHA}" \
             --tree-sha "$(git rev-parse 'HEAD^{tree}')" \
             --summary "${GITHUB_STEP_SUMMARY}"
 
   publish:
-    name: Main Publish
+    name: Release Candidate
     runs-on: ubuntu-24.04
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/heads/release/') && github.ref_protected
     needs: [candidate]
     timeout-minutes: 45
     permissions:
-      contents: read
+      contents: write
+      actions: read
       packages: write
     steps:
       - name: 检出代码
@@ -68,7 +70,8 @@ jobs:
       - name: 计算不可变 tag
         id: tag
         run: |
-          batch=$(date -u +%Y%m%d)
+          python3 scripts/ci/release_manifest.py prepare --output "${RUNNER_TEMP}/release-plan.json"
+          batch=$(git show -s --format=%cs "${GITHUB_SHA}" | tr -d '-')
           short=$(echo "${GITHUB_SHA}" | cut -c1-12)
           echo "batch=${batch}" >> "${GITHUB_OUTPUT}"
           echo "tag=${batch}-${short}" >> "${GITHUB_OUTPUT}"
@@ -107,3 +110,12 @@ jobs:
           path: ${{ runner.temp }}/images
           if-no-files-found: ignore
           retention-days: 14
+
+      - name: 四镜像回读与预发布记录
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          python3 scripts/ci/release_manifest.py candidate \
+            --plan "${RUNNER_TEMP}/release-plan.json" \
+            --image-tag "${{ steps.tag.outputs.tag }}" \
+            --output "${RUNNER_TEMP}/release-manifest.json"

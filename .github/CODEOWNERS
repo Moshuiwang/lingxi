@@ -2,3 +2,5 @@
 # 本文件配合 main 规则集的「Require review from Code Owners」生效；只覆盖合同文件，
 # 任务表 / 验收与其他文档不受影响。
 docs/traces/**/合同.md @Moshuiwang
+# 候选验收与恢复记录决定正式发布资格，必须由产品负责人批准。
+/deploy/releases/acceptance/ @Moshuiwang
