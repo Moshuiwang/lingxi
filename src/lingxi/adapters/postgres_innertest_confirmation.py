@@ -59,13 +59,11 @@ class InnertestPendingActions:
                 batch = cursor.fetchone()
                 moment = now or datetime.now(UTC)
                 code = self._guard(connection, pending, batch, clicker, version, moment)
+                if code is None and not cancel:
+                    code = self._confirm_current_items(connection, cursor, batch, action)
                 if code:
-                    decision = ConfirmDecision(
-                        kind=code, message="操作不存在、已失效或不是本人确认。"
-                    )
-                    return self._rejected(connection, pending, batch, decision, moment)
+                    return self._rejected(connection, pending, batch, code, moment)
                 if not cancel:
-                    self._confirm_items(connection, cursor, batch, action)
                     cursor.execute(
                         "UPDATE innertest_roster_version SET version=version+1,"
                         "updated_at=now() WHERE scope=%s",
@@ -133,6 +131,17 @@ class InnertestPendingActions:
         if now >= pending.confirm_deadline_at:
             return ConfirmResultKind.EXPIRE
         if batch[4] != version or pending.target_state_snapshot != str(version):
+            return ConfirmResultKind.TARGET_DRIFTED
+        return None
+
+    def _confirm_current_items(self, connection, cursor, batch, action):
+        """先撤销本批所有资格和阶段写入，再在外层有效事务中记录明确失效。"""
+        try:
+            with connection.transaction():
+                self._confirm_items(connection, cursor, batch, action)
+        except InnertestError as error:
+            if error.code != "stale_confirmation":
+                raise
             return ConfirmResultKind.TARGET_DRIFTED
         return None
 
@@ -207,8 +216,16 @@ class InnertestPendingActions:
         )
         return ref
 
-    def _rejected(self, connection, pending, batch, decision, moment):
+    def _rejected(self, connection, pending, batch, code, moment):
         """过期和目标漂移落明确终态，原请求仍可查且不能继续批准。"""
+        decision = ConfirmDecision(
+            kind=code,
+            message=(
+                "人员资料已变化，本批已失效，请重新查询后准备。"
+                if code is ConfirmResultKind.TARGET_DRIFTED
+                else "操作不存在、已失效或不是本人确认。"
+            ),
+        )
         if decision.kind in {ConfirmResultKind.EXPIRE, ConfirmResultKind.TARGET_DRIFTED}:
             state = "expired" if decision.kind is ConfirmResultKind.EXPIRE else "failed"
             with connection.cursor() as cursor:
@@ -221,4 +238,17 @@ class InnertestPendingActions:
                 )
             self.service._audit(connection, batch[0], batch[1], batch[5], state)
             pending = replace(pending, status=PendingActionStatus(state), decided_at=moment)
+            decision = replace(
+                decision, terminal_status=PendingActionStatus(state), reason=decision.kind.value
+            )
+            enqueue_followups(
+                connection,
+                pending_action_id=pending.id,
+                trace_id=batch[5],
+                items=(
+                    FollowupSpec(
+                        subject_key=batch[0], stage="terminal_card_refresh", batch_id=batch[0]
+                    ),
+                ),
+            )
         return ConfirmOutcome(decision=decision, pending=pending)
