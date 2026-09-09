@@ -11,6 +11,7 @@ from pathlib import Path
 from postgres_schema import ensure_production_schema, psycopg_available, reset_production_rows
 
 from lingxi.adapters.postgres import connect
+from lingxi.adapters.postgres_innertest import PostgresInnertestService
 from lingxi.adapters.postgres_innertest_roster import (
     RosterImportRejectedError,
     apply_roster_import,
@@ -122,6 +123,33 @@ class RosterImportPostgresTests(unittest.TestCase):
             ),
             [("ou_admin", 1, True)],
         )
+
+    def test_switching_mode_back_to_legacy_falls_back_without_destroying_members(self):
+        """把 ``mode`` 改回 ``legacy`` 后准入回落到静态名单，且已导入的成员行不被破坏。
+
+        回落必须是「换一个开关」而不是「删一批数据」——否则切回去就没法再切回来，
+        制品先部署后切换的安全性也就不成立了。这里只读断言，不在真实环境执行。
+        """
+        self.seed_directory([("p1", "a@x.test", "ou_p1"), ("p2", "b@x.test", "ou_p2")])
+        plan = self.plan(["a@x.test", "b@x.test"])
+        self.apply(["a@x.test", "b@x.test"], plan.digest)
+        self.assertEqual(roster_import_status(DSN, scope=SCOPE)["mode"], "database")
+
+        self.sql("UPDATE innertest_roster_version SET mode='legacy' WHERE scope=%s", (SCOPE,))
+
+        # 准入侧的唯一闸门是 `_version`：不是 database 模式就拒绝读动态名单，
+        # 调用方据此回落到静态名单。
+        service = PostgresInnertestService(DSN, scope=SCOPE, binding=None, locator=None, audit=None)
+        with connect(DSN) as connection, connection.cursor() as cursor:
+            with self.assertRaises(InnertestError) as raised:
+                service._version(cursor)
+        self.assertEqual(raised.exception.code, "roster_unavailable")
+
+        # 成员行与摘要都还在，切回 database 不需要重新导入。
+        status = roster_import_status(DSN, scope=SCOPE)
+        self.assertEqual(status["mode"], "legacy")
+        self.assertEqual(status["member_count"], 2)
+        self.assertEqual(status["import_digest"], plan.digest)
 
     def test_plan_rejects_mismatched_legacy_sources_without_writing(self):
         self.seed_directory([("p1", "a@x.test", "ou_p1")])
