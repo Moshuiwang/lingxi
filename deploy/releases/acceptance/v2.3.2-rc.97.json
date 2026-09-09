@@ -1,0 +1,12 @@
+{
+  "candidate_tag": "v2.3.2-rc.97",
+  "evidence_url": "https://github.com/Moshuiwang/lingxi/issues/669#issuecomment-5595223003",
+  "manifest_sha256": "9be09545877dfdbab7afb109859f84e1e82c40b7b7fc6d3d8cc65a4a3a7116c5",
+  "recovery": {
+    "evidence_url": "https://github.com/Moshuiwang/lingxi/issues/669#issuecomment-5595223003",
+    "instructions": "把 deploy/.env.prod 的 LINGXI_IMAGE_TAG 与四个 *_IMAGE_DIGEST 改回 v2.3.1 的值（值见 Issue #606 评论 5569323787，生产主机另有 deploy/.env.prod.before-* 备份），再执行 docker compose --env-file deploy/.env.prod -f deploy/compose.yaml -f deploy/compose.prod.yaml --profile mvp up -d。不回退数据库：本候选与 v2.3.1 的迁移头同为 0090_delivery_retry_backoff、migrations/ 零差异，两版面对同一套数据库结构。未在真实环境执行回退演练，如实记录。",
+    "previous_tag": "v2.3.1"
+  },
+  "result": "passed",
+  "schema": 1
+}
