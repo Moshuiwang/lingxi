@@ -111,6 +111,7 @@ class DispatchGates:
     admin_router: Any = None
     innertest_roster_gate: Callable[[str], bool] | None = None
     delegated_subject_open_id: str | None = None
+    innertest_progress: Callable[[str], str | None] | None = None
 
 
 class EventPipeline:
@@ -412,6 +413,13 @@ class EventPipeline:
                 event_id=message.event_id,
                 trace_id=message.trace_id,
             )
+            tx.mark_handled_as(event_id=message.event_id, handled_as=HandledAs.DROPPED)
+            return Outcome(handled_as=HandledAs.DROPPED)
+
+        progress = self._gates.innertest_progress
+        key = progress(message.sender_open_id) if progress is not None else None
+        if key is not None:
+            deferred.append(self._texts.catalog.text(key))
             tx.mark_handled_as(event_id=message.event_id, handled_as=HandledAs.DROPPED)
             return Outcome(handled_as=HandledAs.DROPPED)
 

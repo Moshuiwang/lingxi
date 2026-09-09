@@ -144,9 +144,20 @@ def assemble_followups(config, *, pending_actions, callback, cards, lifecycle, a
             timeouts=config.postgres_timeouts,
         ),
     )
+    from lingxi.apps.gateway.innertest import confirmation_handler
+
+    confirmation = confirmation_handler(config, store=store, audit=audit, callback=callback)
     consumers = []
     for kind, stages in (
-        ("postprocess", ("terminal_card_refresh", "management_card_refresh", "group_notify")),
+        (
+            "postprocess",
+            (
+                "terminal_card_refresh",
+                "management_card_refresh",
+                "group_notify",
+                "confirmation_card_send",
+            ),
+        ),
         ("recompute", ("permission_recompute",)),
         ("observe", ("publish_observe",)),
     ):
@@ -154,7 +165,10 @@ def assemble_followups(config, *, pending_actions, callback, cards, lifecycle, a
             store=store,
             consumer_kind=kind,
             owner=new_id("run"),
-            handlers={stage: handlers.handle for stage in stages},
+            handlers={
+                stage: (confirmation if stage == "confirmation_card_send" else handlers.handle)
+                for stage in stages
+            },
             audit=audit,
         )
         lifecycle.register(consumer)

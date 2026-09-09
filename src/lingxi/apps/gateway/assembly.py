@@ -199,7 +199,7 @@ def _build_dispatch_gates(config: GatewayConfig, *, audit: Any, admin_router: An
     # 刻意从 `delegated_subject_lookup` 而不是 `delegated_credentials` 导入：后者的
     # 其它函数用到 cryptography，而 gateway 的依赖组明确不含它——gateway 不碰 Fernet。
     from lingxi.adapters.delegated_subject_lookup import registered_delegated_subject_open_id
-    from lingxi.core.identity.innertest_roster_gate import is_open_id_innertest_allowed
+    from lingxi.apps.innertest import build_roster_gate
 
     try:
         delegated_subject_open_id = registered_delegated_subject_open_id(
@@ -209,12 +209,12 @@ def _build_dispatch_gates(config: GatewayConfig, *, audit: Any, admin_router: An
         delegated_subject_open_id = None
         audit.record("gateway.delegated_subject_lookup_failed", error=type(error).__name__)
 
-    def innertest_roster_gate(open_id: str) -> bool:
-        return is_open_id_innertest_allowed(open_id, config.innertest_roster_open_ids)
+    innertest_roster_gate = build_roster_gate(config)
 
     return DispatchGates(
         admin_router=admin_router,
         innertest_roster_gate=innertest_roster_gate,
+        innertest_progress=getattr(innertest_roster_gate, "progress", None),
         delegated_subject_open_id=delegated_subject_open_id,
     )
 
@@ -247,6 +247,9 @@ def _build_admin_stack(
         durable_followups=lifecycle is not None,
         notify_group=bool(config.admin_group_chat_id),
     )
+    from lingxi.apps.innertest import wrap_pending_actions
+
+    pending_action_store = wrap_pending_actions(config, pending_action_store, audit)
     # 确认卡片的出站发送与回调后的终态更新共用同一个卡片传输实例。
     admin_card_transport = LarkAdminCardTransport(client)
     cards = _build_management_card_stack(

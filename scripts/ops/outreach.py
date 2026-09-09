@@ -541,12 +541,20 @@ def build_dispatcher(config: Any, dsn: str, *, initiated_by: str) -> Any:
     # 告警那一侧拿不带发起人的原始出口：告警是系统故障事实，不属于某一次人工发起。
     alerting = build_alerting_duty(config, audit=audit)
     source = default_content_source()
+    sender = FeishuUserCards(
+        base_url=config.feishu_base_url,
+        app_id=config.feishu_app_id,
+        app_secret=config.feishu_app_secret,
+    )
+    if config.innertest_scope:
+        from lingxi.adapters.innertest_outreach import CheckedInnertestSender
+        from lingxi.apps.scheduler.innertest import _build_probe
+
+        sender = CheckedInnertestSender(
+            dsn=dsn, sender=sender, probe=_build_probe(config), initiated_by=initiated_by
+        )
     dispatcher = OutreachDispatcher(
-        sender=FeishuUserCards(
-            base_url=config.feishu_base_url,
-            app_id=config.feishu_app_id,
-            app_secret=config.feishu_app_secret,
-        ),
+        sender=sender,
         store=PostgresOutreachStore(dsn),
         audit=_AuditWithInitiator(audit, initiated_by=initiated_by),
         send_outcome=alerting.send_outcome_callback(),

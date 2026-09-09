@@ -34,6 +34,21 @@ from importlib.metadata import PackageNotFoundError, metadata
 
 # 逐个检查，缺哪个报哪个，不要笼统失败。
 REQUIRED_MODULES = (
+    "lingxi.adapters.innertest_runner",
+    "lingxi.adapters.innertest_request",
+    "lingxi.adapters.postgres_innertest_retention",
+    "lingxi.adapters.innertest_confirmation_card",
+    "lingxi.adapters.innertest_handlers",
+    "lingxi.adapters.innertest_outreach",
+    "lingxi.adapters.postgres_innertest",
+    "lingxi.adapters.postgres_innertest_confirmation",
+    "lingxi.adapters.postgres_innertest_locator",
+    "lingxi.adapters.postgres_innertest_roster",
+    "lingxi.adapters.postgres_innertest_views",
+    "lingxi.apps.innertest",
+    "lingxi.apps.innertest_status",
+    "lingxi.apps.gateway.innertest",
+    "lingxi.apps.scheduler.innertest",
     # 包初始化文件也属于制品：它们决定 Python 的包边界，不能因为多数为空就从
     # 制品清单里隐身。`scheduler.__main__` 是可执行入口，不能直接 import，下面的
     # `_installed_module_location` 会只取它的已安装文件位置，不启动续期进程。
@@ -617,6 +632,28 @@ PROCESS_RUNTIME_IMPORTS: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {
         # 函数内 import 意味着"进程能起来"证明不了"这两个模块装得上"——正是 #29 之后
         # 建立的防漂移机制在这里的缺口：不列进来，extras 那条干净环境的路径永远不会红。
         (
+            "lingxi.adapters.innertest_runner",
+            "lingxi.adapters.innertest_request",
+            "lingxi.adapters.innertest_binding",
+            "lingxi.adapters.innertest_handlers",
+            "lingxi.adapters.innertest_mcp",
+            "lingxi.adapters.innertest_socket",
+            "lingxi.adapters.postgres_admin_followup",
+            "lingxi.adapters.postgres_admin_followup_confirmation",
+            "lingxi.adapters.postgres_admin_followup_recovery",
+            "lingxi.adapters.postgres_innertest",
+            "lingxi.adapters.postgres_innertest_confirmation",
+            "lingxi.adapters.postgres_innertest_locator",
+            "lingxi.adapters.postgres_innertest_retention",
+            "lingxi.adapters.postgres_innertest_roster",
+            "lingxi.adapters.postgres_innertest_views",
+            "lingxi.adapters.postgres_pending_action",
+            "lingxi.adapters.postgres_pending_action_execution",
+            "lingxi.apps.innertest",
+            "lingxi.apps.scheduler.innertest",
+            "lingxi.core.admin.followup_consumer",
+            "lingxi.core.admin.followup_renewal",
+            "lingxi.core.admin.innertest",
             "lingxi",
             "lingxi.apps",
             "lingxi.apps.scheduler",
@@ -1132,6 +1169,21 @@ PROCESS_RUNTIME_IMPORTS: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {
     ),
     "gateway": (
         (
+            "lingxi.adapters.innertest_request",
+            "lingxi.adapters.feishu_user_card",
+            "lingxi.adapters.innertest_confirmation_card",
+            "lingxi.adapters.postgres_identity",
+            "lingxi.adapters.postgres_innertest",
+            "lingxi.adapters.postgres_innertest_confirmation",
+            "lingxi.adapters.postgres_innertest_locator",
+            "lingxi.adapters.postgres_innertest_roster",
+            "lingxi.adapters.postgres_innertest_views",
+            "lingxi.apps.gateway.innertest",
+            "lingxi.apps.innertest",
+            "lingxi.core.admin.innertest",
+            "lingxi.core.identity.onboarding_terminal",
+            "lingxi.core.identity.preprovision",
+            "lingxi.core.identity.provisioning",
             # 注意导入的是承载 ``main`` 的包与 ``__main__``：后者带 ``if __name__``
             # 卫语句（与 worker 同惯例），import 它不会真的把长连接跑起来。
             "lingxi",

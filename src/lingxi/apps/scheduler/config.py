@@ -320,6 +320,10 @@ class SchedulerConfig:
     # `from_env` 里快速失败，不会静默放行别人。``repr=False``：名单是一批
     # open_id，与本文件其余凭据字段同一条纪律，不进 `repr(config)`。
     innertest_roster_open_ids: frozenset[str] = field(default_factory=frozenset, repr=False)
+    innertest_scope: str | None = None
+    innertest_binding_id: str | None = None
+    innertest_socket_path: str | None = None
+    innertest_binding_path: str | None = None
     # 排完发布意图之后，等发布消费职责把它真的写出去并读回一致的上限。等不到是本侧故障
     # （`LX-ONBOARD-001`），不是 MCP 同步超时。
     onboarding_publish_wait_seconds: float = 120.0
@@ -424,6 +428,10 @@ class SchedulerConfig:
             user_env_root=_parse_optional_identifier(source, "LINGXI_USER_ENV_ROOT"),
             onboarding_workers=onboarding_workers,
             innertest_roster_open_ids=innertest_roster_open_ids,
+            innertest_scope=source.get("LINGXI_INNERTEST_SCOPE") or None,
+            innertest_binding_id=source.get("LINGXI_INNERTEST_BINDING_ID") or None,
+            innertest_socket_path=source.get("LINGXI_INNERTEST_SOCKET_PATH") or None,
+            innertest_binding_path=source.get("LINGXI_INNERTEST_BINDING_PATH") or None,
             org_snapshot_round_budget_seconds=org_snapshot_round_budget_seconds,
             company_function_metric_map_path=company_function_metric_map_path,
         )

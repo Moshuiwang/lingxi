@@ -12,6 +12,7 @@ import threading
 import time
 
 from lingxi.adapters.innertest_mcp import InnertestMcpSession
+from lingxi.adapters.innertest_request import remaining, request_window
 from lingxi.core.admin.followup import ShutdownReport
 
 MAX_BYTES = 65536
@@ -137,8 +138,13 @@ class InnertestSocketListener:
                 line, _, remainder = state[0].partition(b"\n")
                 state[0] = bytearray(remainder)
                 self._accepted += 1
-                with self.db_slots:
-                    response = state[1].handle(json.loads(line))
+                with request_window():
+                    if not self.db_slots.acquire(timeout=remaining()):
+                        raise ValueError("request_timeout")
+                    try:
+                        response = state[1].handle(json.loads(line))
+                    finally:
+                        self.db_slots.release()
                 if response is not None:
                     client.settimeout(REQUEST_SECONDS)
                     client.sendall(json.dumps(response, ensure_ascii=False).encode() + b"\n")

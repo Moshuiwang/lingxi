@@ -475,6 +475,8 @@ def _is_position_scope_pending(pending: PendingAction) -> bool:
 
 def _outcome_text(pending: PendingAction) -> str:
     if pending.status is PendingActionStatus.EXECUTED:
+        if pending.action_type is PendingActionType.INNERTEST_ADDITIONS:
+            return "已加入内测资格，开通结果请逐人查询"
         # 数据库事务已记录，但重算/发布由后台队列异步完成；不能把「已记录」
         # 误报为「即时生效」。完成后由后台回调把原管理卡刷新为最终状态。
         return "操作已记录，权限正在下发"

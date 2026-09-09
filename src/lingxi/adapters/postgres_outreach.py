@@ -41,7 +41,7 @@ ON CONFLICT (dedupe_key) DO UPDATE
        status = 'pending',
        content_version = EXCLUDED.content_version,
        card_style = EXCLUDED.card_style
- WHERE outreach_message.status <> 'delivered'
+ WHERE outreach_message.status NOT IN ('delivered','unknown') AND outreach_message.effect_started_at IS NULL
    AND outreach_message.recipient_open_id = EXCLUDED.recipient_open_id
 RETURNING id, status, attempts, recipient_open_id
 """
@@ -182,7 +182,7 @@ class PostgresOutreachStore:
         """
         self._execute(
             "UPDATE outreach_message SET status = 'failed', last_error = %s"
-            " WHERE id = %s AND status <> 'delivered'",
+            " WHERE id = %s AND status NOT IN ('delivered','unknown')",
             (str(error)[:500], record_id),
         )
 

@@ -56,6 +56,7 @@ REQUIRED_TEXT_KEYS: tuple[str, ...] = (
     "onboarding.internal_error",
     "onboarding.stalled",
     "onboarding.innertest_not_open",
+    "onboarding.innertest_waiting",
     # 预开通用户首聊时补的一句（静默＋首聊补一句）。
     "onboarding.preprovisioned_first_chat",
     "onboarding.delegated_subject",

@@ -30,10 +30,10 @@ from lingxi.adapters.postgres_local_permission import (
     PostgresLocalPermissionOverrideStore,
     local_override_reader,
 )
+from lingxi.apps.innertest import build_roster_gate
 from lingxi.apps.scheduler.audit import AuditSink
 from lingxi.apps.scheduler.config import SchedulerConfig
 from lingxi.apps.scheduler.permission_publish import PermissionPublishDuty
-from lingxi.core.identity.innertest_roster_gate import build_innertest_roster_gate
 from lingxi.core.permission.mcp_readiness_base import ReadinessSchedule
 from lingxi.core.permission.metric_translation import metric_translation_available
 
@@ -715,7 +715,7 @@ def _onboarding_publish_kwargs(
     timeouts = config.postgres_timeouts
 
     return {
-        "innertest_roster_gate": build_innertest_roster_gate(config.innertest_roster_open_ids),
+        "innertest_roster_gate": build_roster_gate(config),
         # 每次判定现读一次登记表（只读，不碰凭据文件、不碰 refresh_token）：
         # 换主体之后旧值会让新的专用授权账号落回普通员工路径。
         "delegated_subject": lambda: registered_delegated_subject_open_id(dsn, timeouts=timeouts),

@@ -87,7 +87,9 @@ class LinuxProtocolTests(unittest.TestCase):
 
     def test_real_sdk_stdio_relay_three_tools(self):
         relay = self.root / "innertest_relay.py"
-        shutil.copy("/work/scripts/admin/innertest_relay.py", relay)
+        shutil.copy(
+            str(Path(__file__).resolve().parents[1] / "scripts/admin/innertest_relay.py"), relay
+        )
         os.chmod(relay, 0o644)
         relay.with_name("innertest-relay.json").write_text(
             json.dumps(
@@ -138,3 +140,34 @@ class LinuxProtocolTests(unittest.TestCase):
         finally:
             for s in clients:
                 s.close()
+
+    def test_listener_and_database_budget_share_common_deadline(self):
+        import threading
+
+        from lingxi.core.admin.followup_lifecycle import BackgroundLifecycle
+
+        budget = self.listener.db_slots
+        borrowed = threading.Event()
+        release = threading.Event()
+
+        def occupy():
+            with budget:
+                borrowed.set()
+                release.wait(2)
+
+        worker = threading.Thread(target=occupy)
+        worker.start()
+        self.assertTrue(borrowed.wait(2))
+        try:
+            self.assertTrue(budget.acquire(blocking=False))
+            budget.release()
+            lifecycle = BackgroundLifecycle(budget_seconds=120)
+            lifecycle.register(self.listener)
+            started = time.monotonic()
+            lifecycle.request_stop()
+            lifecycle.drain_until(started + 0.5)
+            self.assertLess(time.monotonic() - started, 0.6)
+            self.assertFalse(Path(self.path).exists())
+        finally:
+            release.set()
+            worker.join(3)

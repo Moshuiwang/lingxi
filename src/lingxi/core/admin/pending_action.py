@@ -36,6 +36,7 @@ class PendingActionType(str, Enum):
     文档「本地权限收回（revoke）如何复用同一套机制」。
     """
 
+    INNERTEST_ADDITIONS = "innertest_additions"
     SUSPEND_USER = "suspend_user"
     RESUME_USER = "resume_user"
     LOCAL_PERMISSION_GRANT = "local_permission_grant"
@@ -217,6 +218,7 @@ def decide_prepare(
 #: 上。不 import 复用同一份对象：依赖方向是 notification → pending_action，
 #: 反向引用会造成循环导入，展示文案就地各维护一份、靠用例锁死取值一致。
 _ACTION_TYPE_DISPLAY_NAME: dict[PendingActionType, str] = {
+    PendingActionType.INNERTEST_ADDITIONS: "加入内测资格",
     PendingActionType.SUSPEND_USER: "停用用户",
     PendingActionType.RESUME_USER: "恢复用户",
     PendingActionType.LOCAL_PERMISSION_GRANT: "补充授权",

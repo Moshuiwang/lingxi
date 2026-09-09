@@ -226,12 +226,16 @@ def build_loop(
         if heartbeat is None:
             heartbeat = alerting_duty.heartbeat_callback("scheduler")
 
-    return SchedulerLoop(
+    loop = SchedulerLoop(
         duties=tuple(duties),
         interval_seconds=config.interval_seconds,
         stop=stop,
         heartbeat=heartbeat,
     )
+    from lingxi.apps.scheduler.innertest import wire_innertest
+
+    wire_innertest(config, loop=loop, duties=duties, audit=sink)
+    return loop
 
 
 def _wire_permission_and_onboarding_pipeline(

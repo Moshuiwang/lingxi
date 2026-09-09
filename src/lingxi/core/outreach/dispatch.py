@@ -238,6 +238,10 @@ class OutreachDispatcher:
         )
         if record.status == STATUS_DELIVERED:
             return self._finish(target, purpose, card, STATUS_DELIVERED, skipped=True)
+        if record.status == "unknown":
+            return self._finish(
+                target, purpose, card, "unknown", skipped=True, error_code="notification_unknown"
+            )
         if record.recipient_open_id and record.recipient_open_id != target.recipient_open_id:
             return self._finish(
                 target, purpose, card, STATUS_FAILED, error_code=REASON_RECIPIENT_CHANGED
@@ -262,7 +266,13 @@ class OutreachDispatcher:
             self._store.mark_failed(record.record_id, error=code)
             self._notify_send_outcome(succeeded=False)
             logger.error("主动发送失败 记录=%s error=%s", record.record_id, code)
-            return self._finish(target, purpose, card, STATUS_FAILED, error_code=code)
+            return self._finish(
+                target,
+                purpose,
+                card,
+                "unknown" if code == "notification_unknown" else STATUS_FAILED,
+                error_code=code,
+            )
         # 先报成功再记账：卡片已经在对方手里，告警状态机不该因为记账出问题而认为
         # 这一次投递失败。
         self._notify_send_outcome(succeeded=True)

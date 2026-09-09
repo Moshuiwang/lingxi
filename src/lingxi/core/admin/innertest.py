@@ -116,3 +116,10 @@ def normalized_intent(emails):
     values = tuple(sorted({email.strip().casefold() for email in emails}))
     digest = hashlib.sha256(json.dumps(values, separators=(",", ":")).encode()).hexdigest()
     return values, digest
+
+
+def target_digest(targets):
+    """确认绑定准备时完整解析快照，目标字段变化不能冒用旧卡。"""
+    return hashlib.sha256(
+        json.dumps(sorted(targets), ensure_ascii=False, separators=(",", ":")).encode()
+    ).hexdigest()
