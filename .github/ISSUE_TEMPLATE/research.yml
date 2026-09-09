@@ -33,3 +33,10 @@ body:
           required: true
         - label: 已确认不在 Issue 中记录令牌、个人数据、生产数据或敏感配置。
           required: true
+  - type: checkboxes
+    id: triage
+    attributes:
+      label: 建卡自检
+      options:
+        - label: 已打上 P0/P1/P2 之一，并登记已知的被阻塞项与父子关系（见 docs/协作约定.md「优先级、依赖与 Discussions」）。
+          required: true
