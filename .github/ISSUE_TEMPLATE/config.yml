@@ -1,0 +1,5 @@
+blank_issues_enabled: true
+contact_links:
+  - name: 建卡规范（必读）
+    url: https://github.com/Moshuiwang/lingxi/blob/main/docs/%E5%8D%8F%E4%BD%9C%E7%BA%A6%E5%AE%9A.md
+    about: 必填字段、标题字段、类型与状态标签、优先级都在协作约定里。本仓库不再维护 Issue 模板——代理用 gh 建卡本来就不走模板，规则只保留一份正文。
