@@ -596,25 +596,25 @@ class AdminQueriesTests(AdminRegistryPostgresTestCase):
             event_id="evt_in_window",
             open_id="ou_a",
             received_at=now - timedelta(hours=1),
-            trace_id="trc_in",
+            trace_id="01J00004363950401903755474",
         )
         self.add_event(
             event_id="evt_out_of_window",
             open_id="ou_a",
             received_at=now - timedelta(hours=50),
-            trace_id="trc_out",
+            trace_id="01J00012436532939880685990",
         )
         self.add_event(
             event_id="evt_other_user",
             open_id="ou_b",
             received_at=now - timedelta(hours=1),
-            trace_id="trc_other",
+            trace_id="01J00005599064495344430535",
         )
         queries = PostgresAdminQueries(self._dsn)
 
         events = queries.recent_events(identifier="ou_a", window_hours=24, limit=20)
 
-        self.assertEqual([event.trace_id for event in events], ["trc_in"])
+        self.assertEqual([event.trace_id for event in events], ["01J00004363950401903755474"])
 
     def test_recent_events_without_identifier_covers_all_users(self) -> None:
         now = datetime.now(UTC)
@@ -622,19 +622,22 @@ class AdminQueriesTests(AdminRegistryPostgresTestCase):
             event_id="evt_1",
             open_id="ou_a",
             received_at=now - timedelta(minutes=5),
-            trace_id="trc_1",
+            trace_id="01J00011264252526392528757",
         )
         self.add_event(
             event_id="evt_2",
             open_id="ou_b",
             received_at=now - timedelta(minutes=10),
-            trace_id="trc_2",
+            trace_id="01J00005207267045225027487",
         )
         queries = PostgresAdminQueries(self._dsn)
 
         events = queries.recent_events(identifier=None, window_hours=24, limit=20)
 
-        self.assertEqual({event.trace_id for event in events}, {"trc_1", "trc_2"})
+        self.assertEqual(
+            {event.trace_id for event in events},
+            {"01J00011264252526392528757", "01J00005207267045225027487"},
+        )
 
     def test_recent_events_respects_limit_and_orders_newest_first(self) -> None:
         now = datetime.now(UTC)
@@ -643,14 +646,16 @@ class AdminQueriesTests(AdminRegistryPostgresTestCase):
                 event_id=f"evt_{index}",
                 open_id="ou_a",
                 received_at=now - timedelta(minutes=index),
-                trace_id=f"trc_{index}",
+                trace_id=f"01J{index:023d}",
             )
         queries = PostgresAdminQueries(self._dsn)
 
         events = queries.recent_events(identifier="ou_a", window_hours=24, limit=2)
 
         self.assertEqual(len(events), 2)
-        self.assertEqual([event.trace_id for event in events], ["trc_0", "trc_1"])
+        self.assertEqual(
+            [event.trace_id for event in events], [f"01J{index:023d}" for index in range(2)]
+        )
 
 
 class TraceLookupTests(AdminRegistryPostgresTestCase):
@@ -664,7 +669,7 @@ class TraceLookupTests(AdminRegistryPostgresTestCase):
 
         queries = PostgresAdminQueries(self._dsn)
 
-        self.assertIsNone(queries.trace_lookup(trace_id="trc_missing"))
+        self.assertIsNone(queries.trace_lookup(trace_id="01J00002924906273838028934"))
 
     def test_trace_without_failure_reason_reports_state_only(self) -> None:
         """追溯号存在（有入站事件、有开通状态）但没有失败记录：如实回报状态，
@@ -675,11 +680,11 @@ class TraceLookupTests(AdminRegistryPostgresTestCase):
             event_id="evt_ok",
             open_id="ou_ok",
             received_at=datetime.now(UTC),
-            trace_id="trc_ok",
+            trace_id="01J00004555751682067916470",
         )
         queries = PostgresAdminQueries(self._dsn)
 
-        trace = queries.trace_lookup(trace_id="trc_ok")
+        trace = queries.trace_lookup(trace_id="01J00004555751682067916470")
 
         self.assertIsNotNone(trace)
         assert trace is not None
@@ -696,17 +701,17 @@ class TraceLookupTests(AdminRegistryPostgresTestCase):
             event_id="evt_fail",
             open_id="ou_fail",
             received_at=datetime.now(UTC),
-            trace_id="trc_fail",
+            trace_id="01J00008761128672861065729",
         )
         recorder = PostgresFailureReasonRecorder(self._dsn)
         recorder.record_failure(
-            trace_id="trc_fail",
+            trace_id="01J00008761128672861065729",
             failure_reason="directory_unavailable",
             event_type="onboarding.result",
         )
         queries = PostgresAdminQueries(self._dsn)
 
-        trace = queries.trace_lookup(trace_id="trc_fail")
+        trace = queries.trace_lookup(trace_id="01J00008761128672861065729")
 
         self.assertIsNotNone(trace)
         assert trace is not None
@@ -725,11 +730,11 @@ class TraceLookupTests(AdminRegistryPostgresTestCase):
             event_id="evt_secret",
             open_id="ou_should_not_appear",
             received_at=datetime.now(UTC),
-            trace_id="trc_secret",
+            trace_id="01J00008768759373544944291",
         )
         queries = PostgresAdminQueries(self._dsn)
 
-        trace = queries.trace_lookup(trace_id="trc_secret")
+        trace = queries.trace_lookup(trace_id="01J00008768759373544944291")
 
         self.assertIsNotNone(trace)
         assert trace is not None
@@ -764,7 +769,7 @@ class TraceLookupTests(AdminRegistryPostgresTestCase):
             event_id="evt_task",
             open_id="ou_task",
             received_at=datetime.now(UTC),
-            trace_id="trc_task",
+            trace_id="01J00011836247644199347424",
         )
         self.add_task(
             task_id="tsk_task",
@@ -775,13 +780,13 @@ class TraceLookupTests(AdminRegistryPostgresTestCase):
         )
         queries = PostgresAdminQueries(self._dsn)
 
-        trace = queries.trace_lookup(trace_id="trc_task")
+        trace = queries.trace_lookup(trace_id="01J00011836247644199347424")
 
         assert trace is not None
         self.assertEqual(trace.task_status, "failed")
         self.assertEqual(trace.task_error_kind, "session_failed")
         self.assertEqual(trace.task_failure_code, "session_failed")
-        self.assertEqual(trace.task_failure_signature, "psycopg.errors.OperationalError")
+        self.assertEqual(trace.task_failure_signature, "unknown")
         self.assertTrue(trace.task_ended_at)
 
     def test_trace_carries_document_delivery_degradation_from_the_checkpoint(self) -> None:
@@ -794,7 +799,7 @@ class TraceLookupTests(AdminRegistryPostgresTestCase):
             event_id="evt_doc",
             open_id="ou_doc",
             received_at=datetime.now(UTC),
-            trace_id="trc_doc",
+            trace_id="01J00014256146092916803383",
         )
         self.add_task(
             task_id="tsk_doc",
@@ -815,7 +820,7 @@ class TraceLookupTests(AdminRegistryPostgresTestCase):
                        'unsupported_nested_blocks')"""
         )
 
-        trace = PostgresAdminQueries(self._dsn).trace_lookup(trace_id="trc_doc")
+        trace = PostgresAdminQueries(self._dsn).trace_lookup(trace_id="01J00014256146092916803383")
 
         assert trace is not None
         self.assertEqual(trace.task_status, "succeeded")
@@ -834,7 +839,7 @@ class TraceLookupTests(AdminRegistryPostgresTestCase):
             event_id="evt_doc_failed",
             open_id="ou_doc_failed",
             received_at=datetime.now(UTC),
-            trace_id="trc_doc_failed",
+            trace_id="01J00017426144608058581561",
         )
         self.add_task(
             task_id="tsk_doc_failed",
@@ -854,7 +859,7 @@ class TraceLookupTests(AdminRegistryPostgresTestCase):
                        now() + interval '1 day', 'permission_not_confirmed')"""
         )
 
-        trace = PostgresAdminQueries(self._dsn).trace_lookup(trace_id="trc_doc_failed")
+        trace = PostgresAdminQueries(self._dsn).trace_lookup(trace_id="01J00017426144608058581561")
 
         assert trace is not None
         self.assertEqual(trace.task_status, "succeeded")
@@ -872,11 +877,11 @@ class TraceLookupTests(AdminRegistryPostgresTestCase):
             event_id="evt_notask",
             open_id="ou_notask",
             received_at=datetime.now(UTC),
-            trace_id="trc_notask",
+            trace_id="01J00007006114747326777863",
         )
         queries = PostgresAdminQueries(self._dsn)
 
-        trace = queries.trace_lookup(trace_id="trc_notask")
+        trace = queries.trace_lookup(trace_id="01J00007006114747326777863")
 
         assert trace is not None
         self.assertIsNone(trace.task_status)
@@ -897,7 +902,9 @@ class TraceLookupTests(AdminRegistryPostgresTestCase):
                 event_id=f"evt_{suffix}",
                 open_id=f"ou_{suffix}",
                 received_at=datetime.now(UTC),
-                trace_id=f"trc_{suffix}",
+                trace_id={"a": "01J00016209509937273578506", "b": "01J00001145485318548185390"}[
+                    suffix
+                ],
             )
         self.add_task(
             task_id="tsk_b",
@@ -908,8 +915,11 @@ class TraceLookupTests(AdminRegistryPostgresTestCase):
         )
         queries = PostgresAdminQueries(self._dsn)
 
-        self.assertIsNone(queries.trace_lookup(trace_id="trc_a").task_status)
-        self.assertEqual(queries.trace_lookup(trace_id="trc_b").task_failure_code, "turn_timeout")
+        self.assertIsNone(queries.trace_lookup(trace_id="01J00016209509937273578506").task_status)
+        self.assertEqual(
+            queries.trace_lookup(trace_id="01J00001145485318548185390").task_failure_code,
+            "turn_timeout",
+        )
 
 
 class ResolveIdentifierTests(AdminRegistryPostgresTestCase):

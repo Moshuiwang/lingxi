@@ -6,6 +6,7 @@ from datetime import timedelta
 from typing import Any
 
 from lingxi.adapters.postgres import connect
+from lingxi.core.task_reference import valid_trace_id
 
 from ._dataclasses import (
     DeliveryEventRecord,
@@ -22,9 +23,11 @@ _LIST_PENDING_DELIVERY_SQL = """
     SELECT t.id, t.conversation_id, c.feishu_chat_id, c.feishu_thread_id,
            t.reply_to_message_id, t.status, t.card_id, t.card_seq,
            t.delivery_message_id, t.fallback_text, t.delivery_consumed_sequence,
-           t.delivery_retry_attempts
+           t.delivery_retry_attempts, e.trace_id, t.created_at
       FROM task AS t
       JOIN conversation AS c ON c.id = t.conversation_id
+      LEFT JOIN inbound_event AS e
+        ON t.inbound_event_id = e.feishu_event_id AND e.expires_at > now()
      WHERE t.status IN ('running', 'awaiting_delivery')
        AND t.dispatch_reserved_kind IS NULL
        AND (t.delivery_retry_after IS NULL OR t.delivery_retry_after <= now())
@@ -76,6 +79,8 @@ class _GatewayDeliveryMixin:
                         fallback_text=row[9],
                         consumed_sequence=row[10],
                         retry_attempts=row[11],
+                        trace_id=valid_trace_id(row[12]),
+                        task_created_at=row[13],
                     )
                     for row in cursor.fetchall()
                 ]

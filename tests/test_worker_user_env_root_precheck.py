@@ -86,7 +86,7 @@ class EnsureUserEnvRootAvailableUnitTests(unittest.TestCase):
                 line for line in lines if line["event"] == "worker.queue.user_env_root.unavailable"
             )
             self.assertEqual(failure_line["reason"], "open_failed")
-            self.assertEqual(failure_line["trace_id"], "trace-2")
+            self.assertEqual(failure_line["worker_run_id"], "trace-2")
 
     def test_a_path_that_is_a_regular_file_not_a_directory_is_rejected(self) -> None:
         with tempfile.TemporaryDirectory() as base:
@@ -203,7 +203,9 @@ class QueueModeUserEnvRootPrecheckTests(unittest.TestCase):
             self.assertNotIn("worker.queue.user_env_root.unavailable", events)
             self.assertIn("worker.queue.start", events, "必须真的越过预检、进入队列启动日志")
 
-    def test_turn_mode_does_not_require_user_env_root(self) -> None:
+    @mock.patch.dict("sys.modules", {"claude_agent_sdk": None})
+    @mock.patch("asyncio.create_subprocess_exec", side_effect=AssertionError("本用例不得启动 SDK"))
+    def test_turn_mode_does_not_require_user_env_root(self, spawn) -> None:
         """一次性受控回合模式没有 user_id 概念，不该被这条队列专属的前置检查
         拖累。"""
 
@@ -225,6 +227,7 @@ class QueueModeUserEnvRootPrecheckTests(unittest.TestCase):
         self.assertNotEqual(code, EXIT_CONFIG_ERROR)
         payload = json.loads(stdout.getvalue())
         self.assertNotIn("USER_ENV_ROOT", json.dumps(payload, ensure_ascii=False))
+        spawn.assert_not_called()
 
 
 if __name__ == "__main__":  # pragma: no cover

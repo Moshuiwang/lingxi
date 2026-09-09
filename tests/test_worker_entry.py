@@ -1207,7 +1207,7 @@ class OutputSafetyCanaryTest(unittest.TestCase):
         injected = [r for r in records if r.get("event") == "worker.output_safety_canary_injected"]
         self.assertEqual(len(injected), 1, "每轮注入必须恰好留一条可回读的低敏痕迹")
         self.assertEqual(injected[0]["mode"], "masked")
-        self.assertEqual(injected[0]["trace_id"], config.trace_id)
+        self.assertEqual(injected[0]["worker_run_id"], config.trace_id)
         self.assertNotIn("合成安全验收提示词", stderr.getvalue(), "痕迹不得携带提示词原文")
 
     def test_an_invalid_canary_value_fails_at_startup_without_echoing_it(self) -> None:
@@ -2183,7 +2183,7 @@ class ReviewHardeningTest(unittest.TestCase):
 
         line = json.loads(captured.getvalue())
         self.assertEqual(line["event"], "worker.sdk.stderr")
-        self.assertEqual(line["trace_id"], config.trace_id)
+        self.assertEqual(line["worker_run_id"], config.trace_id)
         self.assertNotIn("LINGXI_FAKE_SECRET_z9y8x7w6v5u4t3s2", captured.getvalue())
 
     def test_gate_bypass_outranks_a_session_failure_in_the_exit_code(self) -> None:
@@ -2315,7 +2315,7 @@ class StopCausalTerminationTest(unittest.TestCase):
         races = [line for line in lines if line["event"] == "worker.stop.interrupt_race"]
         self.assertEqual(len(races), 1)
         self.assertEqual(races[0]["terminal_reason"], "aborted_streaming")
-        self.assertEqual(races[0]["trace_id"], config.trace_id)
+        self.assertEqual(races[0]["worker_run_id"], config.trace_id)
 
     def test_an_sdk_abort_without_any_local_interrupt_stays_a_failure(self) -> None:
         """回归锁：无人 stop 时 SDK 自行 ``aborted_*`` 仍是 ``cancelled``（失败分支）。
@@ -2434,7 +2434,7 @@ class WorkerCliTest(unittest.TestCase):
         lines = [json.loads(line) for line in stderr.getvalue().splitlines() if line.strip()]
         self.assertTrue(lines, "结构化日志必须写到 stderr")
         for line in lines:
-            self.assertEqual(line["trace_id"], "01J0000000000000000TEST000")
+            self.assertEqual(line["worker_run_id"], "01J0000000000000000TEST000")
         self.assertIn("worker.turn.finished", [line["event"] for line in lines])
 
     def test_cli_passes_the_known_metric_description_as_external_text(self) -> None:
@@ -2887,7 +2887,7 @@ class WrapperDenialFuseWiringTest(unittest.TestCase):
         self.assertEqual(events[0]["denied_count"], 5)
         self.assertEqual(events[0]["threshold"], 5)
         self.assertEqual(events[0]["task_id"], "tsk-fuse-1")
-        self.assertEqual(events[0]["trace_id"], config.trace_id)
+        self.assertEqual(events[0]["worker_run_id"], config.trace_id)
 
     def test_a_stop_event_still_reaches_the_sdk_when_the_fuse_never_trips(self) -> None:
         """回归锁：包装拒绝熔断新增的转发机制不得影响既有 `/stop` 行为——熔断从
@@ -3048,7 +3048,7 @@ class McpStatusAuditTest(unittest.TestCase):
         self.assertEqual(by_server["roster"]["error"], "token expired")
         for event in events:
             self.assertEqual(event["task_id"], "tsk-mcp-1")
-            self.assertEqual(event["trace_id"], "01J0000000000000000TEST000")
+            self.assertEqual(event["worker_run_id"], "01J0000000000000000TEST000")
             self.assertEqual(event["level"], "warning")
 
     def test_all_connected_servers_emit_zero_events(self) -> None:
@@ -3158,7 +3158,7 @@ class McpStatusAuditTest(unittest.TestCase):
         # `config`/`tools`/`serverInfo`；这条断言钉住事件里只有这三个业务字段
         # （加上通用的 trace_id/level/event/task_id），不会顺带带出别的键。
         self.assertEqual(
-            set(events[0]) - {"trace_id", "level", "event", "task_id"},
+            set(events[0]) - {"worker_run_id", "level", "event", "task_id"},
             {"server", "status", "error"},
         )
 

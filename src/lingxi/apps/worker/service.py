@@ -13,7 +13,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import replace
 from typing import Any
 
@@ -47,6 +47,7 @@ from lingxi.apps.worker.terminal_outcome import TerminalOutcomeAudit
 from lingxi.apps.worker.turn import WorkerTurnExecutor
 from lingxi.config.content import ContentCatalog, default_content_catalog
 from lingxi.core.delivery.ports import DeliveryEventType, TerminalKind, assert_content_allowed
+from lingxi.core.task_reference import append_failure_reference, reference_fields, valid_trace_id
 
 logger = logging.getLogger(__name__)
 
@@ -238,6 +239,11 @@ class WorkerService:
         )
         if context is None:
             return
+        claimed = replace(
+            claimed,
+            trace_id=valid_trace_id(context.trace_id),
+            task_created_at=context.task_created_at,
+        )
         self._append_event(claimed, event_type="started", idempotency_key_suffix="started")
 
         stop_event = asyncio.Event()
@@ -311,12 +317,7 @@ class WorkerService:
             # ``replace`` 会重跑数据类的后置校验：任务配置携带的是**已解析**的提示词，
             # 必须同时清掉文件指针，否则「文件与提示词互斥」的不变量会把每一个成功读到
             # 提示词的任务当场炸成会话失败。
-            task_config = replace(
-                self._config,
-                mcp_servers=user_mcp_servers,
-                system_prompt=task_system_prompt,
-                system_prompt_file=None,
-            )
+            task_config = self._task_config(claimed, user_mcp_servers, task_system_prompt)
             executor = self._executor_factory(task_config, lambda: self._mark_side_effect(claimed))
             report = await self._invoke_executor(
                 executor, claimed, context, stop_event=stop_event, progress=progress
@@ -338,6 +339,22 @@ class WorkerService:
                 pass
             await progress.drain()
         return report, executor, system_prompt_digest
+
+    def _task_config(
+        self,
+        claimed: ClaimedTask,
+        user_mcp_servers: Mapping[str, Any],
+        task_system_prompt: str | None,
+    ) -> WorkerConfig:
+        """每任务建立不可变执行配置，迟到回调保留原任务关系。"""
+        return replace(
+            self._config,
+            mcp_servers=user_mcp_servers,
+            system_prompt=task_system_prompt,
+            system_prompt_file=None,
+            task_id=claimed.task_id,
+            task_trace_id=claimed.trace_id,
+        )
 
     async def _invoke_executor(
         self,
@@ -384,7 +401,7 @@ class WorkerService:
             logger.warning(
                 "worker.system_prompt.degraded reason=%s task_id=%s（本任务以无提示词执行）",
                 degraded,
-                claimed.task_id,
+                reference_fields(claimed.task_id, claimed.trace_id),
             )
         return task_system_prompt, digest
 
@@ -408,7 +425,7 @@ class WorkerService:
             logger.warning(
                 "worker.user_memory.degraded error=%s task_id=%s（本任务不带记忆继续执行）",
                 type(error).__name__,
-                claimed.task_id,
+                reference_fields(claimed.task_id, claimed.trace_id),
             )
             return prompt
         if memory is None or not memory.text:
@@ -418,7 +435,7 @@ class WorkerService:
                 "worker.user_memory.prompt_truncated kept=%d total=%d task_id=%s",
                 memory.kept_entries,
                 memory.total_entries,
-                claimed.task_id,
+                reference_fields(claimed.task_id, claimed.trace_id),
             )
         return f"{prompt}\n\n{memory.text}" if prompt else memory.text
 
@@ -452,9 +469,10 @@ class WorkerService:
             )
         except Exception as error:
             logger.error(
-                "worker.delivery_event_write_failed event_type=%s error=%s",
+                "worker.delivery_event_write_failed event_type=%s error=%s reference=%s",
                 event_type,
                 type(error).__name__,
+                reference_fields(claimed.task_id, claimed.trace_id),
             )
 
     def _finish_terminal(
@@ -475,12 +493,19 @@ class WorkerService:
         本方法是全部终态写入的唯一收口点，因此低敏审计在这里记一次，覆盖停止／失败／
         拒发／成功全部分支，不必在每个分支各写一遍。
         """
+        decision = replace(
+            decision,
+            content=append_failure_reference(
+                self._catalog, decision.content, task_id=claimed.task_id, trace_id=claimed.trace_id
+            ),
+        )
         turn_outcome = outcome if outcome is not None else empty_outcome()
         self._terminal_audit.log(
             task_id=claimed.task_id,
             decision=decision,
             outcome=turn_outcome,
             system_prompt_digest=system_prompt_digest,
+            trace_id=claimed.trace_id,
         )
         signature = turn_outcome.failure_signature
         safe_signature = sanitize_failure_signature(signature) if signature is not None else None

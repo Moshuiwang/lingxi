@@ -21,6 +21,7 @@ from collections.abc import Mapping, Sequence
 from lingxi.adapters.postgres import DEFAULT_POSTGRES_TIMEOUTS, PostgresTimeouts, connect
 from lingxi.adapters.postgres_local_permission import PostgresLocalPermissionOverrideStore
 from lingxi.adapters.postgres_onboarding_failure import fetch_failure_reason
+from lingxi.adapters.task_trace_query import fetch_trace_task
 from lingxi.core.admin.registry import (
     AdminRegistryEntry,
     AdminRegistrySeedConflictError,
@@ -34,6 +35,7 @@ from lingxi.core.admin.views import (
     LocalPermissionOverrideView,
 )
 from lingxi.core.ids import new_id
+from lingxi.core.task_reference import parse_reference
 
 
 def admin_registry_entry_from_row(row: tuple) -> AdminRegistryEntry:
@@ -289,6 +291,11 @@ class PostgresAdminQueries:
         不聚合全部历史。已知取舍：两个 JOIN 键都没有索引，是可接受的顺序
         扫描——本命令是管理员手工低频操作，不划算为它新建索引。
         """
+        parsed = parse_reference(trace_id)
+        if parsed is None:
+            return None
+        if parsed.reference_kind == "task":
+            return self._task_reference_lookup(trace_id)
         with (
             connect(self._dsn, timeouts=self._timeouts) as connection,
             connection.cursor() as cursor,
@@ -298,7 +305,7 @@ class PostgresAdminQueries:
                 SELECT received_at, event_type, handled_as, user_open_id,
                        onboarding_dispatched_at
                   FROM inbound_event
-                 WHERE trace_id = %s
+                 WHERE trace_id = %s AND expires_at > now()
                  ORDER BY received_at
                 """,
                 (trace_id,),
@@ -327,71 +334,36 @@ class PostgresAdminQueries:
             failure_reason=failure.failure_reason if failure is not None else None,
             failure_event_type=failure.event_type if failure is not None else None,
             failure_occurred_at=failure.occurred_at if failure is not None else None,
-            task_status=task[0] if task is not None else None,
-            task_error_kind=task[1] if task is not None else None,
-            task_failure_code=task[2] if task is not None else None,
-            task_failure_signature=task[3] if task is not None else None,
-            task_ended_at=_isoformat(task[4]) if task is not None and task[4] is not None else None,
-            document_delivery_status=task[5] if task is not None else None,
-            document_delivery_last_error=task[6] if task is not None else None,
-            document_body_degraded_reason=task[7] if task is not None else None,
+            **_task_view_fields(task),
         )
 
-    def _trace_task(
-        self, *, trace_id: str
-    ) -> (
-        tuple[
-            str,
-            str | None,
-            str | None,
-            str | None,
-            object,
-            str | None,
-            str | None,
-            str | None,
-        ]
-        | None
-    ):
-        """按追溯号取这条入站事件派生的**最近一个**任务与文档投递收口结果。
+    def _task_reference_lookup(self, trace_id: str) -> AdminTraceView | None:
+        task = self._trace_task(trace_id=trace_id)
+        if task is None:
+            return None
+        return AdminTraceView(
+            trace_id=trace_id,
+            reference_kind="task",
+            event_count=None,
+            first_received_at=None,
+            last_event_type=None,
+            last_handled_as=None,
+            dispatched=None,
+            provisioning_state=None,
+            account_state=None,
+            failure_reason=None,
+            failure_event_type=None,
+            failure_occurred_at=None,
+            **_task_view_fields(task),
+        )
 
-        查不到返回 ``None``——这条追溯号没有派生任何任务是完全正常的情形
-        （管理命令、未开通用户、重复投递事件都不入队），不是错误，调用方据此
-        在回显里省掉整段而不是显示一堆空值。
-        """
+    def _trace_task(self, *, trace_id: str) -> tuple | None:
+        """按封闭号码形状读取任务及文档交付状态。"""
         with (
             connect(self._dsn, timeouts=self._timeouts) as connection,
             connection.cursor() as cursor,
         ):
-            cursor.execute(
-                """
-                SELECT task.status, task.error_kind, task.failure_code,
-                       task.failure_signature, task.ended_at,
-                       delivery.status, delivery.last_error,
-                       delivery.body_degraded_reason
-                  FROM task
-                  JOIN inbound_event
-                    ON inbound_event.feishu_event_id = task.inbound_event_id
-                  LEFT JOIN task_document_delivery_request AS delivery
-                    ON delivery.task_id = task.id
-                 WHERE inbound_event.trace_id = %s
-                 ORDER BY task.created_at DESC, delivery.created_at DESC NULLS LAST
-                 LIMIT 1
-                """,
-                (trace_id,),
-            )
-            row = cursor.fetchone()
-        if row is None:
-            return None
-        return (
-            row[0],
-            row[1],
-            row[2],
-            row[3],
-            row[4],
-            row[5],
-            row[6],
-            row[7],
-        )
+            return fetch_trace_task(cursor, trace_id)
 
     def resolve_identifier(self, *, identifier: str) -> str:
         """把邮箱形态的标识反查成 open_id；查询失败与"零命中/多命中"都原样返回输入。
@@ -657,3 +629,20 @@ def _verify_seeded_row(existing: tuple | None, *, normalized_label: str) -> None
         mismatched.append("roles")
     if mismatched:
         raise AdminRegistrySeedConflictError(mismatched_fields=tuple(mismatched))
+
+
+def _task_view_fields(task: tuple | None) -> dict[str, object]:
+    """事件和任务参考号使用同一组低敏展示字段。"""
+    if task is None:
+        return {}
+    return dict(
+        task_status=task[0],
+        task_error_kind=task[1],
+        task_failure_code=task[2],
+        task_failure_signature=task[3],
+        task_ended_at=_isoformat(task[4]) if task[4] else None,
+        document_delivery_status=task[5],
+        document_delivery_last_error=task[6],
+        document_body_degraded_reason=task[7],
+        task_started_at=_isoformat(task[8]) if task[8] else None,
+    )

@@ -131,6 +131,8 @@ class WorkerConfig:
     turn_timeout_seconds: float
     # 直接构造配置的测试与嵌入调用方沿用旧接口时仍使用同一安全默认值；正式入口
     # 通过 load_config 显式校验并传入部署值。
+    task_id: str | None = None
+    task_trace_id: str | None = None
     max_turns: int = DEFAULT_MAX_TURNS
     drain_grace_seconds: float = DEFAULT_DRAIN_GRACE_SECONDS
     audit_input_fields: tuple[str, ...] = ()

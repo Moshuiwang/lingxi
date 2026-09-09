@@ -144,7 +144,7 @@ class _RecordingAlerts:
     raise_times: int = 0
     calls: list[tuple[str, str]] = field(default_factory=list)
 
-    def __call__(self, kind: str, task_id: str) -> None:
+    def __call__(self, kind: str, task_id: str, trace_id: str | None = None) -> None:
         self.calls.append((kind, task_id))
         if self.raise_times > 0:
             self.raise_times -= 1

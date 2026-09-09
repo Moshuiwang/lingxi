@@ -370,6 +370,10 @@ def render_trace(trace_id: str, trace: AdminTraceView | None) -> str:
     """
     if trace is None:
         return f"追溯号 {trace_id}：查无此追溯号"
+    if trace.reference_kind == "task":
+        return "\n".join(
+            [f"任务参考号 {trace_id}", *_trace_task_lines(trace), *_trace_document_lines(trace)]
+        )
     lines = [
         f"追溯号 {trace_id}：{trace.event_count} 条入站事件",
         f"首次接收: {trace.first_received_at}",
@@ -410,6 +414,8 @@ def _trace_task_lines(trace: AdminTraceView) -> list[str]:
         return []
     suffix = f"（{trace.task_ended_at}）" if trace.task_ended_at is not None else ""
     lines = [f"任务结果: {_display_or_unregistered(trace.task_status, _TASK_STATUS_LABEL)}{suffix}"]
+    if trace.task_started_at is not None:
+        lines.append(f"任务开始: {trace.task_started_at}")
     # 有细分失败码用它，否则退回错误类别：没有经过终态写入的失败（心跳超时回收、投递
     # 到期、排队超时）在细分列上恒为空，只有错误类别说得出原因，不能因此整行消失。
     task_failure = trace.task_failure_code or trace.task_error_kind

@@ -16,6 +16,7 @@
 
 from __future__ import annotations
 
+import json
 import logging
 import threading
 import time
@@ -38,25 +39,28 @@ from lingxi.core.execution.card_stream import (
     TextTransport,
     decode_progress_action,
 )
+from lingxi.core.task_reference import reference_fields
 
 logger = logging.getLogger(__name__)
 
-AlertCallback = Callable[[str, str], None]
+AlertCallback = Callable[..., None]
 
 # 循环级异常发生在"读哪些任务"这一步，此时还不知道是哪个任务，没有
-# ``task_id`` 可填；但既有告警回调的形状是 ``(kind, task_id)``，且 ``task_id``
-# 会被上报当作 ``trace_id``。用一个固定、符合安全格式的占位标识，让这类告警
-# 在管理群里仍然认得出来源，而不是退化成一条没有任何出处的裸告警。
+# 任务可绑定的号码；循环告警继续使用已有安全事件标识，不冒充用户任务。
 LOOP_ALERT_TRACE_ID = "gateway-delivery-loop"
 
 
-def _default_alert(kind: str, task_id: str) -> None:
+def _default_alert(kind: str, task_id: str, trace_id: str | None = None) -> None:
     """默认告警出口：结构化日志。
 
     真实告警路由（管理群、AlertManager）由调用方注入；本类不持有任何具体的
     告警传输，只保证"发生了"一定会被记下来，不含正文。
     """
-    logger.error("投递消费告警 kind=%s task_id=%s", kind, task_id)
+    logger.error(
+        "投递消费告警 kind=%s %s",
+        kind,
+        json.dumps(reference_fields(task_id, trace_id), sort_keys=True),
+    )
 
 
 class _FallbackOutcome(Enum):
@@ -171,7 +175,7 @@ class DeliveryConsumer:
         self.consecutive_loop_failures = 0
         self.loop_failures_total = 0
 
-    def _alert_deduped(self, kind: str, task_id: str) -> None:
+    def _alert_deduped(self, kind: str, task_id: str, trace_id: str | None = None) -> None:
         """同一个 (kind, task_id) 在 `alert_min_interval_seconds` 内只告警一次。
 
         默认 1 秒轮询下不去重会变成密集的告警噪音，真实告警路由接上后就是
@@ -184,7 +188,7 @@ class DeliveryConsumer:
         if last is not None and now - last < self._alert_min_interval_seconds:
             return
         self._last_alerted_at[key] = now
-        self._alert(kind, task_id)
+        self._alert(kind, task_id, trace_id)
 
     def _advance_delivery_cursor(self, **fields: Any) -> None:
         """推进消费游标，并记下"这一轮确实有进展"。
@@ -220,7 +224,7 @@ class DeliveryConsumer:
         except Exception as error:  # 见方法文档：只降级退避本身
             logger.error(
                 "投递重试退避写回失败，该任务下一轮照常进入候选 task_id=%s error=%s",
-                task.task_id,
+                reference_fields(task.task_id, getattr(task, "trace_id", None)),
                 type(error).__name__,
             )
 
@@ -300,7 +304,7 @@ class DeliveryConsumer:
             except Exception as error:  # 一个任务的异常不能带走同一轮的其他任务
                 logger.error(
                     "投递消费单个任务异常，本轮其余任务不受影响 task_id=%s error=%s",
-                    task.task_id,
+                    reference_fields(task.task_id, getattr(task, "trace_id", None)),
                     type(error).__name__,
                 )
                 # 一轮抛穿＝这个名额白占了。同样按退避让路，否则一条每轮都抛的
@@ -353,7 +357,7 @@ class DeliveryConsumer:
             except Exception as error:  # 单条发送失败不影响其余候选，下一轮重试
                 logger.error(
                     "排队提示发送失败，下一轮重试 task_id=%s error=%s",
-                    row.task_id,
+                    reference_fields(row.task_id, getattr(row, "trace_id", None)),
                     type(error).__name__,
                 )
                 continue
@@ -378,7 +382,7 @@ class DeliveryConsumer:
             # （与本 Story 改动前的单行行为一致），不是任务失败、不影响终态。
             logger.error(
                 "进度累积历史重建失败，本轮卡片正文从当前信号重新开始 task_id=%s error=%s",
-                task.task_id,
+                reference_fields(task.task_id, getattr(task, "trace_id", None)),
                 type(error).__name__,
             )
             return ()
@@ -401,6 +405,12 @@ class DeliveryConsumer:
 
     def _process_task(self, task: Any) -> None:
         self._advanced_this_task = False
+        logger.info(
+            "gateway.delivery.task %s",
+            json.dumps(
+                reference_fields(task.task_id, getattr(task, "trace_id", None)), sort_keys=True
+            ),
+        )
         events = self._queue.read_delivery_events(
             task_id=task.task_id, after_sequence=task.consumed_sequence
         )
@@ -481,7 +491,7 @@ class DeliveryConsumer:
                 # 预留位、不推进游标、不降级，转入既有 uncertain 告警路径。
                 logger.error(
                     "建卡结果不明，转入 uncertain 等待人工核对 task_id=%s error=%s",
-                    task.task_id,
+                    reference_fields(task.task_id, getattr(task, "trace_id", None)),
                     type(error).__name__,
                 )
                 return False
@@ -520,7 +530,11 @@ class DeliveryConsumer:
             # 序号被 CardKit 拒绝、降级为文本通道——不产生重复投递，只是让
             # 用户看到一张卡停在"正在处理"。这里不引入预留位完全消除这个
             # 窗口（成本需单独评估），只保证它不再是零告警的静默永久降级。
-            self._alert_deduped("progress_persist_failed:" + type(error).__name__, task.task_id)
+            self._alert_deduped(
+                "progress_persist_failed:" + type(error).__name__,
+                task.task_id,
+                getattr(task, "trace_id", None),
+            )
             raise
 
     def _finish_card_channel(
@@ -552,7 +566,7 @@ class DeliveryConsumer:
         except Exception as error:  # 白名单反转：只吞掉明确失败
             logger.error(
                 "终态卡片更新结果不明，转入 uncertain 等待人工核对 task_id=%s error=%s",
-                task.task_id,
+                reference_fields(task.task_id, getattr(task, "trace_id", None)),
                 type(error).__name__,
             )
             return _CardFinishOutcome.HALT
@@ -575,10 +589,12 @@ class DeliveryConsumer:
         """
         logger.error(
             "终态卡片更新结果不明，转入 uncertain 等待人工核对 task_id=%s reason=%s",
-            task.task_id,
+            reference_fields(task.task_id, getattr(task, "trace_id", None)),
             error.reason,
         )
-        self._alert_deduped("card_finish_uncertain:" + error.reason, task.task_id)
+        self._alert_deduped(
+            "card_finish_uncertain:" + error.reason, task.task_id, getattr(task, "trace_id", None)
+        )
         return _CardFinishOutcome.HALT
 
     def _handle_terminal(self, task: Any, stream: CardStream, event: Any) -> None:
@@ -630,7 +646,11 @@ class DeliveryConsumer:
             # 明确失败（白名单）：清预留位，下一轮按退避重试。
             self._queue.clear_dispatch_reservation(task_id=task.task_id)
             self._record_retry_backoff(task)
-            self._alert_deduped("fallback_send_failed:" + type(error).__name__, task.task_id)
+            self._alert_deduped(
+                "fallback_send_failed:" + type(error).__name__,
+                task.task_id,
+                getattr(task, "trace_id", None),
+            )
             return _FallbackOutcome.RETRY_LATER
         except Exception as error:  # 结果不明（白名单反转）：服务端可能
             # 已经受理并投递——不清预留位、不进入重试退避（那等于"下一轮原样
@@ -640,7 +660,7 @@ class DeliveryConsumer:
             # ``DeliveryUncertainError.retry_safe``，一律保留预留位转人工核对。
             logger.error(
                 "文本兜底发送结果不明，转入 uncertain 等待人工核对 task_id=%s error=%s",
-                task.task_id,
+                reference_fields(task.task_id, getattr(task, "trace_id", None)),
                 type(error).__name__,
             )
             return _FallbackOutcome.UNCERTAIN
@@ -667,7 +687,7 @@ class DeliveryConsumer:
         except Exception as error:  # 记录后交给下一轮重试
             logger.error(
                 "confirm_delivery 调用异常，下一轮重试 task_id=%s error=%s",
-                task.task_id,
+                reference_fields(task.task_id, getattr(task, "trace_id", None)),
                 type(error).__name__,
             )
             return
@@ -677,7 +697,7 @@ class DeliveryConsumer:
             # 记一条日志便于事后核对，不重试、不报错。
             logger.info(
                 "confirm_delivery 未命中可确认的记录，任务可能已由到期路径收敛 task_id=%s",
-                task.task_id,
+                reference_fields(task.task_id, getattr(task, "trace_id", None)),
             )
 
     def run_forever(

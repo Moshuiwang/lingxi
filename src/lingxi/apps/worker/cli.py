@@ -751,8 +751,8 @@ def _emit(stream: TextIO, payload: Mapping[str, Any]) -> None:
     stream.flush()
 
 
-def _log(stream: TextIO, trace_id: str, level: str, event: str, **fields: Any) -> None:
-    record = {"level": level, "event": event, "trace_id": trace_id}
+def _log(stream: TextIO, worker_run_id: str, level: str, event: str, **fields: Any) -> None:
+    record = {"level": level, "event": event, "worker_run_id": worker_run_id}
     record.update(fields)
     stream.write(json.dumps(record, ensure_ascii=False, sort_keys=True))
     stream.write("\n")

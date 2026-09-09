@@ -2,8 +2,8 @@
 # 由 scripts/ci/check_content_version.py 生成与校验，请不要手工编辑。
 # 改完 content.toml 的文案后：先递增 [meta] version，再运行
 #   python3 scripts/ci/check_content_version.py --refresh
-version = "2026-09-07"
-digest = "sha256:dc412e93fb89a3510840aa5da94ebcbc1e78e7a36ba3a54e704907d05c1231e1"
+version = "2026-09-09.657"
+digest = "sha256:d2c45a933fb1670ce7f1868e0f2947e2cc184f6283df3ca9ec2488da234b0e5e"
 
 # 用过的旧版本标识，不得复用：同一个版本号对应两批文案会让落库的追溯依据失效。
 retired_versions = [
@@ -40,6 +40,7 @@ retired_versions = [
   "2026-09-03-2",
   "2026-09-03-3",
   "2026-09-05",
+  "2026-09-07",
 ]
 
 # 每条用户可见文案的短摘要，用于在门禁失败时指出具体是哪几个键变了。
@@ -176,6 +177,8 @@ retired_versions = [
 "texts.worker.card_handoff_notice" = "f926d145f0f18496"
 "texts.worker.context_too_long" = "33805373cca13b15"
 "texts.worker.failed" = "51f1df400deab9d0"
+"texts.worker.failure_reference" = "2ed3435c42f19d5c"
+"texts.worker.failure_task_reference" = "6f1842e39283018c"
 "texts.worker.max_turns" = "166d8e19f4b2f3b4"
 "texts.worker.mcp_bad_gateway" = "eebf2f9dc2fbe503"
 "texts.worker.queued_timeout" = "cc4e6e37b3fe6e04"

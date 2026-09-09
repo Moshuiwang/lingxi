@@ -19,6 +19,8 @@ from datetime import UTC, datetime, timedelta
 from enum import Enum
 from typing import Protocol
 
+from lingxi.core.task_reference import task_reference, valid_trace_id
+
 logger = logging.getLogger(__name__)
 
 
@@ -181,6 +183,7 @@ class AlertSignal:
     count: int = 1
     trace_id: str | None = None
     final: bool = False
+    task_id: str | None = None
 
     def __post_init__(self) -> None:
         """把 ``observed_at``/``scope`` 归一化并校验各字段的取值域。"""
@@ -191,6 +194,8 @@ class AlertSignal:
         if self.trace_id is not None:
             if not _SAFE_TRACE_ID.fullmatch(self.trace_id):
                 raise ValueError("trace_id 必须是安全的标识")
+        if self.task_id is not None and task_reference(self.task_id) is None:
+            raise ValueError("任务标识格式不合法")
         if self.kind is not AlertKind.FEISHU_SEND_FAILED and self.final:
             raise ValueError("只有飞书发送失败事件可以标记为 final")
 
@@ -228,6 +233,7 @@ class AlertNotice:
     count: int
     trace_id: str | None
     dedupe_key: str
+    task_id: str | None = None
 
     @property
     def event_type(self) -> str:
@@ -245,13 +251,18 @@ class AlertNotice:
         action_label = _NOTICE_ACTION_LABEL[self.action]
         kind_label = _ALERT_KIND_LABEL.get(self.kind, self.kind.value)
         trace = self.trace_id or "-"
+        label = "追溯号"
+        if self.task_id:
+            ref = task_reference(self.task_id, self.trace_id)
+            trace = ref.reference if ref else "-"
+            label = "任务参考号" if ref and ref.reference_kind == "task" else label
         return (
             f"[BI Plus 运行告警] {action_label}\n"
             f"类型：{kind_label}\n"
             f"范围：{self.scope}\n"
             f"次数：{self.count}\n"
             f"时间：{self.observed_at.isoformat()}\n"
-            f"追溯号：{trace}"
+            f"{label}：{trace}"
         )
 
 
@@ -353,6 +364,7 @@ class _FailureWindow:
     last_alert_at: datetime | None = None
     recovery_since: datetime | None = None
     trace_id: str | None = None
+    task_id: str | None = None
 
 
 class AlertManager:
@@ -369,7 +381,7 @@ class AlertManager:
         self.heartbeats = heartbeats or HeartbeatRegistry(
             default_timeout_seconds=self.policy.heartbeat_timeout_seconds
         )
-        self._windows: dict[tuple[AlertKind, str], _FailureWindow] = {}
+        self._windows: dict[tuple[AlertKind, str, str | None], _FailureWindow] = {}
 
     def register_process(self, component: str) -> None:
         """登记一个心跳组件，超时阈值取自策略配置。"""
@@ -459,7 +471,7 @@ class AlertManager:
 
     def observe(self, signal: AlertSignal) -> tuple[AlertNotice, ...]:
         """记一次故障观察，跨过阈值/去重窗口才真正产出一条告警通知。"""
-        key = (signal.kind, signal.scope)
+        key = (signal.kind, signal.scope, signal.task_id)
         window = self._windows.get(key)
         if window is None or self._new_send_window(window, signal):
             window = _FailureWindow(
@@ -467,6 +479,7 @@ class AlertManager:
                 scope=signal.scope,
                 window_started_at=signal.observed_at,
                 last_failure_at=signal.observed_at,
+                task_id=signal.task_id,
             )
             self._windows[key] = window
 
@@ -501,7 +514,7 @@ class AlertManager:
 
     def resolve(self, signal: AlertSignal) -> tuple[AlertNotice, ...]:
         """记一次恢复观察，进入稳定期计时，真正的恢复通知由 :meth:`tick` 产出。"""
-        key = (signal.kind, signal.scope)
+        key = (signal.kind, signal.scope, signal.task_id)
         window = self._windows.get(key)
         if window is None:
             return ()
@@ -544,6 +557,7 @@ class AlertManager:
                 action.value,
                 window.kind.value,
                 window.scope,
+                window.task_id or "",
                 window.window_started_at.isoformat(),
             )
         ).encode("utf-8")
@@ -556,6 +570,7 @@ class AlertManager:
             count=window.total_count,
             trace_id=window.trace_id,
             dedupe_key=dedupe_key,
+            task_id=window.task_id,
         )
 
 
@@ -847,33 +862,27 @@ class AlertingDuty:
 
         return report
 
-    def delivery_alert_callback(self) -> Callable[[str, str], None]:
-        """返回给 Gateway ``DeliveryConsumer.on_alert`` 的回调。
+    def delivery_alert_callback(self) -> Callable[..., None]:
+        """任务与原事件分别携带；非任务告警保留已有安全事件标识。"""
 
-        投递消费循环的告警形状是 ``(kind: str, task_id: str)``——``kind`` 是自由
-        字符串（见 ``apps/gateway/delivery.py``），与 ``AlertKind`` 枚举不是同一
-        套分类。这里统一归入 ``FEISHU_SEND_FAILED``，把原始 kind 字符串标准化后
-        放进 ``scope``，让不同子类型各自独立限流与去重，不互相掩盖。``task_id``
-        通常满足 ``AlertSignal.trace_id`` 的安全格式；不满足时退化为不带
-        trace_id，不让一次格式意外的输入打断整条告警链路。
-        """
-
-        def report(kind: str, task_id: str) -> None:
+        def report(kind: str, task_id: str, trace_id: str | None = None) -> None:
             scope = _normalize_delivery_alert_scope(kind)
             at = _as_utc(self._clock())
             final = _is_final_delivery_alert(kind)
-            try:
-                signal = AlertSignal(
-                    kind=AlertKind.FEISHU_SEND_FAILED,
-                    observed_at=at,
-                    scope=scope,
-                    trace_id=task_id,
-                    final=final,
-                )
-            except ValueError:
-                signal = AlertSignal(
-                    kind=AlertKind.FEISHU_SEND_FAILED, observed_at=at, scope=scope, final=final
-                )
+            is_task = task_reference(task_id) is not None
+            event_id = valid_trace_id(trace_id) if is_task else task_id
+            if not is_task and (
+                task_id.startswith("tsk_") or not _SAFE_TRACE_ID.fullmatch(task_id)
+            ):
+                event_id = None
+            signal = AlertSignal(
+                kind=AlertKind.FEISHU_SEND_FAILED,
+                observed_at=at,
+                scope=scope,
+                trace_id=event_id,
+                task_id=task_id if is_task else None,
+                final=final,
+            )
             self._submit(self._manager.observe(signal))
 
         return report
@@ -911,6 +920,7 @@ class AlertingDuty:
                     event_type=notice.event_type,
                     count=notice.count,
                     trace_id=notice.trace_id or "-",
+                    task_id=notice.task_id,
                 )
             except Exception as error:  # 审计失败不能丢待投递告警
                 logger.error("运行告警记录失败 action=%s error=%s", action, type(error).__name__)

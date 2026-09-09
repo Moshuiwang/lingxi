@@ -87,7 +87,7 @@ class NoWritePathSourceScanTests(unittest.TestCase):
 class RunArgumentAndFailureClosedTests(unittest.TestCase):
     def test_missing_dsn_env_var_exits_one(self) -> None:
         err = io.StringIO()
-        code = trace.run(["trc_x"], env={}, stderr=err)
+        code = trace.run(["01J00005140978232367656210"], env={}, stderr=err)
         self.assertEqual(code, 1)
         self.assertIn(trace.DSN_ENV_VAR, err.getvalue())
 
@@ -101,7 +101,7 @@ class RunArgumentAndFailureClosedTests(unittest.TestCase):
 
         err = io.StringIO()
         code = trace.run(
-            ["trc_x"],
+            ["01J00005140978232367656210"],
             env={"LINGXI_POSTGRES_DSN": "postgresql://u:p@192.0.2.1:5/db"},
             stderr=err,
             connect=exploding_connect,
@@ -146,7 +146,7 @@ class TraceLookupRealDatabaseTests(unittest.TestCase):
                     datetime.now(UTC) - timedelta(minutes=5),
                     "im.message.receive_v1",
                     "ou_trace_1",
-                    "trc_lookup_1",
+                    "01J00017385680126649243792",
                     datetime.now(UTC) - timedelta(minutes=5),
                 ),
             )
@@ -157,7 +157,7 @@ class TraceLookupRealDatabaseTests(unittest.TestCase):
         return code, out.getvalue(), err.getvalue()
 
     def test_an_unknown_trace_id_says_so_explicitly(self) -> None:
-        code, out, _err = self._run("trc_does_not_exist")
+        code, out, _err = self._run("01J00003474197944257461197")
         self.assertEqual(code, 0)
         self.assertIn("查无此追溯号", out)
         self.assertNotIn("事件标识", out, "查无结果不得输出空壳记录")
@@ -165,7 +165,7 @@ class TraceLookupRealDatabaseTests(unittest.TestCase):
     def test_a_known_trace_id_reports_event_and_user_state_without_open_id_by_default(
         self,
     ) -> None:
-        code, out, _err = self._run("trc_lookup_1")
+        code, out, _err = self._run("01J00017385680126649243792")
         self.assertEqual(code, 0)
         self.assertIn("evt_trace_1", out)
         self.assertIn("mcp_syncing", out)
@@ -173,7 +173,7 @@ class TraceLookupRealDatabaseTests(unittest.TestCase):
         self.assertNotIn("ou_trace_1", out, "默认输出不得包含 open_id")
 
     def test_include_open_id_flag_prints_it(self) -> None:
-        code, out, _err = self._run("trc_lookup_1", "--include-open-id")
+        code, out, _err = self._run("01J00017385680126649243792", "--include-open-id")
         self.assertEqual(code, 0)
         self.assertIn("ou_trace_1", out)
 
@@ -184,7 +184,7 @@ class TraceLookupRealDatabaseTests(unittest.TestCase):
         before_events = self._count("inbound_event")
         before_users = self._count("app_user")
 
-        code, _out, _err = self._run("trc_lookup_1")
+        code, _out, _err = self._run("01J00017385680126649243792")
 
         self.assertEqual(code, 0)
         self.assertEqual(self._count("inbound_event"), before_events)

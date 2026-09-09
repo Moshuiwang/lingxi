@@ -45,6 +45,7 @@ from lingxi.core.execution.message_stream import TurnStreamRecorder
 from lingxi.core.execution.tool_policy import ToolPolicy
 from lingxi.core.innertest_content_capture import ContentCaptureRecord, RawTurnCapture
 from lingxi.core.mcp_naming import QUERY_MCP_SERVER_NAME
+from lingxi.core.task_reference import reference_fields
 
 from .config import OUTPUT_SAFETY_CANARY_SURVIVOR_BODY, WorkerConfig
 from .report import build_report
@@ -387,7 +388,9 @@ class WorkerTurnExecutor:
 
     def _emit_stderr_record(self, **fields: object) -> None:
         """结构化 stderr 输出的唯一出口：每行一个 JSON 对象，恒带 trace_id。"""
-        record = {"trace_id": self._config.trace_id, **fields}
+        record = {"worker_run_id": self._config.trace_id, **fields}
+        if self._config.task_id is not None:
+            record.update(reference_fields(self._config.task_id, self._config.task_trace_id))
         self._stderr_stream.write(json.dumps(record, ensure_ascii=False, sort_keys=True))
         self._stderr_stream.write("\n")
         self._stderr_stream.flush()

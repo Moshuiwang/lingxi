@@ -255,8 +255,11 @@ class ContentDirectoryTests(unittest.TestCase):
                 others = {name: "x" for name in variables if name != "reference"}
                 with self.assertRaises(ContentRenderError):
                     catalog.text(key, **others)
-                rendered = catalog.text(key, reference="ref-x", **others)
-                self.assertIn("ref-x", rendered.text)
+                reference = "01J00000000000000000000001"
+                if key == "worker.failure_task_reference":
+                    reference = "T-" + reference
+                rendered = catalog.text(key, reference=reference, **others)
+                self.assertIn(reference, rendered.text)
         self.assertGreaterEqual(
             exercised, 3, "本用例应至少覆盖 internal_error/sync_timeout/stalled 三个键"
         )
@@ -356,6 +359,8 @@ class ContentDirectoryTests(unittest.TestCase):
                 "delivery.sheet_failed",
                 "delivery.sheet_uncertain",
                 "gateway.unexpected_error",
+                "worker.failure_reference",
+                "worker.failure_task_reference",
             }
         )
         self.assertEqual(

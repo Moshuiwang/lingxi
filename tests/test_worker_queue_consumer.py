@@ -2099,7 +2099,8 @@ class WorkerServiceTests(unittest.TestCase):
 
         self.assertEqual(len(sink.calls), 1)
         fields = sink.calls[0]
-        self.assertEqual(fields["task_id"], "tsk-1")
+        self.assertIsNone(fields["task_id"])
+        self.assertTrue(fields["reference_integrity_error"])
         self.assertEqual(fields["error_kind"], "redacted_withheld")
         self.assertEqual(fields["terminal_kind"], "redacted_withheld")
         self.assertIs(fields["output_safety_blocked"], True)

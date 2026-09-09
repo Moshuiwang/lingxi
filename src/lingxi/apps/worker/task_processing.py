@@ -24,12 +24,13 @@ from lingxi.apps.worker.report_extraction import (
 from lingxi.apps.worker.turn import MCP_BAD_GATEWAY_FAILURE_CODE
 from lingxi.config.content import ContentCatalog, RenderedContent
 from lingxi.core.delivery.ports import TerminalKind
+from lingxi.core.task_reference import append_failure_reference
 
 #: 模型把工具调用协议写成正文散文时的失败码。
 MODEL_PROTOCOL_BREAKDOWN_FAILURE_CODE = "model_protocol_breakdown"
 
 
-def failure_content(catalog: ContentCatalog, code: object) -> tuple[str, RenderedContent]:
+def _base_failure_content(catalog: ContentCatalog, code: object) -> tuple[str, RenderedContent]:
     """把失败码翻成可查询的原因与用户可见文案。
 
     几个确定性失败有自己的专属文案：对"问题本身步骤太多""回执太大"这类失败，「请稍后
@@ -54,6 +55,18 @@ def failure_content(catalog: ContentCatalog, code: object) -> tuple[str, Rendere
     if code == MCP_BAD_GATEWAY_FAILURE_CODE:
         return MCP_BAD_GATEWAY_FAILURE_CODE, catalog.text("worker.mcp_bad_gateway")
     return "session_failed", catalog.text("worker.failed")
+
+
+def failure_content(
+    catalog: ContentCatalog,
+    code: object,
+    *,
+    task_id: str | None = None,
+    trace_id: str | None = None,
+) -> tuple[str, RenderedContent]:
+    """无任务的单回合兼容原文，受理任务共用安全追加规则。"""
+    kind, content = _base_failure_content(catalog, code)
+    return kind, append_failure_reference(catalog, content, task_id=task_id, trace_id=trace_id)
 
 
 def empty_outcome() -> TurnOutcome:
