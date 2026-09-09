@@ -34,7 +34,9 @@ def wire_innertest(config, *, loop, duties, audit):
             executor=owners[0].onboarding_executor,
             should_stop=lambda: loop.stopping,
         ),
-        probe=_build_probe(config),
+        probe=_build_probe(
+            config, db_slots=loop.followup_db_slots, should_stop=lambda: loop.stopping
+        ),
     )
     consumer = FollowupConsumer(
         store=store,
@@ -59,17 +61,20 @@ def wire_innertest(config, *, loop, duties, audit):
     consumer.start()
 
 
-def _build_probe(config):
+def _build_probe(config, *, db_slots=None, should_stop=None):
     """沿用逐用户加密令牌读取，传输与执行均受本入口五秒预算约束。"""
+    from lingxi.adapters.innertest_probe import InnertestMcpTokens
     from lingxi.adapters.mcp_token_cipher import McpTokenCipher
-    from lingxi.adapters.postgres_mcp_token import PostgresMcpTokenStore, token_cipher_provider
+    from lingxi.adapters.postgres_mcp_token import token_cipher_provider
     from lingxi.adapters.query_mcp_probe import QueryMcpProbe, content_text_metrics_reader
     from lingxi.apps.scheduler.onboarding import HardDeadlineProbe
 
-    tokens = PostgresMcpTokenStore(
+    tokens = InnertestMcpTokens(
         config.postgres_dsn,
         cipher=McpTokenCipher(config.mcp_token_encrypt_key),
         timeouts=config.postgres_timeouts,
+        db_slots=db_slots,
+        should_stop=should_stop,
     )
     probe = QueryMcpProbe(
         endpoint=config.query_mcp_endpoint,

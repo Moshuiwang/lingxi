@@ -38,7 +38,7 @@ class ProbeAssemblyTests(unittest.TestCase):
         self.addCleanup(self.stack.close)
         self.token = self.stack.enter_context(
             patch(
-                "lingxi.adapters.postgres_mcp_token.PostgresMcpTokenStore.token_cipher",
+                "lingxi.adapters.innertest_probe.InnertestMcpTokens._read_cipher",
                 autospec=True,
                 return_value=McpTokenCipher(MASTER_KEY).encrypt("synthetic-user-token"),
             )
@@ -141,4 +141,6 @@ class ProbeAssemblyTests(unittest.TestCase):
             loop = build_loop(config, audit=Mock(), roster_access_token=lambda: "synthetic")
             self.addCleanup(loop.request_stop)
             consumer = start.call_args.args[0]
-            self.assert_user_probe(consumer.handlers["innertest_readiness_check"].__self__.probe)
+            probe = consumer.handlers["innertest_readiness_check"].__self__.probe
+            self.assertIs(probe._probe._token_provider.__self__.db_slots, loop.followup_db_slots)
+            self.assert_user_probe(probe)
