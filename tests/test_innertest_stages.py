@@ -173,6 +173,7 @@ class InnertestStageTests(InnertestPostgresTests):
             guarded.send_card(
                 open_id="ou_person1",
                 card={"synthetic": True},
+                permission_snapshot=("usr_person1", 1, "pub_person1"),
                 dedupe_key="welcome:apply:usr_person1",
             )
         sender.send_card.assert_not_called()
@@ -182,6 +183,7 @@ class InnertestStageTests(InnertestPostgresTests):
             guarded.send_card(
                 open_id="ou_person1",
                 card={"synthetic": True},
+                permission_snapshot=("usr_person1", 1, "pub_person1"),
                 dedupe_key="welcome:apply:usr_person1",
             )
         self.assertEqual(reserve().status, "unknown")
@@ -189,9 +191,54 @@ class InnertestStageTests(InnertestPostgresTests):
             guarded.send_card(
                 open_id="ou_person1",
                 card={"synthetic": True},
+                permission_snapshot=("usr_person1", 1, "pub_person1"),
                 dedupe_key="welcome:apply:usr_person1",
             )
         self.assertEqual(sender.send_card.call_count, 1)
+
+    def test_prepared_card_permission_or_publish_change_before_first_probe_refuses(self):
+        from dataclasses import replace
+
+        from test_outreach_ops import PERMISSIONS, TOOL, _recipients
+
+        from lingxi.adapters.postgres_outreach import PostgresOutreachSubjects
+        from lingxi.core.outreach.dispatch import OutreachDispatcher, OutreachPurpose
+
+        self.user()
+        self.sql("UPDATE app_user SET email='person1@example.test'")
+        self.sql(
+            "UPDATE publish_outbox SET payload=jsonb_build_object('permissions', %s::text)",
+            (PERMISSIONS,),
+        )
+        facts = PostgresOutreachSubjects(DSN).facts_for("person1@example.test")
+        self.assertEqual((facts.permission_version, facts.publish_id), (1, "pub_person1"))
+        recipients = _recipients(replace(facts, roster_names=("合成",)))
+        self.assertTrue(recipients[0].plan.sendable)
+        self.sql("UPDATE app_user SET permission_version=2")
+        self.sql(
+            "INSERT INTO publish_outbox(id,user_id,permission_version,reason,payload,status,published_at) VALUES('pub_new','usr_person1',2,'synthetic','{}','published',now())"
+        )
+        probe, sender = Mock(), Mock()
+        probe.list_metrics.return_value = 1
+        sender.send_card.return_value = "synthetic_message"
+        guard = CheckedInnertestSender(dsn=DSN, sender=sender, probe=probe, initiated_by="ou_admin")
+        dispatcher = OutreachDispatcher(
+            sender=guard, store=PostgresOutreachStore(DSN), audit=self.audit
+        )
+        results = TOOL.run_outreach(
+            recipients,
+            dispatcher=dispatcher,
+            purpose=OutreachPurpose.APPLY,
+            admin_open_id=None,
+            run_id="synthetic",
+        )
+        self.assertEqual(results[0].detail, "check_version_changed")
+        probe.list_metrics.assert_not_called()
+        sender.send_card.assert_not_called()
+        self.assertEqual(
+            self.sql("SELECT count(*) FROM outreach_message WHERE effect_started_at IS NOT NULL"),
+            [(0,)],
+        )
 
     def test_legacy_switch_restore_and_db_failure_not_empty_roster(self):
         roster = PostgresInnertestRoster(DSN, scope="synthetic", legacy=frozenset({"ou_old"}))
@@ -239,7 +286,10 @@ class InnertestStageTests(InnertestPostgresTests):
         guard._authorized = authorization
         with self.assertRaisesRegex(InnertestError, "check_version_changed"):
             guard.send_card(
-                open_id="ou_person1", card={"synthetic": True}, dedupe_key="guard:apply:usr_person1"
+                open_id="ou_person1",
+                card={"synthetic": True},
+                permission_snapshot=("usr_person1", 1, "pub_person1"),
+                dedupe_key="guard:apply:usr_person1",
             )
         sender.send_card.assert_not_called()
         self.assertEqual(

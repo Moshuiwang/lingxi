@@ -6,13 +6,13 @@ import json
 import os
 import selectors
 import socket
-import stat
 import struct
 import threading
 import time
 
 from lingxi.adapters.innertest_mcp import InnertestMcpSession
 from lingxi.adapters.innertest_request import remaining, request_window
+from lingxi.adapters.innertest_socket_path import SocketPathOwner
 from lingxi.core.admin.followup import ShutdownReport
 
 MAX_BYTES = 65536
@@ -27,49 +27,43 @@ def peer_uid(connection):
     return struct.unpack("3i", connection.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, 12))[1]
 
 
-def validate_socket_directory(path):
-    """受限 SSH 主体不能替换目录，避免连接到伪造服务。"""
-    directory = os.path.dirname(os.path.abspath(path))
-    info = os.lstat(directory)
-    if not stat.S_ISDIR(info.st_mode) or info.st_uid not in {0, os.geteuid()}:
-        raise ValueError("socket_directory_owner_invalid")
-    if info.st_mode & 0o022:
-        raise ValueError("socket_directory_writable")
-    if os.path.lexists(path):
-        raise ValueError("socket_path_exists")
-
-
 class InnertestSocketListener:
     """每个短请求串行占一个数据库槽，网络等待不占数据库槽。"""
 
-    def __init__(self, *, path, service, db_slots, socket_gid=None):
+    def __init__(self, *, path, service, db_slots, socket_gid=None, stop=None):
         """只保存固定服务端配置，不从客户端接收路径或 UID。"""
         self.path, self.service, self.db_slots = path, service, db_slots
         self.socket_gid = socket_gid
-        self._stop = threading.Event()
+        self._path_owner = SocketPathOwner(path)
+        self._stop = threading.Event() if stop is None else stop
         self._thread = None
         self._server = None
         self._accepted = self._finished = 0
 
     def start(self):
-        """现有 socket 不擅删；必须由同一实例退出后清理。"""
+        """独占锁覆盖绑定到退出，强杀后的遗留路径须先证明无人监听。"""
         if self._thread is not None or self._stop.is_set():
             return
-        validate_socket_directory(self.path)
         server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         try:
+            self._path_owner.acquire()
             server.bind(self.path)
+            self._path_owner.remember_bound()
             os.chmod(self.path, 0o660)
             if self.socket_gid is not None:
                 os.chown(self.path, -1, self.socket_gid)
             server.listen(MAX_CONNECTIONS)
             server.setblocking(False)
+            self._server = server
+            self._thread = threading.Thread(
+                target=self._run, name="lingxi-innertest-mcp", daemon=True
+            )
+            self._thread.start()
         except Exception:
             server.close()
+            self._path_owner.close()
+            self._thread = None
             raise
-        self._server = server
-        self._thread = threading.Thread(target=self._run, name="lingxi-innertest-mcp", daemon=True)
-        self._thread.start()
 
     def request_stop(self):
         """先关闭接收标记；事件循环最多一百毫秒观察到停止。"""
@@ -88,9 +82,9 @@ class InnertestSocketListener:
     def _run(self):
         """连接状态有界；空闲/半包五秒关闭，不能占住开通池。"""
         selector = selectors.DefaultSelector()
-        selector.register(self._server, selectors.EVENT_READ)
         clients = {}
         try:
+            selector.register(self._server, selectors.EVENT_READ)
             while not self._stop.is_set():
                 for key, _ in selector.select(0.1):
                     if self._stop.is_set():
@@ -107,7 +101,7 @@ class InnertestSocketListener:
                 self._close(selector, clients, client)
             selector.close()
             self._server.close()
-            os.unlink(self.path)
+            self._path_owner.close()
 
     def _accept(self, selector, clients):
         """第五连接立即拒绝；认证来自实际连接凭据。"""

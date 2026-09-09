@@ -14,11 +14,13 @@ class CheckedInnertestSender:
         """发送凭据沿用原 sender，逐用户探针不使用服务账号。"""
         self.dsn, self.sender, self.probe, self.initiated_by = dsn, sender, probe, initiated_by
 
-    def send_card(self, *, open_id, card, dedupe_key):
+    def send_card(self, *, open_id, card, dedupe_key, permission_snapshot=None):
         """检查与实际发送都复核当前权限，外发开始后未知永不盲发。"""
         self._authorized()
         if ":precheck:" not in dedupe_key:
             snapshot = self._snapshot(open_id)
+            if permission_snapshot is None or snapshot != permission_snapshot:
+                raise InnertestError("check_version_changed")
             started, code, count = datetime.now(UTC), "check_passed", None
             try:
                 count = self.probe.list_metrics(user_id=snapshot[0])
@@ -78,7 +80,7 @@ class CheckedInnertestSender:
                 "ON p.user_id=u.id AND p.permission_version=u.permission_version "
                 "WHERE u.feishu_open_id=%s AND u.account_state='enabled' "
                 "AND u.provisioning_state='active' AND p.status='published' "
-                "ORDER BY p.created_at DESC LIMIT 1",
+                "ORDER BY p.created_at DESC,p.id DESC LIMIT 1",
                 (open_id,),
             )
             row = cursor.fetchone()

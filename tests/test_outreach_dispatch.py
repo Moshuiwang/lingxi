@@ -127,7 +127,7 @@ class FakeSender:
         self.calls: list[dict] = []
         self._errors = list(errors or [])
 
-    def send_card(self, *, open_id, card, dedupe_key):
+    def send_card(self, *, open_id, card, dedupe_key, permission_snapshot=None):
         self.calls.append({"open_id": open_id, "card": card, "dedupe_key": dedupe_key})
         error = self._errors.pop(0) if self._errors else None
         if error is not None:

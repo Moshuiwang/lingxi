@@ -46,6 +46,8 @@ class SubjectFacts:
     account_state: str | None = None
     permissions: str | None = None
     roster_names: tuple[str, ...] = ()
+    permission_version: int | None = None
+    publish_id: str | None = None
 
 
 @dataclass(frozen=True)
