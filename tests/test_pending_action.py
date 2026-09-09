@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import dataclasses
 import unittest
+from unittest import mock
 from datetime import UTC, datetime, timedelta, timezone
 
 from lingxi.core.admin.pending_action import (
@@ -622,6 +623,49 @@ class DecideConfirmTargetDriftTests(unittest.TestCase):
                 current_account_state="enabled",
             )
         self.assertEqual(raised.exception.classification, "entry_not_assembled")
+
+    def test_guard_also_fires_when_only_one_of_the_two_registries_is_missing(self) -> None:
+        """守卫的两半各自都要管用：只登记了一半的动作类型同样必须被拒。
+
+        原来的用例传的类型两张表里都没有，删掉守卫条件的任意一半它都照样通过，
+        证明不了「只在一张表里登记、另一张漏了」这种真实的接线遗漏也会被挡住。
+        """
+        pending = _pending(
+            action_type=PendingActionType.INNERTEST_ADDITIONS, target_state_snapshot="7"
+        )
+        patched = dict(REQUIRED_ROLE)
+        patched[PendingActionType.INNERTEST_ADDITIONS] = AdminRole.SUPER_ADMIN
+        with mock.patch.dict(REQUIRED_ROLE, patched, clear=True):
+            with self.assertRaises(PendingActionTransientFailureError) as raised:
+                decide_confirm(
+                    pending=pending,
+                    clicker_open_id=INITIATOR,
+                    now=NOW,
+                    registry_entry=_full_admin_entry(),
+                    current_account_state="enabled",
+                )
+        self.assertEqual(raised.exception.classification, "entry_not_assembled")
+
+    def test_expired_unassembled_action_is_reported_as_expired_not_unassembled(self) -> None:
+        """过期判定排在守卫之前，顺序不能被换：过期的点击要说过期。
+
+        谁把守卫挪到过期检查之前，管理员点一个早就过期的卡会收到「系统繁忙」
+        而不是「已过期，请重新发起」，这条会红。
+        """
+        pending = _pending(
+            action_type=PendingActionType.INNERTEST_ADDITIONS,
+            target_state_snapshot="7",
+            confirm_deadline_at=NOW - timedelta(seconds=1),
+        )
+        decision = decide_confirm(
+            pending=pending,
+            clicker_open_id=INITIATOR,
+            now=NOW,
+            registry_entry=_full_admin_entry(),
+            current_account_state="enabled",
+        )
+        self.assertIs(decision.kind, ConfirmResultKind.EXPIRE)
+        self.assertIs(decision.terminal_status, PendingActionStatus.EXPIRED)
 
     def test_target_missing_entirely_counts_as_drift(self) -> None:
         pending = _pending(target_state_snapshot="enabled")

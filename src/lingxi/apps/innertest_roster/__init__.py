@@ -210,13 +210,18 @@ def _cmd_verify(
         print(f"回读失败：{type(error).__name__}", file=err)
         return 1
     payload = dict(ok=True, schema_revision=1, scope=args.scope, **status)
+    exit_code = 0
     if args.binding_id:
         try:
             payload["binding"] = binding_status(dsn, scope=args.scope, binding_id=args.binding_id)
         except Exception as error:
+            # 调用方点名要回读绑定，那一半没读成就不是一次成功的核验；名单那半的
+            # 结果照旧输出，但整体判失败，免得部署步骤靠退出码或 ok 放行。
+            payload["ok"] = False
             payload["binding_error"] = type(error).__name__
+            exit_code = 1
     print(json.dumps(payload, ensure_ascii=False), file=out)
-    return 0
+    return exit_code
 
 
 def run(

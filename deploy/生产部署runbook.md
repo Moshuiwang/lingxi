@@ -903,8 +903,12 @@ docker compose --env-file deploy/.env.prod \
   exec -T scheduler python -m lingxi.apps.innertest_status
 ```
 
-`ok: true` 且 `roster`/`binding`/`followups` 三段都有内容，说明监听器已经注册并能
-访问数据库；`configuration_missing` 说明四个变量没有全部到位。
+`ok: true` 且 `roster`/`binding`/`followups` 三段都有内容，**只说明数据库这一侧读得通**——
+这个命令只读三个环境变量再查库，**不连 socket、不检查监听线程**，因此它不能证明受限
+管理入口现在可用。`configuration_missing` 说明作用域、绑定标识、连接串三者没有全部
+到位（它不检查两条路径变量，那两条缺失时是启动期直接失败，不会走到这里）。
+
+要证明入口真的可用，只有一条路：**通过受限通路实际认证一次并调用一次工具**。
 
 启动日志里也能读到这个职责是否注册，两条互斥，认准这两句：
 

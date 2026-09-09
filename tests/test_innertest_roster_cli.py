@@ -177,6 +177,7 @@ class ApplyCommandTests(unittest.TestCase):
 
     def test_success_redacts_admin_open_id_and_prints_binding(self) -> None:
         out = io.StringIO()
+        err = io.StringIO()
         calls = []
 
         def fake_apply(dsn, **kwargs):
@@ -187,6 +188,7 @@ class ApplyCommandTests(unittest.TestCase):
             self._argv(),
             env={"LINGXI_POSTGRES_DSN": "postgresql://u:p@x/y"},
             stdout=out,
+            stderr=err,
             lookup_delegated_subject=lambda: "ou_real_secret_identifier",
             apply_import=fake_apply,
         )
@@ -195,6 +197,8 @@ class ApplyCommandTests(unittest.TestCase):
         self.assertEqual(calls[0]["admin_open_id"], "ou_real_secret_identifier")
         self.assertTrue(calls[0]["binding_id"].startswith("iab_"))
         self.assertNotIn("ou_real_secret_identifier", out.getvalue())
+        # 只封锁标准输出等于只锁半扇门：标识漏到标准错误一样是泄漏。
+        self.assertNotIn("ou_real_secret_identifier", err.getvalue())
         self.assertIn("digest123", out.getvalue())
         self.assertIn(calls[0]["binding_id"], out.getvalue())
 
@@ -251,6 +255,48 @@ class VerifyCommandTests(unittest.TestCase):
         payload = out.getvalue()
         self.assertIn('"mode": "database"', payload)
         self.assertIn('"member_count": 2', payload)
+
+    def test_binding_readback_is_included_when_binding_id_is_given(self) -> None:
+        out = io.StringIO()
+
+        code = innertest_roster.run(
+            ["verify", "--scope", "s", "--binding-id", "iab_1"],
+            env={"LINGXI_POSTGRES_DSN": "postgresql://u:p@x/y"},
+            stdout=out,
+            verify_status=lambda dsn, *, scope: dict(
+                mode="database", version=1, import_digest="digest123", member_count=2
+            ),
+            binding_status=lambda dsn, *, scope, binding_id: dict(
+                binding_id=binding_id, version=1, enabled=True, authorized=True
+            ),
+        )
+
+        self.assertEqual(code, 0)
+        self.assertIn('"binding"', out.getvalue())
+        self.assertIn('"enabled": true', out.getvalue())
+
+    def test_binding_readback_failure_is_not_reported_as_success(self) -> None:
+        """点名要回读绑定却没读成，不能靠退出码或 ok 让部署步骤放行。"""
+        out = io.StringIO()
+
+        def exploding_binding(dsn, *, scope, binding_id):
+            raise RuntimeError("模拟绑定回读时连接断开")
+
+        code = innertest_roster.run(
+            ["verify", "--scope", "s", "--binding-id", "iab_1"],
+            env={"LINGXI_POSTGRES_DSN": "postgresql://u:p@x/y"},
+            stdout=out,
+            verify_status=lambda dsn, *, scope: dict(
+                mode="database", version=1, import_digest="digest123", member_count=2
+            ),
+            binding_status=exploding_binding,
+        )
+
+        self.assertEqual(code, 1)
+        self.assertIn('"ok": false', out.getvalue())
+        self.assertIn('"binding_error": "RuntimeError"', out.getvalue())
+        # 名单那一半已经读到的结果照旧输出，不因为绑定失败就一起丢掉。
+        self.assertIn('"member_count": 2', out.getvalue())
 
     def test_status_failure_exits_one(self) -> None:
         err = io.StringIO()
