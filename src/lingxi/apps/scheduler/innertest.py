@@ -60,13 +60,21 @@ def wire_innertest(config, *, loop, duties, audit):
 
 
 def _build_probe(config):
-    """逐用户加密令牌读取，不新建服务账号或 Agent 会话。"""
+    """沿用逐用户加密令牌读取，传输与执行均受本入口五秒预算约束。"""
+    from lingxi.adapters.mcp_token_cipher import McpTokenCipher
+    from lingxi.adapters.postgres_mcp_token import PostgresMcpTokenStore, token_cipher_provider
     from lingxi.adapters.query_mcp_probe import QueryMcpProbe, content_text_metrics_reader
-    from lingxi.apps.scheduler.onboarding import _build_user_mcp_tokens
+    from lingxi.apps.scheduler.onboarding import HardDeadlineProbe
 
-    return QueryMcpProbe(
-        endpoint=config.mcp_probe_endpoint,
-        token_provider=_build_user_mcp_tokens(config).query_token_provider(),
+    tokens = PostgresMcpTokenStore(
+        config.postgres_dsn,
+        cipher=McpTokenCipher(config.mcp_token_encrypt_key),
+        timeouts=config.postgres_timeouts,
+    )
+    probe = QueryMcpProbe(
+        endpoint=config.query_mcp_endpoint,
+        token_provider=token_cipher_provider(tokens),
         metrics_reader=content_text_metrics_reader,
         timeout_seconds=5,
     )
+    return HardDeadlineProbe(probe=probe, timeout_seconds=5)
