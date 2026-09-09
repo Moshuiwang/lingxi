@@ -96,7 +96,7 @@ jobs:
 
   # Issue #520 F2：**这条轻量档当前不会被触发。** 分类器里的
   # `L1_LIGHT_ROUTE_ENABLED = False` 把只改 L1 内容资产的改动路由回了完整门禁——
-  # 那三份资产随镜像发布，走轻量档不会产出候选证明，合入 main 后 Main Publish 必然
+  # 那三份资产随镜像发布，走轻量档不会产出候选证明，合入 main 后候选发布必然
   # 找不到候选而失败。本 job 与分类器里的判定代码一起原样保留，留待上线后重启用；
   # 停用期间 l1_changed 仍为 true，下面 gate 里的 L1 资产检查照常执行。
   l1:
@@ -391,7 +391,7 @@ jobs:
   # （2026-08-21 PR #285 现场复验；2026-08-06 已有同样记录），因此不能把它当作机器人
   # 可执行的主姿势，只能留给产品负责人等有权限的身份通过网页手动操作。
   #
-  # 不管走哪条姿势，产出的 run 都必须仍是 `event=pull_request`：`Main Publish` 的
+  # 不管走哪条姿势，产出的 run 都必须仍是 `event=pull_request`：`Release Candidate`（publish.yml）的
   # `verify_epic_candidate.py` 只认这个 event 类型的 run 去找候选证明 artifact，
   # `workflow_dispatch`（本工作流的 `on:` 里一直都有，可用于任意 ref 单独验证镜像
   # 可复现性）产生的 run 在 GitHub API 里 event 永远是 workflow_dispatch，天然满足
@@ -409,7 +409,8 @@ jobs:
     # **本 job 不要任何写权限**（codex 二轮 P1-1）。它在 pull_request 上也会跑，而
     # 同仓分支的 PR job 会**照样拿到**这里声明的令牌——于是一个被改造过的 workflow
     # 可以在 PR 阶段就推 / 覆盖 GHCR，把"合并后才发布"这道门整个绕过去。
-    # 推送因此拆到下面独立的 publish job，只在 push + main 触发。
+    # 推送因此拆在独立的 publish job 里，位于 publish.yml（工作流名 Release
+    # Candidate），只由推送 release/** 分支触发——不在本文件内，也不再由 main 触发。
     permissions:
       contents: read
 
@@ -562,7 +563,7 @@ jobs:
             --expect-run-id "${GITHUB_RUN_ID}"
 
       # 命名与 epic-candidate-pr-* 并列但不同名：那份 artifact 只装 candidate.json，
-      # Main Publish 的 verify_epic_candidate.py 断言其文件列表恰好是 ["candidate.json"]，
+      # Release Candidate 的 verify_epic_candidate.py 断言其文件列表恰好是 ["candidate.json"]，
       # 混进 tar 会直接破坏合并后的候选回读。四镜像候选必须是独立的 artifact。
       # 保存期 14 天，与 publish.yml「降级留证：上传镜像 tar」一致——同类产物同一保存期，
       # 不为 PR 候选单独定一个更长的期限。
@@ -671,7 +672,7 @@ jobs:
 
       # 三步都额外要求 image 真正 success（不是「非文档」就够）：Issue #278 之后，
       # 跟踪 PR 的自动 synchronize 里 image 常态是 skipped，此时绝不能写出候选
-      # 证明——那会让 Main Publish 误以为一份从没验证过可复现构建的树可以发布。
+      # 证明——那会让 Release Candidate 误以为一份从没验证过可复现构建的树可以发布。
       - name: 检出代码
         if: >-
           github.event_name == 'pull_request' &&
