@@ -17,6 +17,7 @@ from lingxi.adapters.postgres_daily_report_watermark import PostgresDailyReportW
 from lingxi.adapters.postgres_identity import PostgresOrgSnapshotStore
 from lingxi.apps.gateway import _BackgroundLoops, _install_background_stop
 from lingxi.apps.scheduler.daily_report import DailyReportDuty
+from lingxi.apps.scheduler.lifecycle import SignalStopEvent
 from lingxi.apps.scheduler.loop import SchedulerLoop, install_signal_handlers
 from lingxi.apps.scheduler.onboarding import OnboardingExecutor
 from lingxi.apps.scheduler.org_snapshot_sync import OrgSnapshotSyncDuty
@@ -26,7 +27,7 @@ from lingxi.core.admin.followup_renewal import FollowupLeaseKeeper
 
 def shutdown_process(dsn, kind, pipe):
     budget = 20 if kind == "gateway" else 120
-    stop = threading.Event()
+    stop = threading.Event() if kind == "gateway" else SignalStopEvent()
     started_work = threading.Event()
 
     def slow(*_args, **_kwargs):
@@ -45,6 +46,7 @@ def shutdown_process(dsn, kind, pipe):
         consumer_kind = "postprocess"
         scheduler = None
         socket_path = None
+        socket_directory = None
     else:
         executor = OnboardingExecutor(workers=1, backlog=1, should_stop=stop.is_set)
         executor.start()
@@ -82,7 +84,8 @@ def shutdown_process(dsn, kind, pipe):
         lifecycle = scheduler.lifecycle
         install_signal_handlers(scheduler)
         scheduler.run_once()
-        socket_path = str(Path(tempfile.mkdtemp(prefix="s6-deadline-")) / "mcp.sock")
+        socket_directory = tempfile.TemporaryDirectory(prefix="s6-deadline-")
+        socket_path = str(Path(socket_directory.name) / "mcp.sock")
         listener = InnertestSocketListener(
             path=socket_path, service=Mock(), db_slots=scheduler.followup_db_slots
         )
@@ -106,11 +109,14 @@ def shutdown_process(dsn, kind, pipe):
     if consumer._current is None:
         raise RuntimeError("consumer_not_running")
     pipe.send(dict(state="ready", pid=os.getpid(), socket=socket_path, budget=budget))
-    while not stop.wait(0.01):
-        pass
+    if scheduler is None:
+        while not stop.wait(0.01):
+            pass
+    else:
+        scheduler.run_forever()
     started = time.monotonic()
     first_deadline = lifecycle.deadline
-    report = lifecycle.drain_until()
+    report = lifecycle.drain_until() if scheduler is None else scheduler.drain_until()
     if kind == "gateway":
         loops.join_within(clock, 20)
         residual = int(loops.delivery.is_alive()) + int(loops.document_delivery.is_alive())
@@ -125,5 +131,5 @@ def shutdown_process(dsn, kind, pipe):
             socket_absent=not (socket_path and Path(socket_path).exists()),
         )
     )
-    if socket_path:
-        Path(socket_path).parent.rmdir()
+    if socket_directory is not None:
+        socket_directory.cleanup()
