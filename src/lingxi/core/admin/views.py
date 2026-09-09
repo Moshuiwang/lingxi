@@ -117,6 +117,7 @@ class AdminTraceView:
     # ``None`` 是精确语义——这条追溯号可能压根没有派生任务（管理命令、未开通
     # 用户、重复投递），也可能任务还在排队。脱敏姿态与本视图其余字段一致：
     # 只带状态、分类码与异常类型名，不带提问正文、模型输出或异常正文。
+    followups: tuple[object, ...] = ()
     reference_kind: str = "event"
     task_started_at: str | None = None
     task_status: str | None = None

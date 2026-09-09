@@ -19,7 +19,7 @@ from datetime import UTC, datetime, timedelta
 from enum import Enum
 from typing import Protocol
 
-from lingxi.core.task_reference import task_reference, valid_trace_id
+from lingxi.core.task_reference import reference_fields, task_reference, valid_trace_id
 
 logger = logging.getLogger(__name__)
 
@@ -919,8 +919,11 @@ class AlertingDuty:
                     action,
                     event_type=notice.event_type,
                     count=notice.count,
-                    trace_id=notice.trace_id or "-",
-                    task_id=notice.task_id,
+                    **(
+                        reference_fields(notice.task_id, notice.trace_id)
+                        if notice.task_id
+                        else {"trace_id": notice.trace_id or "-", "task_id": None}
+                    ),
                 )
             except Exception as error:  # 审计失败不能丢待投递告警
                 logger.error("运行告警记录失败 action=%s error=%s", action, type(error).__name__)

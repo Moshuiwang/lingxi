@@ -138,16 +138,20 @@ class _GatewayDeliveryMixin:
             with connection.cursor() as cursor:
                 cursor.execute(
                     """
-                    SELECT id, dispatch_reserved_kind FROM task
-                     WHERE dispatch_reserved_kind IS NOT NULL
-                       AND status IN ('running', 'awaiting_delivery')
+                    SELECT t.id, t.dispatch_reserved_kind, e.trace_id FROM task AS t
+                      LEFT JOIN inbound_event AS e
+                        ON t.inbound_event_id = e.feishu_event_id AND e.expires_at > now()
+                     WHERE t.dispatch_reserved_kind IS NOT NULL
+                       AND t.status IN ('running', 'awaiting_delivery')
                      ORDER BY created_at
                      LIMIT %s
                     """,
                     (limit,),
                 )
                 return [
-                    UncertainDeliveryTask(task_id=row[0], reserved_kind=row[1])
+                    UncertainDeliveryTask(
+                        task_id=row[0], reserved_kind=row[1], trace_id=valid_trace_id(row[2])
+                    )
                     for row in cursor.fetchall()
                 ]
 

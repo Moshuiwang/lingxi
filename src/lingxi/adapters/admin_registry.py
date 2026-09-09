@@ -19,6 +19,7 @@ from __future__ import annotations
 from collections.abc import Mapping, Sequence
 
 from lingxi.adapters.postgres import DEFAULT_POSTGRES_TIMEOUTS, PostgresTimeouts, connect
+from lingxi.adapters.postgres_admin_followup_projection import fetch_followups
 from lingxi.adapters.postgres_local_permission import PostgresLocalPermissionOverrideStore
 from lingxi.adapters.postgres_onboarding_failure import fetch_failure_reason
 from lingxi.adapters.task_trace_query import fetch_trace_task
@@ -311,8 +312,9 @@ class PostgresAdminQueries:
                 (trace_id,),
             )
             rows = cursor.fetchall()
+        followups = fetch_followups(self._dsn, trace_id=trace_id, timeouts=self._timeouts)
         if not rows:
-            return None
+            return self._followup_reference_lookup(trace_id, followups)
 
         event_count = len(rows)
         first_received_at = _isoformat(rows[0][0])
@@ -324,6 +326,7 @@ class PostgresAdminQueries:
 
         return AdminTraceView(
             trace_id=trace_id,
+            followups=followups,
             event_count=event_count,
             first_received_at=first_received_at,
             last_event_type=last_event_type,
@@ -335,6 +338,26 @@ class PostgresAdminQueries:
             failure_event_type=failure.event_type if failure is not None else None,
             failure_occurred_at=failure.occurred_at if failure is not None else None,
             **_task_view_fields(task),
+        )
+
+    @staticmethod
+    def _followup_reference_lookup(trace_id: str, followups: tuple) -> AdminTraceView | None:
+        """确认阶段可早于入站事件留存，不能伪造事件时间线。"""
+        if not followups:
+            return None
+        return AdminTraceView(
+            trace_id=trace_id,
+            followups=followups,
+            event_count=None,
+            first_received_at=None,
+            last_event_type=None,
+            last_handled_as=None,
+            dispatched=None,
+            provisioning_state=None,
+            account_state=None,
+            failure_reason=None,
+            failure_event_type=None,
+            failure_occurred_at=None,
         )
 
     def _task_reference_lookup(self, trace_id: str) -> AdminTraceView | None:

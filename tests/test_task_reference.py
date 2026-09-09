@@ -285,6 +285,9 @@ class TaskAlertTests(unittest.TestCase):
         task_rows = [fields for _, fields in audit.records if fields["task_id"]]
         self.assertEqual({r["task_id"] for r in task_rows}, {TASK, "tsk_" + A})
         self.assertEqual(task_rows[0]["trace_id"], A)
+        self.assertIsNone(task_rows[1]["trace_id"])
+        self.assertEqual(task_rows[1]["reference"], "T-" + A)
+        self.assertEqual(task_rows[1]["reference_kind"], "task")
 
     def test_admin_task_shape_keeps_authorization_and_invalid_zero_calls(self):
         from test_admin_router import (

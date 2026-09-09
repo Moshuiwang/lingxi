@@ -59,7 +59,12 @@ def _default_alert(kind: str, task_id: str, trace_id: str | None = None) -> None
     logger.error(
         "投递消费告警 kind=%s %s",
         kind,
-        json.dumps(reference_fields(task_id, trace_id), sort_keys=True),
+        json.dumps(
+            {"event_id": task_id}
+            if task_id == LOOP_ALERT_TRACE_ID
+            else reference_fields(task_id, trace_id),
+            sort_keys=True,
+        ),
     )
 
 
@@ -281,8 +286,7 @@ class DeliveryConsumer:
             self._note_loop_failure(error, stage="list_uncertain")
             uncertain_tasks = []
             loop_healthy = False
-        for uncertain in uncertain_tasks:
-            self._alert_deduped("dispatch_uncertain:" + uncertain.reserved_kind, uncertain.task_id)
+        self._alert_uncertain_tasks(uncertain_tasks)
         if len(uncertain_tasks) >= self._uncertain_limit:
             # `list_uncertain_delivery_tasks` 的 `LIMIT` 会让超过这个数量的
             # uncertain 任务静默无告警。这里没有条件做到精确判断"是否
@@ -320,6 +324,15 @@ class DeliveryConsumer:
             # "整条循环坏了"。
             self._note_loop_recovered()
         return len(tasks)
+
+    def _alert_uncertain_tasks(self, uncertain_tasks: list[Any]) -> None:
+        """已保留外发结果不明的任务分别告警，不从其它任务补号。"""
+        for uncertain in uncertain_tasks:
+            self._alert_deduped(
+                "dispatch_uncertain:" + uncertain.reserved_kind,
+                uncertain.task_id,
+                getattr(uncertain, "trace_id", None),
+            )
 
     def _notify_stale_queued(self) -> None:
         """排队可感知：入队超过阈值仍未被领取时，补发一条排队提示。

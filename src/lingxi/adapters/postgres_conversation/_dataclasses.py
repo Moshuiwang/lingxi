@@ -131,6 +131,7 @@ class UncertainDeliveryTask:
 
     task_id: str
     reserved_kind: str
+    trace_id: str | None = None
 
 
 @dataclass(frozen=True)

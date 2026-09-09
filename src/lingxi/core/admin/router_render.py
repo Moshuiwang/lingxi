@@ -11,6 +11,7 @@ from collections.abc import Sequence
 from lingxi.config.content import ContentCatalog, RenderedContent, default_content_catalog
 from lingxi.core.admin.commands import AdminRejectReason
 from lingxi.core.admin.display_names import AdminDisplayNames
+from lingxi.core.admin.followup_render import render_followups
 from lingxi.core.admin.views import (
     AdminEventView,
     AdminTraceView,
@@ -370,6 +371,8 @@ def render_trace(trace_id: str, trace: AdminTraceView | None) -> str:
     """
     if trace is None:
         return f"追溯号 {trace_id}：查无此追溯号"
+    if trace.event_count is None and trace.followups:
+        return f"追溯号 {trace_id}\n{render_followups(trace.followups)}"
     if trace.reference_kind == "task":
         return "\n".join(
             [f"任务参考号 {trace_id}", *_trace_task_lines(trace), *_trace_document_lines(trace)]
@@ -400,6 +403,8 @@ def render_trace(trace_id: str, trace: AdminTraceView | None) -> str:
         lines.append("无开通失败记录")
     lines.extend(_trace_task_lines(trace))
     lines.extend(_trace_document_lines(trace))
+    if trace.followups:
+        lines.append(render_followups(trace.followups))
     return "\n".join(lines)
 
 

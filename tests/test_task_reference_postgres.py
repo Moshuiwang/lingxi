@@ -117,6 +117,10 @@ class TaskReferencePostgresTests(unittest.TestCase):
         pending = self.queue.list_pending_delivery_tasks()
         self.assertEqual({t.task_id: t.trace_id for t in pending}, expected)
         self.assertTrue(all(t.task_created_at is not None for t in pending))
+        for task in pending:
+            self.assertTrue(self.queue.reserve_dispatch(task_id=task.task_id, kind="card_create"))
+        uncertain = self.queue.list_uncertain_delivery_tasks()
+        self.assertEqual({t.task_id: t.trace_id for t in uncertain}, expected)
 
     def test_claim_does_not_lock_source_and_preserves_version_filter(self):
         self.seed(A, A)
@@ -154,6 +158,9 @@ class TaskReferencePostgresTests(unittest.TestCase):
         pending = self.queue.list_pending_delivery_tasks()
         self.assertEqual(len(pending), 3)
         self.assertTrue(all(t.trace_id is None for t in pending))
+        for task in pending:
+            self.assertTrue(self.queue.reserve_dispatch(task_id=task.task_id, kind="card_create"))
+        self.assertTrue(all(t.trace_id is None for t in self.queue.list_uncertain_delivery_tasks()))
 
     def test_system_terminal_queued_timeout_version_and_reclaim_repeat(self):
         for source in (A, None):
@@ -285,3 +292,44 @@ class TaskReferencePostgresTests(unittest.TestCase):
             for bad in ("T-", "T-T-" + A, "tsk_" + A, "姓名", "a@example.com", "'; SELECT 1--"):
                 self.assertIsNone(self.queries.trace_lookup(trace_id=bad))
             factory.assert_not_called()
+
+    def test_followup_unknown_is_visible_without_inbound_event(self):
+        from datetime import UTC, datetime
+
+        from lingxi.adapters.postgres_admin_followup import PostgresFollowupStore, enqueue_followups
+        from lingxi.core.admin.followup import FollowupSpec
+
+        self.sql("""INSERT INTO pending_action(id,action_type,target_open_id,initiated_by_open_id,
+            target_state_snapshot,status,created_at,confirm_deadline_at) VALUES
+            ('pac_ref','suspend_user','ou_synthetic','ou_admin','enabled','pending',now(),now()+interval '1 hour')""")
+        with connect(DSN) as conn:
+            enqueue_followups(
+                conn,
+                pending_action_id="pac_ref",
+                trace_id=A,
+                items=(FollowupSpec(subject_key="synthetic", stage="group_notify"),),
+            )
+        store = PostgresFollowupStore(DSN)
+        item = store.claim_followup(
+            consumer_kind="gateway", owner="synthetic", now=datetime.now(UTC) + timedelta(seconds=1)
+        )
+        self.assertTrue(
+            store.complete_followup(
+                id=item.id,
+                owner="synthetic",
+                attempt=item.attempt,
+                status="unknown",
+                result_code="unknown",
+            )
+        )
+        view = self.queries.trace_lookup(trace_id=A)
+        self.assertIsNone(view.event_count)
+        self.assertEqual(len(view.followups), 1)
+        text = render_trace(A, view)
+        self.assertIn("结果待核实", text)
+        self.assertIn(A, text)
+        self.assertIn(item.id, text)
+        self.assertNotIn("入站事件", text)
+        self.assertIsNone(self.queries.trace_lookup(trace_id=B))
+        self.sql("UPDATE admin_action_followup SET created_at=now()-interval '91 days'")
+        self.assertIsNone(self.queries.trace_lookup(trace_id=A))

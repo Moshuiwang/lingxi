@@ -5045,7 +5045,7 @@ class YearGroundingSuspectAlertTests(unittest.TestCase):
         task_id/命中词/查询年份，不携带问句与答案正文。"""
 
         record = self._record_with_query(
-            task_id="tsk-year-suspect",
+            task_id="tsk_01J00000000000000000000009",
             question="最近，尤其是7月之后数据下滑得厉害",
             start_date="2025-01-01",
             end_date="2025-08-25",
@@ -5055,7 +5055,7 @@ class YearGroundingSuspectAlertTests(unittest.TestCase):
 
         self.assertEqual(len(received), 1)
         fields = received[0]
-        self.assertEqual(fields["task_id"], "tsk-year-suspect")
+        self.assertEqual(fields["task_id"], "tsk_01J00000000000000000000009")
         self.assertEqual(fields["matched_relative_time_terms"], ["最近", "7月之后"])
         self.assertEqual(fields["query_years"], [2025])
         self.assertNotIn("question", fields)

@@ -125,6 +125,7 @@ class WorkerConfig:
 
     question: str
     read_only_tools: tuple[str, ...]
+    # 兼容 LINGXI_WORKER_TRACE_ID 配置名；仅代表进程运行号，日志名 worker_run_id。
     trace_id: str
     # 单回合墙钟上限（业务执行预算）：SDK 传输挂住不发终止消息时，没有它整个
     # 回合会永久等待，连失败报告都出不来。不含收尾宽限。

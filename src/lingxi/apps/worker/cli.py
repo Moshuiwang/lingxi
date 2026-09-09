@@ -7,7 +7,7 @@
 
 - **stdout**：恰好一个 JSON 对象，就是回合报告；配置错误时 ``turn`` 为空、
   ``failure.code`` 为 ``config_error``。
-- **stderr**：结构化日志，每行一个 JSON 对象，都带 ``trace_id``，不写文件。
+- **stderr**：结构化日志，每行一个 JSON 对象，都带进程号 ``worker_run_id``，不写文件。
 - **退出码**：0 正常收口；2 跑完但没收口；3 配置错误；4 会话失败；
   5 检测到绕过屏障的调用（``ungated_count > 0``）。
 
@@ -459,7 +459,7 @@ class _LogOnlyAlertSender:
     """
 
     def __init__(self, *, err: TextIO, trace_id: str) -> None:
-        """记住输出流与 trace_id，供 :meth:`send_text` 复用。"""
+        """记住输出流与进程号，供 :meth:`send_text` 复用。"""
         self._err = err
         self._trace_id = trace_id
 
@@ -470,7 +470,7 @@ class _LogOnlyAlertSender:
 
 class _StructuredAuditSink:
     def __init__(self, *, err: TextIO, trace_id: str) -> None:
-        """记住输出流与 trace_id，供 :meth:`record` 复用。"""
+        """记住输出流与进程号，供 :meth:`record` 复用。"""
         self._err = err
         self._trace_id = trace_id
 
@@ -482,7 +482,7 @@ def _terminal_outcome_sink(*, err: TextIO, trace_id: str) -> Callable[[Mapping[s
     """把 ``WorkerService`` 的终态收口低敏审计事件接到本文件的结构化 stderr 出口。
 
     ``WorkerService`` 是纯组装对象，不该假设 stdlib ``logging`` 有 handler；
-    这里复用现成的 ``_log()`` 出口，带上 ``trace_id``。``denied_count > 0``
+    这里复用现成的 ``_log()`` 出口，带上进程号，任务字段由回合携带。``denied_count > 0``
     （这一回合有工具调用被拒绝）时把事件提到 ``warning`` 级别——拒绝本身不算
     失败，但白名单配错这类问题只在这里才留得下痕迹，不该淹没在 ``info`` 里。
     """
