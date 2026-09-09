@@ -3,6 +3,10 @@
 裸 ULID 查有效入站事件，T-ULID 只查精确任务；两者分别遵守原事件和任务保留期限。
 任务投影不含问题、答案或个人资料，默认仍不显示 open_id；历史开通视图需要核对外部
 身份时，仍需显式 --include-open-id。查询使用同一只读事务，不提供写入口。
+
+本命令不知道自己被装进哪个容器：三个角色的连接串变量名不统一（见
+``adapters.postgres.DSN_ENV_VAR_BY_ROLE``），因此按固定顺序逐个回退尝试，
+不要求调用方另配连接串。
 """
 
 from __future__ import annotations
@@ -13,12 +17,38 @@ from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any
 
+from lingxi.adapters.postgres import DSN_ENV_VAR_BY_ROLE
 from lingxi.adapters.task_trace_query import fetch_trace_task
 from lingxi.core.task_reference import parse_reference
 
-#: scheduler 角色使用的连接串环境变量名，与 ``apps/healthcheck`` 的角色映射保持
-#: 同一个变量（本命令按设计固定在 scheduler 容器内执行，见模块文档）。
-DSN_ENV_VAR = "LINGXI_POSTGRES_DSN"
+#: 历史默认：scheduler / worker 角色的连接串环境变量名，向后兼容按此键注入
+#: 环境的旧调用方。真正的读取顺序见 :func:`_resolve_dsn`——本命令按固定顺序
+#: 回退尝试，不止读这一个变量。
+DSN_ENV_VAR = DSN_ENV_VAR_BY_ROLE["scheduler"]
+
+#: 回退顺序固定：先 scheduler/worker 的历史默认变量，再 gateway 的独立前缀
+#: 变量；worker 与 scheduler 同名，不需要单独再试一次。顺序不随
+#: ``DSN_ENV_VAR_BY_ROLE`` 的字典遍历顺序变化。
+_DSN_FALLBACK_ROLES: tuple[str, ...] = ("scheduler", "gateway")
+
+
+def _resolve_dsn(source: Mapping[str, str]) -> tuple[str, tuple[str, ...]]:
+    """按 :data:`_DSN_FALLBACK_ROLES` 顺序找第一个非空连接串环境变量。
+
+    返回 ``(dsn, tried)``：命中时 ``dsn`` 非空、``tried`` 是命中之前（含命中
+    本身）尝试过的变量名；全部落空时 ``dsn`` 为空串、``tried`` 是全部尝试过的
+    变量名——调用方用它在失败提示里逐个列出，不需要重新猜一遍找过哪些。
+    """
+    tried: list[str] = []
+    for role in _DSN_FALLBACK_ROLES:
+        var_name = DSN_ENV_VAR_BY_ROLE[role]
+        if var_name in tried:
+            continue
+        tried.append(var_name)
+        value = (source.get(var_name) or "").strip()
+        if value:
+            return value, tuple(tried)
+    return "", tuple(tried)
 
 
 @dataclass(frozen=True)
@@ -268,9 +298,9 @@ def run(
     out = sys.stdout if stdout is None else stdout
     err = sys.stderr if stderr is None else stderr
 
-    dsn = (source.get(DSN_ENV_VAR) or "").strip()
+    dsn, tried_vars = _resolve_dsn(source)
     if not dsn:
-        print(f"缺少数据库连接串环境变量 {DSN_ENV_VAR}", file=err)
+        print("缺少数据库连接串环境变量，已尝试：" + "、".join(tried_vars), file=err)
         return 1
 
     parsed = parse_reference(args.trace_id)
