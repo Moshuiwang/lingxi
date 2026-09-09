@@ -332,4 +332,25 @@ class TaskReferencePostgresTests(unittest.TestCase):
         self.assertNotIn("入站事件", text)
         self.assertIsNone(self.queries.trace_lookup(trace_id=B))
         self.sql("UPDATE admin_action_followup SET created_at=now()-interval '91 days'")
+        still_visible = self.queries.trace_lookup(trace_id=A)
+        self.assertIsNotNone(still_visible)
+        self.assertEqual([row.followup_id for row in still_visible.followups], [item.id])
+        self.sql("DELETE FROM pending_action WHERE id='pac_ref'")
+        self.sql("""INSERT INTO pending_action(id,action_type,target_open_id,initiated_by_open_id,
+            target_state_snapshot,status,created_at,confirm_deadline_at) VALUES
+            ('pac_ref','suspend_user','ou_synthetic','ou_admin','enabled','pending',
+             now()-interval '91 days',now()-interval '91 days'+interval '1 hour')""")
+        with connect(DSN) as conn:
+            enqueue_followups(
+                conn,
+                pending_action_id="pac_ref",
+                trace_id=A,
+                items=(FollowupSpec(subject_key="synthetic", stage="group_notify"),),
+            )
+        self.assertEqual(
+            self.sql("""SELECT f.created_at > p.created_at + interval '90 days'
+                FROM admin_action_followup f JOIN pending_action p ON p.id=f.pending_action_id
+                WHERE p.id='pac_ref'"""),
+            [(True,)],
+        )
         self.assertIsNone(self.queries.trace_lookup(trace_id=A))
