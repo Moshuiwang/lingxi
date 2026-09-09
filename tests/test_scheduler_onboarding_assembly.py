@@ -905,203 +905,91 @@ class SchedulerLoopDutiesPropertyTests(unittest.TestCase):
         self.assertEqual(loop.duties, (duty_a, duty_b))
 
 
-class MainExitJoinsOnboardingExecutorsTests(unittest.TestCase):
-    """Issue #284 C 组 #8（Trace #373 D7 裁定修复）：``main()`` 的退出路径必须真的
-    调用 ``join_onboarding_executors(loop.duties)``，不是文档写了但没接线。
-    ``ShutdownWiringTests`` 只覆盖 ``join_onboarding_executors`` 函数本身对不对
-    （直接传一个职责列表进去），从不经过 ``main()``——如果以后有人在 ``main()`` 里
-    删掉这一行调用，那组测试全绿也测不出来。这里用轻量桩顶掉 ``main()`` 里其余的真实
-    装配（配置读取、告警、``build_loop``、信号安装），只把"退出路径真的用
-    ``loop.duties`` 调用了 ``join_onboarding_executors``"这一段接线暴露成断言，不真的
-    起一个 scheduler 进程或后台线程（``loop.run_forever()`` 本身也是桩，立即返回）。
+class _MainLifecycleFixture:
+    """经 main 的新生命周期实际调用职责 stop/join，不替换被验证的接线。"""
 
-    变异验红：把 ``lingxi/apps/scheduler/__init__.py`` 里
-    ``join_onboarding_executors(loop.duties)`` 那一行删掉（或换成 ``pass``）重跑本
-    用例，``join_mock.assert_called_once_with(...)`` 会因为从未被调用而失败。
-    """
-
-    def test_main_calls_join_onboarding_executors_with_the_loops_duties(self) -> None:
+    def run_main(self, *, loop_error=None, join_error=None):
         import types
         from unittest import mock
 
-        sentinel_duties = (object(), object())
+        from lingxi.apps.scheduler.loop import SchedulerLoop
 
-        class _StubLoop:
-            duties = sentinel_duties
+        events = []
+        executor = mock.Mock()
+        executor.alive = False
+        executor.stop.side_effect = lambda: events.append("stop")
 
-            def run_forever(self) -> None:
-                return None
+        def join(*, timeout):
+            events.append("join")
+            self.assertGreaterEqual(timeout, 0)
+            self.assertLessEqual(timeout, 120)
+            if join_error is not None:
+                raise join_error
 
-            def request_stop(self) -> None:
-                return None
+        executor.join.side_effect = join
+        duty = types.SimpleNamespace(onboarding_executor=executor)
+        loop = SchedulerLoop(duties=[duty])
 
-        stub_loop = _StubLoop()
-        stub_config = types.SimpleNamespace(interval_seconds=5)
+        def run():
+            if loop_error is not None:
+                raise loop_error
 
+        loop.run_forever = run
         with (
             mock.patch("lingxi.apps.scheduler.SchedulerConfig") as config_cls,
-            mock.patch("lingxi.apps.scheduler.build_alerting_duty", return_value=mock.MagicMock()),
+            mock.patch("lingxi.apps.scheduler.build_alerting_duty", return_value=mock.Mock()),
+            mock.patch("lingxi.apps.scheduler.build_loop", return_value=loop) as build,
+            mock.patch("lingxi.apps.scheduler.install_signal_handlers") as install,
             mock.patch(
-                "lingxi.apps.scheduler.build_loop", return_value=stub_loop
-            ) as build_loop_mock,
-            mock.patch("lingxi.apps.scheduler.install_signal_handlers") as install_mock,
-            mock.patch("lingxi.apps.scheduler.join_onboarding_executors") as join_mock,
+                "lingxi.apps.scheduler.close_idle_connections",
+                side_effect=lambda: events.append("close"),
+            ) as close,
         ):
-            config_cls.from_env.return_value = stub_config
-
+            config_cls.from_env.return_value = types.SimpleNamespace(interval_seconds=5)
             from lingxi.apps.scheduler import main
 
-            code = main([])
-
-        self.assertEqual(code, 0)
-        install_mock.assert_called_once_with(stub_loop)
-        build_loop_mock.assert_called_once()
-        join_mock.assert_called_once_with(sentinel_duties)
-
-
-class MainExitClosesIdleConnectionsTests(unittest.TestCase):
-    """D-17（#593 元守护审核 P2-b）：``main()`` 停机路径必须在
-    ``join_onboarding_executors`` 之后显式调用一次
-    ``lingxi.adapters.postgres.close_idle_connections``，不能只靠进程退出时的
-    ``atexit``。同上一组用例的姿态：轻量桩顶掉真实装配，只把这一段接线暴露成
-    断言，不真的连数据库。
-
-    变异验红：把 ``lingxi/apps/scheduler/__init__.py`` 里
-    ``close_idle_connections()`` 那一行删掉重跑本用例，
-    ``close_mock.assert_called_once_with()`` 会因为从未被调用而失败。
-    """
-
-    def test_main_calls_close_idle_connections_once_after_shutdown(self) -> None:
-        import types
-        from unittest import mock
-
-        class _StubLoop:
-            duties = ()
-
-            def run_forever(self) -> None:
-                return None
-
-            def request_stop(self) -> None:
-                return None
-
-        stub_loop = _StubLoop()
-        stub_config = types.SimpleNamespace(interval_seconds=5)
-
-        with (
-            mock.patch("lingxi.apps.scheduler.SchedulerConfig") as config_cls,
-            mock.patch("lingxi.apps.scheduler.build_alerting_duty", return_value=mock.MagicMock()),
-            mock.patch("lingxi.apps.scheduler.build_loop", return_value=stub_loop),
-            mock.patch("lingxi.apps.scheduler.install_signal_handlers"),
-            mock.patch("lingxi.apps.scheduler.join_onboarding_executors"),
-            mock.patch("lingxi.apps.scheduler.close_idle_connections") as close_mock,
-        ):
-            config_cls.from_env.return_value = stub_config
-
-            from lingxi.apps.scheduler import main
-
-            code = main([])
-
-        self.assertEqual(code, 0)
-        close_mock.assert_called_once_with()
+            if loop_error is not None:
+                with self.assertRaises(type(loop_error)) as caught:
+                    main([])
+                self.assertIs(caught.exception, loop_error)
+                code = None
+            else:
+                code = main([])
+        install.assert_called_once_with(loop)
+        build.assert_called_once()
+        executor.join.assert_called_once()
+        close.assert_called_once_with()
+        self.assertTrue(loop.stopping)
+        self.assertLess(events.index("stop"), events.index("join"))
+        self.assertLess(events.index("join"), events.index("close"))
+        self.assertEqual(events[-1], "close")
+        return code
 
 
-class MainExceptionExitStillJoinsOnboardingExecutorsTests(unittest.TestCase):
-    """P1-B（codex 外审 · Trace #373 H1 批终修复包②）：``main()`` 里
-    ``join_onboarding_executors(loop.duties)`` 此前放在 ``loop.run_forever()``
-    之后、没有 ``finally`` 覆盖——主循环抛出未处理异常时这一行会被绕过，开通
-    执行器的独立线程池只能靠解释器退出时被任意截断，而不是走"停止领取、等在途
-    工作在预算内收尾"的退出语义。本用例钉住修复后的行为：``run_forever()`` 抛
-    异常时 join 仍必须被调用，且原始异常必须原样向上传播（不能被收尾覆盖或吞掉）。
+class MainExitJoinsOnboardingExecutorsTests(_MainLifecycleFixture, unittest.TestCase):
+    """正常退出必须经共同生命周期停止并等待真实登记的职责。"""
 
-    变异验红：把 ``lingxi/apps/scheduler/__init__.py`` 里包住 ``run_forever()``
-    的 ``try``/``finally`` 去掉、改回顺序调用（``loop.run_forever()`` 后面直接
-    跟 ``join_onboarding_executors(loop.duties)``）重跑本用例，
-    ``join_mock.assert_called_once_with(...)`` 会因为异常路径跳过了 join 调用
-    而失败。
-    """
+    def test_main_calls_join_onboarding_executors_with_the_loops_duties(self):
+        self.assertEqual(self.run_main(), 0)
 
-    def test_run_forever_exception_still_joins_and_propagates(self) -> None:
-        import types
-        from unittest import mock
 
-        sentinel_duties = (object(), object())
-        boom = RuntimeError("主循环崩了")
+class MainExitClosesIdleConnectionsTests(_MainLifecycleFixture, unittest.TestCase):
+    """空闲连接关闭发生在职责等待之后，不能只依赖 atexit。"""
 
-        class _StubLoop:
-            duties = sentinel_duties
+    def test_main_calls_close_idle_connections_once_after_shutdown(self):
+        self.assertEqual(self.run_main(), 0)
 
-            def run_forever(self) -> None:
-                raise boom
 
-            def request_stop(self) -> None:
-                return None
+class MainExceptionExitStillJoinsOnboardingExecutorsTests(_MainLifecycleFixture, unittest.TestCase):
+    """异常路径仍排空职责，收尾失败不得遮蔽原始异常。"""
 
-        stub_loop = _StubLoop()
-        stub_config = types.SimpleNamespace(interval_seconds=5)
+    def test_run_forever_exception_still_joins_and_propagates(self):
+        self.run_main(loop_error=RuntimeError("主循环的原始故障"))
 
-        with (
-            mock.patch("lingxi.apps.scheduler.SchedulerConfig") as config_cls,
-            mock.patch("lingxi.apps.scheduler.build_alerting_duty", return_value=mock.MagicMock()),
-            mock.patch(
-                "lingxi.apps.scheduler.build_loop", return_value=stub_loop
-            ) as build_loop_mock,
-            mock.patch("lingxi.apps.scheduler.install_signal_handlers") as install_mock,
-            mock.patch("lingxi.apps.scheduler.join_onboarding_executors") as join_mock,
-        ):
-            config_cls.from_env.return_value = stub_config
-
-            from lingxi.apps.scheduler import main
-
-            with self.assertRaises(RuntimeError) as ctx:
-                main([])
-
-        self.assertIs(ctx.exception, boom, "原始异常必须原样向上传播，不能被收尾覆盖")
-        install_mock.assert_called_once_with(stub_loop)
-        build_loop_mock.assert_called_once()
-        # 主循环抛异常时 join_onboarding_executors 仍必须被调用。
-        join_mock.assert_called_once_with(sentinel_duties)
-
-    def test_join_failure_during_exception_exit_does_not_mask_the_original_error(self) -> None:
-        """收尾自身失败不得覆盖原始故障：``run_forever()`` 与
-        ``join_onboarding_executors`` 都抛异常时，向上传播的必须是
-        ``run_forever()`` 的原始异常。"""
-
-        import types
-        from unittest import mock
-
-        sentinel_duties = (object(),)
-        original_error = RuntimeError("主循环的原始故障")
-
-        class _StubLoop:
-            duties = sentinel_duties
-
-            def run_forever(self) -> None:
-                raise original_error
-
-            def request_stop(self) -> None:
-                return None
-
-        stub_loop = _StubLoop()
-        stub_config = types.SimpleNamespace(interval_seconds=5)
-
-        with (
-            mock.patch("lingxi.apps.scheduler.SchedulerConfig") as config_cls,
-            mock.patch("lingxi.apps.scheduler.build_alerting_duty", return_value=mock.MagicMock()),
-            mock.patch("lingxi.apps.scheduler.build_loop", return_value=stub_loop),
-            mock.patch("lingxi.apps.scheduler.install_signal_handlers"),
-            mock.patch(
-                "lingxi.apps.scheduler.join_onboarding_executors",
-                side_effect=RuntimeError("收尾 join 也失败了"),
-            ),
-        ):
-            config_cls.from_env.return_value = stub_config
-
-            from lingxi.apps.scheduler import main
-
-            with self.assertRaises(RuntimeError) as ctx:
-                main([])
-
-        self.assertIs(ctx.exception, original_error, "收尾失败不得覆盖 run_forever() 的原始异常")
+    def test_join_failure_during_exception_exit_does_not_mask_the_original_error(self):
+        self.run_main(
+            loop_error=RuntimeError("主循环的原始故障"), join_error=RuntimeError("收尾等待失败")
+        )
 
 
 class StopSentinelRaceTests(unittest.TestCase):
