@@ -42,6 +42,8 @@ class SchedulerLoop:
         self._interval_seconds = interval_seconds
         self._stop = SignalStopEvent() if stop is None else stop
         self._signal_requested_at = None
+        self._signal_number = None
+        self._signal_noted = False
         self._heartbeat = heartbeat
         from lingxi.apps.scheduler.lifecycle import DutyLifecycle
         from lingxi.core.admin.followup_lifecycle import BackgroundLifecycle
@@ -70,16 +72,25 @@ class SchedulerLoop:
 
     def request_stop(self) -> None:
         """置位停止信号：本轮及之后不再有职责领取新工作。"""
+        self._note_signal()
         self._stop.set()
         deadline = None if self._signal_requested_at is None else self._signal_requested_at + 120
         self.lifecycle.request_stop(deadline_monotonic=deadline)
 
-    def signal_stop(self):
-        """信号只登记首次停止时刻；资源停止留给主循环的安全位置。"""
+    def signal_stop(self, signal_number=None):
+        """信号只登记首次停止时刻与来源信号；日志留给主循环的安全位置。"""
         if self._signal_requested_at is None:
             self._signal_requested_at = time.monotonic()
+            self._signal_number = signal_number
         if isinstance(self._stop, SignalStopEvent):
             self._stop.signal_stop()
+
+    def _note_signal(self) -> None:
+        """信号处理函数内写日志会与被打断的日志锁重入，改在停止领取的安全位置补记一次。"""
+        if self._signal_number is None or self._signal_noted:
+            return
+        self._signal_noted = True
+        logger.info("收到信号，停止领取新的到期凭据 signal=%s", self._signal_number)
 
     def register_background(self, component):
         """后继 listener 与阶段只登记本生命周期，不建第二调度器。"""
@@ -135,13 +146,17 @@ def install_signal_handlers(loop: _Stoppable) -> None:
     """把 ``SIGTERM`` / ``SIGINT`` 接到"停止领取"上。
 
     处理函数只设一个事件标志，不做任何 I/O：信号处理函数里写库或发网络请求会在
-    退出路径上引入新的失败模式，而这条路径恰恰是最不该出错的地方。
+    退出路径上引入新的失败模式，而这条路径恰恰是最不该出错的地方。日志同理——写
+    日志要取日志锁，信号打断的恰好可能是持锁的那段代码。因此「收到信号」那行由
+    :meth:`SchedulerLoop._note_signal` 在主循环的安全位置补记，不在这里打。
     """
 
     def handle(signal_number: int, _frame: Any) -> None:
-        del signal_number
-        stop = getattr(loop, "signal_stop", loop.request_stop)
-        stop()
+        stop = getattr(loop, "signal_stop", None)
+        if stop is None:
+            loop.request_stop()
+        else:
+            stop(signal_number)
 
     signal.signal(signal.SIGTERM, handle)
     signal.signal(signal.SIGINT, handle)

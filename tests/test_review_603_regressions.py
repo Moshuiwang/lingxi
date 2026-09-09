@@ -2,6 +2,7 @@
 
 import contextlib
 import os
+import signal
 import subprocess
 import sys
 import textwrap
@@ -213,3 +214,34 @@ class SchedulerSignalRegressionTests(unittest.TestCase):
         )
         self.assertEqual(completed.returncode, 0, completed.stderr)
         self.assertIn("zero subsequent claims", completed.stdout)
+
+    def test_sigterm_logs_the_stop_notice_outside_the_signal_handler(self):
+        """V-部署-05 靠这行日志判定优雅停机；信号处理函数内写日志会与日志锁重入，
+        因此断言两件事：处理函数返回时还没有日志，主循环回到安全位置后补记一次。"""
+        script = textwrap.dedent("""
+            import logging, os, signal, sys
+            from types import SimpleNamespace
+            from lingxi.apps.scheduler.loop import SchedulerLoop, install_signal_handlers
+
+            logging.basicConfig(level=logging.INFO, stream=sys.stdout, format="%(message)s")
+            loop = SchedulerLoop(duties=[SimpleNamespace(run_once=lambda: None)],
+                interval_seconds=0.01)
+            install_signal_handlers(loop)
+            os.kill(os.getpid(), signal.SIGTERM)
+            assert loop.stopping
+            print("HANDLER-RETURNED", flush=True)
+            loop.run_forever()
+            assert loop.drain_until().still_running == 0
+        """)
+        completed = subprocess.run(
+            [sys.executable, "-B", "-c", script],
+            text=True,
+            capture_output=True,
+            timeout=15,
+            env=os.environ.copy(),
+        )
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        notice = f"收到信号，停止领取新的到期凭据 signal={int(signal.SIGTERM)}"
+        self.assertIn(notice, completed.stdout)
+        # 处理函数自身不写日志：该行必须晚于处理函数返回的标记。
+        self.assertLess(completed.stdout.index("HANDLER-RETURNED"), completed.stdout.index(notice))
