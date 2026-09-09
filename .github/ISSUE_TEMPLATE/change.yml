@@ -68,3 +68,10 @@ body:
       options:
         - label: 关闭前如改变长期产品事实，将先更新 docs/；否则在 Issue 说明「无需回写」的原因。
           required: true
+  - type: checkboxes
+    id: triage
+    attributes:
+      label: 建卡自检
+      options:
+        - label: 已打上 P0/P1/P2 之一，并登记已知的被阻塞项与父子关系（见 docs/协作约定.md「优先级、依赖与 Discussions」）。
+          required: true

@@ -34,3 +34,10 @@ body:
       options:
         - label: 已确认不含秘密、令牌、生产数据或个人敏感信息。
           required: true
+  - type: checkboxes
+    id: triage
+    attributes:
+      label: 建卡自检
+      options:
+        - label: 已打上 P0/P1/P2 之一，并登记已知的被阻塞项与父子关系（见 docs/协作约定.md「优先级、依赖与 Discussions」）。
+          required: true

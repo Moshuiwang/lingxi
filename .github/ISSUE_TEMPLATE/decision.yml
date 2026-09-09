@@ -35,3 +35,10 @@ body:
       options:
         - label: 若本次决定在 Issue 关闭后仍有效，将把结论回写到 docs/ 的产品合同、当前能力或长期决策记录。
           required: true
+  - type: checkboxes
+    id: triage
+    attributes:
+      label: 建卡自检
+      options:
+        - label: 已打上 P0/P1/P2 之一，并登记已知的被阻塞项与父子关系（见 docs/协作约定.md「优先级、依赖与 Discussions」）。
+          required: true
