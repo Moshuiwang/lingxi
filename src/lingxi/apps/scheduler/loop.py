@@ -9,10 +9,12 @@ from __future__ import annotations
 import logging
 import signal
 import threading
+import time
 from collections.abc import Callable, Sequence
 from typing import Any, Protocol
 
 from lingxi.apps.scheduler.config import DEFAULT_INTERVAL_SECONDS
+from lingxi.apps.scheduler.lifecycle import SignalStopEvent
 
 logger = logging.getLogger(__name__)
 
@@ -38,7 +40,8 @@ class SchedulerLoop:
             raise ValueError("定时职责进程至少要有一个职责")
         self._duties = tuple(duties)
         self._interval_seconds = interval_seconds
-        self._stop = threading.Event() if stop is None else stop
+        self._stop = SignalStopEvent() if stop is None else stop
+        self._signal_requested_at = None
         self._heartbeat = heartbeat
         from lingxi.apps.scheduler.lifecycle import DutyLifecycle
         from lingxi.core.admin.followup_lifecycle import BackgroundLifecycle
@@ -63,12 +66,20 @@ class SchedulerLoop:
     @property
     def stopping(self) -> bool:
         """是否已收到停止信号。"""
-        return self._stop.is_set()
+        return self._signal_requested_at is not None or self._stop.is_set()
 
     def request_stop(self) -> None:
         """置位停止信号：本轮及之后不再有职责领取新工作。"""
         self._stop.set()
-        self.lifecycle.request_stop()
+        deadline = None if self._signal_requested_at is None else self._signal_requested_at + 120
+        self.lifecycle.request_stop(deadline_monotonic=deadline)
+
+    def signal_stop(self):
+        """信号只登记首次停止时刻；资源停止留给主循环的安全位置。"""
+        if self._signal_requested_at is None:
+            self._signal_requested_at = time.monotonic()
+        if isinstance(self._stop, SignalStopEvent):
+            self._stop.signal_stop()
 
     def register_background(self, component):
         """后继 listener 与阶段只登记本生命周期，不建第二调度器。"""
@@ -88,7 +99,8 @@ class SchedulerLoop:
             except Exception as error:  # 心跳失败不能跳过定时职责
                 logger.error("scheduler 心跳记录失败，职责继续运行 error=%s", type(error).__name__)
         for duty in self._duties:
-            if self._stop.is_set():
+            if self.stopping:
+                self.request_stop()
                 # 已经在停止中：不再让后面的职责领取新工作（断言 V-保留-17）。
                 reports.append(None)
                 continue
@@ -106,11 +118,12 @@ class SchedulerLoop:
 
     def run_forever(self) -> None:
         """按 `interval_seconds` 循环跑 `run_once`，直到停止信号置位。"""
-        while not self._stop.is_set():
+        while not self.stopping:
             self.run_once()
-            if self._stop.is_set():
+            if self.stopping:
                 break
             self._stop.wait(self._interval_seconds)
+        self.request_stop()
         logger.info("定时职责已停止领取并退出")
 
 
@@ -126,8 +139,9 @@ def install_signal_handlers(loop: _Stoppable) -> None:
     """
 
     def handle(signal_number: int, _frame: Any) -> None:
-        logger.info("收到信号，停止领取新的到期凭据 signal=%s", signal_number)
-        loop.request_stop()
+        del signal_number
+        stop = getattr(loop, "signal_stop", loop.request_stop)
+        stop()
 
     signal.signal(signal.SIGTERM, handle)
     signal.signal(signal.SIGINT, handle)

@@ -41,10 +41,8 @@ class GatewayFollowupHandlers:
         """重算现有权限，不重放确认时的权限快照。"""
         outcome = self.recompute.trigger(pending)
         if outcome.kind is RecomputeKind.SKIPPED:
+            self.cards.reporter.on_skipped(pending, outcome)
             return FollowupResult("skipped", outcome.reason or "recompute_skipped")
-        if outcome.kind is RecomputeKind.UNCHANGED:
-            self.cards.reporter.on_completed(pending)
-            return FollowupResult()
         reference = self.store.current_publish_reference(target_user_id=item.target_user_id)
         if reference is None:
             return FollowupResult("retry_wait", "publish_reference_pending")

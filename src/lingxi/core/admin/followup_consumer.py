@@ -8,6 +8,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 
 from lingxi.core.admin.followup import EXTERNAL_STAGES, ShutdownReport
+from lingxi.core.admin.followup_effect import effect_guard
 
 
 @dataclass(frozen=True)
@@ -23,11 +24,11 @@ class FollowupResult:
 class FollowupConsumer:
     """固定处理器表，未知阶段保持待处理直到装配了正确消费者。"""
 
-    def __init__(self, *, store, consumer_kind, owner, handlers, audit):
+    def __init__(self, *, store, consumer_kind, owner, handlers, audit, stop=None):
         """构造不启动线程，由生命周期装配显式启动。"""
         self.store, self.kind, self.owner = store, consumer_kind, owner
         self.handlers, self.audit = dict(handlers), audit
-        self._stop = threading.Event()
+        self._stop = threading.Event() if stop is None else stop
         self._gate = threading.Lock()
         self._thread = None
         self._accepted = self._finished = self._unknown = 0
@@ -68,6 +69,8 @@ class FollowupConsumer:
                 return False
             now = datetime.now(UTC)
             self.store.recover_expired(now=now, limit=32)
+            if self._stop.is_set():
+                return False
             item = self.store.claim_followup(consumer_kind=self.kind, owner=self.owner, now=now)
             if item is None:
                 return False
@@ -93,7 +96,8 @@ class FollowupConsumer:
                 return
             else:
                 self._effect_started = item.stage in EXTERNAL_STAGES
-                result = handler(item)
+                with effect_guard(lambda: not self._lease_lost):
+                    result = handler(item)
             self._finish(item, result)
         except Exception as error:
             self.store.retry_followup(

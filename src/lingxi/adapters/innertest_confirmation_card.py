@@ -4,6 +4,7 @@ from datetime import UTC, datetime
 
 from lingxi.adapters.postgres_innertest import InnertestPrincipal
 from lingxi.core.admin.followup_consumer import FollowupResult
+from lingxi.core.admin.followup_effect import effect_allowed
 from lingxi.core.admin.innertest import InnertestError, target_digest
 from lingxi.core.admin.notification import (
     ConfirmCardButton,
@@ -30,18 +31,22 @@ class InnertestConfirmationCard:
             return FollowupResult("skipped", "stale_confirmation")
         recipient, card, card_id = target
         if card_id is None:
+            if not self._may_start_effect(item):
+                return FollowupResult("unknown", "lease_lost")
             card_id = self.create_card(render_card_payload(card))
             with self.store.transaction() as connection, connection.cursor() as cursor:
                 cursor.execute(
                     "UPDATE pending_action p SET card_id=%s FROM admin_action_followup f "
                     "WHERE p.id=%s AND f.id=%s AND f.lease_owner=%s AND f.attempt=%s "
-                    "AND f.status='running' AND p.status='pending'",
+                    "AND f.status='running' AND f.lease_until>now() AND p.status='pending'",
                     (card_id, item.pending_action_id, item.id, item.lease_owner, item.attempt),
                 )
                 if cursor.rowcount != 1:
                     return FollowupResult("unknown", "card_unknown")
         if self._read(item) is None:
             return FollowupResult("skipped", "stale_confirmation")
+        if not self._may_start_effect(item):
+            return FollowupResult("unknown", "lease_lost")
         try:
             message_id = self.send_card(
                 open_id=recipient,
@@ -57,6 +62,16 @@ class InnertestConfirmationCard:
             return FollowupResult("unknown", "card_unknown")
         self._delivered(item, card_id, message_id)
         return FollowupResult(external_ref=message_id)
+
+    def _may_start_effect(self, item):
+        """失权后不再创建或发送；数据库校验完成后再读一次续租失败标志。"""
+        return (
+            effect_allowed()
+            and self.store.mark_effect_started(
+                id=item.id, owner=item.lease_owner, attempt=item.attempt, now=datetime.now(UTC)
+            )
+            and effect_allowed()
+        )
 
     def _read(self, item):
         """每次发送动作前校验当前绑定，旧卡、旧版本不发。"""

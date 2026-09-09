@@ -39,6 +39,7 @@ def wire_innertest(config, *, loop, duties, audit):
     consumer = FollowupConsumer(
         store=store,
         consumer_kind="scheduler",
+        stop=loop.stop_event,
         owner=new_id("run"),
         handlers={
             s: handlers.handle for s in ("innertest_preprovision", "innertest_readiness_check")
@@ -50,6 +51,7 @@ def wire_innertest(config, *, loop, duties, audit):
         service=service,
         db_slots=loop.followup_db_slots,
         socket_gid=binding.socket_gid,
+        stop=loop.stop_event,
     )
     listener.start()
     for component in (consumer, listener, FollowupLeaseKeeper([consumer], audit=audit)):

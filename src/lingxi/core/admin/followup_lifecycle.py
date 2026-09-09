@@ -28,11 +28,13 @@ class BackgroundLifecycle:
                 self._objects.append(component)
         return component
 
-    def request_stop(self):
+    def request_stop(self, deadline_monotonic=None):
         """重复停止保留第一次截止，先关闭所有对象接收。"""
         with self._lock:
             if self.deadline is None:
                 self.deadline = self.clock() + self.budget_seconds
+            if deadline_monotonic is not None:
+                self.deadline = min(self.deadline, deadline_monotonic)
             objects = tuple(self._objects)
         for component in objects:
             component.request_stop()

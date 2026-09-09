@@ -65,6 +65,7 @@ def recover_expired(store, *, now, limit=32):
                     id,
                 ),
             )
+        _settle_management_cards(cursor, limit)
         _close_dependencies(cursor, now, limit)
         _expire_old(cursor, now, limit)
     return RecoveryCounts(**counts)
@@ -107,3 +108,20 @@ def _expire_old(cursor, now, limit):
         (now, now, ids),
     )
     cursor.execute("DELETE FROM admin_action_followup WHERE id=ANY(%s)", (ids,))
+
+
+def _settle_management_cards(cursor, limit):
+    """只收口当前操作的下发中卡；终止事实持久化后重启仍能补刷。"""
+    cursor.execute(
+        "WITH unfinished AS (SELECT c.message_id FROM management_card_context c "
+        "JOIN LATERAL (SELECT id FROM pending_action WHERE origin_card_message_id=c.message_id "
+        "ORDER BY created_at DESC,id DESC LIMIT 1) p ON true "
+        "WHERE c.state='dispatching' AND EXISTS (SELECT 1 FROM admin_action_followup f "
+        "WHERE f.pending_action_id=p.id AND f.stage IN ('permission_recompute','publish_observe') "
+        "AND f.status IN ('failed','skipped')) "
+        "ORDER BY c.message_id FOR UPDATE OF c SKIP LOCKED LIMIT %s) "
+        "UPDATE management_card_context c SET state='incomplete',dispatch_status='incomplete',"
+        "state_version=state_version+1,card_sequence=card_sequence+1,needs_refresh=true,"
+        "updated_at=now() FROM unfinished u WHERE c.message_id=u.message_id",
+        (min(32, max(0, limit)),),
+    )
