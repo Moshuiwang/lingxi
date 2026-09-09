@@ -96,7 +96,12 @@ class FollowupConsumer:
                 return
             else:
                 self._effect_started = item.stage in EXTERNAL_STAGES
-                with effect_guard(lambda: not self._lease_lost):
+                with effect_guard(
+                    lambda: not self._lease_lost,
+                    lambda: self.store.mark_effect_started(
+                        id=item.id, owner=self.owner, attempt=item.attempt, now=datetime.now(UTC)
+                    ),
+                ):
                     result = handler(item)
             self._finish(item, result)
         except Exception as error:

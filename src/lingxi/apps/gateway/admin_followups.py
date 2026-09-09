@@ -5,6 +5,7 @@ from __future__ import annotations
 from lingxi.core.admin.followup import FollowupSpec
 from lingxi.core.admin.followup_budget import FollowupDatabaseBudget
 from lingxi.core.admin.followup_consumer import FollowupConsumer, FollowupResult
+from lingxi.core.admin.followup_effect import effect_lease_allowed
 from lingxi.core.admin.notification import render_group_notice
 from lingxi.core.ids import new_id
 from lingxi.core.permission.targeted_recompute import RecomputeKind
@@ -73,6 +74,8 @@ class GatewayFollowupHandlers:
         if card is None:
             return FollowupResult("skipped", "card_missing")
         sequence = self.pending_actions.next_card_sequence(pending_action_id=pending.id)
+        if not effect_lease_allowed():
+            return FollowupResult("retry_wait", "lease_lost")
         self.callback._confirm_cards.update(card_id=pending.card_id, sequence=sequence, card=card)
         return FollowupResult()
 
@@ -111,6 +114,8 @@ class GatewayFollowupHandlers:
             company_label=company,
             metric_label=metric,
         )
+        if not effect_lease_allowed():
+            return FollowupResult("unknown", "lease_lost")
         cb._group_notifier.send_text(chat_id=cb._group_chat_id, text=text, dedupe_key=pending.id)
         return FollowupResult()
 
