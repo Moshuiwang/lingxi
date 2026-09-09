@@ -478,7 +478,8 @@ docker compose exec -T scheduler python -m lingxi.apps.innertest_roster apply \
 
 # 3. 回读确认：模式、版本、摘要、成员数、绑定状态，输出是一行 JSON。
 docker compose exec -T scheduler python -m lingxi.apps.innertest_roster verify \
-  --scope <作用域>
+  --scope <作用域> \
+  --binding-id <上一步打印的绑定标识>
 ```
 
 预演打印「待写入成员 N 人」与摘要；写入打印「已写入成员 N 人」、同一个摘要与绑定标识；

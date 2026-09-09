@@ -143,6 +143,9 @@ def _cmd_plan(
     except InnertestError as error:
         _print_rejection(error, err)
         return 1
+    except Exception as error:
+        print(f"预演失败：{type(error).__name__}", file=err)
+        return 1
     print(f"[只读预演] scope={args.scope} 待写入成员：{len(plan.members)} 人", file=out)
     print(f"摘要：{plan.digest}", file=out)
     for email, _open_id in plan.members:
@@ -182,6 +185,9 @@ def _cmd_apply(
         )
     except InnertestError as error:
         _print_rejection(error, err)
+        return 1
+    except Exception as error:
+        print(f"写入失败：{type(error).__name__}", file=err)
         return 1
     print(f"已写入 scope={args.scope} 成员：{len(plan.members)} 人", file=out)
     print(f"摘要：{plan.digest}", file=out)

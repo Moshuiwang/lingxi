@@ -1,13 +1,25 @@
-"""scheduler 内受限管理入口与唯一后台阶段装配。"""
+"""scheduler 内受限管理入口与唯一后台阶段装配。
+
+装配与否在启动日志里各留一条：没有这条日志，运维只能靠猜这个职责是不是起来了，
+而「没配所以没起」与「配了但起失败」在外部看起来是同一个样子。
+"""
+
+import logging
 
 from lingxi.core.admin.followup_consumer import FollowupConsumer
 from lingxi.core.admin.followup_renewal import FollowupLeaseKeeper
 from lingxi.core.ids import new_id
 
+logger = logging.getLogger(__name__)
+
 
 def wire_innertest(config, *, loop, duties, audit):
     """显式配置才启动入口，生命周期与数据库预算复用同一进程 Owner。"""
     if not config.innertest_scope:
+        logger.info(
+            "未配置 LINGXI_INNERTEST_SCOPE：不注册受限管理入口，"
+            "内测扩员的管理命令与后台阶段在本进程内均不可用（不阻止启动）"
+        )
         return
     from lingxi.adapters.innertest_binding import load_binding
     from lingxi.adapters.innertest_handlers import InnertestFollowupHandlers
@@ -59,6 +71,12 @@ def wire_innertest(config, *, loop, duties, audit):
     for component in (consumer, listener, FollowupLeaseKeeper([consumer], audit=audit)):
         loop.register_background(component)
     consumer.start()
+    logger.info(
+        "已注册受限管理入口：scope=%s socket=%s binding=%s",
+        config.innertest_scope,
+        config.innertest_socket_path,
+        config.innertest_binding_path,
+    )
 
 
 def _build_probe(config, *, db_slots=None, should_stop=None):

@@ -904,5 +904,11 @@ docker compose --env-file deploy/.env.prod \
 ```
 
 `ok: true` 且 `roster`/`binding`/`followups` 三段都有内容，说明监听器已经注册并能
-访问数据库；`configuration_missing` 说明四个变量没有全部到位。启动日志里也能读到
-这个职责是否注册，见 `src/lingxi/apps/scheduler/innertest.py` 的模块说明。
+访问数据库；`configuration_missing` 说明四个变量没有全部到位。
+
+启动日志里也能读到这个职责是否注册，两条互斥，认准这两句：
+
+- 注册了：`已注册受限管理入口：scope=… socket=… binding=…`
+- 没注册：`未配置 LINGXI_INNERTEST_SCOPE：不注册受限管理入口，…（不阻止启动）`
+
+读不到其中任何一句，说明 scheduler 根本没走到这段装配，先查它是不是起来了。

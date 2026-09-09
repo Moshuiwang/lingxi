@@ -416,11 +416,13 @@ class TargetDriftRealDbTests(PendingActionPostgresTestCase):
 
 
 class UnassembledEntryRealDbTests(PendingActionPostgresTestCase):
-    """否定断言：动作类型还没接线时确认 → 明确拒绝，且是真实事务回滚。
+    """否定断言：动作类型还没接线时确认 → 明确拒绝，且事务结束后库里没有任何变化。
 
     纯函数层已经断言过「抛瞬时失败、分类 entry_not_assembled」；这里补的是
     数据库层面那一半——``pending_action`` 与 ``app_user`` 都停在事务开始前的
-    状态，管理员可以在接线之后直接重新点击，不需要人工修数据。
+    状态，管理员可以在接线之后直接重新点击，不需要人工修数据。守卫今天位于
+    任何写入之前，因此这条读的是「什么都没写」；将来谁把守卫挪到写入之后而
+    忘了回滚，它同样会红。
     """
 
     def test_unassembled_action_type_refuses_and_rolls_the_transaction_back(self) -> None:

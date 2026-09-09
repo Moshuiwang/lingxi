@@ -739,7 +739,7 @@ def check_content_capture_prod_guard() -> list[str]:
             "需要同步更新）"
         ]
 
-    for path in (COMPOSE_BASE, COMPOSE_STAGE, COMPOSE_PROD):
+    for path in (COMPOSE_BASE, COMPOSE_STAGE, COMPOSE_PROD, COMPOSE_INNERTEST):
         stripped = strip_comments(read(path))
         for needle in (flag_var, confirm_var, confirm_value):
             if needle in stripped:
@@ -1423,7 +1423,7 @@ def check_compose_interpolation_is_yaml_safe() -> list[str]:
 
     failures: list[str] = []
     required_variables: set[str] = set()
-    for path in (COMPOSE_BASE, COMPOSE_STAGE, COMPOSE_PROD):
+    for path in (COMPOSE_BASE, COMPOSE_STAGE, COMPOSE_PROD, COMPOSE_INNERTEST):
         for number, line in enumerate(read(path).splitlines(), start=1):
             if line.lstrip().startswith("#") or "${" not in line:
                 continue
