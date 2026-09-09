@@ -23,6 +23,7 @@ from lingxi.core.admin.pending_action import (
     ConfirmResultKind,
     PendingAction,
     PendingActionStatus,
+    PendingActionTransientFailureError,
     PendingActionType,
     decide_cancel,
     decide_confirm,
@@ -601,6 +602,26 @@ class DecideConfirmTargetDriftTests(unittest.TestCase):
         self.assertEqual(decision.code, "target_state_changed")
         self.assertIs(decision.terminal_status, PendingActionStatus.FAILED)
         self.assertEqual(decision.reason, "target_drifted")
+
+    def test_unassembled_action_type_is_refused_instead_of_reported_as_drift(self) -> None:
+        """未装配内测入口的 gateway 收到扩员确认时，不得误报成「目标状态已变化」。
+
+        这类动作的 ``target_state_snapshot`` 存的是名单版本号，与账号状态不同源；
+        继续比对必然判 ``TARGET_DRIFTED`` 并把整批写成 ``failed``，等于把配置问题
+        当成业务问题告诉管理员，且批次被误杀。正确行为是明确拒绝、什么都不改。
+        """
+        pending = _pending(
+            action_type=PendingActionType.INNERTEST_ADDITIONS, target_state_snapshot="7"
+        )
+        with self.assertRaises(PendingActionTransientFailureError) as raised:
+            decide_confirm(
+                pending=pending,
+                clicker_open_id=INITIATOR,
+                now=NOW,
+                registry_entry=_full_admin_entry(),
+                current_account_state="enabled",
+            )
+        self.assertEqual(raised.exception.classification, "entry_not_assembled")
 
     def test_target_missing_entirely_counts_as_drift(self) -> None:
         pending = _pending(target_state_snapshot="enabled")

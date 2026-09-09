@@ -416,6 +416,12 @@ def decide_confirm(
         return blocked
     if (blocked := _confirm_expired(pending, now)) is not None:
         return blocked
+    # 本函数没有登记的动作类型（如未装配内测入口的 gateway 收到的 ``innertest_additions``）
+    # 继续往下会在 ``REQUIRED_ROLE`` 上 ``KeyError``，被调用方兜底成「结果不明」——把配置
+    # 问题说成结果不明，管理员既看不出原因也无从判断该不该重试。这里明确拒绝，什么都不改。
+    # 必须排在角色判定之前：那一步就会先撞 ``KeyError``。
+    if pending.action_type not in REQUIRED_ROLE or pending.action_type not in TARGET_ACCOUNT_STATE:
+        raise PendingActionTransientFailureError("entry_not_assembled")
     if (blocked := _confirm_role_revoked(pending, registry_entry)) is not None:
         return blocked
     if (blocked := _confirm_target_drifted(pending, current_account_state)) is not None:
@@ -518,14 +524,13 @@ class PendingActionAuditWriteFailedError(RuntimeError):
 
 
 class PendingActionTransientFailureError(RuntimeError):
-    """确认/取消操作命中数据库瞬时故障（死锁、锁等待超时，或其他操作性错误）。
+    """确认/取消未能进行，事务已整体回滚，``pending_action`` 与目标均无变化。
 
-    事务已整体回滚，``pending_action`` 与目标 ``app_user`` 均未发生任何变化，
-    调用方可以安全重试；「停用一个正在聊天的用户」最容易撞见锁等待超时。定义
-    在这个纯类型模块而不是 adapter 模块，与 :class:`PendingActionAuditWriteFailedError`
-    同一取舍，让调用方能在不引入 psycopg 依赖链的情况下拿到这个类型去写
-    ``except``。``classification`` 只是抛出方 psycopg 异常的类名，仅用于审计
-    记录，不参与控制流判断。
+    两类来源共用本类型，由 ``classification`` 区分：数据库瞬时故障（死锁、锁等待
+    超时等，「停用一个正在聊天的用户」最容易撞见）；以及本进程未装配该动作类型的
+    入口。两者对外契约相同——什么都没改、可安全重试。定义在纯类型模块而不是
+    adapter，与 :class:`PendingActionAuditWriteFailedError` 同一取舍，让调用方不引入
+    psycopg 依赖链也能 ``except``。``classification`` 仅用于审计，不参与控制流。
     """
 
     def __init__(self, classification: str) -> None:
