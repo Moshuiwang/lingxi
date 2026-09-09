@@ -90,12 +90,14 @@ class GatewayFollowupHandlers:
         status = self.cards.status_lookup(context.identifier)
         if status is None:
             return FollowupResult("retry_wait", "status_unavailable")
-        self.cards.refresher.update(
+        refreshed = self.cards.refresher.update(
             context=context,
             status=status,
             state=context.state,
             dispatch_status=context.dispatch_status,
         )
+        if refreshed is False:
+            return FollowupResult("skipped", "card_superseded")
         return FollowupResult()
 
     def _notify(self, item, pending):
@@ -117,6 +119,7 @@ class GatewayFollowupHandlers:
 
 def assemble_followups(config, *, pending_actions, callback, cards, lifecycle, audit):
     """三个固定消费者共用最多两个活动数据库操作，不接受内存业务队列。"""
+    from lingxi.adapters.admin_followup_recompute import CurrentPermissionRecompute
     from lingxi.adapters.postgres_admin_followup import PostgresFollowupStore
     from lingxi.adapters.postgres_permission_recompute_trigger import PermissionRecomputeAdapter
 
@@ -130,11 +133,15 @@ def assemble_followups(config, *, pending_actions, callback, cards, lifecycle, a
         pending_actions=pending_actions,
         callback=callback,
         cards=cards,
-        recompute=PermissionRecomputeAdapter(
+        recompute=CurrentPermissionRecompute(
+            PermissionRecomputeAdapter(
+                str(config.postgres_dsn),
+                timeouts=config.postgres_timeouts,
+                audit=audit,
+                metric_map_path=config.metric_map_path,
+            ),
             str(config.postgres_dsn),
             timeouts=config.postgres_timeouts,
-            audit=audit,
-            metric_map_path=config.metric_map_path,
         ),
     )
     consumers = []

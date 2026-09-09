@@ -451,3 +451,90 @@ with connect(os.environ['LINGXI_POSTGRES_DSN']) as connection:
         )
         consumer.request_stop()
         self.assertFalse(consumer.run_once())
+
+    def test_recovery_uses_current_account_not_historical_suspend(self):
+        from unittest.mock import Mock
+
+        from test_pending_action_postgres import PendingActionPostgresTestCase
+
+        from lingxi.adapters.admin_followup_recompute import CurrentPermissionRecompute
+        from lingxi.core.admin.pending_action import PendingActionType
+
+        fixture = PendingActionPostgresTestCase()
+        fixture._dsn = DSN
+        fixture.setUp()
+        fixture.add_target_user()
+        action_id = fixture.prepare_and_deliver()
+        pending = fixture.store.get(pending_action_id=action_id)
+        self.assertEqual(pending.action_type, PendingActionType.SUSPEND_USER)
+        delegate = Mock()
+        recovery = CurrentPermissionRecompute(delegate, DSN)
+        recovery.trigger(pending)
+        self.assertEqual(
+            delegate.trigger.call_args.args[0].action_type, PendingActionType.RESUME_USER
+        )
+        with connect(DSN) as conn, conn.cursor() as cur:
+            cur.execute("UPDATE app_user SET account_state='suspended'")
+        recovery.trigger(pending)
+        self.assertEqual(
+            delegate.trigger.call_args.args[0].action_type, PendingActionType.SUSPEND_USER
+        )
+
+    def test_real_consumer_never_blindly_resends_uncertain_notification(self):
+        from unittest.mock import Mock
+
+        from lingxi.core.admin.followup_consumer import FollowupConsumer
+
+        self.add("group_notify")
+        with connect(DSN) as conn, conn.cursor() as cur:
+            cur.execute(
+                "UPDATE admin_action_followup SET next_attempt_at=now()-interval '1 second'"
+            )
+        calls = []
+
+        def uncertain(item):
+            calls.append(item.id)
+            raise TimeoutError("synthetic-receipt-missing")
+
+        consumer = FollowupConsumer(
+            store=self.store,
+            consumer_kind="postprocess",
+            owner="send-owner",
+            handlers={"group_notify": uncertain},
+            audit=Mock(),
+        )
+        self.assertTrue(consumer.run_once())
+        self.assertEqual(
+            self.store.list_for_action(pending_action_id="pac_test")[0].status, "unknown"
+        )
+        for _ in range(3):
+            self.assertFalse(consumer.run_once())
+        self.assertEqual(len(calls), 1)
+        consumer.request_stop()
+
+    def test_late_state_update_cannot_overwrite_reused_card(self):
+        from test_management_card_publish_association_postgres import (
+            MESSAGE_ID,
+            ManagementCardReuseAssociationTestCase,
+        )
+
+        fixture = ManagementCardReuseAssociationTestCase()
+        fixture._dsn = DSN
+        fixture.setUp()
+        old = fixture.seed_executed_action(
+            created_at=fixture.now - timedelta(minutes=2),
+            decided_at=fixture.now - timedelta(minutes=1),
+        )
+        new = fixture.seed_waiting_action(created_at=fixture.now)
+        fixture.store.update_state(message_id=MESSAGE_ID, state="submitted")
+        self.assertIsNone(
+            fixture.store.update_state(
+                message_id=MESSAGE_ID, state="effective", expected_action_id=old
+            )
+        )
+        self.assertEqual(fixture.store.lookup_context(message_id=MESSAGE_ID).state, "submitted")
+        self.assertIsNotNone(
+            fixture.store.update_state(
+                message_id=MESSAGE_ID, state="dispatching", expected_action_id=new
+            )
+        )

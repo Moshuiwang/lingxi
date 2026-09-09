@@ -36,7 +36,15 @@ def enqueue_confirmation(connection, *, pending, target_user_id, trace_id, notif
                 "UPDATE management_card_context SET state=%s,"
                 "dispatch_status=%s,state_version=state_version+1,card_sequence=card_sequence+1,"
                 "needs_refresh=TRUE,"
-                "updated_at=now() WHERE message_id=%s AND state<>'closed'",
-                (state, dispatch, pending.origin_card_message_id),
+                "updated_at=now() WHERE message_id=%s AND state<>'closed' "
+                "AND %s=(SELECT id FROM pending_action WHERE origin_card_message_id=%s "
+                "ORDER BY created_at DESC,id DESC LIMIT 1)",
+                (
+                    state,
+                    dispatch,
+                    pending.origin_card_message_id,
+                    pending.id,
+                    pending.origin_card_message_id,
+                ),
             )
     return refs

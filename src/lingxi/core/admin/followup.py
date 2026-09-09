@@ -104,3 +104,35 @@ class FollowupLifecycle(Protocol):
     def drain_until(self, deadline_monotonic: float) -> ShutdownReport:
         """所有职责共享一个绝对截止时刻。"""
         ...
+
+
+class FollowupStore(Protocol):
+    """专用阶段存取端口，SQL 和连接策略由适配器承担。"""
+
+    def claim_followup(self, *, consumer_kind, owner, now, lease_seconds=120):
+        """返回一条当前代数的任务，未到期或停止时不领取。"""
+        ...
+
+    def mark_effect_started(self, *, id, owner, attempt, now):
+        """持久外发标记成功才允许执行。"""
+        ...
+
+    def complete_followup(
+        self, *, id, owner, attempt, status, result_code, external_ref=None, next_items=()
+    ):
+        """同一事务完成当前代数并登记固定后继。"""
+        ...
+
+    def recover_expired(self, *, now, limit=32):
+        """安全阶段恢复，未知外发保持明确未知。"""
+        ...
+
+
+class EnqueueFollowups(Protocol):
+    """调用方必须传入已有确认事务的连接。"""
+
+    def __call__(
+        self, connection, *, pending_action_id, trace_id, items: tuple[FollowupSpec, ...]
+    ) -> tuple[FollowupRef, ...]:
+        """登记失败传播给调用方，不能先确认再异步排队。"""
+        ...
