@@ -1,0 +1,27 @@
+title: ""
+body:
+  - type: markdown
+    attributes:
+      value: |
+        **什么该在这里**：方向本身还没定，这次要产出的是一个决定，不是一份能验收的交付物。
+
+        **什么该去 [Issue](https://github.com/Moshuiwang/lingxi/issues/new/choose)**：交付物和完成标准都清楚，做完就能关。
+
+        **结论出来之后**：回头开 Issue 并回链本讨论，再把这里标为已回答或关闭。Discussions 是 Issue 的上游，不是终点——留在这里不动的讨论，等于没人负责。
+  - type: textarea
+    id: question
+    attributes:
+      label: 要定的是什么
+      description: 一句话说清这次要产出哪个决定。
+    validations:
+      required: true
+  - type: textarea
+    id: options
+    attributes:
+      label: 已知的候选与影响
+      description: 只写可核对的事实；「可不可承受」由产品负责人判断，不要替他下结论。事实不足写「未知」和原因。
+  - type: textarea
+    id: blocked
+    attributes:
+      label: 定不下来会挡住什么
+      description: 已有对应 Issue 就写编号；没有就说明现在还不需要开卡。
