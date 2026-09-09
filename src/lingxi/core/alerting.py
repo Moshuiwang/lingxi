@@ -528,7 +528,7 @@ class AlertManager:
         return self._recover_due(signal.observed_at)
 
     def tick(self, *, at: datetime) -> tuple[AlertNotice, ...]:
-        """推进稳定恢复计时，也让待恢复事件不依赖下一次业务发送。"""
+        """推进恢复及任务投递故障闲置计时，不依赖下一次业务发送。"""
         return self._recover_due(_as_utc(at))
 
     def _recover_due(self, at: datetime) -> tuple[AlertNotice, ...]:
@@ -536,6 +536,18 @@ class AlertManager:
         for key in sorted(self._windows, key=lambda item: (item[0].value, item[1])):
             window = self._windows[key]
             if window.recovery_since is None:
+                # 任务投递观察只保留计数与去重所需时间；待发送摘要由 dispatcher 独立持有。
+                # 没有成功观察不能推断已恢复，因此释放时不生成恢复通知。
+                if (
+                    window.task_id is not None
+                    and window.kind is AlertKind.FEISHU_SEND_FAILED
+                    and (at - window.last_failure_at).total_seconds()
+                    >= max(
+                        self.policy.dedupe_window_seconds,
+                        self.policy.send_failure_window_seconds,
+                    )
+                ):
+                    del self._windows[key]
                 continue
             if (at - window.recovery_since).total_seconds() < self.policy.recovery_stable_seconds:
                 continue
