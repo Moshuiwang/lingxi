@@ -738,6 +738,14 @@ docker compose --env-file deploy/.env.prod \
   -f deploy/compose.yaml -f deploy/compose.prod.yaml config --no-env-resolution | grep -A4 'deploy:'
 ```
 
+**受限内测入口装配点**（默认关闭的可选覆盖文件，见 `deploy/compose.innertest.yaml` 头部注释与「生产部署runbook.md」相应小节）：只在 `-f` 链末尾显式追加它才生效，不追加时对渲染结果零影响。
+
+```bash
+docker compose --env-file deploy/.env.stage \
+  -f deploy/compose.yaml -f deploy/compose.stage.yaml \
+  -f deploy/compose.innertest.yaml config --no-env-resolution | grep -A4 'deploy:'
+```
+
 **门禁只核对结构**（`scripts/ci/check_deploy_contract.py` 的
 `check_resource_limits`）：六个服务是否都声明了 `cpus`/`memory`/`pids` 三项键，
 不核对具体数值——数值对错是容量判断，不是机械可判定的对错，门禁只保证"没有

@@ -855,3 +855,54 @@ dry-run 打印的条数与这张表对不上，说明职位列命中的键跟预
 这一张。**反向条件的失效是安静的**——它不报错，只会多圈进一个没想到的人，而消息发出去不可撤回。
 
 判读要点：写筛选条件之前先问一句「谁会意外满足这组条件」。答不上来就改成白名单。
+
+## 十五、受限内测入口装配点（默认关闭的可选覆盖）
+
+这一节说明怎么打开 `deploy/compose.innertest.yaml`——一份默认不生效的可选覆盖文件，
+控制 scheduler 内受限管理入口（Unix socket 监听器）是否装配。不追加它，scheduler
+与 gateway 的启动行为与不存在这份文件时完全相同。
+
+### 15.1 打开前必须准备好的东西（运维一次性动作，不在本节范围内完成）
+
+- 两个宿主机目录已经建好，属主与权限允许容器内 `10001:10001`（scheduler 的运行
+  用户）按需读写：
+  - socket 目录（挂到容器内 `/run/lingxi-innertest`）：scheduler 要在这里创建
+    socket 文件，必须可写。
+  - 绑定配置目录（挂到容器内 `/etc/lingxi/innertest`，只读挂载）：目录下要有一份
+    有效的 `binding.json`。这份文件的内容与受限身份映射由运维的一次性安装动作
+    产出，不属于这份覆盖文件负责的范围。
+- 受限通路真正可用所需的 SSH forced-command、authorized_keys、主体到 socket 权限
+  的映射——这些同样是运维安装侧的前置，本节不涉及，也不由这份覆盖文件提供。
+- 一份受限作用域标识（`LINGXI_INNERTEST_SCOPE`）与绑定标识
+  （`LINGXI_INNERTEST_BINDING_ID`）的约定值，与绑定文件里登记的一致。
+
+### 15.2 打开的命令
+
+```bash
+docker compose --env-file deploy/.env.prod \
+  -f deploy/compose.yaml -f deploy/compose.prod.yaml \
+  -f deploy/compose.innertest.yaml \
+  --profile mvp up -d
+```
+
+四个变量（`LINGXI_INNERTEST_SCOPE`、`LINGXI_INNERTEST_BINDING_ID`、
+`LINGXI_INNERTEST_SOCKET_DIR`、`LINGXI_INNERTEST_CONFIG_DIR`）缺任何一个，渲染
+直接报错退出，不会起一个"看起来正常、实际没装上"的容器。stage 把
+`.env.prod`/`compose.prod.yaml` 换成 `.env.stage`/`compose.stage.yaml`，其余相同。
+
+### 15.3 关闭
+
+从 `-f` 链里去掉 `deploy/compose.innertest.yaml`，重新 `up -d` 让 compose 按新的
+服务定义重建 scheduler 与 gateway。渲染结果回到没有这四个变量与两条挂载的原状。
+
+### 15.4 装配是否生效的回读
+
+```bash
+docker compose --env-file deploy/.env.prod \
+  -f deploy/compose.yaml -f deploy/compose.prod.yaml -f deploy/compose.innertest.yaml \
+  exec -T scheduler python -m lingxi.apps.innertest_status
+```
+
+`ok: true` 且 `roster`/`binding`/`followups` 三段都有内容，说明监听器已经注册并能
+访问数据库；`configuration_missing` 说明四个变量没有全部到位。启动日志里也能读到
+这个职责是否注册，见 `src/lingxi/apps/scheduler/innertest.py` 的模块说明。

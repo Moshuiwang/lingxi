@@ -1,0 +1,50 @@
+# 受限内测入口装配点：默认关闭的可选覆盖文件。
+#
+# 不追加本文件时，对渲染结果零影响——scheduler 与 gateway 的启动行为与不存在
+# 这份文件时完全相同。要开启这个装配点，在现有 `-f` 链末尾显式追加它：
+#
+#   docker compose --env-file deploy/.env.stage \
+#     -f deploy/compose.yaml -f deploy/compose.stage.yaml \
+#     -f deploy/compose.innertest.yaml up -d
+#
+# 生产同理：把 `.env.stage`/`compose.stage.yaml` 换成 `.env.prod`/`compose.prod.yaml`。
+#
+# 追加后做什么：给 scheduler 与 gateway 注入受限作用域与绑定标识；scheduler 额外
+# 注入 socket 与绑定文件的容器内路径，并挂载两个宿主机目录——只有它会真的启动
+# 受限管理监听器，gateway 只需要知道自己所属的作用域。容器内两条路径是固定字面量，
+# 逐字取自 `deploy/control/contract.json` 的 `channel.scheduler_socket_path` /
+# `scheduler_binding_path`，不做成变量：这两个路径已经是磁盘协议的一部分，不是
+# 本文件可以自选的实现细节，两条部署路径必须共用同一组值。
+#
+# 两个宿主机目录变量都没有默认值，缺一个就直接拒绝渲染——不允许监听器悄悄挂到
+# 一个不存在或者错误的路径上、看起来启动成功、实则连不上：
+#   LINGXI_INNERTEST_SOCKET_DIR   宿主机 socket 所在目录 → 容器内 /run/lingxi-innertest（读写）
+#   LINGXI_INNERTEST_CONFIG_DIR   宿主机绑定配置所在目录 → 容器内 /etc/lingxi/innertest（只读）
+#
+# 这两个宿主机目录本身的属主、权限与受限身份映射是运维的一次性安装动作，不属于
+# 本文件负责的范围。
+
+services:
+  scheduler:
+    environment:
+      LINGXI_INNERTEST_SCOPE: ${LINGXI_INNERTEST_SCOPE:?必须提供受限内测作用域}
+      LINGXI_INNERTEST_BINDING_ID: ${LINGXI_INNERTEST_BINDING_ID:?必须提供受限内测绑定标识}
+      LINGXI_INNERTEST_SOCKET_PATH: /run/lingxi-innertest/admin.sock
+      LINGXI_INNERTEST_BINDING_PATH: /etc/lingxi/innertest/binding.json
+    volumes:
+      - type: bind
+        source: ${LINGXI_INNERTEST_SOCKET_DIR:?必须提供宿主机 socket 目录}
+        target: /run/lingxi-innertest
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ${LINGXI_INNERTEST_CONFIG_DIR:?必须提供宿主机绑定配置目录}
+        target: /etc/lingxi/innertest
+        read_only: true
+        bind:
+          create_host_path: false
+
+  gateway:
+    environment:
+      LINGXI_INNERTEST_SCOPE: ${LINGXI_INNERTEST_SCOPE:?必须提供受限内测作用域}
+      LINGXI_INNERTEST_BINDING_ID: ${LINGXI_INNERTEST_BINDING_ID:?必须提供受限内测绑定标识}

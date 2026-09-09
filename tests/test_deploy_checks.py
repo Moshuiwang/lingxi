@@ -460,6 +460,215 @@ class SchedulerUserVolumeTest(unittest.TestCase):
         self.assertEqual(CONTRACT.check_scheduler_user_volume(), [])
 
 
+#: 受限内测入口装配点（默认关闭的可选覆盖文件）的合法样例，逐字对应
+#: deploy/compose.innertest.yaml 的 ``services:`` 小节（不含文件头部注释）。
+#: 下面每条负例测试都从这份合法样例出发做一处改动，而不是从零现写——这样才能
+#: 保证"这处改动确实是唯一变量"。
+VALID_INNERTEST_BODY = (
+    "services:\n"
+    "  scheduler:\n"
+    "    environment:\n"
+    "      LINGXI_INNERTEST_SCOPE: ${LINGXI_INNERTEST_SCOPE:?必须提供受限内测作用域}\n"
+    "      LINGXI_INNERTEST_BINDING_ID: ${LINGXI_INNERTEST_BINDING_ID:?必须提供受限内测绑定标识}\n"
+    "      LINGXI_INNERTEST_SOCKET_PATH: /run/lingxi-innertest/admin.sock\n"
+    "      LINGXI_INNERTEST_BINDING_PATH: /etc/lingxi/innertest/binding.json\n"
+    "    volumes:\n"
+    "      - type: bind\n"
+    "        source: ${LINGXI_INNERTEST_SOCKET_DIR:?必须提供宿主机 socket 目录}\n"
+    "        target: /run/lingxi-innertest\n"
+    "        bind:\n"
+    "          create_host_path: false\n"
+    "      - type: bind\n"
+    "        source: ${LINGXI_INNERTEST_CONFIG_DIR:?必须提供宿主机绑定配置目录}\n"
+    "        target: /etc/lingxi/innertest\n"
+    "        read_only: true\n"
+    "        bind:\n"
+    "          create_host_path: false\n"
+    "\n"
+    "  gateway:\n"
+    "    environment:\n"
+    "      LINGXI_INNERTEST_SCOPE: ${LINGXI_INNERTEST_SCOPE:?必须提供受限内测作用域}\n"
+    "      LINGXI_INNERTEST_BINDING_ID: ${LINGXI_INNERTEST_BINDING_ID:?必须提供受限内测绑定标识}\n"
+)
+
+
+class InnertestComposeOverlayTest(unittest.TestCase):
+    """#701：受限内测入口装配点（默认关闭的可选覆盖文件）的结构断言。
+
+    真实容器内路径的事实源是 ``deploy/control/contract.json``，本类不重复
+    mock 它——只替换 ``CONTRACT.COMPOSE_INNERTEST`` 指向的覆盖文件，这样"路径
+    与合同逐字相等"这条断言实际读的仍是仓库里那份真实合同。
+    """
+
+    def _check(self, body: str) -> list[str]:
+        directory = Path(self.enterContext(__import__("tempfile").TemporaryDirectory()))
+        overlay = directory / "compose.innertest.yaml"
+        overlay.write_text(body, encoding="utf-8")
+        original = CONTRACT.COMPOSE_INNERTEST
+        CONTRACT.COMPOSE_INNERTEST = overlay
+        try:
+            return CONTRACT.check_innertest_compose_overlay()
+        finally:
+            CONTRACT.COMPOSE_INNERTEST = original
+
+    def test_well_formed_overlay_passes(self) -> None:
+        self.assertEqual(self._check(VALID_INNERTEST_BODY), [])
+
+    def test_real_repository_overlay_passes(self) -> None:
+        """真实仓库状态必须通过——防止本检查因为文件结构变化而变成空转。"""
+
+        self.assertEqual(CONTRACT.check_innertest_compose_overlay(), [])
+
+    def test_missing_file_is_caught(self) -> None:
+        directory = Path(self.enterContext(__import__("tempfile").TemporaryDirectory()))
+        original = CONTRACT.COMPOSE_INNERTEST
+        CONTRACT.COMPOSE_INNERTEST = directory / "does-not-exist.yaml"
+        try:
+            failures = CONTRACT.check_innertest_compose_overlay()
+        finally:
+            CONTRACT.COMPOSE_INNERTEST = original
+        self.assertTrue(any("不存在" in f for f in failures), failures)
+
+    def test_unexpected_extra_service_is_caught(self) -> None:
+        """变异验红：加一个第三方 service，必须被拒绝——装配点只允许触及两个服务。"""
+
+        body = VALID_INNERTEST_BODY + "  worker:\n    image: x\n"
+        failures = self._check(body)
+        self.assertTrue(
+            any("不该出现的 service" in f and "worker" in f for f in failures), failures
+        )
+
+    def test_image_key_is_caught(self) -> None:
+        """变异验红：覆盖文件不许改镜像引用，只负责变量与挂载。"""
+
+        body = VALID_INNERTEST_BODY.replace(
+            "  scheduler:\n    environment:",
+            "  scheduler:\n    image: ghcr.io/example/lingxi-scheduler:latest\n    environment:",
+        )
+        failures = self._check(body)
+        self.assertTrue(any("`image:` 键" in f for f in failures), failures)
+
+    def test_ports_key_is_caught(self) -> None:
+        """变异验红：受限内测入口走 Unix socket，不新增任何网络端口。"""
+
+        body = VALID_INNERTEST_BODY.replace(
+            "  gateway:\n    environment:",
+            '  gateway:\n    ports:\n      - "8080:8080"\n    environment:',
+        )
+        failures = self._check(body)
+        self.assertTrue(any("`ports:` 键" in f for f in failures), failures)
+
+    def test_wrong_socket_path_diverges_from_contract_is_caught(self) -> None:
+        """变异验红：容器内路径必须逐字取自 deploy/control/contract.json。"""
+
+        body = VALID_INNERTEST_BODY.replace(
+            "LINGXI_INNERTEST_SOCKET_PATH: /run/lingxi-innertest/admin.sock",
+            "LINGXI_INNERTEST_SOCKET_PATH: /run/lingxi-innertest/wrong.sock",
+        )
+        failures = self._check(body)
+        self.assertTrue(
+            any("LINGXI_INNERTEST_SOCKET_PATH" in f and "不一致" in f for f in failures), failures
+        )
+
+    def test_wrong_binding_path_diverges_from_contract_is_caught(self) -> None:
+        body = VALID_INNERTEST_BODY.replace(
+            "LINGXI_INNERTEST_BINDING_PATH: /etc/lingxi/innertest/binding.json",
+            "LINGXI_INNERTEST_BINDING_PATH: /etc/lingxi/innertest/wrong.json",
+        )
+        failures = self._check(body)
+        self.assertTrue(
+            any("LINGXI_INNERTEST_BINDING_PATH" in f and "不一致" in f for f in failures), failures
+        )
+
+    def test_missing_read_only_on_config_mount_is_caught(self) -> None:
+        """变异验红：绑定配置目录只应被运维一次性写入，scheduler 必须只读挂载。"""
+
+        body = VALID_INNERTEST_BODY.replace("        read_only: true\n", "")
+        failures = self._check(body)
+        self.assertTrue(any("read_only: true" in f for f in failures), failures)
+
+    def test_socket_dir_silent_default_is_caught(self) -> None:
+        """变异验红：宿主机目录变量必须 fail-fast，不许留一个能悄悄生效的默认值。"""
+
+        body = VALID_INNERTEST_BODY.replace(
+            "${LINGXI_INNERTEST_SOCKET_DIR:?必须提供宿主机 socket 目录}",
+            "${LINGXI_INNERTEST_SOCKET_DIR:-/tmp/fallback}",
+        )
+        failures = self._check(body)
+        self.assertTrue(
+            any("socket 目录挂载的 source" in f and "无默认值" in f for f in failures), failures
+        )
+
+    def test_config_dir_silent_default_is_caught(self) -> None:
+        body = VALID_INNERTEST_BODY.replace(
+            "${LINGXI_INNERTEST_CONFIG_DIR:?必须提供宿主机绑定配置目录}",
+            "${LINGXI_INNERTEST_CONFIG_DIR:-/tmp/fallback}",
+        )
+        failures = self._check(body)
+        self.assertTrue(
+            any("绑定配置目录挂载的" in f and "无默认值" in f for f in failures), failures
+        )
+
+    def test_scope_silent_default_is_caught(self) -> None:
+        """变异验红：LINGXI_INNERTEST_SCOPE 硬编码值同样必须被拒绝，不只是缺失。"""
+
+        body = VALID_INNERTEST_BODY.replace(
+            "LINGXI_INNERTEST_SCOPE: ${LINGXI_INNERTEST_SCOPE:?必须提供受限内测作用域}\n"
+            "      LINGXI_INNERTEST_BINDING_ID: ${LINGXI_INNERTEST_BINDING_ID:?必须提供受限内测绑定标识}\n"
+            "      LINGXI_INNERTEST_SOCKET_PATH",
+            "LINGXI_INNERTEST_SCOPE: hardcoded-scope\n"
+            "      LINGXI_INNERTEST_BINDING_ID: ${LINGXI_INNERTEST_BINDING_ID:?必须提供受限内测绑定标识}\n"
+            "      LINGXI_INNERTEST_SOCKET_PATH",
+        )
+        failures = self._check(body)
+        self.assertTrue(
+            any(
+                "scheduler" in f and "LINGXI_INNERTEST_SCOPE" in f and "无默认值" in f
+                for f in failures
+            ),
+            failures,
+        )
+
+    def test_gateway_leaking_socket_path_is_caught(self) -> None:
+        """变异验红：只有 scheduler 读取两条路径变量，gateway 声明它们是漂移风险。"""
+
+        body = VALID_INNERTEST_BODY.replace(
+            "  gateway:\n    environment:\n",
+            "  gateway:\n    environment:\n"
+            "      LINGXI_INNERTEST_SOCKET_PATH: /run/lingxi-innertest/admin.sock\n",
+        )
+        failures = self._check(body)
+        self.assertTrue(
+            any("gateway 不该声明 LINGXI_INNERTEST_SOCKET_PATH" in f for f in failures), failures
+        )
+
+    def test_gateway_declaring_volumes_is_caught(self) -> None:
+        """变异验红：两条挂载只给 scheduler，gateway 不直接连接受限入口。"""
+
+        body = VALID_INNERTEST_BODY.replace(
+            "  gateway:\n    environment:\n",
+            "  gateway:\n    volumes:\n      - type: bind\n        source: /tmp\n"
+            "        target: /tmp/x\n    environment:\n",
+        )
+        failures = self._check(body)
+        self.assertTrue(any("gateway 不该声明 volumes" in f for f in failures), failures)
+
+    def test_missing_socket_mount_entirely_is_caught(self) -> None:
+        body = VALID_INNERTEST_BODY.replace(
+            "      - type: bind\n"
+            "        source: ${LINGXI_INNERTEST_SOCKET_DIR:?必须提供宿主机 socket 目录}\n"
+            "        target: /run/lingxi-innertest\n"
+            "        bind:\n"
+            "          create_host_path: false\n",
+            "",
+        )
+        failures = self._check(body)
+        self.assertTrue(
+            any("/run/lingxi-innertest" in f and "没有把宿主机目录挂到" in f for f in failures),
+            failures,
+        )
+
+
 class ResourceLimitsTest(unittest.TestCase):
     """六个服务必须在 ``deploy.resources.limits`` 声明 cpus/memory/pids 三项
     （Trace #373 H2 / S-H2-1，产品负责人 2026-08-28 先行裁定）。
