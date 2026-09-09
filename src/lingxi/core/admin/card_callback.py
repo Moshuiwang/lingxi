@@ -36,6 +36,7 @@ from lingxi.core.admin.card_callback_ports import (
 )
 from lingxi.core.admin.card_dispatch import management_card_fingerprint
 from lingxi.core.admin.display_names import AdminDisplayNames
+from lingxi.core.admin.followup import FollowupCapacityError
 from lingxi.core.admin.notification import (
     DECISION_CANCEL,
     DECISION_CONFIRM,
@@ -152,13 +153,13 @@ class AdminCardCallbackHandler(_ManagementCardCallbackMixin):
 
         try:
             if decision == DECISION_CONFIRM:
-                outcome = self._pending_actions.confirm(
-                    pending_action_id=pending_action_id, clicker_open_id=operator_open_id
-                )
+                outcome = self._confirm_action(pending_action_id, operator_open_id, trace_id)
             else:
                 outcome = self._pending_actions.cancel(
                     pending_action_id=pending_action_id, clicker_open_id=operator_open_id
                 )
+        except FollowupCapacityError:
+            return _toast_error("系统繁忙，请稍后重试")
         except PendingActionAuditWriteFailedError:
             self._audit.record(
                 "admin.card_callback.audit_write_failed",
@@ -191,6 +192,15 @@ class AdminCardCallbackHandler(_ManagementCardCallbackMixin):
             )
             return _toast_error("操作不存在或已失效")
         return outcome, outcome.pending
+
+    def _confirm_action(self, pending_action_id, operator_open_id, trace_id):
+        """持久确认传递本次追溯号，既有测试端口保持原签名。"""
+        kwargs = {}
+        if getattr(self._pending_actions, "durable_followups", False) is True:
+            kwargs["trace_id"] = trace_id
+        return self._pending_actions.confirm(
+            pending_action_id=pending_action_id, clicker_open_id=operator_open_id, **kwargs
+        )
 
     def _apply_post_decision_side_effects(
         self, *, pending: PendingAction, outcome: _Outcome, terminal_card: Any | None, trace_id: str
@@ -279,6 +289,11 @@ class AdminCardCallbackHandler(_ManagementCardCallbackMixin):
         card_payload: dict[str, Any] | None = None
         if pending.status is not PendingActionStatus.PENDING:
             terminal_card, card_payload = self._render_terminal_card(pending)
+
+        if getattr(self._pending_actions, "durable_followups", False) is True:
+            return self._build_confirm_response(
+                pending=pending, outcome=outcome, card_payload=card_payload
+            )
 
         self._run_after_response(
             lambda: self._apply_post_decision_side_effects(

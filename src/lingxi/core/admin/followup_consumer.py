@@ -32,6 +32,8 @@ class FollowupConsumer:
         self._thread = None
         self._accepted = self._finished = self._unknown = 0
         self._current = None
+        self._lease_lost = False
+        self._effect_started = False
 
     def start(self):
         """只创建一条消费者线程，重复启动无副作用。"""
@@ -54,7 +56,10 @@ class FollowupConsumer:
         if self._thread is not None:
             self._thread.join(max(0, deadline_monotonic - time.monotonic()))
         running = int(self._thread is not None and self._thread.is_alive())
-        return ShutdownReport(self._accepted, self._finished, running, self._unknown, running)
+        uncertain = int(bool(running and self._effect_started))
+        return ShutdownReport(
+            self._accepted, self._finished, running - uncertain, self._unknown + uncertain, running
+        )
 
     def run_once(self):
         """停止门与领取原子排序，处理失败不能阻止其他目标。"""
@@ -68,6 +73,8 @@ class FollowupConsumer:
                 return False
             self._accepted += 1
             self._current = item
+            self._lease_lost = False
+            self._effect_started = False
         self._execute(item)
         self._current = None
         return True
@@ -75,6 +82,8 @@ class FollowupConsumer:
     def _execute(self, item):
         """外发标记失败零调用；失去领取代数绝不覆盖其他执行者。"""
         try:
+            if self._lease_lost:
+                return
             handler = self.handlers.get(item.stage)
             if handler is None:
                 result = FollowupResult("retry_wait", "handler_unavailable")
@@ -83,6 +92,7 @@ class FollowupConsumer:
             ):
                 return
             else:
+                self._effect_started = item.stage in EXTERNAL_STAGES
                 result = handler(item)
             self._finish(item, result)
         except Exception as error:

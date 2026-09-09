@@ -66,6 +66,7 @@ def recover_expired(store, *, now, limit=32):
                 ),
             )
         _close_dependencies(cursor, now, limit)
+        _expire_old(cursor, now, limit)
     return RecoveryCounts(**counts)
 
 
@@ -81,3 +82,28 @@ def _close_dependencies(cursor, now, limit):
         "finished_at=%s,updated_at=%s FROM blocked b WHERE f.id=b.id",
         (min(32, max(0, limit)), now, now),
     )
+
+
+def _expire_old(cursor, now, limit):
+    """到期先结束依赖工作并删除可识别阶段，不无限保留历史。"""
+    cursor.execute(
+        "SELECT id FROM admin_action_followup WHERE created_at<=%s-interval '90 days' "
+        "ORDER BY created_at,id FOR UPDATE SKIP LOCKED LIMIT %s",
+        (now, min(32, max(0, limit))),
+    )
+    ids = [row[0] for row in cursor.fetchall()]
+    if not ids:
+        return
+    cursor.execute(
+        "UPDATE admin_action_followup SET status=CASE WHEN effect_started_at IS NOT NULL "
+        "AND stage=ANY(%s) THEN 'unknown' ELSE 'failed' END, result_code='retention_expired',"
+        "updated_at=%s,finished_at=%s WHERE id=ANY(%s) AND status IN ('pending','running','retry_wait')",
+        (list(EXTERNAL_STAGES), now, now, ids),
+    )
+    cursor.execute(
+        "UPDATE admin_action_followup SET status='skipped',result_code='dependency_expired',"
+        "finished_at=%s,updated_at=%s WHERE depends_on_id=ANY(%s) "
+        "AND status IN ('pending','retry_wait')",
+        (now, now, ids),
+    )
+    cursor.execute("DELETE FROM admin_action_followup WHERE id=ANY(%s)", (ids,))

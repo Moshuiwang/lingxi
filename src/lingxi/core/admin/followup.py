@@ -33,7 +33,7 @@ class FollowupSpec:
     subject_key: str
     stage: str
     target_user_id: str | None = None
-    target_version: str | None = None
+    target_version: int | None = None
     batch_id: str | None = None
     batch_item_id: str | None = None
     depends_on_id: str | None = None

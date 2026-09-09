@@ -51,3 +51,28 @@ class FollowupConsumerTests(unittest.TestCase):
             obj.drain_until.assert_called_once_with(130)
         with self.assertRaises(RuntimeError):
             lifecycle.register(Mock())
+
+    def test_database_activity_budget_is_two_and_nested_is_safe(self):
+        import threading
+
+        from lingxi.core.admin.followup_budget import FollowupDatabaseBudget
+
+        budget = FollowupDatabaseBudget()
+        barrier = threading.Barrier(3)
+        release = threading.Event()
+
+        def hold():
+            with budget, budget:
+                barrier.wait()
+                release.wait(2)
+
+        threads = [threading.Thread(target=hold) for _ in range(2)]
+        for thread in threads:
+            thread.start()
+        barrier.wait()
+        self.assertFalse(budget.acquire(blocking=False))
+        release.set()
+        for thread in threads:
+            thread.join()
+        self.assertTrue(budget.acquire(blocking=False))
+        budget.release()

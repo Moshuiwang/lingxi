@@ -58,7 +58,6 @@ from lingxi.apps.scheduler.late_readiness_recovery import (
     LateReadinessRecoveryReport,
 )
 from lingxi.apps.scheduler.loop import SchedulerLoop, install_signal_handlers
-from lingxi.apps.scheduler.onboarding import join_onboarding_executors
 from lingxi.apps.scheduler.org_snapshot_sync import OrgSnapshotSyncDuty
 from lingxi.apps.scheduler.permission_publish import (
     PermissionPublishDuty,
@@ -203,7 +202,9 @@ def main(argv: list[str] | None = None) -> int:
         # daemon 线程只能靠解释器退出时被任意截断。收尾自身的异常不得覆盖原始
         # 故障——记一条日志后放行，让 `run_forever()` 的原始异常继续原样传播。
         try:
-            join_onboarding_executors(loop.duties)
+            report = loop.drain_until()
+            if report.still_running:
+                logger.error("scheduler 仍有后台职责在途 count=%s", report.still_running)
         except Exception as error:  # 只记类型名与调用栈帧，异常正文不进日志
             logger.error(
                 "lingxi-scheduler 收尾 join_onboarding_executors 失败 error=%s\n调用栈（不含异常正文）：\n%s",

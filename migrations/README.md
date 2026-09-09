@@ -11,7 +11,7 @@
 | 当前事实 | 值 |
 | --- | --- |
 | 基线 revision（链首） | `20260806_baseline` |
-| head revision | `0090_delivery_retry_backoff` |
+| head revision | `0091_admin_action_followup` |
 | 配置文件 | 仓库根目录 `alembic.ini` |
 | revision 目录 | `migrations/alembic/versions/` |
 | 连接串环境变量 | `LINGXI_MIGRATION_DSN`（缺失即失败，无默认值） |
@@ -822,3 +822,7 @@ OAuth 路径已被 2026-07-28 决策排除；它们此前**不属于生产链**�
 2026-08-09 #67 阶段 B 交付正式重授权入口后，`002`、`003` 因仍是当时唯一跑通的开通验证
 入口而继续保留，废弃时点顺延到 E4 真实 onboarding runner 通过 L4a 之后——即本次触发
 清退的条件。
+
+## `0091_admin_action_followup`（管理后台持久阶段）
+
+新增 v1 专用阶段表及有限领取索引，不回填历史通知。应用恢复必须使用识别 v1 的兼容消费者；有阶段记录时降级迁移拒绝删除表。阶段恢复扫描会结束到期依赖并清除满九十天的阶段；既有动作清理继续保留自身的脱敏规则。

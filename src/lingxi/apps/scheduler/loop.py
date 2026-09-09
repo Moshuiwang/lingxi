@@ -40,6 +40,15 @@ class SchedulerLoop:
         self._interval_seconds = interval_seconds
         self._stop = threading.Event() if stop is None else stop
         self._heartbeat = heartbeat
+        from lingxi.apps.scheduler.lifecycle import DutyLifecycle
+        from lingxi.core.admin.followup_lifecycle import BackgroundLifecycle
+
+        self.lifecycle = BackgroundLifecycle(budget_seconds=120)
+        from lingxi.core.admin.followup_budget import FollowupDatabaseBudget
+
+        self.followup_db_slots = FollowupDatabaseBudget()
+        for duty in self._duties:
+            self.lifecycle.register(DutyLifecycle(duty))
 
     @property
     def duties(self) -> tuple[Any, ...]:
@@ -59,6 +68,16 @@ class SchedulerLoop:
     def request_stop(self) -> None:
         """置位停止信号：本轮及之后不再有职责领取新工作。"""
         self._stop.set()
+        self.lifecycle.request_stop()
+
+    def register_background(self, component):
+        """后继 listener 与阶段只登记本生命周期，不建第二调度器。"""
+        return self.lifecycle.register(component)
+
+    def drain_until(self, deadline_monotonic=None):
+        """使用首次停止时刻的统一截止，不截断续期凭据安全保存。"""
+        self.request_stop()
+        return self.lifecycle.drain_until(deadline_monotonic)
 
     def run_once(self) -> tuple[Any, ...]:
         """依次跑一遍每个职责。任何一个职责抛异常都不影响其余职责本轮执行。"""

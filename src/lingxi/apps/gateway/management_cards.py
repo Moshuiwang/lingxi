@@ -273,8 +273,12 @@ class RecomputeResultReporter:
             display, machine = self._status_texts(
                 context, complete=complete, state=state, status_message=status_message
             )
+            update_kwargs = {}
+            if getattr(self._context_store, "supports_action_guard", False) is True:
+                update_kwargs["expected_action_id"] = pending.id
             updated = self._context_store.update_state(
                 message_id=origin_message_id,
+                **update_kwargs,
                 state=state,
                 dispatch_status=machine,
                 snapshot_fingerprint=management_card_fingerprint(status),

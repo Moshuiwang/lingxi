@@ -60,6 +60,7 @@ def build_supervisor(
     config: GatewayConfig,
     *,
     transport: Any = None,
+    background_lifecycle: Any = None,
     should_stop: Callable[[], bool] | None = None,
     onboarding: OnboardingRunner | None = None,
     heartbeat: Callable[[], None] | None = None,
@@ -83,7 +84,7 @@ def build_supervisor(
         on_onboarding_assembled(effective_onboarding)
 
     client = _build_outbound_client(config)
-    admin = _build_admin_stack(config, audit=audit, client=client)
+    admin = _build_admin_stack(config, audit=audit, client=client, lifecycle=background_lifecycle)
     handle_event = _build_event_handler(
         config,
         audit=audit,
@@ -218,7 +219,9 @@ def _build_dispatch_gates(config: GatewayConfig, *, audit: Any, admin_router: An
     )
 
 
-def _build_admin_stack(config: GatewayConfig, *, audit: Any, client: Any) -> _AdminStack:
+def _build_admin_stack(
+    config: GatewayConfig, *, audit: Any, client: Any, lifecycle: Any = None
+) -> _AdminStack:
     """装配管理命令面：查询口、待确认操作、确认卡、管理卡、回调处理器。
 
     查询端口各自开自己的连接，不共享管线的事务——管理查询是只读的，不需要参与入站
@@ -241,6 +244,8 @@ def _build_admin_stack(config: GatewayConfig, *, audit: Any, client: Any) -> _Ad
         timeouts=config.postgres_timeouts,
         audit=audit,
         metric_map_path=config.metric_map_path,
+        durable_followups=lifecycle is not None,
+        notify_group=bool(config.admin_group_chat_id),
     )
     # 确认卡片的出站发送与回调后的终态更新共用同一个卡片传输实例。
     admin_card_transport = LarkAdminCardTransport(client)
@@ -265,6 +270,7 @@ def _build_admin_stack(config: GatewayConfig, *, audit: Any, client: Any) -> _Ad
             confirm_cards=admin_card_transport,
             router=router,
             cards=cards,
+            lifecycle=lifecycle,
         ),
         context_store=cards.context_store,
         recovery=cards.recovery,
@@ -312,6 +318,7 @@ def _build_card_callback(
     confirm_cards: Any,
     router: Any,
     cards: _ManagementCardStack,
+    lifecycle: Any = None,
 ) -> Any:
     """装配卡片回调处理器：确认/取消卡、管理卡表单、定向重算触发。
 
@@ -322,7 +329,7 @@ def _build_card_callback(
     from lingxi.adapters.admin_post_callback import BackgroundPostCallbackExecutor
     from lingxi.core.admin.card_callback import AdminCardCallbackHandler
 
-    return AdminCardCallbackHandler(
+    callback = AdminCardCallbackHandler(
         pending_actions=pending_actions,
         confirm_cards=confirm_cards,
         group_notifier=_build_group_notifier(config),
@@ -333,9 +340,27 @@ def _build_card_callback(
         management_context_store=cards.context_store,
         management_state_lookup=cards.status_lookup,
         management_card_refresher=cards.refresher,
-        recompute_trigger=_build_recompute_trigger(config, audit=audit, reporter=cards.reporter),
-        post_callback_executor=BackgroundPostCallbackExecutor(audit=audit),
+        recompute_trigger=(
+            None
+            if lifecycle is not None
+            else _build_recompute_trigger(config, audit=audit, reporter=cards.reporter)
+        ),
+        post_callback_executor=(
+            None if lifecycle is not None else BackgroundPostCallbackExecutor(audit=audit)
+        ),
     )
+    if lifecycle is not None:
+        from lingxi.apps.gateway.admin_followups import assemble_followups
+
+        assemble_followups(
+            config,
+            pending_actions=pending_actions,
+            callback=callback,
+            cards=cards,
+            lifecycle=lifecycle,
+            audit=audit,
+        )
+    return callback
 
 
 @dataclass(frozen=True)

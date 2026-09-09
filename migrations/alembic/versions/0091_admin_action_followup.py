@@ -10,16 +10,16 @@ depends_on = None
 _UPGRADE_SQL = """
 CREATE TABLE admin_action_followup (
  id TEXT PRIMARY KEY,
- pending_action_id TEXT NOT NULL REFERENCES pending_action(id),
+ pending_action_id TEXT NOT NULL REFERENCES pending_action(id) ON DELETE CASCADE,
  subject_key TEXT NOT NULL,
  stage TEXT NOT NULL,
  contract_version INTEGER NOT NULL DEFAULT 1,
  trace_id TEXT,
- target_user_id TEXT REFERENCES app_user(id),
- target_version TEXT,
+ target_user_id TEXT REFERENCES app_user(id) ON DELETE SET NULL,
+ target_version BIGINT,
  batch_id TEXT,
  batch_item_id TEXT,
- depends_on_id TEXT REFERENCES admin_action_followup(id),
+ depends_on_id TEXT REFERENCES admin_action_followup(id) ON DELETE SET NULL,
  status TEXT NOT NULL DEFAULT 'pending'
   CHECK (status IN ('pending','running','retry_wait','succeeded','skipped','failed','unknown')),
  attempt INTEGER NOT NULL DEFAULT 0 CHECK (attempt >= 0),

@@ -188,6 +188,8 @@ class PostgresPendingActionStore(_ExecutionMixin):
         timeouts: PostgresTimeouts = DEFAULT_POSTGRES_TIMEOUTS,
         audit: AuditSink,
         metric_map_path: Path | None,
+        durable_followups: bool = False,
+        notify_group: bool = False,
     ) -> None:
         """记下连接参数、审计出口与指标映射外置路径。
 
@@ -203,6 +205,8 @@ class PostgresPendingActionStore(_ExecutionMixin):
         self._timeouts = timeouts
         self._audit = audit
         self._metric_map_path = metric_map_path
+        self.durable_followups = durable_followups
+        self._notify_group = notify_group
 
     def get(self, *, pending_action_id: str) -> PendingAction | None:
         """按 ID 回读一条待确认操作；查无返回 ``None``。"""
@@ -404,6 +408,7 @@ class PostgresPendingActionStore(_ExecutionMixin):
         pending_action_id: str,
         clicker_open_id: str,
         now: datetime | None = None,
+        trace_id: str | None = None,
     ) -> ConfirmOutcome:
         """确认卡片"确认执行"按钮的完整事务，详见 ``decide_confirm`` 分支文档。
 
@@ -422,6 +427,7 @@ class PostgresPendingActionStore(_ExecutionMixin):
                 pending_action_id=pending_action_id,
                 clicker_open_id=clicker_open_id,
                 now=now,
+                trace_id=trace_id,
             )
         except OperationalError as error:
             raise PendingActionTransientFailureError(type(error).__name__) from error
@@ -471,7 +477,12 @@ class PostgresPendingActionStore(_ExecutionMixin):
             return
 
     def _confirm_locked(
-        self, *, pending_action_id: str, clicker_open_id: str, now: datetime | None
+        self,
+        *,
+        pending_action_id: str,
+        clicker_open_id: str,
+        now: datetime | None,
+        trace_id: str | None = None,
     ) -> tuple[PendingAction | None, ConfirmDecision]:
         """:meth:`confirm` 的事务体本身。不对外暴露，不是任何协议的一部分。
 
@@ -485,15 +496,8 @@ class PostgresPendingActionStore(_ExecutionMixin):
             with connection.transaction():
                 with connection.cursor() as cursor:
                     pending = self._lock_pending_action_row(cursor, pending_action_id)
-                    registry_entry = (
-                        self._lock_admin_registry_entry(cursor, pending)
-                        if pending is not None
-                        else None
-                    )
-                    target_user_id, current_account_state = (
-                        self._lock_target_account(cursor, pending)
-                        if pending is not None
-                        else (None, None)
+                    registry_entry, target_user_id, current_account_state = (
+                        self._lock_confirm_inputs(cursor, pending)
                     )
                     # 两把行锁（待确认操作、目标账号）与 admin_registry 的
                     # FOR SHARE 都已经拿到——现在才取时钟：等锁期间如果被并发
@@ -528,8 +532,30 @@ class PostgresPendingActionStore(_ExecutionMixin):
                             clicker_open_id=clicker_open_id,
                             moment=moment,
                         )
+                        if self.durable_followups and target_user_id is not None:
+                            self._enqueue_confirmed(connection, committed, target_user_id, trace_id)
 
         return committed, decision
+
+    def _lock_confirm_inputs(self, cursor, pending):
+        """确认所需管理员与目标状态在同事务内锁定。"""
+        if pending is None:
+            return None, None, None
+        registry_entry = self._lock_admin_registry_entry(cursor, pending)
+        target_user_id, current_account_state = self._lock_target_account(cursor, pending)
+        return registry_entry, target_user_id, current_account_state
+
+    def _enqueue_confirmed(self, connection, pending, target_user_id, trace_id=None):
+        """确认记录与阶段共用调用方连接，登记异常使整体回滚。"""
+        from lingxi.adapters.postgres_admin_followup_confirmation import enqueue_confirmation
+
+        enqueue_confirmation(
+            connection,
+            pending=pending,
+            target_user_id=target_user_id,
+            trace_id=trace_id or pending.id,
+            notify_group=self._notify_group,
+        )
 
     def cancel(
         self,
@@ -597,5 +623,9 @@ class PostgresPendingActionStore(_ExecutionMixin):
                             clicker_open_id=clicker_open_id,
                             moment=moment,
                         )
+                        if self.durable_followups:
+                            target_user_id, _ = self._lock_target_account(cursor, pending)
+                            if target_user_id is not None:
+                                self._enqueue_confirmed(connection, committed, target_user_id)
 
         return committed, decision

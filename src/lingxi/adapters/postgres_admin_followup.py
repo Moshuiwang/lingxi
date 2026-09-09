@@ -209,3 +209,73 @@ class PostgresFollowupStore:
                 )
                 for row in cursor.fetchall()
             )
+
+    def current_publish_reference(self, *, target_user_id):
+        """仅关联当前版本的既有发布记录。"""
+        with self.transaction() as connection, connection.cursor() as cursor:
+            cursor.execute(
+                "SELECT p.id,p.permission_version FROM publish_outbox p "
+                "JOIN app_user u ON u.id=p.user_id AND "
+                "u.permission_version=p.permission_version WHERE p.user_id=%s "
+                "ORDER BY p.created_at DESC LIMIT 1",
+                (target_user_id,),
+            )
+            return cursor.fetchone()
+
+    def dependency_publish_state(self, item):
+        """观察父阶段冻结的引用，目标版本变化时只返回已被取代。"""
+        with self.transaction() as connection, connection.cursor() as cursor:
+            cursor.execute(
+                "SELECT p.status,u.permission_version FROM admin_action_followup f "
+                "JOIN publish_outbox p ON p.id=f.external_ref "
+                "JOIN app_user u ON u.id=p.user_id WHERE f.id=%s",
+                (item.depends_on_id,),
+            )
+            row = cursor.fetchone()
+            if row is None:
+                return None
+            return row[0] if str(row[1]) == str(item.target_version) else "superseded"
+
+    def recovery_status(self):
+        """部署前只读兼容性清点，未知格式不能当作已恢复。"""
+        with self.transaction() as connection, connection.cursor() as cursor:
+            cursor.execute(
+                "SELECT contract_version,status,count(*) FROM admin_action_followup "
+                "GROUP BY contract_version,status"
+            )
+            rows = cursor.fetchall()
+        return {
+            "contract_versions": sorted({row[0] for row in rows}),
+            "compatible": all(row[0] == 1 for row in rows),
+            "inflight": sum(n for _, status, n in rows if status == "running"),
+            "recoverable": sum(n for _, status, n in rows if status in {"pending", "retry_wait"}),
+            "unknown": sum(n for _, status, n in rows if status == "unknown"),
+        }
+
+    def resolve_target(self, *, id, owner, attempt, target_user_id, batch_identity_lookup):
+        """核验原批次项身份后补齐真实用户；批次查询由固定业务适配器注入。"""
+        with self.transaction() as connection, connection.cursor() as cursor:
+            cursor.execute(
+                "SELECT batch_item_id,target_user_id FROM admin_action_followup "
+                "WHERE id=%s AND status='running' AND lease_owner=%s AND attempt=%s "
+                "FOR UPDATE",
+                (id, owner, attempt),
+            )
+            row = cursor.fetchone()
+            if row is None or row[0] is None:
+                return False
+            original_open_id = batch_identity_lookup(connection, row[0])
+            if not original_open_id or (row[1] is not None and row[1] != target_user_id):
+                return False
+            cursor.execute(
+                "SELECT feishu_open_id FROM app_user WHERE id=%s FOR SHARE", (target_user_id,)
+            )
+            user = cursor.fetchone()
+            if user is None or user[0] != original_open_id:
+                return False
+            cursor.execute(
+                "UPDATE admin_action_followup SET target_user_id=%s,"
+                "result_code='resolved_target',updated_at=now() WHERE id=%s",
+                (target_user_id, id),
+            )
+            return True
