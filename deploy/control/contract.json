@@ -40,5 +40,23 @@
     "credentials",
     "user_data",
     "ssh_public_key_bindings"
-  ]
+  ],
+  "public_config": {
+    "schema": 1,
+    "keys": [
+      "schema",
+      "values",
+      "files"
+    ],
+    "file_names": {
+      "scheduler": [
+        "company_function_metric_map.toml",
+        "content.override.toml"
+      ],
+      "worker": [
+        "system_prompt.md",
+        "content.override.toml"
+      ]
+    }
+  }
 }

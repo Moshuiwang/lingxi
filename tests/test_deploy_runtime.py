@@ -31,6 +31,58 @@ class RuntimeTests(unittest.TestCase):
         self.runtime = runtime_module.Runtime(self.host, self.config)
         self.runtime.state_directory = self.root
 
+    def test_public_file_content_drift_is_rejected_without_reading_private_env(self):
+        directory = self.root / "runtime"
+        directory.mkdir(mode=0o700)
+        path = directory / "system_prompt.md"
+        path.write_text("合成提示词")
+        (directory / ".env.private").write_text("SECRET_SENTINEL")
+        self.config["values"]["LINGXI_WORKER_RUNTIME_CONFIG_DIR"] = str(directory)
+        self.config["files"]["worker"]["system_prompt.md"] = hashlib.sha256(
+            path.read_bytes()
+        ).hexdigest()
+        self.runtime.verify_public_files()
+        path.write_text("发生改变")
+        with self.assertRaisesRegex(state.DeployError, "^public_file_configuration_changed$"):
+            self.runtime.verify_public_files()
+
+    def test_unplanned_service_cannot_be_stopped_and_partial_update_is_bounded(self):
+        import copy
+
+        current = {
+            name: {
+                "image": self.plan["old"]["images"]["worker" if name == "worker-queue" else name],
+                "config_sha256": self.plan["recovery"]["config_sha256"],
+                "bundle_sha256": self.plan["old"]["control_bundle"]["sha256"],
+            }
+            for name in runtime_module.SERVICES
+        }
+        ledger = self.root / (self.plan["id"] + ".state.json")
+        state.atomic_write(ledger, {"stages": {}})
+        with patch.object(self.runtime, "containers", return_value=current):
+            self.runtime.verify_service_inventory(self.plan)
+            self.plan["new"] = copy.deepcopy(self.plan["new"])
+            image = self.plan["new"]["images"]["worker"].replace("c" * 64, "d" * 64)
+            self.plan["new"]["images"]["worker"] = image
+            current["worker-queue"]["image"] = image
+            with self.assertRaisesRegex(state.DeployError, "unplanned_service"):
+                self.runtime.verify_service_inventory(self.plan)
+            state.atomic_write(ledger, {"stages": {"start": {"status": "running"}}})
+            self.runtime.verify_service_inventory(self.plan)
+            current["gateway"]["image"] = current["gateway"]["image"].replace("c" * 64, "e" * 64)
+            with self.assertRaisesRegex(state.DeployError, "unplanned_service"):
+                self.runtime.verify_service_inventory(self.plan)
+
+    def test_missing_business_modules_report_unavailable_without_starting_services(self):
+        with patch.object(self.runtime, "docker", return_value=(1, "")) as docker:
+            with self.assertRaisesRegex(
+                state.DeployError, "^business_recovery_interface_unavailable$"
+            ):
+                self.runtime.verify_business_modules(self.plan)
+        self.assertEqual(docker.call_args.args[0], "run")
+        self.assertIn("none", docker.call_args.args)
+        self.assertNotIn("lingxi.apps.scheduler", docker.call_args.args)
+
     def test_generated_compose_has_three_services_and_only_scheduler_socket_mount(self):
         result = self.runtime.channel_compose(self.plan)
         self.assertEqual(set(result["services"]), set(runtime_module.SERVICES))
@@ -56,6 +108,20 @@ class RuntimeTests(unittest.TestCase):
         self.assertEqual(argv[-3:], ["scheduler", "gateway", "worker-queue"])
         self.assertTrue(any(self.plan["new"]["control_bundle"]["sha256"] in x for x in argv))
 
+    def test_revision_readback_uses_fixed_native_current_and_rejects_unknown_output(self):
+        with patch.object(
+            self.runtime, "docker", return_value=(0, "0092_innertest_membership (head)\n")
+        ) as docker:
+            self.assertEqual(self.runtime.migration(self.plan), ["0092_innertest_membership"])
+        self.assertEqual(
+            docker.call_args.args[-2:], (self.plan["new"]["images"]["migrate"], "current")
+        )
+        self.assertNotIn("--entrypoint", docker.call_args.args)
+        for value in [(1, "SECRET_SENTINEL"), (0, ""), (0, "head_a\nhead_b")]:
+            with patch.object(self.runtime, "docker", return_value=value):
+                with self.assertRaisesRegex(state.UnknownError, "^migration_revision_unknown$"):
+                    self.runtime.migration(self.plan)
+
     def test_migration_preserves_named_job_and_uses_image_entrypoint(self):
         with (
             patch.object(self.runtime, "compose", return_value=(0, "job-id")) as compose,
@@ -68,6 +134,22 @@ class RuntimeTests(unittest.TestCase):
         )
         self.assertNotIn("--rm", arguments)
         self.assertEqual(docker.call_args.args, ("wait", "lingxi-migration-" + self.plan["id"]))
+
+    def test_active_migration_is_not_queried_or_retried_and_failed_job_is_not_verified(self):
+        job = {"Running": True, "ExitCode": 0}
+        with (
+            patch.object(self.runtime, "containers", return_value={}),
+            patch.object(self.runtime, "job", return_value=job),
+            patch.object(self.runtime, "migration") as migration,
+        ):
+            snapshot = self.runtime.snapshot(self.plan)
+        self.assertIsNone(snapshot["migration_heads"])
+        migration.assert_not_called()
+        snapshot = {
+            "migration_heads": self.plan["new"]["migration_heads"],
+            "job": {"Running": False, "ExitCode": 1},
+        }
+        self.assertFalse(self.runtime.complete("migrate", self.plan, snapshot))
 
     def test_status_only_executes_reads_and_never_creates_migration_container(self):
         with (

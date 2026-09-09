@@ -70,6 +70,6 @@ python3 "$CONTROL_ROOT/deploy/lingxi_deploy.py" \
 
 确认完整差异与窗口后，去掉 `--dry-run` 保存计划；随后将尾部改为 `apply "$PLAN_ID" --approval "$APPROVAL"` 执行。断线后用 `status "$PLAN_ID"` 只读查进度，同一 `apply` 接续。完成后再次 apply 只核对、不重建。恢复需另存 operation=recover 且引用原部署的计划，并使用 `recover "$RECOVERY_PLAN_ID" --approval "$RECOVERY_APPROVAL"`；不能复用 apply 批准。
 
-新 schema 缺控制包直接拒绝。旧 schema 1 的选择必须显式 `--allow-legacy`，仅作历史核对；历史恢复记录另绑定原部署、原四镜像、发布证据、兼容证明、恢复工具包和入口停用收据，不向历史 Release 补造验收清单。存在新格式阶段或动态名单但无兼容消费者时不能恢复旧版。
+新 schema 缺控制包直接拒绝。旧 schema 1 的选择必须显式 `--allow-legacy`，仅作历史核对；历史恢复记录另绑定原部署、原四镜像、发布证据、兼容证明、恢复工具包和入口停用收据；没有新清单的原始标签使用计划内 historical 类型，不捏造维护分支或构建编号，不向历史 Release 补造验收清单。存在新格式阶段或动态名单但无兼容消费者时不能恢复旧版。
 
 正式记录另外保存提升时 main 提交/运行编号、验收文件路径/提交/摘要，业务候选提交保持不变。批准前可以回读 main 资格；接续只使用原窗口及固定制品，明确撤销记录会阻止继续。发布包不含任何私有环境文件、真实公钥或业务数据。

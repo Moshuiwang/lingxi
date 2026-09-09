@@ -94,7 +94,7 @@ def fixture(root):
         "docker": "/usr/bin/docker",
         "approval_sources": ["https://github.com/Moshuiwang/lingxi/issues/566"],
     }
-    config = {"schema": 1, "values": {}}
+    config = {"schema": 1, "values": {}, "files": {"scheduler": {}, "worker": {}}}
     request = {
         "id": "synthetic-deploy",
         "operation": "apply",
@@ -267,7 +267,11 @@ class DeployTests(unittest.TestCase):
     def test_secret_sentinel_refused_without_echo(self):
         with self.assertRaisesRegex(state.DeployError, "^non_public_configuration_rejected$"):
             deploy.public_config(
-                {"schema": 1, "values": {"LINGXI_POSTGRES_DSN": "SECRET_SENTINEL_566"}}
+                {
+                    "schema": 1,
+                    "values": {"LINGXI_POSTGRES_DSN": "SECRET_SENTINEL_566"},
+                    "files": {"scheduler": {}, "worker": {}},
+                }
             )
 
     def test_dry_run_cli_creates_no_files_and_no_executor(self):
@@ -478,6 +482,18 @@ class DeployRecoveryTests(unittest.TestCase):
         }
         plan["recovery"]["historical"] = history
         deploy.validate_plan(plan, self.host, self.config)
+        historic = dict(
+            legacy, schema="historical", version="2.3.1", tag="v2.3.1", prerelease=False
+        )
+        del historic["branch"]
+        del historic["run_id"]
+        explicit = copy.deepcopy(plan)
+        explicit["old"] = historic
+        explicit["recovery"]["target_manifest_sha256"] = state.fingerprint(historic)
+        explicit["recovery"]["historical"]["manifest_sha256"] = state.fingerprint(historic)
+        deploy.validate_plan(explicit, self.host, self.config)
+        self.assertNotIn("branch", explicit["old"])
+        self.assertNotIn("run_id", explicit["old"])
         for key, value in [
             ("deployment_id", "different"),
             ("compatible", False),

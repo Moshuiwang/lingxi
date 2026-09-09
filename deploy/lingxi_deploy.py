@@ -43,9 +43,22 @@ def exact(value, fields, code):
 
 def public_config(doc):
     """非秘密配置必须命中固定字段集合。"""
-    exact(doc, "schema values", "public_config_shape")
+    exact(doc, "schema values files", "public_config_shape")
     if doc["schema"] != 1 or not isinstance(doc["values"], dict):
         raise DeployError("public_config_shape")
+    exact(doc["files"], "scheduler worker", "public_file_inventory_shape")
+    allowed_files = {
+        "scheduler": {"company_function_metric_map.toml", "content.override.toml"},
+        "worker": {"system_prompt.md", "content.override.toml"},
+    }
+    for role, files in doc["files"].items():
+        if not isinstance(files, dict) or set(files) - allowed_files[role]:
+            raise DeployError("non_public_file_rejected")
+        if any(
+            not isinstance(value, str) or not re.fullmatch("[0-9a-f]{64}", value)
+            for value in files.values()
+        ):
+            raise DeployError("public_file_digest_required")
     pattern = r"LINGXI_(?:(?:SCHEDULER|GATEWAY|WORKER|WORKER_QUEUE|MIGRATE|REAUTHORIZE)_(?:CPU_LIMIT|MEM_LIMIT|PIDS_LIMIT|TMPFS_SIZE|RUNTIME_CONFIG_DIR)|WORKER_MAX_CONCURRENCY|SCHEDULER_INTERVAL_SECONDS|INNERTEST_(?:SCOPE|BINDING_ID|SOCKET_PATH|BINDING_PATH|SOCKET_DIRECTORY|BINDING_DIRECTORY))"
     for key, value in doc["values"].items():
         if (
@@ -78,6 +91,33 @@ def validate_host(host):
         for x in host["approval_sources"]
     ):
         raise DeployError("approval_sources_required")
+
+
+def validate_historical_release(release):
+    """历史标签单独登记原始事实，不伪造维护分支、构建或验收清单。"""
+    exact(
+        release,
+        "schema repository version tag prerelease commit tree images migration_heads",
+        "historical_release_shape",
+    )
+    version, candidate = release_manifest.release_version(release["tag"])
+    if candidate or release["prerelease"] is not False or release["version"] != version:
+        raise DeployError("historical_formal_tag_required")
+    if not re.fullmatch("[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", release["repository"]):
+        raise DeployError("historical_repository_required")
+    if any(not release_manifest.SHA.fullmatch(release[key]) for key in ("commit", "tree")):
+        raise DeployError("historical_source_required")
+    if (
+        set(release["images"]) != set(release_manifest.SERVICES)
+        or len(release["migration_heads"]) != 1
+    ):
+        raise DeployError("historical_artifacts_incomplete")
+    for service, reference in release["images"].items():
+        prefix = "ghcr.io/" + release["repository"].lower() + "-" + service + "@"
+        if not reference.startswith(prefix) or not release_manifest.DIGEST.fullmatch(
+            reference[len(prefix) :]
+        ):
+            raise DeployError("historical_image_digest_required")
 
 
 def validate_history(plan, release):
@@ -159,10 +199,13 @@ def validate_plan(plan, host, config):
         }
         if set(release) - allowed:
             raise DeployError("release_unknown_fields")
-        release_manifest.validate_manifest(
-            release, release["repository"], prerelease=release["prerelease"]
-        )
-        if release["schema"] == 1:
+        if release["schema"] == "historical":
+            validate_historical_release(release)
+        else:
+            release_manifest.validate_manifest(
+                release, release["repository"], prerelease=release["prerelease"]
+            )
+        if release["schema"] != 2:
             validate_history(plan, release)
     if plan["operation"] == "apply" and plan["new"]["schema"] != 2:
         raise DeployError("legacy_release_cannot_be_new_target")
@@ -395,7 +438,7 @@ def execute(plan, approval, store, runtime, *, now=None):
         return state
 
 
-def preview(plan):
+def preview(plan, host, config):
     """差异、窗口和恢复材料在批准前集中展示。"""
     changes = [
         {
@@ -408,6 +451,18 @@ def preview(plan):
     ]
     return {
         "result": "等待批准",
+        "target": {
+            key: host[key]
+            for key in (
+                "host",
+                "project",
+                "deploy_root",
+                "config_root",
+                "bundle_root",
+                "relay_root",
+            )
+        },
+        "public_configuration": config,
         "deployment_id": plan["id"],
         "environment": plan["environment"],
         "image_changes": changes,
@@ -449,7 +504,11 @@ def main():
             store.save_plan(plan)
         print(
             canonical(
-                {"plan": plan, "plan_sha256": fingerprint(plan), "summary": preview(plan)}
+                {
+                    "plan": plan,
+                    "plan_sha256": fingerprint(plan),
+                    "summary": preview(plan, host, config),
+                }
             ).decode(),
             end="",
         )
@@ -470,6 +529,19 @@ def main():
         if plan["operation"] != args.operation:
             raise DeployError("independent_recovery_approval_required")
         result = execute(plan, read_json(args.approval), store, runtime)
+    labels = {
+        "planned": "等待批准",
+        "running": "等待部署完成",
+        "verified": "成功",
+        "failed": "失败",
+        "unknown": "结果待核查",
+    }
+    result["result"] = labels.get(result["status"], "结果待核查")
+    result["required_action"] = (
+        "无需重复执行"
+        if result["status"] == "verified"
+        else "按原计划和有效批准回读接续；恢复须独立批准"
+    )
     print(canonical(result).decode(), end="")
 
 

@@ -145,14 +145,80 @@ class Runtime:
                 raise DeployError("installation_directory_unavailable")
         self.check_revocation(plan)
         self.installation_receipt(plan)
+        self.verify_service_inventory(plan)
+        self.verify_public_files()
         if plan["operation"] == "recover":
             original = read_json(self.state_directory / (plan["recovery_of"]["id"] + ".plan.json"))
             job = self.job(original)
             if job and job["Running"]:
                 raise UnknownError("original_migration_still_running")
 
+    def verify_public_files(self):
+        """只核对明确非秘密运行文件，禁止扫描或读取私有 env 文件。"""
+        allowed = {
+            "scheduler": {"company_function_metric_map.toml", "content.override.toml"},
+            "worker": {"system_prompt.md", "content.override.toml"},
+        }
+        for role, names in allowed.items():
+            directory = self.config["values"].get("LINGXI_" + role.upper() + "_RUNTIME_CONFIG_DIR")
+            expected = self.config["files"][role]
+            if directory is None:
+                if expected:
+                    raise DeployError("public_file_directory_required")
+                continue
+            root = Path(directory)
+            if (
+                not root.is_absolute()
+                or root.is_symlink()
+                or not root.is_dir()
+                or root.stat().st_mode & 0o022
+            ):
+                raise DeployError("public_file_directory_permissions")
+            actual = {}
+            for name in names:
+                path = root / name
+                if not path.exists() and not path.is_symlink():
+                    continue
+                if (
+                    path.is_symlink()
+                    or not path.is_file()
+                    or path.stat().st_mode & 0o022
+                    or path.stat().st_size > 1024 * 1024
+                ):
+                    raise DeployError("public_file_permissions_or_size")
+                actual[name] = digest(path.read_bytes())
+            if actual != expected:
+                raise DeployError("public_file_configuration_changed")
+
+    def verify_service_inventory(self, plan):
+        """只能停止计划已登记的旧服务，接续只允许旧新两份制品。"""
+        current = self.containers(plan["project"])
+        ledger = read_json(self.state_directory / (plan["id"] + ".state.json"))
+        changed = "start" in ledger["stages"] or plan["operation"] == "recover"
+        if not changed and set(current) != set(SERVICES):
+            raise DeployError("service_inventory_changed")
+        choices = [("old", plan["recovery"]["config_sha256"])]
+        if changed:
+            choices.append(("new", plan["config_sha256"]))
+        for name, actual in current.items():
+            service = "worker" if name == "worker-queue" else name
+            matched = False
+            for side, config_sha in choices:
+                release = plan[side]
+                same_image = (
+                    actual["image"].split("@")[-1] == release["images"][service].split("@")[-1]
+                )
+                same_config = release["schema"] != 2 or (
+                    actual["config_sha256"] == config_sha
+                    and actual["bundle_sha256"] == control_for(plan, release)["sha256"]
+                )
+                matched = matched or (same_image and same_config)
+            if not matched:
+                raise DeployError("unplanned_service_artifact_or_config")
+
     def check_revocation(self, plan):
         """已明确撤销的资格在执行与观察期间也不能继续使用。"""
+        self.verify_public_files()
         revocation = Path(self.host["config_root"]) / "deployment-revocation.json"
         if revocation.exists():
             record = read_json(revocation)
@@ -197,7 +263,7 @@ class Runtime:
             "io.lingxi.deployment-id": plan["id"],
         }
         result = {"services": {name: {"labels": labels} for name in SERVICES}}
-        if plan["new"]["schema"] == 1:
+        if plan["new"]["schema"] != 2:
             return result
         values = self.config["values"]
         common = {
@@ -242,7 +308,7 @@ class Runtime:
         """冻结relay、实际socket和容器映射必须一致。"""
         import stat
 
-        if plan["new"]["schema"] == 1:
+        if plan["new"]["schema"] != 2:
             pointer = Path(self.host["relay_root"]) / "current"
             if pointer.exists() or pointer.is_symlink():
                 raise DeployError("historical_relay_must_be_disabled")
@@ -350,14 +416,10 @@ class Runtime:
         return result
 
     def migration(self, plan):
-        """版本回读使用只读事务。"""
-        probe = (
-            "import json,os,psycopg;"
-            "c=psycopg.connect(os.environ['LINGXI_MIGRATION_DSN'],connect_timeout=5,options='-c statement_timeout=3000 -c default_transaction_read_only=on');"
-            "print(json.dumps([r[0] for r in c.execute('SELECT version_num FROM alembic_version')]));c.close()"
-        )
+        """版本回读复用固定迁移镜像的 current，不在宿主解析凭据。"""
         suffix = "prod" if plan["environment"] == "production" else "stage"
-        _, output = self.docker(
+        source = plan["new"] if plan["operation"] == "apply" else plan["old"]
+        code, output = self.docker(
             "run",
             "--rm",
             "--read-only",
@@ -365,14 +427,12 @@ class Runtime:
             "host",
             "--env-file",
             str(Path(self.host["config_root"]) / f".env.{suffix}.migrate"),
-            "--entrypoint",
-            "python",
-            plan["old"]["images"]["migrate"],
-            "-c",
-            probe,
+            source["images"]["migrate"],
+            "current",
+            allowed_failure=True,
         )
-        heads = json.loads(output)
-        if len(heads) != 1:
+        heads = re.findall(r"^([A-Za-z0-9_]+)(?:\s+\(head\))?\s*$", output, re.M)
+        if code or len(heads) != 1:
             raise UnknownError("migration_revision_unknown")
         return heads
 
@@ -409,7 +469,7 @@ class Runtime:
             if plan["operation"] != "recover":
                 raise UnknownError("business_probe_unavailable")
             suffix = "prod" if plan["environment"] == "production" else "stage"
-            _, raw = self.docker(
+            code, raw = self.docker(
                 "run",
                 "--rm",
                 "--read-only",
@@ -432,11 +492,19 @@ class Runtime:
                 "-B",
                 "-m",
                 "lingxi.apps.innertest_status",
+                allowed_failure=True,
             )
         else:
-            _, raw = self.docker(
-                "exec", scheduler["id"], "python", "-m", "lingxi.apps.innertest_status"
+            code, raw = self.docker(
+                "exec",
+                scheduler["id"],
+                "python",
+                "-m",
+                "lingxi.apps.innertest_status",
+                allowed_failure=True,
             )
+        if code:
+            raise DeployError("business_recovery_interface_unavailable")
         result = json.loads(raw)
         if (
             set(result) != {"ok", "schema_revision", "roster", "binding", "followups"}
@@ -461,7 +529,7 @@ class Runtime:
             or followups["compatible"] is not True
         ):
             raise DeployError("business_recovery_or_binding_incompatible")
-        if plan["new"]["schema"] == 1 and (
+        if plan["new"]["schema"] != 2 and (
             roster["requires_dynamic_roster"]
             or any(followups[k] for k in ("inflight", "recoverable", "unknown"))
         ):
@@ -470,7 +538,7 @@ class Runtime:
 
     def recovery_status(self, plan, containers):
         """复用只读业务恢复接口，未知外发不改成未发送。"""
-        if plan["old"]["schema"] == 1:
+        if plan["old"]["schema"] != 2:
             # 首次引导的旧镜像没有新接口，仅使用独立绑定的历史兼容记录。
             return {"compatible": plan["recovery"]["historical"]["compatible"]}
         return self.business_status(plan, containers)["followups"]
@@ -490,14 +558,45 @@ class Runtime:
             _, raw = self.docker("exec", running["id"], "python", "-c", probe)
             heads = json.loads(raw)
         else:
-            heads = self.migration(plan)
-        result = {"services": containers, "migration_heads": heads, "job": self.job(plan)}
+            job = self.job(plan)
+            heads = None if job and job["Running"] else self.migration(plan)
+        result = {
+            "services": containers,
+            "migration_heads": heads,
+            "job": self.job(plan) if readonly else job,
+        }
         if containers.get("scheduler", {}).get("running") and plan["new"]["schema"] == 2:
             try:
                 result["business"] = self.business_status(plan, containers)
             except (DeployError, ValueError, KeyError):
                 result["business"] = {"status": "unavailable"}
         return result
+
+    def verify_business_modules(self, plan):
+        """停止旧服务前确认固定新镜像具备恢复接口，不启动业务进程。"""
+        if plan["new"]["schema"] != 2:
+            return
+        probe = "import importlib.util;assert all(importlib.util.find_spec(n) for n in ('lingxi.apps.innertest_status','lingxi.adapters.innertest_socket','lingxi.adapters.innertest_handlers'))"
+        code, _ = self.docker(
+            "run",
+            "--rm",
+            "--read-only",
+            "--network",
+            "none",
+            "--pids-limit",
+            "32",
+            "--memory",
+            "128m",
+            "--entrypoint",
+            "python",
+            plan["new"]["images"]["scheduler"],
+            "-B",
+            "-c",
+            probe,
+            allowed_failure=True,
+        )
+        if code:
+            raise DeployError("business_recovery_interface_unavailable")
 
     def perform(self, stage, plan):
         """只允许预定义的部署副作用。"""
@@ -515,6 +614,7 @@ class Runtime:
             for image in plan["new"]["images"].values():
                 self.docker("pull", image)
                 self.image(image)
+            self.verify_business_modules(plan)
             if (
                 shutil.disk_usage(self.host["deploy_root"]).free
                 < plan["resources"]["required_free_bytes"]
@@ -551,7 +651,7 @@ class Runtime:
             if output.strip() != "0":
                 raise UnknownError("migration_failed_reconcile_required")
         elif stage == "activate":
-            if plan["new"]["schema"] == 1:
+            if plan["new"]["schema"] != 2:
                 pointer = Path(self.host["relay_root"]) / "current"
                 if pointer.is_symlink():
                     pointer.unlink()
@@ -617,8 +717,9 @@ class Runtime:
             )
             return required and all(not item["running"] for item in snapshot["services"].values())
         if stage == "migrate":
-            return snapshot["migration_heads"] == plan["new"]["migration_heads"] and not (
-                snapshot["job"] and snapshot["job"]["Running"]
+            job = snapshot["job"]
+            return snapshot["migration_heads"] == plan["new"]["migration_heads"] and (
+                job is None or (not job["Running"] and job["ExitCode"] == 0)
             )
         if stage == "activate":
             pointer = Path(self.host["bundle_root"]) / "current"
@@ -642,7 +743,7 @@ class Runtime:
             return (
                 healthy
                 and self.channel_status(plan)
-                and (plan["new"]["schema"] == 1 or bool(self.business_status(plan, services)))
+                and (plan["new"]["schema"] != 2 or bool(self.business_status(plan, services)))
             )
         return False
 
