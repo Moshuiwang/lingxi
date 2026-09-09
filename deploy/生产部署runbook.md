@@ -1,5 +1,6 @@
 # 生产部署 Runbook（biplus-prod / Bot-Prod）
 
+> 新控制包版本以[固定计划与一次批准](releases/README.md#固定计划与一次批准)的四操作为主入口。以下逐步命令仅保留为独立批准的历史/应急路径，必须使用已冻结的 Compose、四镜像及配置；不能用最新 main 接续旧计划。开发测试不代表真实安装、stage 或生产验收通过。
 > 新流程版本先按 [版本发布操作](releases/README.md) 使用 `release_manifest.py resolve --environment production` 核对正式发布资格与固定镜像，再执行下文部署。预发布版不得部署生产。切换前历史版本的回退继续按对应原始记录核对，不补造验收资格。
 
 
@@ -341,7 +342,7 @@ docker image inspect --format='{{index .RepoDigests 0}}' \
 
 **重部署纪律**：先停旧再起新，不做并行叠加。
 
-- 固定使用普通 `docker compose --env-file deploy/.env.prod -f deploy/compose.yaml -f deploy/compose.prod.yaml up -d`（不加 `--scale`、不使用 `--no-deps` 跳过依赖顺序）：compose 对已在运行的服务默认走「先让旧容器完全退出、再创建并启动新容器」的单容器替换流程，本身就满足单实例。
+- 固定使用普通 `docker compose --env-file deploy/.env.prod -f deploy/compose.yaml -f deploy/compose.prod.yaml --profile mvp up -d`（不加 `--scale`、不使用 `--no-deps` 跳过依赖顺序）：compose 对已在运行的服务默认走「先让旧容器完全退出、再创建并启动新容器」的单容器替换流程，本身就满足单实例。
 - 怀疑上一次部署未完全收口时，先 `docker compose ... ps` 核对没有残留的旧容器（例如状态卡在 `Restarting` 或存在两个同服务容器），确认干净后再执行 `up -d`；不得在残留未清的状态下直接叠加新容器。
 - 需要手工介入单个服务（例如单独重启 `gateway`）时，使用 `docker compose ... stop gateway` 等待其完全退出后再 `docker compose ... up -d gateway`，不使用 `restart`（`restart` 在部分场景下不保证严格的先停后起顺序）。
 
@@ -364,7 +365,7 @@ docker image inspect --format='{{index .RepoDigests 0}}' \
 
 # 2. 执行 up -d，compose 按「四、单实例纪律」的替换流程逐个服务先停旧再起新
 docker compose --env-file deploy/.env.prod \
-  -f deploy/compose.yaml -f deploy/compose.prod.yaml up -d
+  -f deploy/compose.yaml -f deploy/compose.prod.yaml --profile mvp up -d
 
 # 3. 回读确认实际运行 digest 与目标一致（见「三、镜像 digest 固定」；四份镜像各一次；
 #    钉住拉取的镜像没有裸 tag 引用，必须写 tag@digest 形态）

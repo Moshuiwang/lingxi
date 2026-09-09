@@ -23,7 +23,7 @@
 services:
   scheduler:
     env_file:
-      - ./.env.prod.scheduler
+      - ${LINGXI_ENV_ROOT:-.}/.env.prod.scheduler
     environment:
       LINGXI_SCHEDULER_INTERVAL_SECONDS: ${LINGXI_SCHEDULER_INTERVAL_SECONDS:-60}
     # 资源限制：生产建议值，按架构设计「九、容量与资源」定档（推导见
@@ -57,7 +57,7 @@ services:
 
   gateway:
     env_file:
-      - ./.env.prod.gateway
+      - ${LINGXI_ENV_ROOT:-.}/.env.prod.gateway
     deploy:
       resources:
         limits:
@@ -73,7 +73,7 @@ services:
 
   worker:
     env_file:
-      - ./.env.prod.worker
+      - ${LINGXI_ENV_ROOT:-.}/.env.prod.worker
     environment:
       # 报告 C-7：代码侧的环境判据。`apps/worker/config.py` 的
       # `_innertest_content_capture` 见到这个值就一律不启用内测轮内容级采集，
@@ -105,7 +105,7 @@ services:
   # env 文件，理由见 compose.stage.yaml 同名 service 的注释（PR #173 复核 P1-2）。
   worker-queue:
     env_file:
-      - ./.env.prod.worker-queue
+      - ${LINGXI_ENV_ROOT:-.}/.env.prod.worker-queue
     environment:
       # 报告 C-7：同 `worker` 服务，理由见那一段注释。
       LINGXI_DEPLOY_ENVIRONMENT: "prod"
@@ -160,7 +160,7 @@ services:
 
   migrate:
     env_file:
-      - ./.env.prod.migrate
+      - ${LINGXI_ENV_ROOT:-.}/.env.prod.migrate
     deploy:
       resources:
         limits:
@@ -170,7 +170,7 @@ services:
 
   reauthorize:
     env_file:
-      - ./.env.prod.reauthorize
+      - ${LINGXI_ENV_ROOT:-.}/.env.prod.reauthorize
     deploy:
       resources:
         limits:

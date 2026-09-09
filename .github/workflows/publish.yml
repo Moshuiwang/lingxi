@@ -111,6 +111,11 @@ jobs:
           if-no-files-found: ignore
           retention-days: 14
 
+      - name: 同候选控制包只打包一次
+        run: |
+          python3 deploy/control_bundle.py --root "$PWD" --commit "${GITHUB_SHA}" \
+            --output "${RUNNER_TEMP}/lingxi-control.tar" > "${RUNNER_TEMP}/control-metadata.json"
+
       - name: 四镜像回读与预发布记录
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -118,4 +123,6 @@ jobs:
           python3 scripts/ci/release_manifest.py candidate \
             --plan "${RUNNER_TEMP}/release-plan.json" \
             --image-tag "${{ steps.tag.outputs.tag }}" \
+            --control-bundle "${RUNNER_TEMP}/lingxi-control.tar" \
+            --control-metadata "${RUNNER_TEMP}/control-metadata.json" \
             --output "${RUNNER_TEMP}/release-manifest.json"

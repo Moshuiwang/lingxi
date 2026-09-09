@@ -1,5 +1,6 @@
 # 部署编排（S11，[Issue #62](https://github.com/Moshuiwang/lingxi/issues/62)）
 
+> 新控制包版本以[固定计划与一次批准](releases/README.md#固定计划与一次批准)的四操作为主入口。以下逐步命令仅保留为独立批准的历史/应急路径，必须使用已冻结的 Compose、四镜像及配置；不能用最新 main 接续旧计划。开发测试不代表真实安装、stage 或生产验收通过。
 > 新版本按[版本发布操作](releases/README.md)从 release/X.Y 独立打包，区分候选与正式资格。本文既有 Main Publish 描述属于切换前发布路径，历史制品保留，不据此从 main 继续发新版。
 
 
@@ -441,7 +442,7 @@ docker compose --env-file deploy/.env.stage \
 ```bash
 # 把 deploy/.env.prod 里的 LINGXI_IMAGE_TAG 改回上一个 tag，然后：
 docker compose --env-file deploy/.env.prod \
-  -f deploy/compose.yaml -f deploy/compose.prod.yaml up -d
+  -f deploy/compose.yaml -f deploy/compose.prod.yaml --profile mvp up -d
 ```
 
 回滚不触碰数据库，也不触碰两个持久卷。**前提是迁移遵守"先加后删"**：破坏性变更必须拆成两次发布，否则回滚就从"切 tag 重启"变成"恢复数据库备份"。这一条由 `scripts/ci/verify_old_image_new_schema.sh` 在每次 CI 上实测（断言 V-部署-05）。
@@ -450,7 +451,7 @@ docker compose --env-file deploy/.env.prod \
 
 ```bash
 docker compose --env-file deploy/.env.prod -f deploy/compose.yaml -f deploy/compose.prod.yaml down
-docker compose --env-file deploy/.env.prod -f deploy/compose.yaml -f deploy/compose.prod.yaml up -d
+docker compose --env-file deploy/.env.prod -f deploy/compose.yaml -f deploy/compose.prod.yaml --profile mvp up -d
 ```
 
 数据库备份与恢复遵循 Supabase 托管方案。两个持久卷单独备份。
