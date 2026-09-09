@@ -54,15 +54,15 @@ def private_directory(root: Path, *, create=False):
         raise DeployError("private_directory_permissions")
 
 
-def read_json(path: Path):
-    """拒绝链接与宽权限的批准或状态材料。"""
+def read_json(path: Path, *, public=False):
+    """私有材料只允许本人读取；非秘密映射可读但不能由他人改写。"""
     fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
     try:
         info = os.fstat(fd)
         if (
             not stat.S_ISREG(info.st_mode)
             or info.st_uid != os.geteuid()
-            or stat.S_IMODE(info.st_mode) != 0o600
+            or (info.st_mode & 0o022 if public else stat.S_IMODE(info.st_mode) != 0o600)
         ):
             raise DeployError("private_file_permissions")
         with os.fdopen(fd, "rb", closefd=False) as stream:

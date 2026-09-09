@@ -245,6 +245,8 @@ class RuntimeTests(unittest.TestCase):
             "socket_gid": channel["socket_gid"],
         }
         state.atomic_write(binding_dir / "binding.json", binding)
+        # scheduler 以非 root 运行，非秘密主体映射必须可读而不可改。
+        (binding_dir / "binding.json").chmod(0o644)
         installation = {
             "schema": 1,
             "environment": self.plan["environment"],

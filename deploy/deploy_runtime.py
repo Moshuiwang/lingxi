@@ -358,7 +358,7 @@ class Runtime:
             raise DeployError("socket_identity_or_acl_drift")
         binding = Path(self.host["config_root"]) / "innertest" / "binding.json"
 
-        value = read_json(binding)
+        value = read_json(binding, public=True)
         if (
             value.get("schema_revision") != 1
             or value.get("host_uid") != channel["host_uid"]
@@ -466,7 +466,7 @@ class Runtime:
         """只读固定业务接口，不因进程存在就宣告恢复兼容。"""
         scheduler = containers.get("scheduler")
         if not scheduler or not scheduler["running"]:
-            if plan["operation"] != "recover":
+            if plan["old"]["schema"] != 2:
                 raise UnknownError("business_probe_unavailable")
             suffix = "prod" if plan["environment"] == "production" else "stage"
             code, raw = self.docker(
@@ -547,15 +547,25 @@ class Runtime:
         """状态查询不创建容器或修改状态账。"""
         containers = self.containers(plan["project"])
         if readonly:
-            running = next((v for v in containers.values() if v["running"]), None)
+            running = next(
+                (
+                    (name, containers[name])
+                    for name in ("scheduler", "worker-queue", "gateway")
+                    if containers.get(name, {}).get("running")
+                ),
+                None,
+            )
             if running is None:
                 return {"services": containers, "migration_heads": None, "job": self.job(plan)}
+            dsn_name = (
+                "LINGXI_GATEWAY_POSTGRES_DSN" if running[0] == "gateway" else "LINGXI_POSTGRES_DSN"
+            )
             probe = (
                 "import json,os;from lingxi.adapters.postgres import connect;"
-                "c=connect(os.environ['LINGXI_POSTGRES_DSN']);"
+                f"c=connect(os.environ[{dsn_name!r}]);"
                 "print(json.dumps([r[0] for r in c.execute('SELECT version_num FROM alembic_version')]));c.close()"
             )
-            _, raw = self.docker("exec", running["id"], "python", "-c", probe)
+            _, raw = self.docker("exec", running[1]["id"], "python", "-c", probe)
             heads = json.loads(raw)
         else:
             job = self.job(plan)
