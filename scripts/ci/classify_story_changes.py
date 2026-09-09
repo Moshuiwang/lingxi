@@ -133,7 +133,7 @@ def classify_detail(paths: list[str]) -> Classification:
             if L1_LIGHT_ROUTE_ENABLED:
                 return Classification("fast", "l1", docs_changed, True, False)
             # 停用期间路由到完整门禁（Issue #520 F2）。这样 image job 会跑、候选证明
-            # 会写出来，L1 资产改动合入 main 之后 Main Publish 才有候选可回读。
+            # 会写出来，L1 资产改动进入 release 分支之后候选发布才有候选可回读。
             return Classification("full", "full", docs_changed, True, False)
         return Classification("docs", "l0", docs_changed, False, False)
 

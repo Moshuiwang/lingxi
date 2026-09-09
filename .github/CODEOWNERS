@@ -4,3 +4,9 @@
 docs/traces/**/合同.md @Moshuiwang
 # 候选验收与恢复记录决定正式发布资格，必须由产品负责人批准。
 /deploy/releases/acceptance/ @Moshuiwang
+# 门禁自身的改动须产品负责人批准（#682 A-1，2026-09-09 裁定）。
+# 理由：pull_request 事件用的是 PR 自己那一版工作流，而 Epic Full 是 main /
+# release 规则集唯一的必需检查——不设此项，一个 PR 可以在同一次提交里放松门禁，
+# 再由被它自己改过的门禁给自己盖通过章。
+# scripts/ci/ 刻意不纳入：改动频率高得多，且已有棘轮与钉住测试兜底。
+/.github/workflows/ @Moshuiwang
