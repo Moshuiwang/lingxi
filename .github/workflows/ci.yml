@@ -119,12 +119,16 @@ jobs:
       - name: 校验门禁没有改写工作树
         run: test -z "$(git status --porcelain)"
 
+  # 显式状态条件允许手动运行时跳过分类器；PR仍须分类成功，取消后不再开工。
   gate:
     name: Epic Full / gate
     needs: [classify]
     if: >-
-      github.event_name != 'pull_request' || github.base_ref != 'main' ||
-      (needs.classify.outputs.mode != 'docs' && needs.classify.outputs.risk_level != 'l1')
+      !cancelled() &&
+      (needs.classify.result == 'success' ||
+      (github.event_name != 'pull_request' && needs.classify.result == 'skipped')) &&
+      (github.event_name != 'pull_request' || github.base_ref != 'main' ||
+      (needs.classify.outputs.mode != 'docs' && needs.classify.outputs.risk_level != 'l1'))
     runs-on: ubuntu-24.04
     # 本机实测 Python 测试步骤 350s（≈5.8 分钟，679 条，含真库），已超原先的 5 分钟；
     # 而 runner 的波动系数实测可达 3 倍以上——#53 有过一次 90s 量级的工作被拖到 5 分钟
@@ -297,8 +301,11 @@ jobs:
     name: Epic Full / extras (${{ matrix.extra }})
     needs: [classify]
     if: >-
-      github.event_name != 'pull_request' || github.base_ref != 'main' ||
-      (needs.classify.outputs.mode != 'docs' && needs.classify.outputs.risk_level != 'l1')
+      !cancelled() &&
+      (needs.classify.result == 'success' ||
+      (github.event_name != 'pull_request' && needs.classify.result == 'skipped')) &&
+      (github.event_name != 'pull_request' || github.base_ref != 'main' ||
+      (needs.classify.outputs.mode != 'docs' && needs.classify.outputs.risk_level != 'l1'))
     runs-on: ubuntu-24.04
     # migrate 路径在争抢下实测过 4m32s（此前 bot-test 路径也曾 5 分钟触顶，该 extra 已随
     # #146 清退删除）。每条路径只做「干净环境装一个 extra + 导入校验」，8 分钟足够且
@@ -401,10 +408,13 @@ jobs:
     runs-on: ubuntu-24.04
     needs: [classify, gate, extras]
     if: >-
-      github.event_name != 'pull_request' || github.base_ref != 'main' ||
+      !cancelled() && needs.gate.result == 'success' && needs.extras.result == 'success' &&
+      (needs.classify.result == 'success' ||
+      (github.event_name != 'pull_request' && needs.classify.result == 'skipped')) &&
+      (github.event_name != 'pull_request' || github.base_ref != 'main' ||
       (needs.classify.outputs.mode != 'docs' && needs.classify.outputs.risk_level != 'l1' &&
       (!startsWith(github.head_ref, 'epic/') || github.run_attempt != '1' ||
-      needs.classify.outputs.image_candidate == 'true'))
+      needs.classify.outputs.image_candidate == 'true')))
     timeout-minutes: 45
     # **本 job 不要任何写权限**（codex 二轮 P1-1）。它在 pull_request 上也会跑，而
     # 同仓分支的 PR job 会**照样拿到**这里声明的令牌——于是一个被改造过的 workflow
