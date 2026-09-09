@@ -98,6 +98,8 @@ class PostgresFollowupStore:
             cursor.execute(
                 "WITH candidate AS (SELECT f.id FROM admin_action_followup f "
                 "WHERE f.contract_version=1 AND f.status IN ('pending','retry_wait') "
+                "AND EXISTS (SELECT 1 FROM pending_action p WHERE p.id=f.pending_action_id "
+                "AND p.retention_expires_at>%s) "
                 "AND f.next_attempt_at<=%s AND f.stage=ANY(%s) "
                 "AND (f.depends_on_id IS NULL OR EXISTS (SELECT 1 FROM admin_action_followup d "
                 "WHERE d.id=f.depends_on_id AND d.status='succeeded')) "
@@ -105,7 +107,7 @@ class PostgresFollowupStore:
                 "UPDATE admin_action_followup f SET status='running',attempt=attempt+1,"
                 "lease_owner=%s,lease_until=%s + %s * interval '1 second',updated_at=%s "
                 "FROM candidate c WHERE f.id=c.id RETURNING " + _CLAIM_COLUMNS,
-                (now, list(stages[consumer_kind]), owner, now, lease_seconds, now),
+                (now, now, list(stages[consumer_kind]), owner, now, lease_seconds, now),
             )
             row = cursor.fetchone()
         return (

@@ -39,6 +39,19 @@ class FollowupPostgresTests(unittest.TestCase):
                 "('pac_test','suspend_user','ou_synthetic','ou_admin','enabled','pending',now(),now()+interval '1 hour')"
             )
 
+    def replace_action(self, created_at):
+        """从原创建时刻插入历史合成动作，不绕过创建时间不可修改的守卫。"""
+        with connect(DSN) as conn, conn.cursor() as cur:
+            cur.execute("DELETE FROM pending_action WHERE id='pac_test'")
+            cur.execute(
+                "INSERT INTO pending_action(id,action_type,target_open_id,initiated_by_open_id,"
+                "target_state_snapshot,status,created_at,confirm_deadline_at) VALUES "
+                "('pac_test','suspend_user','ou_synthetic','ou_admin','enabled','pending',%s,%s) "
+                "RETURNING retention_expires_at",
+                (created_at, created_at + timedelta(hours=1)),
+            )
+            return cur.fetchone()[0]
+
     def add(self, stage="permission_recompute", **kwargs):
         with connect(DSN) as conn:
             return enqueue_followups(
@@ -281,8 +294,8 @@ class FollowupPostgresTests(unittest.TestCase):
         self.assertEqual(len(views), 1)
         self.assertIn("结果待核实", render_followups(views))
         self.assertIn("trc_synthetic", render_followups(views))
-        with connect(DSN) as conn, conn.cursor() as cur:
-            cur.execute("UPDATE admin_action_followup SET created_at=now()-interval '91 days'")
+        self.replace_action(datetime.now(UTC) - timedelta(days=91))
+        self.add("group_notify")
         self.assertEqual(fetch_followups(DSN, trace_id="trc_synthetic"), ())
 
     def test_new_user_resolution_rejects_forged_identity_and_keeps_subject(self):
@@ -350,14 +363,10 @@ class FollowupPostgresTests(unittest.TestCase):
         self.assertEqual(self.store.recovery_status()["recoverable"], 10000)
 
     def test_retention_closes_dependents_without_replaying_old_actions(self):
+        self.replace_action(datetime.now(UTC) - timedelta(days=91))
         old = self.add("permission_recompute")
         self.add("publish_observe", depends_on_id=old.id)
-        with connect(DSN) as conn, conn.cursor() as cur:
-            cur.execute(
-                "UPDATE admin_action_followup SET created_at=now()-interval '91 days' WHERE id=%s",
-                (old.id,),
-            )
-        self.store.recover_expired(now=datetime.now(UTC) + timedelta(seconds=1))
+        self.store.recover_expired(now=datetime.now(UTC) + timedelta(seconds=1), limit=1)
         refs = self.store.list_for_action(pending_action_id="pac_test")
         self.assertEqual(len(refs), 1)
         self.assertEqual(refs[0].status, "skipped")

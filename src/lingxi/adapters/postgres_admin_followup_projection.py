@@ -26,9 +26,10 @@ def fetch_followups(dsn, *, trace_id, timeouts=DEFAULT_POSTGRES_TIMEOUTS):
     """只按阶段实际 trace_id 精确匹配，缺入站事件仍可查询确认阶段。"""
     with connect(dsn, timeouts=timeouts) as connection, connection.cursor() as cursor:
         cursor.execute(
-            "SELECT id,pending_action_id,stage,status,result_code,trace_id,updated_at,attempt "
-            "FROM admin_action_followup WHERE trace_id=%s "
-            "AND created_at>now()-interval '90 days' ORDER BY created_at,id LIMIT 100",
+            "SELECT f.id,f.pending_action_id,f.stage,f.status,f.result_code,f.trace_id,f.updated_at,f.attempt "
+            "FROM admin_action_followup f JOIN pending_action p ON p.id=f.pending_action_id "
+            "WHERE f.trace_id=%s AND p.retention_expires_at>now() "
+            "ORDER BY f.created_at,f.id LIMIT 100",
             (trace_id,),
         )
         return tuple(AdminFollowupView(*row) for row in cursor.fetchall())

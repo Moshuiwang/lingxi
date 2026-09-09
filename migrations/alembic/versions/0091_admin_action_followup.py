@@ -42,6 +42,8 @@ CREATE INDEX admin_followup_lease ON admin_action_followup(lease_until)
  WHERE status = 'running';
 CREATE INDEX admin_followup_action ON admin_action_followup(pending_action_id);
 CREATE INDEX admin_followup_item ON admin_action_followup(batch_item_id);
+CREATE INDEX admin_followup_trace ON admin_action_followup(trace_id,created_at,id);
+CREATE INDEX admin_followup_operation_retention ON pending_action(retention_expires_at,id);
 """
 
 
@@ -57,3 +59,4 @@ def downgrade():
         "RAISE EXCEPTION 'followup records require compatible recovery'; END IF; END $$"
     )
     op.execute("DROP TABLE admin_action_followup")
+    op.execute("DROP INDEX admin_followup_operation_retention")

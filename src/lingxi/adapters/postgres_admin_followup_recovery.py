@@ -88,8 +88,9 @@ def _close_dependencies(cursor, now, limit):
 def _expire_old(cursor, now, limit):
     """到期先结束依赖工作并删除可识别阶段，不无限保留历史。"""
     cursor.execute(
-        "SELECT id FROM admin_action_followup WHERE created_at<=%s-interval '90 days' "
-        "ORDER BY created_at,id FOR UPDATE SKIP LOCKED LIMIT %s",
+        "SELECT f.id FROM pending_action p JOIN admin_action_followup f ON f.pending_action_id=p.id "
+        "WHERE p.retention_expires_at<=%s "
+        "ORDER BY p.retention_expires_at,f.id FOR UPDATE OF f SKIP LOCKED LIMIT %s",
         (now, min(32, max(0, limit))),
     )
     ids = [row[0] for row in cursor.fetchall()]

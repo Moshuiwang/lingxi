@@ -1,7 +1,8 @@
-"""每个消费者仅一条线程，领取及停止串行化，任务在数据库中等待。"""
+"""每个消费者仅一条线程，停止不等数据库，任务通过持久状态交接。"""
 
 from __future__ import annotations
 
+import logging
 import threading
 import time
 from dataclasses import dataclass
@@ -9,6 +10,8 @@ from datetime import UTC, datetime
 
 from lingxi.core.admin.followup import EXTERNAL_STAGES, ShutdownReport
 from lingxi.core.admin.followup_effect import effect_guard
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -47,9 +50,8 @@ class FollowupConsumer:
             self._thread.start()
 
     def request_stop(self):
-        """返回后绝不再领取；已领取的工作在同一预算内结束。"""
-        with self._gate:
-            self._stop.set()
+        """立即停止新增领取；已经在途的领取返回后只交回。"""
+        self._stop.set()
 
     def drain_until(self, deadline_monotonic):
         """超时仍在途如实计数，连接归执行线程持有直至自身退出。"""
@@ -63,27 +65,65 @@ class FollowupConsumer:
         )
 
     def run_once(self):
-        """停止门与领取原子排序，处理失败不能阻止其他目标。"""
+        """领取前后都核对停止，处理失败不能阻止其他目标。"""
         with self._gate:
             if self._stop.is_set():
                 return False
             now = datetime.now(UTC)
-            self.store.recover_expired(now=now, limit=32)
+            self._recover(now)
             if self._stop.is_set():
                 return False
-            item = self.store.claim_followup(consumer_kind=self.kind, owner=self.owner, now=now)
+            item = self.store.claim_followup(
+                consumer_kind=self.kind, owner=self.owner, now=datetime.now(UTC)
+            )
             if item is None:
                 return False
             self._accepted += 1
             self._current = item
             self._lease_lost = False
             self._effect_started = False
-        self._execute(item)
-        self._current = None
+        try:
+            self._execute(item)
+        finally:
+            self._current = None
         return True
+
+    def _recover(self, now):
+        """恢复扫描失败仍允许独立任务通过领取口自己的安全条件。"""
+        try:
+            self.store.recover_expired(now=now, limit=32)
+        except Exception as error:
+            try:
+                self.audit.record(
+                    "admin.followup.recovery_failed",
+                    consumer_kind=self.kind,
+                    run_id=self.owner,
+                    error=type(error).__name__,
+                )
+            except Exception as audit_error:
+                logger.error(
+                    "后台恢复扫描及审计失败 recovery_error=%s audit_error=%s",
+                    type(error).__name__,
+                    type(audit_error).__name__,
+                )
+
+    def _release_stopped(self, item):
+        """停止期间返回的领取只交回持久队列，不开始外发或增加失败次数。"""
+        self.store.retry_followup(
+            id=item.id,
+            owner=self.owner,
+            attempt=item.attempt,
+            now=datetime.now(UTC),
+            result_code="stopping",
+            stopped=True,
+        )
+        self._record(item, "stopping")
 
     def _execute(self, item):
         """外发标记失败零调用；失去领取代数绝不覆盖其他执行者。"""
+        if self._stop.is_set():
+            self._release_stopped(item)
+            return
         try:
             if self._lease_lost:
                 return
