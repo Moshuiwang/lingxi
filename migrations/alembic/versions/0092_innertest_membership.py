@@ -47,7 +47,7 @@ CREATE TABLE innertest_membership (
  created_at TIMESTAMPTZ NOT NULL DEFAULT now(), PRIMARY KEY(scope,open_id)
 );
 CREATE TABLE innertest_check (
- id TEXT PRIMARY KEY, batch_item_id TEXT REFERENCES innertest_batch_item(id) ON DELETE SET NULL,
+ id TEXT PRIMARY KEY, batch_item_id TEXT REFERENCES innertest_batch_item(id) ON DELETE CASCADE,
  user_id TEXT NOT NULL REFERENCES app_user(id) ON DELETE CASCADE, permission_version BIGINT NOT NULL,
  publish_version BIGINT NOT NULL, started_at TIMESTAMPTZ NOT NULL,
  finished_at TIMESTAMPTZ NOT NULL, result_code TEXT NOT NULL, metric_count INTEGER,

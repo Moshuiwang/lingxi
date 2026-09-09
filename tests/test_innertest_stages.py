@@ -275,3 +275,23 @@ class InnertestStageTests(InnertestPostgresTests):
         )
         self.sql("DELETE FROM app_user WHERE id='usr_person1'")
         self.assertEqual(self.sql("SELECT count(*) FROM innertest_check"), [(0,)])
+
+    def test_late_check_retention_is_bound_to_original_batch(self):
+        from datetime import UTC, datetime, timedelta
+
+        from lingxi.adapters.postgres import connect
+        from lingxi.adapters.postgres_innertest_retention import purge_innertest_history
+
+        self.user()
+        batch = self.prepare()
+        self.delivered(batch)
+        self.confirm(batch)
+        now = datetime.now(UTC)
+        self.sql(
+            "INSERT INTO innertest_check(id,batch_item_id,user_id,permission_version,publish_version,started_at,finished_at,result_code,trace_id) VALUES('ich_late',%s,'usr_person1',1,1,%s,%s,'check_passed','trc_synthetic')",
+            (batch["items"][0]["item_id"], now + timedelta(hours=23), now + timedelta(hours=23)),
+        )
+        with connect(DSN) as connection:
+            purge_innertest_history(connection, now=now + timedelta(days=90, minutes=1), limit=20)
+        self.assertEqual(self.sql("SELECT count(*) FROM innertest_check"), [(0,)])
+        self.assertEqual(self.sql("SELECT count(*) FROM innertest_membership"), [(1,)])
