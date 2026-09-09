@@ -134,7 +134,7 @@ class InnertestSocketListener:
             state[0].extend(data)
             if len(state[0]) > MAX_BYTES:
                 raise ValueError("request_too_large")
-            while b"\n" in state[0]:
+            while b"\n" in state[0] and not self._stop.is_set():
                 line, _, remainder = state[0].partition(b"\n")
                 state[0] = bytearray(remainder)
                 self._accepted += 1
