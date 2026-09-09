@@ -216,6 +216,9 @@ class PostgresCarrierRetention:
                     },
                 )
                 redacted = cursor.rowcount
+                from lingxi.adapters.postgres_innertest_retention import purge_innertest_history
+
+                purge_innertest_history(connection, now=moment, limit=batch)
         if redacted:
             logger.info("待确认操作已到期脱敏 条数=%s", redacted)
         return redacted

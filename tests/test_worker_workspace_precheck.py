@@ -112,7 +112,7 @@ class EnsureWorkerWorkspaceUnitTests(unittest.TestCase):
                 line for line in lines if line["event"] == "worker.queue.workspace.unavailable"
             )
             self.assertEqual(failure_line["reason"], "not_a_writable_directory")
-            self.assertEqual(failure_line["trace_id"], "trace-3")
+            self.assertEqual(failure_line["worker_run_id"], "trace-3")
 
     @unittest.skipIf(_RUNNING_AS_ROOT, "root 无视权限位，负向断言在此环境下不成立")
     def test_an_uncreatable_path_fails_with_an_identifiable_event(self) -> None:

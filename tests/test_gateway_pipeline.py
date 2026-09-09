@@ -2705,3 +2705,40 @@ class PipelineFailedAuditLeakageTests(PipelineTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class DynamicInnertestProgressTests(PipelineTestCase):
+    def test_pending_stage_never_claims_identity_check_or_saves_question(self):
+        runner = FakeOnboarding(result=OnboardingResult(state=OnboardingState.STARTED))
+        pipeline = self.build(
+            onboarding=runner,
+            innertest_roster_gate=lambda _oid: True,
+        )
+        from dataclasses import replace
+
+        pipeline._gates = replace(
+            pipeline._gates, innertest_progress=lambda _oid: "onboarding.innertest_waiting"
+        )
+        outcome = pipeline.handle_message(
+            message(event_id="evt_pending", open_id="ou_new", text="合成业务问题"), now=NOW
+        )
+        self.assertEqual(outcome.handled_as, HandledAs.DROPPED)
+        self.assertEqual(runner.calls, [])
+        self.assertEqual(self.state.tasks, [])
+        self.assertEqual(
+            [f["content_key"] for f in self.log.fields("audit.reply.sent")],
+            ["onboarding.innertest_waiting"],
+        )
+
+    def test_roster_read_failure_is_technical_failure_not_closed_roster(self):
+        runner = FakeOnboarding(result=OnboardingResult(state=OnboardingState.STARTED))
+
+        def unavailable(_oid):
+            raise RuntimeError("synthetic_database_unavailable")
+
+        pipeline = self.build(onboarding=runner, innertest_roster_gate=unavailable)
+        pipeline.handle_message(message(event_id="evt_db_unavailable", open_id="ou_new"), now=NOW)
+        self.assertEqual(runner.calls, [])
+        keys = [f["content_key"] for f in self.log.fields("audit.reply.sent")]
+        self.assertNotIn("onboarding.innertest_not_open", keys)
+        self.assertIn("gateway.unexpected_error", keys)

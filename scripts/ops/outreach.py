@@ -273,6 +273,13 @@ def build_target(
         subject=apply_subject(recipient.facts),
         audience=recipient.plan.audience,
         user_id=recipient.facts.user_id,
+        permission_snapshot=(
+            recipient.facts.user_id,
+            recipient.facts.permission_version,
+            recipient.facts.publish_id,
+        )
+        if recipient.facts.permission_version is not None and recipient.facts.publish_id
+        else None,
     )
 
 
@@ -379,7 +386,9 @@ def _state_gate(
 
 def _classify(email: str, outcome: OutreachOutcome) -> PersonResult:
     """把一次发送的结局翻译成清单上的一行。"""
-    if outcome.skipped:
+    if outcome.status == "unknown":
+        return PersonResult(email, "unknown", outcome.error_code or "notification_unknown")
+    if outcome.status == "delivered" and outcome.skipped:
         return PersonResult(email, "already_delivered")
     if outcome.status == "delivered":
         return PersonResult(email, "delivered", outcome.message_id)
@@ -397,10 +406,11 @@ def print_results(results: Sequence[PersonResult], *, purpose: OutreachPurpose) 
     already = sum(1 for item in results if item.status == "already_delivered")
     failed = sum(1 for item in results if item.status.startswith("failed"))
     skipped = sum(1 for item in results if item.status == "skipped")
+    unknown = sum(1 for item in results if item.status == "unknown")
     unrecorded = sum(1 for item in results if item.status == STATUS_DELIVERED_NOT_RECORDED)
     print(
         f"{label}完成：送达 {delivered}、此前已送达 {already}、失败 {failed}、"
-        f"跳过 {skipped}、已送达但未记账 {unrecorded}（共 {len(results)} 人）。"
+        f"跳过 {skipped}、待核实 {unknown}、已送达但未记账 {unrecorded}（共 {len(results)} 人）。"
     )
     if purpose is OutreachPurpose.PRECHECK:
         print("预检记录标记为 precheck，不算正式送达；正式发送仍需 --apply。")
@@ -541,12 +551,19 @@ def build_dispatcher(config: Any, dsn: str, *, initiated_by: str) -> Any:
     # 告警那一侧拿不带发起人的原始出口：告警是系统故障事实，不属于某一次人工发起。
     alerting = build_alerting_duty(config, audit=audit)
     source = default_content_source()
+    sender = FeishuUserCards(
+        base_url=config.feishu_base_url,
+        app_id=config.feishu_app_id,
+        app_secret=config.feishu_app_secret,
+    )
+    from lingxi.adapters.innertest_outreach import CheckedInnertestSender
+    from lingxi.apps.scheduler.innertest import _build_probe
+
+    sender = CheckedInnertestSender(
+        dsn=dsn, sender=sender, probe=_build_probe(config), initiated_by=initiated_by
+    )
     dispatcher = OutreachDispatcher(
-        sender=FeishuUserCards(
-            base_url=config.feishu_base_url,
-            app_id=config.feishu_app_id,
-            app_secret=config.feishu_app_secret,
-        ),
+        sender=sender,
         store=PostgresOutreachStore(dsn),
         audit=_AuditWithInitiator(audit, initiated_by=initiated_by),
         send_outcome=alerting.send_outcome_callback(),
@@ -748,7 +765,7 @@ def _flush_alerts(alerting: Any) -> str | None:
 
 
 def _exit_code(results: Sequence[PersonResult], *, alert_error: str | None) -> int:
-    """收口退出码：``0`` 跑完，``3`` 发出去了但收尾没做干净。
+    """收口退出码：``0`` 跑完，``3`` 结果待核实或收尾异常。
 
     两种收尾不干净都要指名道姓地说清下一步：已送达未记账的人按 ``message_id`` 人工
     核对，告警没投出去要说明发送本身不受影响。
@@ -768,7 +785,12 @@ def _exit_code(results: Sequence[PersonResult], *, alert_error: str | None) -> i
             "发送本身不受影响，不必重跑名单。",
             file=sys.stderr,
         )
-    return 3 if unrecorded or alert_error is not None else 0
+    unknown = [item for item in results if item.status == "unknown"]
+    for item in unknown:
+        print(
+            f"{item.email} 的通知结果待核实：先查原记录并核验平台，不要盲目重发。", file=sys.stderr
+        )
+    return 3 if unknown or unrecorded or alert_error is not None else 0
 
 
 def main(argv: list[str] | None = None) -> int:

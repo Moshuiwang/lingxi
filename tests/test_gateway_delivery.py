@@ -923,7 +923,7 @@ class NetworkResultUnknownDoesNotDuplicateDeliveryTests(DeliveryConsumerTestCase
             queue=self.queue,
             cards=RecordingCards(),
             texts=texts,
-            on_alert=lambda kind, task_id: alerts.append((kind, task_id)),
+            on_alert=lambda kind, task_id, trace_id=None: alerts.append((kind, task_id)),
         )
         processed_next = recovered.run_once()
         self.assertEqual(processed_next, 0, "uncertain 任务不进入正常候选")
@@ -1598,7 +1598,7 @@ class TerminalReceiptRequiredBeforeConfirmTests(DeliveryConsumerTestCase):
             cards=cards,
             texts=texts,
             monotonic=lambda: clock[0],
-            on_alert=lambda kind, task_id: alerts.append((kind, task_id)),
+            on_alert=lambda kind, task_id, trace_id=None: alerts.append((kind, task_id)),
         )
         consumer.run_once()
 

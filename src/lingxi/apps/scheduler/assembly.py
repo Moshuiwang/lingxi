@@ -26,6 +26,7 @@ from lingxi.apps.scheduler.document_delivery_dead_letter import (
     _wire_document_delivery_maintenance_duty,
 )
 from lingxi.apps.scheduler.late_readiness_recovery import _build_late_readiness_recovery_duty
+from lingxi.apps.scheduler.lifecycle import SignalStopEvent
 from lingxi.apps.scheduler.loop import SchedulerLoop
 from lingxi.apps.scheduler.onboarding import _build_onboarding_duty
 from lingxi.apps.scheduler.org_snapshot_sync import _build_org_snapshot_sync_duty
@@ -198,7 +199,7 @@ def build_loop(
     其装配点写在对应函数的注释里。调用方（主要是测试）传自定义实现即可
     替换默认供给。
     """
-    stop = threading.Event()
+    stop = SignalStopEvent()
     sink = audit if audit is not None else StructuredLogAuditSink()
 
     holder, rotation, cleanups = _build_rotation_and_cleanup_duties(config, stop, sink)
@@ -226,12 +227,16 @@ def build_loop(
         if heartbeat is None:
             heartbeat = alerting_duty.heartbeat_callback("scheduler")
 
-    return SchedulerLoop(
+    loop = SchedulerLoop(
         duties=tuple(duties),
         interval_seconds=config.interval_seconds,
         stop=stop,
         heartbeat=heartbeat,
     )
+    from lingxi.apps.scheduler.innertest import wire_innertest
+
+    wire_innertest(config, loop=loop, duties=duties, audit=sink)
+    return loop
 
 
 def _wire_permission_and_onboarding_pipeline(

@@ -11,6 +11,7 @@ from collections.abc import Sequence
 from lingxi.config.content import ContentCatalog, RenderedContent, default_content_catalog
 from lingxi.core.admin.commands import AdminRejectReason
 from lingxi.core.admin.display_names import AdminDisplayNames
+from lingxi.core.admin.followup_render import render_followups
 from lingxi.core.admin.views import (
     AdminEventView,
     AdminTraceView,
@@ -370,6 +371,12 @@ def render_trace(trace_id: str, trace: AdminTraceView | None) -> str:
     """
     if trace is None:
         return f"追溯号 {trace_id}：查无此追溯号"
+    if trace.event_count is None and trace.followups:
+        return f"追溯号 {trace_id}\n{render_followups(trace.followups)}"
+    if trace.reference_kind == "task":
+        return "\n".join(
+            [f"任务参考号 {trace_id}", *_trace_task_lines(trace), *_trace_document_lines(trace)]
+        )
     lines = [
         f"追溯号 {trace_id}：{trace.event_count} 条入站事件",
         f"首次接收: {trace.first_received_at}",
@@ -396,6 +403,8 @@ def render_trace(trace_id: str, trace: AdminTraceView | None) -> str:
         lines.append("无开通失败记录")
     lines.extend(_trace_task_lines(trace))
     lines.extend(_trace_document_lines(trace))
+    if trace.followups:
+        lines.append(render_followups(trace.followups))
     return "\n".join(lines)
 
 
@@ -410,6 +419,8 @@ def _trace_task_lines(trace: AdminTraceView) -> list[str]:
         return []
     suffix = f"（{trace.task_ended_at}）" if trace.task_ended_at is not None else ""
     lines = [f"任务结果: {_display_or_unregistered(trace.task_status, _TASK_STATUS_LABEL)}{suffix}"]
+    if trace.task_started_at is not None:
+        lines.append(f"任务开始: {trace.task_started_at}")
     # 有细分失败码用它，否则退回错误类别：没有经过终态写入的失败（心跳超时回收、投递
     # 到期、排队超时）在细分列上恒为空，只有错误类别说得出原因，不能因此整行消失。
     task_failure = trace.task_failure_code or trace.task_error_kind

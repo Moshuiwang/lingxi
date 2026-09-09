@@ -1,17 +1,8 @@
-"""``python -m lingxi.apps.trace``：追溯号只读查询入口。
+"""受控只读追溯 CLI，保留原事件/开通视图并补充低敏任务与文档交付状态。
 
-补的是哪个洞：用户看到的失败终态带一个追溯号，但在本命令之前，能解析
-它的唯一出口是结构化日志，而产品负责人没有生产宿主机访问——给了追溯
-号却没人能解析等于没给。本命令是最小可行的解析入口：受控只读 CLI，
-形状照 ``apps/healthcheck``/``apps/reauthorize``（后者是双人复核写入，
-前者是纯只读，本命令属于后者）。只读，没有任何写路径：全程只用一个
-只读事务读四张表，不做网页查询页、不进管理 MCP。身份最小化：默认不
-打印 ``open_id``，只打印内部 ``user_id`` 与账号/
-开通状态，需要核对具体是哪个人时用显式 ``--include-open-id`` 打开
-（默认收紧、显式选择才放宽）。能回答：事件是谁、何时到的、有没有被
-认领、用户开通/账号状态、发布意图状态、就绪探针历史；回答不了
-``failure_reason``——管理员私聊 ``/admin trace`` 可查，本模块保持零
-变更，是给持有容器访问权限的运维用的补充诊断视图。
+裸 ULID 查有效入站事件，T-ULID 只查精确任务；两者分别遵守原事件和任务保留期限。
+任务投影不含问题、答案或个人资料，默认仍不显示 open_id；历史开通视图需要核对外部
+身份时，仍需显式 --include-open-id。查询使用同一只读事务，不提供写入口。
 """
 
 from __future__ import annotations
@@ -21,6 +12,9 @@ import sys
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any
+
+from lingxi.adapters.task_trace_query import fetch_trace_task
+from lingxi.core.task_reference import parse_reference
 
 #: scheduler 角色使用的连接串环境变量名，与 ``apps/healthcheck`` 的角色映射保持
 #: 同一个变量（本命令按设计固定在 scheduler 容器内执行，见模块文档）。
@@ -75,7 +69,7 @@ def _fetch_events(cursor: Any, trace_id: str) -> tuple[_EventRow, ...]:
         SELECT feishu_event_id, received_at, event_type, handled_as,
                user_open_id, onboarding_dispatched_at
           FROM inbound_event
-         WHERE trace_id = %s
+         WHERE trace_id = %s AND expires_at > now()
          ORDER BY received_at
         """,
         (trace_id,),
@@ -219,7 +213,7 @@ def _render(
 
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="python -m lingxi.apps.trace")
-    parser.add_argument("trace_id", help="要查询的追溯号（ULID）")
+    parser.add_argument("trace_id", help="原事件追溯号（ULID）或任务参考号（T-加ULID）")
     parser.add_argument(
         "--include-open-id",
         action="store_true",
@@ -279,6 +273,11 @@ def run(
         print(f"缺少数据库连接串环境变量 {DSN_ENV_VAR}", file=err)
         return 1
 
+    parsed = parse_reference(args.trace_id)
+    if parsed is None:
+        print("核查号码格式不合法", file=err)
+        return 1
+
     connect_fn = connect
     if connect_fn is None:
         from lingxi.adapters.postgres import connect as connect_fn
@@ -287,23 +286,57 @@ def run(
         with connect_fn(dsn) as connection:
             connection.read_only = True
             with connection.cursor() as cursor:
-                events, users, publishes, readiness = _collect_trace_data(cursor, args.trace_id)
+                if parsed.reference_kind == "task":
+                    data = (), {}, {}, {}
+                else:
+                    data = _collect_trace_data(cursor, args.trace_id)
+                task = fetch_trace_task(cursor, args.trace_id)
     except Exception as error:  # 查询失败只需要区分"能不能查"
         print(f"查询失败：{type(error).__name__}", file=err)
         return 1
 
     print(
-        _render(
+        _render_lookup(
+            parsed.reference_kind,
             args.trace_id,
-            events,
-            users,
-            publishes,
-            readiness,
-            include_open_id=args.include_open_id,
+            task,
+            data,
+            args.include_open_id,
         ),
         file=out,
     )
     return 0
+
+
+def _render_lookup(kind, reference, task, data, include_open_id):
+    """任务参考号不伪造事件、开通状态或个人资料。"""
+    if kind == "task":
+        text = (
+            f"任务参考号 {reference}"
+            if task is not None
+            else f"任务参考号 {reference}：查无此追溯号"
+        )
+    else:
+        text = _render(reference, *data, include_open_id=include_open_id)
+    if task is not None:
+        text += "\n" + _render_task(task)
+    return text
+
+
+def _render_task(task: tuple) -> str:
+    """与管理入口相同的低敏任务投影；没有正文和个人资料列。"""
+    labels = (
+        "任务状态",
+        "错误分类",
+        "失败码",
+        "失败签名",
+        "任务结束",
+        "文档交付状态",
+        "文档交付错误",
+        "文档简化原因",
+        "任务开始",
+    )
+    return "\n".join(f"{label}: {value}" for label, value in zip(labels, task) if value is not None)
 
 
 def main() -> int:  # pragma: no cover - 由 __main__.py 与真实 CLI 调用

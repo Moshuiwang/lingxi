@@ -36,6 +36,7 @@ from lingxi.core.admin.pending_action import (
 #: ``core/admin/router._OVERRIDE_DIRECTION_LABEL`` 三处同步，杜绝同一操作两套
 #: 说法。确认卡/终态卡/群通知/标题四处共用这一份映射。
 _ACTION_LABEL: dict[PendingActionType, str] = {
+    PendingActionType.INNERTEST_ADDITIONS: "加入内测资格",
     PendingActionType.SUSPEND_USER: "停用",
     PendingActionType.RESUME_USER: "恢复",
     PendingActionType.LOCAL_PERMISSION_GRANT: "补充授权",

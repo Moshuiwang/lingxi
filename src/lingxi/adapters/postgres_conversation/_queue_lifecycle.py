@@ -14,12 +14,14 @@ worker 侧的 ``claim``/``finish``/心跳续期，以及 scheduler 侧的心跳�
 
 from __future__ import annotations
 
+import logging
 from collections.abc import Sequence
 from datetime import timedelta
 from typing import Any
 
 from lingxi.adapters.postgres import connect
 from lingxi.core.delivery.ports import DeliveryEventType, TerminalKind
+from lingxi.core.task_reference import append_failure_reference, task_reference, valid_trace_id
 
 from ._dataclasses import ClaimedTask, TaskContext, TerminalTask
 
@@ -87,6 +89,8 @@ def _row_to_claimed_task(row: Any) -> ClaimedTask:
         reply_to_message_id=row[7],
         stop_requested=row[8],
         side_effect_state=row[9],
+        trace_id=valid_trace_id(row[10]),
+        task_created_at=row[11],
     )
 
 
@@ -114,6 +118,7 @@ class _TaskLifecycleMixin:
             with connection.cursor() as cursor:
                 cursor.execute(
                     """
+                    WITH claimed AS (
                     UPDATE task SET status = 'running',
                                     worker_id = %s,
                                     started_at = now(),
@@ -130,7 +135,15 @@ class _TaskLifecycleMixin:
                      )
                     RETURNING id, conversation_id, user_id, prompt,
                               resumed_session, target_worker_version, attempts,
-                              reply_to_message_id, stop_requested, side_effect_state
+                              reply_to_message_id, stop_requested, side_effect_state,
+                              inbound_event_id, created_at
+                    )
+                    SELECT claimed.id, claimed.conversation_id, claimed.user_id, claimed.prompt,
+                           claimed.resumed_session, claimed.target_worker_version, claimed.attempts,
+                           claimed.reply_to_message_id, claimed.stop_requested, claimed.side_effect_state,
+                           e.trace_id, claimed.created_at
+                      FROM claimed LEFT JOIN inbound_event AS e
+                        ON claimed.inbound_event_id = e.feishu_event_id AND e.expires_at > now()
                     """,
                     (worker_id, target_worker_version, limit),
                 )
@@ -257,9 +270,12 @@ class _TaskLifecycleMixin:
                 SELECT t.id, t.conversation_id, t.user_id, t.prompt,
                        t.resumed_session, t.target_worker_version, t.attempts,
                        t.reply_to_message_id, t.stop_requested, t.side_effect_state,
-                       c.feishu_chat_id, c.feishu_thread_id, c.agent_session_id
+                       c.feishu_chat_id, c.feishu_thread_id, c.agent_session_id,
+                       e.trace_id, t.created_at
                   FROM task AS t
                   JOIN conversation AS c ON c.id = t.conversation_id
+                  LEFT JOIN inbound_event AS e
+                    ON t.inbound_event_id = e.feishu_event_id AND e.expires_at > now()
                  WHERE t.id = %s AND t.worker_id = %s AND t.status = 'running'
                 """,
                 (task_id, worker_id),
@@ -281,6 +297,8 @@ class _TaskLifecycleMixin:
                 chat_id=row[10],
                 thread_id=row[11],
                 agent_session_id=row[12],
+                trace_id=valid_trace_id(row[13]),
+                task_created_at=row[14],
             )
 
     def reclaim_stale(
@@ -467,13 +485,11 @@ class _TaskLifecycleMixin:
         content_key = _SYSTEM_TERMINAL_CONTENT_KEYS.get(error_kind)
         if content_key is None:
             raise ValueError(f"没有为 error_kind={error_kind!r} 登记用户可见文案键")
-        content = self._content_catalog.text(content_key).text
-
-        self._ensure_system_started_event(cursor, task_id=task_id)
-
         terminal_key = f"{task_id}:terminal"
         if self._find_by_idempotency_key(cursor, terminal_key) is not None:
             return False
+        content = self._system_failure_content(cursor, task_id, content_key)
+        self._ensure_system_started_event(cursor, task_id=task_id)
 
         self._insert_new_event(
             cursor,
@@ -499,6 +515,28 @@ class _TaskLifecycleMixin:
             # 的既有处理方式一致）。
             raise RuntimeError(f"任务 {task_id} 在系统代为收口时状态发生了竞态")
         return True
+
+    def _system_failure_content(self, cursor: Any, task_id: str, content_key: str) -> str:
+        """调用方先持有任务锁并排除旧终态，再读取有效原号。"""
+        cursor.execute(
+            """
+            SELECT e.trace_id FROM task AS t LEFT JOIN inbound_event AS e
+              ON t.inbound_event_id = e.feishu_event_id AND e.expires_at > now()
+             WHERE t.id = %s
+            """,
+            (task_id,),
+        )
+        row = cursor.fetchone()
+        if task_reference(task_id) is None:
+            logging.getLogger(__name__).error(
+                "系统失败任务主键损坏，保留原提示；reference_integrity_error=true"
+            )
+        return append_failure_reference(
+            self._content_catalog,
+            self._content_catalog.text(content_key),
+            task_id=task_id,
+            trace_id=valid_trace_id(row[0]) if row else None,
+        ).text
 
     def _ensure_system_started_event(self, cursor: Any, *, task_id: str) -> None:
         """幂等写入系统代为收口的 ``started`` 哨兵事件。

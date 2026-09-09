@@ -78,11 +78,24 @@ def release_version(tag: str) -> tuple[str, bool]:
     return ".".join(match.group(1, 2, 3)), bool(match.group(4))
 
 
+def verify_control_bundle(path: Path, metadata: dict) -> None:
+    import importlib.util
+
+    source = Path(__file__).resolve().parents[2] / "deploy/control_bundle.py"
+    spec = importlib.util.spec_from_file_location("lingxi_fixed_control_bundle", source)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    try:
+        module.verify(path, metadata)
+    except (ValueError, KeyError, OSError, module.BundleError):
+        raise ReleaseError("控制包内容与固定清单不符") from None
+
+
 def validate_manifest(doc: dict, repository: str, *, prerelease: bool) -> None:
     version, is_candidate = release_version(doc.get("tag", ""))
     expected_branch = "release/" + ".".join(version.split(".")[:2])
     if (
-        doc.get("schema") != 1
+        doc.get("schema") not in (1, 2)
         or doc.get("repository") != repository
         or doc.get("version") != version
         or doc.get("branch") != expected_branch
@@ -105,6 +118,52 @@ def validate_manifest(doc: dict, repository: str, *, prerelease: bool) -> None:
             raise ReleaseError("镜像必须按完整 digest 固定")
     if not isinstance(doc.get("migration_heads"), list) or not doc["migration_heads"]:
         raise ReleaseError("发布记录缺少迁移头")
+
+    if doc["schema"] == 1:
+        if "control_bundle" in doc:
+            raise ReleaseError("旧清单不得夹带未验证的控制包")
+    else:
+        bundle = doc.get("control_bundle", {})
+        if (
+            set(bundle)
+            != {"asset", "sha256", "index_sha256", "schema_revision", "source_commit", "runtime"}
+            or bundle["asset"] != "lingxi-control.tar"
+            or bundle["schema_revision"] != 1
+            or bundle["source_commit"] != doc["commit"]
+            or not re.fullmatch("[0-9a-f]{64}", bundle.get("sha256", ""))
+            or not re.fullmatch("[0-9a-f]{64}", bundle.get("index_sha256", ""))
+            or bundle["runtime"]
+            != {
+                "python_minimum": "3.11",
+                "platform": "linux",
+                "tools": ["docker"],
+                "compose_minimum": "2.24.0",
+                "stdlib_only": True,
+                "deployment_euid": 0,
+            }
+        ):
+            raise ReleaseError("新清单必须绑定完整控制包及运行环境")
+
+    if doc["schema"] == 2 and not prerelease:
+        promotion = doc.get("promotion", {})
+        if (
+            set(promotion)
+            != {
+                "main_commit",
+                "run_id",
+                "acceptance_sha256",
+                "acceptance_path",
+                "acceptance_commit",
+            }
+            or not SHA.fullmatch(promotion["main_commit"])
+            or promotion["acceptance_commit"] != promotion["main_commit"]
+            or type(promotion["run_id"]) is not int
+            or promotion["run_id"] <= 0
+            or promotion["acceptance_sha256"] != fingerprint(doc.get("acceptance", {}))
+            or promotion["acceptance_path"]
+            != "deploy/releases/acceptance/" + doc.get("candidate_tag", "") + ".json"
+        ):
+            raise ReleaseError("正式提升缺少固定 main 来源与验收摘要")
 
 
 def validate_acceptance(receipt: dict, candidate: dict) -> None:
@@ -139,6 +198,12 @@ def validate_release_record(release: dict, doc: dict) -> None:
     assets = [a for a in release.get("assets", []) if a.get("name") == "release-manifest.json"]
     if len(assets) != 1:
         raise ReleaseError("发布记录必须恰好有一份镜像清单")
+    if (
+        doc["schema"] == 2
+        and len([a for a in release.get("assets", []) if a.get("name") == "lingxi-control.tar"])
+        != 1
+    ):
+        raise ReleaseError("新发布缺少唯一控制包附件")
 
 
 def find_release(repository: str, tag: str) -> dict | None:
@@ -166,6 +231,22 @@ def load_release(repository: str, tag: str, *, require_completed: bool = True) -
             directory,
         )
         doc = json.loads((Path(directory) / "release-manifest.json").read_text())
+        validate_manifest(doc, repository, prerelease=release_version(tag)[1])
+        if doc["schema"] == 2:
+            command(
+                "gh",
+                "release",
+                "download",
+                tag,
+                "--repo",
+                repository,
+                "--pattern",
+                "lingxi-control.tar",
+                "--dir",
+                directory,
+            )
+            verify_control_bundle(Path(directory) / "lingxi-control.tar", doc["control_bundle"])
+
     validate_manifest(doc, repository, prerelease=release_version(tag)[1])
     validate_release_record(release, doc)
     actual = api(f"repos/{repository}/commits/{quote(tag, safe='')}")
@@ -183,7 +264,15 @@ def load_release(repository: str, tag: str, *, require_completed: bool = True) -
     return release, doc
 
 
-def write_release(doc: dict, output: Path) -> None:
+def write_release(doc: dict, output: Path, bundle_path: Path | None = None) -> None:
+    if doc["schema"] == 2:
+        if (
+            bundle_path is None
+            or hashlib.sha256(bundle_path.read_bytes()).hexdigest()
+            != doc["control_bundle"]["sha256"]
+        ):
+            raise ReleaseError("控制包附件缺失或摘要不符")
+        verify_control_bundle(bundle_path, doc["control_bundle"])
     output.write_bytes(canonical(doc))
     repo, tag = doc["repository"], doc["tag"]
     existing = find_release(repo, tag)
@@ -243,6 +332,41 @@ def write_release(doc: dict, output: Path) -> None:
         command(
             "gh", "release", "upload", tag, str(output) + "#release-manifest.json", "--repo", repo
         )
+    if doc["schema"] == 2:
+        bundle_assets = [
+            a for a in existing.get("assets", []) if a.get("name") == "lingxi-control.tar"
+        ]
+        if bundle_assets:
+            with tempfile.TemporaryDirectory() as directory:
+                command(
+                    "gh",
+                    "release",
+                    "download",
+                    tag,
+                    "--repo",
+                    repo,
+                    "--pattern",
+                    "lingxi-control.tar",
+                    "--dir",
+                    directory,
+                )
+                if (
+                    hashlib.sha256(
+                        (Path(directory) / "lingxi-control.tar").read_bytes()
+                    ).hexdigest()
+                    != doc["control_bundle"]["sha256"]
+                ):
+                    raise ReleaseError("已有控制包不同，拒绝覆盖")
+        else:
+            command(
+                "gh",
+                "release",
+                "upload",
+                tag,
+                str(bundle_path) + "#lingxi-control.tar",
+                "--repo",
+                repo,
+            )
     api(
         f"repos/{repo}/releases/{existing['id']}",
         method="PATCH",
@@ -267,7 +391,7 @@ def prepare(output: Path) -> None:
     if command("git", "rev-parse", "HEAD") != commit:
         raise ReleaseError("当前检出不是工作流固定提交")
     doc = {
-        "schema": 1,
+        "schema": 2,
         "repository": os.environ["GITHUB_REPOSITORY"],
         "version": version,
         "tag": f"v{version}-rc.{os.environ['GITHUB_RUN_NUMBER']}",
@@ -301,7 +425,9 @@ def migration_heads() -> list[str]:
     return sorted(revisions - parents)
 
 
-def candidate(plan: Path, image_tag: str, output: Path) -> None:
+def candidate(
+    plan: Path, image_tag: str, output: Path, control_bundle: Path, control_metadata: Path
+) -> None:
     from push_image import read_back_digest
 
     doc = json.loads(plan.read_text())
@@ -312,9 +438,10 @@ def candidate(plan: Path, image_tag: str, output: Path) -> None:
         if digest is None:
             raise ReleaseError("四镜像未全部推送并回读，不创建预发布")
         doc["images"][service] = reference.split(":", 1)[0] + "@" + digest
+    doc["control_bundle"] = json.loads(control_metadata.read_text())
     doc["migration_heads"] = migration_heads()
     validate_manifest(doc, doc["repository"], prerelease=True)
-    write_release(doc, output)
+    write_release(doc, output, control_bundle)
 
 
 def receipt_for(candidate_doc: dict) -> dict:
@@ -343,16 +470,45 @@ def promote(repository: str, tag: str, output: Path, apply: bool) -> None:
         candidate_tag=tag,
         candidate_manifest_sha256=fingerprint(candidate_doc),
         acceptance=receipt,
+        promotion={
+            "main_commit": os.environ["GITHUB_SHA"],
+            "run_id": int(os.environ["GITHUB_RUN_ID"]),
+            "acceptance_sha256": fingerprint(receipt),
+            "acceptance_path": "deploy/releases/acceptance/" + tag + ".json",
+            "acceptance_commit": os.environ["GITHUB_SHA"],
+        },
     )
     validate_manifest(result, repository, prerelease=False)
     output.write_bytes(canonical(result))
     if apply:
-        write_release(result, output)
+        with tempfile.TemporaryDirectory() as directory:
+            bundle_path = Path(directory) / "lingxi-control.tar"
+            if result["schema"] == 2:
+                command(
+                    "gh",
+                    "release",
+                    "download",
+                    tag,
+                    "--repo",
+                    repository,
+                    "--pattern",
+                    "lingxi-control.tar",
+                    "--dir",
+                    directory,
+                )
+            write_release(result, output, bundle_path if result["schema"] == 2 else None)
     else:
         print("正式提升预检通过；未写入版本")
 
 
-def resolve(repository: str, tag: str, environment: str, output: Path) -> None:
+def resolve(
+    repository: str,
+    tag: str,
+    environment: str,
+    output: Path,
+    manifest_output: Path | None = None,
+    allow_legacy: bool = False,
+) -> None:
     _, doc = load_release(repository, tag)
     if environment == "production":
         if doc["prerelease"]:
@@ -366,11 +522,23 @@ def resolve(repository: str, tag: str, environment: str, output: Path) -> None:
             raise ReleaseError("正式版没有引用 main 中经过审查的同一验收记录")
         if any(
             doc.get(key) != candidate_doc.get(key)
-            for key in ("commit", "tree", "images", "migration_heads", "run_id")
+            for key in (
+                "schema",
+                "commit",
+                "tree",
+                "images",
+                "migration_heads",
+                "run_id",
+                "control_bundle",
+            )
         ):
             raise ReleaseError("正式版不是已验收的同一份制品")
         if doc.get("candidate_manifest_sha256") != fingerprint(candidate_doc):
             raise ReleaseError("正式版与候选摘要不匹配")
+    if doc["schema"] == 1 and not allow_legacy:
+        raise ReleaseError("旧清单仅允许显式历史兼容核对；不能用作新部署目标")
+    if manifest_output is not None:
+        manifest_output.write_bytes(canonical(doc))
     lines = [
         f"LINGXI_IMAGE_REGISTRY=ghcr.io/{repository.lower().rsplit('/', 1)[0]}",
         "LINGXI_IMAGE_TAG=" + tag,
@@ -391,6 +559,8 @@ def main() -> int:
     p = sub.add_parser("candidate")
     p.add_argument("--plan", type=Path, required=True)
     p.add_argument("--image-tag", required=True)
+    p.add_argument("--control-bundle", type=Path, required=True)
+    p.add_argument("--control-metadata", type=Path, required=True)
     p.add_argument("--output", type=Path, required=True)
     for name in ("promote", "resolve"):
         p = sub.add_parser(name)
@@ -400,6 +570,8 @@ def main() -> int:
         if name == "promote":
             p.add_argument("--apply", action="store_true")
         else:
+            p.add_argument("--manifest-output", type=Path)
+            p.add_argument("--allow-legacy", action="store_true")
             p.add_argument("--environment", choices=("stage", "production"), required=True)
     args = parser.parse_args()
     if hasattr(args, "repository") and not re.fullmatch(

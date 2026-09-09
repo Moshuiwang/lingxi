@@ -29,6 +29,9 @@ def check(root: Path = ROOT) -> list[str]:
         '--base-ref "${GITHUB_REF_NAME}"',
         "release_manifest.py prepare",
         "release_manifest.py candidate",
+        "deploy/control_bundle.py --root",
+        "--control-bundle",
+        "--control-metadata",
     ):
         if marker not in publish:
             failures.append("候选发布缺少 " + marker)
@@ -40,7 +43,10 @@ def check(root: Path = ROOT) -> list[str]:
         failures.append("正式提升必须经过受保护 main 的验收检查")
     if "release_manifest.py promote" not in promotion or "--apply" not in promotion:
         failures.append("正式提升没有调用同一制品核验入口")
-    if any(x in promotion for x in ("build_image.sh", "docker build", "packages: write")):
+    if any(
+        x in promotion
+        for x in ("build_image.sh", "docker build", "packages: write", "control_bundle.py")
+    ):
         failures.append("正式提升不得重新构建或写镜像")
     if "/deploy/releases/acceptance/ @Moshuiwang" not in owners:
         failures.append("正式验收记录缺少代码所有者保护")

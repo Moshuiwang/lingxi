@@ -18,6 +18,7 @@ from lingxi.apps.worker.report_extraction import _cap_log_token, sanitize_failur
 from lingxi.apps.worker.service_ports import TerminalOutcomeCallback
 from lingxi.apps.worker.task_processing import TerminalDecision, TurnOutcome
 from lingxi.config.content_override import content_digest
+from lingxi.core.task_reference import reference_fields
 
 logger = logging.getLogger("lingxi.apps.worker.service")
 
@@ -40,6 +41,7 @@ class TerminalOutcomeAudit:
         decision: TerminalDecision,
         outcome: TurnOutcome,
         system_prompt_digest: str | None,
+        trace_id: str | None = None,
     ) -> None:
         """记一条终态收口事件；出口本身失败只记日志，不带走任务收口。"""
         if self._on_terminal_outcome is None:
@@ -51,6 +53,7 @@ class TerminalOutcomeAudit:
                     decision=decision,
                     outcome=outcome,
                     system_prompt_digest=system_prompt_digest,
+                    trace_id=trace_id,
                 )
             )
         except Exception as error:
@@ -64,6 +67,7 @@ class TerminalOutcomeAudit:
         decision: TerminalDecision,
         outcome: TurnOutcome,
         system_prompt_digest: str | None,
+        trace_id: str | None = None,
     ) -> dict[str, object]:
         """组装事件字段；自由文本一律先截到长度上界。
 
@@ -85,7 +89,7 @@ class TerminalOutcomeAudit:
         capped_reasons, reasons_truncated = cls._cap_all(reasons)
         capped_tool_names, names_truncated = cls._cap_all(outcome.denied_tool_names)
         return {
-            "task_id": task_id,
+            **reference_fields(task_id, trace_id),
             "failure_code": capped_code,
             "failure_signature": capped_signature,
             "error_kind": decision.error_kind,

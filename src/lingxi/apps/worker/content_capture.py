@@ -15,6 +15,7 @@ from lingxi.apps.worker.config import WorkerConfig
 from lingxi.apps.worker.service_ports import YearGroundingSuspectCallback
 from lingxi.apps.worker.turn import WorkerTurnExecutor
 from lingxi.core.innertest_content_capture import ContentCaptureRecord
+from lingxi.core.task_reference import reference_fields
 from lingxi.core.year_grounding_guard import detect_year_grounding_suspect
 
 logger = logging.getLogger("lingxi.apps.worker.service")
@@ -66,9 +67,11 @@ class ContentCaptureRecorder:
                 type(error).__name__,
             )
         if record is not None:
-            self._check_year_grounding_suspect(record)
+            self._check_year_grounding_suspect(record, trace_id=claimed.trace_id)
 
-    def _check_year_grounding_suspect(self, record: ContentCaptureRecord) -> None:
+    def _check_year_grounding_suspect(
+        self, record: ContentCaptureRecord, *, trace_id: str | None = None
+    ) -> None:
         """年份接地护栏第二层：结构性检测＋告警。
 
         只做检测与告警，**不拦截、不改答案投递路径**。调用方已经在全部终态分支收口之后
@@ -88,7 +91,9 @@ class ContentCaptureRecorder:
                 current_year=datetime.now().year,
             )
             if suspect is not None:
-                self._on_year_grounding_suspect(suspect.to_alert_fields())
+                self._on_year_grounding_suspect(
+                    {**suspect.to_alert_fields(), **reference_fields(record.task_id, trace_id)}
+                )
         except Exception as error:
             logger.error(
                 "年份接地护栏检测异常，任务结果不受影响 task_id=%s error=%s",

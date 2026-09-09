@@ -167,6 +167,8 @@ def _row_to_context(row: tuple) -> ManagementCardContext:
 class PostgresManagementCardContextStore:
     """``management_card_context`` 的唯一真实读写实现。"""
 
+    supports_action_guard = True
+
     def __init__(
         self,
         dsn: str,
@@ -350,6 +352,7 @@ class PostgresManagementCardContextStore:
         dispatch_status: str | None = None,
         snapshot_fingerprint: str | None = None,
         last_trace_id: str | None = None,
+        expected_action_id: str | None = None,
     ) -> ManagementCardContext | None:
         """按传入的非空字段更新一张管理卡；不传任何字段时只读回现状。"""
         assignments, values = self._build_state_update(
@@ -361,6 +364,13 @@ class PostgresManagementCardContextStore:
         if not assignments:
             return self.lookup_context(message_id=message_id)
         values.append(message_id)
+        condition = ""
+        if expected_action_id is not None:
+            condition = (
+                " AND state<>'closed' AND %s=(SELECT id FROM pending_action "
+                "WHERE origin_card_message_id=%s ORDER BY created_at DESC,id DESC LIMIT 1)"
+            )
+            values.extend((expected_action_id, message_id))
         with (
             connect(self._dsn, timeouts=self._timeouts) as connection,
             connection.cursor() as cursor,
@@ -369,7 +379,9 @@ class PostgresManagementCardContextStore:
                 "UPDATE management_card_context SET "
                 + ", ".join(assignments)
                 + ", updated_at = now() WHERE message_id = %s"
-                " RETURNING " + _SELECT_COLUMNS,
+                + condition
+                + " RETURNING "
+                + _SELECT_COLUMNS,
                 tuple(values),
             )
             row = cursor.fetchone()

@@ -18,6 +18,7 @@ from dataclasses import dataclass
 from enum import Enum
 
 from lingxi.core.ids import is_ulid
+from lingxi.core.task_reference import parse_reference
 
 #: 目标标识（open_id 或邮箱）允许的形状：字母、数字、下划线、连字符、点、冒号、
 #: ``@``，1–128 字符。刻意排除空白、引号、分号等 SQL / shell 元字符——不是因为
@@ -477,7 +478,7 @@ def _parse_tokens(tokens: list[str]) -> AdminCommand:
     if sub == "trace":
         if len(rest) != 1:
             return _unknown(AdminRejectReason.WRONG_ARGUMENT_COUNT)
-        if not is_ulid(rest[0]):
+        if parse_reference(rest[0]) is None:
             return _unknown(AdminRejectReason.BAD_TRACE_ID)
         return AdminCommand(kind=AdminCommandKind.QUERY_TRACE, identifier=rest[0])
 

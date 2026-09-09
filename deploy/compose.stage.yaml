@@ -37,7 +37,7 @@
 services:
   scheduler:
     env_file:
-      - ./.env.stage.scheduler
+      - ${LINGXI_ENV_ROOT:-.}/.env.stage.scheduler
     environment:
       # stage 扫得勤一些，便于受控验证时尽快观察到一轮扫描。
       LINGXI_SCHEDULER_INTERVAL_SECONDS: ${LINGXI_SCHEDULER_INTERVAL_SECONDS:-30}
@@ -84,7 +84,7 @@ services:
 
   gateway:
     env_file:
-      - ./.env.stage.gateway
+      - ${LINGXI_ENV_ROOT:-.}/.env.stage.gateway
     deploy:
       resources:
         limits:
@@ -104,7 +104,7 @@ services:
 
   worker:
     env_file:
-      - ./.env.stage.worker
+      - ${LINGXI_ENV_ROOT:-.}/.env.stage.worker
     # Agent SDK 一个回合会拉起 Claude CLI 与多个 MCP 子进程；pids 限制过低会
     # 在正常负载下直接杀死本该成功的回合（PM 2026-08-28 裁定明确点名的风险）。
     deploy:
@@ -123,7 +123,7 @@ services:
   # Agent SDK 继承给模型执行环境），要么 worker-queue 拿不到 DSN 而无限崩溃重启。
   worker-queue:
     env_file:
-      - ./.env.stage.worker-queue
+      - ${LINGXI_ENV_ROOT:-.}/.env.stage.worker-queue
     environment:
       # Issue #496 / Trace #502：stage 与生产执行并发合同均固定为 4。
       LINGXI_WORKER_MAX_CONCURRENCY: "4"
@@ -168,7 +168,7 @@ services:
 
   migrate:
     env_file:
-      - ./.env.stage.migrate
+      - ${LINGXI_ENV_ROOT:-.}/.env.stage.migrate
     deploy:
       resources:
         limits:
@@ -178,7 +178,7 @@ services:
 
   reauthorize:
     env_file:
-      - ./.env.stage.reauthorize
+      - ${LINGXI_ENV_ROOT:-.}/.env.stage.reauthorize
     deploy:
       resources:
         limits:

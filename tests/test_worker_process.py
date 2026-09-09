@@ -416,7 +416,7 @@ class QueueModeTerminalOutcomeLoggingTest(unittest.TestCase):
     """
 
     WORKER_ID = "worker-terminal-log-test"
-    TASK_ID = "tsk-terminal-log"
+    TASK_ID = "tsk_01J00000000000000000000003"
     CONVERSATION_ID = "cnv-terminal-log"
     TRACE_ID = "01J00000000000000000000WR3"
 
@@ -542,7 +542,9 @@ class QueueModeTerminalOutcomeLoggingTest(unittest.TestCase):
             f"应恰好出现一条 worker.task.terminal 事件，实际 stderr={stderr}",
         )
         event = terminal_events[0]
-        self.assertEqual(event["trace_id"], self.TRACE_ID)
+        self.assertEqual(event["worker_run_id"], self.TRACE_ID)
+        self.assertIsNone(event["trace_id"])
+        self.assertEqual(event["reference"], "T-" + self.TASK_ID[4:])
         self.assertEqual(event["task_id"], self.TASK_ID)
         self.assertEqual(event["terminal_kind"], "stopped")
         self.assertEqual(event["error_kind"], "stopped")

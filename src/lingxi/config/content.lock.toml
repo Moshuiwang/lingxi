@@ -2,8 +2,8 @@
 # 由 scripts/ci/check_content_version.py 生成与校验，请不要手工编辑。
 # 改完 content.toml 的文案后：先递增 [meta] version，再运行
 #   python3 scripts/ci/check_content_version.py --refresh
-version = "2026-09-07"
-digest = "sha256:dc412e93fb89a3510840aa5da94ebcbc1e78e7a36ba3a54e704907d05c1231e1"
+version = "2026-09-09.668"
+digest = "sha256:ca0b96371f0edb3476dcdec1b6667af2485893c3dcf065f4566bc04621a683ba"
 
 # 用过的旧版本标识，不得复用：同一个版本号对应两批文案会让落库的追溯依据失效。
 retired_versions = [
@@ -40,6 +40,8 @@ retired_versions = [
   "2026-09-03-2",
   "2026-09-03-3",
   "2026-09-05",
+  "2026-09-07",
+  "2026-09-09.657",
 ]
 
 # 每条用户可见文案的短摘要，用于在门禁失败时指出具体是哪几个键变了。
@@ -92,7 +94,8 @@ retired_versions = [
 "texts.onboarding.checking" = "738d208e40a19f0b"
 "texts.onboarding.completed" = "e6e721e2af6a2d7d"
 "texts.onboarding.delegated_subject" = "2d5caff476da0546"
-"texts.onboarding.innertest_not_open" = "b5ede80f7add1eda"
+"texts.onboarding.innertest_not_open" = "3a0ecc3ec7848f18"
+"texts.onboarding.innertest_waiting" = "4806d45828882db1"
 "texts.onboarding.internal_error" = "c7bef626a5602d4a"
 "texts.onboarding.matched" = "21cf0e7d79a0a085"
 "texts.onboarding.not_authorized" = "c4dfa61c10679764"
@@ -176,6 +179,8 @@ retired_versions = [
 "texts.worker.card_handoff_notice" = "f926d145f0f18496"
 "texts.worker.context_too_long" = "33805373cca13b15"
 "texts.worker.failed" = "51f1df400deab9d0"
+"texts.worker.failure_reference" = "2ed3435c42f19d5c"
+"texts.worker.failure_task_reference" = "6f1842e39283018c"
 "texts.worker.max_turns" = "166d8e19f4b2f3b4"
 "texts.worker.mcp_bad_gateway" = "eebf2f9dc2fbe503"
 "texts.worker.queued_timeout" = "cc4e6e37b3fe6e04"

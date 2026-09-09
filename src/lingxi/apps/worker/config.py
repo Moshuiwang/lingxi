@@ -125,12 +125,15 @@ class WorkerConfig:
 
     question: str
     read_only_tools: tuple[str, ...]
+    # 兼容 LINGXI_WORKER_TRACE_ID 配置名；仅代表进程运行号，日志名 worker_run_id。
     trace_id: str
     # 单回合墙钟上限（业务执行预算）：SDK 传输挂住不发终止消息时，没有它整个
     # 回合会永久等待，连失败报告都出不来。不含收尾宽限。
     turn_timeout_seconds: float
     # 直接构造配置的测试与嵌入调用方沿用旧接口时仍使用同一安全默认值；正式入口
     # 通过 load_config 显式校验并传入部署值。
+    task_id: str | None = None
+    task_trace_id: str | None = None
     max_turns: int = DEFAULT_MAX_TURNS
     drain_grace_seconds: float = DEFAULT_DRAIN_GRACE_SECONDS
     audit_input_fields: tuple[str, ...] = ()

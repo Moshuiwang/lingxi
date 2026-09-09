@@ -149,7 +149,9 @@ class ReleaseManifestTests(unittest.TestCase):
             patch.object(release, "load_release", return_value=({}, candidate())),
         ):
             output = Path(tmp) / "images.env"
-            release.resolve("Moshuiwang/lingxi", candidate()["tag"], "stage", output)
+            release.resolve(
+                "Moshuiwang/lingxi", candidate()["tag"], "stage", output, allow_legacy=True
+            )
             text = output.read_text()
             self.assertEqual(text.count("@sha256:"), 4)
             self.assertNotIn("GITHUB_TOKEN", text)
@@ -159,7 +161,13 @@ class ReleaseManifestTests(unittest.TestCase):
         with (
             tempfile.TemporaryDirectory() as tmp,
             patch.dict(
-                os.environ, {"GITHUB_REF": "refs/heads/main", "GITHUB_REF_PROTECTED": "true"}
+                os.environ,
+                {
+                    "GITHUB_REF": "refs/heads/main",
+                    "GITHUB_REF_PROTECTED": "true",
+                    "GITHUB_SHA": "d" * 40,
+                    "GITHUB_RUN_ID": "43",
+                },
             ),
             patch.object(release, "load_release", return_value=({}, doc)),
             patch.object(release, "receipt_for", return_value=receipt(doc)),
@@ -181,7 +189,13 @@ class ReleaseManifestTests(unittest.TestCase):
         with (
             tempfile.TemporaryDirectory() as tmp,
             patch.dict(
-                os.environ, {"GITHUB_REF": "refs/heads/main", "GITHUB_REF_PROTECTED": "true"}
+                os.environ,
+                {
+                    "GITHUB_REF": "refs/heads/main",
+                    "GITHUB_REF_PROTECTED": "true",
+                    "GITHUB_SHA": "d" * 40,
+                    "GITHUB_RUN_ID": "43",
+                },
             ),
             patch.object(release, "load_release", return_value=({}, doc)),
             patch.object(release, "write_release") as write,
@@ -270,7 +284,19 @@ class ReleaseManifestTests(unittest.TestCase):
             )
 
     def test_migrations_are_discovered_from_current_chain(self):
-        self.assertEqual(release.migration_heads(), ["0090_delivery_retry_backoff"])
+        import re
+
+        documented = (ROOT / "migrations/README.md").read_text()
+        heads = release.migration_heads()
+        self.assertEqual(len(heads), 1)
+        self.assertRegex(heads[0], r"^00[0-9]{2}_[a-z_]+$")
+        self.assertIn(heads[0], documented)
+        self.assertTrue(
+            any(
+                re.search(r"revision.*" + re.escape(heads[0]), p.read_text())
+                for p in (ROOT / "migrations/alembic/versions").glob("*.py")
+            )
+        )
 
 
 class ReleaseWorkflowTests(unittest.TestCase):
@@ -282,6 +308,12 @@ class ReleaseWorkflowTests(unittest.TestCase):
             (".github/workflows/publish.yml", "      - 'release/**'", "      - main"),
             (".github/workflows/ci.yml", '--base-ref "${{ github.base_ref }}"', ""),
             (".github/workflows/release.yml", "needs: [candidate]", "needs: []"),
+            (
+                ".github/workflows/publish.yml",
+                "deploy/control_bundle.py --root",
+                "missing_packager",
+            ),
+            (".github/workflows/publish.yml", "--control-bundle", "--missing-bundle"),
             (".github/workflows/release.yml", "github.ref_protected", "true"),
             (".github/CODEOWNERS", "/deploy/releases/acceptance/ @Moshuiwang", ""),
         ]

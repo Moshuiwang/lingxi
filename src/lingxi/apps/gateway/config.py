@@ -85,6 +85,10 @@ class GatewayConfig:
     # `innertest_roster_gate` 模块文档口径）；`repr=False` 避免一条日志把名单
     # 整份写出去（同 `_Secret` 字段纪律）。
     innertest_roster_open_ids: frozenset[str] = field(default_factory=frozenset, repr=False)
+    innertest_scope: str | None = None
+    innertest_binding_id: str | None = None
+    innertest_socket_path: str | None = None
+    innertest_binding_path: str | None = None
     # 文档投递独立消费循环的租户域名——不是密钥，是拼文档链接用的裸域名（见
     # `adapters/feishu_docx_delivery.py` 模块文档「文档 URL 的构造」）。可选，
     # 默认 `None`：未配置时 `document_delivery.assemble_document_delivery_
@@ -354,6 +358,10 @@ def load_config(env: Mapping[str, str]) -> GatewayConfig:
         feishu_base_url=_text(env, "FEISHU_BASE_URL") or DEFAULT_FEISHU_BASE_URL,
         card_failure_injection=_card_failure_injection(env),
         innertest_roster_open_ids=_innertest_roster_open_ids(env),
+        innertest_scope=env.get("LINGXI_INNERTEST_SCOPE") or None,
+        innertest_binding_id=env.get("LINGXI_INNERTEST_BINDING_ID") or None,
+        innertest_socket_path=env.get("LINGXI_INNERTEST_SOCKET_PATH") or None,
+        innertest_binding_path=env.get("LINGXI_INNERTEST_BINDING_PATH") or None,
         tenant_domain=_tenant_domain(env),
         markdown_convert_enabled=_markdown_convert_enabled(env),
         bot_open_id=_bot_open_id(env),

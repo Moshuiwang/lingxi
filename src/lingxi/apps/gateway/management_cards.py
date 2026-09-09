@@ -16,6 +16,7 @@ from collections.abc import Callable
 from typing import Any
 
 from lingxi.core.admin.card_dispatch import ManagementCardContext, management_card_fingerprint
+from lingxi.core.admin.followup_effect import effect_lease_allowed
 from lingxi.core.admin.management_card import render_management_card
 from lingxi.core.permission.targeted_recompute import RecomputeKind
 
@@ -84,6 +85,8 @@ class ManagementCardRefresher:
             sequence_kwargs["expected_card_sequence"] = expected_card_sequence
         sequence = self._context_store.next_card_sequence(**sequence_kwargs)
         if sequence is None:
+            return False
+        if not effect_lease_allowed():
             return False
         self._transport.update(card_id=context.card_id, sequence=sequence, card=card)
         return self._mark_refreshed(context, sequence, expected_card_sequence)
@@ -273,8 +276,12 @@ class RecomputeResultReporter:
             display, machine = self._status_texts(
                 context, complete=complete, state=state, status_message=status_message
             )
+            update_kwargs = {}
+            if getattr(self._context_store, "supports_action_guard", False) is True:
+                update_kwargs["expected_action_id"] = pending.id
             updated = self._context_store.update_state(
                 message_id=origin_message_id,
+                **update_kwargs,
                 state=state,
                 dispatch_status=machine,
                 snapshot_fingerprint=management_card_fingerprint(status),

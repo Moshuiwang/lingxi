@@ -56,6 +56,7 @@ REQUIRED_TEXT_KEYS: tuple[str, ...] = (
     "onboarding.internal_error",
     "onboarding.stalled",
     "onboarding.innertest_not_open",
+    "onboarding.innertest_waiting",
     # 预开通用户首聊时补的一句（静默＋首聊补一句）。
     "onboarding.preprovisioned_first_chat",
     "onboarding.delegated_subject",
@@ -98,6 +99,8 @@ REQUIRED_TEXT_KEYS: tuple[str, ...] = (
     "worker.stopped",
     "worker.stopped_result",
     "worker.failed",
+    "worker.failure_reference",
+    "worker.failure_task_reference",
     "worker.side_effect_uncertain",
     "worker.context_too_long",
     "worker.result_too_large",
@@ -379,6 +382,21 @@ class ContentCatalog:
         if template is None:
             raise ContentRenderError("未登记的文案键")
         provided = _merge_variables(variables, values)
+        if key in {"worker.failure_reference", "worker.failure_task_reference"}:
+            from lingxi.core.ids import is_ulid
+
+            reference = provided.get("reference")
+            valid = (
+                is_ulid(reference)
+                if key == "worker.failure_reference"
+                else (
+                    isinstance(reference, str)
+                    and reference.startswith("T-")
+                    and is_ulid(reference[2:])
+                )
+            )
+            if not valid:
+                raise ContentRenderError("核查号码格式不合法")
         rendered = _render_template(template, provided)
         _validate_user_visible_text(
             rendered, internal_terms=(), contains_model_text=contains_model_text
@@ -513,6 +531,10 @@ def _make_template(key: str, template: str) -> _TextTemplate:
     if not template and key not in {"roster.note.changed"}:
         raise ContentValidationError(f"文案键 {key} 不能为空")
     variables = _template_variables(template, key)
+    if key in {"worker.failure_reference", "worker.failure_task_reference"} and variables != {
+        "reference"
+    }:
+        raise ContentValidationError("核查号码模板必须且只能使用 reference")
     _validate_fixed_template_safety((template,), key)
     return _TextTemplate(key=key, template=template, variables=variables)
 

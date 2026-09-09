@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import datetime
 
 
 @dataclass(frozen=True)
@@ -21,6 +22,8 @@ class ClaimedTask:
     reply_to_message_id: str | None = None
     stop_requested: bool = False
     side_effect_state: str = "none"
+    trace_id: str | None = None
+    task_created_at: datetime | None = None
 
 
 @dataclass(frozen=True)
@@ -40,6 +43,8 @@ class TaskContext:
     agent_session_id: str | None
     stop_requested: bool
     side_effect_state: str
+    trace_id: str | None = None
+    task_created_at: datetime | None = None
 
 
 @dataclass(frozen=True)
@@ -97,6 +102,8 @@ class PendingDeliveryTask:
     fallback_text: bool
     consumed_sequence: int
     retry_attempts: int
+    trace_id: str | None = None
+    task_created_at: datetime | None = None
 
 
 @dataclass(frozen=True)
@@ -124,6 +131,7 @@ class UncertainDeliveryTask:
 
     task_id: str
     reserved_kind: str
+    trace_id: str | None = None
 
 
 @dataclass(frozen=True)

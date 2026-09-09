@@ -41,7 +41,7 @@ ON CONFLICT (dedupe_key) DO UPDATE
        status = 'pending',
        content_version = EXCLUDED.content_version,
        card_style = EXCLUDED.card_style
- WHERE outreach_message.status <> 'delivered'
+ WHERE outreach_message.status NOT IN ('delivered','unknown') AND outreach_message.effect_started_at IS NULL
    AND outreach_message.recipient_open_id = EXCLUDED.recipient_open_id
 RETURNING id, status, attempts, recipient_open_id
 """
@@ -71,14 +71,14 @@ SELECT recipient_open_id, purpose, content_key, content_version, card_style,
 #: ``core/outreach/audience`` 按姓名是否唯一决定发不发。
 _SUBJECT_SQL = """
 SELECT u.id, u.feishu_open_id, u.provisioning_state, u.account_state,
-       (SELECT o.payload ->> 'permissions'
-          FROM publish_outbox o
-         WHERE o.user_id = u.id
-           AND o.permission_version = u.permission_version
-           AND o.status = 'published'
-         ORDER BY o.created_at DESC
-         LIMIT 1)
+       p.payload ->> 'permissions', u.permission_version, p.id
   FROM app_user u
+  LEFT JOIN LATERAL (
+       SELECT o.id, o.payload FROM publish_outbox o
+        WHERE o.user_id = u.id AND o.permission_version = u.permission_version
+          AND o.status = 'published'
+        ORDER BY o.created_at DESC, o.id DESC LIMIT 1
+  ) p ON true
  WHERE lower(btrim(u.email)) = %s
  LIMIT 1
 """
@@ -182,7 +182,7 @@ class PostgresOutreachStore:
         """
         self._execute(
             "UPDATE outreach_message SET status = 'failed', last_error = %s"
-            " WHERE id = %s AND status <> 'delivered'",
+            " WHERE id = %s AND status NOT IN ('delivered','unknown')",
             (str(error)[:500], record_id),
         )
 
@@ -273,6 +273,8 @@ class PostgresOutreachSubjects:
             account_state=str(user_row[3]) if user_row[3] else None,
             permissions=str(user_row[4]) if user_row[4] else None,
             roster_names=names,
+            permission_version=user_row[5],
+            publish_id=str(user_row[6]) if user_row[6] else None,
         )
 
     def state_for(self, user_id: str) -> tuple[str | None, str | None]:

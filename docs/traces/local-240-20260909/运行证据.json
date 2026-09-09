@@ -1,0 +1,809 @@
+{
+  "code_candidate": "f0508309c6314b504fe5e9bf3457dea15990ef68",
+  "branch": "codex/2.4.0-execution-isolated-20260909",
+  "local_repository_gate": {
+    "result": "passed",
+    "unittest_ran": 6343,
+    "seconds": 314.036,
+    "root_skipped": 3,
+    "sdk_execution_guard_triggered": false,
+    "candidate": "570814a9f95570de0da73e00cfd83a6a9d38aa5a"
+  },
+  "nonroot_supplement": {
+    "result": "passed",
+    "ran": 6,
+    "skipped": 0,
+    "seconds": 0.006
+  },
+  "migration_chain": {
+    "result": "passed",
+    "revisions_round_tripped": 37,
+    "scratch_databases_cleaned": true
+  },
+  "ci": {
+    "status": "passed",
+    "workflow_id": 320039124,
+    "workflow_path": ".github/workflows/ci.yml",
+    "dispatch_result": "HTTP 403 Resource not accessible by integration",
+    "app_dispatch_created_run": false,
+    "manual_runs": [
+      {
+        "id": 34316312942,
+        "url": "https://github.com/Moshuiwang/lingxi/actions/runs/34316312942",
+        "head_sha": "570814a9f95570de0da73e00cfd83a6a9d38aa5a",
+        "event": "workflow_dispatch",
+        "conclusion": "failure",
+        "reason": "classify skipped; gate/extras/image also skipped; unchanged aggregate correctly failed"
+      },
+      {
+        "id": 34317989528,
+        "url": "https://github.com/Moshuiwang/lingxi/actions/runs/34317989528",
+        "head_sha": "3f24e5190a8277a8c6e534fe7e9c560d05521133",
+        "event": "workflow_dispatch",
+        "status": "completed",
+        "created_at": "2026-09-09T06:11:37Z",
+        "conclusion": "success",
+        "completed_at": "2026-09-09T06:25:32Z"
+      }
+    ],
+    "app_initial_runs_readback": [],
+    "repair_source_commit": "3d1dd660c21ed2ff423dc9d11fe5b75af62be5ae",
+    "repair_integration_commit": "f0508309c6314b504fe5e9bf3457dea15990ef68",
+    "local_repair_check": {
+      "tests": 55,
+      "seconds": 4.588,
+      "result": "passed",
+      "implementation_mutations_red_then_green": 3,
+      "runtime_migrations_dependencies_unchanged_from_local_full": true
+    },
+    "fixed_run_candidate": "3f24e5190a8277a8c6e534fe7e9c560d05521133",
+    "conclusion": "success",
+    "run_url": "https://github.com/Moshuiwang/lingxi/actions/runs/34317989528",
+    "candidate_head_sha": "3f24e5190a8277a8c6e534fe7e9c560d05521133",
+    "created_at": "2026-09-09T06:11:37Z",
+    "completed_at": "2026-09-09T06:25:32Z",
+    "artifact_count": 0,
+    "jobs": [
+      {
+        "name": "Epic Full / gate",
+        "id": 102358178788,
+        "conclusion": "success",
+        "started_at": "2026-09-09T06:11:42Z",
+        "completed_at": "2026-09-09T06:21:33Z"
+      },
+      {
+        "name": "Epic Full / extras (scheduler)",
+        "id": 102358178915,
+        "conclusion": "success",
+        "started_at": "2026-09-09T06:11:41Z",
+        "completed_at": "2026-09-09T06:11:56Z"
+      },
+      {
+        "name": "Epic Full / extras (reauthorize)",
+        "id": 102358178970,
+        "conclusion": "success",
+        "started_at": "2026-09-09T06:11:42Z",
+        "completed_at": "2026-09-09T06:11:58Z"
+      },
+      {
+        "name": "Epic Full / extras (worker)",
+        "id": 102358178989,
+        "conclusion": "success",
+        "started_at": "2026-09-09T06:11:41Z",
+        "completed_at": "2026-09-09T06:12:02Z"
+      },
+      {
+        "name": "Epic Full / extras (migrate)",
+        "id": 102358179001,
+        "conclusion": "success",
+        "started_at": "2026-09-09T06:11:42Z",
+        "completed_at": "2026-09-09T06:12:01Z"
+      },
+      {
+        "name": "Epic Full / extras (gateway)",
+        "id": 102358179029,
+        "conclusion": "success",
+        "started_at": "2026-09-09T06:11:42Z",
+        "completed_at": "2026-09-09T06:12:04Z"
+      },
+      {
+        "name": "Epic Full / docs",
+        "id": 102358179423,
+        "conclusion": "skipped",
+        "started_at": "2026-09-09T06:11:39Z",
+        "completed_at": "2026-09-09T06:11:39Z"
+      },
+      {
+        "name": "Epic Full / l1",
+        "id": 102358179425,
+        "conclusion": "skipped",
+        "started_at": "2026-09-09T06:11:39Z",
+        "completed_at": "2026-09-09T06:11:39Z"
+      },
+      {
+        "name": "Epic / classify",
+        "id": 102358198716,
+        "conclusion": "skipped",
+        "started_at": "2026-09-09T06:11:44Z",
+        "completed_at": "2026-09-09T06:11:38Z"
+      },
+      {
+        "name": "Epic Full / image",
+        "id": 102360360141,
+        "conclusion": "success",
+        "started_at": "2026-09-09T06:21:36Z",
+        "completed_at": "2026-09-09T06:25:25Z"
+      },
+      {
+        "name": "Epic Full",
+        "id": 102361236514,
+        "conclusion": "success",
+        "started_at": "2026-09-09T06:25:28Z",
+        "completed_at": "2026-09-09T06:25:32Z"
+      }
+    ],
+    "scope": "Manual Epic Full ran gate, all five extras, image and aggregate successfully. PR-only classify/docs/l1 skipped by design; gate includes documentation checks. No PR approval identity, frozen release artifact, publication or deployment claimed.",
+    "job_steps": {
+      "Epic Full / gate": [
+        {
+          "name": "Set up job",
+          "conclusion": "success"
+        },
+        {
+          "name": "Initialize containers",
+          "conclusion": "success"
+        },
+        {
+          "name": "检出代码",
+          "conclusion": "success"
+        },
+        {
+          "name": "准备权限影响面计数证明（L3，仓库外 stage registration 可选）",
+          "conclusion": "skipped"
+        },
+        {
+          "name": "生成权限影响面 diff（L3）",
+          "conclusion": "skipped"
+        },
+        {
+          "name": "留存权限影响面与计数证明（L3）",
+          "conclusion": "skipped"
+        },
+        {
+          "name": "L1 资产版本锁与术语扫描（混合高风险改动）",
+          "conclusion": "skipped"
+        },
+        {
+          "name": "配置 Worker 校验运行时",
+          "conclusion": "success"
+        },
+        {
+          "name": "校验 OAuth Worker",
+          "conclusion": "success"
+        },
+        {
+          "name": "配置 Python 运行时",
+          "conclusion": "success"
+        },
+        {
+          "name": "安装测试依赖与锁定版本的 shellcheck",
+          "conclusion": "success"
+        },
+        {
+          "name": "校验已安装的包完整",
+          "conclusion": "success"
+        },
+        {
+          "name": "真实 Agent SDK 冒烟（不调模型、不用凭据）",
+          "conclusion": "success"
+        },
+        {
+          "name": "运行基础质量门禁",
+          "conclusion": "success"
+        },
+        {
+          "name": "校验 CI 没有改写受版本控制的文件",
+          "conclusion": "success"
+        },
+        {
+          "name": "Post 配置 Python 运行时",
+          "conclusion": "success"
+        },
+        {
+          "name": "Post 配置 Worker 校验运行时",
+          "conclusion": "success"
+        },
+        {
+          "name": "Post 检出代码",
+          "conclusion": "success"
+        },
+        {
+          "name": "Stop containers",
+          "conclusion": "success"
+        },
+        {
+          "name": "Complete job",
+          "conclusion": "success"
+        }
+      ],
+      "Epic Full / extras (scheduler)": [
+        {
+          "name": "Set up job",
+          "conclusion": "success"
+        },
+        {
+          "name": "检出代码",
+          "conclusion": "success"
+        },
+        {
+          "name": "配置 Python 运行时",
+          "conclusion": "success"
+        },
+        {
+          "name": "在干净虚拟环境里只装这一个 extra",
+          "conclusion": "success"
+        },
+        {
+          "name": "校验制品完整与该进程的运行依赖",
+          "conclusion": "success"
+        },
+        {
+          "name": "Post 配置 Python 运行时",
+          "conclusion": "success"
+        },
+        {
+          "name": "Post 检出代码",
+          "conclusion": "success"
+        },
+        {
+          "name": "Complete job",
+          "conclusion": "success"
+        }
+      ],
+      "Epic Full / extras (reauthorize)": [
+        {
+          "name": "Set up job",
+          "conclusion": "success"
+        },
+        {
+          "name": "检出代码",
+          "conclusion": "success"
+        },
+        {
+          "name": "配置 Python 运行时",
+          "conclusion": "success"
+        },
+        {
+          "name": "在干净虚拟环境里只装这一个 extra",
+          "conclusion": "success"
+        },
+        {
+          "name": "校验制品完整与该进程的运行依赖",
+          "conclusion": "success"
+        },
+        {
+          "name": "Post 配置 Python 运行时",
+          "conclusion": "success"
+        },
+        {
+          "name": "Post 检出代码",
+          "conclusion": "success"
+        },
+        {
+          "name": "Complete job",
+          "conclusion": "success"
+        }
+      ],
+      "Epic Full / extras (worker)": [
+        {
+          "name": "Set up job",
+          "conclusion": "success"
+        },
+        {
+          "name": "检出代码",
+          "conclusion": "success"
+        },
+        {
+          "name": "配置 Python 运行时",
+          "conclusion": "success"
+        },
+        {
+          "name": "在干净虚拟环境里只装这一个 extra",
+          "conclusion": "success"
+        },
+        {
+          "name": "校验制品完整与该进程的运行依赖",
+          "conclusion": "success"
+        },
+        {
+          "name": "Post 配置 Python 运行时",
+          "conclusion": "success"
+        },
+        {
+          "name": "Post 检出代码",
+          "conclusion": "success"
+        },
+        {
+          "name": "Complete job",
+          "conclusion": "success"
+        }
+      ],
+      "Epic Full / extras (migrate)": [
+        {
+          "name": "Set up job",
+          "conclusion": "success"
+        },
+        {
+          "name": "检出代码",
+          "conclusion": "success"
+        },
+        {
+          "name": "配置 Python 运行时",
+          "conclusion": "success"
+        },
+        {
+          "name": "在干净虚拟环境里只装这一个 extra",
+          "conclusion": "success"
+        },
+        {
+          "name": "校验制品完整与该进程的运行依赖",
+          "conclusion": "success"
+        },
+        {
+          "name": "Post 配置 Python 运行时",
+          "conclusion": "success"
+        },
+        {
+          "name": "Post 检出代码",
+          "conclusion": "success"
+        },
+        {
+          "name": "Complete job",
+          "conclusion": "success"
+        }
+      ],
+      "Epic Full / extras (gateway)": [
+        {
+          "name": "Set up job",
+          "conclusion": "success"
+        },
+        {
+          "name": "检出代码",
+          "conclusion": "success"
+        },
+        {
+          "name": "配置 Python 运行时",
+          "conclusion": "success"
+        },
+        {
+          "name": "在干净虚拟环境里只装这一个 extra",
+          "conclusion": "success"
+        },
+        {
+          "name": "校验制品完整与该进程的运行依赖",
+          "conclusion": "success"
+        },
+        {
+          "name": "Post 配置 Python 运行时",
+          "conclusion": "success"
+        },
+        {
+          "name": "Post 检出代码",
+          "conclusion": "success"
+        },
+        {
+          "name": "Complete job",
+          "conclusion": "success"
+        }
+      ],
+      "Epic Full / docs": [],
+      "Epic Full / l1": [],
+      "Epic / classify": [],
+      "Epic Full / image": [
+        {
+          "name": "Set up job",
+          "conclusion": "success"
+        },
+        {
+          "name": "检出代码（构建 A）",
+          "conclusion": "success"
+        },
+        {
+          "name": "检出代码（构建 B，路径刻意更长）",
+          "conclusion": "success"
+        },
+        {
+          "name": "计算不可变 tag",
+          "conclusion": "success"
+        },
+        {
+          "name": "构建四个镜像（构建 A）",
+          "conclusion": "success"
+        },
+        {
+          "name": "构建四个镜像（构建 B，独立目录、冷缓存）",
+          "conclusion": "success"
+        },
+        {
+          "name": "两次构建产物等价（内容级）",
+          "conclusion": "success"
+        },
+        {
+          "name": "镜像部署契约逐条核对",
+          "conclusion": "success"
+        },
+        {
+          "name": "旧镜像在新库结构上启动（V-部署-05）",
+          "conclusion": "success"
+        },
+        {
+          "name": "Compose 结构对照（stage ↔ 生产）",
+          "conclusion": "success"
+        },
+        {
+          "name": "导出四镜像候选并生成 manifest（Issue",
+          "conclusion": "skipped"
+        },
+        {
+          "name": "自校验候选镜像包结构（Issue",
+          "conclusion": "skipped"
+        },
+        {
+          "name": "留存候选镜像 artifact（Issue",
+          "conclusion": "skipped"
+        },
+        {
+          "name": "Post 检出代码（构建 B，路径刻意更长）",
+          "conclusion": "success"
+        },
+        {
+          "name": "Post 检出代码（构建 A）",
+          "conclusion": "success"
+        },
+        {
+          "name": "Complete job",
+          "conclusion": "success"
+        }
+      ],
+      "Epic Full": [
+        {
+          "name": "Set up job",
+          "conclusion": "success"
+        },
+        {
+          "name": "确认完整门禁全部通过",
+          "conclusion": "success"
+        },
+        {
+          "name": "检出代码",
+          "conclusion": "skipped"
+        },
+        {
+          "name": "写入候选身份",
+          "conclusion": "skipped"
+        },
+        {
+          "name": "留存候选证明",
+          "conclusion": "skipped"
+        },
+        {
+          "name": "Complete job",
+          "conclusion": "success"
+        }
+      ]
+    },
+    "detailed_log_download": {
+      "status": "unavailable",
+      "reason": "GitHub log storage TLS handshake timeout; remaining identical-route download terminated. Completed run and all job/step conclusions read successfully through API.",
+      "ci_test_count_claimed": false
+    }
+  },
+  "environment": {
+    "host_python": "3.12.13",
+    "isolated_python": "3.12.14",
+    "dependencies": [
+      "alembic==1.19.2",
+      "annotated-types==0.8.0",
+      "anyio==4.15.1",
+      "attrs==26.1.0",
+      "certifi==2026.7.22",
+      "cffi==2.1.1",
+      "claude-agent-sdk==0.2.128",
+      "click==8.5.0",
+      "cryptography==45.0.7",
+      "greenlet==3.5.5",
+      "h11==0.16.0",
+      "httpcore==1.0.9",
+      "httpx==0.28.1",
+      "httpx-sse==0.4.3",
+      "idna==3.19",
+      "jsonschema==4.26.0",
+      "jsonschema-specifications==2025.9.1",
+      "lingxi @ file:///workspace/repository",
+      "Mako==1.4.1",
+      "MarkupSafe==3.0.3",
+      "mcp==1.30.0",
+      "packaging==26.3",
+      "pip==25.0.1",
+      "psycopg==3.3.5",
+      "psycopg-binary==3.3.5",
+      "pycparser==3.0",
+      "pydantic==2.13.5",
+      "pydantic-settings==2.15.0",
+      "pydantic_core==2.46.5",
+      "PyJWT==2.13.0",
+      "python-dotenv==1.2.3",
+      "python-multipart==0.0.32",
+      "referencing==0.37.0",
+      "rpds-py==2026.6.3",
+      "ruff==0.16.4",
+      "setuptools==84.0.0",
+      "shellcheck_py==0.11.0.1",
+      "sniffio==1.3.1",
+      "SQLAlchemy==2.0.52",
+      "sse-starlette==3.4.11",
+      "starlette==1.6.0",
+      "typing-inspection==0.4.4",
+      "typing_extensions==4.16.0",
+      "uvicorn==0.52.4",
+      "websockets==15.0.1",
+      "wheel==0.48.0"
+    ],
+    "github_actions_cache": "Successful manual CI installed dependencies and built four images twice; download/build/Actions caches may affect future timings. Not a cold-environment comparison; no global cache purge.",
+    "host_cache": "uv/pip downloads and Docker base/build caches were used; no global cache purge."
+  },
+  "log_fingerprints": [
+    {
+      "name": "lingxi-240-final-full-1.log",
+      "sha256": "30ee269a392bdfc5338bc490c1820f89b0982592b58e17db41694300d6a92759",
+      "bytes": 1663146
+    },
+    {
+      "name": "lingxi-240-final-nonroot.log",
+      "sha256": "1d4e0560284e37f89042466536ebe66463e4ca83452d82395d2f3e16258c5071",
+      "bytes": 1820
+    },
+    {
+      "name": "lingxi-240-final-migration.log",
+      "sha256": "71dfdd5ea9c6107e43acdacdc1abf82ff52adf7cf33fae358b5cdb65b7ef4544",
+      "bytes": 185687
+    },
+    {
+      "name": "lingxi-240-first-full.log",
+      "sha256": "3a0d3181451c6e762b025b22fc4b28e7260c9f950e806957a4724d2ef73a706a",
+      "bytes": 8040
+    },
+    {
+      "name": "lingxi-240-first-full-2.log",
+      "sha256": "8218f94fa6aa4c524a874c79b04e86d44a1d4233f0170830e9e130ebc9dcc1bc",
+      "bytes": 1641330
+    },
+    {
+      "name": "lingxi-240-first-migration.log",
+      "sha256": "4b9aa6c6d58fba95229e4ef69a15b5d7866d7c81383bebd7d5e0a119f52b61bf",
+      "bytes": 176895
+    },
+    {
+      "name": "lingxi-240-first-nonroot.log",
+      "sha256": "1d4e0560284e37f89042466536ebe66463e4ca83452d82395d2f3e16258c5071",
+      "bytes": 1820
+    },
+    {
+      "name": "lingxi-240-ci-run-34316312942.json",
+      "sha256": "fbae97e943ef259b11fd1a6e78ec0bc981fc39d389d8cc4a58180cc9c48cd0a3",
+      "bytes": 3055
+    },
+    {
+      "name": "lingxi-240-ci-run-34316312942-failed.log",
+      "sha256": "a3f3d0a21a0299056b049a16df38b83125a2a222a6631db18477ce5da86086aa",
+      "bytes": 10249
+    },
+    {
+      "name": "lingxi-240-ci-fix-tests.log",
+      "sha256": "8d4bc20fc63cc995ac21e64863ebd2b7b02ca87de3e0a46c0033fec63fae625c",
+      "bytes": 98
+    },
+    {
+      "name": "lingxi-240-acceptance-sync.log",
+      "sha256": "8f7c2487da52dbcee22065abbc6fc30c9d86c058e3cf23ffcbd96b3aca81bb66",
+      "bytes": 4653
+    },
+    {
+      "name": "lingxi-240-check-env-build.log",
+      "sha256": "d38fa7f059d2661a2d6a2a141d0f0f9efc339bbd5ef69ffac2f67fe4e1d39ed5",
+      "bytes": 32040
+    },
+    {
+      "name": "lingxi-240-ci-artifacts-34317989528.json",
+      "sha256": "244563f989470892c537c9a4622920af0d228ee4528f7d00c64a06d6cd95856c",
+      "bytes": 32
+    },
+    {
+      "name": "lingxi-240-ci-fix-docs.log",
+      "sha256": "31185955656a3955d8ea9921c1d0a13d98f18e138b6bc69547ed36769e807f3e",
+      "bytes": 4653
+    },
+    {
+      "name": "lingxi-240-ci-gate-34317989528.log",
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "bytes": 0
+    },
+    {
+      "name": "lingxi-240-ci-image-34317989528.log",
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "bytes": 0
+    },
+    {
+      "name": "lingxi-240-ci-run-34317989528.json",
+      "sha256": "9abf61a17e8d44c8ad84bc668d3354c386c56626090acac2e4dd689cd178e26f",
+      "bytes": 16989
+    },
+    {
+      "name": "lingxi-240-dangling-volumes.json",
+      "sha256": "4601acd482c17b3c2e9b73ee9105ba50e21305c93ea3dfb618df94a9782f51ec",
+      "bytes": 1381
+    },
+    {
+      "name": "lingxi-240-final-environment.txt",
+      "sha256": "3d1fc236f4eb293cc3cb7140a5cf9618690f7b58e09d8f39e5d3ca55cbd06ef1",
+      "bytes": 851
+    },
+    {
+      "name": "lingxi-240-final-freeze-docs.log",
+      "sha256": "5d039c23c98574ac0b0a1918049197cdd7df925520dd5c00fcff10d442383415",
+      "bytes": 4653
+    },
+    {
+      "name": "lingxi-240-first-integration-docs.log",
+      "sha256": "b56acd14260d6744863bbbb88df2cf63dd6f2ea09b2cc91cae5671ede6645a8d",
+      "bytes": 4798
+    },
+    {
+      "name": "lingxi-240-first-integration-tests.log",
+      "sha256": "1b0240126b8c4334a7bd254c1fe302602f176952ddfc9097441c51d11934898c",
+      "bytes": 114
+    },
+    {
+      "name": "lingxi-240-isolated-branch-docs.log",
+      "sha256": "4d370cff42d644403ef91daf5cb23b9a1b4a95126dd1657438a2a11434be34a4",
+      "bytes": 4653
+    },
+    {
+      "name": "lingxi-240-package-gaps.log",
+      "sha256": "e16075a402d662da689a82575be938704391005ecba1755c18d74619034a96c8",
+      "bytes": 6494
+    },
+    {
+      "name": "lingxi-240-progress-docs.log",
+      "sha256": "c2b5ced3f2a665ee05703f0bbacb1ed0405cb2deb1d65f1ca45880ad32824c5b",
+      "bytes": 4653
+    },
+    {
+      "name": "lingxi-240-s0-docs.log",
+      "sha256": "1a5230c3160076eebf32e7d936390a3de235d33838544759c04442c9630aa4fe",
+      "bytes": 4798
+    },
+    {
+      "name": "lingxi-240-s5-ready-docs.log",
+      "sha256": "479aa5e17b2fd02ee83d193caff6df8a8ae9badf2defca67da0bffa4637221b3",
+      "bytes": 4653
+    },
+    {
+      "name": "lingxi-240-s6-docs.log",
+      "sha256": "4d370cff42d644403ef91daf5cb23b9a1b4a95126dd1657438a2a11434be34a4",
+      "bytes": 4653
+    },
+    {
+      "name": "lingxi-240-s6-packaging.log",
+      "sha256": "990a53188a4104ff8db66266f9b6462d0e70fdc2b7010afd1b5d3171cb02ce61",
+      "bytes": 26319
+    },
+    {
+      "name": "lingxi-240-s7-ready-docs.log",
+      "sha256": "8cf154f7881f7a1dcd1cc73836f54a3635416d8d128f78c3d9fbc483949c3ea0",
+      "bytes": 4798
+    },
+    {
+      "name": "lingxi-240-s7-status-docs.log",
+      "sha256": "8cf154f7881f7a1dcd1cc73836f54a3635416d8d128f78c3d9fbc483949c3ea0",
+      "bytes": 4798
+    },
+    {
+      "name": "lingxi-240-source-566.md",
+      "sha256": "b60659184f4dca04fb769ec1ae3430e6d4c3c71f924754cd9349bc9f82e5fad6",
+      "bytes": 18901
+    },
+    {
+      "name": "lingxi-240-source-668.md",
+      "sha256": "f5decc3db686b1506c5ff8e24965f82fd06a6f97dae86612b235bc5196d61551",
+      "bytes": 27210
+    },
+    {
+      "name": "lingxi-240-version-docs.log",
+      "sha256": "734e47f2cb1806d2aa1ab542a52c0dd416b3c7b11c732776a5d5d8e8dff7afb8",
+      "bytes": 4798
+    }
+  ],
+  "comparison_inputs": {
+    "baseline": "caa2bc13545875e03a3bb7e2d976ede39daa69a0",
+    "original_issue_snapshot": "/private/tmp/lingxi-240-issues-20260909.json",
+    "sha256": "44c82a04a1b1b1fd2ecf41fffa7648fb19869bdf1ad4e210f9cbb864ffc2404f",
+    "preserve_original": true,
+    "deepseek_started": false
+  },
+  "cleanup": {
+    "completed_at": "2026-09-09T06:32:22.670410+00:00",
+    "removed_paths": [
+      "/private/tmp/lingxi-240-acceptance-sync.log",
+      "/private/tmp/lingxi-240-check-env-build.log",
+      "/private/tmp/lingxi-240-ci-artifacts-34317989528.json",
+      "/private/tmp/lingxi-240-ci-fix-docs.log",
+      "/private/tmp/lingxi-240-ci-fix-tests.log",
+      "/private/tmp/lingxi-240-ci-gate-34317989528.log",
+      "/private/tmp/lingxi-240-ci-image-34317989528.log",
+      "/private/tmp/lingxi-240-ci-run-34316312942-failed.log",
+      "/private/tmp/lingxi-240-ci-run-34316312942.json",
+      "/private/tmp/lingxi-240-ci-run-34317989528.json",
+      "/private/tmp/lingxi-240-dangling-volumes.json",
+      "/private/tmp/lingxi-240-final-environment.txt",
+      "/private/tmp/lingxi-240-final-freeze-docs.log",
+      "/private/tmp/lingxi-240-final-full-1.log",
+      "/private/tmp/lingxi-240-final-migration.log",
+      "/private/tmp/lingxi-240-final-nonroot.log",
+      "/private/tmp/lingxi-240-first-full-2.log",
+      "/private/tmp/lingxi-240-first-full.log",
+      "/private/tmp/lingxi-240-first-integration-docs.log",
+      "/private/tmp/lingxi-240-first-integration-tests.log",
+      "/private/tmp/lingxi-240-first-migration.log",
+      "/private/tmp/lingxi-240-first-nonroot.log",
+      "/private/tmp/lingxi-240-isolated-branch-docs.log",
+      "/private/tmp/lingxi-240-package-gaps.log",
+      "/private/tmp/lingxi-240-progress-docs.log",
+      "/private/tmp/lingxi-240-s0-docs.log",
+      "/private/tmp/lingxi-240-s5-ready-docs.log",
+      "/private/tmp/lingxi-240-s6-docs.log",
+      "/private/tmp/lingxi-240-s6-packaging.log",
+      "/private/tmp/lingxi-240-s7-ready-docs.log",
+      "/private/tmp/lingxi-240-s7-status-docs.log",
+      "/private/tmp/lingxi-240-source-566.md",
+      "/private/tmp/lingxi-240-source-668.md",
+      "/private/tmp/lingxi-240-version-docs.log",
+      "/private/tmp/lingxi-240-check-env",
+      "/Users/wangzhipeng/.codex/worktrees/d1a7/lingxi/.dev-check",
+      "/private/tmp/lingxi-240-closure-docs.log"
+    ],
+    "implementation_worktrees_removed": true,
+    "own_containers_networks_volumes_absent": true,
+    "own_check_image_removed": "lingxi-240-check-env:20260909",
+    "root_build_and_egg_info_removed": true,
+    "retained": [
+      {
+        "path": "/Users/wangzhipeng/.codex/worktrees/d1a7/lingxi",
+        "owner": "本任务编排者，交由产品负责人保留",
+        "purpose": "已提交的合并前候选，后续按用户指令继续验收",
+        "cleanup": "后续明确归档时由所属任务移除worktree；不删除本轮来源提交"
+      },
+      {
+        "path": "/Users/wangzhipeng/Documents/project/lingxi",
+        "owner": "规划及元守护任务",
+        "purpose": "原规划工作区，非本轮临时实施目录",
+        "cleanup": "由所属任务按后续用户决定处理"
+      },
+      {
+        "path": "/private/tmp/lingxi-240-issues-20260909.json",
+        "owner": "元守护任务",
+        "purpose": "用户要求保留的原始中性输入，后续独立对照",
+        "cleanup": "不得按本轮旧清理规则删除；由元守护封存并等待用户后续决定"
+      }
+    ],
+    "shared_caches_not_purged": true,
+    "unrelated_resources_untouched": true
+  },
+  "closure_docs_check": {
+    "result": "passed",
+    "python": "3.14.6",
+    "command": "bash scripts/ci/verify_docs.sh",
+    "log_sha256": "e3078223dfc301a3fd946a55466cf8c3a3a9efdb3f9f6d3c22ac9d1efa6e4246",
+    "scope": "Final changes only in this Trace directory; runtime, migration, dependency and CI workflow bytes unchanged from passing run candidate."
+  }
+}

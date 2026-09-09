@@ -1,0 +1,62 @@
+{
+  "schema_revision": 1,
+  "release_schema": 2,
+  "bundle_index_schema": 1,
+  "runtime": {
+    "python_minimum": "3.11",
+    "platform": "linux",
+    "tools": [
+      "docker"
+    ],
+    "compose_minimum": "2.24.0",
+    "stdlib_only": true,
+    "deployment_euid": 0
+  },
+  "channel": {
+    "protocol": "2025-11-25",
+    "socket_mode": 432,
+    "directory_mode": 488,
+    "max_connections": 4,
+    "max_request_bytes": 65536,
+    "request_timeout_seconds": 5,
+    "scheduler_socket_path": "/run/lingxi-innertest/admin.sock",
+    "scheduler_binding_path": "/etc/lingxi/innertest/binding.json"
+  },
+  "business_shutdown_seconds": {
+    "gateway": 20,
+    "scheduler": 120
+  },
+  "observation_seconds": 900,
+  "external_materials": [
+    "host-contract.json",
+    "public-config.json",
+    "approval.json",
+    "binding.json",
+    "innertest-relay.json",
+    "service_env_files"
+  ],
+  "forbidden_bundle_materials": [
+    "private_env",
+    "credentials",
+    "user_data",
+    "ssh_public_key_bindings"
+  ],
+  "public_config": {
+    "schema": 1,
+    "keys": [
+      "schema",
+      "values",
+      "files"
+    ],
+    "file_names": {
+      "scheduler": [
+        "company_function_metric_map.toml",
+        "content.override.toml"
+      ],
+      "worker": [
+        "system_prompt.md",
+        "content.override.toml"
+      ]
+    }
+  }
+}

@@ -1,0 +1,9 @@
+# 由独立安装任务替换占位符并验证生效策略；本模板不创建账号或权限。
+Match User <RESTRICTED_RELAY_ACCOUNT>
+    AuthenticationMethods publickey
+    PasswordAuthentication no
+    KbdInteractiveAuthentication no
+    DisableForwarding yes
+    PermitTTY no
+    PermitUserRC no
+    X11Forwarding no

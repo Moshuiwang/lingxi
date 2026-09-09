@@ -298,6 +298,21 @@ def main(argv: list[str] | None = None, env: Mapping[str, str] | None = None) ->
     return _run(config)
 
 
+def _install_background_stop(config, stop_event):
+    """同一次停止信号同时冻结后台领取与既有投递预算。"""
+    from lingxi.core.admin.followup_lifecycle import BackgroundLifecycle
+
+    shutdown = _ShutdownClock()
+    lifecycle = BackgroundLifecycle(budget_seconds=config.shutdown_timeout_seconds)
+
+    def request_stop():
+        shutdown.mark_requested()
+        lifecycle.request_stop()
+
+    install_signal_handlers(stop_event, on_stop=request_stop)
+    return lifecycle, shutdown, request_stop
+
+
 def _run(config: GatewayConfig) -> int:
     """装配两条循环与长连接，跑到停机，再在预算内收尾。"""
     # 内容目录（含可选的宿主机外置覆盖）在装配前读一次并记一行来源事实；不在
@@ -306,8 +321,7 @@ def _run(config: GatewayConfig) -> int:
     # `apps/scheduler/content_override_notice.py`。
     log_content_source("gateway")
     stop_event = threading.Event()
-    shutdown = _ShutdownClock()
-    install_signal_handlers(stop_event, on_stop=shutdown.mark_requested)
+    lifecycle, shutdown, request_stop = _install_background_stop(config, stop_event)
 
     # 一份告警职责服务两条循环，各自用不同的心跳与活性角色，因此任一条停摆都能被单独
     # 发现，不会被另一条仍然健康掩盖。
@@ -318,6 +332,7 @@ def _run(config: GatewayConfig) -> int:
     assembled: list[OnboardingRunner] = []
     supervisor = build_supervisor(
         config,
+        background_lifecycle=lifecycle,
         should_stop=stop_event.is_set,
         onboarding=_RecordingOnboarding(),
         on_onboarding_assembled=assembled.append,
@@ -336,6 +351,10 @@ def _run(config: GatewayConfig) -> int:
         # 长连接侧已经收到停机信号（或提前异常退出）：确保后台线程也收到同一个信号，
         # 再在停机预算内等它们退出——不能让进程在后台还在跑外部调用时直接走人。
         stop_event.set()
+        request_stop()
+        report = lifecycle.drain_until()
+        if report.still_running:
+            logger.error("管理后台仍有在途工作，按持久阶段恢复 count=%s", report.still_running)
         loops.join_within(shutdown, config.shutdown_timeout_seconds)
         # 所有职责与后台线程都已收口：显式关闭本进程空闲栈里的连接，不再只靠
         # atexit。清理本身的异常不得覆盖上面可能已经在传播的真实故障，只记日志不重抛。

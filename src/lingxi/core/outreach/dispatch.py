@@ -87,6 +87,7 @@ class OutreachTarget:
     subject: str
     audience: WelcomeAudience
     user_id: str | None = None
+    permission_snapshot: tuple[str, int, str] | None = None
 
 
 @dataclass(frozen=True)
@@ -164,9 +165,16 @@ class OutreachRecordStore(Protocol):
 
 
 class UserCardSender(Protocol):
-    """向用户本人私聊发一张卡片的可注入面。实现见 ``adapters/feishu_user_card.py``。"""
+    """绑定卡片权限快照的发送口，由检查适配器复核后调用飞书。"""
 
-    def send_card(self, *, open_id: str, card: Mapping[str, Any], dedupe_key: str) -> str | None:
+    def send_card(
+        self,
+        *,
+        open_id: str,
+        card: Mapping[str, Any],
+        dedupe_key: str,
+        permission_snapshot: tuple[str, int, str] | None,
+    ) -> str | None:
         """发一张卡片，返回平台回读标识；失败时抛异常。"""
         ...
 
@@ -238,6 +246,10 @@ class OutreachDispatcher:
         )
         if record.status == STATUS_DELIVERED:
             return self._finish(target, purpose, card, STATUS_DELIVERED, skipped=True)
+        if record.status == "unknown":
+            return self._finish(
+                target, purpose, card, "unknown", skipped=True, error_code="notification_unknown"
+            )
         if record.recipient_open_id and record.recipient_open_id != target.recipient_open_id:
             return self._finish(
                 target, purpose, card, STATUS_FAILED, error_code=REASON_RECIPIENT_CHANGED
@@ -255,14 +267,23 @@ class OutreachDispatcher:
         """真正发一次，并把结果落进记录与告警。"""
         try:
             message_id = self._sender.send_card(
-                open_id=target.recipient_open_id, card=card.payload, dedupe_key=dedupe_key
+                open_id=target.recipient_open_id,
+                card=card.payload,
+                dedupe_key=dedupe_key,
+                permission_snapshot=target.permission_snapshot,
             )
         except Exception as error:  # 主动发送失败不得静默
             code = _error_code(error)
             self._store.mark_failed(record.record_id, error=code)
             self._notify_send_outcome(succeeded=False)
             logger.error("主动发送失败 记录=%s error=%s", record.record_id, code)
-            return self._finish(target, purpose, card, STATUS_FAILED, error_code=code)
+            return self._finish(
+                target,
+                purpose,
+                card,
+                "unknown" if code == "notification_unknown" else STATUS_FAILED,
+                error_code=code,
+            )
         # 先报成功再记账：卡片已经在对方手里，告警状态机不该因为记账出问题而认为
         # 这一次投递失败。
         self._notify_send_outcome(succeeded=True)
