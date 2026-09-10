@@ -176,6 +176,49 @@ class InnertestStageTests(InnertestPostgresTests):
         self.assertIs(outcome.decision.kind, ConfirmResultKind.ROLE_REVOKED)
         self.assertEqual(self.sql("SELECT count(*) FROM innertest_membership"), [(0,)])
 
+    def test_executed_batch_replayed_after_authorization_change_keeps_its_result(self):
+        """已执行的批次事后撤权再点，不得被改写成授权拒绝。
+
+        外审指出的真实风险：资格已经发出去了，状态却被后来的点击改成 failed，
+        回执还说「本次未执行」——真实结果被抹掉，而且每点一次多一条审计。
+        """
+        batch = self.prepare()
+        self.delivered(batch)
+        self.confirm(batch)
+        before_pending = self.sql("SELECT status,reason,decided_at FROM pending_action")
+        before_batch = self.sql("SELECT status FROM innertest_batch")
+        before_members = self.sql("SELECT count(*) FROM innertest_membership")
+        before_audit = self.sql("SELECT count(*) FROM innertest_audit")
+        self.assertEqual(before_pending[0][0], "executed")
+
+        self.sql("UPDATE innertest_admin_binding SET version=version+1")
+        outcome = self.confirm(batch)
+
+        self.assertIs(outcome.decision.kind, ConfirmResultKind.ALREADY_TERMINAL)
+        self.assertEqual(
+            self.sql("SELECT status,reason,decided_at FROM pending_action"), before_pending
+        )
+        self.assertEqual(self.sql("SELECT status FROM innertest_batch"), before_batch)
+        self.assertEqual(self.sql("SELECT count(*) FROM innertest_membership"), before_members)
+        self.assertEqual(self.sql("SELECT count(*) FROM innertest_audit"), before_audit)
+
+    def test_repeated_click_after_authorization_refusal_does_not_rewrite_it(self):
+        """授权拒绝落终态之后再点，不得改写决定时刻，也不得多记一条审计。"""
+        batch = self.prepare()
+        self.delivered(batch)
+        self.sql("UPDATE innertest_admin_binding SET version=version+1")
+        self.confirm(batch)
+        before_pending = self.sql("SELECT status,reason,decided_at FROM pending_action")
+        before_audit = self.sql("SELECT count(*) FROM innertest_audit")
+
+        outcome = self.confirm(batch)
+
+        self.assertIs(outcome.decision.kind, ConfirmResultKind.ALREADY_TERMINAL)
+        self.assertEqual(
+            self.sql("SELECT status,reason,decided_at FROM pending_action"), before_pending
+        )
+        self.assertEqual(self.sql("SELECT count(*) FROM innertest_audit"), before_audit)
+
     def test_check_permissions_changed_after_probe_blocks_usable_result(self):
         self.user()
         batch = self.prepare()

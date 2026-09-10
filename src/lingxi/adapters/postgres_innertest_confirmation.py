@@ -164,10 +164,13 @@ class InnertestPendingActions:
                 and target_digest(cursor.fetchall()) != batch[6]
             ):
                 return ConfirmResultKind.TARGET_DRIFTED
-        principal = InnertestPrincipal(batch[2], batch[1], batch[3])
-        self.service._principal(connection, principal)
+        # 终态检查必须排在授权校验之前：已经终态的批次无论授权还成不成立都不该
+        # 再被改写。反过来的次序会让「已执行 + 事后撤权 + 重放点击」把 executed
+        # 覆盖成 failed，资格却还在，回执还说本次未执行——等于抹掉真实结果。
         if pending.status is not PendingActionStatus.PENDING:
             return ConfirmResultKind.ALREADY_TERMINAL
+        principal = InnertestPrincipal(batch[2], batch[1], batch[3])
+        self.service._principal(connection, principal)
         if now >= pending.confirm_deadline_at:
             return ConfirmResultKind.EXPIRE
         if batch[4] != version or pending.target_state_snapshot != str(version):

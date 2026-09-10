@@ -150,14 +150,14 @@ class InnertestPostgresTests(unittest.TestCase):
         )
         self.sql("UPDATE innertest_roster_version SET version=version+1")
         self.assertFalse(self.confirm(batch).decision.ok)
+        before = self.sql("SELECT status,reason,decided_at FROM pending_action")
         self.sql("UPDATE innertest_admin_binding SET enabled=false")
-        # 绑定被停用后点确认：明确拒绝并落终态，不再把异常冒给调用方当「结果不明」。
+        # 这批此前已因过期落终态。事后撤权再点，只能得到「已终态」，**不得**被改写
+        # 成授权拒绝——终态一旦形成就不该再动，否则真实结果会被后来的点击抹掉。
         outcome = self.confirm(batch)
         self.assertFalse(outcome.decision.ok)
-        self.assertIs(outcome.decision.kind, ConfirmResultKind.ROLE_REVOKED)
-        self.assertEqual(
-            self.sql("SELECT status,reason FROM pending_action"), [("failed", "role_revoked")]
-        )
+        self.assertIs(outcome.decision.kind, ConfirmResultKind.ALREADY_TERMINAL)
+        self.assertEqual(self.sql("SELECT status,reason,decided_at FROM pending_action"), before)
         self.assertEqual(self.sql("SELECT count(*) FROM innertest_membership"), [(0,)])
 
     def test_transaction_rolls_back_when_enqueue_or_audit_fails(self):
