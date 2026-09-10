@@ -214,6 +214,64 @@ class DurationManifestTests(unittest.TestCase):
         self.assertEqual(run_tests._manifest_key(outside), outside)
 
 
+class NoOptInEnvironmentBehaviorTests(unittest.TestCase):
+    """不设任何 `LINGXI_TEST_*` 环境变量时，`_run()` 必须与改造前逐字相同。
+
+    这是本次改造能否合并的前提：新增的耗时清单、贪心装箱、耗时记录全部必须是
+    纯粹的 opt-in，默认路径（CI 与本机大多数调用）不能有任何新副作用——不写
+    耗时文件、不打印分片汇总行、照常发现并跑完全部用例。用一个只有一条用例的
+    临时目录顶替真正的 `tests/`，让这条钉住测试本身跑得够快、不依赖真库。
+    """
+
+    def _write_trivial_fixture(self, directory: Path) -> None:
+        (directory / "test_fixture_ok.py").write_text(
+            "import unittest\n\n\n"
+            "class FixtureOkTests(unittest.TestCase):\n"
+            "    def test_pass(self) -> None:\n"
+            "        self.assertTrue(True)\n",
+            encoding="utf-8",
+        )
+
+    def test_run_without_any_env_var_matches_pre_change_behavior(self) -> None:
+        opt_in_vars = (
+            "LINGXI_TEST_SHARD_INDEX",
+            "LINGXI_TEST_SHARD_COUNT",
+            "LINGXI_TEST_DURATIONS_DIR",
+            "LINGXI_TEST_REPORT_PATH",
+        )
+        with TemporaryDirectory() as workdir:
+            fixture_dir = Path(workdir) / "fixture_tests"
+            fixture_dir.mkdir()
+            self._write_trivial_fixture(fixture_dir)
+
+            with (
+                mock.patch.object(run_tests, "TESTS_DIRECTORY", fixture_dir),
+                mock.patch.dict(os.environ, {}, clear=False),
+            ):
+                for key in opt_in_vars:
+                    os.environ.pop(key, None)
+                captured_stderr = io.StringIO()
+                with mock.patch("sys.stderr", captured_stderr):
+                    exit_code = run_tests._run()
+
+            self.assertEqual(exit_code, 0, "没有环境变量时应跑通全部用例，返回码为 0")
+            self.assertNotIn(
+                run_tests._SHARD_SUMMARY_PREFIX,
+                captured_stderr.getvalue(),
+                "不分片时不应该打印分片汇总行——这是改造前就有的行为，不应该被新代码改变",
+            )
+            # 没有 LINGXI_TEST_DURATIONS_DIR 时，装箱/清单相关的新代码路径必须完全
+            # 不触碰文件系统：不该多出任何 durations-*.json（`__pycache__` 是
+            # Python 导入 fixture 模块自己产生的字节码缓存，与本次改造无关）。
+            self.assertEqual(list(fixture_dir.glob("durations-*.json")), [])
+
+    def test_duration_output_path_is_none_without_the_opt_in_env_var(self) -> None:
+        with mock.patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("LINGXI_TEST_DURATIONS_DIR", None)
+            self.assertIsNone(run_tests._duration_output_path(None))
+            self.assertIsNone(run_tests._duration_output_path((0, 2)))
+
+
 class ShardEnvironmentTests(unittest.TestCase):
     """两个分片环境变量必须同时给出或同时不给，且值必须落在合法范围。"""
 
