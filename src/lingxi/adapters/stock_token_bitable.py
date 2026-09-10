@@ -157,7 +157,13 @@ class BitableStockTokenSource:
                             permissions=readback_text(fields.get("permissions")).strip(),
                         )
                     )
-            if data.get("has_more") is not True:
+            has_more = data.get("has_more")
+            if not isinstance(has_more, bool):
+                # 字段缺失（None）与类型非法都不是合法 bool：这一轮到底翻完没有是未知
+                # 的，不能当"读完了"处理（对齐 feishu_paged_client 多列表翻页路径的
+                # 严格口径，理由见该文件模块文档）。
+                raise StockTokenSourceError("has_more_invalid", definite=False)
+            if has_more is False:
                 break
             candidate = data.get("page_token")
             if not isinstance(candidate, str) or not candidate or candidate == page_token:
