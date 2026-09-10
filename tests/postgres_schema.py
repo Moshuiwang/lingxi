@@ -406,6 +406,10 @@ def reset_production_rows(dsn: str) -> tuple[str, ...]:
 
     ensure_production_schema(dsn)
     with _connect(dsn) as connection, connection.cursor() as cursor:
+        # 清场连接单独放宽语句超时：3 秒是给**产品**连接的安全预算，用来兜住线上
+        # 一条查询拖垮连接池；清场是测试脚手架，撞上它只会把「这台机器这一刻比较慢」
+        # 变成两百多条看不懂的判红。放宽只影响本连接，产品路径的预算一个字都没动。
+        cursor.execute("SET statement_timeout = '120s'")
         tables = _fetch_production_tables(cursor)
         holding_rows = _fetch_tables_holding_rows(cursor, tables)
         if not holding_rows:

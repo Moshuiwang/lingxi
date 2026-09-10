@@ -25,8 +25,10 @@
 from __future__ import annotations
 
 import ast
+import json
 import math
 import pathlib
+import posixpath
 import re
 import sys
 
@@ -37,6 +39,8 @@ DOCKERIGNORE = REPOSITORY_ROOT / ".dockerignore"
 COMPOSE_BASE = REPOSITORY_ROOT / "deploy" / "compose.yaml"
 COMPOSE_STAGE = REPOSITORY_ROOT / "deploy" / "compose.stage.yaml"
 COMPOSE_PROD = REPOSITORY_ROOT / "deploy" / "compose.prod.yaml"
+COMPOSE_INNERTEST = REPOSITORY_ROOT / "deploy" / "compose.innertest.yaml"
+CONTRACT_JSON = REPOSITORY_ROOT / "deploy" / "control" / "contract.json"
 ENV_EXAMPLE = REPOSITORY_ROOT / "deploy" / ".env.example"
 DEPLOY_CHECKLIST = REPOSITORY_ROOT / "deploy" / "验收前部署配置清单.md"
 COMPOSE_STRUCTURE_SCRIPT = REPOSITORY_ROOT / "scripts" / "ci" / "verify_compose_structure.sh"
@@ -735,7 +739,7 @@ def check_content_capture_prod_guard() -> list[str]:
             "需要同步更新）"
         ]
 
-    for path in (COMPOSE_BASE, COMPOSE_STAGE, COMPOSE_PROD):
+    for path in (COMPOSE_BASE, COMPOSE_STAGE, COMPOSE_PROD, COMPOSE_INNERTEST):
         stripped = strip_comments(read(path))
         for needle in (flag_var, confirm_var, confirm_value):
             if needle in stripped:
@@ -1181,6 +1185,219 @@ def check_resource_limits() -> list[str]:
     return failures
 
 
+# ---- 受限内测入口装配点：默认关闭的可选覆盖文件 ------------------------------
+_LONG_FORM_BIND_ENTRY_BOUNDARY = re.compile(r"(?=^\s*-\s*type:\s*bind\s*$)", re.MULTILINE)
+
+
+def _innertest_contract_paths() -> tuple[str, str]:
+    """受限内测入口在容器内的两条固定路径，直接取自部署合同。
+
+    不在本文件里另抄一份字面量：两条部署路径（新部署器与本覆盖文件）必须共用
+    同一组路径，抄两份意味着以后两处会各自漂移而没有任何东西报错。
+    """
+
+    try:
+        contract = json.loads(read(CONTRACT_JSON))
+    except (OSError, ValueError) as error:
+        raise ValueError(f"读不到或解析不了 {display(CONTRACT_JSON)}：{error}") from error
+    channel = contract.get("channel", {}) if isinstance(contract, dict) else {}
+    socket_path = channel.get("scheduler_socket_path")
+    binding_path = channel.get("scheduler_binding_path")
+    if not isinstance(socket_path, str) or not isinstance(binding_path, str):
+        raise ValueError(
+            f"{display(CONTRACT_JSON)} 缺少 channel.scheduler_socket_path / "
+            "channel.scheduler_binding_path 字符串字面量"
+        )
+    return socket_path, binding_path
+
+
+def _top_level_service_names(compose_text: str) -> list[str]:
+    """列出 ``services:`` 顶层的各个 service 名，不递归子块。
+
+    本覆盖文件只有两级缩进结构（每级 2 空格），因此按"恰好 2 空格缩进的
+    ``名字:``"匹配就够，不需要引入完整 YAML 解析。
+    """
+
+    block = service_block(compose_text, "services")
+    if block is None:
+        return []
+    return [
+        match.group(1)
+        for line in block.splitlines()
+        if (match := re.match(r"^  ([A-Za-z][\w-]*):\s*$", line))
+    ]
+
+
+def _long_form_bind_mounts(volumes_text: str) -> list[dict[str, str | None]]:
+    """解析长格式 bind 挂载列表（``- type: bind`` 起始的多行映射）。
+
+    仓库其余挂载都用短格式字符串（``source:target[:ro]``，见 `_volume_mounts`）。
+    受限内测入口的两条挂载刻意用长格式：只有长格式能表达 `create_host_path:
+    false`——宿主机目录没准备好时必须让渲染直接报错，不能让 Docker 悄悄用 root
+    建一个空目录出来顶上，那样容器会正常启动，只有真正连接受限入口时才会发现
+    目录里什么都没有。
+    """
+
+    entries = [
+        entry for entry in _LONG_FORM_BIND_ENTRY_BOUNDARY.split(volumes_text) if entry.strip()
+    ]
+    mounts: list[dict[str, str | None]] = []
+    for entry in entries:
+        # 用 `.+?`（而不是 `\S+`）取值：`${VAR:?说明文字}` 的说明部分允许带空格
+        # （本仓库既有惯例，例如 compose.yaml 里 `必须指定不可变镜像 tag`），
+        # `\S+` 会在第一个空格处截断，把闭合的 `}` 丢在截断点之后。
+        target = re.search(r"^\s*target:\s*(.+?)\s*$", entry, re.MULTILINE)
+        source = re.search(r"^\s*source:\s*(.+?)\s*$", entry, re.MULTILINE)
+        read_only = re.search(r"^\s*read_only:\s*(.+?)\s*$", entry, re.MULTILINE)
+        mounts.append(
+            {
+                "target": target.group(1) if target else None,
+                "source": source.group(1) if source else None,
+                "read_only": read_only.group(1) if read_only else None,
+            }
+        )
+    return mounts
+
+
+def check_innertest_compose_overlay() -> list[str]:
+    """受限内测入口的装配点：默认关闭、显式追加才生效的覆盖文件。
+
+    只核对这份覆盖文件本身的结构，不核对追加之后与基线/环境文件合并的最终渲染
+    结果——那部分是 `docker compose config` 的事，见
+    `scripts/ci/verify_compose_structure.sh` 的两态对照。这里守住四件事：
+    覆盖文件存在且能被本文件的轻量解析读出结构；只触及 scheduler 与 gateway，
+    不新增服务、不改镜像、不开端口；scheduler 的两条容器内路径与部署合同逐字
+    相等；两条宿主机目录挂载没有默认值（缺配必须让渲染直接失败）且只读挂载
+    确实标了 `read_only: true`。
+    """
+
+    if not COMPOSE_INNERTEST.exists():
+        return [
+            f"{display(COMPOSE_INNERTEST)} 不存在。受限内测入口需要这份默认关闭的"
+            "可选覆盖文件才能被装配；不追加它时该文件本身仍必须存在，只是零影响。"
+        ]
+
+    try:
+        expected_socket_path, expected_binding_path = _innertest_contract_paths()
+    except ValueError as error:
+        return [str(error)]
+
+    text = strip_comments(read(COMPOSE_INNERTEST))
+    failures: list[str] = []
+
+    expected_services = {"scheduler", "gateway"}
+    found_services = set(_top_level_service_names(text))
+    unexpected = sorted(found_services - expected_services)
+    missing = sorted(expected_services - found_services)
+    if unexpected:
+        failures.append(
+            f"{display(COMPOSE_INNERTEST)} 声明了不该出现的 service：{unexpected}。"
+            "这份覆盖文件只允许触及 scheduler 与 gateway，新增第三个服务超出了"
+            "装配点的范围。"
+        )
+    if re.search(r"^\s*image:\s*\S", text, re.MULTILINE):
+        failures.append(
+            f"{display(COMPOSE_INNERTEST)} 出现 `image:` 键。这份覆盖文件只负责变量"
+            "与挂载，不改镜像引用——镜像仍由基线文件与 `${LINGXI_IMAGE_TAG}` 决定。"
+        )
+    if re.search(r"^\s*ports:\s*", text, re.MULTILINE):
+        failures.append(
+            f"{display(COMPOSE_INNERTEST)} 出现 `ports:` 键。受限内测入口不开放任何"
+            "网络端口，通道走的是 Unix socket。"
+        )
+    if missing:
+        failures.append(f"{display(COMPOSE_INNERTEST)} 缺少 service：{missing}，无法核对其余断言。")
+        return failures
+
+    scheduler_block = service_block(text, "scheduler") or ""
+    gateway_block = service_block(text, "gateway") or ""
+
+    for label, block in (("scheduler", scheduler_block), ("gateway", gateway_block)):
+        for variable in ("LINGXI_INNERTEST_SCOPE", "LINGXI_INNERTEST_BINDING_ID"):
+            value = _environment_value(block, variable)
+            if value is None:
+                failures.append(f"{display(COMPOSE_INNERTEST)} 的 {label} 没有声明 {variable}")
+            elif not REQUIRED_VARIABLE.match(value):
+                failures.append(
+                    f"{display(COMPOSE_INNERTEST)} 的 {label} 的 {variable} 不是 "
+                    f"`${{变量:?说明}}` 无默认值形态（原文 `{value}`）。缺配必须拒绝"
+                    "渲染，不能用默认值悄悄放行。"
+                )
+
+    for variable, expected in (
+        ("LINGXI_INNERTEST_SOCKET_PATH", expected_socket_path),
+        ("LINGXI_INNERTEST_BINDING_PATH", expected_binding_path),
+    ):
+        value = _environment_value(scheduler_block, variable)
+        if value != expected:
+            failures.append(
+                f"{display(COMPOSE_INNERTEST)} 的 scheduler 的 {variable}={value!r}，"
+                f"与 {display(CONTRACT_JSON)} 记录的 {expected!r} 不一致。两条部署"
+                "路径必须共用同一组容器内固定路径，不得出现第二套口径。"
+            )
+
+    for variable in ("LINGXI_INNERTEST_SOCKET_PATH", "LINGXI_INNERTEST_BINDING_PATH"):
+        if _environment_value(gateway_block, variable) is not None:
+            failures.append(
+                f"{display(COMPOSE_INNERTEST)} 的 gateway 不该声明 {variable}：只有"
+                "scheduler 实际读取并使用这两条路径，gateway 声明它们只会制造一个"
+                "本不需要存在的第二处口径。"
+            )
+    if service_block(gateway_block, "volumes") is not None:
+        failures.append(
+            f"{display(COMPOSE_INNERTEST)} 的 gateway 不该声明 volumes：受限内测入口"
+            "的两条挂载只给 scheduler，gateway 不直接连接 socket 或读取绑定文件。"
+        )
+
+    volumes_block = service_block(scheduler_block, "volumes") or ""
+    mounts_by_target = {
+        mount["target"]: mount for mount in _long_form_bind_mounts(volumes_block) if mount["target"]
+    }
+
+    expected_socket_dir = posixpath.dirname(expected_socket_path)
+    socket_mount = mounts_by_target.get(expected_socket_dir)
+    if socket_mount is None:
+        failures.append(
+            f"{display(COMPOSE_INNERTEST)} 的 scheduler 没有把宿主机目录挂到 "
+            f"`{expected_socket_dir}`（取自 {display(CONTRACT_JSON)} 的 "
+            "scheduler_socket_path 的父目录）。监听器要在这个目录下创建 socket 文件。"
+        )
+    else:
+        if not REQUIRED_VARIABLE.match(socket_mount["source"] or ""):
+            failures.append(
+                f"{display(COMPOSE_INNERTEST)} 的 scheduler socket 目录挂载的 source "
+                "不是 `${变量:?说明}` 无默认值形态。缺配宿主机目录不能被默认值悄悄"
+                "放行——那会让监听器挂到一个不存在或者错误的路径上，看起来启动成功。"
+            )
+        if (socket_mount["read_only"] or "").strip().lower() == "true":
+            failures.append(
+                f"{display(COMPOSE_INNERTEST)} 的 scheduler socket 目录被挂成只读。"
+                "监听器要在这个目录下创建 socket 文件，只读会让它连启动都做不到。"
+            )
+
+    expected_config_dir = posixpath.dirname(expected_binding_path)
+    config_mount = mounts_by_target.get(expected_config_dir)
+    if config_mount is None:
+        failures.append(
+            f"{display(COMPOSE_INNERTEST)} 的 scheduler 没有把宿主机目录挂到 "
+            f"`{expected_config_dir}`（取自 {display(CONTRACT_JSON)} 的 "
+            "scheduler_binding_path 的父目录）。"
+        )
+    else:
+        if not REQUIRED_VARIABLE.match(config_mount["source"] or ""):
+            failures.append(
+                f"{display(COMPOSE_INNERTEST)} 的 scheduler 绑定配置目录挂载的 "
+                "source 不是 `${变量:?说明}` 无默认值形态。"
+            )
+        if (config_mount["read_only"] or "").strip().lower() != "true":
+            failures.append(
+                f"{display(COMPOSE_INNERTEST)} 的 scheduler 绑定配置目录挂载缺少 "
+                "`read_only: true`。这个目录只由运维一次性安装写入，scheduler 只应该读。"
+            )
+
+    return failures
+
+
 # ---- compose 插值占位符必须能被 YAML 解析（PR #506 CI 实测教训）--------------
 # compose 的值要先过 **YAML 解析**，再做 `${VAR}` 插值。未加引号的 YAML 标量遇到
 # 「空格 + #」就被当成行内注释**从那里截断**——`#494` 里的那个 `#` 把 `}` 连同后半
@@ -1206,7 +1423,7 @@ def check_compose_interpolation_is_yaml_safe() -> list[str]:
 
     failures: list[str] = []
     required_variables: set[str] = set()
-    for path in (COMPOSE_BASE, COMPOSE_STAGE, COMPOSE_PROD):
+    for path in (COMPOSE_BASE, COMPOSE_STAGE, COMPOSE_PROD, COMPOSE_INNERTEST):
         for number, line in enumerate(read(path).splitlines(), start=1):
             if line.lstrip().startswith("#") or "${" not in line:
                 continue
@@ -2104,6 +2321,7 @@ def main() -> int:
         ("scheduler 用户环境卷挂载", check_scheduler_user_volume),
         ("worker-queue 工作目录与用户目录隔离", check_worker_workspace_isolation),
         ("六服务资源限制结构", check_resource_limits),
+        ("受限内测入口装配覆盖文件", check_innertest_compose_overlay),
         ("worker-queue /tmp 内存盘上限分环境显式", check_worker_tmpfs_capacity),
         ("compose 插值占位符 YAML 安全与渲染可行", check_compose_interpolation_is_yaml_safe),
         ("日志留存下限", check_log_retention_floor),

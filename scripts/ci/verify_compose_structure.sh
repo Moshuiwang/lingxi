@@ -23,6 +23,11 @@ cd "${repository_root}"
 
 workspace=$(mktemp -d -t lingxi62-compose-XXXXXX)
 
+# 受限内测入口两态对照用的宿主机占位目录：`docker compose config` 只做插值与
+# 渲染，不检查 bind 挂载的源路径是否存在，但显式建出来更贴近真实用法，也让
+# 这两个目录的语义在脚本里可读。
+mkdir -p "${workspace}/innertest-socket" "${workspace}/innertest-config"
+
 # compose 的 env_file 默认是必需的：文件不存在时 `config` 直接报错。这里造两个**空的**
 # 占位文件让渲染能跑完。它们匹配 .gitignore 既有的 `.env.*` 规则，因此不会污染工作树，
 # 也不会被 gate 的「CI 未改写受版本控制的文件」那一步看到。
@@ -77,6 +82,13 @@ export LINGXI_WORKER_QUEUE_PIDS_LIMIT=512
 # 只影响"渲染跑不跑得完"。
 export LINGXI_SCHEDULER_MEM_LIMIT=512M
 export LINGXI_GATEWAY_MEM_LIMIT=512M
+
+# 受限内测入口装配点（默认关闭的可选覆盖文件）两态对照用的占位值：只用来验证
+# 追加 -f deploy/compose.innertest.yaml 之后渲染出什么，不代表任何真实环境的值。
+export LINGXI_INNERTEST_SCOPE=compose-structure-check
+export LINGXI_INNERTEST_BINDING_ID=compose-structure-check
+export LINGXI_INNERTEST_SOCKET_DIR="${workspace}/innertest-socket"
+export LINGXI_INNERTEST_CONFIG_DIR="${workspace}/innertest-config"
 
 # 摘要脚本单独用带引号的 heredoc 装进变量：直接写 `python3 -c '...'` 时，
 # 内层的引号会与外层冲突（第一版就栽在这上面）。
@@ -181,6 +193,102 @@ raise SystemExit(0)
 PYTHON
 )
 
+# 受限内测入口装配点（默认关闭的可选覆盖文件 deploy/compose.innertest.yaml）两态
+# 对照：追加它之后，只允许 scheduler/gateway 的 environment 与 volumes 发生变化，
+# 且变化必须恰好是预期的那几项——其余服务、其余键，以及 scheduler/gateway 已有的
+# 键值，都必须与不追加时逐字相同。
+innertest_diff_program=$(
+  cat <<'PYTHON'
+import json
+import sys
+
+with open(sys.argv[1], encoding="utf-8") as handle:
+    without_doc = json.load(handle)
+with open(sys.argv[2], encoding="utf-8") as handle:
+    with_doc = json.load(handle)
+label = sys.argv[3]
+
+without_services = without_doc.get("services", {})
+with_services = with_doc.get("services", {})
+offenders = []
+
+if sorted(without_services) != sorted(with_services):
+    offenders.append(
+        label + " 追加 compose.innertest.yaml 改变了 service 集合："
+        + repr(sorted(without_services)) + " -> " + repr(sorted(with_services))
+    )
+
+expected_extra_env = {
+    "scheduler": {
+        "LINGXI_INNERTEST_SCOPE",
+        "LINGXI_INNERTEST_BINDING_ID",
+        "LINGXI_INNERTEST_SOCKET_PATH",
+        "LINGXI_INNERTEST_BINDING_PATH",
+    },
+    "gateway": {"LINGXI_INNERTEST_SCOPE", "LINGXI_INNERTEST_BINDING_ID"},
+}
+expected_extra_volume_targets = {
+    "scheduler": {"/run/lingxi-innertest", "/etc/lingxi/innertest"},
+    "gateway": set(),
+}
+
+for name in sorted(set(without_services) & set(with_services)):
+    before = without_services[name]
+    after = with_services[name]
+
+    for key in sorted(set(before) | set(after)):
+        if key in ("environment", "volumes"):
+            continue
+        if before.get(key) != after.get(key):
+            offenders.append(label + " " + name + "." + key + " 被覆盖文件改变了，超出了它的范围")
+
+    before_env = set(before.get("environment", {}))
+    after_env = set(after.get("environment", {}))
+    expected = expected_extra_env.get(name, set())
+    if after_env - before_env != expected:
+        offenders.append(
+            label + " " + name + " 新增的 environment 键是 "
+            + repr(sorted(after_env - before_env)) + "，与预期 " + repr(sorted(expected)) + " 不一致"
+        )
+    if before_env - after_env:
+        offenders.append(
+            label + " " + name + " 追加覆盖文件后反而丢失了 environment 键："
+            + repr(sorted(before_env - after_env))
+        )
+    for key in before_env & after_env:
+        if before["environment"][key] != after["environment"][key]:
+            offenders.append(label + " " + name + " 已有的 environment 键 " + key + " 的值被改变了")
+
+    before_targets = {v.get("target") for v in before.get("volumes", [])}
+    after_targets = {v.get("target") for v in after.get("volumes", [])}
+    expected_targets = expected_extra_volume_targets.get(name, set())
+    if after_targets - before_targets != expected_targets:
+        offenders.append(
+            label + " " + name + " 新增的挂载目标是 "
+            + repr(sorted(after_targets - before_targets)) + "，与预期 "
+            + repr(sorted(expected_targets)) + " 不一致"
+        )
+    if before_targets - after_targets:
+        offenders.append(
+            label + " " + name + " 追加覆盖文件后反而丢失了挂载："
+            + repr(sorted(before_targets - after_targets))
+        )
+
+if not offenders:
+    config_mount = next(
+        (v for v in with_services["scheduler"]["volumes"] if v.get("target") == "/etc/lingxi/innertest"),
+        None,
+    )
+    if config_mount is None or config_mount.get("read_only") is not True:
+        offenders.append(label + " scheduler 的 /etc/lingxi/innertest 挂载在渲染结果里不是只读")
+
+if offenders:
+    for line in offenders:
+        print(line, file=sys.stderr)
+    raise SystemExit(1)
+PYTHON
+)
+
 for environment in stage prod; do
   if [[ "${environment}" == prod ]]; then
     export LINGXI_WORKER_QUEUE_TMPFS_SIZE=256m
@@ -202,7 +310,19 @@ for environment in stage prod; do
   python3 -c "${worker_contract_program}" "${workspace}/${environment}.json" "${environment}"
   python3 -c "${summary_program}" "${workspace}/${environment}.json" \
     > "${workspace}/${environment}.summary"
+
+  # 受限内测入口装配点两态对照：不追加时的渲染就是上面刚产出的
+  # "${workspace}/${environment}.json"；这里额外渲染一次追加了覆盖文件（并给全
+  # 四个变量）的版本，交给 innertest_diff_program 钉住两者的差异恰好是预期范围。
+  docker compose -f deploy/compose.yaml -f "deploy/compose.${environment}.yaml" \
+    -f deploy/compose.innertest.yaml \
+    --profile job --profile gateway --profile mvp config --format json \
+    > "${workspace}/${environment}-innertest.json"
+  python3 -c "${innertest_diff_program}" \
+    "${workspace}/${environment}.json" "${workspace}/${environment}-innertest.json" "${environment}"
 done
+
+printf '受限内测入口装配点两态对照：stage 与生产均通过（不追加零影响，追加只影响 scheduler/gateway 的预期键）\n'
 
 printf '=== stage 与生产的结构摘要 ===\n'
 cat "${workspace}/stage.summary"

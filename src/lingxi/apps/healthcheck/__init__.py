@@ -24,17 +24,11 @@ from collections.abc import Callable, Mapping, Sequence
 from pathlib import Path
 from typing import NamedTuple
 
+from lingxi.adapters.postgres import DSN_ENV_VAR_BY_ROLE as _DSN_ENV_VAR_BY_ROLE
 from lingxi.apps.liveness import liveness_path, read_liveness_age_seconds, touch_liveness
 
-# 三个进程读数据库连接串用的环境变量名不统一（scheduler/worker 用不带前缀的
-# LINGXI_POSTGRES_DSN；gateway 的配置整体加了 LINGXI_GATEWAY_ 前缀，见
-# apps/gateway/config.py 的 ENV_PREFIX）。healthcheck 与业务代码一样按角色映射，
-# 不引入第三套变量名。
-_DSN_ENV_VAR_BY_ROLE: Mapping[str, str] = {
-    "scheduler": "LINGXI_POSTGRES_DSN",
-    "worker": "LINGXI_POSTGRES_DSN",
-    "gateway": "LINGXI_GATEWAY_POSTGRES_DSN",
-}
+# 角色→环境变量名映射的定义与理由见 adapters.postgres.DSN_ENV_VAR_BY_ROLE；
+# apps/trace 的追溯 CLI 复用同一份映射按固定顺序回退尝试，避免抄一份漂移。
 
 # 各角色的默认最大心跳年龄（秒）：与各自主循环轮询间隔的量级匹配，不是同一个
 # 数字硬套三个进程。scheduler 默认 60s 一轮，worker 默认 2s 一轮（`process_once`

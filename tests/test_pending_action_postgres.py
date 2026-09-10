@@ -415,6 +415,40 @@ class TargetDriftRealDbTests(PendingActionPostgresTestCase):
         self.assertEqual(self.current_account_state(), "suspended")
 
 
+class UnassembledEntryRealDbTests(PendingActionPostgresTestCase):
+    """否定断言：动作类型还没接线时确认 → 明确拒绝，且事务结束后库里没有任何变化。
+
+    纯函数层已经断言过「抛瞬时失败、分类 entry_not_assembled」；这里补的是
+    数据库层面那一半——``pending_action`` 与 ``app_user`` 都停在事务开始前的
+    状态，管理员可以在接线之后直接重新点击，不需要人工修数据。守卫今天位于
+    任何写入之前，因此这条读的是「什么都没写」；将来谁把守卫挪到写入之后而
+    忘了回滚，它同样会红。
+    """
+
+    def test_unassembled_action_type_refuses_and_rolls_the_transaction_back(self) -> None:
+        self.add_target_user(account_state="enabled")
+        pending_id = self.prepare_and_deliver(action_type=PendingActionType.SUSPEND_USER)
+
+        # 直接把类型改成尚未登记进 REQUIRED_ROLE/TARGET_ACCOUNT_STATE 的那一个，
+        # 模拟「行已经在表里、但确认分支还没接线」这个真实处境；不依赖建这类行的
+        # 上游编排是否已经实现。
+        self.execute(
+            "UPDATE pending_action SET action_type = 'innertest_additions' WHERE id = %s",
+            (pending_id,),
+        )
+
+        with self.assertRaises(PendingActionTransientFailureError) as raised:
+            self.store.confirm(pending_action_id=pending_id, clicker_open_id=ADMIN_OPEN_ID)
+
+        self.assertEqual(raised.exception.classification, "entry_not_assembled")
+
+        # 事务整体回滚：状态没被写成任何终态，目标账号也没被动过。
+        rows = self.query("SELECT status, reason FROM pending_action WHERE id = %s", (pending_id,))
+        self.assertEqual(rows[0][0], "pending")
+        self.assertIsNone(rows[0][1])
+        self.assertEqual(self.current_account_state(), "enabled")
+
+
 class AuditWriteFailureRealDbTests(PendingActionPostgresTestCase):
     """否定断言：审计 sink 异常 → 不执行（失败关闭），且是真实事务回滚——不是
     "函数抛了异常"这个表面现象，而是 ``pending_action``/``app_user`` 在数据库里

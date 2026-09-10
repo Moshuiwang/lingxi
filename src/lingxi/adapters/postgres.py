@@ -27,6 +27,16 @@ from typing import Any
 
 logger = logging.getLogger(__name__)
 
+#: 三个常驻进程读数据库连接串用的环境变量名不统一：scheduler/worker 用不带
+#: 前缀的 ``LINGXI_POSTGRES_DSN``，gateway 加了 ``LINGXI_GATEWAY_`` 前缀（见
+#: ``apps/gateway/config.py`` 的 ``ENV_PREFIX``）。按角色查这张表，不新增
+#: 第三套变量名；``apps/trace`` 按固定顺序逐个回退尝试，见该模块的说明。
+DSN_ENV_VAR_BY_ROLE: Mapping[str, str] = {
+    "scheduler": "LINGXI_POSTGRES_DSN",
+    "worker": "LINGXI_POSTGRES_DSN",
+    "gateway": "LINGXI_GATEWAY_POSTGRES_DSN",
+}
+
 DEFAULT_CONNECT_TIMEOUT_SECONDS = 5
 DEFAULT_STATEMENT_TIMEOUT_SECONDS = 3
 DEFAULT_LOCK_TIMEOUT_SECONDS = 2

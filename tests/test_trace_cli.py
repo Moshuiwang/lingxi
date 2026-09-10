@@ -86,10 +86,12 @@ class NoWritePathSourceScanTests(unittest.TestCase):
 
 class RunArgumentAndFailureClosedTests(unittest.TestCase):
     def test_missing_dsn_env_var_exits_one(self) -> None:
+        """两个连接串变量都缺时，提示逐个列出找过哪些变量名（#657 E-3）。"""
         err = io.StringIO()
         code = trace.run(["01J00005140978232367656210"], env={}, stderr=err)
         self.assertEqual(code, 1)
-        self.assertIn(trace.DSN_ENV_VAR, err.getvalue())
+        self.assertIn("LINGXI_POSTGRES_DSN", err.getvalue())
+        self.assertIn("LINGXI_GATEWAY_POSTGRES_DSN", err.getvalue())
 
     def test_missing_trace_id_argument_is_a_usage_error(self) -> None:
         with self.assertRaises(SystemExit):
@@ -109,6 +111,65 @@ class RunArgumentAndFailureClosedTests(unittest.TestCase):
         self.assertEqual(code, 1)
         self.assertNotIn("192.0.2.1", err.getvalue())
         self.assertNotIn("u:p", err.getvalue())
+
+    def test_only_scheduler_dsn_env_var_is_used(self) -> None:
+        """gateway/worker-queue 容器缺的那个变量不在时，scheduler 的历史默认变量单独可用。"""
+        seen: list[str] = []
+
+        def capturing_connect(dsn: str, **kwargs: object):
+            seen.append(dsn)
+            raise RuntimeError("connection refused")
+
+        err = io.StringIO()
+        code = trace.run(
+            ["01J00005140978232367656210"],
+            env={"LINGXI_POSTGRES_DSN": "postgresql://u:p@scheduler/db"},
+            stderr=err,
+            connect=capturing_connect,
+        )
+        self.assertEqual(code, 1)
+        self.assertEqual(seen, ["postgresql://u:p@scheduler/db"])
+        self.assertNotIn("缺少数据库连接串环境变量", err.getvalue())
+
+    def test_only_gateway_dsn_env_var_is_used_as_fallback(self) -> None:
+        """gateway 容器只有独立前缀变量时，回退读取必须命中它（#657 主诉求）。"""
+        seen: list[str] = []
+
+        def capturing_connect(dsn: str, **kwargs: object):
+            seen.append(dsn)
+            raise RuntimeError("connection refused")
+
+        err = io.StringIO()
+        code = trace.run(
+            ["01J00005140978232367656210"],
+            env={"LINGXI_GATEWAY_POSTGRES_DSN": "postgresql://u:p@gateway/db"},
+            stderr=err,
+            connect=capturing_connect,
+        )
+        self.assertEqual(code, 1)
+        self.assertEqual(seen, ["postgresql://u:p@gateway/db"])
+        self.assertNotIn("缺少数据库连接串环境变量", err.getvalue())
+
+    def test_scheduler_dsn_env_var_takes_priority_when_both_are_set(self) -> None:
+        """两个变量都在时，回退顺序固定优先取 scheduler 的历史默认变量。"""
+        seen: list[str] = []
+
+        def capturing_connect(dsn: str, **kwargs: object):
+            seen.append(dsn)
+            raise RuntimeError("connection refused")
+
+        err = io.StringIO()
+        code = trace.run(
+            ["01J00005140978232367656210"],
+            env={
+                "LINGXI_POSTGRES_DSN": "postgresql://u:p@scheduler/db",
+                "LINGXI_GATEWAY_POSTGRES_DSN": "postgresql://u:p@gateway/db",
+            },
+            stderr=err,
+            connect=capturing_connect,
+        )
+        self.assertEqual(code, 1)
+        self.assertEqual(seen, ["postgresql://u:p@scheduler/db"])
 
 
 @unittest.skipUnless(DSN and psycopg_available(), SKIP_DB)

@@ -11,6 +11,7 @@ from __future__ import annotations
 import dataclasses
 import unittest
 from datetime import UTC, datetime, timedelta, timezone
+from unittest import mock
 
 from lingxi.core.admin.pending_action import (
     _ACTION_TYPE_DISPLAY_NAME,
@@ -23,6 +24,7 @@ from lingxi.core.admin.pending_action import (
     ConfirmResultKind,
     PendingAction,
     PendingActionStatus,
+    PendingActionTransientFailureError,
     PendingActionType,
     decide_cancel,
     decide_confirm,
@@ -601,6 +603,69 @@ class DecideConfirmTargetDriftTests(unittest.TestCase):
         self.assertEqual(decision.code, "target_state_changed")
         self.assertIs(decision.terminal_status, PendingActionStatus.FAILED)
         self.assertEqual(decision.reason, "target_drifted")
+
+    def test_unassembled_action_type_is_refused_instead_of_reported_as_drift(self) -> None:
+        """未装配内测入口的 gateway 收到扩员确认时，不得误报成「目标状态已变化」。
+
+        这类动作的 ``target_state_snapshot`` 存的是名单版本号，与账号状态不同源；
+        继续比对必然判 ``TARGET_DRIFTED`` 并把整批写成 ``failed``，等于把配置问题
+        当成业务问题告诉管理员，且批次被误杀。正确行为是明确拒绝、什么都不改。
+        """
+        pending = _pending(
+            action_type=PendingActionType.INNERTEST_ADDITIONS, target_state_snapshot="7"
+        )
+        with self.assertRaises(PendingActionTransientFailureError) as raised:
+            decide_confirm(
+                pending=pending,
+                clicker_open_id=INITIATOR,
+                now=NOW,
+                registry_entry=_full_admin_entry(),
+                current_account_state="enabled",
+            )
+        self.assertEqual(raised.exception.classification, "entry_not_assembled")
+
+    def test_guard_also_fires_when_only_one_of_the_two_registries_is_missing(self) -> None:
+        """守卫的两半各自都要管用：只登记了一半的动作类型同样必须被拒。
+
+        原来的用例传的类型两张表里都没有，删掉守卫条件的任意一半它都照样通过，
+        证明不了「只在一张表里登记、另一张漏了」这种真实的接线遗漏也会被挡住。
+        """
+        pending = _pending(
+            action_type=PendingActionType.INNERTEST_ADDITIONS, target_state_snapshot="7"
+        )
+        patched = dict(REQUIRED_ROLE)
+        patched[PendingActionType.INNERTEST_ADDITIONS] = AdminRole.SUPER_ADMIN
+        with mock.patch.dict(REQUIRED_ROLE, patched, clear=True):
+            with self.assertRaises(PendingActionTransientFailureError) as raised:
+                decide_confirm(
+                    pending=pending,
+                    clicker_open_id=INITIATOR,
+                    now=NOW,
+                    registry_entry=_full_admin_entry(),
+                    current_account_state="enabled",
+                )
+        self.assertEqual(raised.exception.classification, "entry_not_assembled")
+
+    def test_expired_unassembled_action_is_reported_as_expired_not_unassembled(self) -> None:
+        """过期判定排在守卫之前，顺序不能被换：过期的点击要说过期。
+
+        谁把守卫挪到过期检查之前，管理员点一个早就过期的卡会收到「系统繁忙」
+        而不是「已过期，请重新发起」，这条会红。
+        """
+        pending = _pending(
+            action_type=PendingActionType.INNERTEST_ADDITIONS,
+            target_state_snapshot="7",
+            confirm_deadline_at=NOW - timedelta(seconds=1),
+        )
+        decision = decide_confirm(
+            pending=pending,
+            clicker_open_id=INITIATOR,
+            now=NOW,
+            registry_entry=_full_admin_entry(),
+            current_account_state="enabled",
+        )
+        self.assertIs(decision.kind, ConfirmResultKind.EXPIRE)
+        self.assertIs(decision.terminal_status, PendingActionStatus.EXPIRED)
 
     def test_target_missing_entirely_counts_as_drift(self) -> None:
         pending = _pending(target_state_snapshot="enabled")

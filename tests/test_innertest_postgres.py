@@ -16,6 +16,7 @@ from lingxi.adapters.postgres_innertest_confirmation import InnertestPendingActi
 from lingxi.adapters.postgres_innertest_roster import PostgresInnertestRoster
 from lingxi.adapters.postgres_pending_action import PostgresPendingActionStore
 from lingxi.core.admin.innertest import InnertestError
+from lingxi.core.admin.pending_action import ConfirmResultKind
 from lingxi.core.identity.org_snapshot import SnapshotMember
 from lingxi.core.identity.preprovision import PreprovisionSkip, PreprovisionTarget
 
@@ -149,9 +150,17 @@ class InnertestPostgresTests(unittest.TestCase):
         )
         self.sql("UPDATE innertest_roster_version SET version=version+1")
         self.assertFalse(self.confirm(batch).decision.ok)
+        before = self.sql("SELECT status,reason,decided_at FROM pending_action")
+        # 先钉住这批确实已经因过期落终态，否则下面「终态不被改写」证明不了什么。
+        self.assertEqual(before[0][0], "expired")
+        self.assertIsNotNone(before[0][2])
         self.sql("UPDATE innertest_admin_binding SET enabled=false")
-        with self.assertRaisesRegex(InnertestError, "binding_disabled"):
-            self.confirm(batch)
+        # 这批此前已因过期落终态。事后撤权再点，只能得到「已终态」，**不得**被改写
+        # 成授权拒绝——终态一旦形成就不该再动，否则真实结果会被后来的点击抹掉。
+        outcome = self.confirm(batch)
+        self.assertFalse(outcome.decision.ok)
+        self.assertIs(outcome.decision.kind, ConfirmResultKind.ALREADY_TERMINAL)
+        self.assertEqual(self.sql("SELECT status,reason,decided_at FROM pending_action"), before)
         self.assertEqual(self.sql("SELECT count(*) FROM innertest_membership"), [(0,)])
 
     def test_transaction_rolls_back_when_enqueue_or_audit_fails(self):

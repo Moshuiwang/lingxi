@@ -346,6 +346,11 @@ REQUIRED_MODULES = (
     # `docker exec` 语义手动调用，不是常驻进程。
     "lingxi.apps.admin_bootstrap",
     "lingxi.apps.admin_bootstrap.__main__",
+    # 内测名单受控导入命令（Issue #702）：同一姿态——scripts/ 被 .dockerignore
+    # 排除，随 scheduler 镜像一起装，由运维在容器内以 `docker exec` 语义手动
+    # 调用，不是常驻进程。
+    "lingxi.apps.innertest_roster",
+    "lingxi.apps.innertest_roster.__main__",
     # 管理员角色登记表判定/命令解析/路由（Issue #95 S-M-01）：纯逻辑，被
     # admin_bootstrap（种子命令，只用 registry）与 gateway 的管理命令面
     # （registry + commands + router）分别消费。
@@ -850,6 +855,13 @@ PROCESS_RUNTIME_IMPORTS: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {
             # 登记在 gateway 闭包里。
             "lingxi.apps.admin_bootstrap",
             "lingxi.apps.admin_bootstrap.__main__",
+            # 内测名单受控导入命令（Issue #702），同一姿态：随 scheduler 镜像装、
+            # 由运维以 `docker exec` 语义手动调用。函数内延迟 import
+            # `lingxi.adapters.postgres_innertest_roster` 与
+            # `lingxi.adapters.delegated_subject_lookup`，两者已在本闭包内，
+            # 因此没有新增第三方依赖，只补 lingxi 模块本身。
+            "lingxi.apps.innertest_roster",
+            "lingxi.apps.innertest_roster.__main__",
             "lingxi.adapters.admin_registry",
             # #319 S-P-1b 卡 B：`adapters/admin_registry.py` 的 `PostgresAdminQueries`
             # 新增「/admin user 回显当前生效本地覆盖」，模块级 import 了
@@ -1066,6 +1078,12 @@ PROCESS_RUNTIME_IMPORTS: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {
             "lingxi.apps.liveness",
             "lingxi.apps.healthcheck",
             "lingxi.apps.healthcheck.__main__",
+            # Issue #657：追溯号只读查询 CLI 改为按角色回退取连接串，本进程容器里
+            # 也要能调用它，同一姿态——随镜像装、由运维以 `docker exec` 语义手动
+            # 调用，不是常驻进程的一部分。
+            "lingxi.apps.trace",
+            "lingxi.apps.trace.__main__",
+            "lingxi.adapters.task_trace_query",
             "lingxi.adapters",
             "lingxi.adapters.claude_agent_hooks",
             "lingxi.adapters.claude_agent_session",
@@ -1190,6 +1208,11 @@ PROCESS_RUNTIME_IMPORTS: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {
             "lingxi.core.identity.onboarding_terminal",
             "lingxi.core.identity.preprovision",
             "lingxi.core.identity.provisioning",
+            # Issue #657：追溯号只读查询 CLI 改为按角色回退取连接串，本进程容器里
+            # 也要能调用它，同一姿态——随镜像装、由运维以 `docker exec` 语义手动
+            # 调用，不是常驻进程的一部分。
+            "lingxi.apps.trace",
+            "lingxi.apps.trace.__main__",
             # 注意导入的是承载 ``main`` 的包与 ``__main__``：后者带 ``if __name__``
             # 卫语句（与 worker 同惯例），import 它不会真的把长连接跑起来。
             "lingxi",
@@ -1505,13 +1528,23 @@ PROCESS_SOURCE_ENTRY_POINTS: dict[str, tuple[str, ...]] = {
         # 静态闭包走到 `run()` 函数内的 `lingxi.adapters.admin_registry`/
         # `lingxi.adapters.delegated_credentials` 延迟 import。
         "lingxi.apps.admin_bootstrap.__main__",
+        # 内测名单受控导入命令（Issue #702），同一姿态：加进来才能让静态闭包走到
+        # `run()` 函数内的 `lingxi.adapters.postgres_innertest_roster` 延迟 import。
+        "lingxi.apps.innertest_roster.__main__",
     ),
     "reauthorize": ("lingxi.apps.reauthorize.__main__",),
-    "worker": ("lingxi.apps.worker.__main__", "lingxi.apps.healthcheck.__main__"),
+    # 追溯号只读查询 CLI 现在按角色回退取连接串（Issue #657），worker 与 gateway
+    # 容器里也要能调用它，因此这两个闭包同样登记它的入口。
+    "worker": (
+        "lingxi.apps.worker.__main__",
+        "lingxi.apps.healthcheck.__main__",
+        "lingxi.apps.trace.__main__",
+    ),
     "gateway": (
         "lingxi.apps.gateway",
         "lingxi.apps.gateway.__main__",
         "lingxi.apps.healthcheck.__main__",
+        "lingxi.apps.trace.__main__",
     ),
     # 迁移作业运行 alembic，不加载任何 lingxi 模块；这是显式边界，不是漏登记。
     "migrate": (),

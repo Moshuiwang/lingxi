@@ -447,6 +447,65 @@ docker compose --env-file deploy/.env.prod \
 
 回滚不触碰数据库，也不触碰两个持久卷。**前提是迁移遵守"先加后删"**：破坏性变更必须拆成两次发布，否则回滚就从"切 tag 重启"变成"恢复数据库备份"。这一条由 `scripts/ci/verify_old_image_new_schema.sh` 在每次 CI 上实测（断言 V-部署-05）。
 
+## 内测名单从静态切动态的受控步骤
+
+静态名单靠两个环境变量（gateway 与 scheduler 各一份，内容必须一致）；动态名单靠
+`innertest_roster_version.mode='database'` 加 `innertest_membership` 的成员行。切换只能由
+`python -m lingxi.apps.innertest_roster` 显式完成——MCP 准备路径不会隐式切换，没建好那两行之前
+扩员准备一定失败。
+
+命令随业务镜像交付，在 scheduler 容器内以 `docker exec` 语义调用，读 `LINGXI_POSTGRES_DSN`。
+三份输入都是文本文件，一行一个值，`#` 起头的行与空行忽略：
+
+- `--gateway-legacy-file` / `--scheduler-legacy-file`：两份现行静态名单，**内容必须一致**，不一致整份拒绝。
+- `--emails-file`：本次要写入的成员邮箱。
+- `--binding-id`（仅 `apply`）：**必须与 `/etc/lingxi/innertest/binding.json` 里的 `binding_id`、以及
+  `LINGXI_INNERTEST_BINDING_ID` 是同一个字符串。** 受限管理入口按这个标识去查绑定行，三处对不上
+  就认证不了任何请求——装配看起来正常，实际每次调用都失败。**先定这个值，再建绑定文件、配环境
+  变量、跑导入**，顺序不要颠倒。
+
+```bash
+# 1. 只读预演：核两份静态名单是否一致、把每个邮箱定位到组织成员、算出摘要。零写入。
+docker compose exec -T scheduler python -m lingxi.apps.innertest_roster plan \
+  --scope <作用域> \
+  --gateway-legacy-file /tmp/legacy-gateway.txt \
+  --scheduler-legacy-file /tmp/legacy-scheduler.txt \
+  --emails-file /tmp/emails.txt
+
+# 2. 带上一步打印的摘要执行写入。摘要不逐字相符就零写入并给出拒绝码。
+docker compose exec -T scheduler python -m lingxi.apps.innertest_roster apply \
+  --scope <作用域> \
+  --gateway-legacy-file /tmp/legacy-gateway.txt \
+  --scheduler-legacy-file /tmp/legacy-scheduler.txt \
+  --emails-file /tmp/emails.txt \
+  --confirm-digest <上一步的摘要> \
+  --binding-id <与 binding.json 和 LINGXI_INNERTEST_BINDING_ID 相同的那个标识>
+
+# 3. 回读确认：模式、版本、摘要、成员数、绑定状态，输出是一行 JSON。
+docker compose exec -T scheduler python -m lingxi.apps.innertest_roster verify \
+  --scope <作用域> \
+  --binding-id <上一步打印的绑定标识>
+```
+
+预演打印「待写入成员 N 人」与摘要；写入打印「已写入成员 N 人」、同一个摘要与绑定标识；
+回读的 JSON 里 `mode` 应为 `database`，`import_digest` 与摘要一致，`member_count` 与人数一致。
+三者对不上就不要继续，先查原因。
+
+被拒绝时命令打印 `拒绝：<码>` 并原样退出，不做部分写入。常见的几种：
+
+| 拒绝码 | 含义 | 怎么办 |
+| --- | --- | --- |
+| `legacy_roster_mismatch` | 两份静态名单内容不一致 | 先让两份一致再重来，工具不取并集、不猜哪份为准 |
+| `email_resolution_failed` | 有邮箱定位不到组织成员，或同一邮箱对应多个人员 | 逐条看命令列出的原因；同邮箱多人一律不猜，需先在花名册侧消歧 |
+| `duplicate_email_in_list` | 待写入名单自身有重复邮箱 | 去重后重来——工具不会替你去重，去重会让「批准了几个人」这件事失真 |
+| `digest_mismatch` | 摘要与本次实际输入算出的不一致 | 名单在预演之后被改过，重跑预演拿新摘要 |
+| `scope_already_database` | 该作用域已是动态模式 | 已经切过了，用回读确认现状；要改名单走扩员流程，不是重新导入 |
+| `scope_already_has_members` | 该作用域已有成员行 | 同上 |
+
+**回落是安全的**：把 `mode` 改回 `legacy` 即回到静态名单，成员行与摘要都保留、不被删除，因此可以
+先部署制品再切换，切换后也还能退回来。反过来，`0091`/`0092` 的库降级在表内有数据时会直接拒绝执行，
+任何情况下不要降库。
+
 ## 恢复入口
 
 ```bash
@@ -736,6 +795,14 @@ docker compose --env-file deploy/.env.stage \
   -f deploy/compose.yaml -f deploy/compose.stage.yaml config --no-env-resolution | grep -A4 'deploy:'
 docker compose --env-file deploy/.env.prod \
   -f deploy/compose.yaml -f deploy/compose.prod.yaml config --no-env-resolution | grep -A4 'deploy:'
+```
+
+**受限内测入口装配点**（默认关闭的可选覆盖文件，见 `deploy/compose.innertest.yaml` 头部注释与「生产部署runbook.md」相应小节）：只在 `-f` 链末尾显式追加它才生效，不追加时对渲染结果零影响。
+
+```bash
+docker compose --env-file deploy/.env.stage \
+  -f deploy/compose.yaml -f deploy/compose.stage.yaml \
+  -f deploy/compose.innertest.yaml config --no-env-resolution | grep -A4 'deploy:'
 ```
 
 **门禁只核对结构**（`scripts/ci/check_deploy_contract.py` 的
