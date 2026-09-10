@@ -18,7 +18,11 @@ from dataclasses import replace
 from typing import Any
 
 from lingxi.adapters.postgres import close_idle_connections
-from lingxi.adapters.postgres_conversation import ClaimedTask, TerminalTask
+from lingxi.adapters.postgres_conversation import (
+    ClaimedTask,
+    TerminalTask,
+    is_dependency_unavailable,
+)
 from lingxi.adapters.user_mcp_config import UserMcpConfigError, load_user_mcp_servers
 from lingxi.apps.worker.config import WorkerConfig
 from lingxi.apps.worker.content_capture import ContentCaptureRecorder
@@ -56,6 +60,11 @@ logger = logging.getLogger(__name__)
 # 连续让出 3 轮才能观测到标志位翻转（只让出一次对真实信号无效，对用 call_soon 模拟的
 # 假信号却有效——这正是当年用例是绿的、生产路径依旧漏的原因）。这里给到 5 轮留余量。
 _STOP_SIGNAL_DRAIN_YIELDS = 5
+
+
+def _log_dependency_unavailable(action: str, error: BaseException) -> None:
+    """记一条"这一步依赖暂时不可用、已降级"的统一格式日志。"""
+    logger.warning("worker.%s_dependency_unavailable error=%s", action, type(error).__name__)
 
 
 class WorkerService:
@@ -116,7 +125,7 @@ class WorkerService:
         self._tick_alerts()
         # 巡检搬离事件循环：占住循环＝只读屏障唯一判定层的工具前置钩子应答不了，而钩子
         # 超时是失败关闭。
-        terminal_tasks = await asyncio.to_thread(self._housekeeper.run)
+        terminal_tasks = await self._run_housekeeping_round()
 
         # 紧贴 claim() 之前再判一次停机信号（见 `_STOP_SIGNAL_DRAIN_YIELDS`）：判定与
         # claim() 之间几乎全同步，信号若落在那段窗口里，标志位读到的还是旧值——会把一条
@@ -129,6 +138,21 @@ class WorkerService:
                     return bool(terminal_tasks)
 
         return await self._run_rolling_claim_loop(terminal_tasks)
+
+    async def _run_housekeeping_round(self) -> list[TerminalTask]:
+        """跑一次巡检；依赖暂时不可用时当作本轮没有终态任务，不向上抛出。
+
+        `process_once` 入口与 `_run_rolling_claim_loop` 内部的节拍复用同一个
+        判定：只要有一处漏隔离，崩溃点就会换个位置重新出现，因此收口成一个
+        方法而不是各自重复一份 try/except。编码缺陷类异常原样上抛。
+        """
+        try:
+            return await asyncio.to_thread(self._housekeeper.run)
+        except Exception as error:
+            if not is_dependency_unavailable(error):
+                raise
+            _log_dependency_unavailable("housekeeping", error)
+            return []
 
     async def _run_rolling_claim_loop(self, terminal_tasks: list[TerminalTask]) -> bool:
         """滚动并发领取：维持一个至多 ``max_concurrency`` 的在途集合，谁终态谁腾槽。
@@ -164,7 +188,7 @@ class WorkerService:
                 if now - last_housekeep_at >= self._config.poll_interval_seconds:
                     last_housekeep_at = now
                     self._tick_alerts()
-                    terminal_tasks.extend(await asyncio.to_thread(self._housekeeper.run))
+                    terminal_tasks.extend(await self._run_housekeeping_round())
         except BaseException:
             for task in pending:
                 task.cancel()
@@ -175,34 +199,54 @@ class WorkerService:
         return claimed_any or bool(terminal_tasks)
 
     def _claim_into(self, pending: set[asyncio.Task[None]]) -> bool:
-        """把空槽填满；返回这一次是否真的领到了任务。"""
+        """把空槽填满；返回这一次是否真的领到了任务。
+
+        领取抛出依赖暂时不可用时当作"这一轮没有可领取的任务"，不向上抛出——
+        向上抛出会命中 `_run_rolling_claim_loop` 的 `except BaseException`，
+        把同批全部在途任务一并取消。编码缺陷类异常原样上抛（这条边界被
+        `test_worker_listener_recovery.py` 的用例钉住）。
+        """
         capacity = self._config.max_concurrency - len(pending)
         if capacity <= 0:
             return False
-        newly_claimed = self._queue.claim(
-            worker_id=self._config.worker_id,
-            target_worker_version=self._config.target_worker_version,
-            limit=capacity,
-        )
+        try:
+            newly_claimed = self._queue.claim(
+                worker_id=self._config.worker_id,
+                target_worker_version=self._config.target_worker_version,
+                limit=capacity,
+            )
+        except Exception as error:
+            if not is_dependency_unavailable(error):
+                raise
+            _log_dependency_unavailable("claim", error)
+            return False
         for task in newly_claimed:
             pending.add(asyncio.create_task(self._process_task(task)))
         return bool(newly_claimed)
 
     @staticmethod
     def _raise_first_exception(done: set[asyncio.Task[None]]) -> None:
-        """**先取全部异常再决定是否抛出**，然后抛第一个。
+        """在已完成任务里找编码缺陷类异常并抛出第一个；依赖类异常只记录不抛。
 
-        取结果与取异常都会把异常标记为"已取回"，但取结果会在第一个失败的任务上就地抛出，
-        把同一批里排在它后面的任务的异常晾在原地——那些异常从未被取回，会被运行时在垃圾
-        回收时打成一条"异常从未被取回"的噪音日志。正常路径下任务内部已经把一切吞成结构化
-        日志或终态，这里只是双保险。
+        先取全部异常（取结果会在第一个失败任务上就地抛出，让同批其余任务的
+        异常从未被取回、被当成垃圾回收噪音）。依赖暂时不可用不再上抛——上抛
+        会让 `except BaseException` 取消同批全部在途任务，其中可能有正在
+        处理真实用户请求、本身完全正常的兄弟任务。
 
         Raises:
-            BaseException: 这一批里第一个真正抛出的异常。
+            BaseException: 这一批里第一个编码缺陷类异常。
         """
-        errors = [error for task in done if (error := task.exception()) is not None]
-        if errors:
-            raise errors[0]
+        coding_defects: list[BaseException] = []
+        for task in done:
+            error = task.exception()
+            if error is None:
+                continue
+            if is_dependency_unavailable(error):
+                _log_dependency_unavailable("task", error)
+                continue
+            coding_defects.append(error)
+        if coding_defects:
+            raise coding_defects[0]
 
     def _emit_heartbeat(self) -> None:
         """戳一次活性；失败只记异常类型，不能因为告警输入失败而让 worker 停止消费。"""
@@ -337,6 +381,10 @@ class WorkerService:
                 await monitor
             except asyncio.CancelledError:
                 pass
+            except Exception as error:
+                if not is_dependency_unavailable(error):
+                    raise
+                _log_dependency_unavailable("monitor", error)
             await progress.drain()
         return report, executor, system_prompt_digest
 
