@@ -130,10 +130,16 @@ jobs:
       (github.event_name != 'pull_request' || github.base_ref != 'main' ||
       (needs.classify.outputs.mode != 'docs' && needs.classify.outputs.risk_level != 'l1'))
     runs-on: ubuntu-24.04
-    # 本机实测 Python 测试步骤 350s（≈5.8 分钟，679 条，含真库），已超原先的 5 分钟；
-    # 而 runner 的波动系数实测可达 3 倍以上——#53 有过一次 90s 量级的工作被拖到 5 分钟
-    # 触顶被杀（见 26e9973 的重触发说明）。10 分钟吸收绝大多数波动。
-    timeout-minutes: 10
+    # 曾定为 10 分钟：当时本机测试步骤 350s，而 runner 波动系数实测可达 3 倍以上
+    # （#53 有过 90s 量级的工作被拖到 5 分钟触顶被杀，见 26e9973 的重触发说明）。
+    #
+    # 那个余量已经吃完：连续三次实测 gate 耗时 9 分 54 秒、9 分 50 秒、10 分 06 秒，
+    # 前两次各只剩 6 秒与 10 秒，第三次新增三条测试即超时被杀。**这不是某一批把它撑爆，
+    # 是它长期贴着上限在过**，任何新增都会触顶。
+    #
+    # 放到 15 分钟是止血。耗时大头是 admin_action_followup.depends_on_id 缺索引，
+    # 使每条真库用例的清场呈平方级（见 #706）；补上那条索引后应当明显回落，届时再收紧。
+    timeout-minutes: 15
     services:
       postgres:
         image: postgres:16-alpine
