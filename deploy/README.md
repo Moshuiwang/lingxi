@@ -288,6 +288,37 @@ GitHub API 里 `event` 字段永远是 `workflow_dispatch`，不是 `pull_reques
 `workflow_dispatch` 只能用于不需要候选证明的场景（例如只是想手动确认某个提交的
 镜像可复现构建）。
 
+## `trace/**` 批次分支的镜像跳过与判红（Issue #733）
+
+`trace/**` 分支（Trace 批次分支，例如 `trace/732-2.4.2`）复用与上面 `epic/**`
+完全相同的跳过机制：base 为 `main`、head 为 `trace/**` 的 PR，**首次自动**
+synchronize 不自动跑 `image` job（`gate` / `extras` 两个检查照常自动跑，不受
+影响），编排者要固定候选时同样用带 `Image-Candidate: true` trailer 的推送显式
+触发——触发方式与上面「编排者冻结前显式触发镜像构建」一节完全一致。**唯一的
+简化**：`trace/**` 没有挂 `epic/**` 那条「仅 Story Fast 后合并」规则集（仓库现有
+规则集只有 `epic/**`、`main`、`release/**`、版本标签四条），编排者可以直接把带
+trailer 的空提交推到 `trace/**` 分支本身，不需要像 `epic/**` 那样另开一个 Story
+PR 绕过服务端拒绝。
+
+**`trace/**` 与 `epic/**` 唯一的行为差异，也是必须遵守的三条安全条款
+（Issue #733 正文）：**
+
+1. **合并点必须有镜像证明，且这一条判红而不是判文档自觉。** `epic/**` 的合并点
+   镜像证明由发布时 `verify_epic_candidate.py` 兜底核对合并树是否与候选证明
+   一致，因此首次 synchronize 跳过镜像可以判绿。`trace/**` 不发布、不进
+   `release/**`，没有这道兜底——`ci.yml` 的 `candidate` job 因此对「head 为
+   `trace/**` 且 `image` 被跳过」这种情形显式判红（exit 1），失败信息会指明
+   要推一次带 `Image-Candidate: true` trailer 的提交。`scripts/ci/
+   check_deploy_contract.py` 钉住这条判红分支必须真的存在，不能只写在文档里。
+2. **`trace/**` 不得成为绕过 `gate` 或 `extras` 的入口。** 本机制只改
+   `image` 与 `candidate` 两个作业；`gate` 与 `extras` 的准入条件逐字沿用改动前
+   的样子，`check_deploy_contract.py` 钉住这两个作业体内不得出现 `trace/` 或
+   `head_ref` 相关的跳过条件。
+3. **`trace/**` 只由当任 Trace 的编排者持有**，不是给任意代理、Story 或个人分支
+   使用的通用前缀。批次分支本来就是唯一写入者攒批推送，不需要逐提交的 Story
+   闸；同一时刻只应存在一个当任编排者持有的 `trace/**` 分支在推送（见
+   [协作约定](../docs/协作约定.md)）。
+
 ## PR 候选镜像下载与校验（Issue #150；仅用于 #102 验收，不是发布路径）
 
 > **这一节只在验收某个未合并 PR 时使用。** 合并后的正式部署仍按上面「主机读取身份」「安装与升级」走 GHCR 拉取。**严禁在 `biai-stage` 现场用 `docker build` 重新构建这四个镜像，也不得用合并后 `Main Publish` 推送 GHCR 的镜像替代未合并 PR 的候选**——两者是不同对象：合并后的镜像是从合并树重新构建的，不保证与 PR 验收时的树逐位相同（Issue #62 决策登记、[验证与门禁](../docs/技术设计/验证与门禁.md)「五、CI 分层」）。

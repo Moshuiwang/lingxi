@@ -1325,6 +1325,7 @@ class PublishJobGuardTest(unittest.TestCase):
             needs: [classify, docs, l1, gate, extras, image]
             steps:
               - run: python3 scripts/ci/write_epic_candidate.py
+              - run: is_trace_head=1  # Image-Candidate: true trailer
               - uses: actions/upload-artifact@sha
     """
     STORY = """
@@ -1672,6 +1673,64 @@ class CandidateSummaryRoutingTest(unittest.TestCase):
                     "DOCS_CHANGED": "false",
                     "DOCS_RESULT": "skipped",
                     "GATE_RESULT": "failure",
+                    "EXTRAS_RESULT": "success",
+                    "IMAGE_RESULT": "skipped",
+                },
+                False,
+            ),
+            # Issue #733：trace/** 批次分支复用 image 的按需跳过，但合并点没有 epic/**
+            # 那样的发布期兜底，跳过必须在这里判红，不能像 epic/** 一样判绿。
+            (
+                "trace batch image skipped is a hard failure",
+                {
+                    "BASE_REF": "main",
+                    "HEAD_REF": "trace/732-2.4.2",
+                    "RUN_ATTEMPT": "1",
+                    "DOCS_CHANGED": "false",
+                    "DOCS_RESULT": "skipped",
+                    "GATE_RESULT": "success",
+                    "EXTRAS_RESULT": "success",
+                    "IMAGE_RESULT": "skipped",
+                },
+                False,
+            ),
+            (
+                "trace batch with image candidate trailer passes",
+                {
+                    "BASE_REF": "main",
+                    "HEAD_REF": "trace/732-2.4.2",
+                    "RUN_ATTEMPT": "1",
+                    "DOCS_CHANGED": "false",
+                    "DOCS_RESULT": "skipped",
+                    "GATE_RESULT": "success",
+                    "EXTRAS_RESULT": "success",
+                    "IMAGE_RESULT": "success",
+                },
+                True,
+            ),
+            (
+                "epic synchronize unaffected by trace/** routing",
+                {
+                    "BASE_REF": "main",
+                    "HEAD_REF": "epic/rc23",
+                    "RUN_ATTEMPT": "1",
+                    "DOCS_CHANGED": "false",
+                    "DOCS_RESULT": "skipped",
+                    "GATE_RESULT": "success",
+                    "EXTRAS_RESULT": "success",
+                    "IMAGE_RESULT": "skipped",
+                },
+                True,
+            ),
+            (
+                "unregistered prefix gets no image skip exemption",
+                {
+                    "BASE_REF": "main",
+                    "HEAD_REF": "fix/275",
+                    "RUN_ATTEMPT": "1",
+                    "DOCS_CHANGED": "false",
+                    "DOCS_RESULT": "skipped",
+                    "GATE_RESULT": "success",
                     "EXTRAS_RESULT": "success",
                     "IMAGE_RESULT": "skipped",
                 },
