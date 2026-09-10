@@ -15,14 +15,16 @@ import（含 ``from lingxi import core``），②「代码行数」（总行数�
 每个入口文件都会 import 一些 core 类型来装配；行数下限把「只是引用了几个 core 类型
 签名的三五行胶水代码」排除在外，留下真正体量足以承载业务判断的文件。
 
-**已知边界，不是缺陷**：这条判据在真实扫描中命中了 ``apps/`` 里约一半的 ``.py``
-文件——绝大多数是职责循环（``*_refresh.py``/``*_sync.py``/``*Duty``）、进程装配
+**已知边界，不是缺陷**：这条判据在真实扫描中命中了 ``apps/`` 里 50 / 71 个 ``.py``
+文件（**七成**；这两个数由本脚本自己扫出来，改动后重扫即可复算）——绝大多数是职责循环（``*_refresh.py``/``*_sync.py``/``*Duty``）、进程装配
 （``assembly.py``/``__init__.py``）、类型化配置读取（``config.py``）或端口协议
 （``*_ports.py``），它们 import core 类型是为了构造/转发/声明协议，不是因为业务
 判断本身长在这里；这类装配件在基线里占绝大多数，逐条豁免见基线文件头注释。启发式
-本身**只在整个文件的粒度上生效**，覆盖率约 8%：一个文件一旦命中就整份进登记表，
+本身**只在整个文件的粒度上生效**：一个文件一旦命中就整份进登记表，
 门禁分辨不出文件内部哪几行是组装、哪几行可能真的是业务判断（两者常常交错在同一个
-函数里）；反过来，不 import core 的重复业务逻辑（例如某处把本该调用 core 判定函数
+函数里）——**命中文件合计约 12,365 行代码，占 ``apps/`` 全部约 17,085 行的七成**，
+也就是说「登记在案」覆盖的行很多，但其中真正属于业务判断的比例本门禁分辨不出；
+反过来，不 import core 的重复业务逻辑（例如某处把本该调用 core 判定函数
 的分支自己重新写了一遍）完全不在这条门禁的视野内。这是静态扫描能负担的成本与
 "抓到点什么"之间的取舍，不是宣称"命中的都是违规、干净的都没问题"。
 
@@ -140,20 +142,60 @@ def _pure_comment_line_numbers(source: str) -> set[int]:
     return pure
 
 
-def _imports_lingxi_core(tree: ast.Module) -> bool:
-    """是否存在至少一处直接 import ``lingxi.core``（或其子模块）的语句。"""
+def _module_dotted_name(relative_posix: str) -> str:
+    """把 ``src/lingxi/apps/gateway/foo.py`` 还原成 ``lingxi.apps.gateway.foo``。"""
 
+    stem = relative_posix.removeprefix("src/").removesuffix(".py")
+    parts = [segment for segment in stem.split("/") if segment]
+    if parts and parts[-1] == "__init__":
+        parts.pop()
+    return ".".join(parts)
+
+
+def _resolve_relative(module_name: str, level: int, target: str) -> str:
+    """把一处相对 import 还原成绝对模块名；越过包根时返回空串。"""
+
+    package = module_name.rsplit(".", 1)[0] if "." in module_name else ""
+    parts = package.split(".") if package else []
+    if level - 1 > len(parts):
+        return ""
+    base = parts[: len(parts) - (level - 1)] if level > 1 else parts
+    return ".".join([*base, target]) if target else ".".join(base)
+
+
+def _is_core(name: str) -> bool:
+    return name == "lingxi.core" or name.startswith("lingxi.core.")
+
+
+def _imports_lingxi_core(tree: ast.Module, relative_posix: str) -> bool:
+    """是否存在至少一处 import ``lingxi.core``（或其子模块）的语句。
+
+    **相对 import 一样算**：本仓大量使用 ``from ..core.x import y`` 这种写法，
+    只认绝对模块名等于给判据留了一个改写 import 形态就能绕过去的口子——独立审查
+    实测坐实：同一个判定模块换成相对 import 即判绿。这里按文件位置把相对 import
+    还原成绝对名再判。
+    """
+
+    module_name = _module_dotted_name(relative_posix)
     for node in ast.walk(tree):
         if isinstance(node, ast.Import):
             for alias in node.names:
-                if alias.name == "lingxi.core" or alias.name.startswith("lingxi.core."):
+                if _is_core(alias.name):
                     return True
         elif isinstance(node, ast.ImportFrom):
+            level = node.level or 0
             module = node.module or ""
-            if module == "lingxi.core" or module.startswith("lingxi.core."):
+            absolute = _resolve_relative(module_name, level, module) if level else module
+            if not absolute:
+                continue
+            if _is_core(absolute):
                 return True
-            if module == "lingxi" and any(alias.name == "core" for alias in node.names):
+            if absolute == "lingxi" and any(alias.name == "core" for alias in node.names):
                 return True
+            if level and absolute.endswith(".core"):
+                # `from ..core import x`：还原后可能停在包名 `lingxi.core` 上
+                if _is_core(absolute):
+                    return True
     return False
 
 
@@ -184,7 +226,7 @@ def measure(paths: list[Path]) -> dict[str, int]:
             tree = ast.parse(source, filename=relative)
         except SyntaxError as error:
             raise BaselineError(f"{relative} 解析失败：{error}") from error
-        if not _imports_lingxi_core(tree):
+        if not _imports_lingxi_core(tree, relative):
             continue
         count = _code_line_count(source, tree)
         if count >= MIN_CODE_LINES:
