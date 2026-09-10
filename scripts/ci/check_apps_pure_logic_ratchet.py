@@ -22,7 +22,8 @@ import（含 ``from lingxi import core``），②「代码行数」（总行数�
 判断本身长在这里；这类装配件在基线里占绝大多数，逐条豁免见基线文件头注释。启发式
 本身**只在整个文件的粒度上生效**：一个文件一旦命中就整份进登记表，
 门禁分辨不出文件内部哪几行是组装、哪几行可能真的是业务判断（两者常常交错在同一个
-函数里）——**命中文件合计约 12,365 行代码，占 ``apps/`` 全部约 17,085 行的七成**，
+函数里）——**命中文件合计 12,365 行代码，占 ``apps/`` 全部 13,713 行的九成**（两个数都用本脚本
+自己的「代码行」口径量，改动后重扫即可复算；换一把尺去比会得出不同的数），
 也就是说「登记在案」覆盖的行很多，但其中真正属于业务判断的比例本门禁分辨不出；
 反过来，不 import core 的重复业务逻辑（例如某处把本该调用 core 判定函数
 的分支自己重新写了一遍）完全不在这条门禁的视野内。这是静态扫描能负担的成本与
@@ -142,24 +143,38 @@ def _pure_comment_line_numbers(source: str) -> set[int]:
     return pure
 
 
-def _module_dotted_name(relative_posix: str) -> str:
-    """把 ``src/lingxi/apps/gateway/foo.py`` 还原成 ``lingxi.apps.gateway.foo``。"""
+def _package_dotted_name(relative_posix: str) -> str:
+    """相对 import 要按哪个包来解析。
+
+    ``src/lingxi/apps/gateway/foo.py``  → ``lingxi.apps.gateway``（模块的父包）
+    ``src/lingxi/apps/zz_pkg/__init__.py`` → ``lingxi.apps.zz_pkg``（包自己）
+
+    两者必须分开：包的 ``__init__.py`` 的 ``__package__`` 就是它自己，按「父包」
+    去解会少解一级，于是包初始化文件里的每一处相对 import 都被算成指向别处。
+    独立审查实测坐实：不分开时 ``apps/**/__init__.py`` 里的相对 import 一律漏判，
+    而 ``__init__.py`` 正是本仓 ``apps/`` 代码的主要落点。
+    """
 
     stem = relative_posix.removeprefix("src/").removesuffix(".py")
     parts = [segment for segment in stem.split("/") if segment]
     if parts and parts[-1] == "__init__":
-        parts.pop()
+        parts.pop()  # 包自己就是解析基准
+    else:
+        parts = parts[:-1]  # 普通模块按父包解析
     return ".".join(parts)
 
 
-def _resolve_relative(module_name: str, level: int, target: str) -> str:
-    """把一处相对 import 还原成绝对模块名；越过包根时返回空串。"""
+def _resolve_relative(package: str, level: int, target: str) -> str:
+    """把一处相对 import 还原成绝对模块名；越过包根时返回空串。
 
-    package = module_name.rsplit(".", 1)[0] if "." in module_name else ""
+    ``level`` 为 1 表示「当前包」，每多一级向上退一层。退到超出包根时返回空串
+    ——那种写法在真 Python 里本就 ``ImportError``，这里按「不可能命中」处理。
+    """
+
     parts = package.split(".") if package else []
     if level - 1 > len(parts):
         return ""
-    base = parts[: len(parts) - (level - 1)] if level > 1 else parts
+    base = parts[: len(parts) - (level - 1)]
     return ".".join([*base, target]) if target else ".".join(base)
 
 
@@ -171,12 +186,11 @@ def _imports_lingxi_core(tree: ast.Module, relative_posix: str) -> bool:
     """是否存在至少一处 import ``lingxi.core``（或其子模块）的语句。
 
     **相对 import 一样算**：本仓大量使用 ``from ..core.x import y`` 这种写法，
-    只认绝对模块名等于给判据留了一个改写 import 形态就能绕过去的口子——独立审查
-    实测坐实：同一个判定模块换成相对 import 即判绿。这里按文件位置把相对 import
-    还原成绝对名再判。
+    只认绝对模块名等于给判据留了一个「改写 import 形态就能绕过去」的口子。
+    这里按文件位置把相对 import 还原成绝对名再判。
     """
 
-    module_name = _module_dotted_name(relative_posix)
+    package = _package_dotted_name(relative_posix)
     for node in ast.walk(tree):
         if isinstance(node, ast.Import):
             for alias in node.names:
@@ -185,17 +199,13 @@ def _imports_lingxi_core(tree: ast.Module, relative_posix: str) -> bool:
         elif isinstance(node, ast.ImportFrom):
             level = node.level or 0
             module = node.module or ""
-            absolute = _resolve_relative(module_name, level, module) if level else module
+            absolute = _resolve_relative(package, level, module) if level else module
             if not absolute:
                 continue
             if _is_core(absolute):
                 return True
             if absolute == "lingxi" and any(alias.name == "core" for alias in node.names):
                 return True
-            if level and absolute.endswith(".core"):
-                # `from ..core import x`：还原后可能停在包名 `lingxi.core` 上
-                if _is_core(absolute):
-                    return True
     return False
 
 

@@ -6,6 +6,7 @@
 
 from __future__ import annotations
 
+import ast
 import importlib.util
 import tempfile
 import textwrap
@@ -125,27 +126,27 @@ class ImportsCoreDetectionTest(unittest.TestCase):
 
     def test_absolute_from_import_is_detected(self) -> None:
         tree = self._tree("from lingxi.core.ids import new_id\n")
-        self.assertTrue(CHECK._imports_lingxi_core(tree))
+        self.assertTrue(CHECK._imports_lingxi_core(tree, "src/lingxi/apps/gateway/probe.py"))
 
     def test_absolute_plain_import_is_detected(self) -> None:
         tree = self._tree("import lingxi.core.ids\n")
-        self.assertTrue(CHECK._imports_lingxi_core(tree))
+        self.assertTrue(CHECK._imports_lingxi_core(tree, "src/lingxi/apps/gateway/probe.py"))
 
     def test_from_lingxi_import_core_is_detected(self) -> None:
         tree = self._tree("from lingxi import core\n")
-        self.assertTrue(CHECK._imports_lingxi_core(tree))
+        self.assertTrue(CHECK._imports_lingxi_core(tree, "src/lingxi/apps/gateway/probe.py"))
 
     def test_adapters_import_alone_is_not_core(self) -> None:
         tree = self._tree("from lingxi.adapters.postgres import connect\n")
-        self.assertFalse(CHECK._imports_lingxi_core(tree))
+        self.assertFalse(CHECK._imports_lingxi_core(tree, "src/lingxi/apps/gateway/probe.py"))
 
     def test_a_string_literal_mentioning_core_is_not_an_import(self) -> None:
         tree = self._tree('MESSAGE = "lingxi.core.ids is not imported here"\n')
-        self.assertFalse(CHECK._imports_lingxi_core(tree))
+        self.assertFalse(CHECK._imports_lingxi_core(tree, "src/lingxi/apps/gateway/probe.py"))
 
     def test_a_comment_mentioning_core_is_not_an_import(self) -> None:
         tree = self._tree("# from lingxi.core.ids import new_id (commented out)\nx = 1\n")
-        self.assertFalse(CHECK._imports_lingxi_core(tree))
+        self.assertFalse(CHECK._imports_lingxi_core(tree, "src/lingxi/apps/gateway/probe.py"))
 
 
 class CodeLineCountTest(unittest.TestCase):
@@ -378,3 +379,44 @@ class MeasureAndBootstrapTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class RelativeImportIsNotAnEscapeHatchTests(unittest.TestCase):
+    """相对 import 不得成为绕过这条判据的口子。
+
+    本仓大量使用 ``from ..core.x import y``。判据若只认绝对模块名，任何人把
+    import 形态换一下就能让一个纯业务判定模块合法地留在 apps/——独立审查用探针
+    实测过两种形态都能绕过：普通模块的三级相对 import，以及包 ``__init__.py``
+    里的相对 import（后者更隐蔽，因为包的解析基准是它自己，按父包解会少一级）。
+    """
+
+    def _tree(self, source: str) -> ast.Module:
+        return ast.parse(source)
+
+    def test_relative_import_from_a_plain_module_counts(self) -> None:
+        tree = self._tree("from ...core.admin.commands import AdminCommandKind\n")
+        self.assertTrue(
+            CHECK._imports_lingxi_core(tree, "src/lingxi/apps/gateway/judgment.py"),
+            "apps/gateway/judgment.py 里的 `from ...core...` 解出来就是 lingxi.core.*",
+        )
+
+    def test_relative_import_inside_a_package_init_counts(self) -> None:
+        tree = self._tree("from ...core.admin.commands import AdminCommandKind\n")
+        self.assertTrue(
+            CHECK._imports_lingxi_core(tree, "src/lingxi/apps/zz_pkg/__init__.py"),
+            "包 __init__.py 的解析基准是包自己；按父包解会少一级、漏判",
+        )
+
+    def test_relative_import_pointing_elsewhere_is_not_counted(self) -> None:
+        tree = self._tree("from ...adapters.postgres import connect\n")
+        self.assertFalse(
+            CHECK._imports_lingxi_core(tree, "src/lingxi/apps/gateway/judgment.py"),
+            "指向 adapters 的相对 import 不算命中——判宽了会把装配件全卷进来",
+        )
+
+    def test_relative_import_beyond_the_package_root_is_not_counted(self) -> None:
+        tree = self._tree("from ......core.x import y\n")
+        self.assertFalse(
+            CHECK._imports_lingxi_core(tree, "src/lingxi/apps/gateway/judgment.py"),
+            "越过包根的写法在真 Python 里本就 ImportError，按不可能命中处理",
+        )
