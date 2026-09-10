@@ -10,7 +10,8 @@
 #   scripts/dev/check.sh --keep-db           # full 模式结束后不清理临时真库容器
 #   scripts/dev/check.sh --reuse-venv        # 复用已存在的虚拟环境，跳过默认的重建
 #   scripts/dev/check.sh full --shards [N]   # full 模式按 N 片并行跑单测，N 省略时取
-#                                             # DEFAULT_SHARD_COUNT（Issue #712 调粒度批实测）
+#                                             # DEFAULT_SHARD_COUNT（占位值，尚未验证为绿，
+#                                             # 见 Issue #712 调粒度批）
 #
 # 三层与 CI 的对应关系（验证与门禁第五节 / 第十一节）：
 #   docs  等价于 Story / docs 与 Epic Full / docs：只跑 scripts/ci/verify_docs.sh，
@@ -75,7 +76,8 @@ usage() {
   --keep-db            full 模式结束后保留临时真库容器（默认用完即删）
   --reuse-venv         复用已存在的虚拟环境，跳过默认的「每次重建」
   --shards [N]         full 模式按 N 片并行跑单测，每片独占一个数据库（Issue #712）；
-                       N 省略时取 DEFAULT_SHARD_COUNT（本机实测稳定跑绿的分片数）
+                       N 省略时取 DEFAULT_SHARD_COUNT（占位值，尚未验证为绿，
+                       见变量定义处注释）
   -h, --help           显示本帮助
 EOF
 }
@@ -88,10 +90,15 @@ committed_only=0
 reuse_venv=0
 shard_count=""
 
-# --shards 不给具体数字时的默认分片数：本机 2026-09-10 实测（#712 调粒度批），
-# 4 路并发会把同一个一次性 postgres 容器压过 statement_timeout（判红，不是代码
-# 问题），2 路是当时验证过零环境性失败的最小可用值。以后要调大，先跑绿再改这
-# 个数，不要只因为「更多分片听起来更快」就改。
+# --shards 不给具体数字时的默认分片数。**2 尚未验证为绿**：本机 2026-09-10
+# 实测，4 路与 2 路并发都会让 tests/test_roster_audit_postgres.py 的
+# `TRUNCATE app_user CASCADE` 撞上同一个 3 秒 statement_timeout（同一失败签
+# 名）——根因是该文件每条用例都在 setUp 里全表清场，这个操作本身不满足并发
+# 场景下的 3 秒预算，与并发度是 4 还是 2 无关；串行（不分片）路径只是因为零
+# 并发才一直压线通过。分片因此暂时**卡在**这批测试文件的清场方式上，是独立
+# 待办，不在本次调粒度的范围内。这个默认值先占位，`--shards` 本身仍是显式
+# opt-in（不给这个参数时 full 跟改造前一样不分片）；批次能稳定跑绿之前不要
+# 把默认分片数当作「已验证」使用。
 readonly DEFAULT_SHARD_COUNT=2
 
 while [[ $# -gt 0 ]]; do
