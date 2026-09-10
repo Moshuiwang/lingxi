@@ -2167,6 +2167,15 @@ def check_ci_workflow() -> list[str]:
             if marker not in candidate:
                 failures.append(f"ci.yml candidate 缺少 `{marker}`，main 无法回读候选身份。")
 
+        # Issue #733 安全条款①：「trace/** 合并点必须有镜像证明」不能只靠文档自觉，
+        # 必须落成可检查的形式——candidate job 体内必须真的出现判红分支的特征串。
+        for marker in ("is_trace_head=1", "Image-Candidate: true trailer"):
+            if marker not in candidate:
+                failures.append(
+                    f"ci.yml candidate job 缺少 `{marker}`：trace/** 合并点必须有镜像证明"
+                    "这条判红逻辑未落成可检查的形式（Issue #733 安全条款①）。"
+                )
+
     # Issue #150：PR 候选四镜像必须真的导出、自校验并留存成可下载 artifact，
     # 不能只是"构建过、验证过契约"就完事——那些镜像在 job 结束后随 runner 一起消失，
     # biai-stage 拿不到与这次构建逐字节一致的对象。
@@ -2187,6 +2196,35 @@ def check_ci_workflow() -> list[str]:
                 failures.append(
                     f"ci.yml 的 image job 缺少 `{marker}`：PR 候选镜像制品链不完整（Issue #150）。"
                 )
+
+    # Issue #733：本批唯一的真实行为改动就是 image job 条件里的 trace/ 前缀。
+    # 独立审查实测：把它改回基线写法，测试全绿、契约检查也 exit 0——即这条改动
+    # 此前零钉住，任何人顺手改回去都不会有人报警（后果是成本回归，不是安全回归，
+    # 但既然一条断言就能钉住，没有理由留着）。
+    image_body = job_body(full, "image")
+    if image_body is None:
+        failures.append("ci.yml 缺少 image job。")
+    elif "startsWith(github.head_ref, 'trace/')" not in strip_comments(image_body):
+        failures.append(
+            "ci.yml 的 image job 条件缺少 `startsWith(github.head_ref, 'trace/')`："
+            "trace/** 批次分支拿不到按需跳过，每次推送都会全额构建镜像（Issue #733）。"
+        )
+
+    # Issue #733 安全条款②：trace/** 不得成为绕过 gate 或 extras 的入口——本单只动
+    # image 与 candidate 两个作业。这里钉住"以后谁都不能悄悄给 gate / extras 加一条
+    # trace/** 或 head_ref 相关的跳过"；只看去掉整行注释之后的实际内容，注释里提到
+    # 这两个词不算数（例如上面解释 image job 按需跳过机制的说明文字）。
+    for boundary_job in ("gate", "extras"):
+        boundary_body = job_body(full, boundary_job)
+        if boundary_body is None:
+            failures.append(f"ci.yml 缺少 {boundary_job} job。")
+            continue
+        boundary_code = strip_comments(boundary_body)
+        if "trace/" in boundary_code or "head_ref" in boundary_code:
+            failures.append(
+                f"ci.yml 的 {boundary_job} job 出现 `trace/` 或 `head_ref`：trace/** 不得"
+                f"成为绕过 {boundary_job} 的入口（Issue #733 安全条款②）。"
+            )
 
     # 纯文档 main PR 的稳定 required check 仍叫 Epic Full，但不得启动真库、extras
     # 或镜像构建；docs + L1 混合改动也必须运行同一份文档门禁。遗漏这些标记会让

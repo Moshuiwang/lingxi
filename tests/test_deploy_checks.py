@@ -1314,6 +1314,9 @@ class PublishJobGuardTest(unittest.TestCase):
               matrix:
                 extra: [scheduler, worker, gateway, bot-test, migrate]
           image:
+            if: >-
+              !(startsWith(github.head_ref, 'epic/') || startsWith(github.head_ref, 'trace/')) ||
+              github.run_attempt != '1' || needs.classify.outputs.image_candidate == 'true'
             steps:
               - run: python3 scripts/ci/write_epic_candidate_images.py
               - run: python3 scripts/ci/verify_epic_candidate_bundle.py
@@ -1325,6 +1328,9 @@ class PublishJobGuardTest(unittest.TestCase):
             needs: [classify, docs, l1, gate, extras, image]
             steps:
               - run: python3 scripts/ci/write_epic_candidate.py
+              - run: |
+                  case "${HEAD_REF}" in trace/*) is_trace_head=1 ;; *) is_trace_head=0 ;; esac
+                  echo 'trace/** 的合并点必须带 Image-Candidate: true trailer 的推送' >&2
               - uses: actions/upload-artifact@sha
     """
     STORY = """
@@ -1456,6 +1462,9 @@ class PublishJobGuardTest(unittest.TestCase):
         full = self.FULL.replace(
             """
           image:
+            if: >-
+              !(startsWith(github.head_ref, 'epic/') || startsWith(github.head_ref, 'trace/')) ||
+              github.run_attempt != '1' || needs.classify.outputs.image_candidate == 'true'
             steps:
               - run: python3 scripts/ci/write_epic_candidate_images.py
               - run: python3 scripts/ci/verify_epic_candidate_bundle.py
@@ -1466,6 +1475,46 @@ class PublishJobGuardTest(unittest.TestCase):
         )
         failures = self._with_workflows(full=full)
         self.assertTrue(any("缺少 image job" in failure for failure in failures), failures)
+
+    def test_candidate_without_trace_image_proof_branch_is_caught(self) -> None:
+        """Issue #733 安全条款①：合并点必须有镜像证明这条判红逻辑被删掉要挡住。
+
+        它就是「可检查的形式」本身。删掉它，trace/** 的候选仍然会因为最后那条
+        「三项全 success」判红，但失败信息读不出下一步该做什么。断言立在这里，
+        才不会有人以为把它删掉没有代价。
+        """
+
+        full = self.FULL.replace(
+            '                  case "${HEAD_REF}" in trace/*) is_trace_head=1 ;; *) is_trace_head=0 ;; esac\n',
+            "",
+        )
+        failures = self._with_workflows(full=full)
+        self.assertTrue(any("is_trace_head=1" in failure for failure in failures), failures)
+
+    def test_gate_job_with_trace_prefix_skip_is_caught(self) -> None:
+        """Issue #733 安全条款②：给 gate 加一条 trace/** 跳过必须当场被拦。"""
+
+        full = self.FULL.replace(
+            "          gate:\n            if: needs.classify.outputs.mode != 'docs'",
+            "          gate:\n            if: !startsWith(github.head_ref, 'trace/') && needs.classify.outputs.mode != 'docs'",
+            1,
+        )
+        failures = self._with_workflows(full=full)
+        self.assertTrue(any("绕过 gate 的入口" in failure for failure in failures), failures)
+
+    def test_image_job_without_trace_prefix_is_caught(self) -> None:
+        """Issue #733：本批唯一的真实行为改动被改回基线写法要挡住。
+
+        独立审查实测过：不加这条断言，把 image 的 trace/ 前缀撤掉，全套测试与
+        契约检查都是绿的——没有人会知道批次分支又开始全额付镜像构建了。
+        """
+
+        full = self.FULL.replace(
+            "!(startsWith(github.head_ref, 'epic/') || startsWith(github.head_ref, 'trace/'))",
+            "!startsWith(github.head_ref, 'epic/')",
+        )
+        failures = self._with_workflows(full=full)
+        self.assertTrue(any("拿不到按需跳过" in failure for failure in failures), failures)
 
     def test_image_job_missing_export_script_is_caught(self) -> None:
         """image job 存在但漏掉导出/自校验/上传其中一步，同样要挡住（Issue #150）。"""
@@ -1607,6 +1656,40 @@ class CandidateSummaryRoutingTest(unittest.TestCase):
                     result.stdout + result.stderr,
                 )
 
+    def test_trace_head_with_failed_gate_points_at_gate_not_trailer(self) -> None:
+        """Issue #733 / 把关审查 P2-B：gate 没过时不得把人指去补 trailer。
+
+        gate 或 extras 没通过时 image 同样被跳过，也落到 trace 的判红分支。若不先
+        分辨，读者会把「gate 红」读成「你没推 trailer」，于是白推一个空提交、白跑
+        一轮完整门禁才发现问题根本不在 trailer 上。两种情形都必须判红，但要指向
+        不同的下一步。
+        """
+
+        workflow = CONTRACT.read(CONTRACT.CI_WORKFLOW)
+        base = {
+            "BASE_REF": "main",
+            "HEAD_REF": "trace/732-2.4.2",
+            "RUN_ATTEMPT": "1",
+            "DOCS_CHANGED": "false",
+            "DOCS_RESULT": "skipped",
+            "EXTRAS_RESULT": "success",
+            "IMAGE_RESULT": "skipped",
+        }
+
+        failed_gate = self._run_summary(workflow, **{**base, "GATE_RESULT": "failure"})
+        self.assertNotEqual(failed_gate.returncode, 0, failed_gate.stdout + failed_gate.stderr)
+        failed_output = failed_gate.stdout + failed_gate.stderr
+        self.assertIn("先看 gate / extras 各自的作业结论", failed_output)
+        self.assertNotIn("再推一个空提交", failed_output)
+
+        missing_trailer = self._run_summary(workflow, **{**base, "GATE_RESULT": "success"})
+        self.assertNotEqual(
+            missing_trailer.returncode, 0, missing_trailer.stdout + missing_trailer.stderr
+        )
+        trailer_output = missing_trailer.stdout + missing_trailer.stderr
+        self.assertIn("再推一个空提交", trailer_output)
+        self.assertNotIn("先看 gate / extras 各自的作业结论", trailer_output)
+
     def test_full_and_image_candidate_summary_matrix(self) -> None:
         workflow = CONTRACT.read(CONTRACT.CI_WORKFLOW)
         cases = [
@@ -1672,6 +1755,85 @@ class CandidateSummaryRoutingTest(unittest.TestCase):
                     "DOCS_CHANGED": "false",
                     "DOCS_RESULT": "skipped",
                     "GATE_RESULT": "failure",
+                    "EXTRAS_RESULT": "success",
+                    "IMAGE_RESULT": "skipped",
+                },
+                False,
+            ),
+            # Issue #733：trace/** 批次分支复用 image 的按需跳过，但合并点没有 epic/**
+            # 那样的发布期兜底，跳过必须在这里判红，不能像 epic/** 一样判绿。
+            #
+            # 下面第一格钉住的是**分支顺序**而不是某个取值：纯文档早退必须排在
+            # trace/** 判红之前。独立审查实测：把判红块挪到早退之前，151 条测试
+            # 全绿、契约检查也 exit 0，而纯文档的 trace PR 立刻由绿变红——本 Trace
+            # 自己的合同 PR 与收口 PR 正是走这条路径。
+            (
+                "trace docs-only PR still exits early before the image-proof check",
+                {
+                    "BASE_REF": "main",
+                    "HEAD_REF": "trace/732-2.4.2",
+                    "RUN_ATTEMPT": "1",
+                    "MODE": "docs",
+                    "RISK_LEVEL": "l0",
+                    "DOCS_CHANGED": "true",
+                    "DOCS_RESULT": "success",
+                    "GATE_RESULT": "skipped",
+                    "EXTRAS_RESULT": "skipped",
+                    "IMAGE_RESULT": "skipped",
+                },
+                True,
+            ),
+            (
+                "trace batch image skipped is a hard failure",
+                {
+                    "BASE_REF": "main",
+                    "HEAD_REF": "trace/732-2.4.2",
+                    "RUN_ATTEMPT": "1",
+                    "DOCS_CHANGED": "false",
+                    "DOCS_RESULT": "skipped",
+                    "GATE_RESULT": "success",
+                    "EXTRAS_RESULT": "success",
+                    "IMAGE_RESULT": "skipped",
+                },
+                False,
+            ),
+            (
+                "trace batch with image candidate trailer passes",
+                {
+                    "BASE_REF": "main",
+                    "HEAD_REF": "trace/732-2.4.2",
+                    "RUN_ATTEMPT": "1",
+                    "DOCS_CHANGED": "false",
+                    "DOCS_RESULT": "skipped",
+                    "GATE_RESULT": "success",
+                    "EXTRAS_RESULT": "success",
+                    "IMAGE_RESULT": "success",
+                },
+                True,
+            ),
+            (
+                "epic synchronize unaffected by trace/** routing",
+                {
+                    "BASE_REF": "main",
+                    "HEAD_REF": "epic/rc23",
+                    "RUN_ATTEMPT": "1",
+                    "DOCS_CHANGED": "false",
+                    "DOCS_RESULT": "skipped",
+                    "GATE_RESULT": "success",
+                    "EXTRAS_RESULT": "success",
+                    "IMAGE_RESULT": "skipped",
+                },
+                True,
+            ),
+            (
+                "unregistered prefix without image proof is a hard failure",
+                {
+                    "BASE_REF": "main",
+                    "HEAD_REF": "fix/275",
+                    "RUN_ATTEMPT": "1",
+                    "DOCS_CHANGED": "false",
+                    "DOCS_RESULT": "skipped",
+                    "GATE_RESULT": "success",
                     "EXTRAS_RESULT": "success",
                     "IMAGE_RESULT": "skipped",
                 },

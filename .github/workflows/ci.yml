@@ -409,6 +409,12 @@ jobs:
   # `workflow_dispatch`（本工作流的 `on:` 里一直都有，可用于任意 ref 单独验证镜像
   # 可复现性）产生的 run 在 GitHub API 里 event 永远是 workflow_dispatch，天然满足
   # 不了这个条件，因此不能用它替代冻结候选证明的产出。
+  #
+  # Issue #733：trace/** 批次分支复用同一条跳过（使用形态与 epic/** 相同：长期
+  # 存在、多次 synchronize、只有最后一次需要制品），但合并点的证明责任不同——
+  # epic/** 在发布时由 verify_epic_candidate.py 兜底核对合并树，trace/** 不发布、
+  # 不进 release/**，没有这道兜底，因此下面 candidate job 对 trace/** 这种情形
+  # 显式判红，不像 epic/** 那样判绿（详见 candidate job 与 deploy/README.md）。
   image:
     name: Epic Full / image
     runs-on: ubuntu-24.04
@@ -419,7 +425,8 @@ jobs:
       (github.event_name != 'pull_request' && needs.classify.result == 'skipped')) &&
       (github.event_name != 'pull_request' || github.base_ref != 'main' ||
       (needs.classify.outputs.mode != 'docs' && needs.classify.outputs.risk_level != 'l1' &&
-      (!startsWith(github.head_ref, 'epic/') || github.run_attempt != '1' ||
+      (!(startsWith(github.head_ref, 'epic/') || startsWith(github.head_ref, 'trace/')) ||
+      github.run_attempt != '1' ||
       needs.classify.outputs.image_candidate == 'true')))
     timeout-minutes: 45
     # **本 job 不要任何写权限**（codex 二轮 P1-1）。它在 pull_request 上也会跑，而
@@ -678,6 +685,30 @@ jobs:
             echo 'squash 合并时把提交信息末尾加一行 Image-Candidate: true（见 deploy/README.md）；'
             echo '或者由有 Actions 写权限的身份对本次 run 执行 `gh run rerun <run-id>`（全量重跑）。'
             exit 0
+          fi
+          # Issue #733：trace/** 批次分支同样吃到上面 image job 的按需跳过，但它不像
+          # epic/** 那样在发布时另有一道合并树核对兜底（本 Trace 不发布、不进
+          # release/**）。跳过镜像在这里绝不能也判绿——那会让「合并点必须有镜像
+          # 证明」退化成只靠自觉。gate/extras 是否通过看它们各自的作业结论，本步
+          # 只对「有没有镜像证明」下结论，因此这里没有 is_epic_head 分支那样的
+          # exit 0 出口。
+          case "${HEAD_REF}" in trace/*) is_trace_head=1 ;; *) is_trace_head=0 ;; esac
+          if [ "${EVENT_NAME}" = pull_request ] && [ "${BASE_REF}" = main ] \
+             && [ "${is_trace_head}" = 1 ] && [ "${RUN_ATTEMPT}" = 1 ] && [ "${IMAGE_RESULT}" = skipped ]; then
+            printf 'trace/** 本次推送未产出镜像证明（image=%s；gate=%s extras=%s）。\n' \
+              "${IMAGE_RESULT}" "${GATE_RESULT}" "${EXTRAS_RESULT}" >&2
+            # 把关审查 P2-B：gate 或 extras 没过时 image 同样被跳过，也落到这个分支。
+            # 若不先分辨，读者会把「gate 红」读成「你没推 trailer」，于是白推一个空
+            # 提交、白跑一轮完整门禁（约 15 分钟）才发现问题根本不在 trailer 上。
+            if [ "${GATE_RESULT}" != success ] || [ "${EXTRAS_RESULT}" != success ]; then
+              echo '先看 gate / extras 各自的作业结论：它们没有全部通过，补 trailer 也不会让本步转绿。' >&2
+              echo '修完让 gate 与 extras 先绿，再谈冻结候选。' >&2
+              exit 1
+            fi
+            echo 'trace/** 的合并点必须带 Image-Candidate: true trailer 的推送才能产出候选证明，' >&2
+            echo '否则合不进 main：在该分支上再推一个空提交，正文末尾独占一行 Image-Candidate: true' >&2
+            echo '（步骤见 deploy/README.md）。不要改写已被审查的那个提交——追加，不是重写。' >&2
+            exit 1
           fi
           if [ "${GATE_RESULT}" != success ] || [ "${EXTRAS_RESULT}" != success ] || [ "${IMAGE_RESULT}" != success ]; then
             printf 'Epic 候选未冻结：gate=%s extras=%s image=%s\n' \
