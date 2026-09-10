@@ -1,5 +1,5 @@
 [meta]
-version = "2026-09-09.668"
+version = "2026-09-10.717-2"
 
 [texts]
 "worker.failure_reference" = "追溯号：{reference}。"
@@ -12,7 +12,12 @@ version = "2026-09-09.668"
 # 『权限正在同步，预计最多需要十五分钟』，用户无需重复开通」的逐字要求。合并成一次发送，
 # 避免连着推两条只差一句话的消息。
 "onboarding.syncing" = "已核对到你的银河权限，正在完成 BI Plus 开通和权限同步。权限正在同步，预计最多需要十五分钟，无需重复开通。同步完成后会通知你。"
-"onboarding.completed" = "开通完成，你现在可以开始使用 BI Plus。当前可用范围：公司：{company_name}；职能：{function_name}。"
+# Issue #717②：合同规定「开通前发送的内容一律丢弃：不执行、不保存、不回显」
+# （产品合同与外部边界.md「用户记忆」上一节），但这条完成文案此前只说开通结果与
+# 可用范围，从未告诉用户「你开通前发的那条已经作废」。用户等了十几分钟收到这条、
+# 却一直等不到答案，无从知道自己白等——补一句明确提醒，不改「一律丢弃」这条规则
+# 本身。
+"onboarding.completed" = "开通完成，你现在可以开始使用 BI Plus。当前可用范围：公司：{company_name}；职能：{function_name}。开通过程中发送的内容不会被处理，如果仍然需要那个问题的答案，请现在重新发送。"
 "onboarding.not_authorized" = "当前没有可用的银河权限，请先在银河申请或补充权限。银河权限生效并完成同步后，请再回到 BI Plus 使用。BI Plus 不能代替你申请或扩大银河权限。如果你在银河已经有权限但仍看到此提示，请联系银河管理员。"
 # Issue #280 裁定 B2-4：加追溯号，占位名不能叫 trace_id（内容安全规则见 content.py
 # 的 _PROCESS_MARKER_PATTERN，用 {reference} 代替，见联合设计 §0.1）。
@@ -46,14 +51,25 @@ version = "2026-09-09.668"
 "onboarding.preprovisioned_first_chat" = "你的 BI Plus 已经开通，当前可用范围：公司：{company_name}；职能：{function_name}。你可以直接提问；不知道从哪里开始，可以直接问我“你能查什么？”。"
 
 "gateway.busy_hint" = "当前任务仍在处理中"
-# Issue #465（rc22 S-3，100% 响应覆盖）：同一个"话题被占用"状态现在按任务真实
-# 所处阶段拆成两条文案——已被 worker 领取、正在执行用 `gateway.busy_hint`
-# （"处理中"是真话）；已入队但还没被任何 worker 领取用这一条（"排队中"才是
-# 真话）。两条覆盖同一个用户体验缺口：既回答"忙碌期再发消息得到什么提示"
-# （`core/conversation/pipeline.py` 的忙碌判定分支），也回答"消息入队后迟迟
-# 没人理会时要不要主动补一句"（`apps/gateway/delivery.py` 的排队阈值提示，
-# 阈值定值理由见该模块文档）。
+# Issue #465（rc22 S-3，100% 响应覆盖）：同一个"话题被占用"状态按任务真实所处
+# 阶段拆成两条文案——已被 worker 领取、正在执行用 `gateway.busy_hint`
+# （"处理中"是真话）。
+# Issue #717④ 订正（2026-09-10）：`gateway.busy_hint_queued` 此前同时被两处取用——
+# `apps/gateway/delivery.py`（已入队任务迟迟没人理会时主动补的排队阈值提示，阈值
+# 定值理由见该模块文档）与 `core/conversation/pipeline.py` 的忙碌判定分支（topic
+# 被占用、新消息因此完全不受理，取的是"占位任务本身还在排队"这一支）。同一句
+# "前面还有任务在排队，请稍等"用来回答两个不同的问题：前者的任务已经入队、只是
+# 还没人领，"请稍等"是真话；后者这条新消息从未被受理、不进历史也不会自动生效，
+# 用户据此以为补充已经生效——把它继续换成"请重发"又会让前者真正排队中的任务也
+# 被要求重发（白重发一次）。因此两个场景**从今天起拆成两个键**：这一条**只**留给
+# 已入队任务的排队阈值提示；新消息未受理的那一支改取 `gateway.busy_hint_rejected`。
 "gateway.busy_hint_queued" = "前面还有任务在排队，请稍等"
+# Issue #717④ 新增：话题被占用（现有任务仍在排队、还没被任何 worker 领取）期间
+# 又来的新消息——这条消息本身**没有被受理**（不进对话历史、不排队、不会在现有
+# 任务结束后自动提交或生效），与上面 `gateway.busy_hint_queued` 描述的"你自己的
+# 任务已经排队、请稍等"是相反的事实，因此不能沿用同一句话，也不能说"请重发"以外
+# 的任何暗示已生效的话。取用点见 `core/conversation/pipeline.py::_busy_hint_for`。
+"gateway.busy_hint_rejected" = "前面还有任务在排队，这条消息暂时不会被处理；如果仍然需要，请稍后重新发送。"
 "gateway.suspended" = "你的 BI Plus 账号当前已停用，暂时无法发起新的问数。"
 "gateway.queue_failed" = "消息已收到，但当前暂时无法开始处理，请稍后重试。错误码：LX-QUEUE-001"
 # Issue #465（rc22 S-3，100% 响应覆盖）：`EventPipeline.handle_message` 的兜底
@@ -287,7 +303,10 @@ version = "2026-09-09.668"
 # rc22 B-8-1（#439 TOP-10）：/memory list 不再展示裸 mem_ ULID，改用按登记时间
 # 排出的短序号（1、2、3……）；/memory forget 同步支持按短序号删除，原始 mem_
 # id 入参仍然兼容（见 core/conversation/commands.py）。
-"memory.usage_help" = "支持的记忆命令：/memory list 查看已登记记忆（附带序号）；/memory remember <类型> <关键词> => <说明> 登记（类型可选 term_mapping/calibration_preference/convention_template）；/memory forget <序号> 删除一条（序号见 /memory list，也可以直接用完整 id）；/memory clear 清空全部。"
+# Issue #717③：完整规则一直只写在产品合同里（登记形状、50 条上限、停用或权限
+# 变化即清且不可恢复），产品内从未向用户说明过；这几条会直接改变用户预期（登记的
+# 东西会被清、有上限、不能存数字），因此把关键几条并进用法提示，规则本身不改。
+"memory.usage_help" = "支持的记忆命令：/memory list 查看已登记记忆（附带序号）；/memory remember <类型> <关键词> => <说明> 登记（类型可选 term_mapping/calibration_preference/convention_template）；/memory forget <序号> 删除一条（序号见 /memory list，也可以直接用完整 id）；/memory clear 清空全部。记忆只接受“关键词 => 说明”这一种登记形状，不会存查询结果、数字等数据本身；最多登记 50 条，达到上限后新的登记会被拒绝，需要先用 /memory clear 或 /memory forget 删除几条；账号被停用或数据权限发生变化时，已登记的记忆会被清空且无法恢复。"
 "memory.remembered" = "已登记这条记忆，下一次提问开始生效，可以用 /memory list 查看全部。"
 "memory.remember_unsafe" = "这条记忆的内容未能登记：其中包含疑似系统指令或内部标识的文本，无法安全展示或使用，请修改关键词/说明后重试。"
 "memory.limit_exceeded" = "已达到记忆条数上限（50 条），请先用 /memory clear 或 /memory forget <序号> 删除几条后再登记。"
@@ -325,7 +344,12 @@ version = "2026-09-09.668"
 # 承诺的欢迎语。
 "outreach.welcome.title" = "欢迎使用 BI Plus"
 "outreach.welcome.greeting" = "你好，{name}。"
-"outreach.welcome.intro" = "我是 BI Plus，四达时代的经营数据助手。你可以直接用中文问我经营数据，我会按你的权限范围取数作答，也能把结果整理成飞书文档发给你。"
+# 末句为 Issue #717① 新增：问数结果的可信标准规定"MCP 返回数据最新时间则展示、
+# 未返回则省略，不提示『数据时间未知』"（产品合同与外部边界.md「问数结果的可信
+# 标准」）——这条取舍本身不改，但用户此前完全不知道有这回事，问"昨天"或"本月
+# 累计"时可能把没提到数据时间误读成查询期间已经完整覆盖。提前说明这条事实，
+# 不在回答里新增"数据时间未知"这句话（合同明确禁止）。
+"outreach.welcome.intro" = "我是 BI Plus，四达时代的经营数据助手。你可以直接用中文问我经营数据，我会按你的权限范围取数作答，也能把结果整理成飞书文档发给你。如果某次回答没有提到数据更新时间，说明这次没有取得这项信息，不代表你问的时间段数据已经完整。"
 # 四个字段标题。字段列表样式把它们放进左列，markdown 分段样式把它们与取值用冒号拼成
 # 一行——两种读法共用同一份字，冒号是标点、留在代码里。
 "outreach.welcome.scope_heading" = "你当前可用范围"
@@ -353,7 +377,14 @@ version = "2026-09-09.668"
 # 批准文案里这一行前面标着「（脚注）」，那是排版位置的标注、不是要显示给用户的字：
 # 卡片里真出现「（脚注）」两个字会被读成漏删的编辑标记。位置由样式承担（永远排在
 # 最后一段），字面不带标注。
-"outreach.welcome.footnote" = "本条由 BI Plus 主动发送，你可以直接开始提问。"
+# 末句为 Issue #717⑤ 新增：欢迎卡的指标全集经 `core/outreach/audience.py` 的
+# `_parse_scope` 取得，多公司或全部公司范围下用的是"这个人到底有没有任何指标"的
+# 存在性判定（`core/permission/publish_row.lookup_metrics`，`company_id=None`
+# 时对全部键取并集），这个并集被原样当成了三条示例句的展示用指标全集——多公司
+# 用户因此可能看到一条只在其中一家公司成立的指标。真正按公司分别核对指标可用性
+# 需要改这条装配逻辑，不在本卡范围（只改说法，不改行为）；这里先加一句必要且
+# 可理解的澄清，示例不再被当作对每一家公司都保证成立的承诺。
+"outreach.welcome.footnote" = "本条由 BI Plus 主动发送，你可以直接开始提问；示例中的指标以你实际能查到的结果为准。"
 # 三条取值规则里的两个展示词。公司位在通配（全非）与超过上限时都不能把编号列表
 # 直接给用户看，两种情形的读法不同，因此是两条不同的话，不是一条带参数的话。
 "outreach.welcome.company_word_multi" = "各公司"

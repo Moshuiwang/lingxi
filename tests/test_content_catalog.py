@@ -209,6 +209,52 @@ class ContentDirectoryTests(unittest.TestCase):
         self.assertEqual(rendered.version, catalog.version)
         self.assertIn("测试公司", rendered.text)
 
+    def test_onboarding_completed_tells_the_user_to_resend_the_discarded_question(
+        self,
+    ) -> None:
+        """Issue #717②：合同规定「用户在开通前发送的内容一律丢弃：不执行、不
+        保存、不回显」，但此前 ``onboarding.completed`` 只说开通结果与可用
+        范围，从未告诉用户那条丢弃是真的发生了——用户等完开通只会继续等一个
+        永远不会来的答案。这里钉住补的那句话，且不改「一律丢弃」这条规则
+        本身（合同侧断言见 ``docs/产品合同与外部边界.md``，本卡不改文档）。
+        """
+        rendered = default_content_catalog().text(
+            "onboarding.completed", company_name="测试公司", function_name="测试职能"
+        )
+        self.assertIn("开通过程中发送的内容不会被处理", rendered.text)
+        self.assertIn("请现在重新发送", rendered.text)
+
+    def test_memory_usage_help_discloses_storage_shape_cap_and_clearing_rule(self) -> None:
+        """Issue #717③：记忆的完整规则（登记形状、50 条上限、停用或权限变化即
+        清且不可恢复）此前只写在产品合同里，产品内从未向用户说明过；这几条会
+        直接改变用户预期，因此并进用法提示，规则本身不改。"""
+        text = default_content_catalog().text("memory.usage_help").text
+        self.assertIn("不会存查询结果、数字等数据本身", text, "能存什么")
+        self.assertIn("最多登记 50 条", text, "上限")
+        self.assertIn("已登记的记忆会被清空且无法恢复", text, "会被清")
+
+    def test_busy_rejected_and_busy_queued_are_distinct_and_never_ask_a_queued_task_to_resend(
+        self,
+    ) -> None:
+        """Issue #717④：忙碌期新消息未受理（``gateway.busy_hint_rejected``，
+        ``core/conversation/pipeline.py`` 忙碌分支专用）与已入队任务的排队阈值
+        提示（``gateway.busy_hint_queued``，``apps/gateway/delivery.py`` 专用）
+        此前共用同一个键，全局换成"请重发"会让真正已经排上队的任务也被要求
+        重发——白重发一次。这里钉住两条已经拆开、且否定断言成立：已经排上队
+        的任务不得被告知"请重发"。
+        """
+        catalog = default_content_catalog()
+        rejected = catalog.text("gateway.busy_hint_rejected").text
+        queued = catalog.text("gateway.busy_hint_queued").text
+        self.assertNotEqual(rejected, queued, "两个场景不能再共用同一句话")
+        self.assertIn("重新发送", rejected, "未受理的新消息必须引导用户重发")
+        for phrase in ("请重发", "重新发送", "重发"):
+            self.assertNotIn(
+                phrase,
+                queued,
+                "已经排上队的任务不得被告知重发——那是白白多发一次",
+            )
+
     def test_a_template_naming_the_trace_id_placeholder_is_rejected_at_load_time(self) -> None:
         """#280 联合设计 §0.1【阻断级】：占位名如果叫 ``trace_id``，会在目录**加载期**
         被内容安全规则拒绝——`pipeline.py` 在 import 期就调用 `default_content_catalog()`，

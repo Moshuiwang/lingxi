@@ -395,11 +395,15 @@ class TopicSerialisationTests(GatewayPostgresTestCase):
         pipeline.handle_message(inbound("evt_1"), now=NOW)
 
         # 领取之前：evt_1 的任务默认 ``status='queued'``，还没有任何 worker 认领。
+        # Issue #717④ 起，这一支改取 `gateway.busy_hint_rejected`——evt_2 这条
+        # 新消息本身没有被受理，与 `gateway.busy_hint_queued`（`apps/gateway/
+        # delivery.py` 的排队阈值提示，说的是"你自己已受理的任务还在排队"）
+        # 是两码事，不能再共用同一句话。
         outcome = pipeline.handle_message(inbound("evt_2"), now=NOW)
         self.assertEqual(outcome.handled_as, HandledAs.BUSY_HINT)
         self.assertEqual(
             self.log.fields("reply.send_text")[-1]["text"],
-            default_content_catalog().text("gateway.busy_hint_queued").text,
+            default_content_catalog().text("gateway.busy_hint_rejected").text,
         )
 
         # 领取之后：同一个任务真正被 worker 抢到，状态转为 running。
