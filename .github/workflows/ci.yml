@@ -282,6 +282,11 @@ jobs:
         env:
           LINGXI_POSTGRES_CONTAINER: ${{ job.services.postgres.id }}
           LINGXI_POSTGRES_DSN: postgresql://postgres@localhost:5432/lingxi_test
+          # Issue #712：单测按文件哈希分 4 片并行，每片在同一个 postgres 服务容器内
+          # 各自一个数据库，互不清场、一片污染不连坐其余分片。4 与公共 runner
+          # （ubuntu-24.04，标准规格 4 vCPU）核数对齐；不拆本 job 的图——job 图早已
+          # 并行（docs/l1/gate/extras 同时起跑），这里只改这一步内部的执行方式。
+          LINGXI_TEST_SHARD_COUNT: "4"
         run: scripts/ci/verify_repository.sh
 
       # 安装与测试都在检出目录里跑。生成物已被 .gitignore 覆盖，但受版本控制的

@@ -9,6 +9,7 @@
 #   scripts/dev/check.sh --print-mode        # 只打印分层结论，不安装依赖、不运行任何检查
 #   scripts/dev/check.sh --keep-db           # full 模式结束后不清理临时真库容器
 #   scripts/dev/check.sh --reuse-venv        # 复用已存在的虚拟环境，跳过默认的重建
+#   scripts/dev/check.sh full --shards N     # full 模式按 N 片并行跑单测（Issue #712）
 #
 # 三层与 CI 的对应关系（验证与门禁第五节 / 第十一节）：
 #   docs  等价于 Story / docs 与 Epic Full / docs：只跑 scripts/ci/verify_docs.sh，
@@ -72,6 +73,7 @@ usage() {
   --print-mode         只打印分层结论（docs/l1/fast/full），不做任何安装或检查
   --keep-db            full 模式结束后保留临时真库容器（默认用完即删）
   --reuse-venv         复用已存在的虚拟环境，跳过默认的「每次重建」
+  --shards <N>         full 模式按 N 片并行跑单测，每片独占一个数据库（Issue #712）
   -h, --help           显示本帮助
 EOF
 }
@@ -82,6 +84,7 @@ keep_db=0
 print_mode_only=0
 committed_only=0
 reuse_venv=0
+shard_count=""
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -116,6 +119,18 @@ while [[ $# -gt 0 ]]; do
     --reuse-venv)
       reuse_venv=1
       shift
+      ;;
+    --shards)
+      if [[ $# -lt 2 ]]; then
+        printf -- '--shards 需要一个参数（分片数），例如 --shards 4\n' >&2
+        exit 1
+      fi
+      if ! [[ "$2" =~ ^[0-9]+$ ]] || [[ "$2" -lt 1 ]]; then
+        printf -- '--shards 必须是一个正整数，实际给的是 %s\n' "$2" >&2
+        exit 1
+      fi
+      shard_count="$2"
+      shift 2
       ;;
     -h | --help)
       usage
@@ -398,10 +413,20 @@ run_full() {
   printf '临时真库已就绪：容器=%s 端口=%s（trust 认证，与本机既有 scram 测试库互不影响）\n' \
     "${full_pg_container}" "${host_port}" >&2
 
-  LINGXI_POSTGRES_CONTAINER="${full_pg_container}" \
-    LINGXI_POSTGRES_DSN="postgresql://postgres@localhost:${host_port}/${spec[POSTGRES_DB]}" \
-    PATH="${venv_dir}/bin:${PATH}" \
-    scripts/ci/verify_repository.sh
+  # --shards 未给时这一行与改造前逐字相同（回退路径）：不导出
+  # LINGXI_TEST_SHARD_COUNT，verify_repository.sh 走它今天已有的单进程分支。
+  if [[ -n "${shard_count}" ]]; then
+    LINGXI_POSTGRES_CONTAINER="${full_pg_container}" \
+      LINGXI_POSTGRES_DSN="postgresql://postgres@localhost:${host_port}/${spec[POSTGRES_DB]}" \
+      LINGXI_TEST_SHARD_COUNT="${shard_count}" \
+      PATH="${venv_dir}/bin:${PATH}" \
+      scripts/ci/verify_repository.sh
+  else
+    LINGXI_POSTGRES_CONTAINER="${full_pg_container}" \
+      LINGXI_POSTGRES_DSN="postgresql://postgres@localhost:${host_port}/${spec[POSTGRES_DB]}" \
+      PATH="${venv_dir}/bin:${PATH}" \
+      scripts/ci/verify_repository.sh
+  fi
   check_git_tree_is_clean
 }
 
