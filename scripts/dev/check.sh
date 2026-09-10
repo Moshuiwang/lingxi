@@ -9,7 +9,8 @@
 #   scripts/dev/check.sh --print-mode        # 只打印分层结论，不安装依赖、不运行任何检查
 #   scripts/dev/check.sh --keep-db           # full 模式结束后不清理临时真库容器
 #   scripts/dev/check.sh --reuse-venv        # 复用已存在的虚拟环境，跳过默认的重建
-#   scripts/dev/check.sh full --shards N     # full 模式按 N 片并行跑单测（Issue #712）
+#   scripts/dev/check.sh full --shards [N]   # full 模式按 N 片并行跑单测，N 省略时取
+#                                             # DEFAULT_SHARD_COUNT（Issue #712 调粒度批实测）
 #
 # 三层与 CI 的对应关系（验证与门禁第五节 / 第十一节）：
 #   docs  等价于 Story / docs 与 Epic Full / docs：只跑 scripts/ci/verify_docs.sh，
@@ -73,7 +74,8 @@ usage() {
   --print-mode         只打印分层结论（docs/l1/fast/full），不做任何安装或检查
   --keep-db            full 模式结束后保留临时真库容器（默认用完即删）
   --reuse-venv         复用已存在的虚拟环境，跳过默认的「每次重建」
-  --shards <N>         full 模式按 N 片并行跑单测，每片独占一个数据库（Issue #712）
+  --shards [N]         full 模式按 N 片并行跑单测，每片独占一个数据库（Issue #712）；
+                       N 省略时取 DEFAULT_SHARD_COUNT（本机实测稳定跑绿的分片数）
   -h, --help           显示本帮助
 EOF
 }
@@ -85,6 +87,12 @@ print_mode_only=0
 committed_only=0
 reuse_venv=0
 shard_count=""
+
+# --shards 不给具体数字时的默认分片数：本机 2026-09-10 实测（#712 调粒度批），
+# 4 路并发会把同一个一次性 postgres 容器压过 statement_timeout（判红，不是代码
+# 问题），2 路是当时验证过零环境性失败的最小可用值。以后要调大，先跑绿再改这
+# 个数，不要只因为「更多分片听起来更快」就改。
+readonly DEFAULT_SHARD_COUNT=2
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -121,16 +129,20 @@ while [[ $# -gt 0 ]]; do
       shift
       ;;
     --shards)
-      if [[ $# -lt 2 ]]; then
-        printf -- '--shards 需要一个参数（分片数），例如 --shards 4\n' >&2
-        exit 1
+      # 数字参数可省略：后面没有参数、或紧跟着另一个看起来不是分片数的 token
+      # （下一层级关键字、另一个 `--` 选项）时，都视为「没给」，取默认值，而不
+      # 是报错——`--shards` 后面不是必须再跟一个数字。
+      if [[ $# -ge 2 && "$2" =~ ^[0-9]+$ ]]; then
+        if [[ "$2" -lt 1 ]]; then
+          printf -- '--shards 给的数字必须是正整数，实际给的是 %s\n' "$2" >&2
+          exit 1
+        fi
+        shard_count="$2"
+        shift 2
+      else
+        shard_count="${DEFAULT_SHARD_COUNT}"
+        shift 1
       fi
-      if ! [[ "$2" =~ ^[0-9]+$ ]] || [[ "$2" -lt 1 ]]; then
-        printf -- '--shards 必须是一个正整数，实际给的是 %s\n' "$2" >&2
-        exit 1
-      fi
-      shard_count="$2"
-      shift 2
       ;;
     -h | --help)
       usage

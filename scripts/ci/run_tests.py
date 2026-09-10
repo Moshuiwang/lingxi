@@ -67,7 +67,7 @@ def _iter_test_cases(suite: unittest.TestSuite) -> Any:
 
 
 def _case_source_file(case: unittest.TestCase) -> str:
-    """一条用例所在的源文件绝对路径，作为分片哈希的输入。
+    """一条用例所在的源文件绝对路径，作为分片分桶的依据。
 
     模块导入失败时 unittest 会造一个占位 `_FailedTest`，它的 `__module__`
     指向 `unittest.loader` 本身而不是真正失败的那个文件——这种情况下退回
