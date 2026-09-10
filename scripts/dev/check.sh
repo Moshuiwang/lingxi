@@ -449,6 +449,15 @@ run_full() {
   check_git_tree_is_clean
 }
 
+# 独立审查提出：`--shards` 只在 full 层被读取，给了别的层级会被**静默忽略**——
+# 敲了参数、以为分片生效了，其实什么都没发生。今天这一批已经反复踩到「一个信号
+# 在它该为假时照样返回真」，这里不留同型的坑：不适用就响亮拒绝，不装作接受。
+if [[ -n "${shard_count}" && "${mode}" != "full" ]]; then
+  printf -- '--shards 只对 full 层有效，当前层级是 %s。\n' "${mode}" >&2
+  printf -- '换成 `scripts/dev/check.sh full --shards %s`，或去掉 --shards。\n' "${shard_count}" >&2
+  exit 2
+fi
+
 case "${mode}" in
   docs) run_docs ;;
   l1) run_l1 ;;

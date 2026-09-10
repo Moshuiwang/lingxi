@@ -309,10 +309,17 @@ class NoOptInEnvironmentBehaviorTests(unittest.TestCase):
         with TemporaryDirectory() as workdir:
             passing_dir = Path(workdir) / "passing_tests"
             passing_dir.mkdir()
+            # 独立复核 P2-6：夹具只有一条用例时，`Ran [1-9]\d*` 只能证明「至少跑了
+            # 一条」。实测把发现结果截断成只保留第一条，真实仓库 6563 条只跑 1 条，
+            # 门禁照常打印「通过」而钉住测试全绿。三条用例 + 精确匹配才挡得住截断。
             (passing_dir / "test_premise_ok.py").write_text(
                 "import unittest\n\n\n"
                 "class PremiseOkTests(unittest.TestCase):\n"
                 "    def test_premise_pass(self) -> None:\n"
+                "        self.assertTrue(True)\n\n"
+                "    def test_premise_pass_second(self) -> None:\n"
+                "        self.assertTrue(True)\n\n"
+                "    def test_premise_pass_third(self) -> None:\n"
                 "        self.assertTrue(True)\n",
                 encoding="utf-8",
             )
@@ -323,8 +330,9 @@ class NoOptInEnvironmentBehaviorTests(unittest.TestCase):
             # 恒返回 0 或 discover 匹配不到文件时，这一行会是 `Ran 0 tests`。
             self.assertRegex(
                 output,
-                r"Ran [1-9]\d* tests?",
-                "默认路径必须真的发现并跑到用例；`Ran 0 tests` 与恒返回 0 都是假绿",
+                r"Ran 3 tests",
+                "默认路径必须把夹具里三条用例全部跑到——`Ran 0` 是空跑、"
+                "`Ran 1` 是发现结果被截断，两者在只看退出码时都伪装成全绿",
             )
             self.assertIn(
                 "test_premise_pass",
@@ -335,17 +343,112 @@ class NoOptInEnvironmentBehaviorTests(unittest.TestCase):
         with TemporaryDirectory() as workdir:
             failing_dir = Path(workdir) / "failing_tests"
             failing_dir.mkdir()
+            # 独立复核 P2-7：只有 self.fail()（failure 一类）时，把返回码判定改成
+            # 只看 failures 就能静默吞掉 error 一类。两类各放一条才挡得住。
             (failing_dir / "test_premise_fail.py").write_text(
                 "import unittest\n\n\n"
                 "class PremiseFailTests(unittest.TestCase):\n"
                 "    def test_premise_fail(self) -> None:\n"
-                "        self.fail('钉住：失败必须传播成非零退出码')\n",
+                "        self.fail('钉住：失败必须传播成非零退出码')\n\n"
+                "    def test_premise_error(self) -> None:\n"
+                "        raise ValueError('钉住：抛异常同样必须传播成非零退出码')\n",
                 encoding="utf-8",
             )
             code, output = run_against(failing_dir)
 
             self.assertEqual(code, 1, "用例失败时默认路径必须返回 1——吞掉失败是本条要挡的假绿")
-            self.assertRegex(output, r"Ran [1-9]\d* tests?")
+            self.assertRegex(output, r"Ran 2 tests")
+            self.assertIn("failures=1", output)
+            self.assertIn("errors=1", output)
+
+        # 上面那个夹具里 failure 与 error 各一条，于是「只看 failures」的吞法照样
+        # 返回 1，抓不住——独立复核实测该变异存活。这里再要一个**只有 error**的
+        # 场景：把返回码判定改成只看 failures，这一段立刻判红。
+        with TemporaryDirectory() as workdir:
+            error_only_dir = Path(workdir) / "error_only_tests"
+            error_only_dir.mkdir()
+            (error_only_dir / "test_premise_error_only.py").write_text(
+                "import unittest\n\n\n"
+                "class PremiseErrorOnlyTests(unittest.TestCase):\n"
+                "    def test_premise_raises(self) -> None:\n"
+                "        raise ValueError('钉住：只有 error 时同样必须返回 1')\n",
+                encoding="utf-8",
+            )
+            code, output = run_against(error_only_dir)
+
+            self.assertEqual(
+                code,
+                1,
+                "只有 error、没有 failure 时也必须返回 1——「只看 failures」是本条要挡的吞法",
+            )
+            self.assertIn("errors=1", output)
+            self.assertNotIn("failures=1", output)
+
+    def test_default_path_keeps_unittest_cli_warning_behaviour(self) -> None:
+        """独立复核 P2-8：`warnings="default"` 这个修复本身没有被钉住。
+
+        `python -m unittest` 经 TestProgram 传 `warnings='default'`；
+        `TextTestRunner` 不传时默认是 None，于是 DeprecationWarning /
+        ResourceWarning 在门禁日志里彻底消失。退出码不受影响，所以它是一处
+        **静默的**判据强度下降——正因为静默，一次「清理多余参数」的改动就能
+        把它退回去而无人察觉。这条直接钉住那个参数的效果，不是钉住它的写法。
+        """
+
+        opt_in_vars = (
+            "LINGXI_TEST_SHARD_INDEX",
+            "LINGXI_TEST_SHARD_COUNT",
+            "LINGXI_TEST_DURATIONS_DIR",
+            "LINGXI_TEST_REPORT_PATH",
+        )
+        with TemporaryDirectory() as workdir:
+            fixture_dir = Path(workdir) / "warning_tests"
+            fixture_dir.mkdir()
+            (fixture_dir / "test_premise_warn.py").write_text(
+                "import unittest\n"
+                "import warnings\n\n\n"
+                "class PremiseWarnTests(unittest.TestCase):\n"
+                "    def test_emits_deprecation_warning(self) -> None:\n"
+                "        warnings.warn('钉住：默认路径必须照常打印这条', DeprecationWarning)\n",
+                encoding="utf-8",
+            )
+            for stale in [m for m in sys.modules if m.startswith("test_premise_")]:
+                sys.modules.pop(stale, None)
+            recorded: dict[str, object] = {}
+            real_runner = run_tests.unittest.TextTestRunner
+
+            def spy(*args, **kwargs):  # noqa: ANN002, ANN003, ANN202
+                recorded.update(kwargs)
+                return real_runner(*args, **kwargs)
+
+            with (
+                mock.patch.object(run_tests, "TESTS_DIRECTORY", fixture_dir),
+                mock.patch.object(run_tests.unittest, "TextTestRunner", spy),
+                mock.patch.dict(os.environ, {}, clear=False),
+            ):
+                for key in opt_in_vars:
+                    os.environ.pop(key, None)
+                captured = io.StringIO()
+                with mock.patch("sys.stderr", captured):
+                    code = run_tests._run()
+            output = captured.getvalue()
+
+        self.assertEqual(code, 0, output)
+        # 本来直接断言输出里有 DeprecationWarning，但**那条断言在这个跑法下没有
+        # 区分力**：外层是 `python -m unittest` 起的，TestProgram 已把 warnings
+        # 过滤全局设成 default，内层 _run() 继承了它——去掉参数照样打印。独立复核
+        # 实测该变异存活，因此改成直接钉住传给 runner 的那个参数本身。
+        self.assertEqual(
+            recorded.get("warnings"),
+            "default",
+            "TextTestRunner 必须显式收到 warnings='default'，与 `python -m unittest` 一致；"
+            "不传时弃用告警会在门禁日志里静默消失",
+        )
+        self.assertIn(
+            "DeprecationWarning",
+            output,
+            "默认路径必须与 `python -m unittest` 一样打印弃用告警；"
+            "少打印的告警同样是可观察行为差异",
+        )
 
 
 class ShardEnvironmentTests(unittest.TestCase):

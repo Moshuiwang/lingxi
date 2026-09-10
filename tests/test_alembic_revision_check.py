@@ -284,12 +284,41 @@ class ReadmeDocumentedRevisionsTest(unittest.TestCase):
         self.assertEqual(len(failures), 1)
         self.assertIn("基线 revision（链首）", failures[0])
 
-    def test_missing_table_is_rejected_for_both_rows(self) -> None:
+    def test_missing_table_is_rejected_and_says_the_table_is_missing(self) -> None:
+        """小节在、表不在：判红，且文案必须指向「表读不到」而不是「表里缺某一行」。
+
+        独立复核 P2-5：此前这里复用的是逐行文案（报两条「表里没有这一行」），
+        而表根本不存在——改的人会盯着一张不存在的表找那两行。判红方向没变，
+        变的是它把人指向哪里。
+        """
+
         readme = "## 谁说了算\n\n本文档没有表格。\n"
         failures = CHECK.check_readme_documented_revisions(
             readme, heads=["0093_admin_followup_depends_idx"], bases=["20260806_baseline"]
         )
-        self.assertEqual(len(failures), 2)
+        self.assertEqual(len(failures), 1, failures)
+        self.assertIn("读不到", failures[0])
+        self.assertIn("当前事实", failures[0])
+
+    def test_missing_section_says_the_section_is_missing(self) -> None:
+        """小节标题被改动一个字：判红，且文案必须指向标题而不是表。
+
+        独立复核 P2-4：小节标题是整行全等比对，改一个字就等于把这道校验关掉，
+        所以必须判红；但此前的文案说「表里没有这一行」，而表和值都是对的。
+        """
+
+        readme = (
+            "## 谁说了算（2026 改写）\n\n"
+            "| 当前事实 | 值 |\n"
+            "| --- | --- |\n"
+            "| 基线 revision（链首） | `20260806_baseline` |\n"
+            "| head revision | `0093_admin_followup_depends_idx` |\n"
+        )
+        failures = CHECK.check_readme_documented_revisions(
+            readme, heads=["0093_admin_followup_depends_idx"], bases=["20260806_baseline"]
+        )
+        self.assertEqual(len(failures), 1, failures)
+        self.assertIn("小节标题", failures[0])
 
     def test_a_decoy_table_outside_the_section_cannot_stand_in(self) -> None:
         """外审实测的绕过：正确的同名表放在别处，真正那张被删，校验静默通过。

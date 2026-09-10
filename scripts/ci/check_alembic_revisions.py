@@ -206,6 +206,12 @@ _README_BASE_LABEL = "基线 revision（链首）"
 _README_SECTION_HEADING = "## 谁说了算"
 
 
+def _has_section(readme: str) -> bool:
+    """「谁说了算」小节标题是否存在（整行全等，与解析时同一口径）。"""
+
+    return any(line.strip() == _README_SECTION_HEADING for line in readme.splitlines())
+
+
 def _extract_readme_documented_values(readme: str) -> dict[str, str]:
     """只解析「谁说了算」小节那张固定的「当前事实」表，取每行反引号包裹的取值。
 
@@ -260,6 +266,26 @@ def check_readme_documented_revisions(readme: str, heads: list[str], bases: list
 
     failures: list[str] = []
     documented = _extract_readme_documented_values(readme)
+
+    # 独立复核 P2-4 / P2-5：小节标题被改动一个字（全等比较不成立），或小节内表格
+    # 之前出现了含 `## ` 行的代码块，都会让表读不到。判红方向是对的（fail-closed），
+    # 但此前复用的是「表里没有这一行」那句文案——表明明就在那儿、值也是对的，改的人
+    # 会盯着表找问题。这里把「小节没找到」「小节里没有表」各拆出一句，直接指向真因。
+    if not _has_section(readme):
+        failures.append(
+            f"migrations/README.md 里找不到「{_README_SECTION_HEADING}」小节标题"
+            "（按整行全等比对）。「当前事实」表必须落在这一节里才会被读取——"
+            "改了标题就等于把这道校验关掉了，因此这里判红。"
+        )
+        return failures
+    if not documented:
+        failures.append(
+            f"migrations/README.md 的「{_README_SECTION_HEADING}」小节里读不到"
+            "「当前事实」表。常见原因：表被挪到小节之外，或表之前插入了含 `## ` "
+            "开头行的代码块（那会被当成新小节的开始）。"
+        )
+        return failures
+
     expectations: list[tuple[str, str]] = []
     if len(heads) == 1:
         expectations.append((_README_HEAD_LABEL, heads[0]))
