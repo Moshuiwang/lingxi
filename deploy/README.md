@@ -59,6 +59,13 @@ docker compose --env-file deploy/.env.stage -f deploy/compose.yaml -f deploy/com
 
 镜像仓库为 GHCR（2026-08-06 产品负责人拍板，见 Issue #62 决策登记），CI 用 Actions 原生 `GITHUB_TOKEN` 推送，不新增外部账号凭据。
 
+**推送结果只有两个分支，读日志时按这两句原文认**（`scripts/ci/push_image.py` 的现行输出）：
+
+- **成功**：摘要写「**镜像已推送 GHCR**」，并回读 digest。此时 GHCR 上那一份就是权威制品。
+- **权限不足**：摘要写「**未推送 GHCR：权限不足（已降级为 CI artifact）**」，同时发一条告警，镜像 tar 存进 **CI artifact** 留证。**这是显式降级，不是失败**——作业仍然是绿的，但那一份镜像**不在 GHCR 上**，拉取方拉不到；要用它必须从 artifact 取。
+
+**其余失败（网络、超时、仓库不存在等）不降级、直接判红**：把它们一起降级会让真正的问题变成一个绿色作业，没人来看。
+
 ## 版本号规则
 
 （Issue #417，2.0 发布前置）
