@@ -365,7 +365,9 @@ def run_bootstrap() -> int:
 
 
 def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description="apps 纯逻辑棘轮门禁（Issue #656）", allow_abbrev=False)
+    parser = argparse.ArgumentParser(
+        description="apps 纯逻辑棘轮门禁（Issue #656）", allow_abbrev=False
+    )
     mode = parser.add_mutually_exclusive_group()
     mode.add_argument(
         "--refresh",

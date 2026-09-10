@@ -16,7 +16,9 @@ SCRIPT = Path(__file__).parents[1] / "scripts" / "ci" / "check_apps_pure_logic_r
 
 
 def _load_script():
-    spec = importlib.util.spec_from_file_location("apps_pure_logic_ratchet_check_under_test", SCRIPT)
+    spec = importlib.util.spec_from_file_location(
+        "apps_pure_logic_ratchet_check_under_test", SCRIPT
+    )
     module = importlib.util.module_from_spec(spec)
     assert spec.loader is not None
     spec.loader.exec_module(module)
@@ -28,7 +30,9 @@ CHECK = _load_script()
 
 class BaselineParsingTest(unittest.TestCase):
     def test_good_baseline_parses(self) -> None:
-        text = "# 注释行\n\n120\tsrc/lingxi/apps/gateway/foo.py\n30\tsrc/lingxi/apps/worker/bar.py\n"
+        text = (
+            "# 注释行\n\n120\tsrc/lingxi/apps/gateway/foo.py\n30\tsrc/lingxi/apps/worker/bar.py\n"
+        )
         self.assertEqual(
             CHECK.parse_baseline(text),
             {
@@ -75,10 +79,7 @@ class EvaluateTest(unittest.TestCase):
         current = {"src/lingxi/apps/gateway/new_judgment.py": 12}
         failures = CHECK.evaluate(baseline, current)
         self.assertTrue(
-            any(
-                "新命中" in f and "src/lingxi/apps/gateway/new_judgment.py" in f
-                for f in failures
-            ),
+            any("新命中" in f and "src/lingxi/apps/gateway/new_judgment.py" in f for f in failures),
             failures,
         )
 
@@ -298,7 +299,9 @@ class MeasureAndBootstrapTest(unittest.TestCase):
         )
         current = CHECK.measure(CHECK.iter_scope_files())
         self.assertIn("src/lingxi/apps/gateway/judgment.py", current)
-        self.assertGreaterEqual(current["src/lingxi/apps/gateway/judgment.py"], CHECK.MIN_CODE_LINES)
+        self.assertGreaterEqual(
+            current["src/lingxi/apps/gateway/judgment.py"], CHECK.MIN_CODE_LINES
+        )
 
     def test_bootstrap_then_check_passes_on_the_same_tree(self) -> None:
         self._write_module(
