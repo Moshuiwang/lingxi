@@ -173,6 +173,13 @@ GROUNDED_ATTRIBUTIONS: tuple[GroundedAttribution, ...] = (
         "不提供",
     ),
     GroundedAttribution(
+        # 2026-09-10 核对：合同「开通成功后」一节逐字写着这句话，测试引的是原文
+        # 而不是转述，因此按登记表的设计登记为「已对上」，不改写措辞躲开门禁。
+        "tests/test_content_catalog.py",
+        "合同规定「用户在开通前发送的内容一律丢弃：不执行、不保存、不回显」。",
+        "开通成功后",
+    ),
+    GroundedAttribution(
         "src/lingxi/core/execution/input_safety.py",
         "个动机本身有合同依据，与 `apps/worker/report.py` 的 ``obtained`` 同一条",
         "交付规则",

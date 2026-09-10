@@ -212,11 +212,12 @@ class ContentDirectoryTests(unittest.TestCase):
     def test_onboarding_completed_tells_the_user_to_resend_the_discarded_question(
         self,
     ) -> None:
-        """Issue #717②：合同规定「用户在开通前发送的内容一律丢弃：不执行、不
-        保存、不回显」，但此前 ``onboarding.completed`` 只说开通结果与可用
-        范围，从未告诉用户那条丢弃是真的发生了——用户等完开通只会继续等一个
-        永远不会来的答案。这里钉住补的那句话，且不改「一律丢弃」这条规则
-        本身（合同侧断言见 ``docs/产品合同与外部边界.md``，本卡不改文档）。
+        """开通完成后必须告诉用户「开通前那条问题被丢弃了、要重发一次」。
+
+        合同规定「用户在开通前发送的内容一律丢弃：不执行、不保存、不回显」。
+        而此前 ``onboarding.completed`` 只说开通结果与可用范围，从未告诉用户那条
+        丢弃真的发生了——用户等完开通，只会继续等一个永远不会来的答案。这里钉住
+        补的那句话；「一律丢弃」这条规则本身不动。
         """
         rendered = default_content_catalog().text(
             "onboarding.completed", company_name="测试公司", function_name="测试职能"
