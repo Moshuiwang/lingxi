@@ -459,6 +459,10 @@ docker compose --env-file deploy/.env.prod \
 
 - `--gateway-legacy-file` / `--scheduler-legacy-file`：两份现行静态名单，**内容必须一致**，不一致整份拒绝。
 - `--emails-file`：本次要写入的成员邮箱。
+- `--binding-id`（仅 `apply`）：**必须与 `/etc/lingxi/innertest/binding.json` 里的 `binding_id`、以及
+  `LINGXI_INNERTEST_BINDING_ID` 是同一个字符串。** 受限管理入口按这个标识去查绑定行，三处对不上
+  就认证不了任何请求——装配看起来正常，实际每次调用都失败。**先定这个值，再建绑定文件、配环境
+  变量、跑导入**，顺序不要颠倒。
 
 ```bash
 # 1. 只读预演：核两份静态名单是否一致、把每个邮箱定位到组织成员、算出摘要。零写入。
@@ -474,7 +478,8 @@ docker compose exec -T scheduler python -m lingxi.apps.innertest_roster apply \
   --gateway-legacy-file /tmp/legacy-gateway.txt \
   --scheduler-legacy-file /tmp/legacy-scheduler.txt \
   --emails-file /tmp/emails.txt \
-  --confirm-digest <上一步的摘要>
+  --confirm-digest <上一步的摘要> \
+  --binding-id <与 binding.json 和 LINGXI_INNERTEST_BINDING_ID 相同的那个标识>
 
 # 3. 回读确认：模式、版本、摘要、成员数、绑定状态，输出是一行 JSON。
 docker compose exec -T scheduler python -m lingxi.apps.innertest_roster verify \

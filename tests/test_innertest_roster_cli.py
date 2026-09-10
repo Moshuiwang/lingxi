@@ -160,7 +160,7 @@ class ApplyCommandTests(unittest.TestCase):
         self.scheduler = self.fixture.write("scheduler.txt", ["ou_1"])
         self.emails = self.fixture.write("emails.txt", ["a@x.test"])
 
-    def _argv(self, digest="digest123"):
+    def _argv(self, digest="digest123", binding_id="iab_given_by_caller"):
         return [
             "apply",
             "--scope",
@@ -173,6 +173,8 @@ class ApplyCommandTests(unittest.TestCase):
             self.emails,
             "--confirm-digest",
             digest,
+            "--binding-id",
+            binding_id,
         ]
 
     def test_success_redacts_admin_open_id_and_prints_binding(self) -> None:
@@ -195,12 +197,29 @@ class ApplyCommandTests(unittest.TestCase):
 
         self.assertEqual(code, 0)
         self.assertEqual(calls[0]["admin_open_id"], "ou_real_secret_identifier")
-        self.assertTrue(calls[0]["binding_id"].startswith("iab_"))
+        # 绑定标识必须原样用调用方给的那个：受限入口按它查行，自行生成的对不上。
+        self.assertEqual(calls[0]["binding_id"], "iab_given_by_caller")
         self.assertNotIn("ou_real_secret_identifier", out.getvalue())
         # 只封锁标准输出等于只锁半扇门：标识漏到标准错误一样是泄漏。
         self.assertNotIn("ou_real_secret_identifier", err.getvalue())
         self.assertIn("digest123", out.getvalue())
         self.assertIn(calls[0]["binding_id"], out.getvalue())
+
+    def test_binding_id_is_required_and_is_not_generated(self) -> None:
+        """不给绑定标识就不许写。
+
+        自行生成的标识永远对不上受限入口要求的那一个（绑定文件与环境变量里
+        登记的值），装配完认证不了任何请求——那正是这个参数存在的理由。
+        """
+        argv = [a for a in self._argv() if a not in ("--binding-id", "iab_given_by_caller")]
+        with self.assertRaises(SystemExit) as raised:
+            innertest_roster.run(
+                argv,
+                env={"LINGXI_POSTGRES_DSN": "postgresql://u:p@x/y"},
+                stdout=io.StringIO(),
+                stderr=io.StringIO(),
+            )
+        self.assertEqual(raised.exception.code, 2)
 
     def test_lookup_failure_fails_closed_without_calling_apply(self) -> None:
         err = io.StringIO()

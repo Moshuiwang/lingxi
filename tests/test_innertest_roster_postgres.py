@@ -280,12 +280,19 @@ class RosterImportCliDefaultWiringTests(_RosterImportPostgresBase):
                     emails,
                     "--confirm-digest",
                     digest,
+                    "--binding-id",
+                    "iab_round_trip",
                 ],
                 env=env,
                 stdout=apply_out,
             )
             self.assertEqual(code, 0)
             self.assertNotIn("ou_delegated", apply_out.getvalue())
+            # 库里那一行的标识必须就是调用方给的：受限入口按它查行。
+            self.assertEqual(
+                self.sql("select id from innertest_admin_binding where scope=%s", (SCOPE,)),
+                [("iab_round_trip",)],
+            )
 
             verify_out = io.StringIO()
             code = innertest_roster.run(["verify", "--scope", SCOPE], env=env, stdout=verify_out)

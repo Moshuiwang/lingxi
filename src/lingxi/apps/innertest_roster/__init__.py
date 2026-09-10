@@ -21,7 +21,6 @@ from pathlib import Path
 from typing import TextIO
 
 from lingxi.core.admin.innertest import InnertestError
-from lingxi.core.ids import new_id
 
 DSN_ENV_VAR = "LINGXI_POSTGRES_DSN"
 
@@ -44,6 +43,7 @@ def parse_arguments(argv: Sequence[str] = ()) -> argparse.Namespace:
     apply_parser = sub.add_parser("apply")
     _add_source_arguments(apply_parser)
     apply_parser.add_argument("--confirm-digest", required=True)
+    apply_parser.add_argument("--binding-id", required=True)
 
     verify_parser = sub.add_parser("verify")
     verify_parser.add_argument("--scope", required=True)
@@ -161,7 +161,11 @@ def _cmd_apply(
     apply_import: Callable,
     lookup_delegated_subject: Callable[[], str | None],
 ) -> int:
-    """摘要须与调用方给出的逐字相符才写；专用授权主体解析异常同样零写入。"""
+    """摘要须与调用方给出的逐字相符才写；专用授权主体解析异常同样零写入。
+
+    绑定标识由调用方给定而不是这里生成：受限管理入口要求绑定文件、环境变量与
+    这一行的标识是同一个字符串，生成的值对不上，装配完也认证不了任何请求。
+    """
     sources = _load_sources(args, err)
     if sources is None:
         return 2
@@ -171,7 +175,7 @@ def _cmd_apply(
     except Exception as error:
         print(f"读取专用授权主体登记失败：{type(error).__name__}", file=err)
         return 1
-    binding_id = new_id("iab")
+    binding_id = args.binding_id
     try:
         plan = apply_import(
             dsn,

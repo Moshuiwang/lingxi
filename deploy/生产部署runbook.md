@@ -874,7 +874,9 @@ dry-run 打印的条数与这张表对不上，说明职位列命中的键跟预
 - 受限通路真正可用所需的 SSH forced-command、authorized_keys、主体到 socket 权限
   的映射——这些同样是运维安装侧的前置，本节不涉及，也不由这份覆盖文件提供。
 - 一份受限作用域标识（`LINGXI_INNERTEST_SCOPE`）与绑定标识
-  （`LINGXI_INNERTEST_BINDING_ID`）的约定值，与绑定文件里登记的一致。
+  （`LINGXI_INNERTEST_BINDING_ID`）的约定值。**绑定标识有三处必须逐字相同**：这个环境变量、
+  `binding.json` 里的 `binding_id`、以及数据库里那一行绑定的 id（由名单导入命令的 `--binding-id`
+  写入）。三处对不上，入口会注册成功但每次调用都认证失败——先定值，再建文件、配变量、跑导入。
 
 ### 15.2 打开的命令
 
