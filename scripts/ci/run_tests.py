@@ -89,9 +89,13 @@ def _manifest_key(source_file: str) -> str:
 
     清单要能跨机器、跨 worktree 提交复用，不能按绝对路径记——不同 checkout 的
     路径前缀不一样。`_case_source_file` 的正常输出是绝对路径，这里换算成相对
-    路径；换算不出来（不是绝对路径，例如模块导入失败时退回的 `case.id()`，或
+    路径；换算不出来（不是绝对路径，例如模块导入失败时退回的 `该文件在仓库树下的相对路径`，或
     者绝对路径根本不在仓库树下）一律原样返回——`_assign_files_to_shards` 的
     默认权重兜底会接住它，不需要在这里特殊处理或报错。
+
+    注：模块导入失败造出的 `_FailedTest` 解析出的是标准库 `unittest/loader.py`
+    的绝对路径，不在仓库树下，因此走「原样返回」那一支——**不是**退回 `case.id()`。
+    把关审查实测坐实；此前这段与 `_case_source_file` 的说明互相矛盾。
     """
 
     path = Path(source_file)
