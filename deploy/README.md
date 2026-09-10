@@ -320,7 +320,10 @@ PR 绕过服务端拒绝。
    `image` 与 `candidate` 两个作业；`gate` 与 `extras` 的准入条件逐字沿用改动前
    的样子，`check_deploy_contract.py` 钉住这两个作业体内不得出现 `trace/` 或
    `head_ref` 相关的跳过条件。**真正的兜底不是这条断言，而是 `candidate`**：
-   `gate` 或 `extras` 一旦没有 success，`candidate` 照样判红、合不进 `main`。这条
+   **在会走到镜像证明这一步的候选上**（即非纯文档、非 L1 的改动——给 `gate` 开
+   后门必然要改工作流，因此一定落在这一档），`gate` 或 `extras` 一旦没有
+   success，`candidate` 照样判红、合不进 `main`。纯文档与 L1 的候选走的是更早的
+   早退分支，那两条路径上 `gate` / `extras` 本来就该跳过，没有东西被绕过。这条
    断言的作用是让「有人想给 `gate` 开后门」这件事在改动当场就被拦下，而不是等到
    合并时才发现——它只认字面量，把条件换个等价写法可以绕过它，**绕不过的是
    `candidate`**。
