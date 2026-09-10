@@ -1656,6 +1656,40 @@ class CandidateSummaryRoutingTest(unittest.TestCase):
                     result.stdout + result.stderr,
                 )
 
+    def test_trace_head_with_failed_gate_points_at_gate_not_trailer(self) -> None:
+        """Issue #733 / 把关审查 P2-B：gate 没过时不得把人指去补 trailer。
+
+        gate 或 extras 没通过时 image 同样被跳过，也落到 trace 的判红分支。若不先
+        分辨，读者会把「gate 红」读成「你没推 trailer」，于是白推一个空提交、白跑
+        一轮完整门禁才发现问题根本不在 trailer 上。两种情形都必须判红，但要指向
+        不同的下一步。
+        """
+
+        workflow = CONTRACT.read(CONTRACT.CI_WORKFLOW)
+        base = {
+            "BASE_REF": "main",
+            "HEAD_REF": "trace/732-2.4.2",
+            "RUN_ATTEMPT": "1",
+            "DOCS_CHANGED": "false",
+            "DOCS_RESULT": "skipped",
+            "EXTRAS_RESULT": "success",
+            "IMAGE_RESULT": "skipped",
+        }
+
+        failed_gate = self._run_summary(workflow, **{**base, "GATE_RESULT": "failure"})
+        self.assertNotEqual(failed_gate.returncode, 0, failed_gate.stdout + failed_gate.stderr)
+        failed_output = failed_gate.stdout + failed_gate.stderr
+        self.assertIn("先看 gate / extras 各自的作业结论", failed_output)
+        self.assertNotIn("再推一个空提交", failed_output)
+
+        missing_trailer = self._run_summary(workflow, **{**base, "GATE_RESULT": "success"})
+        self.assertNotEqual(
+            missing_trailer.returncode, 0, missing_trailer.stdout + missing_trailer.stderr
+        )
+        trailer_output = missing_trailer.stdout + missing_trailer.stderr
+        self.assertIn("再推一个空提交", trailer_output)
+        self.assertNotIn("先看 gate / extras 各自的作业结论", trailer_output)
+
     def test_full_and_image_candidate_summary_matrix(self) -> None:
         workflow = CONTRACT.read(CONTRACT.CI_WORKFLOW)
         cases = [

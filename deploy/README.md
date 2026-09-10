@@ -307,7 +307,8 @@ PR 绕过服务端拒绝。
    镜像证明由发布时 `verify_epic_candidate.py` 兜底核对合并树是否与候选证明
    一致，因此首次 synchronize 跳过镜像可以判绿。`trace/**` 不发布、不进
    `release/**`，没有这道兜底——`ci.yml` 的 `candidate` job 因此对「head 为
-   `trace/**` 且 `image` 被跳过」这种情形显式判红（exit 1），失败信息会指明
+   `trace/**`、**改动落在非纯文档非 L1 的完整档**、且 `image` 被跳过」这种情形显式
+   判红（exit 1），失败信息会指明
    要**再推一个带 `Image-Candidate: true` trailer 的空提交**（追加，不是改写已被
    审查的那个提交）。`scripts/ci/check_deploy_contract.py` 钉住这条判红分支必须
    真的存在，不能只写在文档里。
@@ -320,8 +321,9 @@ PR 绕过服务端拒绝。
    `image` 与 `candidate` 两个作业；`gate` 与 `extras` 的准入条件逐字沿用改动前
    的样子，`check_deploy_contract.py` 钉住这两个作业体内不得出现 `trace/` 或
    `head_ref` 相关的跳过条件。**真正的兜底不是这条断言，而是 `candidate`**：
-   **在会走到镜像证明这一步的候选上**（即非纯文档、非 L1 的改动——给 `gate` 开
-   后门必然要改工作流，因此一定落在这一档），`gate` 或 `extras` 一旦没有
+   **在会走到镜像证明这一步的候选上**（即非纯文档、非 L1 的改动——给 `gate` 开后门
+   要么改工作流、要么改 `scripts/ci/` 下它跑的脚本，两者都是完整档），`gate` 或
+   `extras` 一旦没有
    success，`candidate` 照样判红、合不进 `main`。纯文档与 L1 的候选走的是更早的
    早退分支，那两条路径上 `gate` / `extras` 本来就该跳过，没有东西被绕过。这条
    断言的作用是让「有人想给 `gate` 开后门」这件事在改动当场就被拦下，而不是等到

@@ -695,8 +695,16 @@ jobs:
           case "${HEAD_REF}" in trace/*) is_trace_head=1 ;; *) is_trace_head=0 ;; esac
           if [ "${EVENT_NAME}" = pull_request ] && [ "${BASE_REF}" = main ] \
              && [ "${is_trace_head}" = 1 ] && [ "${RUN_ATTEMPT}" = 1 ] && [ "${IMAGE_RESULT}" = skipped ]; then
-            printf 'trace/** 本次推送未产出镜像证明（image=%s；gate=%s extras=%s，结论见各自作业）。\n' \
+            printf 'trace/** 本次推送未产出镜像证明（image=%s；gate=%s extras=%s）。\n' \
               "${IMAGE_RESULT}" "${GATE_RESULT}" "${EXTRAS_RESULT}" >&2
+            # 把关审查 P2-B：gate 或 extras 没过时 image 同样被跳过，也落到这个分支。
+            # 若不先分辨，读者会把「gate 红」读成「你没推 trailer」，于是白推一个空
+            # 提交、白跑一轮完整门禁（约 15 分钟）才发现问题根本不在 trailer 上。
+            if [ "${GATE_RESULT}" != success ] || [ "${EXTRAS_RESULT}" != success ]; then
+              echo '先看 gate / extras 各自的作业结论：它们没有全部通过，补 trailer 也不会让本步转绿。' >&2
+              echo '修完让 gate 与 extras 先绿，再谈冻结候选。' >&2
+              exit 1
+            fi
             echo 'trace/** 的合并点必须带 Image-Candidate: true trailer 的推送才能产出候选证明，' >&2
             echo '否则合不进 main：在该分支上再推一个空提交，正文末尾独占一行 Image-Candidate: true' >&2
             echo '（步骤见 deploy/README.md）。不要改写已被审查的那个提交——追加，不是重写。' >&2
