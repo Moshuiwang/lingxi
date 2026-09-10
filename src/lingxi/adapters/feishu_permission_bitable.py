@@ -7,11 +7,10 @@
 由调用方以可调用对象注入，只走请求头，不进 URL/日志/异常消息。分页列举/
 新建/按标识读回已回源实测，``PUT`` 字段级更新未经真实调用验证。
 
-整表分页而非 search：既要找该更新哪一行，也要判断此人是否已以另一种
-``record_key`` 口径存在；search 路径未经验证，行数增长到几千应换用它、
-换前需一次回源验证。``update_row`` 只写调用方给的字段（部分更新语义，
-未列出的列保持原值，是令牌列不被清空的机制所在）；新建行必须带上令牌
-字段——写哪些字段完全由 ``publish`` 决定，传输层不增删。
+整表分页而非 search：既要找该更新哪一行，也要判断此人是否已以另一种 ``record_key`` 口径存在；search 路径未经验证，行数增长到几千应换用它、换前需
+一次回源验证。``update_row`` 只写调用方给的字段（部分更新语义，未列出的列保持 原值，是令牌列不被清空的机制所在）；新建行必须带上令牌字段——写哪些字段完全由
+``publish`` 决定，传输层不增删。
+
 """
 
 from __future__ import annotations
@@ -203,22 +202,10 @@ class BitablePermissionTable:
                     matched.append(ExistingPermissionRow(record_id, dict(fields)))
             has_more = data.get("has_more")
             if not isinstance(has_more, bool):
-                # 字段缺失（None）与类型非法都不是合法 bool：这一轮到底翻完没有是未知
-                # 的，不能当"读完了"处理（对齐 feishu_paged_client 多列表翻页路径的
-                # 严格口径，理由见该文件模块文档）。
-                #
-                # 唯一豁免与那条路径逐字同源（`_pages_multi_empty_result`）：**首页、
-                # 连 items 键都不存在、且 has_more 整个缺失**
-                # ——这正是空表在飞书响应里的真实形状（同上面 items 缺失那处注释）。
-                # 独立审查实测：不留这个口，一张真实空表会在开通与存量令牌读取两条
-                # 旅程上硬失败。**items 明确给成 [] 却缺 has_more 仍然判红**：那是
-                # 响应真的说不清翻完没有，不是空表。
-                # 判据用 `is` 身份比较：`0 == False` 为真，用 `in (False, None)` 会把
-                # `has_more: 0` 误判成合法空结果。
-                # 没有再加一条「还没收到过任何一行」：`page_token is None` 已经
-                # 蕴含这是第一次循环，那时必然一行都没收到。加上它做不出任何
-                # 判别——变异实测坐实它删掉之后没有任何用例会红，而一个永远
-                # 不可能为假的条件就是一条永远不会失败的断言。
+                # 缺失与类型非法都不是合法 bool，判红。唯一豁免与 feishu_paged_client
+                # 的首页空结果同源：首页、连 items 键都不存在、且 has_more 整个缺失，
+                # 三者同时成立才接受（空表的真实响应形状）。用 is 身份比较——0 == False
+                # 为真，写成 in (False, None) 会放过 has_more: 0。
                 if page_token is None and items_key_absent and has_more is None:
                     break
                 raise PermissionTableError("has_more_invalid", definite=False)
