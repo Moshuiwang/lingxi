@@ -206,8 +206,21 @@ class InnertestStageTests(InnertestPostgresTests):
         """授权拒绝落终态之后再点，不得改写决定时刻，也不得多记一条审计。"""
         batch = self.prepare()
         self.delivered(batch)
+        audit_before_first = self.sql("SELECT count(*) FROM innertest_audit")[0][0]
         self.sql("UPDATE innertest_admin_binding SET version=version+1")
-        self.confirm(batch)
+
+        first = self.confirm(batch)
+
+        # 先钉住第一次确实是授权拒绝：不然把上面那行撤权删掉，首次点击正常成功，
+        # 下面「再点一次没变化」的断言照样全绿——那就成了假证据。
+        self.assertIs(first.decision.kind, ConfirmResultKind.ROLE_REVOKED)
+        self.assertEqual(
+            self.sql("SELECT status,reason FROM pending_action"), [("failed", "role_revoked")]
+        )
+        self.assertEqual(self.sql("SELECT count(*) FROM innertest_membership"), [(0,)])
+        self.assertEqual(
+            self.sql("SELECT count(*) FROM innertest_audit")[0][0], audit_before_first + 1
+        )
         before_pending = self.sql("SELECT status,reason,decided_at FROM pending_action")
         before_audit = self.sql("SELECT count(*) FROM innertest_audit")
 
@@ -218,6 +231,25 @@ class InnertestStageTests(InnertestPostgresTests):
             self.sql("SELECT status,reason,decided_at FROM pending_action"), before_pending
         )
         self.assertEqual(self.sql("SELECT count(*) FROM innertest_audit"), before_audit)
+
+    def test_admin_role_revoked_before_click_is_also_a_definite_refusal(self):
+        """管理角色被撤走的是另一个码，也必须落成确定拒绝。
+
+        两条重放用例改的都是绑定版本，触发的是绑定失效那一个码；这条保留绑定
+        有效、只撤掉登记表里的管理角色，覆盖另一条真实路径。
+        """
+        batch = self.prepare()
+        self.delivered(batch)
+        # 登记表有约束：active 的行必须带齐角色列，所以撤角色要走撤销登记这条真实路径。
+        self.sql("UPDATE admin_registry SET entry_status='revoked',revoked_at=now()")
+
+        outcome = self.confirm(batch)
+
+        self.assertIs(outcome.decision.kind, ConfirmResultKind.ROLE_REVOKED)
+        self.assertEqual(
+            self.sql("SELECT status,reason FROM pending_action"), [("failed", "role_revoked")]
+        )
+        self.assertEqual(self.sql("SELECT count(*) FROM innertest_membership"), [(0,)])
 
     def test_check_permissions_changed_after_probe_blocks_usable_result(self):
         self.user()

@@ -151,6 +151,9 @@ class InnertestPostgresTests(unittest.TestCase):
         self.sql("UPDATE innertest_roster_version SET version=version+1")
         self.assertFalse(self.confirm(batch).decision.ok)
         before = self.sql("SELECT status,reason,decided_at FROM pending_action")
+        # 先钉住这批确实已经因过期落终态，否则下面「终态不被改写」证明不了什么。
+        self.assertEqual(before[0][0], "expired")
+        self.assertIsNotNone(before[0][2])
         self.sql("UPDATE innertest_admin_binding SET enabled=false")
         # 这批此前已因过期落终态。事后撤权再点，只能得到「已终态」，**不得**被改写
         # 成授权拒绝——终态一旦形成就不该再动，否则真实结果会被后来的点击抹掉。
