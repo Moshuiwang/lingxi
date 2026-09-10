@@ -45,6 +45,7 @@ from lingxi.adapters.postgres_conversation import (
     PostgresTaskQueue,
     PostgresTaskQueueListener,
     _Transaction,
+    is_dependency_unavailable,
 )
 from lingxi.apps.worker.config import WorkerConfig
 from lingxi.apps.worker.service import WorkerService
@@ -5795,3 +5796,51 @@ class TerminalFailureSignatureTests(unittest.TestCase):
         self.assertEqual(result.stderr, "")
         self.assertEqual(result.stdout.strip(), expected)
         self.assertNotIn("ou_", result.stdout)
+
+
+class DependencyAvailabilityJudgementTests(unittest.TestCase):
+    """判定必须两边都准：依赖故障要判真，编码缺陷**绝不能**被误吞。
+
+    这个判定是整条降级路径的闸门。判宽了，编码缺陷会被当成「数据库抖了一下」
+    静默重试，真 bug 永远不会让进程退出、也不会有人发现；判窄了，一次真实的
+    连接失败就会把常驻进程打死，退回本单要修的那个重启风暴。
+
+    驱动分支刻意**不依赖本机是否装了 psycopg**：被测函数按异常自身的类型信息
+    判定（沿继承链找模块归属为 psycopg 且名为 OperationalError 的类），所以这里
+    用一个同名同模块归属的替身即可覆盖，装没装都跑得到同一条分支。
+    """
+
+    def _driver_operational_error(self) -> BaseException:
+        namespace = {"__module__": "psycopg.errors"}
+        klass = type("OperationalError", (Exception,), namespace)
+        return klass("连接被拒绝")
+
+    def test_driver_operational_error_is_a_dependency_failure(self) -> None:
+        self.assertTrue(is_dependency_unavailable(self._driver_operational_error()))
+
+    def test_subclass_of_driver_operational_error_is_also_a_dependency_failure(self) -> None:
+        parent = type("OperationalError", (Exception,), {"__module__": "psycopg.errors"})
+        child = type("ConnectionTimeout", (parent,), {"__module__": "psycopg.errors"})
+        self.assertTrue(is_dependency_unavailable(child("超时")))
+
+    def test_os_error_is_a_dependency_failure(self) -> None:
+        self.assertTrue(is_dependency_unavailable(OSError("连接被拒绝")))
+
+    def test_coding_defects_are_never_swallowed(self) -> None:
+        """否定断言：这几类必须判假，否则真 bug 会被当成依赖抖动静默重试。"""
+
+        for defect in (
+            TypeError("参数类型错"),
+            AttributeError("属性不存在"),
+            KeyError("键不存在"),
+            ValueError("值非法"),
+            ZeroDivisionError("除零"),
+        ):
+            with self.subTest(defect=type(defect).__name__):
+                self.assertFalse(is_dependency_unavailable(defect))
+
+    def test_same_class_name_from_another_module_is_not_a_dependency_failure(self) -> None:
+        """同名但不是驱动的类不算——判定认的是模块归属加类名，不是只认名字。"""
+
+        impostor = type("OperationalError", (Exception,), {"__module__": "some.other.package"})
+        self.assertFalse(is_dependency_unavailable(impostor("冒名")))
