@@ -1,16 +1,21 @@
 """``scripts/ci/run_tests.py`` 的分片选择、汇总门禁与结果记录（Issue #712）。
 
-覆盖三件事：①按文件分桶确实是一次**划分**——每个文件整体落进恰好一个分片，
-全部分片的并集等于未分片时的完整用例集合，互不重叠；②汇总口径本身是门禁：
-任一分片缺汇总行、分片数与预期不符、分片号重复或越界都必须判红（钉住测试，
-必做项第 3 条）；③逐条结果记录能区分通过/失败/错误/跳过，并带上失败签名，
-不是只有一个 `Ran N` 汇总数字（验收 E-3 ⑤）。
+覆盖五件事：①按文件分桶确实是一次**划分**——每个文件整体落进恰好一个分片，
+全部分片的并集等于未分片时的完整用例集合，互不重叠；②贪心装箱按耗时清单把
+文件分给总耗时最小的分片，装箱结果确定、与调用顺序无关，清单缺条目的文件按
+平均耗时兜底、仍会被分进某个分片而不是被跳过（#712 调粒度批，替换此前按文件
+名哈希取模的分桶算法）；③耗时清单的读取容错——文件不存在、内容损坏都退回空
+字典而不是报错中断；④汇总口径本身是门禁：任一分片缺汇总行、分片数与预期不
+符、分片号重复或越界都必须判红（钉住测试，必做项第 3 条）；⑤逐条结果记录能
+区分通过/失败/错误/跳过，并带上失败签名，不是只有一个 `Ran N` 汇总数字（验收
+E-3 ⑤）。
 """
 
 from __future__ import annotations
 
 import importlib
 import io
+import json
 import os
 import sys
 import types
@@ -41,7 +46,7 @@ def _build_fake_module_case_class(module_name: str, file_path: str) -> type[unit
 
 
 class ShardPartitionTests(unittest.TestCase):
-    """按文件哈希分桶必须是一次划分：不漏、不重、同文件不拆散。"""
+    """按文件装箱分桶必须是一次划分：不漏、不重、同文件不拆散。"""
 
     def setUp(self) -> None:
         self._registered_modules: list[str] = []
@@ -71,7 +76,7 @@ class ShardPartitionTests(unittest.TestCase):
         shard_count = 4
         seen: dict[str, int] = {}
         for index in range(shard_count):
-            selected = run_tests._select_shard(suite, index, shard_count)
+            selected = run_tests._select_shard(suite, index, shard_count, manifest={})
             for case in run_tests._iter_test_cases(selected):
                 seen[case.id()] = seen.get(case.id(), 0) + 1
 
@@ -81,21 +86,132 @@ class ShardPartitionTests(unittest.TestCase):
     def test_same_file_never_splits_across_shards(self) -> None:
         suite = self._build_suite(file_count=10, cases_per_file=5)
         shard_count = 3
+        cases = list(run_tests._iter_test_cases(suite))
+        file_keys = sorted({run_tests._manifest_key(run_tests._case_source_file(c)) for c in cases})
+        assignment = run_tests._assign_files_to_shards(file_keys, shard_count, {})
         for index in range(shard_count):
-            selected = run_tests._select_shard(suite, index, shard_count)
+            selected = run_tests._select_shard(suite, index, shard_count, manifest={})
             files = {
-                run_tests._case_source_file(case) for case in run_tests._iter_test_cases(selected)
+                run_tests._manifest_key(run_tests._case_source_file(case))
+                for case in run_tests._iter_test_cases(selected)
             }
-            for file_path in files:
-                bucket = run_tests._shard_bucket(file_path, shard_count)
-                self.assertEqual(bucket, index, "同一文件的用例必须全部落进它自己的那个分片")
+            for file_key in files:
+                self.assertEqual(
+                    assignment[file_key], index, "同一文件的用例必须全部落进它自己的那个分片"
+                )
 
-    def test_bucket_is_stable_across_repeated_calls(self) -> None:
-        key = "/fake/tests/test_stability.py"
-        first = run_tests._shard_bucket(key, 6)
-        second = run_tests._shard_bucket(key, 6)
-        self.assertEqual(first, second)
-        self.assertTrue(0 <= first < 6)
+    def test_assignment_is_deterministic_across_repeated_calls(self) -> None:
+        file_keys = [f"tests/test_stability_{i}.py" for i in range(9)]
+        manifest = {key: float(index + 1) for index, key in enumerate(file_keys)}
+        first = run_tests._assign_files_to_shards(file_keys, 4, manifest)
+        second = run_tests._assign_files_to_shards(list(reversed(file_keys)), 4, manifest)
+        self.assertEqual(first, second, "装箱结果只应取决于文件与清单内容，与传入顺序无关")
+        self.assertTrue(all(0 <= index < 4 for index in first.values()))
+
+    def test_greedy_packing_keeps_bucket_totals_close(self) -> None:
+        # 必做项第 4 条钉住①：装箱后各桶耗时估计的极差不超过阈值。用一份耗时
+        # 悬殊的合成清单（1 个大户 + 6 个中户 + 8 个小户）钉住贪心装箱的质量：
+        # 极差不应超过单个最长文件的耗时——按文件名哈希、或不看耗时的轮流分配
+        # 都做不到这一点（哈希可能把大户和中户分进同一片，轮流分配则完全不看
+        # 耗时，两者都可能让极差远超过一个最长文件的量级）。
+        weights = [
+            100.0,
+            40.0,
+            38.0,
+            36.0,
+            34.0,
+            32.0,
+            30.0,
+            5.0,
+            5.0,
+            5.0,
+            5.0,
+            5.0,
+            5.0,
+            5.0,
+            5.0,
+        ]
+        manifest = {f"tests/test_synthetic_{i}.py": weight for i, weight in enumerate(weights)}
+        file_keys = list(manifest)
+
+        assignment = run_tests._assign_files_to_shards(file_keys, shard_count=4, manifest=manifest)
+        bucket_totals = [0.0, 0.0, 0.0, 0.0]
+        for key, shard_index in assignment.items():
+            bucket_totals[shard_index] += manifest[key]
+
+        spread = max(bucket_totals) - min(bucket_totals)
+        threshold = max(weights)
+        self.assertLessEqual(
+            spread,
+            threshold,
+            f"装箱后各桶总耗时极差 {spread} 超过了单个最长文件的耗时 {threshold}：{bucket_totals}",
+        )
+
+    def test_files_missing_from_manifest_still_get_assigned(self) -> None:
+        # 必做项第 4 条钉住②：清单缺条目的文件仍会被分到某个桶，不会被跳过。
+        manifest = {"tests/test_known_a.py": 12.0, "tests/test_known_b.py": 8.0}
+        file_keys = [
+            "tests/test_known_a.py",
+            "tests/test_known_b.py",
+            "tests/test_brand_new_one.py",
+            "tests/test_brand_new_two.py",
+        ]
+        assignment = run_tests._assign_files_to_shards(file_keys, shard_count=3, manifest=manifest)
+
+        self.assertEqual(set(assignment), set(file_keys), "清单里没有的文件也必须出现在分配结果里")
+        for file_key in file_keys:
+            self.assertIn(assignment[file_key], range(3), f"{file_key} 的分片号必须落在合法范围内")
+
+
+class DurationManifestTests(unittest.TestCase):
+    """耗时清单的读取、默认权重兜底与相对路径换算（支撑必做项第 1 条）。"""
+
+    def test_missing_file_returns_empty_manifest(self) -> None:
+        with TemporaryDirectory() as workdir:
+            missing = Path(workdir) / "absent.json"
+            self.assertEqual(run_tests._load_duration_manifest(missing), {})
+
+    def test_corrupt_json_returns_empty_manifest(self) -> None:
+        with TemporaryDirectory() as workdir:
+            path = Path(workdir) / "corrupt.json"
+            path.write_text("{not valid json", encoding="utf-8")
+            self.assertEqual(run_tests._load_duration_manifest(path), {})
+
+    def test_non_object_json_returns_empty_manifest(self) -> None:
+        with TemporaryDirectory() as workdir:
+            path = Path(workdir) / "list.json"
+            path.write_text("[1, 2, 3]", encoding="utf-8")
+            self.assertEqual(run_tests._load_duration_manifest(path), {})
+
+    def test_valid_manifest_round_trips_numeric_values(self) -> None:
+        with TemporaryDirectory() as workdir:
+            path = Path(workdir) / "durations.json"
+            path.write_text(
+                json.dumps({"tests/test_a.py": 12.5, "tests/test_b.py": 3}), encoding="utf-8"
+            )
+            manifest = run_tests._load_duration_manifest(path)
+            self.assertEqual(manifest, {"tests/test_a.py": 12.5, "tests/test_b.py": 3.0})
+
+    def test_default_weight_is_manifest_mean_when_nonempty(self) -> None:
+        manifest = {"a": 2.0, "b": 4.0, "c": 9.0}
+        self.assertAlmostEqual(run_tests._default_weight_seconds(manifest), 5.0)
+
+    def test_default_weight_falls_back_when_manifest_empty(self) -> None:
+        self.assertEqual(
+            run_tests._default_weight_seconds({}), run_tests._DEFAULT_WEIGHT_SECONDS_FALLBACK
+        )
+
+    def test_manifest_key_is_repository_relative_posix_path(self) -> None:
+        absolute = str(run_tests.REPOSITORY_ROOT / "tests" / "test_example.py")
+        self.assertEqual(run_tests._manifest_key(absolute), "tests/test_example.py")
+
+    def test_manifest_key_falls_back_for_non_path_case_id(self) -> None:
+        case_id = "unittest.loader._FailedTest.some_broken_module"
+        self.assertEqual(run_tests._manifest_key(case_id), case_id)
+
+    def test_manifest_key_falls_back_for_path_outside_repository(self) -> None:
+        outside = "/definitely/outside/repo/test_x.py"
+        self.assertEqual(run_tests._manifest_key(outside), outside)
 
 
 class ShardEnvironmentTests(unittest.TestCase):

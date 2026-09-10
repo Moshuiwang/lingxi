@@ -7,11 +7,22 @@
 判定逻辑与同一种输出格式——下游比对新旧两条路径时不用适配两套输出。
 
 分片依据 ``LINGXI_TEST_SHARD_INDEX`` / ``LINGXI_TEST_SHARD_COUNT`` 两个环境
-变量，按**测试文件**的绝对路径稳定哈希分桶，不按单条用例分桶：一是不拆散同一个
-``TestCase`` 类共享的 ``setUpClass`` 状态，二是与 ``tests/postgres_schema.py``
-按 DSN 缓存表结构的策略天然兼容——同一分片全程只连一个 DSN，缓存正好命中一次。
-用 ``hashlib`` 而不是内置 ``hash()``：后者受 ``PYTHONHASHSEED`` 影响，同一个
-文件路径在不同进程里可能算出不同桶，会让分片结果不确定。
+变量，按**测试文件**分桶，不按单条用例分桶：一是不拆散同一个 ``TestCase`` 类
+共享的 ``setUpClass`` 状态，二是与 ``tests/postgres_schema.py`` 按 DSN 缓存表
+结构的策略天然兼容——同一分片全程只连一个 DSN，缓存正好命中一次。
+
+分桶算法是贪心装箱（按估计耗时从大到小排序，每次把当前文件放进眼下总耗时最
+小的分片），依据是 ``scripts/ci/shard_durations.json`` 这份可提交的耗时清单，
+不再按文件路径哈希取模——哈希不看每个文件实际跑多久，容易把几个耗时大户分进
+同一片，让总时长被最慢那片锁死（#712 调粒度批的实测教训）。清单按"仓库相对
+路径"记录每个测试文件上一次量出来的耗时；清单里查不到的文件（新增文件、清单
+过期）**不会被跳过**，按清单里已有文件的平均耗时兜底分权重，照常分进某个分片。
+
+清单怎么重新量：给 ``LINGXI_TEST_DURATIONS_DIR`` 指一个目录跑一遍（分片或不
+分片都行），每个分片会各自写一份 ``durations-shard-<N>.json``（不分片时写
+``durations-unsharded.json``），把这些文件合并、四舍五入后覆盖提交到
+``scripts/ci/shard_durations.json`` 即可——这一步不追求自动化，改一次分桶策
+略之间的间隔够长，手工合并的成本不值得为它单独造一条流水线。
 
 两个环境变量任一缺失都视为"不分片"：发现全部测试、原样跑完，不额外打印任何
 分片标记行——这正是改造前 ``unittest discover -s tests -v`` 的行为，是本脚本
@@ -21,16 +32,23 @@
 from __future__ import annotations
 
 import argparse
-import hashlib
 import json
 import os
 import sys
+import time
 import unittest
 from pathlib import Path
 from typing import Any
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
 TESTS_DIRECTORY = REPOSITORY_ROOT / "tests"
+
+# 耗时清单的落库位置：与 run_tests.py 同目录，跟着 scripts/ci 一起走版本控制。
+DURATION_MANIFEST_PATH = REPOSITORY_ROOT / "scripts/ci/shard_durations.json"
+
+# 清单整体为空（例如第一次跑、还没量过任何数据）时的兜底权重——此时所有文件都
+# 拿到同一个值，贪心装箱退化成"按文件数尽量均分"，不是报错，也不是不分片。
+_DEFAULT_WEIGHT_SECONDS_FALLBACK = 1.0
 
 # 分片跑批各自把这一行打到自己的日志里，供 verify_repository.sh 汇合后核对
 # "分片数与预期是否相符、每片是否都真的跑完"——不复用 unittest 自带的
@@ -64,19 +82,144 @@ def _case_source_file(case: unittest.TestCase) -> str:
     return str(Path(module_file).resolve())
 
 
-def _shard_bucket(key: str, shard_count: int) -> int:
-    digest = hashlib.sha256(key.encode("utf-8")).hexdigest()
-    return int(digest[:8], 16) % shard_count
+def _manifest_key(source_file: str) -> str:
+    """把源文件标识换算成耗时清单里用的键：仓库相对路径。
+
+    清单要能跨机器、跨 worktree 提交复用，不能按绝对路径记——不同 checkout 的
+    路径前缀不一样。`_case_source_file` 的正常输出是绝对路径，这里换算成相对
+    路径；换算不出来（不是绝对路径，例如模块导入失败时退回的 `case.id()`，或
+    者绝对路径根本不在仓库树下）一律原样返回——`_assign_files_to_shards` 的
+    默认权重兜底会接住它，不需要在这里特殊处理或报错。
+    """
+
+    path = Path(source_file)
+    if not path.is_absolute():
+        return source_file
+    try:
+        return path.resolve().relative_to(REPOSITORY_ROOT).as_posix()
+    except ValueError:
+        return source_file
+
+
+def _load_duration_manifest(path: Path | None = None) -> dict[str, float]:
+    """读耗时清单；文件不存在、内容损坏或格式不对都返回空字典，不报错中断。
+
+    清单是本机/CI 跑批之间手工同步的辅助数据，不是权威真相——读不到就退回"当
+    它是空的"，让 `_default_weight_seconds` 的兜底逻辑接管，而不是让整个分片
+    流程因为一份数据文件的问题而跑不起来。
+    """
+
+    manifest_path = path if path is not None else DURATION_MANIFEST_PATH
+    if not manifest_path.exists():
+        return {}
+    try:
+        raw = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError):
+        return {}
+    if not isinstance(raw, dict):
+        return {}
+    return {
+        str(key): float(value)
+        for key, value in raw.items()
+        if isinstance(value, int | float) and not isinstance(value, bool)
+    }
+
+
+def _default_weight_seconds(manifest: dict[str, float]) -> float:
+    """清单里查不到某个文件时，给它的估计耗时兜底。
+
+    清单非空时取清单里已知文件的平均耗时——一个新文件大概率不是全仓最慢也不是
+    最快的那一档，平均值比"当它是 0 秒"或"当它是全仓最长"都更接近事实。清单
+    整体为空（例如还没有量过任何数据）时退回一个固定常数，让所有文件权重相同，
+    贪心装箱此时退化成按文件数尽量均分。
+    """
+
+    if not manifest:
+        return _DEFAULT_WEIGHT_SECONDS_FALLBACK
+    return sum(manifest.values()) / len(manifest)
+
+
+def _assign_files_to_shards(
+    file_keys: list[str], shard_count: int, manifest: dict[str, float]
+) -> dict[str, int]:
+    """贪心装箱：按估计耗时从大到小排序，每次把当前文件放进总耗时最小的分片。
+
+    这是经典的"最长优先"装箱启发式——先放大件才不会到最后被小件填不平的桶接住
+    一个大件。`file_keys` 先经过一次普通排序再按权重降序排：Python 的排序是稳
+    定的，权重相同（尤其是清单缺条目、大量文件共享同一个兜底权重）时就按文件路
+    径的字母序决定先后，装箱结果与调用方传入 `file_keys` 的原始顺序无关，同一
+    份清单在任何进程里都能独立算出同一个分配结果。
+    """
+
+    default_weight = _default_weight_seconds(manifest)
+    ordered = sorted(
+        sorted(file_keys),
+        key=lambda key: manifest.get(key, default_weight),
+        reverse=True,
+    )
+    bucket_totals = [0.0] * shard_count
+    assignment: dict[str, int] = {}
+    for key in ordered:
+        weight = manifest.get(key, default_weight)
+        target = min(range(shard_count), key=lambda index: (bucket_totals[index], index))
+        assignment[key] = target
+        bucket_totals[target] += weight
+    return assignment
 
 
 def _select_shard(
-    suite: unittest.TestSuite, shard_index: int, shard_count: int
+    suite: unittest.TestSuite,
+    shard_index: int,
+    shard_count: int,
+    manifest: dict[str, float] | None = None,
 ) -> unittest.TestSuite:
+    if manifest is None:
+        manifest = _load_duration_manifest()
+    cases = list(_iter_test_cases(suite))
+    file_keys = sorted({_manifest_key(_case_source_file(case)) for case in cases})
+    assignment = _assign_files_to_shards(file_keys, shard_count, manifest)
     selected = unittest.TestSuite()
-    for case in _iter_test_cases(suite):
-        if _shard_bucket(_case_source_file(case), shard_count) == shard_index:
+    for case in cases:
+        if assignment[_manifest_key(_case_source_file(case))] == shard_index:
             selected.addTest(case)
     return selected
+
+
+def _record_case_durations(cases: list[unittest.TestCase]) -> dict[str, float]:
+    """给每条用例的 `run` 包一层计时，按文件累加耗时，供重新生成耗时清单用。
+
+    包的是实例属性 `run`（原生 snake_case），不是子类化 `TestResult` 去覆写
+    `startTest`/`stopTest`——后者是驼峰命名，会撞上本仓库的 N802 规则（同类冲
+    突与规避方式见 `_outcome_records` 的说明）。`TestCase.__call__` 内部调用的
+    是 `self.run(...)`，属于普通属性查找，会用到这里实例级别的覆盖——用一个
+    最小可复现的例子验证过这一点，不是凭印象假设 unittest 的内部实现。
+    只在 `LINGXI_TEST_DURATIONS_DIR` 设置时才会被调用，不影响日常跑批路径。
+    """
+
+    durations: dict[str, float] = {}
+
+    for case in cases:
+        key = _manifest_key(_case_source_file(case))
+        original_run = case.run
+
+        def _timed_run(result: Any = None, _original: Any = original_run, _key: str = key) -> Any:
+            start = time.perf_counter()
+            try:
+                return _original(result)
+            finally:
+                durations[_key] = durations.get(_key, 0.0) + (time.perf_counter() - start)
+
+        case.run = _timed_run  # type: ignore[method-assign]
+
+    return durations
+
+
+def _duration_output_path(shard: tuple[int, int] | None) -> Path | None:
+    directory = os.environ.get("LINGXI_TEST_DURATIONS_DIR")
+    if not directory:
+        return None
+    suffix = f"shard-{shard[0]}" if shard is not None else "unsharded"
+    return Path(directory) / f"durations-{suffix}.json"
 
 
 class ShardEnvironmentError(RuntimeError):
@@ -180,12 +323,28 @@ def _run() -> int:
         suite = _select_shard(suite, shard[0], shard[1])
     all_ids = [case.id() for case in _iter_test_cases(suite)]
 
+    durations_output = _duration_output_path(shard)
+    timing: dict[str, float] = {}
+    if durations_output is not None:
+        timing = _record_case_durations(list(_iter_test_cases(suite)))
+
     runner = unittest.TextTestRunner(verbosity=2)
     result = runner.run(suite)
 
     report_path = os.environ.get("LINGXI_TEST_REPORT_PATH")
     if report_path:
         _write_report(report_path, shard, all_ids, result)
+
+    if durations_output is not None:
+        durations_output.parent.mkdir(parents=True, exist_ok=True)
+        durations_output.write_text(
+            json.dumps(
+                {key: round(value, 3) for key, value in sorted(timing.items())},
+                ensure_ascii=False,
+                indent=2,
+            ),
+            encoding="utf-8",
+        )
 
     if shard is not None:
         shard_index, shard_count = shard
