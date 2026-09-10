@@ -291,6 +291,60 @@ class ReadmeDocumentedRevisionsTest(unittest.TestCase):
         )
         self.assertEqual(len(failures), 2)
 
+    def test_a_decoy_table_outside_the_section_cannot_stand_in(self) -> None:
+        """外审实测的绕过：正确的同名表放在别处，真正那张被删，校验静默通过。
+
+        这与 Issue #706 附带修掉的原漏洞是同一类——原来是「整篇搜编号」，收紧成
+        「解析第一张同名表」之后，只要文档里存在第二张同名表，同样的绕过就换个
+        壳回来了。判据必须锚到「谁说了算」小节本身，而不是锚到「全文第一张表」。
+        """
+
+        decoy_first = (
+            "# 迁移说明\n\n"
+            "| 当前事实 | 值 |\n"
+            "| --- | --- |\n"
+            "| 基线 revision（链首） | `20260806_baseline` |\n"
+            "| head revision | `0093_admin_followup_depends_idx` |\n"
+            "\n"
+            "## 谁说了算\n\n"
+            "（这一节里那张表被删掉了。）\n"
+        )
+        failures = CHECK.check_readme_documented_revisions(
+            decoy_first,
+            heads=["0093_admin_followup_depends_idx"],
+            bases=["20260806_baseline"],
+        )
+        self.assertTrue(
+            failures,
+            "小节里没有表时必须判红；文档别处那张值正确的同名表不得顶替它",
+        )
+
+    def test_table_before_the_section_is_not_read(self) -> None:
+        """更强的一条：文档别处那张表**写着错值**，小节里那张是对的，仍须通过。
+
+        证明锚定是真的按小节走，而不是「碰巧取到了对的那张」。
+        """
+
+        correct_section = (
+            "# 迁移说明\n\n"
+            "| 当前事实 | 值 |\n"
+            "| --- | --- |\n"
+            "| 基线 revision（链首） | `錯的基线` |\n"
+            "| head revision | `錯的head` |\n"
+            "\n"
+            "## 谁说了算\n\n"
+            "| 当前事实 | 值 |\n"
+            "| --- | --- |\n"
+            "| 基线 revision（链首） | `20260806_baseline` |\n"
+            "| head revision | `0093_admin_followup_depends_idx` |\n"
+        )
+        failures = CHECK.check_readme_documented_revisions(
+            correct_section,
+            heads=["0093_admin_followup_depends_idx"],
+            bases=["20260806_baseline"],
+        )
+        self.assertEqual(failures, [], f"应当只读小节里那张表，实际：{failures}")
+
 
 class MigrationDsnTest(unittest.TestCase):
     """迁移连接串的校验（V-迁移-05）。

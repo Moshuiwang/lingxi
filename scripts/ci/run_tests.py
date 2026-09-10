@@ -24,9 +24,10 @@
 ``scripts/ci/shard_durations.json`` 即可——这一步不追求自动化，改一次分桶策
 略之间的间隔够长，手工合并的成本不值得为它单独造一条流水线。
 
-两个环境变量任一缺失都视为"不分片"：发现全部测试、原样跑完，不额外打印任何
+**两个环境变量都不设**才视为"不分片"：发现全部测试、原样跑完，不额外打印任何
 分片标记行——这正是改造前 ``unittest discover -s tests -v`` 的行为，是本脚本
-必须留的回退路径，不是遗漏。
+必须留的回退路径，不是遗漏。只设其中一个是**响亮失败**（见 ``ShardEnvironmentError``）：
+那多半是拼错或残留，猜一个默认值顶上会让人以为跑了全部、实际只跑了一片。
 """
 
 from __future__ import annotations
@@ -70,9 +71,10 @@ def _case_source_file(case: unittest.TestCase) -> str:
     """一条用例所在的源文件绝对路径，作为分片分桶的依据。
 
     模块导入失败时 unittest 会造一个占位 `_FailedTest`，它的 `__module__`
-    指向 `unittest.loader` 本身而不是真正失败的那个文件——这种情况下退回
-    用 `case.id()`（其中包含失败模块名）分桶：不如按文件分桶精确，但仍然
-    稳定、仍然会被跑到、仍然会在失败时把对应分片染红，不会被静默漏掉。
+    指向 `unittest.loader` 本身——**实测下来这类用例是按 `unittest/loader.py`
+    的路径分桶的**，不是按真正失败的那个文件，也不是按 `case.id()`。行为仍然
+    安全：它稳定、仍然会被分到某一片、仍然会在失败时把该片染红，不会被静默
+    漏掉；只是同一批导入失败会挤在同一片里，不影响正确性。
     """
 
     module = sys.modules.get(type(case).__module__)
@@ -328,7 +330,12 @@ def _run() -> int:
     if durations_output is not None:
         timing = _record_case_durations(list(_iter_test_cases(suite)))
 
-    runner = unittest.TextTestRunner(verbosity=2)
+    # `python -m unittest` 的默认是 warnings='default'；TextTestRunner 不传这个
+    # 参数时默认是 None，于是 DeprecationWarning / ResourceWarning 不再打印。
+    # 二审实测：同一夹具旧路径打印 4 行警告、新路径 0 行。退出码虽不受影响，但
+    # 「回退路径与改造前逐字相同」是本次改造能合并的前提，少打印的警告同样是
+    # 可观察差异，必须补齐。
+    runner = unittest.TextTestRunner(verbosity=2, warnings="default")
     result = runner.run(suite)
 
     report_path = os.environ.get("LINGXI_TEST_REPORT_PATH")
@@ -386,6 +393,7 @@ def verify_shard_logs(log_paths: list[Path], expected_count: int) -> list[str]:
         problems.append(f"分片日志数量是 {len(log_paths)}，与期望的分片数 {expected_count} 不符。")
 
     seen: dict[int, int] = {}
+    ran_by_index: dict[int, int] = {}
     for path in log_paths:
         text = path.read_text(encoding="utf-8", errors="replace")
         summaries = _parse_shard_summaries(text)
@@ -394,6 +402,20 @@ def verify_shard_logs(log_paths: list[Path], expected_count: int) -> list[str]:
             continue
         for summary in summaries:
             seen[summary["index"]] = seen.get(summary["index"], 0) + 1
+            ran_by_index[summary["index"]] = summary["ran"]
+
+    # 独立审查 P1-2：此前这里解析了 `ran=` 却从不使用，而上面的说明宣称自己守的
+    # 是「N 不减少」——某一片 `ran=0` 照样判绿，正是它要挡的那种漏跑。汇总行齐全
+    # 只证明「每片都留下了脚印」，不证明「每片真的跑到了用例」。
+    for index, ran in sorted(ran_by_index.items()):
+        if ran <= 0:
+            problems.append(
+                f"分片 {index} 的汇总行写着 ran={ran}：这一片一条用例都没跑到。"
+                "分片划分出了空桶，或者发现阶段被改坏了——两者都会让总数悄悄变少。"
+            )
+    total_ran = sum(ran_by_index.values())
+    if ran_by_index and total_ran <= 0:
+        problems.append(f"全部分片合计只跑了 {total_ran} 条用例，这不可能是一次真实跑批。")
 
     for index in range(expected_count):
         occurrences = seen.get(index, 0)

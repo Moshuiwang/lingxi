@@ -282,11 +282,16 @@ jobs:
         env:
           LINGXI_POSTGRES_CONTAINER: ${{ job.services.postgres.id }}
           LINGXI_POSTGRES_DSN: postgresql://postgres@localhost:5432/lingxi_test
-          # Issue #712：单测按文件哈希分 4 片并行，每片在同一个 postgres 服务容器内
-          # 各自一个数据库，互不清场、一片污染不连坐其余分片。4 与公共 runner
-          # （ubuntu-24.04，标准规格 4 vCPU）核数对齐；不拆本 job 的图——job 图早已
-          # 并行（docs/l1/gate/extras 同时起跑），这里只改这一步内部的执行方式。
-          LINGXI_TEST_SHARD_COUNT: "4"
+          # Issue #712：分片能力已经落地（scripts/ci/run_tests.py，按实测耗时贪心
+          # 装箱，每片在同一个 postgres 服务容器内各自一个数据库），但**这里刻意
+          # 不启用**，本 job 仍走改造前的串行路径。两条理由：
+          #   一、Trace #732 的双跑协议写死「影子期内新路径只做比对、不为任何门禁
+          #      背书」。在这一步导出分片变量，就是让一条还没拿到比对证据的路径去
+          #      给唯一的必需检查背书。
+          #   二、4 路与 2 路本机跑批**同一失败签名**（Issue #743：12 个测试文件
+          #      直接 TRUNCATE 的清场方式在并发下不满足 3 秒 statement_timeout），
+          #      在这里开等于把一个已知会红的配置装进主检查。
+          # 要启用请先闭合 #743，并按双跑协议拿到两次逐条一致的比对记录。
         run: scripts/ci/verify_repository.sh
 
       # 安装与测试都在检出目录里跑。生成物已被 .gitignore 覆盖，但受版本控制的

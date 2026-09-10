@@ -271,6 +271,82 @@ class NoOptInEnvironmentBehaviorTests(unittest.TestCase):
             self.assertIsNone(run_tests._duration_output_path(None))
             self.assertIsNone(run_tests._duration_output_path((0, 2)))
 
+    def test_run_without_env_var_actually_runs_cases_and_reports_failure(self) -> None:
+        """二审 P1：上一条只断言「退出码为 0、没有多余输出」，三处变异能存活。
+
+        独立审查实测存活的三处：把 `_run()` 改成恒 `return 0`、把 discover 的
+        pattern 改成匹配不到任何文件（跑 0 条仍返回 0）、把 verbosity 调成 0。
+        前两处正是假绿形态——「什么都没跑」和「跑了但结论被吞掉」在只看退出码
+        的断言下与「全部通过」不可区分。本条补两件事：**真的跑到了用例**，
+        以及**用例失败时真的返回 1**。
+        """
+
+        opt_in_vars = (
+            "LINGXI_TEST_SHARD_INDEX",
+            "LINGXI_TEST_SHARD_COUNT",
+            "LINGXI_TEST_DURATIONS_DIR",
+            "LINGXI_TEST_REPORT_PATH",
+        )
+
+        def run_against(fixture_dir: Path) -> tuple[int, str]:
+            # unittest 的 discover 按模块名缓存：本文件里另一条用例也写过同名的
+            # 夹具模块，两者的临时目录不同，第二次 discover 会直接 ImportError
+            # （"module incorrectly imported from ..."）。这里的模块名刻意与那条
+            # 不同，并在每次跑之前把可能的残留清掉。
+            for stale in [m for m in sys.modules if m.startswith("test_premise_")]:
+                sys.modules.pop(stale, None)
+            with (
+                mock.patch.object(run_tests, "TESTS_DIRECTORY", fixture_dir),
+                mock.patch.dict(os.environ, {}, clear=False),
+            ):
+                for key in opt_in_vars:
+                    os.environ.pop(key, None)
+                captured = io.StringIO()
+                with mock.patch("sys.stderr", captured):
+                    code = run_tests._run()
+            return code, captured.getvalue()
+
+        with TemporaryDirectory() as workdir:
+            passing_dir = Path(workdir) / "passing_tests"
+            passing_dir.mkdir()
+            (passing_dir / "test_premise_ok.py").write_text(
+                "import unittest\n\n\n"
+                "class PremiseOkTests(unittest.TestCase):\n"
+                "    def test_premise_pass(self) -> None:\n"
+                "        self.assertTrue(True)\n",
+                encoding="utf-8",
+            )
+            code, output = run_against(passing_dir)
+
+            self.assertEqual(code, 0)
+            # 「真的跑到了用例」：unittest 的汇总行形如 `Ran 1 test in ...`。
+            # 恒返回 0 或 discover 匹配不到文件时，这一行会是 `Ran 0 tests`。
+            self.assertRegex(
+                output,
+                r"Ran [1-9]\d* tests?",
+                "默认路径必须真的发现并跑到用例；`Ran 0 tests` 与恒返回 0 都是假绿",
+            )
+            self.assertIn(
+                "test_premise_pass",
+                output,
+                "verbosity 被调低会让逐条用例名消失，那是改造前没有的行为差异",
+            )
+
+        with TemporaryDirectory() as workdir:
+            failing_dir = Path(workdir) / "failing_tests"
+            failing_dir.mkdir()
+            (failing_dir / "test_premise_fail.py").write_text(
+                "import unittest\n\n\n"
+                "class PremiseFailTests(unittest.TestCase):\n"
+                "    def test_premise_fail(self) -> None:\n"
+                "        self.fail('钉住：失败必须传播成非零退出码')\n",
+                encoding="utf-8",
+            )
+            code, output = run_against(failing_dir)
+
+            self.assertEqual(code, 1, "用例失败时默认路径必须返回 1——吞掉失败是本条要挡的假绿")
+            self.assertRegex(output, r"Ran [1-9]\d* tests?")
+
 
 class ShardEnvironmentTests(unittest.TestCase):
     """两个分片环境变量必须同时给出或同时不给，且值必须落在合法范围。"""

@@ -203,6 +203,7 @@ def embedded_copy_failures(path: pathlib.Path, migrations_root: pathlib.Path) ->
 _README_TABLE_HEADER = "| 当前事实"
 _README_HEAD_LABEL = "head revision"
 _README_BASE_LABEL = "基线 revision（链首）"
+_README_SECTION_HEADING = "## 谁说了算"
 
 
 def _extract_readme_documented_values(readme: str) -> dict[str, str]:
@@ -217,10 +218,20 @@ def _extract_readme_documented_values(readme: str) -> dict[str, str]:
     values: dict[str, str] = {}
     in_table = False
     skipped_separator = False
+    in_section = False
     for line in lines:
         stripped = line.strip()
+        # 外审实测的绕过（本函数上一版只锚「全文第一张同名表」）：在文档靠前处
+        # 放一张值正确的同名表、把「谁说了算」小节里真正那张删掉，校验静默通过。
+        # 那与 Issue #706 附带修掉的原漏洞是同一类——换了个壳又回来了。因此这里
+        # 必须真的按小节锚定，而不是只在 docstring 里声称按小节锚定。
+        if stripped.startswith("## "):
+            in_section = stripped == _README_SECTION_HEADING
+            if not in_section and in_table:
+                break  # 表还没读完就离开了本小节，后面的内容不属于它
+            continue
         if not in_table:
-            if stripped.startswith(_README_TABLE_HEADER):
+            if in_section and stripped.startswith(_README_TABLE_HEADER):
                 in_table = True
             continue
         if not skipped_separator:
