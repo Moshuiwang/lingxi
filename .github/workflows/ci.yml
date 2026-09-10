@@ -698,7 +698,8 @@ jobs:
             printf 'trace/** 本次推送未产出镜像证明（image=%s；gate=%s extras=%s，结论见各自作业）。\n' \
               "${IMAGE_RESULT}" "${GATE_RESULT}" "${EXTRAS_RESULT}" >&2
             echo 'trace/** 的合并点必须带 Image-Candidate: true trailer 的推送才能产出候选证明，' >&2
-            echo '否则合不进 main：给待合并的提交追加一行 Image-Candidate: true 后重新推送。' >&2
+            echo '否则合不进 main：在该分支上再推一个空提交，正文末尾独占一行 Image-Candidate: true' >&2
+            echo '（步骤见 deploy/README.md）。不要改写已被审查的那个提交——追加，不是重写。' >&2
             exit 1
           fi
           if [ "${GATE_RESULT}" != success ] || [ "${EXTRAS_RESULT}" != success ] || [ "${IMAGE_RESULT}" != success ]; then

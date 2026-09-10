@@ -2197,6 +2197,19 @@ def check_ci_workflow() -> list[str]:
                     f"ci.yml 的 image job 缺少 `{marker}`：PR 候选镜像制品链不完整（Issue #150）。"
                 )
 
+    # Issue #733：本批唯一的真实行为改动就是 image job 条件里的 trace/ 前缀。
+    # 独立审查实测：把它改回基线写法，测试全绿、契约检查也 exit 0——即这条改动
+    # 此前零钉住，任何人顺手改回去都不会有人报警（后果是成本回归，不是安全回归，
+    # 但既然一条断言就能钉住，没有理由留着）。
+    image_body = job_body(full, "image")
+    if image_body is None:
+        failures.append("ci.yml 缺少 image job。")
+    elif "startsWith(github.head_ref, 'trace/')" not in strip_comments(image_body):
+        failures.append(
+            "ci.yml 的 image job 条件缺少 `startsWith(github.head_ref, 'trace/')`："
+            "trace/** 批次分支拿不到按需跳过，每次推送都会全额构建镜像（Issue #733）。"
+        )
+
     # Issue #733 安全条款②：trace/** 不得成为绕过 gate 或 extras 的入口——本单只动
     # image 与 candidate 两个作业。这里钉住"以后谁都不能悄悄给 gate / extras 加一条
     # trace/** 或 head_ref 相关的跳过"；只看去掉整行注释之后的实际内容，注释里提到
