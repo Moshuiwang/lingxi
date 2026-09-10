@@ -11,7 +11,7 @@
 | 当前事实 | 值 |
 | --- | --- |
 | 基线 revision（链首） | `20260806_baseline` |
-| head revision | `0091_admin_action_followup` |
+| head revision | `0093_admin_followup_depends_idx` |
 | 配置文件 | 仓库根目录 `alembic.ini` |
 | revision 目录 | `migrations/alembic/versions/` |
 | 连接串环境变量 | `LINGXI_MIGRATION_DSN`（缺失即失败，无默认值） |
@@ -830,3 +830,7 @@ OAuth 路径已被 2026-07-28 决策排除；它们此前**不属于生产链**�
 ## `0092_innertest_membership`（动态资格与批次）
 
 只建资格、版本、受限身份绑定、批次/逐项、检查及审计结构；不导入真实名单。新增确认动作复用 pending_action，卡片意图与逐人开通均复用 admin_action_followup。outreach 增加外发开始和 unknown，已有终态不回填。动态资格/批次存在时拒绝删除迁移；恢复必须同时支持动态名单与 v1 阶段，不能静默退回旧环境变量名单。
+
+## `0093_admin_followup_depends_idx`（自引用外键补索引）
+
+[Issue #706](https://github.com/Moshuiwang/lingxi/issues/706)。`admin_action_followup.depends_on_id` 是自引用外键（`ON DELETE SET NULL`），此前没有索引：删除该表任意一行都要为「有没有别的行指向它」做一次全表扫描，删 N 行即 N 次全表扫描，清场 `DELETE` 因此呈平方级，见测试脚手架 `tests/test_admin_followup_postgres.py` 堆到万行后紧随其后的清场耗时实测。只补一条普通 `CREATE INDEX`（判定该表尚未上生产、目标环境无并发写入，不算「已有大表」，不需要 `CONCURRENTLY`，判定依据见迁移文件头部注释）。`downgrade()` 只删索引，不影响数据，回退不受表内是否有行影响。

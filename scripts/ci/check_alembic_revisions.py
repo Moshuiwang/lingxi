@@ -15,7 +15,10 @@
    要么真正逆转，要么显式 ``raise``（基线走后者，见裁定③）。
 4. **文档与实现脱节。** head revision id 要写进 ``migrations/README.md``——旧库接管
    命令要用它，下游 Issue 接链也要用它。不核对，README 会在第二条 revision 落地时
-   就过期，而过期的接管命令比没有命令更危险。
+   就过期，而过期的接管命令比没有命令更危险。**核对方式是解析「谁说了算」小节的
+   「当前事实」表、取 head / 基线两行反引号包裹的取值逐值比对**（Issue #706 附带
+   发现修复）：旧版按整篇文本找子串，只要 id 在文档任意位置出现过就判过——而
+   revision 自己的说明小节标题恰好就是它的 id，于是这条检查实际上什么都挡不住。
 
 另外核对 ``alembic.ini`` 不含可用的默认连接串（断言 V-迁移-05）。
 
@@ -28,6 +31,7 @@ from __future__ import annotations
 import ast
 import configparser
 import pathlib
+import re
 import sys
 
 REPOSITORY_ROOT = pathlib.Path(__file__).resolve().parents[2]
@@ -196,6 +200,77 @@ def embedded_copy_failures(path: pathlib.Path, migrations_root: pathlib.Path) ->
     return failures
 
 
+_README_TABLE_HEADER = "| 当前事实"
+_README_HEAD_LABEL = "head revision"
+_README_BASE_LABEL = "基线 revision（链首）"
+
+
+def _extract_readme_documented_values(readme: str) -> dict[str, str]:
+    """只解析「谁说了算」小节那张固定的「当前事实」表，取每行反引号包裹的取值。
+
+    不在全文搜索关键字：同一个 revision id 完全可能作为**别的 revision 自己的
+    说明小节标题**出现在文档别处（`0092_innertest_membership` 就恰好如此），
+    子串命中会把写错的表格值放过去——这正是 Issue #706 附带发现的门禁漏洞。
+    """
+
+    lines = readme.splitlines()
+    values: dict[str, str] = {}
+    in_table = False
+    skipped_separator = False
+    for line in lines:
+        stripped = line.strip()
+        if not in_table:
+            if stripped.startswith(_README_TABLE_HEADER):
+                in_table = True
+            continue
+        if not skipped_separator:
+            skipped_separator = True  # 表头分隔行 `| --- | --- |`，跳过不解析
+            continue
+        if not stripped.startswith("|"):
+            break  # 遇到第一行非表格内容，表已经结束
+        cells = [cell.strip() for cell in stripped.strip("|").split("|")]
+        if len(cells) < 2:
+            continue
+        label, value_cell = cells[0], cells[1]
+        match = re.search(r"`([^`]+)`", value_cell)
+        if match:
+            values[label] = match.group(1)
+    return values
+
+
+def check_readme_documented_revisions(readme: str, heads: list[str], bases: list[str]) -> list[str]:
+    """README「当前事实」表里的 head / 基线 revision 是否与实际链逐值一致。
+
+    旧版（Issue #706 之前）在整篇 README 文本里找子串，只要 id 在文档任意位置
+    出现过——哪怕只是别的 revision 自己的说明小节标题——就判定通过；写错的表格值
+    因此完全不被察觉。这里改成只解析「谁说了算」小节那张固定表格的两行，取出
+    反引号包裹的取值，与实际链头 / 链首逐值比对，不接受"只要出现过"。
+    """
+
+    failures: list[str] = []
+    documented = _extract_readme_documented_values(readme)
+    expectations: list[tuple[str, str]] = []
+    if len(heads) == 1:
+        expectations.append((_README_HEAD_LABEL, heads[0]))
+    if len(bases) == 1:
+        expectations.append((_README_BASE_LABEL, bases[0]))
+    for label, expected_value in expectations:
+        actual_value = documented.get(label)
+        if actual_value is None:
+            failures.append(
+                f"migrations/README.md 的「当前事实」表里没有「{label}」这一行，"
+                "或该行没有反引号包裹的取值。新增 revision 后必须同步 README，"
+                "过期的接管命令比没有命令更危险。"
+            )
+        elif actual_value != expected_value:
+            failures.append(
+                f"migrations/README.md 的「当前事实」表里「{label}」写的是 "
+                f"`{actual_value}`，与实际链上的值 `{expected_value}` 不一致。"
+                "新增 revision 后必须同步这一行，过期的接管命令比没有命令更危险。"
+            )
+    return failures
+
+
 def downgrade_failures(path: pathlib.Path) -> list[str]:
     """逐个 version 文件核对 ``downgrade()`` 不是静默空实现。"""
 
@@ -289,19 +364,10 @@ def main() -> int:
         failures.extend(downgrade_failures(revision_path))
         failures.extend(embedded_copy_failures(revision_path, MIGRATIONS_ROOT))
 
-    # head 与 base 的 id 必须出现在 README：接管旧库的命令要用 base（基线），
-    # 下游 Issue 接链与部署核对要用 head。
+    # head 与 base 的 id 必须逐值写在 README「当前事实」表里：接管旧库的命令要用
+    # base（基线），下游 Issue 接链与部署核对要用 head。
     readme = MIGRATIONS_README.read_text(encoding="utf-8")
-    documented: dict[str, list[str]] = {}
-    for label, identifiers in (("head", heads), ("基线 base", bases)):
-        for identifier in identifiers:
-            documented.setdefault(identifier, []).append(label)
-    for identifier, labels in documented.items():
-        if identifier not in readme:
-            failures.append(
-                f"migrations/README.md 里没有 {'/'.join(labels)} revision id `{identifier}`。"
-                "新增 revision 后必须同步 README，过期的接管命令比没有命令更危险。"
-            )
+    failures.extend(check_readme_documented_revisions(readme, heads, bases))
 
     if failures:
         print("alembic revision 链检查：不通过", file=sys.stderr)

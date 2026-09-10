@@ -223,6 +223,75 @@ class EmbeddedCopyTest(unittest.TestCase):
             self.assertEqual(CHECK.embedded_copy_failures(revision, root), [])
 
 
+class ReadmeDocumentedRevisionsTest(unittest.TestCase):
+    """`check_readme_documented_revisions` 只信「当前事实」表里的取值，不认子串命中。
+
+    Issue #706 附带发现：旧版整篇 README 文本找子串，只要 id 在文档任意位置出现过
+    ——哪怕只是**别的 revision 自己的说明小节标题**——就判定通过；
+    `0092_innertest_membership` 当时恰好如此，写错的表格值因此完全不被察觉。
+    下面第二、三条用例专门构造这种场景，证明收紧后的检查不会再被它放过。
+    """
+
+    _TABLE = (
+        "## 谁说了算\n\n"
+        "| 当前事实 | 值 |\n"
+        "| --- | --- |\n"
+        "| 基线 revision（链首） | `{base}` |\n"
+        "| head revision | `{head}` |\n"
+        "| 配置文件 | 仓库根目录 `alembic.ini` |\n"
+        "\n"
+        "> 上表的两个 revision id 由脚本核对。\n"
+    )
+
+    def test_matching_values_pass(self) -> None:
+        readme = self._TABLE.format(
+            base="20260806_baseline", head="0093_admin_followup_depends_idx"
+        )
+        failures = CHECK.check_readme_documented_revisions(
+            readme, heads=["0093_admin_followup_depends_idx"], bases=["20260806_baseline"]
+        )
+        self.assertEqual(failures, [])
+
+    def test_stale_head_value_is_rejected(self) -> None:
+        """把 head 那一行故意写错——本卡要求的钉住测试（验收 E-2⑤）。"""
+
+        readme = self._TABLE.format(base="20260806_baseline", head="0091_admin_action_followup")
+        failures = CHECK.check_readme_documented_revisions(
+            readme, heads=["0093_admin_followup_depends_idx"], bases=["20260806_baseline"]
+        )
+        self.assertEqual(len(failures), 1)
+        self.assertIn("head revision", failures[0])
+        self.assertIn("0091_admin_action_followup", failures[0])
+        self.assertIn("0093_admin_followup_depends_idx", failures[0])
+
+    def test_stale_head_value_is_rejected_even_when_correct_id_appears_elsewhere(self) -> None:
+        """正确 id 若恰好在文档别处以子串形式出现，旧版会误判通过——这是 #706 附带
+        发现的真实漏洞（`0092_innertest_membership` 恰好是自己的小节标题）。"""
+
+        readme = self._TABLE.format(base="20260806_baseline", head="0091_admin_action_followup")
+        readme += "\n## `0093_admin_followup_depends_idx`（自引用外键补索引）\n\n正文……\n"
+        failures = CHECK.check_readme_documented_revisions(
+            readme, heads=["0093_admin_followup_depends_idx"], bases=["20260806_baseline"]
+        )
+        self.assertEqual(len(failures), 1)
+        self.assertIn("head revision", failures[0])
+
+    def test_stale_base_value_is_rejected(self) -> None:
+        readme = self._TABLE.format(base="some_old_base", head="0093_admin_followup_depends_idx")
+        failures = CHECK.check_readme_documented_revisions(
+            readme, heads=["0093_admin_followup_depends_idx"], bases=["20260806_baseline"]
+        )
+        self.assertEqual(len(failures), 1)
+        self.assertIn("基线 revision（链首）", failures[0])
+
+    def test_missing_table_is_rejected_for_both_rows(self) -> None:
+        readme = "## 谁说了算\n\n本文档没有表格。\n"
+        failures = CHECK.check_readme_documented_revisions(
+            readme, heads=["0093_admin_followup_depends_idx"], bases=["20260806_baseline"]
+        )
+        self.assertEqual(len(failures), 2)
+
+
 class MigrationDsnTest(unittest.TestCase):
     """迁移连接串的校验（V-迁移-05）。
 
@@ -338,6 +407,26 @@ class RealRepositoryStateTest(unittest.TestCase):
         for path in sorted(versions.glob("*.py")):
             with self.subTest(revision=path.name):
                 self.assertEqual(CHECK.embedded_copy_failures(path, CHECK.MIGRATIONS_ROOT), [])
+
+    @unittest.skipUnless(
+        _alembic_available(), "跳过：未安装 migrate extra（alembic），无法建 revision 图"
+    )
+    def test_readme_documented_revisions_match_real_chain(self) -> None:
+        """README「当前事实」表里的 head / 基线必须与真实 revision 图逐值一致。
+
+        用真实 `ScriptDirectory` 建图取 head/base，不是构造用例——防止收紧后的
+        `check_readme_documented_revisions` 本身没问题，但仓库当前的 README 已经
+        脱节（例如合并冲突时手滑改错了这一行）。
+        """
+
+        from alembic.config import Config
+        from alembic.script import ScriptDirectory
+
+        script = ScriptDirectory.from_config(Config(str(CHECK.ALEMBIC_INI)))
+        heads = script.get_heads()
+        bases = script.get_bases()
+        readme = CHECK.MIGRATIONS_README.read_text(encoding="utf-8")
+        self.assertEqual(CHECK.check_readme_documented_revisions(readme, heads, bases), [])
 
 
 if __name__ == "__main__":
