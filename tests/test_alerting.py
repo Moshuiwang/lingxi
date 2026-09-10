@@ -15,10 +15,12 @@ from unittest import mock
 
 from lingxi.core.alerting import (
     AlertDispatcher,
+    AlertingDuty,
     AlertKind,
     AlertManager,
     AlertNotice,
     AlertPolicy,
+    AlertSignal,
     HeartbeatRegistry,
     NoticeAction,
 )
@@ -470,6 +472,190 @@ class GatewayAlertingAuditTests(unittest.TestCase):
             duty.dispatcher.run_once()
         self.assertTrue(
             any("alert.send_failed" in line for line in failed_logs.output), failed_logs.output
+        )
+
+
+class _RecordingSender:
+    """记录每次调用的最小 ``AlertSender`` 实现，不做任何真实网络调用。"""
+
+    def __init__(self) -> None:
+        self.calls: list[dict[str, object]] = []
+
+    def send_text(self, *, chat_id: str, text: str, dedupe_key: str) -> None:
+        self.calls.append({"chat_id": chat_id, "text": text, "dedupe_key": dedupe_key})
+
+
+def _observe_via_delivery_callback(kind: str, task_id: str) -> AlertManager:
+    """走真实的 ``delivery_alert_callback`` 注入点观察一次，返回底层状态机。"""
+    duty = AlertingDuty(
+        manager=AlertManager(), dispatcher=AlertDispatcher(sender=_RecordingSender(), chat_id="oc")
+    )
+    duty.delivery_alert_callback()(kind, task_id)
+    return duty.manager
+
+
+class DeliveryChainAlertReclassificationTests(unittest.TestCase):
+    """Issue #684：投递循环/文档投递维护的数据库、循环类故障此前恒定复用
+    `feishu_send_failed`，数据库故障因此在管理群里显示成「飞书发送失败」，把
+    排查方向指错。下面断言三个被搬走的上报点落新格、真正的飞书发送失败不受
+    影响、且新格复用原有节奏（阈值/去重/窗口重置/`final` 校验/窗口释放）。"""
+
+    def test_the_three_moved_report_points_land_in_the_new_kind_not_feishu_send_failed(
+        self,
+    ) -> None:
+        cases = {
+            "delivery_loop_failed:list_pending": "gateway-delivery-loop",
+            "progress_persist_failed:RuntimeError": "tsk_01J00000000000000000000001",
+            "document_delivery_reclaim_failed": "",
+        }
+        for kind, task_id in cases.items():
+            with self.subTest(kind=kind):
+                manager = _observe_via_delivery_callback(kind, task_id)
+                windows = list(manager._windows.values())
+                self.assertEqual(len(windows), 1)
+                self.assertEqual(windows[0].kind, AlertKind.DELIVERY_CHAIN_FAILED)
+                self.assertNotEqual(
+                    windows[0].kind,
+                    AlertKind.FEISHU_SEND_FAILED,
+                    f"{kind} 是数据库/循环故障，不是飞书发送失败",
+                )
+
+    def test_a_real_feishu_send_failure_is_still_feishu_send_failed(self) -> None:
+        notice = AlertManager().send_failure(
+            channel="card", final=True, at=START, trace_id="01JTRACE"
+        )[0]
+
+        self.assertEqual(notice.kind, AlertKind.FEISHU_SEND_FAILED)
+
+    def test_scope_is_unchanged_by_the_reclassification(self) -> None:
+        # 逐字取自生产事故复现（Issue #684）与本文件既有 scope 归一化断言。
+        cases = {
+            "delivery_loop_failed:list_pending": (
+                "gateway-delivery-loop",
+                "delivery_loop_failed_list_pending",
+            ),
+            "progress_persist_failed:RuntimeError": (
+                "tsk_01J00000000000000000000001",
+                "progress_persist_failed_runtimeerror",
+            ),
+            "document_delivery_reclaim_failed": ("", "document_delivery_reclaim_failed"),
+        }
+        for kind, (task_id, expected_scope) in cases.items():
+            with self.subTest(kind=kind):
+                manager = _observe_via_delivery_callback(kind, task_id)
+                window = next(iter(manager._windows.values()))
+                self.assertEqual(window.scope, expected_scope)
+
+    def test_new_kind_threshold_dedupe_and_window_reset_match_feishu_send_failed(self) -> None:
+        for kind in (AlertKind.FEISHU_SEND_FAILED, AlertKind.DELIVERY_CHAIN_FAILED):
+            with self.subTest(kind=kind):
+                manager = AlertManager()
+                self.assertEqual(
+                    manager.observe(AlertSignal(kind=kind, observed_at=START, scope="x")), ()
+                )
+                self.assertEqual(
+                    manager.observe(
+                        AlertSignal(kind=kind, observed_at=START + timedelta(minutes=1), scope="x")
+                    ),
+                    (),
+                )
+                third = manager.observe(
+                    AlertSignal(kind=kind, observed_at=START + timedelta(minutes=2), scope="x")
+                )
+                self.assertEqual(len(third), 1, "非 final 类型必须攒够 3 次 / 5 分钟才告警")
+                self.assertEqual(third[0].count, 3)
+
+                reset = AlertManager()
+                reset.observe(AlertSignal(kind=kind, observed_at=START, scope="y"))
+                reset.observe(
+                    AlertSignal(kind=kind, observed_at=START + timedelta(minutes=1), scope="y")
+                )
+                self.assertEqual(
+                    reset.observe(
+                        AlertSignal(kind=kind, observed_at=START + timedelta(minutes=6), scope="y")
+                    ),
+                    (),
+                    "五分钟窗口过期必须换成全新窗口，不能延续旧计数",
+                )
+
+                immediate = AlertManager()
+                first = immediate.observe(
+                    AlertSignal(kind=kind, observed_at=START, scope="z", final=True)
+                )
+                duplicate = immediate.observe(
+                    AlertSignal(
+                        kind=kind, observed_at=START + timedelta(minutes=29), scope="z", final=True
+                    )
+                )
+                self.assertEqual(len(first), 1)
+                self.assertEqual(duplicate, (), "30 分钟去重窗口内 final 类型只能有一条主告警")
+
+    def test_final_true_is_accepted_for_the_new_kind_and_still_rejected_elsewhere(self) -> None:
+        AlertSignal(kind=AlertKind.DELIVERY_CHAIN_FAILED, observed_at=START, scope="x", final=True)
+
+        with self.assertRaises(ValueError):
+            AlertSignal(kind=AlertKind.PROCESS_INACTIVE, observed_at=START, scope="x", final=True)
+
+    def test_a_delivery_chain_window_with_a_real_task_id_is_released_after_idle_timeout(
+        self,
+    ) -> None:
+        manager = AlertManager()
+        task_id = "tsk_01J00000000000000000000001"
+        manager.observe(
+            AlertSignal(
+                kind=AlertKind.DELIVERY_CHAIN_FAILED,
+                observed_at=START,
+                scope="progress_persist_failed_runtimeerror",
+                task_id=task_id,
+            )
+        )
+        self.assertEqual(len(manager._windows), 1)
+
+        idle = max(manager.policy.dedupe_window_seconds, manager.policy.send_failure_window_seconds)
+        manager.tick(at=START + timedelta(seconds=idle))
+        self.assertEqual(len(manager._windows), 0, "带真实任务号的窗口必须在闲置超时后释放")
+
+        manager.tick(at=START + timedelta(seconds=idle + 1))
+        self.assertEqual(len(manager._windows), 0, "释放之后重复 tick 不能让 _windows 重新增长")
+
+    def test_an_unmapped_kind_falls_back_to_feishu_send_failed_without_raising(self) -> None:
+        manager = _observe_via_delivery_callback("totally_unregistered_kind:example", "")
+
+        window = next(iter(manager._windows.values()))
+        self.assertEqual(window.kind, AlertKind.FEISHU_SEND_FAILED)
+
+    def test_the_rendered_notice_text_says_delivery_chain_not_feishu_send(self) -> None:
+        sender = _RecordingSender()
+        duty = AlertingDuty(
+            manager=AlertManager(),
+            dispatcher=AlertDispatcher(sender=sender, chat_id="oc_group", clock=lambda: START),
+            clock=lambda: START,
+        )
+
+        duty.delivery_alert_callback()("delivery_loop_failed:list_pending", "gateway-delivery-loop")
+        duty.dispatcher.run_once(at=START)
+
+        self.assertEqual(len(sender.calls), 1)
+        text = sender.calls[0]["text"]
+        self.assertIn("类型：投递链路故障", text)
+        self.assertNotIn("飞书发送失败", text)
+
+    def test_audit_event_type_reflects_the_new_kind(self) -> None:
+        notices = AlertManager().observe(
+            AlertSignal(
+                kind=AlertKind.DELIVERY_CHAIN_FAILED,
+                observed_at=START,
+                scope="delivery_loop_failed_list_pending",
+                final=True,
+            )
+        )
+
+        self.assertEqual(len(notices), 1)
+        self.assertEqual(
+            notices[0].event_type, "delivery_loop_failed_list_pending.delivery_chain_failed"
+        )
+        self.assertNotEqual(
+            notices[0].event_type, "delivery_loop_failed_list_pending.feishu_send_failed"
         )
 
 

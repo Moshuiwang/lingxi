@@ -43,10 +43,18 @@ class AlertKind(str, Enum):
     # 是两类不同的运维动作，因此独立成一个告警类型。
     WORKER_VERSION_UNAVAILABLE = "worker_version_unavailable"
     FEISHU_SEND_FAILED = "feishu_send_failed"
-    # 首次开通失败需要管理员核查——此前 `LINGXI_ADMIN_GROUP_CHAT_ID` 的全部消费方
-    # 都与开通失败无关，「已转交管理员处理」这句用户文案背后没有任何送达动作。
-    # 这一格补上开通失败以及开通中途停摆收口的送达面。
+    DELIVERY_CHAIN_FAILED = "delivery_chain_failed"  # 与飞书出站是否成功无关的投递故障
+    # 首次开通失败需要管理员核查——此前 `LINGXI_ADMIN_GROUP_CHAT_ID` 全部消费方都与
+    # 开通失败无关，「已转交管理员处理」背后没有送达动作；这一格补上开通失败与开通中途停摆收口的送达面。
     ONBOARDING_FAILED = "onboarding_failed"
+
+
+_DELIVERY_CHAIN_ALERT_PREFIXES = (
+    "delivery_loop_failed:",
+    "progress_persist_failed:",
+    "document_delivery_reclaim_failed",
+)
+_DELIVERY_ALERT_FAMILY = (AlertKind.FEISHU_SEND_FAILED, AlertKind.DELIVERY_CHAIN_FAILED)
 
 
 class NoticeAction(str, Enum):
@@ -196,15 +204,14 @@ class AlertSignal:
                 raise ValueError("trace_id 必须是安全的标识")
         if self.task_id is not None and task_reference(self.task_id) is None:
             raise ValueError("任务标识格式不合法")
-        if self.kind is not AlertKind.FEISHU_SEND_FAILED and self.final:
-            raise ValueError("只有飞书发送失败事件可以标记为 final")
+        if self.kind not in _DELIVERY_ALERT_FAMILY and self.final:
+            raise ValueError("只有飞书发送失败与投递链路故障事件可以标记为 final")
 
 
-#: 八类系统告警 → 中文标签：此前群消息是一行英文 key=value，运维之外的管理员
-#: 读不懂哪个英文键对应什么故障；照抄 ``scripts/ops/host_health_alert.py::
-#: render_message`` 的分行中文标签范式，标题带 ``[BI Plus 运行告警]`` 前缀 +
-#: 告警/恢复动作，正文按"类型/范围/次数/时间/追溯号"五个中文标签分行——与宿主
-#: 监控脚本同一视觉范式，不是碰巧长得像。
+#: 九类系统告警 → 中文标签：此前群消息是一行英文 key=value，运维之外的管理员读不
+#: 懂；照抄 ``scripts/ops/host_health_alert.py::render_message`` 的分行中文标签
+#: 范式，标题带 ``[BI Plus 运行告警]`` 前缀 + 告警/恢复动作，正文按"类型/范围/
+#: 次数/时间/追溯号"五个中文标签分行，与宿主监控脚本同一视觉范式。
 _ALERT_KIND_LABEL: dict[AlertKind, str] = {
     AlertKind.PROCESS_INACTIVE: "进程无心跳",
     AlertKind.QUEUED_STUCK: "任务排队超时未领取",
@@ -213,6 +220,7 @@ _ALERT_KIND_LABEL: dict[AlertKind, str] = {
     AlertKind.AWAITING_DELIVERY_STUCK: "投递确认超时未收到",
     AlertKind.WORKER_VERSION_UNAVAILABLE: "目标执行版本不可用",
     AlertKind.FEISHU_SEND_FAILED: "飞书发送失败",
+    AlertKind.DELIVERY_CHAIN_FAILED: "投递链路故障",
     AlertKind.ONBOARDING_FAILED: "用户开通失败",
 }
 
@@ -497,7 +505,7 @@ class AlertManager:
                 )
                 self._windows[key] = window
 
-            if signal.kind is AlertKind.FEISHU_SEND_FAILED and not signal.final:
+            if signal.kind in _DELIVERY_ALERT_FAMILY and not signal.final:
                 # 五分钟窗口过期的重置已由上面的 `_new_send_window` 统一兜底（过期即换成
                 # 全新窗口，consecutive_failures 归零），这里只需累加当前失败次数。
                 window.consecutive_failures += signal.count
@@ -510,7 +518,7 @@ class AlertManager:
             window.trace_id = signal.trace_id or window.trace_id
 
             threshold_reached = signal.final or (
-                signal.kind is not AlertKind.FEISHU_SEND_FAILED
+                signal.kind not in _DELIVERY_ALERT_FAMILY
                 or window.consecutive_failures >= self.policy.send_failure_threshold
             )
             if not threshold_reached:
@@ -556,7 +564,7 @@ class AlertManager:
                     # 持有。没有成功观察不能推断已恢复，因此释放时不生成恢复通知。
                     if (
                         window.task_id is not None
-                        and window.kind is AlertKind.FEISHU_SEND_FAILED
+                        and window.kind in _DELIVERY_ALERT_FAMILY
                         and (at - window.last_failure_at).total_seconds()
                         >= max(
                             self.policy.dedupe_window_seconds,
@@ -574,7 +582,7 @@ class AlertManager:
         return tuple(notices)
 
     def _new_send_window(self, window: _FailureWindow, signal: AlertSignal) -> bool:
-        if signal.kind is not AlertKind.FEISHU_SEND_FAILED or signal.final:
+        if signal.kind not in _DELIVERY_ALERT_FAMILY or signal.final:
             return False
         return (
             signal.observed_at - window.last_failure_at
@@ -937,8 +945,9 @@ class AlertingDuty:
                 task_id.startswith("tsk_") or not _SAFE_TRACE_ID.fullmatch(task_id)
             ):
                 event_id = None
+            chain = kind.startswith(_DELIVERY_CHAIN_ALERT_PREFIXES)
             signal = AlertSignal(
-                kind=AlertKind.FEISHU_SEND_FAILED,
+                kind=AlertKind.DELIVERY_CHAIN_FAILED if chain else AlertKind.FEISHU_SEND_FAILED,
                 observed_at=at,
                 scope=scope,
                 trace_id=event_id,
