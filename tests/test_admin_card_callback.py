@@ -20,6 +20,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 
 from lingxi.core.admin.card_callback import AdminCardCallbackHandler
+from lingxi.core.admin.innertest import InnertestError
 from lingxi.core.admin.notification import DECISION_CANCEL, DECISION_CONFIRM
 from lingxi.core.admin.pending_action import (
     ConfirmResultKind,
@@ -589,6 +590,43 @@ class TransientFailureTests(unittest.TestCase):
         ]
         self.assertEqual(len(transient_records), 1)
         self.assertEqual(transient_records[0]["classification"], "DeadlockDetected")
+
+    def test_authorization_change_is_a_definite_refusal_not_result_unknown(self) -> None:
+        """发起后管理授权变了，回执必须是确定的拒绝，不能说成「结果暂时无法确认」。
+
+        这类失败在事务里被拒、零写入，结果是确定的。落进「结果不明」那句会让
+        管理员以为可能执行了一半而不敢重发，而他真正该做的正是重新发起。
+        """
+        pending_actions = _FakePendingActions()
+        pending_actions.set_confirm_result(InnertestError("binding_disabled"))
+        cards = _FakeCardTransport()
+        group = _FakeGroupNotifier()
+        handler, audit = _build_handler(
+            pending_actions=pending_actions, confirm_cards=cards, group_notifier=group
+        )
+
+        outcome = handler.handle(
+            operator_open_id="ou_admin",
+            pending_action_id="pac_binding_changed",
+            decision=DECISION_CONFIRM,
+            trace_id="trc_binding",
+        )
+
+        self.assertEqual(outcome["toast"]["type"], "error")
+        self.assertIn("请重新发起", outcome["toast"]["content"])
+        self.assertNotIn("无法确认", outcome["toast"]["content"])
+        actions = [action for action, _fields in audit.records]
+        self.assertIn("admin.card_callback.authorization_changed", actions)
+        self.assertNotIn("admin.card_callback.decision_result_unknown", actions)
+        records = [
+            fields
+            for action, fields in audit.records
+            if action == "admin.card_callback.authorization_changed"
+        ]
+        self.assertEqual(records[0]["code"], "binding_disabled")
+        # 卡片与群通知都不动：这一次什么都没执行。
+        self.assertEqual(cards.update_calls, [])
+        self.assertEqual(group.sent, [])
 
     def test_transient_failure_toast_differs_from_audit_write_failure_toast(self) -> None:
         """两条分支产品含义相同（可以直接重试）但文案故意不同——回归防止未来

@@ -37,6 +37,7 @@ from lingxi.core.admin.card_callback_ports import (
 from lingxi.core.admin.card_dispatch import management_card_fingerprint
 from lingxi.core.admin.display_names import AdminDisplayNames
 from lingxi.core.admin.followup import FollowupCapacityError
+from lingxi.core.admin.innertest import InnertestError
 from lingxi.core.admin.notification import (
     DECISION_CANCEL,
     DECISION_CONFIRM,
@@ -63,6 +64,12 @@ from lingxi.core.admin.views import AdminUserStatusView
 #: 快照，走不到这里）。说成"未执行"会诱发第二次点击，去撞合同「同一项待确认操作最多
 #: 成功执行一次」那道行锁；让异常直接穿透 ``handle()`` 更坏——管理员什么应答都拿不到。
 _RESULT_UNKNOWN_TOAST = "操作结果暂时无法确认，请勿重复点击；稍后查看卡片上的最终状态。"
+
+#: 发起这批之后管理授权发生了变化（绑定被换、被停用，或角色被撤）时的回执。
+#: 这类失败**结果是确定的**——确认在事务里被拒、什么都没写，因此不能落进
+#: :data:`_RESULT_UNKNOWN_TOAST` 那句「结果暂时无法确认」：管理员会以为可能
+#: 执行了一半而不敢重发，实际上他要做的正是重新发起。
+_AUTHORIZATION_CHANGED_TOAST = "发起这批之后管理授权已变化，本次未执行；请重新发起。"
 
 
 class AdminCardCallbackHandler(_ManagementCardCallbackMixin):
@@ -135,6 +142,20 @@ class AdminCardCallbackHandler(_ManagementCardCallbackMixin):
                 )
         task()
 
+    def _refuse_authorization_changed(self, pending_action_id, trace_id, error):
+        """授权类失败在事务里被拒、零写入，是确定结果，不是结果不明。
+
+        落进「结果暂时无法确认」会让管理员以为可能执行了一半而不敢重发，而他
+        真正该做的正是重新发起。
+        """
+        self._audit.record(
+            "admin.card_callback.authorization_changed",
+            pending_action_id=pending_action_id,
+            trace_id=trace_id,
+            code=error.code,
+        )
+        return _toast_error(_AUTHORIZATION_CHANGED_TOAST)
+
     def _decide_pending_action(
         self, *, decision: str, pending_action_id: str, operator_open_id: str, trace_id: str
     ) -> dict[str, Any] | tuple[_Outcome, PendingAction]:
@@ -175,6 +196,8 @@ class AdminCardCallbackHandler(_ManagementCardCallbackMixin):
                 classification=error.classification,
             )
             return _toast_error("系统繁忙，请稍后重试")
+        except InnertestError as error:
+            return self._refuse_authorization_changed(pending_action_id, trace_id, error)
         except Exception as error:  # 见方法文档：结果不明不得说成未执行
             self._audit.record(
                 "admin.card_callback.decision_result_unknown",
