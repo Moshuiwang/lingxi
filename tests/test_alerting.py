@@ -1,13 +1,23 @@
-"""#92 的纯逻辑告警断言（L2；不连接真实飞书或生产数据库）。"""
+"""#92 的纯逻辑告警断言（L2；不连接真实飞书或生产数据库）。
+
+#685 补充：gateway/scheduler 多条线程共享同一份告警状态机时，加锁前会在
+「检查到期」与「产出/删除」之间的窗口里发生竞态（重复发送、`KeyError`、丢
+计数）；下面的并发用例断言加锁后这三类竞态都不会再发生。
+"""
 
 from __future__ import annotations
 
+import sys
+import threading
 import unittest
 from datetime import UTC, datetime, timedelta
+from unittest import mock
 
 from lingxi.core.alerting import (
+    AlertDispatcher,
     AlertKind,
     AlertManager,
+    AlertNotice,
     AlertPolicy,
     HeartbeatRegistry,
     NoticeAction,
@@ -15,6 +25,9 @@ from lingxi.core.alerting import (
 
 UTC = UTC
 START = datetime(2026, 8, 8, 0, 0, tzinfo=UTC)
+# 并发用例的重复次数：题面要求 ≥50，确认修复不是偶尔绿（也顺带确认变异后
+# 不是偶尔红——两种方向都不能靠运气）。
+_CONCURRENCY_ITERATIONS = 50
 
 
 class AlertPolicyTests(unittest.TestCase):
@@ -254,6 +267,210 @@ class SendFailureTests(unittest.TestCase):
         self.assertEqual(just_inside, (), "稳定窗口内(299s)不能提前发恢复")
         self.assertEqual(len(at_boundary), 1, "整点到达恢复稳定阈值(300s)必须发恢复")
         self.assertEqual(at_boundary[0].action, NoticeAction.RECOVERY)
+
+
+class _BarrierBlockingSender:
+    """真实发送方的替身：在发送时阻塞于两方栅栏，逼出未加锁实现的双发竞态。
+
+    未修复的 ``AlertDispatcher.run_once`` 在"检查到期"与"删除"之间隔着一次真实
+    网络往返；这里用栅栏模拟那段窗口——如果两条线程都认为同一条告警可以发送，
+    它们会在这里撞见彼此，`wait` 立即返回，双双继续发送。修复后同一条告警只会
+    被一条线程认领，另一条线程根本不会调用 ``send_text``；栅栏等不到第二方，
+    超时后自行放行（`BrokenBarrierError` 是预期的正常退出路径，不是失败）。
+    """
+
+    def __init__(self, barrier: threading.Barrier) -> None:
+        self._barrier = barrier
+        self.calls: list[str] = []
+
+    def send_text(self, *, chat_id: str, text: str, dedupe_key: str) -> None:
+        del chat_id, text
+        self.calls.append(dedupe_key)
+        try:
+            self._barrier.wait(timeout=0.05)
+        except threading.BrokenBarrierError:
+            pass
+
+
+class DispatcherConcurrencyTests(unittest.TestCase):
+    """V-告警-01 ①：两条线程并发 `run_once` 必须恰好发送一次、都不抛异常。"""
+
+    def test_two_threads_running_once_send_exactly_once(self) -> None:
+        for iteration in range(_CONCURRENCY_ITERATIONS):
+            self._assert_single_send_under_concurrent_run_once(iteration)
+
+    def _assert_single_send_under_concurrent_run_once(self, iteration: int) -> None:
+        barrier = threading.Barrier(2)
+        sender = _BarrierBlockingSender(barrier)
+        dispatcher = AlertDispatcher(sender=sender, chat_id="chat", clock=lambda: START)
+        notices = AlertManager().send_failure(
+            channel="probe", final=True, at=START, trace_id="01JTRACE"
+        )
+        dispatcher.submit(notices)
+
+        errors: list[BaseException] = []
+        results: list[int] = []
+
+        def run() -> None:
+            try:
+                results.append(dispatcher.run_once(at=START))
+            except BaseException as error:  # noqa: BLE001
+                errors.append(error)
+
+        threads = [threading.Thread(target=run) for _ in range(2)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=5)
+
+        label = f"第 {iteration} 轮"
+        self.assertEqual(errors, [], f"{label}：run_once 不应抛出异常：{errors!r}")
+        self.assertEqual(
+            len(sender.calls), 1, f"{label}：并发推进必须恰好发送一次，实际 {sender.calls!r}"
+        )
+        self.assertEqual(sum(results), 1, f"{label}：两次 run_once 合计成功数必须恰好 1")
+        self.assertEqual(dispatcher.pending_count, 0, f"{label}：成功发送后待发队列必须清零")
+
+
+class RecoverDueConcurrencyTests(unittest.TestCase):
+    """V-告警-01 ②：`_recover_due` 同型——两线程同时 `tick` 必须恰好恢复一次。"""
+
+    def test_two_threads_ticking_together_emit_exactly_one_recovery(self) -> None:
+        for iteration in range(_CONCURRENCY_ITERATIONS):
+            self._assert_single_recovery_under_concurrent_tick(iteration)
+
+    def _assert_single_recovery_under_concurrent_tick(self, iteration: int) -> None:
+        manager = AlertManager()
+        manager.send_failure(channel="probe", final=True, at=START, trace_id="01JTRACE")
+        recovery_start = START + timedelta(seconds=1)
+        manager.send_succeeded(channel="probe", at=recovery_start, trace_id="01JTRACE")
+        recover_at = recovery_start + timedelta(seconds=manager.policy.recovery_stable_seconds)
+
+        barrier = threading.Barrier(2)
+        original_notice = AlertManager._notice
+
+        # 在"判定恢复到期"之后、"产出通知"这一步阻塞于栅栏——这是 `_recover_due`
+        # 里唯一对应 dispatcher 网络往返的位置：两线程都判定到期后才会走到这里。
+        def delayed_notice(window: object, action: NoticeAction, at: datetime) -> AlertNotice:
+            try:
+                barrier.wait(timeout=0.05)
+            except threading.BrokenBarrierError:
+                pass
+            return original_notice(window, action, at)
+
+        errors: list[BaseException] = []
+        notices: list[AlertNotice] = []
+
+        def run() -> None:
+            try:
+                notices.extend(manager.tick(at=recover_at))
+            except BaseException as error:  # noqa: BLE001
+                errors.append(error)
+
+        with mock.patch.object(AlertManager, "_notice", staticmethod(delayed_notice)):
+            threads = [threading.Thread(target=run) for _ in range(2)]
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join(timeout=5)
+
+        label = f"第 {iteration} 轮"
+        self.assertEqual(errors, [], f"{label}：tick 不应抛出异常：{errors!r}")
+        self.assertEqual(len(notices), 1, f"{label}：并发 tick 必须恰好产出 1 条恢复通知")
+        self.assertEqual(notices[0].action, NoticeAction.RECOVERY)
+
+
+class ObserveConcurrencyTests(unittest.TestCase):
+    """V-告警-01 ③：N 条线程各观察一次，累计计数必须恰好为 N，不丢计数。"""
+
+    def test_concurrent_observations_do_not_lose_the_count(self) -> None:
+        for iteration in range(_CONCURRENCY_ITERATIONS):
+            self._assert_all_observations_are_counted(iteration)
+
+    def _assert_all_observations_are_counted(self, iteration: int) -> None:
+        threads_count = 20
+        manager = AlertManager(policy=AlertPolicy(send_failure_threshold=threads_count))
+        barrier = threading.Barrier(threads_count)
+        errors: list[BaseException] = []
+        notices: list[AlertNotice] = []
+
+        def run() -> None:
+            try:
+                barrier.wait(timeout=2.0)
+                notices.extend(manager.send_failure(channel="probe", final=False, at=START))
+            except BaseException as error:  # noqa: BLE001
+                errors.append(error)
+
+        threads = [threading.Thread(target=run) for _ in range(threads_count)]
+        # 观察窗口内没有网络调用可供阻塞；改用缩短 GIL 切换间隔的办法逼出更多
+        # 上下文切换机会，让未加锁的读-改-写在 50 轮里可靠地暴露丢计数。
+        previous_interval = sys.getswitchinterval()
+        sys.setswitchinterval(1e-6)
+        try:
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join(timeout=5)
+        finally:
+            sys.setswitchinterval(previous_interval)
+
+        label = f"第 {iteration} 轮"
+        self.assertEqual(errors, [], f"{label}：observe 不应抛出异常：{errors!r}")
+        self.assertEqual(
+            len(notices), 1, f"{label}：{threads_count} 次并发观察必须恰好触发 1 条告警"
+        )
+        self.assertEqual(notices[0].count, threads_count, f"{label}：并发 observe 不能丢计数")
+
+
+_GATEWAY_ENV_PREFIX = "LINGXI_GATEWAY_"
+_GATEWAY_MINIMAL_ENV = {
+    f"{_GATEWAY_ENV_PREFIX}APP_ID": "cli_fake_app_id",
+    f"{_GATEWAY_ENV_PREFIX}APP_SECRET": "fake-app-secret-for-tests-only-8Xq2",
+    f"{_GATEWAY_ENV_PREFIX}POSTGRES_DSN": (
+        "postgresql://lingxi:fake-password-for-tests-only@db.invalid/lingxi"
+    ),
+}
+
+
+class GatewayAlertingAuditTests(unittest.TestCase):
+    """V-告警-01 ⑤：gateway 装配路径上必须产出 `alert.sent` / `alert.send_failed`。
+
+    改前 `apps/gateway/alerting.py` 构造 `AlertDispatcher` 时没有传 `audit=`，
+    这两条审计永远不会产生；本用例断言改后两条都会产生。
+    """
+
+    def test_dispatcher_emits_sent_and_failed_audit_events(self) -> None:
+        from lingxi.apps.gateway.alerting import LogOnlyAlertSender, build_alerting_duty
+        from lingxi.apps.gateway.config import load_config
+
+        config = load_config(_GATEWAY_MINIMAL_ENV)
+        duty = build_alerting_duty(config)
+
+        sent_notices = duty.manager.send_failure(
+            channel="probe_sent", final=True, at=START, trace_id="01JTRACE"
+        )
+        duty.dispatcher.submit(sent_notices)
+        # 不传 `at=`：`submit` 用的是 dispatcher 自己的真实时钟给 `next_attempt_at`
+        # 盖戳，`run_once` 必须用同一把时钟判定到期，否则会被"未到期"误跳过
+        # （`send_failure` 的 `at=START` 只落进通知正文的 `observed_at`，与调度
+        # 时钟无关）。
+        with self.assertLogs("lingxi.apps.gateway", level="INFO") as sent_logs:
+            sent_count = duty.dispatcher.run_once()
+        self.assertEqual(sent_count, 1)
+        self.assertTrue(any("alert.sent" in line for line in sent_logs.output), sent_logs.output)
+
+        failed_notices = duty.manager.send_failure(
+            channel="probe_failed", final=True, at=START, trace_id="01JTRACE"
+        )
+        duty.dispatcher.submit(failed_notices)
+        with (
+            mock.patch.object(LogOnlyAlertSender, "send_text", side_effect=RuntimeError("boom")),
+            self.assertLogs("lingxi.apps.gateway", level="WARNING") as failed_logs,
+        ):
+            duty.dispatcher.run_once()
+        self.assertTrue(
+            any("alert.send_failed" in line for line in failed_logs.output), failed_logs.output
+        )
 
 
 if __name__ == "__main__":

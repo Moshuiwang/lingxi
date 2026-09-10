@@ -288,6 +288,9 @@ class HeartbeatRegistry:
 
     第一次检查一个尚未发过心跳的组件不会直接产生告警；启动期尚未完成装配不等于
     进程停止。调用方在常驻循环中周期 ``beat``，监控方用 ``statuses`` 判定翻转。
+
+    线程安全：内部持一把可重入锁，全部方法可从多个线程并发调用——gateway/scheduler
+    进程内多条后台循环共享同一份心跳登记表是已确认的正常用法（Issue #685）。
     """
 
     def __init__(self, *, default_timeout_seconds: float = 120.0) -> None:
@@ -295,6 +298,7 @@ class HeartbeatRegistry:
         if not math.isfinite(default_timeout_seconds) or default_timeout_seconds <= 0:
             raise ValueError("default_timeout_seconds 必须是正的有限数字")
         self._default_timeout_seconds = default_timeout_seconds
+        self._lock = threading.RLock()
         self._records: dict[str, _Heartbeat] = {}
 
     def register(self, component: str, *, timeout_seconds: float | None = None) -> None:
@@ -303,23 +307,25 @@ class HeartbeatRegistry:
         timeout = self._default_timeout_seconds if timeout_seconds is None else timeout_seconds
         if not math.isfinite(timeout) or timeout <= 0:
             raise ValueError("heartbeat timeout 必须是正的有限数字")
-        existing = self._records.get(component)
-        if existing is None:
-            self._records[component] = _Heartbeat(timeout_seconds=timeout)
-            return
-        if existing.timeout_seconds != timeout:
-            raise ValueError("同一组件不能在运行中更换心跳阈值")
+        with self._lock:
+            existing = self._records.get(component)
+            if existing is None:
+                self._records[component] = _Heartbeat(timeout_seconds=timeout)
+                return
+            if existing.timeout_seconds != timeout:
+                raise ValueError("同一组件不能在运行中更换心跳阈值")
 
     def beat(self, component: str, *, at: datetime) -> None:
         """记一次心跳；组件未登记过时按默认阈值隐式登记。"""
         component = _category(component, "component")
-        self.register(component)
-        record = self._records[component]
         moment = _as_utc(at)
-        if record.last_seen_at is not None and moment < record.last_seen_at:
-            raise ValueError("心跳时间不能倒退")
-        record.last_seen_at = moment
-        record.previous_active = True
+        with self._lock:
+            self.register(component)
+            record = self._records[component]
+            if record.last_seen_at is not None and moment < record.last_seen_at:
+                raise ValueError("心跳时间不能倒退")
+            record.last_seen_at = moment
+            record.previous_active = True
 
     def status(self, component: str, *, at: datetime) -> HeartbeatStatus:
         """返回组件的活跃判定；``changed`` 是“自上次观察以来是否翻转”的边沿信号。
@@ -332,25 +338,27 @@ class HeartbeatRegistry:
         与基线推进无关；``changed`` 只作日志与边沿判定参考。
         """
         component = _category(component, "component")
-        record = self._records.get(component)
-        if record is None:
-            raise KeyError(component)
         moment = _as_utc(at)
-        if record.last_seen_at is None:
-            active = False
-            changed = False
-        else:
-            active = (moment - record.last_seen_at).total_seconds() < record.timeout_seconds
-            changed = record.previous_active is not None and active != record.previous_active
-        # 推进边沿基线——理由见方法文档；只影响 changed，不影响 active 决策。
-        record.previous_active = (
-            active if record.last_seen_at is not None else record.previous_active
-        )
-        return HeartbeatStatus(component, record.last_seen_at, active, changed)
+        with self._lock:
+            record = self._records.get(component)
+            if record is None:
+                raise KeyError(component)
+            if record.last_seen_at is None:
+                active = False
+                changed = False
+            else:
+                active = (moment - record.last_seen_at).total_seconds() < record.timeout_seconds
+                changed = record.previous_active is not None and active != record.previous_active
+            # 推进边沿基线——理由见方法文档；只影响 changed，不影响 active 决策。
+            record.previous_active = (
+                active if record.last_seen_at is not None else record.previous_active
+            )
+            return HeartbeatStatus(component, record.last_seen_at, active, changed)
 
     def statuses(self, *, at: datetime) -> tuple[HeartbeatStatus, ...]:
         """按组件名排序，返回全部已登记组件的当前活跃判定。"""
-        return tuple(self.status(component, at=at) for component in sorted(self._records))
+        with self._lock:
+            return tuple(self.status(component, at=at) for component in sorted(self._records))
 
 
 @dataclass
@@ -368,7 +376,11 @@ class _FailureWindow:
 
 
 class AlertManager:
-    """阈值、故障窗口去重和稳定恢复的状态机。"""
+    """阈值、故障窗口去重和稳定恢复的状态机。
+
+    线程安全：内部持一把可重入锁，全部方法可从多个线程并发调用——gateway 多条
+    投递循环、scheduler 后台聚合线程共享同一份状态机是正常用法（Issue #685）。
+    """
 
     def __init__(
         self,
@@ -381,6 +393,7 @@ class AlertManager:
         self.heartbeats = heartbeats or HeartbeatRegistry(
             default_timeout_seconds=self.policy.heartbeat_timeout_seconds
         )
+        self._lock = threading.RLock()
         self._windows: dict[tuple[AlertKind, str, str | None], _FailureWindow] = {}
 
     def register_process(self, component: str) -> None:
@@ -472,60 +485,62 @@ class AlertManager:
     def observe(self, signal: AlertSignal) -> tuple[AlertNotice, ...]:
         """记一次故障观察，跨过阈值/去重窗口才真正产出一条告警通知。"""
         key = (signal.kind, signal.scope, signal.task_id)
-        window = self._windows.get(key)
-        if window is None or self._new_send_window(window, signal):
-            window = _FailureWindow(
-                kind=signal.kind,
-                scope=signal.scope,
-                window_started_at=signal.observed_at,
-                last_failure_at=signal.observed_at,
-                task_id=signal.task_id,
+        with self._lock:
+            window = self._windows.get(key)
+            if window is None or self._new_send_window(window, signal):
+                window = _FailureWindow(
+                    kind=signal.kind,
+                    scope=signal.scope,
+                    window_started_at=signal.observed_at,
+                    last_failure_at=signal.observed_at,
+                    task_id=signal.task_id,
+                )
+                self._windows[key] = window
+
+            if signal.kind is AlertKind.FEISHU_SEND_FAILED and not signal.final:
+                # 五分钟窗口过期的重置已由上面的 `_new_send_window` 统一兜底（过期即换成
+                # 全新窗口，consecutive_failures 归零），这里只需累加当前失败次数。
+                window.consecutive_failures += signal.count
+            else:
+                window.consecutive_failures = max(window.consecutive_failures, 1)
+
+            window.last_failure_at = signal.observed_at
+            window.recovery_since = None
+            window.total_count += signal.count
+            window.trace_id = signal.trace_id or window.trace_id
+
+            threshold_reached = signal.final or (
+                signal.kind is not AlertKind.FEISHU_SEND_FAILED
+                or window.consecutive_failures >= self.policy.send_failure_threshold
             )
-            self._windows[key] = window
+            if not threshold_reached:
+                return ()
 
-        if signal.kind is AlertKind.FEISHU_SEND_FAILED and not signal.final:
-            # 五分钟窗口过期的重置已由上面的 `_new_send_window` 统一兜底（过期即换成
-            # 全新窗口，consecutive_failures 归零），这里只需累加当前失败次数。
-            window.consecutive_failures += signal.count
-        else:
-            window.consecutive_failures = max(window.consecutive_failures, 1)
+            if (
+                window.last_alert_at is not None
+                and (signal.observed_at - window.last_alert_at).total_seconds()
+                < self.policy.dedupe_window_seconds
+            ):
+                return ()
 
-        window.last_failure_at = signal.observed_at
-        window.recovery_since = None
-        window.total_count += signal.count
-        window.trace_id = signal.trace_id or window.trace_id
-
-        threshold_reached = signal.final or (
-            signal.kind is not AlertKind.FEISHU_SEND_FAILED
-            or window.consecutive_failures >= self.policy.send_failure_threshold
-        )
-        if not threshold_reached:
-            return ()
-
-        if (
-            window.last_alert_at is not None
-            and (signal.observed_at - window.last_alert_at).total_seconds()
-            < self.policy.dedupe_window_seconds
-        ):
-            return ()
-
-        window.last_alert_at = signal.observed_at
-        return (self._notice(window, NoticeAction.ALERT, signal.observed_at),)
+            window.last_alert_at = signal.observed_at
+            return (self._notice(window, NoticeAction.ALERT, signal.observed_at),)
 
     def resolve(self, signal: AlertSignal) -> tuple[AlertNotice, ...]:
         """记一次恢复观察，进入稳定期计时，真正的恢复通知由 :meth:`tick` 产出。"""
         key = (signal.kind, signal.scope, signal.task_id)
-        window = self._windows.get(key)
-        if window is None:
-            return ()
-        if window.last_alert_at is None:
-            # 尚未达到阈值的瞬时失败自行恢复，只留下日志，不产生恢复噪声。
-            del self._windows[key]
-            return ()
-        if window.recovery_since is None:
-            window.recovery_since = signal.observed_at
-        window.trace_id = signal.trace_id or window.trace_id
-        return self._recover_due(signal.observed_at)
+        with self._lock:
+            window = self._windows.get(key)
+            if window is None:
+                return ()
+            if window.last_alert_at is None:
+                # 尚未达到阈值的瞬时失败自行恢复，只留下日志，不产生恢复噪声。
+                self._windows.pop(key, None)
+                return ()
+            if window.recovery_since is None:
+                window.recovery_since = signal.observed_at
+            window.trace_id = signal.trace_id or window.trace_id
+            return self._recover_due(signal.observed_at)
 
     def tick(self, *, at: datetime) -> tuple[AlertNotice, ...]:
         """推进恢复及任务投递故障闲置计时，不依赖下一次业务发送。"""
@@ -533,26 +548,29 @@ class AlertManager:
 
     def _recover_due(self, at: datetime) -> tuple[AlertNotice, ...]:
         notices: list[AlertNotice] = []
-        for key in sorted(self._windows, key=lambda item: (item[0].value, item[1])):
-            window = self._windows[key]
-            if window.recovery_since is None:
-                # 任务投递观察只保留计数与去重所需时间；待发送摘要由 dispatcher 独立持有。
-                # 没有成功观察不能推断已恢复，因此释放时不生成恢复通知。
+        with self._lock:
+            for key in sorted(self._windows, key=lambda item: (item[0].value, item[1])):
+                window = self._windows[key]
+                if window.recovery_since is None:
+                    # 任务投递观察只保留计数与去重所需时间；待发送摘要由 dispatcher 独立
+                    # 持有。没有成功观察不能推断已恢复，因此释放时不生成恢复通知。
+                    if (
+                        window.task_id is not None
+                        and window.kind is AlertKind.FEISHU_SEND_FAILED
+                        and (at - window.last_failure_at).total_seconds()
+                        >= max(
+                            self.policy.dedupe_window_seconds,
+                            self.policy.send_failure_window_seconds,
+                        )
+                    ):
+                        self._windows.pop(key, None)
+                    continue
                 if (
-                    window.task_id is not None
-                    and window.kind is AlertKind.FEISHU_SEND_FAILED
-                    and (at - window.last_failure_at).total_seconds()
-                    >= max(
-                        self.policy.dedupe_window_seconds,
-                        self.policy.send_failure_window_seconds,
-                    )
-                ):
-                    del self._windows[key]
-                continue
-            if (at - window.recovery_since).total_seconds() < self.policy.recovery_stable_seconds:
-                continue
-            notices.append(self._notice(window, NoticeAction.RECOVERY, at))
-            del self._windows[key]
+                    at - window.recovery_since
+                ).total_seconds() < self.policy.recovery_stable_seconds:
+                    continue
+                notices.append(self._notice(window, NoticeAction.RECOVERY, at))
+                self._windows.pop(key, None)
         return tuple(notices)
 
     def _new_send_window(self, window: _FailureWindow, signal: AlertSignal) -> bool:
@@ -612,6 +630,9 @@ class _PendingAlert:
     notice: AlertNotice
     next_attempt_at: datetime
     attempt: int = 0
+    # 在途标志：锁内认领时置真，避免两条线程并发认领同一条待发告警——认领与
+    # 发送之间隔着一次真实网络往返，光靠"检查到期"不足以互斥（Issue #685）。
+    in_flight: bool = False
 
 
 class AlertDispatcher:
@@ -620,6 +641,11 @@ class AlertDispatcher:
     这里是唯一会调用发送适配器的告警编排层。发送失败只保留摘要和下一次重试时间，
     不把异常抛回调用方，也不保存告警正文之外的业务对象。真实发送行为由注入的
     sender 与各自进程的受控验证负责。
+
+    线程安全：内部持一把可重入锁，gateway 的投递循环与文档投递循环共享同一份
+    实例是正常用法。``run_once`` 的锁不跨在网络发送上（锁内认领、锁外发送、锁
+    内收尾），两线程并发调用的可见结果是恰好一次发送——宁可重复、不可丢一条
+    告警（Issue #685 产品负责人裁定）。
     """
 
     def __init__(
@@ -639,31 +665,43 @@ class AlertDispatcher:
         self._policy = policy or AlertPolicy()
         self._audit = audit
         self._clock = clock or (lambda: datetime.now(UTC))
+        self._lock = threading.RLock()
         self._pending: dict[str, _PendingAlert] = {}
         self.observed_delays: list[float] = []
 
     @property
     def pending_count(self) -> int:
         """当前还没有成功投递、仍在等待重试的告警数量。"""
-        return len(self._pending)
+        with self._lock:
+            return len(self._pending)
 
     def submit(self, notices: Sequence[AlertNotice]) -> None:
         """加入待投递队列；相同去重键只保留一条。"""
         now = _as_utc(self._clock())
-        for notice in sorted(notices, key=lambda item: item.dedupe_key):
-            self._pending.setdefault(
-                notice.dedupe_key,
-                _PendingAlert(notice=notice, next_attempt_at=now),
-            )
+        with self._lock:
+            for notice in sorted(notices, key=lambda item: item.dedupe_key):
+                self._pending.setdefault(
+                    notice.dedupe_key,
+                    _PendingAlert(notice=notice, next_attempt_at=now),
+                )
 
     def run_once(self, *, at: datetime | None = None) -> int:
-        """投递当前到期的告警，返回本轮成功数。"""
+        """投递当前到期、未在途的告警，返回本轮成功数。
+
+        锁内认领到期且未在途的条目并标记在途，发送在锁外进行，见类文档。
+        """
         now = _as_utc(self._clock() if at is None else at)
+        claimed: list[tuple[str, _PendingAlert]] = []
+        with self._lock:
+            for dedupe_key in sorted(tuple(self._pending)):
+                pending = self._pending.get(dedupe_key)
+                if pending is None or pending.in_flight or pending.next_attempt_at > now:
+                    continue
+                pending.in_flight = True
+                claimed.append((dedupe_key, pending))
+
         sent = 0
-        for dedupe_key in sorted(tuple(self._pending)):
-            pending = self._pending.get(dedupe_key)
-            if pending is None or pending.next_attempt_at > now:
-                continue
+        for dedupe_key, pending in claimed:
             notice = pending.notice
             try:
                 self._sender.send_text(
@@ -672,33 +710,46 @@ class AlertDispatcher:
                     dedupe_key=notice.dedupe_key,
                 )
             except Exception as error:  # 告警失败只进入本地重试队列
-                delay = self._policy.retry_delay(pending.attempt)
-                pending.attempt += 1
-                pending.next_attempt_at = now + timedelta(seconds=delay)
-                self.observed_delays.append(delay)
-                self._record(
-                    "alert.send_failed",
-                    event_type=notice.event_type,
-                    action=notice.action.value,
-                    attempt=pending.attempt,
-                    error=type(error).__name__,
-                )
-                logger.error(
-                    "运行告警发送失败，将重试 event=%s attempt=%s error=%s",
-                    notice.event_type,
-                    pending.attempt,
-                    type(error).__name__,
-                )
+                self._finalize_failure(pending, now=now, error=error)
                 continue
-            del self._pending[dedupe_key]
+            self._finalize_success(dedupe_key, notice)
             sent += 1
-            self._record(
-                "alert.sent",
-                event_type=notice.event_type,
-                action=notice.action.value,
-                count=notice.count,
-            )
         return sent
+
+    def _finalize_success(self, dedupe_key: str, notice: AlertNotice) -> None:
+        """发送成功的收尾：锁内摘除待发条目，锁外记一条 ``alert.sent`` 审计。"""
+        with self._lock:
+            self._pending.pop(dedupe_key, None)
+        self._record(
+            "alert.sent",
+            event_type=notice.event_type,
+            action=notice.action.value,
+            count=notice.count,
+        )
+
+    def _finalize_failure(self, pending: _PendingAlert, *, now: datetime, error: Exception) -> None:
+        """发送失败的收尾：锁内清在途标志并计入退避，保留条目供下一轮重试。"""
+        notice = pending.notice
+        with self._lock:
+            delay = self._policy.retry_delay(pending.attempt)
+            pending.attempt += 1
+            pending.next_attempt_at = now + timedelta(seconds=delay)
+            pending.in_flight = False
+            self.observed_delays.append(delay)
+            attempt = pending.attempt
+        self._record(
+            "alert.send_failed",
+            event_type=notice.event_type,
+            action=notice.action.value,
+            attempt=attempt,
+            error=type(error).__name__,
+        )
+        logger.error(
+            "运行告警发送失败，将重试 event=%s attempt=%s error=%s",
+            notice.event_type,
+            attempt,
+            type(error).__name__,
+        )
 
     def _record(self, action: str, /, **fields: object) -> None:
         if self._audit is None:
