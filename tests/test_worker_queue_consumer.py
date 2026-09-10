@@ -135,16 +135,14 @@ def worker_config(**overrides: object) -> WorkerConfig:
 
 
 def dependency_unavailable_error(message: str = "数据库暂时不可达") -> Exception:
-    """构造一个 ``is_dependency_unavailable`` 一定判真的异常，不管本机是否装了
-    psycopg——本机装了就是 ``psycopg.OperationalError``，没装就退回 ``OSError``，
-    与被测函数自身的判定逻辑同一份延迟导入分支，见
-    ``adapters/postgres_conversation/_dependency_availability.py``。
+    """构造一个 ``is_dependency_unavailable`` 一定判真的异常。
+
+    刻意用标准库的 ``ConnectionRefusedError`` 而不是驱动自己的异常：判定按类型
+    信息判、不导入驱动，因此这里也不必依赖本机装没装驱动，装没装都走同一条
+    分支。上一版这段说明写的是「与被测函数同一份延迟导入分支」——那是判定改写
+    之前的实现，留着就是又一处文字与实现相反。
     """
-    try:
-        import psycopg
-    except ModuleNotFoundError:
-        return OSError(message)
-    return psycopg.OperationalError(message)
+    return ConnectionRefusedError(message)
 
 
 class RecordingCards:
@@ -5823,8 +5821,37 @@ class DependencyAvailabilityJudgementTests(unittest.TestCase):
         child = type("ConnectionTimeout", (parent,), {"__module__": "psycopg.errors"})
         self.assertTrue(is_dependency_unavailable(child("超时")))
 
-    def test_os_error_is_a_dependency_failure(self) -> None:
-        self.assertTrue(is_dependency_unavailable(OSError("连接被拒绝")))
+    def test_connection_family_errors_are_dependency_failures(self) -> None:
+        """标准库里真正表示「连不上」的那几类必须判真。"""
+
+        for failure in (
+            ConnectionRefusedError("连接被拒绝"),
+            ConnectionResetError("连接被重置"),
+            BrokenPipeError("管道断了"),
+            TimeoutError("等超时"),
+            __import__("socket").gaierror("域名解析失败"),
+            __import__("ssl").SSLError("握手失败"),
+        ):
+            with self.subTest(failure=type(failure).__name__):
+                self.assertTrue(is_dependency_unavailable(failure))
+
+    def test_local_environment_defects_are_not_dependency_failures(self) -> None:
+        """否定断言：本地配错了不是依赖抖动，必须响亮崩溃而不是每轮重试。
+
+        独立内审与外审各自独立报出同一条：兜底若是整个 ``OSError``，证书路径
+        写错、权限配错这类要人去修的缺陷会被判成「数据库抖了一下」，于是每轮
+        记一条降级日志、永远转下去，**永远不会有人发现**。
+        """
+
+        for defect in (
+            PermissionError("权限配错"),
+            FileNotFoundError("证书路径写错"),
+            IsADirectoryError("路径指到目录了"),
+            NotADirectoryError("路径不是目录"),
+            OSError("裸 OSError 说不清是哪一类"),
+        ):
+            with self.subTest(defect=type(defect).__name__):
+                self.assertFalse(is_dependency_unavailable(defect))
 
     def test_coding_defects_are_never_swallowed(self) -> None:
         """否定断言：这几类必须判假，否则真 bug 会被当成依赖抖动静默重试。"""

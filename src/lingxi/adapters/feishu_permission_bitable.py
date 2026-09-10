@@ -180,6 +180,7 @@ class BitablePermissionTable:
         for _ in range(self._max_pages):
             data = self._call("GET", self._list_url(page_token), body=None)
             items = data.get("items")
+            items_key_absent = items is None
             if items is None:
                 # 空表在飞书的响应里可能没有 items 键；这与"响应形状不对"不同。
                 items = []
@@ -205,6 +206,21 @@ class BitablePermissionTable:
                 # 字段缺失（None）与类型非法都不是合法 bool：这一轮到底翻完没有是未知
                 # 的，不能当"读完了"处理（对齐 feishu_paged_client 多列表翻页路径的
                 # 严格口径，理由见该文件模块文档）。
+                #
+                # 唯一豁免与那条路径逐字同源（`_pages_multi_empty_result`）：**首页、
+                # 连 items 键都不存在、且 has_more 整个缺失**
+                # ——这正是空表在飞书响应里的真实形状（同上面 items 缺失那处注释）。
+                # 独立审查实测：不留这个口，一张真实空表会在开通与存量令牌读取两条
+                # 旅程上硬失败。**items 明确给成 [] 却缺 has_more 仍然判红**：那是
+                # 响应真的说不清翻完没有，不是空表。
+                # 判据用 `is` 身份比较：`0 == False` 为真，用 `in (False, None)` 会把
+                # `has_more: 0` 误判成合法空结果。
+                # 没有再加一条「还没收到过任何一行」：`page_token is None` 已经
+                # 蕴含这是第一次循环，那时必然一行都没收到。加上它做不出任何
+                # 判别——变异实测坐实它删掉之后没有任何用例会红，而一个永远
+                # 不可能为假的条件就是一条永远不会失败的断言。
+                if page_token is None and items_key_absent and has_more is None:
+                    break
                 raise PermissionTableError("has_more_invalid", definite=False)
             if has_more is False:
                 break

@@ -7,15 +7,37 @@
 
 **本模块不导入数据库驱动**：仓库纪律是驱动只能由 ``lingxi.adapters.postgres``
 的连接入口延迟导入，正式代码其余地方一律不碰（``scripts/ci/check_db_timeouts.py``
-钉住这一条）。因此这里改为**按异常自身的类型信息判定**——沿继承链找模块归属为
-``psycopg`` 且名为 ``OperationalError`` 的类——不需要驱动在场，装没装都一样。
-再退一步用标准库 ``OSError`` 兜底，覆盖连接失败与超时这类真实故障。
+钉住这一条）。因此这里按**异常自身的类型信息**判定——沿继承链找模块归属为
+``psycopg`` 且名为 ``OperationalError`` 的类——不需要驱动在场。
+
+**兜底刻意收窄到「连不上」这一类，不是整个 ``OSError``。** 独立内审与外审各自
+独立报出同一条：整个 ``OSError`` 太宽，``PermissionError`` / ``FileNotFoundError``
+/ ``IsADirectoryError`` 这些**本地配置或代码缺陷**会被判成「数据库抖了一下」，
+于是每轮记一条降级日志、永远转下去——证书路径写错、权限配错这类问题从「响亮
+崩溃」变成「静默重试」，永远不会有人发现。判宽的代价比判窄大得多：判窄了只是
+多退出一次进程，判宽了是真 bug 永远不暴露。
 """
 
 from __future__ import annotations
 
+import socket
+import ssl
+
 _DRIVER_ROOT = "psycopg"
 _DRIVER_UNAVAILABLE_ERROR = "OperationalError"
+
+#: 标准库里真正表示「连不上 / 连上了又断了 / 等超时」的那几类，全部是 ``OSError``
+#: 的子类。``ConnectionError`` 一族含 ``ConnectionRefusedError`` /
+#: ``ConnectionResetError`` / ``BrokenPipeError``；``socket.gaierror`` 是域名解析
+#: 失败；``ssl.SSLError`` 是握手阶段失败。刻意不含 ``PermissionError`` 等表示
+#: 「本地环境配错了」的那几类——那不是依赖抖动，是要人去修的缺陷。
+_UNAVAILABLE_STDLIB_ERRORS: tuple[type[BaseException], ...] = (
+    ConnectionError,
+    TimeoutError,
+    socket.gaierror,
+    socket.herror,
+    ssl.SSLError,
+)
 
 
 def is_dependency_unavailable(error: BaseException) -> bool:
@@ -28,4 +50,4 @@ def is_dependency_unavailable(error: BaseException) -> bool:
         module_root = (klass.__module__ or "").split(".", 1)[0]
         if module_root == _DRIVER_ROOT and klass.__name__ == _DRIVER_UNAVAILABLE_ERROR:
             return True
-    return isinstance(error, OSError)
+    return isinstance(error, _UNAVAILABLE_STDLIB_ERRORS)
