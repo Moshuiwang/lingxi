@@ -1485,7 +1485,7 @@ class PublishJobGuardTest(unittest.TestCase):
         """
 
         full = self.FULL.replace(
-            "                  case \"${HEAD_REF}\" in trace/*) is_trace_head=1 ;; *) is_trace_head=0 ;; esac\n",
+            '                  case "${HEAD_REF}" in trace/*) is_trace_head=1 ;; *) is_trace_head=0 ;; esac\n',
             "",
         )
         failures = self._with_workflows(full=full)
