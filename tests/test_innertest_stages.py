@@ -1,6 +1,6 @@
 """唯一持久阶段与真实数据库的隔离故障、版本与未知发送验证。"""
 
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
 from test_innertest_postgres import DSN, InnertestPostgresTests
 
@@ -8,6 +8,7 @@ from lingxi.adapters.innertest_confirmation_card import InnertestConfirmationCar
 from lingxi.adapters.innertest_handlers import InnertestFollowupHandlers
 from lingxi.adapters.innertest_outreach import CheckedInnertestSender
 from lingxi.adapters.postgres_admin_followup import PostgresFollowupStore
+from lingxi.adapters.postgres_innertest_confirmation import InnertestPendingActions
 from lingxi.adapters.postgres_innertest_roster import (
     PostgresInnertestRoster,
     compare_legacy_sources,
@@ -15,6 +16,7 @@ from lingxi.adapters.postgres_innertest_roster import (
 from lingxi.adapters.postgres_outreach import PostgresOutreachStore
 from lingxi.core.admin.followup_consumer import FollowupConsumer
 from lingxi.core.admin.innertest import InnertestError
+from lingxi.core.admin.pending_action import ConfirmResultKind
 
 
 class InnertestStageTests(InnertestPostgresTests):
@@ -123,6 +125,56 @@ class InnertestStageTests(InnertestPostgresTests):
         self.consumer(handler, "gateway").run_once()
         send.assert_not_called()
         self.assertEqual(self.sql("SELECT status FROM admin_action_followup"), [("skipped",)])
+
+    def test_binding_version_changed_before_click_refuses_and_closes_out(self):
+        """发起后绑定版本变了：明确拒绝、落终态、零资格。
+
+        停在 ``pending`` 是不行的——卡片按钮还在，绑定若已转给他人，这批就再也
+        没人能收口它。
+        """
+        batch = self.prepare()
+        self.delivered(batch)
+        self.sql("UPDATE innertest_admin_binding SET version=version+1")
+
+        outcome = self.confirm(batch)
+
+        self.assertFalse(outcome.decision.ok)
+        self.assertIs(outcome.decision.kind, ConfirmResultKind.ROLE_REVOKED)
+        self.assertIn("请重新发起", outcome.decision.message)
+        self.assertEqual(
+            self.sql("SELECT status,reason FROM pending_action"), [("failed", "role_revoked")]
+        )
+        self.assertEqual(self.sql("SELECT status FROM innertest_batch"), [("failed",)])
+        self.assertEqual(self.sql("SELECT count(*) FROM innertest_membership"), [(0,)])
+
+    def test_unknown_guard_error_propagates_instead_of_being_called_authorization_changed(self):
+        """收口只认授权类两个码；将来 ``_principal`` 若新增别的码，不得被顺手吞掉。
+
+        ``_principal`` 今天只会抛这两个码，所以这条分支靠集成路径打不到；直接
+        对着 ``_guarded_code`` 打，才能把「不认识的码要原样抛」这条钉住。
+        """
+        batch = self.prepare()
+        self.delivered(batch)
+        with patch.object(
+            InnertestPendingActions, "_guard", side_effect=InnertestError("synthetic_unknown_code")
+        ):
+            with self.assertRaisesRegex(InnertestError, "synthetic_unknown_code"):
+                self.confirm(batch)
+        self.assertEqual(self.sql("SELECT count(*) FROM innertest_membership"), [(0,)])
+
+    def test_cancel_path_also_refuses_definitely_when_authorization_changed(self):
+        """取消点击走同一条守卫，授权变化时同样要给确定结果。"""
+        batch = self.prepare()
+        self.delivered(batch)
+        self.sql("UPDATE innertest_admin_binding SET version=version+1")
+
+        outcome = self.pending.cancel(
+            pending_action_id=batch["pending_action_id"], clicker_open_id="ou_admin"
+        )
+
+        self.assertFalse(outcome.decision.ok)
+        self.assertIs(outcome.decision.kind, ConfirmResultKind.ROLE_REVOKED)
+        self.assertEqual(self.sql("SELECT count(*) FROM innertest_membership"), [(0,)])
 
     def test_check_permissions_changed_after_probe_blocks_usable_result(self):
         self.user()

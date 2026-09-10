@@ -16,6 +16,7 @@ from lingxi.adapters.postgres_innertest_confirmation import InnertestPendingActi
 from lingxi.adapters.postgres_innertest_roster import PostgresInnertestRoster
 from lingxi.adapters.postgres_pending_action import PostgresPendingActionStore
 from lingxi.core.admin.innertest import InnertestError
+from lingxi.core.admin.pending_action import ConfirmResultKind
 from lingxi.core.identity.org_snapshot import SnapshotMember
 from lingxi.core.identity.preprovision import PreprovisionSkip, PreprovisionTarget
 
@@ -150,8 +151,13 @@ class InnertestPostgresTests(unittest.TestCase):
         self.sql("UPDATE innertest_roster_version SET version=version+1")
         self.assertFalse(self.confirm(batch).decision.ok)
         self.sql("UPDATE innertest_admin_binding SET enabled=false")
-        with self.assertRaisesRegex(InnertestError, "binding_disabled"):
-            self.confirm(batch)
+        # 绑定被停用后点确认：明确拒绝并落终态，不再把异常冒给调用方当「结果不明」。
+        outcome = self.confirm(batch)
+        self.assertFalse(outcome.decision.ok)
+        self.assertIs(outcome.decision.kind, ConfirmResultKind.ROLE_REVOKED)
+        self.assertEqual(
+            self.sql("SELECT status,reason FROM pending_action"), [("failed", "role_revoked")]
+        )
         self.assertEqual(self.sql("SELECT count(*) FROM innertest_membership"), [(0,)])
 
     def test_transaction_rolls_back_when_enqueue_or_audit_fails(self):

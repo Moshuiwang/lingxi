@@ -11,6 +11,26 @@ from lingxi.core.admin.followup import FollowupSpec
 from lingxi.core.admin.innertest import InnertestError, target_digest
 from lingxi.core.admin.pending_action import ConfirmDecision, ConfirmResultKind, PendingActionStatus
 
+#: 落明确终态的拒绝分支。过期与目标漂移是既有的两条；授权已变化补进来是因为
+#: 它同样是「这批不可能再被批准」的确定结果——留在 ``pending`` 会让卡片按钮
+#: 一直在，绑定若已转给他人就再也没人能收口它。
+_TERMINAL_REJECTIONS = frozenset(
+    {
+        ConfirmResultKind.EXPIRE,
+        ConfirmResultKind.TARGET_DRIFTED,
+        ConfirmResultKind.ROLE_REVOKED,
+    }
+)
+
+
+def _rejection_message(code):
+    """按拒绝分支给管理员一句能据以行动的话。"""
+    if code is ConfirmResultKind.TARGET_DRIFTED:
+        return "人员资料已变化，本批已失效，请重新查询后准备。"
+    if code is ConfirmResultKind.ROLE_REVOKED:
+        return "发起这批之后管理授权已变化，本次未执行；请重新发起。"
+    return "操作不存在、已失效或不是本人确认。"
+
 
 class InnertestPendingActions:
     """现有确认入口的扩员适配，其他管理动作逐字委托既有仓储。"""
@@ -58,7 +78,7 @@ class InnertestPendingActions:
                 )
                 batch = cursor.fetchone()
                 moment = now or datetime.now(UTC)
-                code = self._guard(connection, pending, batch, clicker, version, moment)
+                code = self._guarded_code(connection, pending, batch, clicker, version, moment)
                 if code is None and not cancel:
                     code = self._confirm_current_items(connection, cursor, batch, action)
                 if code:
@@ -101,6 +121,26 @@ class InnertestPendingActions:
             terminal_status=PendingActionStatus(state),
         )
         return ConfirmOutcome(decision=decision, pending=updated)
+
+    #: ``_principal`` 用来表达「发起这批时的授权已经不成立」的两个码。绑定被换、
+    #: 被停用、版本与批次记录的不一致都归到这里；其余码（名单不可用、审计写不了）
+    #: 不是授权问题，继续原样抛出，不能混进同一句回执里。
+    _AUTHORIZATION_CODES = frozenset({"binding_disabled", "not_authorized"})
+
+    def _guarded_code(self, connection, pending, batch, clicker, version, now):
+        """授权类失败收口成明确拒绝，走与角色被撤同一条终态路径。
+
+        这类失败在事务里被拒、零写入，结果是确定的。让它冒到卡片回调的兜底里，
+        管理员只会看到一句结果不明：既不知道有没有执行，也不知道该重新发起；
+        而待确认操作会停在 ``pending``，卡片按钮还在，绑定若已转给他人就永远
+        不会收口。
+        """
+        try:
+            return self._guard(connection, pending, batch, clicker, version, now)
+        except InnertestError as error:
+            if error.code not in self._AUTHORIZATION_CODES:
+                raise
+            return ConfirmResultKind.ROLE_REVOKED
 
     def _guard(self, connection, pending, batch, clicker, version, now):
         """送达与本人、动作和版本四条件同时成立才可写资格。"""
@@ -220,13 +260,9 @@ class InnertestPendingActions:
         """过期和目标漂移落明确终态，原请求仍可查且不能继续批准。"""
         decision = ConfirmDecision(
             kind=code,
-            message=(
-                "人员资料已变化，本批已失效，请重新查询后准备。"
-                if code is ConfirmResultKind.TARGET_DRIFTED
-                else "操作不存在、已失效或不是本人确认。"
-            ),
+            message=_rejection_message(code),
         )
-        if decision.kind in {ConfirmResultKind.EXPIRE, ConfirmResultKind.TARGET_DRIFTED}:
+        if decision.kind in _TERMINAL_REJECTIONS:
             state = "expired" if decision.kind is ConfirmResultKind.EXPIRE else "failed"
             with connection.cursor() as cursor:
                 cursor.execute(
