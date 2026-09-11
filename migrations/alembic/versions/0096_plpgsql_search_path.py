@@ -56,95 +56,6 @@ branch_labels: str | None = None
 depends_on: str | None = None
 
 
-# 五个函数的原文（``0095`` 时 ``pg_proc.prosrc`` 逐字节），downgrade 用它们重建。
-# 单独放成常量是为了让「upgrade 只改了 7 处表名」这件事能在 diff 里一眼看出来。
-_ORIGINAL_APP_USER_REJECT_DELEGATED_SUBJECT = r"""
-BEGIN
-    -- 与凭据侧触发器争用同一 advisory 锁：两个 BEFORE 触发器各自的 EXISTS 在
-    -- MVCC 下看不见对方未提交的行，并发提交会让双向防线同时失守（终轮 Codex）。
-    PERFORM pg_advisory_xact_lock(4217003);
-    IF NEW.feishu_open_id IS NOT NULL
-       AND EXISTS (
-           SELECT 1 FROM feishu_delegated_subject
-            WHERE subject_open_id = NEW.feishu_open_id
-       ) THEN
-        RAISE EXCEPTION '专用授权账号不能被建成用户记录';
-    END IF;
-    RETURN NEW;
-END;
-"""
-
-_ORIGINAL_CREDENTIAL_REJECT_APP_USER_SUBJECT = r"""
-BEGIN
-    PERFORM pg_advisory_xact_lock(4217003);
-    IF EXISTS (
-        SELECT 1 FROM app_user WHERE feishu_open_id = NEW.subject_open_id
-    ) THEN
-        RAISE EXCEPTION '该 open_id 已是员工用户记录，不能成为专用授权主体';
-    END IF;
-    RETURN NEW;
-END;
-"""
-
-_ORIGINAL_FEISHU_ORG_SYNC_RUN_VERIFY_CHILDREN = r"""
-DECLARE
-    actual_tenants INTEGER;
-    actual_members INTEGER;
-BEGIN
-    IF NEW.status <> 'complete' THEN
-        RETURN NULL;
-    END IF;
-    SELECT count(*) INTO actual_tenants FROM feishu_org_tenant_snapshot WHERE sync_run_id = NEW.id;
-    SELECT count(*) INTO actual_members FROM feishu_org_member_snapshot WHERE sync_run_id = NEW.id;
-    IF actual_tenants <> NEW.tenant_count OR actual_members <> NEW.member_count THEN
-        RAISE EXCEPTION '完成批次 % 的声明计数与实际子行不一致（租户 %/%、成员 %/%）',
-            NEW.id, NEW.tenant_count, actual_tenants, NEW.member_count, actual_members;
-    END IF;
-    RETURN NULL;
-END;
-"""
-
-_ORIGINAL_APP_USER_RECORD_REAL_INBOUND = r"""
-BEGIN
-    IF NEW.user_open_id IS NULL THEN
-        RETURN NEW;
-    END IF;
-    UPDATE app_user SET
-        first_inbound_at = LEAST(COALESCE(first_inbound_at, NEW.received_at), NEW.received_at),
-        last_inbound_at = GREATEST(COALESCE(last_inbound_at, NEW.received_at), NEW.received_at),
-        outbound_unavailable_at = CASE
-            WHEN outbound_unavailable_at IS NULL OR outbound_unavailable_at <= NEW.received_at
-            THEN NULL ELSE outbound_unavailable_at END,
-        outbound_unavailable_code = CASE
-            WHEN outbound_unavailable_at IS NULL OR outbound_unavailable_at <= NEW.received_at
-            THEN NULL ELSE outbound_unavailable_code END
-    WHERE feishu_open_id = NEW.user_open_id
-      AND (last_inbound_at IS NULL OR last_inbound_at <= NEW.received_at);
-    RETURN NEW;
-END;
-"""
-
-_ORIGINAL_APP_USER_ADOPT_PRIOR_INBOUND = r"""
-DECLARE
-    earliest TIMESTAMPTZ;
-    latest TIMESTAMPTZ;
-BEGIN
-    IF NEW.feishu_open_id IS NULL THEN
-        RETURN NEW;
-    END IF;
-    SELECT MIN(received_at), MAX(received_at) INTO earliest, latest
-      FROM inbound_event WHERE user_open_id = NEW.feishu_open_id;
-    IF earliest IS NULL THEN
-        RETURN NEW;
-    END IF;
-    UPDATE app_user SET
-        first_inbound_at = LEAST(COALESCE(first_inbound_at, earliest), earliest),
-        last_inbound_at = GREATEST(COALESCE(last_inbound_at, latest), latest)
-    WHERE id = NEW.id;
-    RETURN NEW;
-END;
-"""
-
 # 14 个只用 NEW / OLD 与内置函数的触发器函数：定义不动，只固定搜索路径。
 _ALTER_ONLY_FUNCTIONS: tuple[str, ...] = (
     "feishu_org_sync_run_fix_expiry",
@@ -163,59 +74,250 @@ _ALTER_ONLY_FUNCTIONS: tuple[str, ...] = (
     "pending_action_fix_retention_expiry",
 )
 
-# 5 个函数体里有未限定表引用的：(函数名, 原文, 加固后的函数体)。
-# 加固后的函数体与原文的差别**只有**表名前缀 ``public.``，逐条对照原文即可核。
-_REDEFINED_FUNCTIONS: tuple[tuple[str, str, str], ...] = (
-    (
-        "app_user_reject_delegated_subject",
-        _ORIGINAL_APP_USER_REJECT_DELEGATED_SUBJECT,
-        _ORIGINAL_APP_USER_REJECT_DELEGATED_SUBJECT.replace(
-            "SELECT 1 FROM feishu_delegated_subject",
-            "SELECT 1 FROM public.feishu_delegated_subject",
-        ),
-    ),
-    (
-        "credential_reject_app_user_subject",
-        _ORIGINAL_CREDENTIAL_REJECT_APP_USER_SUBJECT,
-        _ORIGINAL_CREDENTIAL_REJECT_APP_USER_SUBJECT.replace(
-            "SELECT 1 FROM app_user WHERE",
-            "SELECT 1 FROM public.app_user WHERE",
-        ),
-    ),
-    (
-        "feishu_org_sync_run_verify_children",
-        _ORIGINAL_FEISHU_ORG_SYNC_RUN_VERIFY_CHILDREN,
-        _ORIGINAL_FEISHU_ORG_SYNC_RUN_VERIFY_CHILDREN.replace(
-            "FROM feishu_org_tenant_snapshot WHERE",
-            "FROM public.feishu_org_tenant_snapshot WHERE",
-        ).replace(
-            "FROM feishu_org_member_snapshot WHERE",
-            "FROM public.feishu_org_member_snapshot WHERE",
-        ),
-    ),
-    (
-        "app_user_record_real_inbound",
-        _ORIGINAL_APP_USER_RECORD_REAL_INBOUND,
-        _ORIGINAL_APP_USER_RECORD_REAL_INBOUND.replace(
-            "UPDATE app_user SET",
-            "UPDATE public.app_user SET",
-        ),
-    ),
-    (
-        "app_user_adopt_prior_inbound",
-        _ORIGINAL_APP_USER_ADOPT_PRIOR_INBOUND,
-        _ORIGINAL_APP_USER_ADOPT_PRIOR_INBOUND.replace(
-            "FROM inbound_event WHERE",
-            "FROM public.inbound_event WHERE",
-        ).replace(
-            "UPDATE app_user SET",
-            "UPDATE public.app_user SET",
-        ),
-    ),
-)
+_PIN_SEARCH_PATH_SQL = r"""
+ALTER FUNCTION public.feishu_org_sync_run_fix_expiry() SET search_path = pg_catalog, pg_temp;
+ALTER FUNCTION public.galaxy_import_batch_fix_expiry() SET search_path = pg_catalog, pg_temp;
+ALTER FUNCTION public.inbound_event_fix_expiry() SET search_path = pg_catalog, pg_temp;
+ALTER FUNCTION public.task_freeze_invariants() SET search_path = pg_catalog, pg_temp;
+ALTER FUNCTION public.queue_failure_notice_fix_expiry() SET search_path = pg_catalog, pg_temp;
+ALTER FUNCTION public.task_delivery_event_fix_expiry() SET search_path = pg_catalog, pg_temp;
+ALTER FUNCTION public.publish_outbox_fix_expiry() SET search_path = pg_catalog, pg_temp;
+ALTER FUNCTION public.mcp_access_token_immutable() SET search_path = pg_catalog, pg_temp;
+ALTER FUNCTION public.mcp_sync_check_fix_expiry() SET search_path = pg_catalog, pg_temp;
+ALTER FUNCTION public.onboarding_completion_notice_fix_expiry() SET search_path = pg_catalog, pg_temp;
+ALTER FUNCTION public.innertest_content_capture_fix_expiry() SET search_path = pg_catalog, pg_temp;
+ALTER FUNCTION public.task_document_delivery_request_fix_expiry() SET search_path = pg_catalog, pg_temp;
+ALTER FUNCTION public.outreach_message_freeze_anchors() SET search_path = pg_catalog, pg_temp;
+ALTER FUNCTION public.pending_action_fix_retention_expiry() SET search_path = pg_catalog, pg_temp;
+"""
 
-# 每个重定义函数必须恰好改掉预期数量的引用；数错了就是原文与预期对不上，宁可在
-# import 阶段炸，也不要把一个没改全的函数体静默写进库。
+_RESET_SEARCH_PATH_SQL = r"""
+ALTER FUNCTION public.feishu_org_sync_run_fix_expiry() RESET search_path;
+ALTER FUNCTION public.galaxy_import_batch_fix_expiry() RESET search_path;
+ALTER FUNCTION public.inbound_event_fix_expiry() RESET search_path;
+ALTER FUNCTION public.task_freeze_invariants() RESET search_path;
+ALTER FUNCTION public.queue_failure_notice_fix_expiry() RESET search_path;
+ALTER FUNCTION public.task_delivery_event_fix_expiry() RESET search_path;
+ALTER FUNCTION public.publish_outbox_fix_expiry() RESET search_path;
+ALTER FUNCTION public.mcp_access_token_immutable() RESET search_path;
+ALTER FUNCTION public.mcp_sync_check_fix_expiry() RESET search_path;
+ALTER FUNCTION public.onboarding_completion_notice_fix_expiry() RESET search_path;
+ALTER FUNCTION public.innertest_content_capture_fix_expiry() RESET search_path;
+ALTER FUNCTION public.task_document_delivery_request_fix_expiry() RESET search_path;
+ALTER FUNCTION public.outreach_message_freeze_anchors() RESET search_path;
+ALTER FUNCTION public.pending_action_fix_retention_expiry() RESET search_path;
+"""
+
+# 5 个函数体里有未限定表引用的：整条 CREATE OR REPLACE 写成完整常量，静态门禁
+# （scripts/ci/check_plpgsql_search_path.py）直接读同一条语句里的 SET 子句。
+# 加固版与下面的原文版差别**只有** 7 处表名前缀 ``public.``，模块导入时逐函数核对。
+_HARDENED_DEFINITIONS_SQL = r"""
+CREATE OR REPLACE FUNCTION public.app_user_reject_delegated_subject() RETURNS TRIGGER
+LANGUAGE plpgsql
+SET search_path = pg_catalog, pg_temp
+AS $function_body$
+BEGIN
+    -- 与凭据侧触发器争用同一 advisory 锁：两个 BEFORE 触发器各自的 EXISTS 在
+    -- MVCC 下看不见对方未提交的行，并发提交会让双向防线同时失守（终轮 Codex）。
+    PERFORM pg_advisory_xact_lock(4217003);
+    IF NEW.feishu_open_id IS NOT NULL
+       AND EXISTS (
+           SELECT 1 FROM public.feishu_delegated_subject
+            WHERE subject_open_id = NEW.feishu_open_id
+       ) THEN
+        RAISE EXCEPTION '专用授权账号不能被建成用户记录';
+    END IF;
+    RETURN NEW;
+END;
+$function_body$;
+
+CREATE OR REPLACE FUNCTION public.credential_reject_app_user_subject() RETURNS TRIGGER
+LANGUAGE plpgsql
+SET search_path = pg_catalog, pg_temp
+AS $function_body$
+BEGIN
+    PERFORM pg_advisory_xact_lock(4217003);
+    IF EXISTS (
+        SELECT 1 FROM public.app_user WHERE feishu_open_id = NEW.subject_open_id
+    ) THEN
+        RAISE EXCEPTION '该 open_id 已是员工用户记录，不能成为专用授权主体';
+    END IF;
+    RETURN NEW;
+END;
+$function_body$;
+
+CREATE OR REPLACE FUNCTION public.feishu_org_sync_run_verify_children() RETURNS TRIGGER
+LANGUAGE plpgsql
+SET search_path = pg_catalog, pg_temp
+AS $function_body$
+DECLARE
+    actual_tenants INTEGER;
+    actual_members INTEGER;
+BEGIN
+    IF NEW.status <> 'complete' THEN
+        RETURN NULL;
+    END IF;
+    SELECT count(*) INTO actual_tenants FROM public.feishu_org_tenant_snapshot WHERE sync_run_id = NEW.id;
+    SELECT count(*) INTO actual_members FROM public.feishu_org_member_snapshot WHERE sync_run_id = NEW.id;
+    IF actual_tenants <> NEW.tenant_count OR actual_members <> NEW.member_count THEN
+        RAISE EXCEPTION '完成批次 % 的声明计数与实际子行不一致（租户 %/%、成员 %/%）',
+            NEW.id, NEW.tenant_count, actual_tenants, NEW.member_count, actual_members;
+    END IF;
+    RETURN NULL;
+END;
+$function_body$;
+
+CREATE OR REPLACE FUNCTION public.app_user_record_real_inbound() RETURNS TRIGGER
+LANGUAGE plpgsql
+SET search_path = pg_catalog, pg_temp
+AS $function_body$
+BEGIN
+    IF NEW.user_open_id IS NULL THEN
+        RETURN NEW;
+    END IF;
+    UPDATE public.app_user SET
+        first_inbound_at = LEAST(COALESCE(first_inbound_at, NEW.received_at), NEW.received_at),
+        last_inbound_at = GREATEST(COALESCE(last_inbound_at, NEW.received_at), NEW.received_at),
+        outbound_unavailable_at = CASE
+            WHEN outbound_unavailable_at IS NULL OR outbound_unavailable_at <= NEW.received_at
+            THEN NULL ELSE outbound_unavailable_at END,
+        outbound_unavailable_code = CASE
+            WHEN outbound_unavailable_at IS NULL OR outbound_unavailable_at <= NEW.received_at
+            THEN NULL ELSE outbound_unavailable_code END
+    WHERE feishu_open_id = NEW.user_open_id
+      AND (last_inbound_at IS NULL OR last_inbound_at <= NEW.received_at);
+    RETURN NEW;
+END;
+$function_body$;
+
+CREATE OR REPLACE FUNCTION public.app_user_adopt_prior_inbound() RETURNS TRIGGER
+LANGUAGE plpgsql
+SET search_path = pg_catalog, pg_temp
+AS $function_body$
+DECLARE
+    earliest TIMESTAMPTZ;
+    latest TIMESTAMPTZ;
+BEGIN
+    IF NEW.feishu_open_id IS NULL THEN
+        RETURN NEW;
+    END IF;
+    SELECT MIN(received_at), MAX(received_at) INTO earliest, latest
+      FROM public.inbound_event WHERE user_open_id = NEW.feishu_open_id;
+    IF earliest IS NULL THEN
+        RETURN NEW;
+    END IF;
+    UPDATE public.app_user SET
+        first_inbound_at = LEAST(COALESCE(first_inbound_at, earliest), earliest),
+        last_inbound_at = GREATEST(COALESCE(last_inbound_at, latest), latest)
+    WHERE id = NEW.id;
+    RETURN NEW;
+END;
+$function_body$;
+"""
+
+# 0095 时的原文（``pg_proc.prosrc`` 逐字节），**只由 downgrade 引用**：降级按它重建，
+# 不带 SET 子句，proconfig 随之回到空。
+_ORIGINAL_DEFINITIONS_SQL = r"""
+CREATE OR REPLACE FUNCTION public.app_user_reject_delegated_subject() RETURNS TRIGGER
+LANGUAGE plpgsql
+AS $function_body$
+BEGIN
+    -- 与凭据侧触发器争用同一 advisory 锁：两个 BEFORE 触发器各自的 EXISTS 在
+    -- MVCC 下看不见对方未提交的行，并发提交会让双向防线同时失守（终轮 Codex）。
+    PERFORM pg_advisory_xact_lock(4217003);
+    IF NEW.feishu_open_id IS NOT NULL
+       AND EXISTS (
+           SELECT 1 FROM feishu_delegated_subject
+            WHERE subject_open_id = NEW.feishu_open_id
+       ) THEN
+        RAISE EXCEPTION '专用授权账号不能被建成用户记录';
+    END IF;
+    RETURN NEW;
+END;
+$function_body$;
+
+CREATE OR REPLACE FUNCTION public.credential_reject_app_user_subject() RETURNS TRIGGER
+LANGUAGE plpgsql
+AS $function_body$
+BEGIN
+    PERFORM pg_advisory_xact_lock(4217003);
+    IF EXISTS (
+        SELECT 1 FROM app_user WHERE feishu_open_id = NEW.subject_open_id
+    ) THEN
+        RAISE EXCEPTION '该 open_id 已是员工用户记录，不能成为专用授权主体';
+    END IF;
+    RETURN NEW;
+END;
+$function_body$;
+
+CREATE OR REPLACE FUNCTION public.feishu_org_sync_run_verify_children() RETURNS TRIGGER
+LANGUAGE plpgsql
+AS $function_body$
+DECLARE
+    actual_tenants INTEGER;
+    actual_members INTEGER;
+BEGIN
+    IF NEW.status <> 'complete' THEN
+        RETURN NULL;
+    END IF;
+    SELECT count(*) INTO actual_tenants FROM feishu_org_tenant_snapshot WHERE sync_run_id = NEW.id;
+    SELECT count(*) INTO actual_members FROM feishu_org_member_snapshot WHERE sync_run_id = NEW.id;
+    IF actual_tenants <> NEW.tenant_count OR actual_members <> NEW.member_count THEN
+        RAISE EXCEPTION '完成批次 % 的声明计数与实际子行不一致（租户 %/%、成员 %/%）',
+            NEW.id, NEW.tenant_count, actual_tenants, NEW.member_count, actual_members;
+    END IF;
+    RETURN NULL;
+END;
+$function_body$;
+
+CREATE OR REPLACE FUNCTION public.app_user_record_real_inbound() RETURNS TRIGGER
+LANGUAGE plpgsql
+AS $function_body$
+BEGIN
+    IF NEW.user_open_id IS NULL THEN
+        RETURN NEW;
+    END IF;
+    UPDATE app_user SET
+        first_inbound_at = LEAST(COALESCE(first_inbound_at, NEW.received_at), NEW.received_at),
+        last_inbound_at = GREATEST(COALESCE(last_inbound_at, NEW.received_at), NEW.received_at),
+        outbound_unavailable_at = CASE
+            WHEN outbound_unavailable_at IS NULL OR outbound_unavailable_at <= NEW.received_at
+            THEN NULL ELSE outbound_unavailable_at END,
+        outbound_unavailable_code = CASE
+            WHEN outbound_unavailable_at IS NULL OR outbound_unavailable_at <= NEW.received_at
+            THEN NULL ELSE outbound_unavailable_code END
+    WHERE feishu_open_id = NEW.user_open_id
+      AND (last_inbound_at IS NULL OR last_inbound_at <= NEW.received_at);
+    RETURN NEW;
+END;
+$function_body$;
+
+CREATE OR REPLACE FUNCTION public.app_user_adopt_prior_inbound() RETURNS TRIGGER
+LANGUAGE plpgsql
+AS $function_body$
+DECLARE
+    earliest TIMESTAMPTZ;
+    latest TIMESTAMPTZ;
+BEGIN
+    IF NEW.feishu_open_id IS NULL THEN
+        RETURN NEW;
+    END IF;
+    SELECT MIN(received_at), MAX(received_at) INTO earliest, latest
+      FROM inbound_event WHERE user_open_id = NEW.feishu_open_id;
+    IF earliest IS NULL THEN
+        RETURN NEW;
+    END IF;
+    UPDATE app_user SET
+        first_inbound_at = LEAST(COALESCE(first_inbound_at, earliest), earliest),
+        last_inbound_at = GREATEST(COALESCE(last_inbound_at, latest), latest)
+    WHERE id = NEW.id;
+    RETURN NEW;
+END;
+$function_body$;
+"""
+
+# 每个重定义函数必须恰好改掉预期数量的引用，且除 ``public.`` 前缀外与原文逐字节相同；
+# 对不上就在 import 阶段炸，不把一个没改全或改多了的函数体静默写进库。
 _EXPECTED_QUALIFIED_REFERENCES: dict[str, int] = {
     "app_user_reject_delegated_subject": 1,
     "credential_reject_app_user_subject": 1,
@@ -223,41 +325,42 @@ _EXPECTED_QUALIFIED_REFERENCES: dict[str, int] = {
     "app_user_record_real_inbound": 1,
     "app_user_adopt_prior_inbound": 2,
 }
-for _name, _original, _hardened in _REDEFINED_FUNCTIONS:
-    _added = _hardened.count("public.") - _original.count("public.")
-    if _added != _EXPECTED_QUALIFIED_REFERENCES[_name]:
-        raise RuntimeError(
-            f"{_name} 预期限定 {_EXPECTED_QUALIFIED_REFERENCES[_name]} 处表引用，实际 {_added} 处"
-        )
-    if _hardened.replace("public.", "") != _original:
-        raise RuntimeError(f"{_name} 加固后的函数体除 public. 前缀外与原文不一致")
 
 
-def _alter_search_path_sql() -> str:
-    return "\n".join(
-        f"ALTER FUNCTION public.{name}() SET search_path = pg_catalog, pg_temp;"
-        for name in _ALTER_ONLY_FUNCTIONS
-    )
+def _function_bodies(definitions_sql: str) -> dict[str, str]:
+    """从一段 CREATE OR REPLACE 常量里取出 {函数名: 函数体}（美元引号标签固定）。"""
+
+    bodies: dict[str, str] = {}
+    for statement in definitions_sql.split("$function_body$;"):
+        if "AS $function_body$" not in statement:
+            continue
+        head, body = statement.split("AS $function_body$", 1)
+        name = head[head.rindex("public.") + len("public.") : head.rindex("() RETURNS TRIGGER")]
+        bodies[name] = body
+    return bodies
 
 
-def _reset_search_path_sql() -> str:
-    return "\n".join(
-        f"ALTER FUNCTION public.{name}() RESET search_path;" for name in _ALTER_ONLY_FUNCTIONS
-    )
+def _verify_definitions_only_add_schema_prefixes() -> None:
+    original = _function_bodies(_ORIGINAL_DEFINITIONS_SQL)
+    hardened = _function_bodies(_HARDENED_DEFINITIONS_SQL)
+    if set(original) != set(_EXPECTED_QUALIFIED_REFERENCES) or set(hardened) != set(original):
+        raise RuntimeError("重定义函数的名单与预期不一致")
+    for name, expected in _EXPECTED_QUALIFIED_REFERENCES.items():
+        added = hardened[name].count("public.") - original[name].count("public.")
+        if added != expected:
+            raise RuntimeError(f"{name} 预期限定 {expected} 处表引用，实际 {added} 处")
+        if hardened[name].replace("public.", "") != original[name]:
+            raise RuntimeError(f"{name} 加固后的函数体除 public. 前缀外与原文不一致")
+    for name in _ALTER_ONLY_FUNCTIONS:
+        pin = f"ALTER FUNCTION public.{name}() SET search_path = pg_catalog, pg_temp;"
+        reset = f"ALTER FUNCTION public.{name}() RESET search_path;"
+        if pin not in _PIN_SEARCH_PATH_SQL or reset not in _RESET_SEARCH_PATH_SQL:
+            raise RuntimeError(f"{name} 没有同时出现在固定与还原两段语句里")
+    if _HARDENED_DEFINITIONS_SQL.count("SET search_path = pg_catalog, pg_temp") != len(hardened):
+        raise RuntimeError("加固版定义里 SET search_path 子句数量与函数数量不一致")
 
 
-def _redefine_sql(hardened: bool) -> str:
-    statements = []
-    for name, original, replaced in _REDEFINED_FUNCTIONS:
-        body = replaced if hardened else original
-        config = "SET search_path = pg_catalog, pg_temp\n" if hardened else ""
-        statements.append(
-            f"CREATE OR REPLACE FUNCTION public.{name}() RETURNS TRIGGER\n"
-            f"LANGUAGE plpgsql\n"
-            f"{config}"
-            f"AS $function_body${body}$function_body$;"
-        )
-    return "\n\n".join(statements)
+_verify_definitions_only_add_schema_prefixes()
 
 
 # 清理函数两条直接 EXECUTE 的收回 / 补回共用的骨架。撤权与补回都必须以属主身份执行：
@@ -429,23 +532,26 @@ def _acl_sql(hardened: bool) -> str:
     return (_CLEANUP_ACL_TEMPLATE % fill) + "\n" + (_DEFAULT_ACL_TEMPLATE % fill)
 
 
-_UPGRADE_SQL = (
-    "-- 一、14 个只用 NEW / OLD 与内置函数的触发器函数：定义不动，只固定搜索路径。\n"
-    + _alter_search_path_sql()
-    + "\n\n-- 二、5 个函数体里有未限定表引用的：重定义，只加 public. 前缀与搜索路径。\n"
-    + _redefine_sql(hardened=True)
-    + "\n\n-- 三、清理函数的两条直接 EXECUTE 与创建者默认权限里的两项。\n"
-    + _acl_sql(hardened=True)
-)
+def _upgrade_sql() -> str:
+    return (
+        "-- 一、14 个只用 NEW / OLD 与内置函数的触发器函数：定义不动，只固定搜索路径。"
+        + _PIN_SEARCH_PATH_SQL
+        + "\n-- 二、5 个函数体里有未限定表引用的：重定义，只加 public. 前缀与搜索路径。"
+        + _HARDENED_DEFINITIONS_SQL
+        + "\n-- 三、清理函数的两条直接 EXECUTE 与创建者默认权限里的两项。\n"
+        + _acl_sql(hardened=True)
+    )
 
-_DOWNGRADE_SQL = (
-    "-- 一、14 个函数：去掉本 revision 固定的搜索路径。\n"
-    + _reset_search_path_sql()
-    + "\n\n-- 二、5 个函数：按 0095 时的原文重建（不带 SET 子句，proconfig 随之回到空）。\n"
-    + _redefine_sql(hardened=False)
-    + "\n\n-- 三、在角色存在的库上把两条直接 EXECUTE 与默认权限的两项补回。\n"
-    + _acl_sql(hardened=False)
-)
+
+def _downgrade_sql() -> str:
+    return (
+        "-- 一、14 个函数：去掉本 revision 固定的搜索路径。"
+        + _RESET_SEARCH_PATH_SQL
+        + "\n-- 二、5 个函数：按 0095 时的原文重建（不带 SET 子句，proconfig 随之回到空）。"
+        + _ORIGINAL_DEFINITIONS_SQL
+        + "\n-- 三、在角色存在的库上把两条直接 EXECUTE 与默认权限的两项补回。\n"
+        + _acl_sql(hardened=False)
+    )
 
 
 def _execute_verbatim(connection, sql: str) -> None:
@@ -460,8 +566,8 @@ def _execute_verbatim(connection, sql: str) -> None:
 
 
 def upgrade() -> None:
-    _execute_verbatim(op.get_bind(), _UPGRADE_SQL)
+    _execute_verbatim(op.get_bind(), _upgrade_sql())
 
 
 def downgrade() -> None:
-    _execute_verbatim(op.get_bind(), _DOWNGRADE_SQL)
+    _execute_verbatim(op.get_bind(), _downgrade_sql())

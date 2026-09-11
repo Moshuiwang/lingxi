@@ -133,9 +133,9 @@ SELECT am.roleid::regrole::text, am.member::regrole::text, am.grantor::regrole::
 def revision_sql() -> tuple[str, str]:
     """静态取 0096 里两段 SQL 的最终文本（与 ``postgres_schema.revision_sql`` 同型）。
 
-    0096 的两段 SQL 由模块顶层的函数拼出来，不是字面常量；这里在受限命名空间里
-    执行模块源码（``alembic.op`` 用占位对象替代），拿到 ``_UPGRADE_SQL`` /
-    ``_DOWNGRADE_SQL``，既不需要 alembic 也不会跑到 ``upgrade()`` 本身。
+    0096 的两段 SQL 由模块里的 ``_upgrade_sql()`` / ``_downgrade_sql()`` 把几段完整
+    常量拼起来；这里在受限命名空间里执行模块源码（``alembic.op`` 用占位对象替代）
+    后调用这两个函数，既不需要 alembic 也不会跑到 ``upgrade()`` 本身。
     """
 
     source = REVISION_FILE.read_text(encoding="utf-8")
@@ -147,7 +147,7 @@ def revision_sql() -> tuple[str, str]:
     ]
     namespace: dict[str, Any] = {"__name__": "revision_0096_static", "op": None}
     exec(compile(ast.Module(body=body, type_ignores=[]), str(REVISION_FILE), "exec"), namespace)
-    return namespace["_UPGRADE_SQL"], namespace["_DOWNGRADE_SQL"]
+    return namespace["_upgrade_sql"](), namespace["_downgrade_sql"]()
 
 
 def _run_alembic(dsn: str, action: str, target: str) -> None:
