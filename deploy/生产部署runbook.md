@@ -403,7 +403,7 @@ docker image inspect --format='{{index .RepoDigests 0}}' \
 
 **部署后观察窗口**：至少持续观察 **15 分钟**（覆盖三服务里最坏的 B 类端到端时延——scheduler 约 6 分钟——的两倍以上，留出多个健康检查周期的余量），期间：
 
-**重部署期间（`up -d` 重建容器的那几分钟）管理群会收到一组「容器不存在 → 已恢复」的告警，属预期现象，不按本节或「六、回滚判据与步骤」处理**；但观察窗口结束之后仍收到「容器不存在」，就按「六、回滚判据与步骤」处理，不再算作预期现象（Trace [#754](https://github.com/Moshuiwang/lingxi/issues/754) 补入）。
+**重部署期间（`up -d` 重建容器的那几分钟）管理群会收到一组「容器不存在 → 已恢复」的告警，属预期现象，不按本节或「六、回滚判据与步骤」处理**；但观察窗口结束之后仍收到「容器不存在」，就按「六、回滚判据与步骤」处理，不再算作预期现象（Trace [#754](https://github.com/Moshuiwang/lingxi/issues/754) 补入）。这组告警**也可能不出现**——`host-monitor` 每分钟 `:00` 探一次，`up -d` 的重建若在两次探针之间完成（2026-09-11 `v2.4.3` 升级实测三容器 Recreate 只用 5 秒，17:40:45–17:40:50Z），管理群不会收到；缺席不是异常，判据仍是本节的健康回读。
 
 - 每隔 1-2 分钟 `docker compose ... ps` 一次，确认三个常驻服务的状态列均为 `healthy`、`restarts` 计数不再增长（部署本身触发的一次容器创建不计入异常重启）；
 - 用 `docker inspect --format='{{json .State.Health.Log}}' <容器>` 抽查最近若干次健康检查记录，确认没有非预期的失败探测；
@@ -420,7 +420,7 @@ docker image inspect --format='{{index .RepoDigests 0}}' \
 
 一次真实的数据库恢复演练此前从未执行过（[Issue #369 第 4 条](https://github.com/Moshuiwang/lingxi/issues/369)）。**已解决的阻碍（对抗审查 P3-1，[Issue #693](https://github.com/Moshuiwang/lingxi/issues/693) 补齐）**：旧版 `scripts/ops/backup_restore_drill.sh` 曾经对生产不可用——它只会对本机容器执行 `docker exec pg_dump`，而 stage 与生产的库都是 Supabase 云托管，没有可 `exec` 的容器。
 
-**现状（2026-09-11，Trace #754 W1 S-1-3）**：脚本已改为 DSN 版——只读 `pg_dump -Fc` 取自源库连接串（不依赖本机容器识别源库），恢复进新建的隔离 `postgres:17` 容器（不发布任何宿主端口，不碰源库本身），随后前滚 `alembic upgrade head` 到链头、在进程内补跑 scheduler 已装配的全部保留清理职责（真实代码路径，不是手写 SQL）、核对到期内容按原始写入时间被清除且未到期内容逐行保留；本机对一次性测试库已跑通整条流程（备份 → 恢复 → 迁移 → 补清理 → 行数与到期行回读），主机客户端版本前提见「十一、实录偏差」11.6。**本批安排**：Trace #754 S-2-5 在预发主机上用该脚本对预发库做第一次真实演练（不碰预发 Supabase 库本身，只读取一次 dump），记录随后写回本节——**这里只是安排，本次改动尚未代为执行**；生产环境的实际演练边界与授权仍需单独批准，不由本次改动授权。
+**现状（2026-09-11，Trace #754 W1 S-1-3）**：脚本已改为 DSN 版——只读 `pg_dump -Fc` 取自源库连接串（不依赖本机容器识别源库），恢复进新建的隔离 `postgres:17` 容器（不发布任何宿主端口，不碰源库本身），随后前滚 `alembic upgrade head` 到链头、在进程内补跑 scheduler 已装配的全部保留清理职责（真实代码路径，不是手写 SQL）、核对到期内容按原始写入时间被清除且未到期内容逐行保留；本机对一次性测试库已跑通整条流程（备份 → 恢复 → 迁移 → 补清理 → 行数与到期行回读），主机客户端版本前提见「十一、实录偏差」11.6。**第一次真实演练已执行（Trace #754 S-2-5，2026-09-11）**：2026-09-11 16:25:33–16:25:49Z（北京 09-12 00:25）在预发主机 `biai-stage` 对预发 Supabase 库执行 `scripts/ops/backup_restore_drill.sh`（工作副本 `64af8c4`，rc.98 `scheduler` / `migrate` 镜像，`postgres:17`，注入合成样本），共 17 秒：`pg_isready` 预检 → `pg_dump -Fc` 4.5 MB（`0600`）、`pg_restore --list` 925 条 → 隔离 `postgres:17` 容器 `pg_restore --no-owner --no-privileges -n public --exit-on-error` 退出码 0（预建角色骨架；清理函数属主改回 `lingxi_retention_owner` 并补回两张受限表 `GRANT`）→ migrate 镜像前滚「已到链头」（源库已在 `0096`）→ 进程内跑 scheduler 已装配的 5 项保留职责（保留清理各删 1 行合成到期样本、未到期样本逐行保留、`checks_wired=False` 属预期跳过、结果结构化核对通过）→ **43 张表行数逐表与源库一致** → 容器（含匿名卷）/ 网络 / dump / 恢复日志全部销毁并回读不存在，磁盘用量前后不变。**差异：无**；此前担心的「RLS policy 引用 `anon` 令 `pg_restore --exit-on-error` 失败」未发生（证据：[Issue #754 评论](https://github.com/Moshuiwang/lingxi/issues/754#issuecomment-5637475011)）。**生产库本批未做演练**（只取了迁移前备份）；生产环境的实际演练边界与授权仍需单独批准，不由本次改动授权。
 
 **2026-09-02 首发的实际处置**：产品负责人显式豁免了本节要求（首发为空库），演练仍未执行；备份侧的过渡安排与撤销条件见「十一、实录偏差」11.6。**该豁免只对首发有效**，不构成后续升级的常设豁免。
 
@@ -576,6 +576,14 @@ README 「主机读取身份」一节原写「把镜像包设为公开的代价�
 - **与日志收集定时器的顺序**：`lingxi-log-collect.timer` 每 5 分钟一次，`up -d` 安排在一次收集之后再做，避免容器重建时刻的日志缺口。
 - **观察结果**：三容器 healthy、`RestartCount=0`、三容器错误计数 0、在途 0；内存 scheduler 42 → 42.7、worker-queue 30 → 31、gateway 181.8 → 183.6 MiB（升级前 141 / 231 / 237）。
 - **未做**：`LINGXI_CONTENT_OVERRIDE_PATH` 未配（D-3：生产默认不启用文案外置）；白名单未动；名单零写入。回滚点＝备份文件内的上一批 tag ＋ 四 digest（`20260904-c6fa5ac5f9ad`）。
+
+### 11.9 `v2.4.3` 升级实录（2026-09-11，Trace #754 W3）
+
+- **序列与耗时**：17:32Z 放行（窗口＝北京 09-12 全天）→ 迁移前备份 `pg_dump -Fc` 到 `~/backups/`（1.36 MB）→ 步 0 `checkout --detach 64af8c4` → `.env.prod` 先 `cp -p` 备份再只改五行（值取自 tz 侧 `release_manifest.py resolve` 输出文件，写后两侧 `sort | md5sum` 相等）→ `pull` + 四 digest 回读一致 → `run --rm migrate`（`0090→0096`，退出 0）→ 17:40:50Z `up -d`（三容器 5 秒 Recreate）→ 17:41:13–17:41:20Z 三服务首次探测即 healthy → 17:56Z 观察窗口结束零重启零错误 → 18:01Z [#673](https://github.com/Moshuiwang/lingxi/issues/673) 回填 `--apply`（干跑 → 过目 → apply → 幂等复跑）→ 18:02Z 起真实问数 `succeeded`。
+- **实测事实①**：`LINGXI_IMAGE_TAG=v2.4.3` 在 GHCR **没有**同名 tag（只有 `20260911-64af8c4025f1`），`name:tag@digest` 引用仍按 digest 拉取成功、tag 只供人读；`docker manifest inspect name:tag@digest` 反而报 `manifest unknown`，不能拿它当判据。
+- **实测事实②**：生产主机 `sh` 无 `PIPESTATUS`，`cmd | tail; echo $?` 打出的是 `tail` 的退出码；判绿只认 `docker image inspect`、`migrate current`、`docker inspect Health`。
+- **观察结果**：三容器 healthy、`RestartCount=0`，日志 `ERROR|Traceback|CRITICAL` 计数 0；`task`/`app_user`/`inbound_event` 行数迁移前后与窗口末不变，在途 0。
+- **未做**：本批未对本次 `0091`–`0096` 真实迁移做生产回滚演练，回滚仍只有 CI 合成证据（见 2.3.7 ⑥）；回滚点＝`.env.prod.before-243-v2.4.3` ＋ 迁移前 `pg_dump` 文件。
 
 ## 十二、#541 预开通批量执行姿势（生产；rc25 补入）
 
