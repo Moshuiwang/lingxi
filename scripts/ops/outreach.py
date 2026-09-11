@@ -539,17 +539,27 @@ def build_dispatcher(config: Any, dsn: str, *, initiated_by: str) -> Any:
     内容目录与它的摘要在这里一次读齐：审计里的 ``content_digest`` 必须是**真正拿去
     渲染的那一份内容**的摘要，配了宿主机覆盖文件时它与 ``content_version`` 不再相等，
     追溯"这个人到底收到的是哪一版字"只能看它。
+
+    ``contact_outcome`` 走 ``build_contact_reachability_recorder``（#673）：把这次
+    正式发送的明确结果落成 ``app_user`` 的不过期状态，失败时转一条管理群待办
+    （不是告警）。它带发起人：这条状态是这次运行的直接结果，不是系统故障事实，
+    与告警那一侧刻意不带发起人的姿态不同。
     """
     from lingxi.adapters.feishu_user_card import FeishuUserCards
     from lingxi.adapters.postgres_outreach import PostgresOutreachStore
     from lingxi.apps.scheduler.alerting_assembly import build_alerting_duty
     from lingxi.apps.scheduler.audit import StructuredLogAuditSink
+    from lingxi.apps.scheduler.contact_reachability_assembly import (
+        build_contact_reachability_recorder,
+    )
     from lingxi.config.content_override import default_content_source
     from lingxi.core.outreach.dispatch import OutreachDispatcher
 
     audit = StructuredLogAuditSink()
     # 告警那一侧拿不带发起人的原始出口：告警是系统故障事实，不属于某一次人工发起。
     alerting = build_alerting_duty(config, audit=audit)
+    audit_with_initiator = _AuditWithInitiator(audit, initiated_by=initiated_by)
+    contact_outcome = build_contact_reachability_recorder(config, dsn, audit=audit_with_initiator)
     source = default_content_source()
     sender = FeishuUserCards(
         base_url=config.feishu_base_url,
@@ -565,8 +575,9 @@ def build_dispatcher(config: Any, dsn: str, *, initiated_by: str) -> Any:
     dispatcher = OutreachDispatcher(
         sender=sender,
         store=PostgresOutreachStore(dsn),
-        audit=_AuditWithInitiator(audit, initiated_by=initiated_by),
+        audit=audit_with_initiator,
         send_outcome=alerting.send_outcome_callback(),
+        contact_outcome=contact_outcome,
         catalog=source.catalog,
         content_digest=source.digest,
     )

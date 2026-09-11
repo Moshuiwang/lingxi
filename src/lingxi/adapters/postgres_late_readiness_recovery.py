@@ -208,17 +208,16 @@ class PostgresLateReadinessStore:
 
         两道守卫与 ``postgres_identity.mark_preprovision_notice_pending`` 一致
         （只挂一次、只挂给从没跟我们说过话的人）；0 行（已挂过/已经在聊）不是
-        失败，激活本身照常提交。
+        失败，激活本身照常提交。判据是 ``first_inbound_at IS NULL``，**不再
+        查询** ``inbound_event``：那张表按九十天上限整行删除，查询它会让一个
+        真实聊过的老用户在证据过期后被重新读成"从没说过话"（见迁移 ``0095``）。
         """
         cursor.execute(
             """UPDATE app_user
                   SET preprovision_notice_armed_at = now()
                 WHERE id = %(user)s
                   AND preprovision_notice_armed_at IS NULL
-                  AND NOT EXISTS (
-                        SELECT 1 FROM inbound_event ie
-                         WHERE ie.user_open_id = app_user.feishu_open_id
-                      )""",
+                  AND first_inbound_at IS NULL""",
             {"user": user_id},
         )
 
