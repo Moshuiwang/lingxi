@@ -30,7 +30,7 @@
 195	src/lingxi/apps/gateway/config.py
 486	src/lingxi/apps/gateway/delivery.py
 57	src/lingxi/apps/gateway/delivery_assembly.py
-502	src/lingxi/apps/gateway/document_delivery.py
+509	src/lingxi/apps/gateway/document_delivery.py
 155	src/lingxi/apps/gateway/event_handler.py
 80	src/lingxi/apps/gateway/group_mention_hint.py
 17	src/lingxi/apps/gateway/innertest.py

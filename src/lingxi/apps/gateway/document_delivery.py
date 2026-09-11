@@ -116,7 +116,7 @@ class DocumentDeliveryConsumer:
                 self._alert("document_delivery_attempts_exhausted", "")
 
         try:
-            requeued, reclaim_failed = self._store.reclaim_stale_processing()
+            requeued, reclaim_failed, reclaim_uncertain = self._store.reclaim_stale_processing()
         except Exception as error:  # 见类文档：只降级这一段
             logger.error("文档投递：回收卡住的处理中行失败 error=%s", type(error).__name__)
         else:
@@ -124,6 +124,13 @@ class DocumentDeliveryConsumer:
             if reclaim_failed > 0:
                 logger.error("gateway.document_delivery.reclaim_failed count=%s", reclaim_failed)
                 self._alert("document_delivery_reclaim_failed", "")
+            if reclaim_uncertain > 0:
+                # 建档/建表调用是否生效本地无法判断，转人工核对——同 _uncertain()
+                # 已有的告警姿态，不假装这是失败也不假装成功。
+                logger.warning(
+                    "gateway.document_delivery.reclaim_uncertain count=%s", reclaim_uncertain
+                )
+                self._alert("document_delivery_reclaim_uncertain", "")
 
     def _resend_pending_notices(self) -> None:
         """补发未确认送达的成功通知，排在认领新行之前。
@@ -293,8 +300,11 @@ class DocumentDeliveryConsumer:
         之后才提交，因此"检查点已落"蕴含"正文已写"；两步段落路径保留了
         "建了档、正文还没写"的中间态，恢复路径的读回判据因此仍有判别力。
         **降级检查点先于写正文提交**：先写后落时一次崩溃会把降级信号带走，
-        恢复路径会发出不带降级说明的通知。
+        恢复路径会发出不带降级说明的通知。**发起建档调用前先落
+        ``creation_attempted_at``**：缝隙里崩溃的行走恢复入口时会转人工核对，
+        不会被当作"还没开始"重新发起、造出第二份产物。
         """
+        self._store.mark_creation_attempted(request_id=claim.id)
         document_id, reason = self._create_docx_body_via_markdown(claim)
         if document_id is not None:
             return document_id, reason
@@ -316,7 +326,8 @@ class DocumentDeliveryConsumer:
 
         差异见 ``adapters/feishu_sheets_delivery.py`` 模块文档「与文档交付的
         差异点」——写值天然幂等（无条件重放），查默认 sheet_id 是纯只读调用
-        （同样无条件重放，不需要检查点），建表响应自带链接。
+        （同样无条件重放，不需要检查点），建表响应自带链接。建表前先落
+        ``creation_attempted_at``，同 ``_create_docx_body`` 的姿态。
         """
         from lingxi.adapters.feishu_sheets_delivery import FeishuSheetsDeliveryError
         from lingxi.adapters.postgres_document_delivery import DocumentDeliveryOwnershipLostError
@@ -325,6 +336,7 @@ class DocumentDeliveryConsumer:
         resource_url = claim.resource_url
         try:
             if spreadsheet_token is None:
+                self._store.mark_creation_attempted(request_id=claim.id)
                 spreadsheet_token, resource_url = self._sheets.create_spreadsheet(claim.title)
                 # 检查点：独立提交，额外一并落 resource_url（链接随建表响应
                 # 一起拿到，不需要第二次调用）。

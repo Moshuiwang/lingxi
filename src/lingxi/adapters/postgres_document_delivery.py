@@ -17,7 +17,7 @@ LOCKED``，让并发的多个 gateway 实例天然互斥。
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import timedelta
+from datetime import datetime, timedelta
 from typing import Any
 
 from lingxi.adapters.postgres import DEFAULT_POSTGRES_TIMEOUTS, PostgresTimeouts, connect
@@ -143,6 +143,36 @@ def _row_to_claim(row: tuple[Any, ...]) -> DocumentDeliveryClaim:
     )
 
 
+#: 一行"卡住的 processing"被 :meth:`PostgresDocumentDeliveryStore.
+#: reclaim_stale_processing` 回收后的去向 -> ``(status, last_error)``；
+#: ``last_error`` 为 ``None`` 时保留该行已有的值，``pending`` 分支不改写它。
+_RECLAIM_TRANSITIONS: dict[str, tuple[str, str | None]] = {
+    "uncertain": ("uncertain", "creation_attempt_unconfirmed"),
+    "failed": ("failed", "attempts_exhausted"),
+    "pending": ("pending", None),
+}
+
+
+def _reclaim_disposition(
+    *,
+    document_id: str | None,
+    creation_attempted_at: datetime | None,
+    attempts: int,
+    max_attempts: int,
+) -> str:
+    """一行"卡住的 processing"该被回收成的去向，键取自 ``_RECLAIM_TRANSITIONS``。
+
+    判定顺序即优先级：``document_id`` 仍为空但已经记录过建档/建表尝试——本地
+    无法判断外部调用有没有生效，转 ``uncertain``，不因为 ``attempts`` 还没
+    耗尽就退回 ``pending``（重新发起会造出第二份产物）。
+    """
+    if document_id is None and creation_attempted_at is not None:
+        return "uncertain"
+    if attempts >= max_attempts:
+        return "failed"
+    return "pending"
+
+
 class PostgresDocumentDeliveryStore:
     """``task_document_delivery_request`` 的唯一读写实现（gateway 侧消费循环用）。"""
 
@@ -230,6 +260,31 @@ class PostgresDocumentDeliveryStore:
                  WHERE id = %s AND status = 'processing'
                 """,
                 (reason, request_id),
+            )
+            if cursor.rowcount != 1:
+                raise DocumentDeliveryOwnershipLostError(request_id)
+
+    def mark_creation_attempted(self, *, request_id: str) -> None:
+        """检查点：即将发起一次外部建档/建表调用，在发起之前单独提交。
+
+        与 :meth:`mark_document_created` 是同一条缝隙的两端：外部调用成功之后
+        才轮到检查点提交 ``document_id``，进程在这中间消失时，本列已经落盘的
+        事实是回收逻辑判断"能不能当作还没开始、放心重新发起"的唯一依据。允许
+        同一次处理内被多次调用（两条创建路径各自触发一次时都合法）；
+        ``status = 'processing'`` 守卫命中 0 行时同样抛出
+        :class:`DocumentDeliveryOwnershipLostError`。
+        """
+        with (
+            connect(self._dsn, timeouts=self._timeouts) as connection,
+            connection.cursor() as cursor,
+        ):
+            cursor.execute(
+                """
+                UPDATE task_document_delivery_request
+                   SET creation_attempted_at = now(), updated_at = now()
+                 WHERE id = %s AND status = 'processing'
+                """,
+                (request_id,),
             )
             if cursor.rowcount != 1:
                 raise DocumentDeliveryOwnershipLostError(request_id)
@@ -354,52 +409,48 @@ class PostgresDocumentDeliveryStore:
         *,
         older_than: timedelta = timedelta(seconds=STALE_PROCESSING_AFTER_SECONDS),
         max_attempts: int = MAX_CLAIM_ATTEMPTS,
-    ) -> tuple[int, int]:
+    ) -> tuple[int, int, int]:
         """回收卡在 ``processing`` 太久的行（消费进程崩溃、从未落任何终态）。
 
-        与 ``apps/worker/service.py`` 的 ``reclaim_stale_with_outcomes`` 同一
-        姿态：``attempts``（认领时已经自增过）未超上限的退回 ``pending`` 等待
-        下一次认领——``document_id`` 若已经在崩溃前完成检查点提交，续做时会跳过
-        重新建档（见模块说明）；超过上限的直接终态 ``failed``，不再无限期占用
-        消费循环。返回 ``(退回 pending 的行数, 转 failed 的行数)``。
+        去向按 :func:`_reclaim_disposition` 三选一：``document_id`` 仍为空但
+        已经记录过建档/建表尝试的转 ``uncertain``（本地无法判断外部调用有没有
+        生效，重新发起会造出第二份产物）；否则 ``attempts`` 超上限转
+        ``failed``；否则退回 ``pending``（``document_id`` 若已检查点提交，续做
+        时会跳过重新建档，见模块说明）。返回三个去向各自的行数，顺序
+        ``(pending, failed, uncertain)``。
         """
-        requeued = 0
-        failed = 0
+        tallies = {"pending": 0, "failed": 0, "uncertain": 0}
         with connect(self._dsn, timeouts=self._timeouts) as connection:
             with connection.transaction():
                 cursor = connection.cursor()
                 cursor.execute(
                     """
-                    SELECT id, attempts FROM task_document_delivery_request
+                    SELECT id, attempts, document_id, creation_attempted_at
+                      FROM task_document_delivery_request
                      WHERE status = 'processing' AND updated_at < now() - %s::interval
                      ORDER BY updated_at
                      FOR UPDATE SKIP LOCKED
                     """,
                     (older_than,),
                 )
-                rows = cursor.fetchall()
-                for request_id, attempts in rows:
-                    if attempts >= max_attempts:
-                        cursor.execute(
-                            """
-                            UPDATE task_document_delivery_request
-                               SET status = 'failed', last_error = 'attempts_exhausted', updated_at = now()
-                             WHERE id = %s AND status = 'processing'
-                            """,
-                            (request_id,),
-                        )
-                        failed += 1
-                    else:
-                        cursor.execute(
-                            """
-                            UPDATE task_document_delivery_request
-                               SET status = 'pending', updated_at = now()
-                             WHERE id = %s AND status = 'processing'
-                            """,
-                            (request_id,),
-                        )
-                        requeued += 1
-        return requeued, failed
+                for request_id, attempts, document_id, creation_attempted_at in cursor.fetchall():
+                    disposition = _reclaim_disposition(
+                        document_id=document_id,
+                        creation_attempted_at=creation_attempted_at,
+                        attempts=attempts,
+                        max_attempts=max_attempts,
+                    )
+                    status, last_error = _RECLAIM_TRANSITIONS[disposition]
+                    cursor.execute(
+                        """
+                        UPDATE task_document_delivery_request
+                           SET status = %s, last_error = COALESCE(%s, last_error), updated_at = now()
+                         WHERE id = %s AND status = 'processing'
+                        """,
+                        (status, last_error, request_id),
+                    )
+                    tallies[disposition] += 1
+        return tallies["pending"], tallies["failed"], tallies["uncertain"]
 
     def fail_exhausted_pending(self, *, max_attempts: int = MAX_CLAIM_ATTEMPTS) -> int:
         """把 attempts 已经耗尽、却仍然停在 ``pending`` 的行直接转终态 ``failed``。
