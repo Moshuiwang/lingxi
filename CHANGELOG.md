@@ -8,7 +8,7 @@
 
 ## [2.4.3] - 2026-09-11
 
-本版把 `2.4.0`、2.4.1（Trace [#709](https://github.com/Moshuiwang/lingxi/issues/709)）与 2.4.2（Trace [#732](https://github.com/Moshuiwang/lingxi/issues/732)）三批此前只在预发验证过的工作一次性发到生产——三版原定分两批发布，产品负责人裁定改为一次发完（Issue [#700](https://github.com/Moshuiwang/lingxi/issues/700)）。生产由 `2.3.1` 直接升级到本版，**不补发 `2.3.2`**：`2.3.2` 只是一次正式制品打包，从未部署过。本版新增数据库迁移 `0091`–`0095`（前三批产生，均只在预发验证过）与本批新增的 `0096_plpgsql_search_path`（数据库函数查找路径加固，Issue [#661](https://github.com/Moshuiwang/lingxi/issues/661)）；其中 `0091`、`0092` 只要表里已有数据就拒绝降级，`0095` 降级会静默丢失「说过话」状态——因此**本版不提供数据库降级**，回滚只切回旧版本的镜像与四份 digest，不触碰数据库结构与数据。**本版随 `2.4.3` 首次进入生产，真实用户验收另行记录。**
+本版把 `2.4.0`、2.4.1（Trace [#709](https://github.com/Moshuiwang/lingxi/issues/709)）与 2.4.2（Trace [#732](https://github.com/Moshuiwang/lingxi/issues/732)）三批此前只在预发验证过的工作一次性发到生产——三版原定分两批发布，产品负责人裁定改为一次发完（Issue [#700](https://github.com/Moshuiwang/lingxi/issues/700)）。生产由 `2.3.1` 直接升级到本版，**不补发 `2.3.2`**：`2.3.2` 只是一次正式制品打包，从未部署过。本版新增数据库迁移 `0091`–`0095`（前三批产生，均只在预发验证过）与本批新增的 `0096_plpgsql_search_path`（数据库函数查找路径加固，Issue [#661](https://github.com/Moshuiwang/lingxi/issues/661)）；其中 `0091`、`0092` 只要表里已有数据就拒绝降级，`0095` 降级会静默丢失「说过话」状态——因此**本版不提供数据库降级**，回滚只切回旧版本的镜像与四份 digest，不触碰数据库结构与数据。**随 v2.4.3 发布到生产；真实用户验收另行记录。**
 
 ### Added
 

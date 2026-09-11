@@ -243,7 +243,7 @@ psql "$LINGXI_POSTGRES_DSN" -Atc "SELECT (SELECT count(*) FROM task WHERE status
 
 ④ **`pg_dump` 客户端版本前提**：执行备份的 `pg_dump` 主版本号必须 **≥** 目标 Supabase 服务器的 PostgreSQL 主版本号，版本不够会直接拒绝连接。已知事实（编排者 2026-09-11 只读回读）：生产主机 `pg_dump` 17.10、Supabase 生产服务器 17.6，**生产主机可以直接用系统自带的 `pg_dump`**；预发主机 `pg_dump` 16.15 对 17.6 服务器**直接拒绝**，预发上的任何备份或恢复演练都必须改用 `docker run --rm postgres:17 pg_dump …`（容器内版本高于服务器，满足前提）。
 
-⑤ **顺序不可调换**（生产整窗口）：G-2 放行 → 自检 → 备份（③）→ 步 0（§2.0）→ `.env.prod` 写入本批 tag 与四份 digest（写之前先把原文件备份为 `.env.prod.before-243-<tag>`）→ 拉取并逐份比对 digest（「三、镜像 digest 固定」）→ `run --rm migrate`（①）→ 回读迁移头 = `0096_plpgsql_search_path` → `up -d` → 健康回读（§2.5）→ 15 分钟观察窗口（「七、观察期」）→ [#673](https://github.com/Moshuiwang/lingxi/issues/673) 回填 → 产品负责人真人问数 → 24 小时观察。**`--profile mvp` 与两个 `-f` 覆盖文件，本窗口内每一条 compose 命令都不能省**（§2.4 三条命令形态纪律同样适用于这里新增的每一步）。
+⑤ **顺序不可调换**（生产整窗口）：G-2 放行 → 自检 → 备份（③）→ 步 0（§2.0）→ `.env.prod` 写入本批 tag 与四份 digest（写之前先把原文件备份为 `.env.prod.before-243-<tag>`）→ 拉取并逐份比对 digest（「三、镜像 digest 固定」）→ `run --rm migrate`（①）→ 回读迁移头 = `0096_plpgsql_search_path` → `up -d` → 健康回读（§2.5）→ 15 分钟观察窗口（「七、观察期」）→ 固定项（`验收.md` §二 F-1/2/3/6）→ [#673](https://github.com/Moshuiwang/lingxi/issues/673) 回填 → 产品负责人真人问数 → 24 小时观察。**`--profile mvp` 与两个 `-f` 覆盖文件，本窗口内每一条 compose 命令都不能省**（§2.4 三条命令形态纪律同样适用于这里新增的每一步）。
 
 ⑥ **本批没有真实回滚演练**：`V-部署-05` 的 CI 实测（`verify_old_image_new_schema.sh`）用的是运行时合成的加列迁移，不是本批 `0091`–`0096` 的真实内容；旧镜像（`v2.3.1`）能否在新库结构上正常启动，目前只有这份合成证据，**没有针对本批真实迁移做过回滚演练**。如实登记，不冒充已演练过；回滚仍然安全的依据是②的静态论证（迁移遵守「先加后删」、`v2.3.1` 不读写新增列）。
 
