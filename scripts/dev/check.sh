@@ -9,6 +9,9 @@
 #   scripts/dev/check.sh --print-mode        # 只打印分层结论，不安装依赖、不运行任何检查
 #   scripts/dev/check.sh --keep-db           # full 模式结束后不清理临时真库容器
 #   scripts/dev/check.sh --reuse-venv        # 复用已存在的虚拟环境，跳过默认的重建
+#   scripts/dev/check.sh full --shards [N]   # full 模式按 N 片并行跑单测，N 省略时取
+#                                             # DEFAULT_SHARD_COUNT（占位值，尚未验证为绿，
+#                                             # 见 Issue #712 调粒度批）
 #
 # 三层与 CI 的对应关系（验证与门禁第五节 / 第十一节）：
 #   docs  等价于 Story / docs 与 Epic Full / docs：只跑 scripts/ci/verify_docs.sh，
@@ -72,6 +75,9 @@ usage() {
   --print-mode         只打印分层结论（docs/l1/fast/full），不做任何安装或检查
   --keep-db            full 模式结束后保留临时真库容器（默认用完即删）
   --reuse-venv         复用已存在的虚拟环境，跳过默认的「每次重建」
+  --shards [N]         full 模式按 N 片并行跑单测，每片独占一个数据库（Issue #712）；
+                       N 省略时取 DEFAULT_SHARD_COUNT（占位值，尚未验证为绿，
+                       见变量定义处注释）
   -h, --help           显示本帮助
 EOF
 }
@@ -82,6 +88,18 @@ keep_db=0
 print_mode_only=0
 committed_only=0
 reuse_venv=0
+shard_count=""
+
+# --shards 不给具体数字时的默认分片数。**2 尚未验证为绿**：本机 2026-09-10
+# 实测，4 路与 2 路并发都会让 tests/test_roster_audit_postgres.py 的
+# `TRUNCATE app_user CASCADE` 撞上同一个 3 秒 statement_timeout（同一失败签
+# 名）——根因是该文件每条用例都在 setUp 里全表清场，这个操作本身不满足并发
+# 场景下的 3 秒预算，与并发度是 4 还是 2 无关；串行（不分片）路径只是因为零
+# 并发才一直压线通过。分片因此暂时**卡在**这批测试文件的清场方式上，是独立
+# 待办，不在本次调粒度的范围内。这个默认值先占位，`--shards` 本身仍是显式
+# opt-in（不给这个参数时 full 跟改造前一样不分片）；批次能稳定跑绿之前不要
+# 把默认分片数当作「已验证」使用。
+readonly DEFAULT_SHARD_COUNT=2
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -116,6 +134,28 @@ while [[ $# -gt 0 ]]; do
     --reuse-venv)
       reuse_venv=1
       shift
+      ;;
+    --shards)
+      # 数字参数可省略：后面没有参数、或紧跟着另一个看起来不是分片数的 token
+      # （下一层级关键字、另一个 `--` 选项）时，都视为「没给」，取默认值，而不
+      # 是报错——`--shards` 后面不是必须再跟一个数字。
+      if [[ $# -ge 2 && "$2" =~ ^[0-9]+$ ]]; then
+        # 把关审查实测：此前只拒 N<1，于是 `--shards 1` 被接受并导出
+        # LINGXI_TEST_SHARD_COUNT=1；verify_repository.sh 因 -gt 1 不成立走回退
+        # 分支，但变量仍留在环境里，最终由 run_tests.py 报「两个变量必须同时
+        # 设置」退出 1——报错指向的地方与真正的原因无关。分片数小于 2 本来就
+        # 不是分片，这里直接说清楚。
+        if [[ "$2" -lt 2 ]]; then
+          printf -- '--shards 至少是 2，实际给的是 %s。\n' "$2" >&2
+          printf -- '不分片请直接去掉 --shards（那正是改造前的行为）。\n' >&2
+          exit 1
+        fi
+        shard_count="$2"
+        shift 2
+      else
+        shard_count="${DEFAULT_SHARD_COUNT}"
+        shift 1
+      fi
       ;;
     -h | --help)
       usage
@@ -398,12 +438,31 @@ run_full() {
   printf '临时真库已就绪：容器=%s 端口=%s（trust 认证，与本机既有 scram 测试库互不影响）\n' \
     "${full_pg_container}" "${host_port}" >&2
 
-  LINGXI_POSTGRES_CONTAINER="${full_pg_container}" \
-    LINGXI_POSTGRES_DSN="postgresql://postgres@localhost:${host_port}/${spec[POSTGRES_DB]}" \
-    PATH="${venv_dir}/bin:${PATH}" \
-    scripts/ci/verify_repository.sh
+  # --shards 未给时这一行与改造前逐字相同（回退路径）：不导出
+  # LINGXI_TEST_SHARD_COUNT，verify_repository.sh 走它今天已有的单进程分支。
+  if [[ -n "${shard_count}" ]]; then
+    LINGXI_POSTGRES_CONTAINER="${full_pg_container}" \
+      LINGXI_POSTGRES_DSN="postgresql://postgres@localhost:${host_port}/${spec[POSTGRES_DB]}" \
+      LINGXI_TEST_SHARD_COUNT="${shard_count}" \
+      PATH="${venv_dir}/bin:${PATH}" \
+      scripts/ci/verify_repository.sh
+  else
+    LINGXI_POSTGRES_CONTAINER="${full_pg_container}" \
+      LINGXI_POSTGRES_DSN="postgresql://postgres@localhost:${host_port}/${spec[POSTGRES_DB]}" \
+      PATH="${venv_dir}/bin:${PATH}" \
+      scripts/ci/verify_repository.sh
+  fi
   check_git_tree_is_clean
 }
+
+# 独立审查提出：`--shards` 只在 full 层被读取，给了别的层级会被**静默忽略**——
+# 敲了参数、以为分片生效了，其实什么都没发生。今天这一批已经反复踩到「一个信号
+# 在它该为假时照样返回真」，这里不留同型的坑：不适用就响亮拒绝，不装作接受。
+if [[ -n "${shard_count}" && "${mode}" != "full" ]]; then
+  printf -- '--shards 只对 full 层有效，当前层级是 %s。\n' "${mode}" >&2
+  printf -- '换成 `scripts/dev/check.sh full --shards %s`，或去掉 --shards。\n' "${shard_count}" >&2
+  exit 2
+fi
 
 case "${mode}" in
   docs) run_docs ;;

@@ -187,8 +187,110 @@ if [[ -n "${LINGXI_POSTGRES_CONTAINER:-}" && -z "${LINGXI_POSTGRES_DSN:-}" ]]; t
   exit 1
 fi
 
+# 分片跑批用的一次性库：每片一个库，同一个容器（Issue #712）。派生 DSN 只换
+# 库名，主机/端口/用户原样保留——CI 与本机这三项各不相同，写死任何一处都会让
+# 另一处失效，与 check_migration_chain.sh 的 scratch_dsn 同一手法，不重复造轮子。
+shard_database_dsn() {
+  local base_dsn="$1"
+  local shard_index="$2"
+  LINGXI_SHARD_BASE_DSN="${base_dsn}" LINGXI_SHARD_INDEX="${shard_index}" python3 - <<'PY'
+import os
+from urllib.parse import urlsplit, urlunsplit
+
+parts = urlsplit(os.environ["LINGXI_SHARD_BASE_DSN"])
+base_db = parts.path.lstrip("/")
+shard_db = f"{base_db}_shard_{os.environ['LINGXI_SHARD_INDEX']}"
+print(urlunsplit(parts._replace(path="/" + shard_db)))
+PY
+}
+
+# 在既有容器里为一片新建一个空库：先 DROP 再建，避免复用上一次门禁失败后留下的
+# 残余对象。按实测耗时装箱前不知道每片会不会摊到真库用例，统一建好比事后判断
+# 「这片要不要库」更简单，代价只是几个空库，门禁结束容器整个销毁。
+create_shard_database() {
+  local container="$1"
+  local base_dsn="$2"
+  local shard_index="$3"
+  local base_db
+  base_db=$(LINGXI_SHARD_BASE_DSN="${base_dsn}" python3 - <<'PY'
+import os
+from urllib.parse import urlsplit
+
+print(urlsplit(os.environ["LINGXI_SHARD_BASE_DSN"]).path.lstrip("/"))
+PY
+)
+  local shard_db="${base_db}_shard_${shard_index}"
+  docker exec "${container}" psql -q -v ON_ERROR_STOP=1 -U postgres -d postgres \
+    -c "DROP DATABASE IF EXISTS ${shard_db} WITH (FORCE);" >/dev/null
+  docker exec "${container}" psql -q -v ON_ERROR_STOP=1 -U postgres -d postgres \
+    -c "CREATE DATABASE ${shard_db};" >/dev/null
+}
+
+# 分片跑批：容器仍然只有一个——Issue #712 立项论证订正过，Trace #709 那次四路
+# 假红是机器容量事故，不是共享资源争抢；本函数是「各分片各自独占数据库」，
+# 不是在同一份**数据库**上加线程（各片一片一库）。注意这不等于零共享：把关审查与 #743 实测坐实，各片仍共用同一个 postgres 实例与同一棵工作树，`TRUNCATE ... CASCADE` 正是因此撞穿 3 秒超时。每片一个 run_tests.py 子进程、各自的 DSN，
+# 互不清场、一片污染不连坐其余分片。
+run_sharded_python_tests() {
+  local shard_count="$1"
+  if ! [[ "${shard_count}" =~ ^[0-9]+$ ]]; then
+    printf 'LINGXI_TEST_SHARD_COUNT 必须是正整数，实际是 %s\n' "${shard_count}" >&2
+    exit 1
+  fi
+  if [[ -n "${LINGXI_POSTGRES_DSN:-}" && -z "${LINGXI_POSTGRES_CONTAINER:-}" ]]; then
+    printf '分片跑批要在容器内为每片建库，但只设置了 LINGXI_POSTGRES_DSN，没有 LINGXI_POSTGRES_CONTAINER。\n' >&2
+    exit 1
+  fi
+
+  local log_dir
+  log_dir=$(mktemp -d)
+  local logs=() pids=() index
+  for ((index = 0; index < shard_count; index++)); do
+    local shard_dsn=""
+    if [[ -n "${LINGXI_POSTGRES_DSN:-}" ]]; then
+      shard_dsn=$(shard_database_dsn "${LINGXI_POSTGRES_DSN}" "${index}")
+      create_shard_database "${LINGXI_POSTGRES_CONTAINER}" "${LINGXI_POSTGRES_DSN}" "${index}"
+    fi
+    local log_file="${log_dir}/shard-${index}.log"
+    logs+=("${log_file}")
+    (
+      LINGXI_TEST_SHARD_INDEX="${index}" \
+        LINGXI_TEST_SHARD_COUNT="${shard_count}" \
+        LINGXI_POSTGRES_DSN="${shard_dsn}" \
+        PYTHONPATH=src python3 scripts/ci/run_tests.py
+    ) >"${log_file}" 2>&1 &
+    pids+=("$!")
+  done
+
+  local overall_status=0 pid
+  for pid in "${pids[@]}"; do
+    if ! wait "${pid}"; then
+      overall_status=1
+    fi
+  done
+
+  local log_file
+  for log_file in "${logs[@]}"; do
+    printf -- '--- 分片日志 %s ---\n' "${log_file}"
+    cat "${log_file}"
+  done
+
+  # 汇总口径本身是一道门禁：分片后 Ran N 会碎成 N 行，任一分片没有产出汇总行、
+  # 或分片数与预期不符，都必须在这里判红——不能让「N 不减少」这条验收标准
+  # 因为汇总环节漏看一片而失去意义（tests/test_run_tests_shard_gate.py 钉住）。
+  if ! python3 scripts/ci/run_tests.py --check-shard-logs "${shard_count}" "${logs[@]}"; then
+    overall_status=1
+  fi
+
+  rm -rf "${log_dir}"
+  return "${overall_status}"
+}
+
 if [[ -d tests ]]; then
-  PYTHONPATH=src python3 -m unittest discover -s tests -v
+  if [[ -n "${LINGXI_TEST_SHARD_COUNT:-}" && "${LINGXI_TEST_SHARD_COUNT}" -gt 1 ]]; then
+    run_sharded_python_tests "${LINGXI_TEST_SHARD_COUNT}"
+  else
+    PYTHONPATH=src python3 scripts/ci/run_tests.py
+  fi
   printf 'Python 自动测试：通过\n'
 fi
 
