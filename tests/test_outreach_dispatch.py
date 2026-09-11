@@ -147,6 +147,12 @@ class RejectedByFeishuError(RuntimeError):
     code = "feishu_code_230013"
 
 
+class UnknownOutcomeError(RuntimeError):
+    """结果不确定的失败——``_error_code`` 会把它折成 ``notification_unknown``。"""
+
+    code = "notification_unknown"
+
+
 def _dispatcher(store, sender, audit, outcomes=None):
     return OutreachDispatcher(
         sender=sender,
@@ -448,6 +454,110 @@ class RecordingOutcomeTest(unittest.TestCase):
 
         self.assertEqual(outcome.status, STATUS_DELIVERED)
         self.assertIn("outreach.delivery_not_recorded", [action for action, _ in audit.records])
+
+
+class ContactOutcomeTest(unittest.TestCase):
+    """#673 旁路：正式发送的明确结果转给联系可达状态回调，预检与不确定结果不转。"""
+
+    def _dispatcher_with_contact(self, store, sender, audit, contact_calls: list[tuple]):
+        return OutreachDispatcher(
+            sender=sender,
+            store=store,
+            audit=audit,
+            contact_outcome=lambda open_id, ok, code: contact_calls.append((open_id, ok, code)),
+            catalog=CATALOG,
+        )
+
+    def test_a_successful_apply_send_is_reported_as_reachable(self) -> None:
+        store, sender, audit = FakeStore(), FakeSender(), FakeAudit()
+        calls: list[tuple] = []
+
+        self._dispatcher_with_contact(store, sender, audit, calls).deliver(
+            _target(), purpose=OutreachPurpose.APPLY
+        )
+
+        self.assertEqual(calls, [(OPEN_ID, True, None)])
+
+    def test_a_definite_failure_is_reported_as_unavailable_with_its_error_code(self) -> None:
+        store = FakeStore()
+        sender = FakeSender(errors=[RejectedByFeishuError()])
+        audit = FakeAudit()
+        calls: list[tuple] = []
+
+        self._dispatcher_with_contact(store, sender, audit, calls).deliver(
+            _target(), purpose=OutreachPurpose.APPLY
+        )
+
+        self.assertEqual(calls, [(OPEN_ID, False, "feishu_code_230013")])
+
+    def test_an_unknown_outcome_is_not_reported_as_a_definite_result(self) -> None:
+        """否定断言：结果不确定时不冒充"明确不可用"，回调根本不被调用。"""
+        store = FakeStore()
+        sender = FakeSender(errors=[UnknownOutcomeError()])
+        audit = FakeAudit()
+        calls: list[tuple] = []
+
+        self._dispatcher_with_contact(store, sender, audit, calls).deliver(
+            _target(), purpose=OutreachPurpose.APPLY
+        )
+
+        self.assertEqual(calls, [])
+
+    def test_a_precheck_send_never_reports_a_contact_outcome(self) -> None:
+        """否定断言：预检收件人是管理员本人，把预检结果记成目标用户状态会张冠李戴。"""
+        store, sender, audit = FakeStore(), FakeSender(), FakeAudit()
+        calls: list[tuple] = []
+        target = OutreachTarget(
+            recipient_open_id="ou_admin_precheck",
+            subject=f"ou_admin_precheck:run1:{USER_ID}",
+            audience=_audience(),
+        )
+
+        self._dispatcher_with_contact(store, sender, audit, calls).deliver(
+            target, purpose=OutreachPurpose.PRECHECK
+        )
+
+        self.assertEqual(calls, [])
+
+    def test_a_skipped_already_delivered_send_does_not_report_again(self) -> None:
+        """已经送达过、这次是空跳过：不是一次新的明确尝试，不该再报一次。"""
+        key = outreach_dedupe_key(
+            content_key=WELCOME_CONTENT_KEY, purpose=OutreachPurpose.APPLY, subject=USER_ID
+        )
+        store = FakeStore(existing={key: STATUS_DELIVERED})
+        sender, audit = FakeSender(), FakeAudit()
+        calls: list[tuple] = []
+
+        self._dispatcher_with_contact(store, sender, audit, calls).deliver(
+            _target(), purpose=OutreachPurpose.APPLY
+        )
+
+        self.assertEqual(sender.calls, [])
+        self.assertEqual(calls, [])
+
+    def test_a_raising_callback_does_not_break_delivery(self) -> None:
+        store, sender, audit = FakeStore(), FakeSender(), FakeAudit()
+        dispatcher = OutreachDispatcher(
+            sender=sender,
+            store=store,
+            audit=audit,
+            contact_outcome=lambda *args: (_ for _ in ()).throw(RuntimeError("挂了")),
+            catalog=CATALOG,
+        )
+
+        outcome = dispatcher.deliver(_target(), purpose=OutreachPurpose.APPLY)
+
+        self.assertEqual(outcome.status, STATUS_DELIVERED)
+
+    def test_no_contact_outcome_callback_configured_is_a_silent_no_op(self) -> None:
+        """未接线回调（默认 ``None``）不改变既有行为——旧调用方不受影响。"""
+        store, sender, audit = FakeStore(), FakeSender(), FakeAudit()
+
+        outcome = _dispatcher(store, sender, audit).deliver(
+            _target(), purpose=OutreachPurpose.APPLY
+        )
+
+        self.assertEqual(outcome.status, STATUS_DELIVERED)
 
 
 if __name__ == "__main__":

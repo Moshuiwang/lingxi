@@ -207,19 +207,24 @@ class OutreachDispatcher:
         store: OutreachRecordStore,
         audit: _AuditSink,
         send_outcome: Callable[[str, bool], Any] | None = None,
+        contact_outcome: Callable[[str, bool, str | None], Any] | None = None,
         catalog: ContentCatalog | None = None,
         style: WelcomeCardStyle = DEFAULT_WELCOME_CARD_STYLE,
         content_digest: str = "",
     ) -> None:
-        """接线出站口、记录口、审计出口与告警回调。
+        """接线出站口、记录口、审计出口、告警回调与联系可达状态回调。
 
-        ``content_digest`` 是 ``catalog`` 那一份内容的摘要（镜像内 + 可能的宿主机
-        覆盖文件），由装配方一次读齐后传进来；不给时审计退回内容版本号。
+        ``content_digest`` 是 ``catalog`` 那一份内容的摘要，配了宿主机覆盖文件时
+        由装配方一次读齐后传入；不给时审计退回内容版本号。``contact_outcome`` 在
+        正式发送（非预检）结果明确（送达或明确失败，不含"不确定"）时调用，参数为
+        ``(收件人 open_id, 是否送达, 失败时的错误码)``；本模块只报告结果，不认识
+        调用方拿它做什么。
         """
         self._sender = sender
         self._store = store
         self._audit = audit
         self._send_outcome = send_outcome
+        self._contact_outcome = contact_outcome
         self._catalog = catalog
         self._style = style
         self._content_digest = content_digest
@@ -276,17 +281,23 @@ class OutreachDispatcher:
             code = _error_code(error)
             self._store.mark_failed(record.record_id, error=code)
             self._notify_send_outcome(succeeded=False)
+            unknown = code == "notification_unknown"
+            if not unknown:
+                # "不确定"（notification_unknown）不是"明确失败"：调用方分不清是否
+                # 真的送达，按未知处理，不把这个人记成明确不可用。
+                self._notify_contact_outcome(target, purpose, succeeded=False, error_code=code)
             logger.error("主动发送失败 记录=%s error=%s", record.record_id, code)
             return self._finish(
                 target,
                 purpose,
                 card,
-                "unknown" if code == "notification_unknown" else STATUS_FAILED,
+                "unknown" if unknown else STATUS_FAILED,
                 error_code=code,
             )
         # 先报成功再记账：卡片已经在对方手里，告警状态机不该因为记账出问题而认为
         # 这一次投递失败。
         self._notify_send_outcome(succeeded=True)
+        self._notify_contact_outcome(target, purpose, succeeded=True, error_code=None)
         self._record_delivered(record, message_id)
         return self._finish(target, purpose, card, STATUS_DELIVERED, message_id=message_id)
 
@@ -323,6 +334,26 @@ class OutreachDispatcher:
             self._send_outcome(OUTREACH_ALERT_CHANNEL, succeeded)
         except Exception as error:  # 告警回调失败不能反过来打断发送收口
             logger.error("主动发送告警回调失败 error=%s", type(error).__name__)
+
+    def _notify_contact_outcome(
+        self,
+        target: OutreachTarget,
+        purpose: OutreachPurpose,
+        *,
+        succeeded: bool,
+        error_code: str | None,
+    ) -> None:
+        """把一次真正尝试的明确结果转给联系可达状态回调。
+
+        只在**正式发送**（非预检）时报告：预检收件人是管理员本人，把预检结果
+        记成目标用户的可达状态会张冠李戴。回调本身出问题不得反过来打断发送收口。
+        """
+        if self._contact_outcome is None or purpose is not OutreachPurpose.APPLY:
+            return
+        try:
+            self._contact_outcome(target.recipient_open_id, succeeded, error_code)
+        except Exception as error:  # 回调失败不能反过来打断发送收口
+            logger.error("联系可达状态回调失败 error=%s", type(error).__name__)
 
     def _finish(
         self,

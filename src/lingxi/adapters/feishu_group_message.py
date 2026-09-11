@@ -47,6 +47,10 @@ DAILY_REPORT_UUID_PREFIX = "lingxi-daily-"
 #: 管理群，但代表独立的投递语义，不能让飞书把不同消息误判为同一逻辑投递。长度为
 #: 16 + 32 = 48，落在飞书的 50 字符 ``uuid`` 上限内。
 MANAGEMENT_CORRECTION_UUID_PREFIX = "lingxi-perm-fix-"
+#: 主动发送明确不可达转出的管理员待办专用去重前缀——它不是告警，与
+#: `AlertDispatcher` 走的告警去重键彼此独立，同样必须有自己的前缀才不会被飞书
+#: 误判为同一逻辑投递。长度为 15 + 32 = 47，落在飞书的 50 字符 ``uuid`` 上限内。
+CONTACT_UNAVAILABLE_UUID_PREFIX = "lingxi-unreach-"
 DELIVERY_UUID_MAX_LENGTH = 50
 SendOutcomeCallback = Callable[[str, bool], None]
 
