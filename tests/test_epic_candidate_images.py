@@ -382,8 +382,23 @@ class ImportAndDigestCheckTest(unittest.TestCase):
     def _document(self) -> dict:
         return {"images": [_image("worker", digest=DIGEST)]}
 
-    def _fake_runner(self, *, load_returncode=0, inspect_stdout=DIGEST, inspect_returncode=0):
+    def _fake_runner(
+        self,
+        *,
+        load_returncode=0,
+        inspect_stdout=DIGEST,
+        inspect_returncode=0,
+        driver="overlay2",
+        info_returncode=0,
+    ):
         def runner(argv):
+            if argv[:2] == ["docker", "info"]:
+                # 默认 overlay2：既有用例的结论必须逐字不变（#707 收窄的硬要求）。
+                return VERIFIER.CommandResult(
+                    info_returncode,
+                    driver if info_returncode == 0 else "",
+                    "" if info_returncode == 0 else "info failed",
+                )
             if argv[:2] == ["docker", "load"]:
                 return VERIFIER.CommandResult(
                     load_returncode, "", "" if load_returncode == 0 else "load failed"
@@ -432,6 +447,85 @@ class ImportAndDigestCheckTest(unittest.TestCase):
                 self._document(), directory, runner=self._fake_runner()
             )
             self.assertTrue(any("缺失" in f for f in failures), failures)
+
+    def test_mismatch_on_overlay2_is_reported_as_inconsistent(self) -> None:
+        """overlay2 下回读值对不上，就是「不一致」——这条结论逐字不变。"""
+
+        with tempfile.TemporaryDirectory() as workdir:
+            directory = Path(workdir)
+            (directory / "lingxi-worker.tar").write_bytes(b"x")
+            failures = VERIFIER.import_and_check_digest(
+                self._document(),
+                directory,
+                runner=self._fake_runner(inspect_stdout="sha256:" + "b" * 64),
+            )
+        self.assertEqual(len(failures), 1, failures)
+        self.assertIn("与候选身份不一致", failures[0])
+        self.assertNotIn("本机无法核验", failures[0])
+
+    def test_mismatch_on_another_driver_is_reported_as_unverifiable(self) -> None:
+        """换个存储驱动，回读值本来就不同源——**不能说成「不一致」**。
+
+        把「本机核验不了」说成「不一致」是一句反向结论，比没有结论更糟：看到的人
+        会去查一个并不存在的身份不符。
+        """
+
+        with tempfile.TemporaryDirectory() as workdir:
+            directory = Path(workdir)
+            (directory / "lingxi-worker.tar").write_bytes(b"x")
+            failures = VERIFIER.import_and_check_digest(
+                self._document(),
+                directory,
+                runner=self._fake_runner(
+                    inspect_stdout="sha256:" + "b" * 64, driver="containerd-snapshotter"
+                ),
+            )
+        self.assertEqual(len(failures), 1, failures)
+        self.assertIn("本机无法核验", failures[0])
+        self.assertIn("containerd-snapshotter", failures[0])
+        self.assertNotIn("与候选身份不一致", failures[0])
+
+    def test_unverifiable_still_fails_closed(self) -> None:
+        """**「无法核验」照样判红**：它不是放行，只是不再冒充结论。
+
+        否定断言——第三态若被做成「放过去」，一份 digest 被改错的清单在非
+        overlay2 的机器上就会静默通过，而那正是本工具存在的唯一理由。
+        """
+
+        with tempfile.TemporaryDirectory() as workdir:
+            directory = Path(workdir)
+            (directory / "lingxi-worker.tar").write_bytes(b"x")
+            failures = VERIFIER.import_and_check_digest(
+                self._document(),
+                directory,
+                runner=self._fake_runner(inspect_stdout="sha256:" + "c" * 64, driver="btrfs"),
+            )
+        self.assertTrue(failures, "取不到同源摘要时必须判红，不能放行")
+
+    def test_driver_unreadable_is_also_unverifiable(self) -> None:
+        """连驱动都读不到时同样按「无法核验」处置，不猜一个默认值。"""
+
+        with tempfile.TemporaryDirectory() as workdir:
+            directory = Path(workdir)
+            (directory / "lingxi-worker.tar").write_bytes(b"x")
+            failures = VERIFIER.import_and_check_digest(
+                self._document(),
+                directory,
+                runner=self._fake_runner(inspect_stdout="sha256:" + "d" * 64, info_returncode=1),
+            )
+        self.assertEqual(len(failures), 1, failures)
+        self.assertIn("本机无法核验", failures[0])
+
+    def test_matching_digest_passes_on_any_driver(self) -> None:
+        """回读值本来就对得上时，任何驱动下都是「一致」，不因驱动判红。"""
+
+        with tempfile.TemporaryDirectory() as workdir:
+            directory = Path(workdir)
+            (directory / "lingxi-worker.tar").write_bytes(b"x")
+            failures = VERIFIER.import_and_check_digest(
+                self._document(), directory, runner=self._fake_runner(driver="btrfs")
+            )
+        self.assertEqual(failures, [])
 
 
 if __name__ == "__main__":

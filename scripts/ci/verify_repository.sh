@@ -134,6 +134,9 @@ python3 scripts/ci/check_comment_ratchet.py
 # 代码框架「二、三层之间的 import 规则」第一条（Issue #238）：core/ 不得 import
 # adapters/、apps/ 或任何外部 SDK。用 ast 遍历整棵树，含函数内延迟导入。
 python3 scripts/ci/check_core_layering.py
+# 同一节的反向规则：apps/ 只做组装，纯业务判定归 core/。棘轮只许收紧——基线里
+# 登记的是现存待搬的那几处，新出现的直接判红。
+python3 scripts/ci/check_apps_pure_logic_ratchet.py
 # 代码框架「三、横切约定」的归属核对（Issue #238）：把某句规则的权威记成产品合同
 # 本身的断言必须能在 docs/产品合同与外部边界.md 正文里找到对应，找不到就红——这道
 # 门禁挡的正是"凭据不进用户环境"这类被错记成产品权威的笔误（代码框架第三节，

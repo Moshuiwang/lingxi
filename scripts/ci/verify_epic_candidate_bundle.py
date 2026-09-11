@@ -219,6 +219,25 @@ def check_bundle_files(document: dict[str, object], bundle_dir: pathlib.Path) ->
     return failures
 
 
+COMPARABLE_STORAGE_DRIVER = "overlay2"
+
+
+def storage_driver(runner=run_command) -> str | None:
+    """本机 docker 的存储驱动；读不到时返回 ``None``。
+
+    只用来判断「本机回读到的镜像标识与 manifest 里的 image_digest 是不是同一种
+    东西」。overlay2 下 ``docker inspect --format {{.Id}}`` 回读的就是可比对的那个
+    摘要；换成别的驱动（例如 containerd 快照器）时两者不同源，直接比会得出一句
+    **反向结论**——把「本机核验不了」说成「不一致」。
+    """
+
+    result = runner(["docker", "info", "--format", "{{.Driver}}"])
+    if result.returncode != 0:
+        return None
+    driver = result.stdout.strip()
+    return driver or None
+
+
 def import_and_check_digest(
     document: dict[str, object], bundle_dir: pathlib.Path, runner=run_command
 ) -> list[str]:
@@ -226,9 +245,20 @@ def import_and_check_digest(
 
     `docker load` 会按 tar 内嵌的 RepoTags 自动打回原来的引用（即 manifest 里的
     `reference`），因此 load 完直接对该引用 `docker inspect` 即可，不需要额外重新打 tag。
+
+    **结论有三态**：一致 / 不一致 / **本机无法核验**。第三态是 Issue #707 收窄后
+    补的：只有 ``overlay2`` 驱动下回读到的 ``.Id`` 与 manifest 里的 ``image_digest``
+    同源，换成别的驱动时两者本就不是一种东西，直接比会把「本机核验不了」说成
+    「不一致」——一句反向结论比没有结论更糟。
+
+    **「无法核验」照样判红（fail-closed）**：它不是放行，只是不再冒充结论。因此
+    一份 digest 被改错的清单在任何驱动下都仍然是红的，新分支没有把真正的不一致
+    一起吞掉。**digest 回读仍是硬判据**，本次只改「说什么」，不改「放不放行」。
     """
 
     failures: list[str] = []
+    driver = storage_driver(runner)
+    comparable = driver == COMPARABLE_STORAGE_DRIVER
     images = document.get("images")
     if not isinstance(images, list):
         return failures
@@ -262,10 +292,20 @@ def import_and_check_digest(
             )
             continue
         actual_digest = inspect_result.stdout.strip()
-        if actual_digest != expected_digest:
+        if actual_digest == expected_digest:
+            continue
+        if comparable:
             failures.append(
                 f"镜像 {service} 导入后的 digest 是 {actual_digest}，manifest 记录 {expected_digest}"
                 "（导入的对象与候选身份不一致）"
+            )
+        else:
+            failures.append(
+                f"镜像 {service}：本机无法核验。回读到 {actual_digest}，manifest 记录 "
+                f"{expected_digest}，但本机存储驱动是 "
+                f"{driver or '读不到'}（可比对的是 {COMPARABLE_STORAGE_DRIVER}），"
+                "两者不同源，比出来的差异不构成「不一致」的结论。"
+                "换一台 overlay2 的机器核验，或用别的方式取同源摘要。"
             )
 
     return failures

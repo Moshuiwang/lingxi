@@ -1,0 +1,74 @@
+# apps/ 纯逻辑棘轮基线（Issue #656）：登记当前已命中「import lingxi.core.* 且
+# 代码行数 >= 10」的 apps/ 文件与其代码行数。
+# 由 scripts/ci/check_apps_pure_logic_ratchet.py --refresh 生成，请不要手工调大
+# 数值——门禁会重新丈量文件的实际代码行数，任何比这里记录的更大的实测值都直接
+# 判红；--refresh 只会把数值调小或整条移除（文件缩到命中线以下或不再 import
+# core），拒绝写入任何增长。一个从未命中过的文件第一次命中时，不会被 --refresh
+# 自动登记进来：先把业务判断挪回 core/，或者确认这确实是装配代码；确有理由要
+# 接受它作为新的棘轮登记对象，人工在下面加一行「代码行数<TAB>路径」，门禁会核对
+# 这一行是否等于该文件的当前实际代码行数。
+#
+# 归类（人工判断，随基线刷新可能需要复核，不逐条钉死理由）：
+#
+# 「放错层，等 #658/#659 搬走」——目前只挑出一条最清楚的候选：
+#   - apps/scheduler/daily_report_sections.py：模块 docstring 自称「纯函数，
+#     只依赖显式传参，不碰任何实例状态」，且注明搬出 daily_report.py 的理由是
+#     把原模块压回体量棘轮阈值以内（工程理由），不是因为它依赖任何 apps/
+#     或 adapters/ 的类型。是本批复核里唯一一处「自己承认是纯逻辑」的文件。
+#
+# 「装配件豁免」——其余全部登记条目：module docstring 自称「职责」「装配」
+#   「配置」「端口协议」「消费循环」的入口/胶水文件，import core 是为了构造、
+#   转发或声明协议类型；未逐条精读函数体确认零业务判断，只按模块自陈的定位与
+#   命名模式归类——这本身就是「覆盖率约 8%」这条已知边界的体现，供 #658/#659
+#   按需复核，不构成「已逐条人工验证零违规」的断言。
+
+130	src/lingxi/apps/admin_bootstrap/__init__.py
+245	src/lingxi/apps/gateway/__init__.py
+154	src/lingxi/apps/gateway/admin_followups.py
+30	src/lingxi/apps/gateway/alerting.py
+343	src/lingxi/apps/gateway/assembly.py
+195	src/lingxi/apps/gateway/config.py
+486	src/lingxi/apps/gateway/delivery.py
+57	src/lingxi/apps/gateway/delivery_assembly.py
+502	src/lingxi/apps/gateway/document_delivery.py
+155	src/lingxi/apps/gateway/event_handler.py
+80	src/lingxi/apps/gateway/group_mention_hint.py
+17	src/lingxi/apps/gateway/innertest.py
+20	src/lingxi/apps/gateway/log_redaction.py
+264	src/lingxi/apps/gateway/management_cards.py
+63	src/lingxi/apps/gateway/management_status.py
+22	src/lingxi/apps/gateway/onboarding.py
+32	src/lingxi/apps/innertest.py
+200	src/lingxi/apps/innertest_roster/__init__.py
+447	src/lingxi/apps/reauthorize/__init__.py
+181	src/lingxi/apps/scheduler/__init__.py
+37	src/lingxi/apps/scheduler/alerting_assembly.py
+420	src/lingxi/apps/scheduler/assembly.py
+293	src/lingxi/apps/scheduler/config.py
+275	src/lingxi/apps/scheduler/credential_rotation.py
+569	src/lingxi/apps/scheduler/daily_report.py
+233	src/lingxi/apps/scheduler/daily_report_sections.py
+89	src/lingxi/apps/scheduler/innertest.py
+434	src/lingxi/apps/scheduler/late_readiness_recovery.py
+43	src/lingxi/apps/scheduler/lifecycle.py
+106	src/lingxi/apps/scheduler/loop.py
+588	src/lingxi/apps/scheduler/onboarding.py
+331	src/lingxi/apps/scheduler/org_snapshot_sync.py
+436	src/lingxi/apps/scheduler/permission_publish.py
+86	src/lingxi/apps/scheduler/permission_readiness_assembly.py
+623	src/lingxi/apps/scheduler/permission_refresh.py
+135	src/lingxi/apps/scheduler/permission_refresh_ports.py
+298	src/lingxi/apps/scheduler/roster_audit.py
+311	src/lingxi/apps/scheduler/stalled_provisioning.py
+290	src/lingxi/apps/trace/__init__.py
+517	src/lingxi/apps/worker/cli.py
+486	src/lingxi/apps/worker/config.py
+67	src/lingxi/apps/worker/content_capture.py
+87	src/lingxi/apps/worker/progress_reporting.py
+293	src/lingxi/apps/worker/report.py
+236	src/lingxi/apps/worker/report_extraction.py
+500	src/lingxi/apps/worker/service.py
+31	src/lingxi/apps/worker/service_ports.py
+181	src/lingxi/apps/worker/task_processing.py
+99	src/lingxi/apps/worker/terminal_outcome.py
+648	src/lingxi/apps/worker/turn.py
