@@ -162,6 +162,7 @@
   "tests/test_permission_refresh_postgres.py": 21.754,
   "tests/test_permission_retention_duty.py": 3.121,
   "tests/test_permission_table_access_token_supply.py": 0.002,
+  "tests/test_plpgsql_search_path_postgres.py": 48.0,
   "tests/test_polling_connection_reuse_wiring.py": 0.003,
   "tests/test_postgres_connection_reuse.py": 1.165,
   "tests/test_postgres_content_capture.py": 1.542,
