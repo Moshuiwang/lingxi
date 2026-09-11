@@ -677,9 +677,10 @@ class PostgresAppUserStore:
     def record_contact_unavailable(self, *, open_id: str, when: datetime, code: str) -> bool:
         """旁路发送明确失败：记下时刻与原因码，供读侧判成「明确不可用」。
 
-        不设"晚于已知入站才写"的对称守卫：调用方只在真的尝试过一次主动发送
-        且拿到明确失败时才调用本方法，这本身就是当下最新的一次尝试。返回是否
-        命中了一行。
+        对称守卫**旧失败不覆盖新事实**：这次失败早于已记录的最近入站，或早于
+        已记录的失败时刻，就一行不改——那条更新的事实才是当前结论。线上调用
+        永远带当下时刻，守卫不会挡住它；挡住的是历史回填里比线上状态更旧的
+        证据。返回是否命中了一行（被守卫挡下同样计 0 行）。
         """
         with (
             connect(self._dsn, timeouts=self._timeouts) as connection,
@@ -689,7 +690,10 @@ class PostgresAppUserStore:
                 """UPDATE app_user
                       SET outbound_unavailable_at = %(when)s,
                           outbound_unavailable_code = %(code)s
-                    WHERE feishu_open_id = %(open_id)s""",
+                    WHERE feishu_open_id = %(open_id)s
+                      AND (last_inbound_at IS NULL OR last_inbound_at < %(when)s)
+                      AND (outbound_unavailable_at IS NULL
+                           OR outbound_unavailable_at <= %(when)s)""",
                 {"when": when, "code": code, "open_id": open_id},
             )
             changed = cursor.rowcount

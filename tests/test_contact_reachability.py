@@ -213,6 +213,42 @@ class ContactStateOrderingTest(ContactReachabilityPostgresTestCase):
 
         self.assertEqual(self.store.contact_reachability(open_id=self.open_id), CONTACT_REACHABLE)
 
+    def test_a_failure_older_than_the_latest_inbound_does_not_mark_unavailable(self) -> None:
+        """旧失败不覆盖新事实：这个人在失败时刻之后又开过口，失败已经是陈旧证据。"""
+        self._insert_real_inbound_event(open_id=self.open_id, event_id="evt_spoke_after")
+        stale = datetime.now(UTC) - timedelta(days=3)
+
+        written = self.store.record_contact_unavailable(
+            open_id=self.open_id, when=stale, code="feishu_code_230013"
+        )
+
+        self.assertFalse(written)
+        self.assertEqual(self.store.contact_reachability(open_id=self.open_id), CONTACT_REACHABLE)
+
+    def test_a_failure_older_than_the_recorded_failure_does_not_move_it_back(self) -> None:
+        newer = datetime.now(UTC)
+        self.store.record_contact_unavailable(open_id=self.open_id, when=newer, code="newer")
+
+        written = self.store.record_contact_unavailable(
+            open_id=self.open_id, when=newer - timedelta(hours=2), code="older"
+        )
+
+        self.assertFalse(written)
+        self.assertEqual(self._column(self.open_id, "outbound_unavailable_code"), "newer")
+
+    def test_a_live_failure_after_an_inbound_is_still_recorded(self) -> None:
+        """对照组：失败晚于最近入站时照常落下——上两条不是"永远写不进去"。"""
+        self._insert_real_inbound_event(open_id=self.open_id, event_id="evt_before_failure")
+
+        written = self.store.record_contact_unavailable(
+            open_id=self.open_id,
+            when=datetime.now(UTC) + timedelta(seconds=1),
+            code="feishu_code_230013",
+        )
+
+        self.assertTrue(written)
+        self.assertEqual(self.store.contact_reachability(open_id=self.open_id), CONTACT_UNAVAILABLE)
+
     def test_record_contact_reachable_returns_false_for_an_unknown_open_id(self) -> None:
         self.assertFalse(
             self.store.record_contact_reachable(open_id="ou_nobody", when=datetime.now(UTC))

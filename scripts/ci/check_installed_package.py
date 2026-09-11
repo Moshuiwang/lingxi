@@ -560,6 +560,9 @@ REQUIRED_MODULES = (
     "lingxi.core.outreach.welcome_card",
     "lingxi.core.outreach.audience",
     "lingxi.core.outreach.dispatch",
+    # 主动发送结果 → 「说过话 / 联系不上」状态与管理员待办的判断（#673）。同上：
+    # 只被 `scripts/ops/outreach.py` 经装配模块函数内 import，没有进程模块级 import。
+    "lingxi.core.outreach.contact_reachability",
     "lingxi.adapters.feishu_user_card",
     "lingxi.adapters.postgres_outreach",
     "lingxi.adapters.admin_followup_recompute",
@@ -787,8 +790,10 @@ PROCESS_RUNTIME_IMPORTS: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {
             "lingxi.apps.scheduler.loop",
             "lingxi.apps.scheduler.assembly",
             "lingxi.apps.scheduler.alerting_assembly",
-            # 理由见 REQUIRED_MODULES 同名条目：`scripts/ops/outreach.py` 函数内 import 它。
+            # 理由见 REQUIRED_MODULES 同名条目：`scripts/ops/outreach.py` 函数内 import 它；
+            # 它顶层 import 的判断模块随它同一条发布理由。
             "lingxi.apps.scheduler.contact_reachability_assembly",
+            "lingxi.core.outreach.contact_reachability",
             "lingxi.adapters.feishu_permission_bitable",
             "lingxi.adapters.feishu_user_message",
             "lingxi.adapters.query_mcp_probe",

@@ -1,15 +1,27 @@
-"""#673 联系可达状态回调装配：管理员待办文案、通知失败不带走已落库状态。
+"""联系可达回调：成功 / 失败两种结局各自落库并留审计，失败时另转管理群待办。
 
-纯逻辑与假出站口那一半在本文件；``build_contact_reachability_recorder`` 接线
-真实 ``PostgresAppUserStore`` 那一半（未配置管理群时的日志兜底分支）在
-``tests/test_contact_reachability.py`` 同一批真库用例旁边——本文件不需要数据库。
+全部用注入式替身，不连库、不发网络请求——失败结局按取证边界只验代码路径。
 """
 
 from __future__ import annotations
 
 import unittest
+from datetime import UTC, datetime
 
-from lingxi.apps.scheduler.contact_reachability_assembly import _send_admin_todo, _todo_text
+from lingxi.apps.scheduler.contact_reachability_assembly import _LogOnlyContactNotifier
+from lingxi.core.outreach.contact_reachability import (
+    AUDIT_MARKED_REACHABLE,
+    AUDIT_MARKED_UNAVAILABLE,
+    AUDIT_TODO_NOTIFIED,
+    AUDIT_TODO_NOTIFY_FAILED,
+    TODO_DEDUPE_PREFIX,
+    ContactReachabilityRecorder,
+    admin_todo_text,
+)
+
+OPEN_ID = "ou_0123456789abcdef0123456789abcdef"
+EMAIL = "person@example.com"
+FIXED_NOW = datetime(2026, 9, 11, 3, 0, tzinfo=UTC)
 
 
 class RecordingAudit:
@@ -24,14 +36,14 @@ class RecordingAudit:
 
 
 class FakeNotifier:
-    def __init__(self, *, error: Exception | None = None) -> None:
-        self.calls: list[dict] = []
-        self._error = error
+    def __init__(self, *, raises: bool = False) -> None:
+        self.sent: list[tuple[str, str, str]] = []
+        self._raises = raises
 
     def send_text(self, *, chat_id: str, text: str, dedupe_key: str) -> None:
-        self.calls.append({"chat_id": chat_id, "text": text, "dedupe_key": dedupe_key})
-        if self._error is not None:
-            raise self._error
+        if self._raises:
+            raise RuntimeError("group unreachable")
+        self.sent.append((chat_id, text, dedupe_key))
 
 
 class _Row:
@@ -40,93 +52,129 @@ class _Row:
 
 
 class FakeStore:
-    def __init__(self, *, email: str | None = "person@example.com", raises: bool = False) -> None:
+    def __init__(self, *, email: str | None = EMAIL, lookup_raises: bool = False) -> None:
+        self.reachable: list[tuple[str, datetime]] = []
+        self.unavailable: list[tuple[str, datetime, str]] = []
         self._email = email
-        self._raises = raises
+        self._lookup_raises = lookup_raises
 
-    def get_by_open_id(self, open_id: str) -> _Row:
-        if self._raises:
-            raise RuntimeError("库炸了")
+    def record_contact_reachable(self, *, open_id: str, when: datetime) -> bool:
+        self.reachable.append((open_id, when))
+        return True
+
+    def record_contact_unavailable(self, *, open_id: str, when: datetime, code: str) -> bool:
+        self.unavailable.append((open_id, when, code))
+        return True
+
+    def get_by_open_id(self, open_id: str) -> _Row | None:
+        if self._lookup_raises:
+            raise RuntimeError("db down")
         return _Row(self._email)
+
+
+def _recorder(store: FakeStore, notifier: FakeNotifier, audit: RecordingAudit | None):
+    return ContactReachabilityRecorder(
+        store=store, notifier=notifier, chat_id="oc_admins", audit=audit, clock=lambda: FIXED_NOW
+    )
 
 
 class TodoTextTest(unittest.TestCase):
     def test_the_text_names_this_as_a_todo_not_an_alert(self) -> None:
-        text = _todo_text(open_id="ou_x", email="a@b.com", error_code="feishu_code_230013")
+        text = admin_todo_text(open_id=OPEN_ID, email=EMAIL, error_code="feishu_code_230013")
+
         self.assertIn("联系待办", text)
         self.assertIn("非故障告警", text)
+        self.assertIn(OPEN_ID, text)
+        self.assertIn(EMAIL, text)
         self.assertIn("feishu_code_230013", text)
-        self.assertIn("a@b.com", text)
 
     def test_a_missing_email_still_gives_an_actionable_fallback(self) -> None:
-        text = _todo_text(open_id="ou_x", email=None, error_code="feishu_code_230013")
-        self.assertIn("ou_x", text)
-        self.assertIn("查花名册", text)
+        text = admin_todo_text(open_id=OPEN_ID, email=None, error_code="feishu_code_230013")
+
+        self.assertIn("花名册", text)
+        self.assertIn(OPEN_ID, text)
 
 
-class SendAdminTodoTest(unittest.TestCase):
-    def test_a_successful_send_notifies_the_configured_channel_and_audits(self) -> None:
-        notifier, store, audit = FakeNotifier(), FakeStore(), RecordingAudit()
+class SuccessOutcomeTest(unittest.TestCase):
+    def test_success_marks_reachable_at_the_clock_time_and_audits_redacted(self) -> None:
+        store, notifier, audit = FakeStore(), FakeNotifier(), RecordingAudit()
 
-        _send_admin_todo(
-            notifier,
-            store,
-            chat_id="oc_admin",
-            open_id="ou_x",
-            error_code="feishu_code_230013",
-            audit=audit,
-        )
+        _recorder(store, notifier, audit)(OPEN_ID, True, None)
 
-        self.assertEqual(len(notifier.calls), 1)
-        self.assertEqual(notifier.calls[0]["chat_id"], "oc_admin")
-        self.assertEqual(notifier.calls[0]["dedupe_key"], "contact-unavailable:ou_x")
-        self.assertIn("outreach.contact_todo_notified", audit.actions())
+        self.assertEqual(store.reachable, [(OPEN_ID, FIXED_NOW)])
+        self.assertEqual(store.unavailable, [])
+        self.assertEqual(notifier.sent, [], "成功结局不该发任何管理群消息")
+        self.assertEqual(audit.actions(), [AUDIT_MARKED_REACHABLE])
+        self.assertNotIn(OPEN_ID, repr(audit.records), "审计里的标识必须脱敏")
+
+
+class FailureOutcomeTest(unittest.TestCase):
+    def test_failure_marks_unavailable_then_sends_one_todo_with_its_own_dedupe_key(self) -> None:
+        store, notifier, audit = FakeStore(), FakeNotifier(), RecordingAudit()
+
+        _recorder(store, notifier, audit)(OPEN_ID, False, "feishu_code_230013")
+
+        self.assertEqual(store.unavailable, [(OPEN_ID, FIXED_NOW, "feishu_code_230013")])
+        self.assertEqual(store.reachable, [])
+        self.assertEqual(len(notifier.sent), 1)
+        chat_id, text, dedupe_key = notifier.sent[0]
+        self.assertEqual(chat_id, "oc_admins")
+        self.assertIn(EMAIL, text)
+        self.assertEqual(dedupe_key, TODO_DEDUPE_PREFIX + OPEN_ID)
+        self.assertEqual(audit.actions(), [AUDIT_MARKED_UNAVAILABLE, AUDIT_TODO_NOTIFIED])
+        self.assertNotIn(OPEN_ID, repr(audit.records), "审计里的标识必须脱敏")
+
+    def test_a_missing_error_code_is_recorded_as_unknown(self) -> None:
+        store, notifier = FakeStore(), FakeNotifier()
+
+        _recorder(store, notifier, None)(OPEN_ID, False, None)
+
+        self.assertEqual(store.unavailable[0][2], "unknown")
+        self.assertIn("unknown", notifier.sent[0][1])
 
     def test_a_lookup_failure_still_sends_the_todo_without_an_email(self) -> None:
-        """查邮箱失败不能带走整条待办：待办本身仍要送到，只是缺一条联系方式。"""
-        notifier, store, audit = FakeNotifier(), FakeStore(raises=True), RecordingAudit()
+        store, notifier, audit = FakeStore(lookup_raises=True), FakeNotifier(), RecordingAudit()
 
-        _send_admin_todo(
-            notifier,
-            store,
-            chat_id="oc_admin",
-            open_id="ou_x",
-            error_code="feishu_code_230013",
-            audit=audit,
-        )
+        _recorder(store, notifier, audit)(OPEN_ID, False, "feishu_code_230013")
 
-        self.assertEqual(len(notifier.calls), 1)
-        self.assertIn("查花名册", notifier.calls[0]["text"])
+        self.assertEqual(len(store.unavailable), 1)
+        self.assertEqual(len(notifier.sent), 1)
+        self.assertNotIn(EMAIL, notifier.sent[0][1])
+        self.assertIn("花名册", notifier.sent[0][1])
+        self.assertIn(AUDIT_TODO_NOTIFIED, audit.actions())
 
-    def test_a_notifier_failure_is_audited_and_does_not_raise(self) -> None:
-        notifier = FakeNotifier(error=RuntimeError("群发不出去"))
-        store, audit = FakeStore(), RecordingAudit()
+    def test_a_notifier_failure_is_audited_and_keeps_the_recorded_state(self) -> None:
+        store, notifier, audit = FakeStore(), FakeNotifier(raises=True), RecordingAudit()
 
-        _send_admin_todo(
-            notifier,
-            store,
-            chat_id="oc_admin",
-            open_id="ou_x",
-            error_code="feishu_code_230013",
-            audit=audit,
-        )
+        _recorder(store, notifier, audit)(OPEN_ID, False, "feishu_code_230013")
 
-        self.assertIn("outreach.contact_todo_notify_failed", audit.actions())
-        self.assertNotIn("outreach.contact_todo_notified", audit.actions())
+        self.assertEqual(len(store.unavailable), 1, "待办没发出去不得带走已落库的状态")
+        self.assertEqual(audit.actions(), [AUDIT_MARKED_UNAVAILABLE, AUDIT_TODO_NOTIFY_FAILED])
+        self.assertNotIn(AUDIT_TODO_NOTIFIED, audit.actions())
 
-    def test_no_audit_sink_is_a_silent_no_op_on_success(self) -> None:
-        notifier, store = FakeNotifier(), FakeStore()
+    def test_no_audit_sink_is_a_silent_no_op(self) -> None:
+        store, notifier = FakeStore(), FakeNotifier()
 
-        _send_admin_todo(
-            notifier,
-            store,
-            chat_id="oc_admin",
-            open_id="ou_x",
-            error_code="feishu_code_230013",
-            audit=None,
-        )
+        _recorder(store, notifier, None)(OPEN_ID, False, "feishu_code_230013")
 
-        self.assertEqual(len(notifier.calls), 1)
+        self.assertEqual(len(store.unavailable), 1)
+        self.assertEqual(len(notifier.sent), 1)
+
+
+class LogOnlyOutletTest(unittest.TestCase):
+    def test_the_log_only_outlet_writes_no_personal_data(self) -> None:
+        text = admin_todo_text(open_id=OPEN_ID, email=EMAIL, error_code="feishu_code_230013")
+
+        with self.assertLogs("lingxi.apps.scheduler.contact_reachability", level="WARNING") as logs:
+            _LogOnlyContactNotifier().send_text(
+                chat_id="scheduler-log-only", text=text, dedupe_key=TODO_DEDUPE_PREFIX + OPEN_ID
+            )
+
+        joined = "\n".join(logs.output)
+        self.assertIn("未配置管理群", joined)
+        self.assertNotIn(OPEN_ID, joined)
+        self.assertNotIn(EMAIL, joined)
+        self.assertNotIn("feishu_code_230013", joined)
 
 
 if __name__ == "__main__":

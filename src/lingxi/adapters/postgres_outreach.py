@@ -71,7 +71,8 @@ SELECT recipient_open_id, purpose, content_key, content_version, card_style,
 #: ``core/outreach/audience`` 按姓名是否唯一决定发不发。
 _SUBJECT_SQL = """
 SELECT u.id, u.feishu_open_id, u.provisioning_state, u.account_state,
-       p.payload ->> 'permissions', u.permission_version, p.id
+       p.payload ->> 'permissions', u.permission_version, p.id,
+       u.outbound_unavailable_at, u.outbound_unavailable_code
   FROM app_user u
   LEFT JOIN LATERAL (
        SELECT o.id, o.payload FROM publish_outbox o
@@ -275,6 +276,8 @@ class PostgresOutreachSubjects:
             roster_names=names,
             permission_version=user_row[5],
             publish_id=str(user_row[6]) if user_row[6] else None,
+            outbound_unavailable_at=user_row[7],
+            outbound_unavailable_code=str(user_row[8]) if user_row[8] else None,
         )
 
     def state_for(self, user_id: str) -> tuple[str | None, str | None]:

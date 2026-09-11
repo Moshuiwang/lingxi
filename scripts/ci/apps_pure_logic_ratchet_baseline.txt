@@ -43,6 +43,7 @@
 447	src/lingxi/apps/reauthorize/__init__.py
 181	src/lingxi/apps/scheduler/__init__.py
 37	src/lingxi/apps/scheduler/alerting_assembly.py
+37	src/lingxi/apps/scheduler/contact_reachability_assembly.py
 420	src/lingxi/apps/scheduler/assembly.py
 293	src/lingxi/apps/scheduler/config.py
 275	src/lingxi/apps/scheduler/credential_rotation.py

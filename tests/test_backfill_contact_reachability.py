@@ -186,6 +186,24 @@ class BackfillTest(unittest.TestCase):
 
         self.assertEqual(self.store.contact_reachability(open_id=self.open_id), CONTACT_UNAVAILABLE)
 
+    def test_a_historical_failure_does_not_overwrite_a_newer_live_inbound(self) -> None:
+        """不覆盖更新的状态：这个人在线上开过口（入站行已到期删除、档案上仍记着），
+        三天前的失败只是陈旧证据——回填不得把他改回「联系不上」。"""
+        now = datetime.now(UTC)
+        self._insert_outreach_message(
+            at=now - timedelta(days=3), status="failed", last_error="feishu_code_230013"
+        )
+        self._insert_inbound_event(event_id="evt_live", at=now - timedelta(minutes=1))
+        with connect(self._dsn) as connection, connection.cursor() as cursor:
+            cursor.execute("DELETE FROM inbound_event")
+        self.assertEqual(self.store.contact_reachability(open_id=self.open_id), CONTACT_REACHABLE)
+
+        evidence = TOOL.load_evidence(self._dsn)
+        TOOL.apply_evidence(self._dsn, evidence)
+
+        self.assertEqual(self.store.contact_reachability(open_id=self.open_id), CONTACT_REACHABLE)
+        self.assertIsNone(self._column("outbound_unavailable_at"))
+
     def test_rerunning_after_interruption_does_not_duplicate_or_regress(self) -> None:
         now = datetime.now(UTC)
         self._insert_inbound_event(event_id="evt_bf1", at=now - timedelta(days=5))
