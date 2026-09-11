@@ -1,0 +1,12 @@
+{
+  "candidate_tag": "v2.4.3-rc.98",
+  "evidence_url": "https://github.com/Moshuiwang/lingxi/issues/754#issuecomment-5637615719",
+  "manifest_sha256": "889b2dadba7816202fe694631a641cb1457e6a4b2f2e0b5d3bca62375cc9424a",
+  "recovery": {
+    "evidence_url": "https://github.com/Moshuiwang/lingxi/issues/754#issuecomment-5635332097",
+    "instructions": "把 deploy/.env.prod 的 LINGXI_IMAGE_TAG 改回 20260907-71fcc88e7059、四个 *_IMAGE_DIGEST 改回 v2.3.1 的值（生产主机 deploy/.env.prod.before-243-<tag> 备份即原文件，值亦见 Trace #754 接管登记补充评论 5632795925），再执行 docker compose --env-file deploy/.env.prod -f deploy/compose.yaml -f deploy/compose.prod.yaml --profile mvp up -d。不回退数据库：本候选把迁移头从 0090 前滚到 0096，其中 0091 / 0092 有数据即拒绝降级、0095 降级会丢「说过话」状态，回滚只切镜像不降库。旧镜像（v2.3.1）跑新库结构只有 CI 合成迁移证据与编排者本机以 v2.3.1 scheduler 镜像对 0096 库的一次复做（启动、续期扫描、SIGTERM 退出码 0），未在真实环境执行回退演练，如实记录。迁移前备份是最后恢复点，恢复动作属显式除外须另请示。",
+    "previous_tag": "v2.3.1"
+  },
+  "result": "passed",
+  "schema": 1
+}
