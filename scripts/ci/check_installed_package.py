@@ -456,6 +456,7 @@ REQUIRED_MODULES = (
     "lingxi.adapters.postgres_conversation._queue_session_cleanup",
     "lingxi.adapters.postgres_conversation._task_queue",
     "lingxi.adapters.postgres_conversation._transaction",
+    "lingxi.adapters.postgres_conversation._dependency_availability",
     "lingxi.apps.gateway",
     "lingxi.apps.gateway.config",
     "lingxi.apps.gateway.__main__",
@@ -951,6 +952,7 @@ PROCESS_RUNTIME_IMPORTS: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {
             "lingxi.adapters.postgres_conversation._queue_session_cleanup",
             "lingxi.adapters.postgres_conversation._task_queue",
             "lingxi.adapters.postgres_conversation._transaction",
+            "lingxi.adapters.postgres_conversation._dependency_availability",
             # 用户记忆（Issue #357 S-H3-3）：`postgres_conversation._transaction`
             # 模块级 import 本模块，`postgres_permission_publish.record_decision`
             # 的权限真变分支复用 `_transaction` 调用 `clear_user_memory`——同上面
@@ -1116,6 +1118,7 @@ PROCESS_RUNTIME_IMPORTS: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {
             "lingxi.adapters.postgres_conversation._queue_session_cleanup",
             "lingxi.adapters.postgres_conversation._task_queue",
             "lingxi.adapters.postgres_conversation._transaction",
+            "lingxi.adapters.postgres_conversation._dependency_availability",
             "lingxi.config",
             "lingxi.config.content",
             "lingxi.config.metric_labels",
@@ -1255,6 +1258,7 @@ PROCESS_RUNTIME_IMPORTS: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {
             "lingxi.adapters.postgres_conversation._queue_session_cleanup",
             "lingxi.adapters.postgres_conversation._task_queue",
             "lingxi.adapters.postgres_conversation._transaction",
+            "lingxi.adapters.postgres_conversation._dependency_availability",
             "lingxi.adapters.postgres",
             # 投递消费循环（Issue #152）：CardKit/文本兜底 adapter 由
             # apps.gateway.assemble_delivery_consumer 在函数内 import；

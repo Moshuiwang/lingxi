@@ -2,15 +2,14 @@
 
 实现 :class:`lingxi.core.identity.stock_token_source.StockTokenSource`：按
 用户邮箱精确查正式权限多维表格的一行，翻成四态之一交给开通链。全程只读，
-没有任何写方法，也不修改正式表的任何字段。两层：:class:`BitableStockTokenSource` 是纯 I/O 层，只读字段、不碰密钥，
-整表分页查找（理由同 ``feishu_permission_bitable``），``lookup_raw`` 只
-返回「查无此行/有行无密文/有行有密文」三种原始事实、不尝试解密——core
-不 import 加解密适配器，三态读端口因此要能不靠主密钥独立测试。
-:class:`DecryptingStockTokenSource` 是组合层，把三态翻成 core 端口的
-四态：解密失败不向上抛异常，是四态里合法的一态，不是"读取失败"。
+没有任何写方法，也不修改正式表的任何字段。两层：:class:`BitableStockTokenSource` 是纯 I/O 层，只读字段、不碰密钥， 整表分页查找（理由同
+``feishu_permission_bitable``），``lookup_raw`` 只 返回「查无此行/有行无密文/有行有密文」三种原始事实、不尝试解密——core 不
+import 加解密适配器，三态读端口因此要能不靠主密钥独立测试。 :class:`DecryptingStockTokenSource` 是组合层，把三态翻成 core
+端口的 四态：解密失败不向上抛异常，是四态里合法的一态，不是"读取失败"。
 只读三个字段：``token_cipher``、``status``、``permissions``，不读其余
-字段以减少可识别数据暴露面；多行命中不假设永远不发生，命中不止一行时
-失败关闭、交给调用方按本侧故障收口，绝不挑一行返回。
+字段以减少可识别数据暴露面；多行命中不假设永远不发生，命中不止一行时 失败关闭、交给调用方按本侧故障收口，绝不挑一行返回。
+
+
 """
 
 from __future__ import annotations
@@ -137,6 +136,7 @@ class BitableStockTokenSource:
         for _ in range(self._max_pages):
             data = self._call(self._list_url(page_token))
             items = data.get("items")
+            items_key_absent = items is None
             if items is None:
                 items = []
             if not isinstance(items, list):
@@ -157,7 +157,16 @@ class BitableStockTokenSource:
                             permissions=readback_text(fields.get("permissions")).strip(),
                         )
                     )
-            if data.get("has_more") is not True:
+            has_more = data.get("has_more")
+            if not isinstance(has_more, bool):
+                # 缺失与类型非法都不是合法 bool，判红。唯一豁免与 feishu_paged_client
+                # 的首页空结果同源：首页、连 items 键都不存在、且 has_more 整个缺失，
+                # 三者同时成立才接受（空表的真实响应形状）。用 is 身份比较——0 == False
+                # 为真，写成 in (False, None) 会放过 has_more: 0。
+                if page_token is None and items_key_absent and has_more is None:
+                    break
+                raise StockTokenSourceError("has_more_invalid", definite=False)
+            if has_more is False:
                 break
             candidate = data.get("page_token")
             if not isinstance(candidate, str) or not candidate or candidate == page_token:

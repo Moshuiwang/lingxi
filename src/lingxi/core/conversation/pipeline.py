@@ -718,9 +718,12 @@ class EventPipeline:
         只信 ``running_task_status == "queued"`` 这一个精确值：其余取值共同的事实是
         "已经有人在处理这个任务，不是单纯在队列里等"，沿用「处理中」文案不算说谎；
         读不到状态时同样保守地落回这一桶，不对不认识的取值猜成"排队中"。
+
+        两条返回值说的都是"这条新消息没有被受理"，与 ``delivery.py`` 排队阈值
+        提示是相反的事实，不共用同一句话（详见 content.toml 两个键旁注）。
         """
         if conversation.running_task_status == "queued":
-            return self._texts.busy_hint_queued_content()
+            return self._texts.busy_hint_rejected_content()
         return self._texts.busy_hint_content()
 
     def _add_reaction(self, message: InboundMessage) -> None:

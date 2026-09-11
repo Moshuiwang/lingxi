@@ -45,6 +45,7 @@ from lingxi.adapters.postgres_conversation import (
     PostgresTaskQueue,
     PostgresTaskQueueListener,
     _Transaction,
+    is_dependency_unavailable,
 )
 from lingxi.apps.worker.config import WorkerConfig
 from lingxi.apps.worker.service import WorkerService
@@ -131,6 +132,17 @@ def worker_config(**overrides: object) -> WorkerConfig:
     }
     values.update(overrides)
     return WorkerConfig(**values)  # type: ignore[arg-type]
+
+
+def dependency_unavailable_error(message: str = "数据库暂时不可达") -> Exception:
+    """构造一个 ``is_dependency_unavailable`` 一定判真的异常。
+
+    刻意用标准库的 ``ConnectionRefusedError`` 而不是驱动自己的异常：判定按类型
+    信息判、不导入驱动，因此这里也不必依赖本机装没装驱动，装没装都走同一条
+    分支。上一版这段说明写的是「与被测函数同一份延迟导入分支」——那是判定改写
+    之前的实现，留着就是又一处文字与实现相反。
+    """
+    return ConnectionRefusedError(message)
 
 
 class RecordingCards:
@@ -3230,6 +3242,209 @@ class WorkerServiceTests(unittest.TestCase):
         close_mock.assert_called_once_with()
 
 
+class DependencyUnavailableIsolationTests(unittest.TestCase):
+    """Issue #683 验收 ⑥/⑧：依赖暂时不可用不得连累在途任务被取消或多写终态。"""
+
+    def test_monitor_heartbeat_dependency_unavailable_does_not_cancel_the_in_flight_task(
+        self,
+    ) -> None:
+        """``_monitor`` 的心跳调用抛依赖类异常时，回合本身必须继续跑，不能被
+        连累取消；回合正常完成后也只应该写出它本来就会写的那个终态，不能
+        凭空多出一种新的终态语义（产品负责人 D-2 裁定：交给既有心跳超时
+        机制兜底，本分支不新增语义）。
+
+        只看"没有异常冒出来"证明不了任务真的还在跑：这里在回合刻意悬而
+        未决的窗口里直接问 ``task.done()``，确认它确实还挂着，而不是恰好
+        在检查前就已经收尾。
+        """
+
+        queue = FakeWorkerQueue()
+        heartbeat_calls = [0]
+        original_heartbeat = queue.heartbeat
+
+        def flaky_heartbeat(**kwargs: object) -> bool:
+            heartbeat_calls[0] += 1
+            if heartbeat_calls[0] == 1:
+                raise dependency_unavailable_error()
+            return original_heartbeat(**kwargs)
+
+        queue.heartbeat = flaky_heartbeat  # type: ignore[assignment]
+
+        turn_started = asyncio.Event()
+        turn_may_finish = asyncio.Event()
+
+        class Executor:
+            async def run_turn(self, prompt: str, **kwargs: object) -> dict:
+                turn_started.set()
+                await turn_may_finish.wait()
+                return {
+                    "turn": {"closed": True, "final_text": "结果", "session_id": None},
+                    "failure": None,
+                }
+
+        service = WorkerService(
+            config=worker_config(heartbeat_interval_seconds=0.01, stop_poll_interval_seconds=0.01),
+            queue=queue,
+            executor_factory=lambda config, marker: Executor(),
+        )
+
+        async def scenario() -> None:
+            process_once_task = asyncio.create_task(service.process_once())
+            await asyncio.wait_for(turn_started.wait(), timeout=2.0)
+
+            deadline = asyncio.get_running_loop().time() + 2.0
+            while heartbeat_calls[0] < 1:
+                if asyncio.get_running_loop().time() > deadline:
+                    self.fail("心跳从未被调用，测试没有触达 _monitor 的失败注入点")
+                await asyncio.sleep(0.005)
+
+            self.assertFalse(
+                process_once_task.done(),
+                "心跳依赖类异常发生后，在途任务必须还在跑，不能被连累取消",
+            )
+            self.assertEqual(queue.terminals, [], "回合还没完成，不应该有终态被提前写入")
+
+            turn_may_finish.set()
+            result = await asyncio.wait_for(process_once_task, timeout=2.0)
+            self.assertTrue(result)
+
+        asyncio.run(scenario())
+
+        self.assertEqual(len(queue.terminals), 1, "回合正常完成后必须写且只写一次终态")
+        self.assertEqual(
+            queue.terminals[0]["terminal_kind"],
+            "success",
+            "心跳失败不应该发明一种新的终态语义，回合本该是什么结果就写什么结果",
+        )
+
+    def test_a_dependency_unavailable_failure_in_one_task_does_not_cancel_its_siblings(
+        self,
+    ) -> None:
+        """``_process_task`` 内部（这里用 ``task_context()`` 模拟"领到任务后
+        数据库掉线"）抛依赖类异常时，同批里正在正常处理真实用户请求的兄弟
+        任务不能被连累取消——旧行为是 ``_run_rolling_claim_loop`` 的
+        ``except BaseException`` 把 ``pending`` 集合里全部任务一并 ``cancel()``。
+        """
+
+        from lingxi.adapters.postgres_conversation import TaskContext
+
+        sibling_running = asyncio.Event()
+        sibling_may_finish = asyncio.Event()
+        sibling_cancelled = [False]
+
+        class TwoTaskQueue:
+            def __init__(self) -> None:
+                self._claimed = False
+                self.claim_calls = 0
+                self.terminals: list[dict[str, object]] = []
+                self.events: list[dict[str, object]] = []
+
+            def claim(self, *, limit: int, **kwargs: object) -> list[ClaimedTask]:
+                self.claim_calls += 1
+                if self._claimed:
+                    return []
+                self._claimed = True
+                return [
+                    ClaimedTask(
+                        task_id="tsk-broken",
+                        conversation_id="cnv-broken",
+                        user_id="usr-1",
+                        prompt="坏任务",
+                        resumed_session=False,
+                        target_worker_version="stable",
+                        attempts=1,
+                        reply_to_message_id="msg-broken",
+                    ),
+                    ClaimedTask(
+                        task_id="tsk-sibling",
+                        conversation_id="cnv-sibling",
+                        user_id="usr-1",
+                        prompt="好任务",
+                        resumed_session=False,
+                        target_worker_version="stable",
+                        attempts=1,
+                        reply_to_message_id="msg-sibling",
+                    ),
+                ]
+
+            def task_context(self, *, task_id: str, **kwargs: object) -> TaskContext | None:
+                if task_id == "tsk-broken":
+                    raise dependency_unavailable_error()
+                return TaskContext(
+                    task_id="tsk-sibling",
+                    conversation_id="cnv-sibling",
+                    user_id="usr-1",
+                    prompt="好任务",
+                    resumed_session=False,
+                    target_worker_version="stable",
+                    attempts=1,
+                    reply_to_message_id="msg-sibling",
+                    chat_id="chat-sibling",
+                    thread_id="topic-sibling",
+                    agent_session_id=None,
+                    stop_requested=False,
+                    side_effect_state="none",
+                )
+
+            def mark_side_effect(self, **kwargs: object) -> bool:
+                return True
+
+            def heartbeat(self, **kwargs: object) -> bool:
+                return True
+
+            def stop_requested(self, **kwargs: object) -> bool:
+                return False
+
+            def append_delivery_event(self, **kwargs: object) -> None:
+                self.events.append(kwargs)
+
+            def write_terminal_event(self, **kwargs: object) -> None:
+                self.terminals.append(kwargs)
+
+        class Executor:
+            async def run_turn(self, prompt: str, **kwargs: object) -> dict:
+                sibling_running.set()
+                try:
+                    await sibling_may_finish.wait()
+                except asyncio.CancelledError:
+                    sibling_cancelled[0] = True
+                    raise
+                return {
+                    "turn": {"closed": True, "final_text": "好任务-结果", "session_id": None},
+                    "failure": None,
+                }
+
+        queue = TwoTaskQueue()
+        service = WorkerService(
+            config=worker_config(max_concurrency=4, poll_interval_seconds=0.02),
+            queue=queue,
+            executor_factory=lambda config, marker: Executor(),
+        )
+
+        async def scenario() -> None:
+            process_once_task = asyncio.create_task(service.process_once())
+            await asyncio.wait_for(sibling_running.wait(), timeout=2.0)
+
+            # 给"坏任务"的异常走完 `_raise_first_exception` 的处理留出调度余量。
+            await asyncio.sleep(0.05)
+
+            self.assertFalse(
+                sibling_cancelled[0], "兄弟任务不能因为另一个任务的依赖类异常被牵连取消"
+            )
+            self.assertFalse(process_once_task.done(), "process_once 不应该提前带着异常退出")
+
+            sibling_may_finish.set()
+            result = await asyncio.wait_for(process_once_task, timeout=2.0)
+            self.assertTrue(result)
+
+        asyncio.run(scenario())
+
+        self.assertFalse(sibling_cancelled[0])
+        self.assertEqual(len(queue.terminals), 1, "只有兄弟任务应该收口成终态，坏任务没有终态")
+        self.assertEqual(queue.terminals[0]["task_id"], "tsk-sibling")
+        self.assertEqual(queue.terminals[0]["terminal_kind"], "success")
+
+
 class SemanticProgressTests(unittest.TestCase):
     """Issue #321 方向 C：语义化等待进度——工具调用阶段文案 + 兜底刷新
     （产品负责人 2026-08-27 裁定，留痕 #321 评论 5434086490；兜底周期由 Issue
@@ -5579,3 +5794,80 @@ class TerminalFailureSignatureTests(unittest.TestCase):
         self.assertEqual(result.stderr, "")
         self.assertEqual(result.stdout.strip(), expected)
         self.assertNotIn("ou_", result.stdout)
+
+
+class DependencyAvailabilityJudgementTests(unittest.TestCase):
+    """判定必须两边都准：依赖故障要判真，编码缺陷**绝不能**被误吞。
+
+    这个判定是整条降级路径的闸门。判宽了，编码缺陷会被当成「数据库抖了一下」
+    静默重试，真 bug 永远不会让进程退出、也不会有人发现；判窄了，一次真实的
+    连接失败就会把常驻进程打死，退回本单要修的那个重启风暴。
+
+    驱动分支刻意**不依赖本机是否装了 psycopg**：被测函数按异常自身的类型信息
+    判定（沿继承链找模块归属为 psycopg 且名为 OperationalError 的类），所以这里
+    用一个同名同模块归属的替身即可覆盖，装没装都跑得到同一条分支。
+    """
+
+    def _driver_operational_error(self) -> BaseException:
+        namespace = {"__module__": "psycopg.errors"}
+        klass = type("OperationalError", (Exception,), namespace)
+        return klass("连接被拒绝")
+
+    def test_driver_operational_error_is_a_dependency_failure(self) -> None:
+        self.assertTrue(is_dependency_unavailable(self._driver_operational_error()))
+
+    def test_subclass_of_driver_operational_error_is_also_a_dependency_failure(self) -> None:
+        parent = type("OperationalError", (Exception,), {"__module__": "psycopg.errors"})
+        child = type("ConnectionTimeout", (parent,), {"__module__": "psycopg.errors"})
+        self.assertTrue(is_dependency_unavailable(child("超时")))
+
+    def test_connection_family_errors_are_dependency_failures(self) -> None:
+        """标准库里真正表示「连不上」的那几类必须判真。"""
+
+        for failure in (
+            ConnectionRefusedError("连接被拒绝"),
+            ConnectionResetError("连接被重置"),
+            BrokenPipeError("管道断了"),
+            TimeoutError("等超时"),
+            __import__("socket").gaierror("域名解析失败"),
+            __import__("ssl").SSLError("握手失败"),
+        ):
+            with self.subTest(failure=type(failure).__name__):
+                self.assertTrue(is_dependency_unavailable(failure))
+
+    def test_local_environment_defects_are_not_dependency_failures(self) -> None:
+        """否定断言：本地配错了不是依赖抖动，必须响亮崩溃而不是每轮重试。
+
+        独立内审与外审各自独立报出同一条：兜底若是整个 ``OSError``，证书路径
+        写错、权限配错这类要人去修的缺陷会被判成「数据库抖了一下」，于是每轮
+        记一条降级日志、永远转下去，**永远不会有人发现**。
+        """
+
+        for defect in (
+            PermissionError("权限配错"),
+            FileNotFoundError("证书路径写错"),
+            IsADirectoryError("路径指到目录了"),
+            NotADirectoryError("路径不是目录"),
+            OSError("裸 OSError 说不清是哪一类"),
+        ):
+            with self.subTest(defect=type(defect).__name__):
+                self.assertFalse(is_dependency_unavailable(defect))
+
+    def test_coding_defects_are_never_swallowed(self) -> None:
+        """否定断言：这几类必须判假，否则真 bug 会被当成依赖抖动静默重试。"""
+
+        for defect in (
+            TypeError("参数类型错"),
+            AttributeError("属性不存在"),
+            KeyError("键不存在"),
+            ValueError("值非法"),
+            ZeroDivisionError("除零"),
+        ):
+            with self.subTest(defect=type(defect).__name__):
+                self.assertFalse(is_dependency_unavailable(defect))
+
+    def test_same_class_name_from_another_module_is_not_a_dependency_failure(self) -> None:
+        """同名但不是驱动的类不算——判定认的是模块归属加类名，不是只认名字。"""
+
+        impostor = type("OperationalError", (Exception,), {"__module__": "some.other.package"})
+        self.assertFalse(is_dependency_unavailable(impostor("冒名")))

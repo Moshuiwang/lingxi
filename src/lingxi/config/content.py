@@ -62,6 +62,10 @@ REQUIRED_TEXT_KEYS: tuple[str, ...] = (
     "onboarding.delegated_subject",
     "gateway.busy_hint",
     "gateway.busy_hint_queued",
+    # 忙碌期新消息未受理，与上一条「已入队任务的排队阈值提示」的独立键（两者
+    # 曾经共用一个键，见 content.toml 该键旁注）。消费点在
+    # `core/conversation/pipeline.py::_busy_hint_for`。
+    "gateway.busy_hint_rejected",
     "gateway.suspended",
     "gateway.queue_failed",
     "gateway.unexpected_error",

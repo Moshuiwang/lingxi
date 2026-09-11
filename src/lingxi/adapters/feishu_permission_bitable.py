@@ -7,11 +7,10 @@
 由调用方以可调用对象注入，只走请求头，不进 URL/日志/异常消息。分页列举/
 新建/按标识读回已回源实测，``PUT`` 字段级更新未经真实调用验证。
 
-整表分页而非 search：既要找该更新哪一行，也要判断此人是否已以另一种
-``record_key`` 口径存在；search 路径未经验证，行数增长到几千应换用它、
-换前需一次回源验证。``update_row`` 只写调用方给的字段（部分更新语义，
-未列出的列保持原值，是令牌列不被清空的机制所在）；新建行必须带上令牌
-字段——写哪些字段完全由 ``publish`` 决定，传输层不增删。
+整表分页而非 search：既要找该更新哪一行，也要判断此人是否已以另一种 ``record_key`` 口径存在；search 路径未经验证，行数增长到几千应换用它、换前需
+一次回源验证。``update_row`` 只写调用方给的字段（部分更新语义，未列出的列保持 原值，是令牌列不被清空的机制所在）；新建行必须带上令牌字段——写哪些字段完全由
+``publish`` 决定，传输层不增删。
+
 """
 
 from __future__ import annotations
@@ -180,6 +179,7 @@ class BitablePermissionTable:
         for _ in range(self._max_pages):
             data = self._call("GET", self._list_url(page_token), body=None)
             items = data.get("items")
+            items_key_absent = items is None
             if items is None:
                 # 空表在飞书的响应里可能没有 items 键；这与"响应形状不对"不同。
                 items = []
@@ -200,7 +200,16 @@ class BitablePermissionTable:
                     fields.get("email"), email
                 ):
                     matched.append(ExistingPermissionRow(record_id, dict(fields)))
-            if data.get("has_more") is not True:
+            has_more = data.get("has_more")
+            if not isinstance(has_more, bool):
+                # 缺失与类型非法都不是合法 bool，判红。唯一豁免与 feishu_paged_client
+                # 的首页空结果同源：首页、连 items 键都不存在、且 has_more 整个缺失，
+                # 三者同时成立才接受（空表的真实响应形状）。用 is 身份比较——0 == False
+                # 为真，写成 in (False, None) 会放过 has_more: 0。
+                if page_token is None and items_key_absent and has_more is None:
+                    break
+                raise PermissionTableError("has_more_invalid", definite=False)
+            if has_more is False:
                 break
             candidate = data.get("page_token")
             if not isinstance(candidate, str) or not candidate or candidate == page_token:

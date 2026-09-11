@@ -55,9 +55,11 @@ def _table(responses: list[object], **kwargs) -> tuple[BitablePermissionTable, R
 
 
 def _page(items, *, has_more=False, page_token=None):
-    data = {"items": items}
+    """构造一页**合法**响应：``has_more`` 恒为显式 bool（真实终止页也必须带这个字段，
+    见 Issue #719——省略它不再等价于"读完了"）。要构造字段缺失/类型非法的畸形响应，
+    绕过本 helper 直接手写 dict。"""
+    data: dict[str, object] = {"items": items, "has_more": has_more}
     if has_more:
-        data["has_more"] = True
         data["page_token"] = page_token
     return {"code": 0, "data": data}
 
@@ -214,8 +216,69 @@ class FindRowsTest(unittest.TestCase):
         self.assertEqual(caught.exception.code, "invalid_page_item")
 
     def test_empty_table_without_items_key_is_not_a_failure(self) -> None:
+        """真实空表的响应形状：``data`` 里既没有 ``items`` 也没有 ``has_more``。
+
+        这是这条链路早就登记过的宽容分支。独立审查实测：#719 把 ``has_more``
+        改判红时一度连这个形状也硬失败了，而它落在开通（权限发布读回）与存量
+        令牌读取两条真实旅程上——一张空表就会让开通报错。豁免与
+        ``feishu_paged_client`` 的首页空结果同源：**首页、还没收到过任何一行、
+        且 ``has_more`` 整个缺失**才接受。
+        """
         table, _ = _table([{"code": 0, "data": {}}])
         self.assertEqual(table.find_rows(record_key=FAKE_EMAIL, email=FAKE_EMAIL), ())
+
+    def test_missing_has_more_on_a_later_page_is_still_rejected(self) -> None:
+        """豁免只给首页：翻到第二页还缺 ``has_more``，说明真的读不出翻完没有。
+
+        这一条与上一条一起，把豁免的边界两边都钉住——只钉宽容那一半，等于把
+        #719 要修的问题原样放回来。
+        """
+        table, _ = _table(
+            [
+                {"code": 0, "data": {"items": [], "has_more": True, "page_token": "p2"}},
+                {"code": 0, "data": {}},
+            ]
+        )
+        with self.assertRaises(PermissionTableError) as caught:
+            table.find_rows(record_key=FAKE_EMAIL, email=FAKE_EMAIL)
+        self.assertEqual(caught.exception.code, "has_more_invalid")
+
+    def test_empty_first_page_with_a_collected_row_is_still_rejected(self) -> None:
+        """已经收到过行之后再遇到缺失，同样判红——豁免的前提是「还没收到过任何一行」。"""
+        table, _ = _table(
+            [
+                {
+                    "code": 0,
+                    "data": {
+                        "items": [{"record_id": "r1", "fields": {"email": FAKE_EMAIL}}],
+                        "has_more": True,
+                        "page_token": "p2",
+                    },
+                },
+                {"code": 0, "data": {}},
+            ]
+        )
+        with self.assertRaises(PermissionTableError) as caught:
+            table.find_rows(record_key=FAKE_EMAIL, email=FAKE_EMAIL)
+        self.assertEqual(caught.exception.code, "has_more_invalid")
+
+    def test_missing_has_more_field_is_rejected_not_end_of_pages(self) -> None:
+        """Issue #719 ①：``has_more`` 字段整个缺失时必须判红，不是静默当作翻完了。"""
+        table, _ = _table([{"code": 0, "data": {"items": []}}])
+        with self.assertRaises(PermissionTableError) as caught:
+            table.find_rows(record_key=FAKE_EMAIL, email=FAKE_EMAIL)
+        self.assertEqual(caught.exception.code, "has_more_invalid")
+        self.assertFalse(caught.exception.definite)
+
+    def test_has_more_wrong_type_is_rejected(self) -> None:
+        """Issue #719 ②：``has_more`` 类型非法（字符串/数字/``None``）同样判红。"""
+        for illegal in ("true", 1, None):
+            with self.subTest(has_more=illegal):
+                table, _ = _table([{"code": 0, "data": {"items": [], "has_more": illegal}}])
+                with self.assertRaises(PermissionTableError) as caught:
+                    table.find_rows(record_key=FAKE_EMAIL, email=FAKE_EMAIL)
+                self.assertEqual(caught.exception.code, "has_more_invalid")
+                self.assertFalse(caught.exception.definite)
 
 
 class WriteTest(unittest.TestCase):

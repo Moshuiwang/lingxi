@@ -24,8 +24,9 @@ class GatewayTexts:
 
     Attributes:
         busy_hint: 话题已被占用且任务已经在处理时的提示。
-        busy_hint_queued: 同一个"话题被占用"状态的另一种真话——任务已经入队，但还
-            没有任何 worker 领取。
+        busy_hint_queued: 已入队任务的排队阈值提示（``delivery.py`` 专用）。
+        busy_hint_rejected: 话题被占用期间新消息未受理的提示（``pipeline.py``
+            专用），与上一条是相反的事实，不共用同一句话，详见 content.toml。
         suspended: 已停用用户的提示。
         catalog: 内容目录本身，供需要按键现渲染的调用方使用。
     """
@@ -35,6 +36,9 @@ class GatewayTexts:
     )
     busy_hint_queued: str = field(
         default_factory=lambda: default_content_catalog().text("gateway.busy_hint_queued").text
+    )
+    busy_hint_rejected: str = field(
+        default_factory=lambda: default_content_catalog().text("gateway.busy_hint_rejected").text
     )
     suspended: str = field(
         default_factory=lambda: default_content_catalog().text("gateway.suspended").text
@@ -48,8 +52,12 @@ class GatewayTexts:
         return _as_content(self.catalog, "gateway.busy_hint", self.busy_hint)
 
     def busy_hint_queued_content(self) -> RenderedContent:
-        """忙碌提示（任务还在队列里等人领取）。"""
+        """忙碌提示：已入队任务的排队阈值提示（``delivery.py`` 专用）。"""
         return _as_content(self.catalog, "gateway.busy_hint_queued", self.busy_hint_queued)
+
+    def busy_hint_rejected_content(self) -> RenderedContent:
+        """忙碌提示：话题被占用、这条新消息没有被受理（``pipeline.py`` 专用）。"""
+        return _as_content(self.catalog, "gateway.busy_hint_rejected", self.busy_hint_rejected)
 
     def suspended_content(self) -> RenderedContent:
         """已停用用户的提示。"""

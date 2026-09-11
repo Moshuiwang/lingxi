@@ -2489,7 +2489,14 @@ class BusyHintHonestyTests(PipelineTestCase):
     """Issue #465（rc22 S-3）：忙碌期提示区分"排队中"与"处理中"两种真实状态，
     不再对两者一概说"当前任务仍在处理中"（触发现场：批闸缺陷下重任务霸占
     worker、轻任务迟迟没被领取时，用户发第二条消息只会被一句"处理中"误导，
-    以为系统正在忙它这条消息）。"""
+    以为系统正在忙它这条消息）。
+
+    Issue #717④ 追加：占用任务"排队中"这一支此前借用的是 ``apps/gateway/
+    delivery.py`` 的排队阈值提示（``gateway.busy_hint_queued``），而那条提示的
+    真实含义是"你自己已受理的任务还在排队"——用来回答"我刚发的这条新消息呢"
+    是一句会误导人的话（新消息从未被受理，不会在原任务结束后自动生效）。这里
+    改断言这一支现在取独立的 ``gateway.busy_hint_rejected``。
+    """
 
     def _busy_conversation(self, *, task_status: str) -> None:
         self.state.conversations[("usr_1", "oc_1", "")] = FakeConversation(
@@ -2518,7 +2525,21 @@ class BusyHintHonestyTests(PipelineTestCase):
         self.assertEqual(len(replies), 1)
         self.assertEqual(
             replies[0]["text"],
+            default_content_catalog().text("gateway.busy_hint_rejected").text,
+        )
+        sent = self.log.fields("audit.reply.sent")
+        self.assertEqual(len(sent), 1)
+        self.assertEqual(
+            sent[0]["content_key"],
+            "gateway.busy_hint_rejected",
+            "占用任务排队中时，新消息未受理这一支必须走独立键，不得借用"
+            "delivery.py 的排队阈值提示（Issue #717④ 否定断言：已经排上队的"
+            "任务不得被告知“请重发”，两个场景不能共用同一句话）",
+        )
+        self.assertNotEqual(
+            replies[0]["text"],
             default_content_catalog().text("gateway.busy_hint_queued").text,
+            "新消息未受理与「你自己的任务还在排队」是两码事，文案不能相同",
         )
 
     def test_says_processing_when_the_running_task_is_actually_running(self) -> None:

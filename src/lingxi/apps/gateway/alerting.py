@@ -53,8 +53,11 @@ def build_alerting_duty(config: GatewayConfig) -> Any:
         sender = LogOnlyAlertSender()
         chat_id = "gateway-log-only"
 
+    audit = LoggingAudit()
     return AlertingDuty(
         manager=AlertManager(policy=config.alert_policy),
-        dispatcher=AlertDispatcher(sender=sender, chat_id=chat_id, policy=config.alert_policy),
-        audit=LoggingAudit(),
+        dispatcher=AlertDispatcher(
+            sender=sender, chat_id=chat_id, policy=config.alert_policy, audit=audit
+        ),
+        audit=audit,
     )

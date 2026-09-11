@@ -85,6 +85,37 @@ class ExampleScopeRuleTest(unittest.TestCase):
         audience = _audience(company_ids=(), all_companies=True)
         self.assertEqual(example_company_word(audience, catalog=CATALOG), "各公司")
 
+    def test_multi_company_footnote_clarifies_examples_are_not_a_universal_guarantee(
+        self,
+    ) -> None:
+        """Issue #717⑤：多公司/全部公司范围下，欢迎卡的指标全集经
+        ``core/outreach/audience.py::_parse_scope`` 取得，`lookup_metrics`
+        在 ``company_id=None`` 时对全部键取并集（这是"有没有任何指标"的存在性
+        判定，被原样当成了展示用的指标全集）——三条示例句可能因此选中一条只在
+        其中一家公司成立的指标。真正按公司核对属于另一处装配逻辑，不在本卡
+        范围（只改说法，不改行为）；这里钉住的是补丁本身：脚注必须带一句必要
+        且可理解的澄清，不能让示例读起来像是对每一家公司都成立的保证。
+        """
+        audience = _audience(
+            company_ids=("1011", "1012"), company_names={"1011": "尼日利亚", "1012": "肯尼亚"}
+        )
+        footnote = welcome_sections(audience, catalog=CATALOG)[-1]
+        self.assertIn("示例中的指标以你实际能查到的结果为准", footnote)
+
+    def test_intro_tells_users_in_advance_that_a_missing_data_time_is_not_full_coverage(
+        self,
+    ) -> None:
+        """Issue #717①：问数结果的可信标准规定"MCP 未返回数据最新时间则省略该
+        字段，不提示『数据时间未知』"（不在本卡改这条取舍）。用户此前完全不知道
+        有这回事，问"昨天"或"本月累计"时可能把没提到数据时间误读成查询期间已经
+        完整覆盖。这里钉住自我介绍段落提前把这条事实说清楚，且不新增被禁止的
+        "数据时间未知"这句话本身。
+        """
+        intro = welcome_sections(_audience(), catalog=CATALOG)[1]
+        self.assertIn("如果某次回答没有提到数据更新时间", intro)
+        self.assertIn("不代表你问的时间段数据已经完整", intro)
+        self.assertNotIn("数据时间未知", intro)
+
     def test_an_unknown_company_id_is_refused_instead_of_showing_the_number(self) -> None:
         """否定断言：查不到中文名不回落编号。
 
@@ -257,7 +288,10 @@ class CardShapeTest(unittest.TestCase):
         elements = render_welcome_card(_audience(), catalog=CATALOG).payload["body"]["elements"]
         self.assertEqual(
             elements[-1]["content"],
-            FOOTNOTE_MARKDOWN.format(footnote="本条由 BI Plus 主动发送，你可以直接开始提问。"),
+            FOOTNOTE_MARKDOWN.format(
+                footnote="本条由 BI Plus 主动发送，你可以直接开始提问；"
+                "示例中的指标以你实际能查到的结果为准。"
+            ),
         )
 
     def test_switching_the_style_changes_the_layout_and_not_a_single_word(self) -> None:

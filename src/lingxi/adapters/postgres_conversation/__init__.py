@@ -29,6 +29,7 @@ from ._dataclasses import (
     TerminalTask,
     UncertainDeliveryTask,
 )
+from ._dependency_availability import is_dependency_unavailable
 from ._gateway_store import (
     DEFAULT_CONNECT_TIMEOUT_SECONDS,
     DEFAULT_STATEMENT_TIMEOUT_MS,
@@ -57,4 +58,5 @@ __all__ = [
     "PostgresTaskQueue",
     "PostgresTaskQueueListener",
     "_Transaction",
+    "is_dependency_unavailable",
 ]
