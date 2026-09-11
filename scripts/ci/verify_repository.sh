@@ -164,6 +164,10 @@ python3 scripts/ci/check_content_version.py
 # 没有容器的环境里也照跑——这几类缺陷恰恰最容易在"本机没起容器"时溜过去。
 # 没装 alembic 时它明确失败而不是跳过。
 python3 scripts/ci/check_alembic_revisions.py
+# 迁移新建的数据库函数必须在定义语句内 SET search_path = pg_catalog, pg_temp
+# （Issue #661，数据库设计第十节）：纯源码扫描、不连库；历史 19 个函数登记在
+# plpgsql_search_path_baseline.txt 只许缩不许涨，基线外缺它即红，扫到 0 个函数也红。
+python3 scripts/ci/check_plpgsql_search_path.py
 # MCP 令牌加解密的互操作向量（Issue #156 / S-C-02）：那几组 AES 断言在
 # `unittest discover` 里带着 skipUnless（缺 cryptography 就跳过，这对无依赖机器是对的），
 # 但**门禁不能跟着跳过**——缺库时整组断言一条都没跑，输出却是绿的。本脚本缺库即明确失败，

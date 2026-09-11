@@ -11,7 +11,7 @@
 | 当前事实 | 值 |
 | --- | --- |
 | 基线 revision（链首） | `20260806_baseline` |
-| head revision | `0095_contact_reachability` |
+| head revision | `0096_plpgsql_search_path` |
 | 配置文件 | 仓库根目录 `alembic.ini` |
 | revision 目录 | `migrations/alembic/versions/` |
 | 连接串环境变量 | `LINGXI_MIGRATION_DSN`（缺失即失败，无默认值） |
@@ -842,3 +842,7 @@ OAuth 路径已被 2026-07-28 决策排除；它们此前**不属于生产链**�
 ## `0095_contact_reachability`（说过话与联系可达状态）
 
 [Issue #673](https://github.com/Moshuiwang/lingxi/issues/673)。`app_user` 新增四列：`first_inbound_at` / `last_inbound_at`（首次 / 最近真实入站）与 `outbound_unavailable_at` / `outbound_unavailable_code`（最近一次主动发送明确送不进去的时刻与错误码）。「跟我们说过话」此前只能从按九十天整行删除的 `inbound_event` 推导，到期后老用户会被重新读成新人；四列是不按九十天删除的**当前状态**（数据库设计第九节 `app_user` 既有例外的延伸，不新建表、不新增一类例外）。新增 `inbound_event` 的 `AFTER INSERT` 触发器：每一条真实入站推进两个入站时间并清空"不可达"标记——这是四列独立于 `inbound_event` 生存期的唯一入站侧写入点，应用层不各自散着补写。再新增 `app_user` 的 `AFTER INSERT` 触发器：建档时把此前已经存在的入站事件（首聊常常先有事件、后有档案）认领进新行，否则这个人会被读成从没说过话。**不改** `inbound_event` 的九十天到期触发器与 `0054` 的受限清理函数。历史行的一次性回填是 `scripts/ops/backfill_contact_reachability.py`（四个来源、`--dry-run` 先出计数），不在 DDL 里掺数据搬运。降级删触发器、函数与四列，不因表内有数据而失败。
+
+## `0096_plpgsql_search_path`（函数搜索路径固定与清理函数匿名执行权收回）
+
+[Issue #661](https://github.com/Moshuiwang/lingxi/issues/661)。`public` 下 21 个 PL/pgSQL 函数里 19 个此前没有固定 `search_path`（基线内嵌 4 个、`0054`–`0095` 逐条新增 15 个），触发器函数按调用会话的搜索路径解析未限定的表名，会话能改自己的 `search_path` 就能把 `feishu_delegated_subject` 这类名字指到别的表。本 revision 给 19 个函数逐个 `SET search_path = pg_catalog, pg_temp`：函数体只用 NEW / OLD 与内置函数的 14 个用 `ALTER FUNCTION`，定义原文不动；函数体里有未限定表引用的 5 个（`app_user_reject_delegated_subject`、`credential_reject_app_user_subject`、`feishu_org_sync_run_verify_children`、`app_user_record_real_inbound`、`app_user_adopt_prior_inbound`，共 7 处）用 `CREATE OR REPLACE` 重定义，只给表名加 `public.` 前缀，触发器时机、异常文案、属主、权限全部沿用。另外两件：收回受限清理函数 `public.lingxi_retention_cleanup(timestamptz, integer)` 对 `anon` / `authenticated` 的两条直接 EXECUTE（属主是无登录角色，执行者拿不到 `SET ROLE` 时沿 `0054` 的做法临时授予再按授予方精确收回，前后核对成员关系没有新增），以及撤掉应用创建者 `postgres` 在 `public` 对 FUNCTIONS 默认权限里给这两个角色的 EXECUTE；`service_role`、`lingxi_scheduler` 与属主的权限一律保留。平台角色不存在的库（CI、本机容器）上后两件静默跳过。**不做**：不拆三服务身份、不动平台自己的默认权限、不批量撤权、不消音日志；撤默认权限也不取消内建的 PUBLIC EXECUTE，新建清理类函数仍须显式 `REVOKE … FROM PUBLIC`。降级把 14 个函数 `RESET search_path`、5 个函数按原文重建，并在角色存在的库上按原授予方补回两条直接 EXECUTE 与默认权限两项；不删数据、不依赖表内有没有行。
