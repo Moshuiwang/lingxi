@@ -1,0 +1,27 @@
+# 数据库函数 search_path 门禁的历史豁免基线：登记 0096_plpgsql_search_path 之前已经
+# 存在、定义语句里不带 SET search_path 的函数（历史 revision 不许改，这些定义由 0096
+# 事后 ALTER FUNCTION … SET search_path = pg_catalog, pg_temp 固定）。
+# 由 scripts/ci/check_plpgsql_search_path.py 核对：每一行都必须仍对应一条缺 SET
+# search_path 的定义，否则判红并要求删掉该行；基线之外任何缺它的定义直接判红。
+# 本清单只许变短、不许变长——tests/test_plpgsql_search_path_check.py 钉住了逐字快照，
+# 往里加一行即红。行格式「revision 文件名<TAB>函数名」，按文件名、函数名排序。
+
+0054_retention_cleanup.py	galaxy_import_batch_fix_expiry
+0057_gateway_tables.py	inbound_event_fix_expiry
+0057_gateway_tables.py	task_freeze_invariants
+0058_worker_execution.py	queue_failure_notice_fix_expiry
+0059_delivery_outbox.py	task_delivery_event_fix_expiry
+0064_permission_publish_outbox.py	publish_outbox_fix_expiry
+0065_mcp_token_and_sync_check.py	mcp_access_token_immutable
+0065_mcp_token_and_sync_check.py	mcp_sync_check_fix_expiry
+0066_onboarding_notice_outbox.py	onboarding_completion_notice_fix_expiry
+0069_innertest_content_capture.py	innertest_content_capture_fix_expiry
+0074_task_document_delivery.py	task_document_delivery_request_fix_expiry
+0088_outreach_message.py	outreach_message_freeze_anchors
+0089_carrier_retention.py	pending_action_fix_retention_expiry
+0095_contact_reachability.py	app_user_adopt_prior_inbound
+0095_contact_reachability.py	app_user_record_real_inbound
+20260806_baseline_006_012.py	app_user_reject_delegated_subject
+20260806_baseline_006_012.py	credential_reject_app_user_subject
+20260806_baseline_006_012.py	feishu_org_sync_run_fix_expiry
+20260806_baseline_006_012.py	feishu_org_sync_run_verify_children
