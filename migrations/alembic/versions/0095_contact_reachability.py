@@ -12,9 +12,11 @@ Revises: 0094_document_creation_attempted
 ``app_user`` 行推进 ``first_inbound_at``/``last_inbound_at`` 并清空「不可达」标记。
 再新增 ``app_user`` 的 ``AFTER INSERT`` 触发器：首聊用户的第一条入站往往早于
 建档（先插事件、后建档案），建档那一刻把此前已经存在的入站事件认领进新行，
-否则这个人会被读成「从没说过话」。两个触发器是新列独立于 ``inbound_event``
-生存期的唯二写入点，不由应用层各自散着补写，测试也因此只能经真实调用点走到
-这四列，直接 UPDATE ``app_user`` 绕不过它。
+否则这个人会被读成「从没说过话」。两个触发器是**入站侧**推进这四列的唯一
+写入点：应用层 ``record_contact_reachable``/``record_contact_unavailable``
+（正式发送结果与一次性回填都经它们）是另一条独立且同样收敛到两个方法的写入
+路径，不是触发器之外的散写。测试因此只能经真实调用点（入站触发器）或这两个
+方法走到这四列，直接 UPDATE ``app_user`` 绕不过它。
 
 ## 为什么不在本迁移里回填历史行
 

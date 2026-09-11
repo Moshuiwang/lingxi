@@ -463,14 +463,28 @@ class RecordingOutcomeTest(unittest.TestCase):
 
 
 class DefiniteDeliveryFailureCodeTest(unittest.TestCase):
-    """只有平台明确拒绝才给出要落的联系不可达错误码，其余一律 ``None``（#673）。"""
+    """只有坐实过的收件人级拒绝码才给出结论，其余一律 ``None``（#673 复修）。
 
-    def test_a_definite_feishu_rejection_returns_its_own_code(self) -> None:
+    ``feishu_code_`` 前缀不等于「收件人级」：取令牌端点的任何非零码与发送端点的
+    频率限制同样带这个前缀，但它们是凭据/限流故障，不是「这个人联系不上」。
+    """
+
+    def test_a_recipient_unreachable_rejection_returns_its_own_code(self) -> None:
         error = FeishuUserCardError("feishu_code_230013")
         self.assertEqual(definite_delivery_failure_code(error), "feishu_code_230013")
 
     def test_a_non_definite_transport_error_returns_none(self) -> None:
         error = FeishuUserCardError("transport_error", definite=False)
+        self.assertIsNone(definite_delivery_failure_code(error))
+
+    def test_a_credential_failure_at_the_token_endpoint_returns_none(self) -> None:
+        """取令牌端点的非零码（如 ``feishu_code_10003``）是凭据故障，不是收件人拒绝。"""
+        error = FeishuUserCardError("feishu_code_10003")
+        self.assertIsNone(definite_delivery_failure_code(error))
+
+    def test_a_rate_limit_failure_at_the_send_endpoint_returns_none(self) -> None:
+        """发送端点的频率限制同样带 ``feishu_code_`` 前缀，但说明的是限流不是收件人。"""
+        error = FeishuUserCardError("feishu_code_99991400")
         self.assertIsNone(definite_delivery_failure_code(error))
 
     def test_a_pre_send_check_failure_returns_none(self) -> None:
@@ -482,14 +496,23 @@ class DefiniteDeliveryFailureCodeTest(unittest.TestCase):
     def test_an_unrecognised_runtime_error_returns_none(self) -> None:
         self.assertIsNone(definite_delivery_failure_code(RuntimeError("boom")))
 
-    def test_a_translated_definite_failure_recovers_the_original_platform_code(self) -> None:
+    def test_a_translated_recipient_unreachable_failure_recovers_the_original_platform_code(
+        self,
+    ) -> None:
         error = InnertestError("notification_failed")
         error.__cause__ = FeishuUserCardError("feishu_code_230013")
         self.assertEqual(definite_delivery_failure_code(error), "feishu_code_230013")
 
-    def test_a_translated_definite_failure_without_a_cause_keeps_the_generic_code(self) -> None:
+    def test_a_translated_credential_failure_returns_none(self) -> None:
+        """cause 是令牌故障时，转译后的 ``notification_failed`` 同样不上报。"""
+        error = InnertestError("notification_failed")
+        error.__cause__ = FeishuUserCardError("feishu_code_10003")
+        self.assertIsNone(definite_delivery_failure_code(error))
+
+    def test_a_translated_failure_without_a_cause_returns_none(self) -> None:
+        """cause 丢了原始平台码，分不清是收件人拒绝还是凭据/限流故障，保持未知。"""
         code = definite_delivery_failure_code(InnertestError("notification_failed"))
-        self.assertEqual(code, "notification_failed")
+        self.assertIsNone(code)
 
 
 class ContactOutcomeTest(unittest.TestCase):

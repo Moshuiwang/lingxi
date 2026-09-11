@@ -20,9 +20,15 @@
 2. ``conversation.created_at``（按 ``user_id``）——已经建过私聊主窗口或话题。
 3. ``task.created_at``（按 ``user_id``）——已经问过数。
 4. ``outreach_message``（按 ``recipient_open_id``，仅 ``purpose='apply'``）——
-   ``delivered`` 视为可达证据；``failed`` 且 ``last_error`` 是平台明确拒绝码
-   （``feishu_code_*``/``notification_failed``）才视为不可用证据。发送前检查
-   （``check_*``）、传输层异常这类失败不是「联系不上」，不进负面证据。
+   ``delivered`` 视为可达证据；``failed`` 且 ``last_error`` ∈
+   ``lingxi.core.outreach.dispatch.RECIPIENT_UNREACHABLE_CODES``（本仓唯一
+   坐实的收件人级拒绝码，目前只有 ``feishu_code_230013``）才视为不可用证据。
+   其余带 ``feishu_code_`` 前缀的码是凭据、限流、参数类故障，说明的是「这次
+   调用没成功」，不是「这个人联系不上」。``notification_failed`` 是
+   ``CheckedInnertestSender`` 转译后的统一码，历史行里已经丢了原始平台码，
+   分不清当初是坐实的拒绝还是别的故障，同样**不**算负面证据，宁可保持未知
+   （#673 复修：此前把它当成负面证据是错的）。发送前检查（``check_*``）、
+   传输层异常这类失败同样不是「联系不上」，不进负面证据。
 
 ## 幂等与中断安全
 
@@ -49,6 +55,8 @@ import sys
 from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import datetime
+
+from lingxi.core.outreach.dispatch import RECIPIENT_UNREACHABLE_CODES
 
 SOURCE_INBOUND_EVENT = "inbound_event"
 SOURCE_CONVERSATION = "conversation"
@@ -87,7 +95,7 @@ UNION ALL
 SELECT u.feishu_open_id, om.created_at, FALSE, %(outreach_message)s, om.last_error
   FROM outreach_message om JOIN app_user u ON u.feishu_open_id = om.recipient_open_id
  WHERE om.purpose = 'apply' AND om.status = 'failed'
-   AND (om.last_error LIKE 'feishu_code_%%' OR om.last_error = 'notification_failed')
+   AND om.last_error = ANY(%(recipient_unreachable_codes)s)
 ORDER BY 1, 2
 """
 
@@ -111,6 +119,9 @@ def load_evidence(dsn: str) -> tuple[Evidence, ...]:
                 "conversation": SOURCE_CONVERSATION,
                 "task": SOURCE_TASK,
                 "outreach_message": SOURCE_OUTREACH_MESSAGE,
+                # psycopg 把 `= ANY(%(name)s)` 适配成数组字面量只认 list，
+                # frozenset/tuple 会报 malformed array literal，因此显式转换。
+                "recipient_unreachable_codes": list(RECIPIENT_UNREACHABLE_CODES),
             },
         )
         rows = cursor.fetchall()

@@ -195,22 +195,33 @@ def _error_code(error: BaseException) -> str:
     return type(error).__name__
 
 
-def definite_delivery_failure_code(error: BaseException) -> str | None:
-    """一次发送异常是不是「平台明确拒绝」；是则给出要落的联系不可达错误码。
+#: 本仓唯一坐实的「机器人对该用户不可用」平台码，出处见
+#: ``docs/参考证据/飞书机器人主动私聊的跨组织前提.md``。其余 ``feishu_code_``
+#: 前缀的码（凭据、限流、参数类故障）说明的是「这次调用没成功」，不是「这个人
+#: 联系不上」；混进来会把一整批收件人错记成联系不上，因此只有这一个码坐实过
+#: 收件人级拒绝，其余保持未知。
+RECIPIENT_UNREACHABLE_CODES: frozenset[str] = frozenset({"feishu_code_230013"})
 
-    ``None`` 表示这次失败没告诉我们这个人是否联系得上（发送前检查、传输层
-    异常、令牌问题、结果不确定都在此列），联系可达状态保持原样。经
-    ``CheckedInnertestSender`` 转译过的失败统一码是 ``notification_failed``，
-    从 ``__cause__`` 掏出原始平台码，不然待办只看得到一个不带原因的码。
+
+def definite_delivery_failure_code(error: BaseException) -> str | None:
+    """一次发送异常是不是「平台明确拒绝这个收件人」；是则给出要落的错误码。
+
+    先解析出平台码：``error.code`` 本身带 ``feishu_code_`` 前缀就是它；转译成
+    ``notification_failed`` 的从 ``__cause__`` 掏一次。只有这个码落在
+    :data:`RECIPIENT_UNREACHABLE_CODES` 里才返回它——发送前检查、传输层异常、
+    结果不确定、凭据/限流/参数类平台错误都不在清单里，也掏不出/掏出的码不在
+    清单里的 ``notification_failed``，一律返回 ``None``：联系可达状态保持
+    原样，宁可保持未知也不冒充一次明确结论。
     """
-    if getattr(error, "definite", False) is True:
-        return _error_code(error)
-    if getattr(error, "code", None) == "notification_failed":
+    code = getattr(error, "code", None)
+    if isinstance(code, str) and code.startswith("feishu_code_"):
+        platform_code: str | None = code
+    elif code == "notification_failed":
         cause_code = getattr(error.__cause__, "code", None)
-        if isinstance(cause_code, str) and cause_code.startswith("feishu_code_"):
-            return cause_code
-        return "notification_failed"
-    return None
+        platform_code = cause_code if isinstance(cause_code, str) else None
+    else:
+        platform_code = None
+    return platform_code if platform_code in RECIPIENT_UNREACHABLE_CODES else None
 
 
 class OutreachDispatcher:
@@ -300,8 +311,8 @@ class OutreachDispatcher:
             self._store.mark_failed(record.record_id, error=code)
             self._notify_send_outcome(succeeded=False)
             unknown = code == "notification_unknown"
-            # 只有平台明确拒绝才落「联系不上」：发送前检查、传输层异常、令牌
-            # 问题与结果不确定都保持未知，不冒充一次明确结论。
+            # 只有坐实过的收件人级拒绝码才落「联系不上」：发送前检查、传输层
+            # 异常、凭据/限流问题与结果不确定都保持未知，不冒充一次明确结论。
             definite_code = definite_delivery_failure_code(error)
             if definite_code is not None:
                 self._notify_contact_outcome(
@@ -408,6 +419,7 @@ class OutreachDispatcher:
 __all__ = [
     "OUTREACH_ALERT_CHANNEL",
     "REASON_RECIPIENT_CHANGED",
+    "RECIPIENT_UNREACHABLE_CODES",
     "STATUS_DELIVERED",
     "STATUS_FAILED",
     "STATUS_PENDING",

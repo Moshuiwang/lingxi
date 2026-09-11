@@ -125,6 +125,38 @@ class RealInboundPathTest(ContactReachabilityPostgresTestCase):
         self.assertIsNotNone(first, "建档时应认领此前已经存在的入站事件")
         self.assertEqual(first, self._column(open_id, "last_inbound_at"))
 
+    def test_adopting_two_prior_events_takes_the_earliest_as_first_and_latest_as_last(
+        self,
+    ) -> None:
+        """变异钉子：认领触发器的 MIN/MAX 不能互换。
+
+        上一条用例只种了一条事件，``first == last`` 时 MIN/MAX 互换照样绿；这里
+        种两条时间不同的事件，`first_inbound_at` 必须是较早那条、`last_inbound_at`
+        必须是较晚那条，互换会让断言指向错的那一条。``insert_inbound_event`` 不接受
+        指定时间，直接 INSERT 造前置状态。
+        """
+        open_id = "ou_speaks_before_provisioning_twice"
+        earlier = datetime.now(UTC) - timedelta(days=2)
+        later = datetime.now(UTC) - timedelta(hours=1)
+        with connect(self._dsn) as connection, connection.cursor() as cursor:
+            cursor.execute(
+                """INSERT INTO inbound_event
+                     (feishu_event_id, received_at, event_type, user_open_id, trace_id)
+                   VALUES (%s, %s, 'im.message.receive_v1', %s, %s)""",
+                ("evt_adopt_earlier", earlier, open_id, "trc_adopt_earlier"),
+            )
+            cursor.execute(
+                """INSERT INTO inbound_event
+                     (feishu_event_id, received_at, event_type, user_open_id, trace_id)
+                   VALUES (%s, %s, 'im.message.receive_v1', %s, %s)""",
+                ("evt_adopt_later", later, open_id, "trc_adopt_later"),
+            )
+
+        self._insert_app_user(open_id)
+
+        self.assertEqual(self._column(open_id, "first_inbound_at"), earlier)
+        self.assertEqual(self._column(open_id, "last_inbound_at"), later)
+
     def test_a_later_real_inbound_event_clears_a_recorded_unavailable_mark(self) -> None:
         """⑤：同一人后来成功入站会清掉「发不进去」这个标记。"""
         self.store.record_contact_unavailable(

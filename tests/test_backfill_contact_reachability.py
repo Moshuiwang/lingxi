@@ -235,8 +235,33 @@ class BackfillTest(unittest.TestCase):
         self.assertEqual(evidence, ())
         self.assertEqual(self.store.contact_reachability(open_id=self.open_id), CONTACT_UNKNOWN)
 
-    def test_a_translated_definite_rejection_produces_negative_evidence(self) -> None:
-        """``notification_failed`` 是平台明确拒绝统一之后的码，仍要算一条负面证据。"""
+    def test_a_recipient_unreachable_code_produces_negative_evidence(self) -> None:
+        """收件人级拒绝清单里的码（本仓唯一坐实的 230013）确实产生负面证据。"""
+        self._insert_outreach_message(
+            at=datetime.now(UTC), status="failed", last_error="feishu_code_230013"
+        )
+
+        evidence = TOOL.load_evidence(self._dsn)
+        TOOL.apply_evidence(self._dsn, evidence)
+
+        self.assertEqual(len(evidence), 1)
+        self.assertEqual(self.store.contact_reachability(open_id=self.open_id), CONTACT_UNAVAILABLE)
+
+    def test_a_credential_failure_code_produces_no_negative_evidence(self) -> None:
+        """令牌端点故障码同样带 ``feishu_code_`` 前缀，但不在收件人级拒绝清单里。"""
+        self._insert_outreach_message(
+            at=datetime.now(UTC), status="failed", last_error="feishu_code_10003"
+        )
+
+        evidence = TOOL.load_evidence(self._dsn)
+        TOOL.apply_evidence(self._dsn, evidence)
+
+        self.assertEqual(evidence, ())
+        self.assertEqual(self.store.contact_reachability(open_id=self.open_id), CONTACT_UNKNOWN)
+
+    def test_a_notification_failed_row_produces_no_negative_evidence(self) -> None:
+        """``notification_failed`` 历史行已经丢了原始平台码，分不清是 230013 还是令牌/
+        限流故障，回填宁可保持未知（#673 复修：此前把它当成负面证据是错的）。"""
         self._insert_outreach_message(
             at=datetime.now(UTC), status="failed", last_error="notification_failed"
         )
@@ -244,7 +269,8 @@ class BackfillTest(unittest.TestCase):
         evidence = TOOL.load_evidence(self._dsn)
         TOOL.apply_evidence(self._dsn, evidence)
 
-        self.assertEqual(self.store.contact_reachability(open_id=self.open_id), CONTACT_UNAVAILABLE)
+        self.assertEqual(evidence, ())
+        self.assertEqual(self.store.contact_reachability(open_id=self.open_id), CONTACT_UNKNOWN)
 
     def test_an_orphan_open_id_with_no_app_user_row_is_not_counted(self) -> None:
         with connect(self._dsn) as connection, connection.cursor() as cursor:
