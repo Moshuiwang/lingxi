@@ -6,7 +6,7 @@
 状态机的阈值与去重，只借用同一条管理群通道。
 
 **待办正文要能让管理员真的找到这个人**：带 open_id 与库里的邮箱。它只发进管理群；
-落到日志与审计里的一律是脱敏后的标识。
+审计记录不携带任何标识，可追溯的线索只留在日志里，且一律是脱敏后的标识。
 
 四种结局都不允许反过来打断发送收口：落库、查邮箱、发待办任一步失败，只记审计与
 日志，已经落下的状态不回滚——「联系不上」这个事实比「待办没发出去」更重要。
@@ -23,7 +23,7 @@ from lingxi.core.identity.identifiers import redact_identifier
 
 logger = logging.getLogger(__name__)
 
-#: 审计动作名。四个都不含正文，标识一律脱敏。
+#: 审计动作名。四个都不携带任何标识；可追溯线索只在日志里，且一律脱敏。
 AUDIT_MARKED_REACHABLE = "outreach.contact_marked_reachable"
 AUDIT_MARKED_UNAVAILABLE = "outreach.contact_marked_unavailable"
 AUDIT_TODO_NOTIFIED = "outreach.contact_todo_notified"
@@ -95,11 +95,17 @@ class ContactReachabilityRecorder:
         now = self._clock()
         if succeeded:
             self._store.record_contact_reachable(open_id=open_id, when=now)
-            self._record(AUDIT_MARKED_REACHABLE, open_id=redact_identifier(open_id))
+            logger.info(
+                "联系可达状态已记录 outcome=%s open_id=%s", "reachable", redact_identifier(open_id)
+            )
+            self._record(AUDIT_MARKED_REACHABLE)
             return
         code = error_code or "unknown"
         self._store.record_contact_unavailable(open_id=open_id, when=now, code=code)
-        self._record(AUDIT_MARKED_UNAVAILABLE, open_id=redact_identifier(open_id), error_code=code)
+        logger.info(
+            "联系可达状态已记录 outcome=%s open_id=%s", "unavailable", redact_identifier(open_id)
+        )
+        self._record(AUDIT_MARKED_UNAVAILABLE, error_code=code)
         self._send_admin_todo(open_id=open_id, error_code=code)
 
     def _send_admin_todo(self, *, open_id: str, error_code: str) -> None:
@@ -120,7 +126,8 @@ class ContactReachabilityRecorder:
             logger.error("联系不可达管理员待办发送失败 error=%s", type(error).__name__)
             self._record(AUDIT_TODO_NOTIFY_FAILED, error=type(error).__name__)
             return
-        self._record(AUDIT_TODO_NOTIFIED, open_id=redact_identifier(open_id))
+        logger.info("联系不可达管理员待办已发送 open_id=%s", redact_identifier(open_id))
+        self._record(AUDIT_TODO_NOTIFIED)
 
     def _record(self, action: str, **fields: object) -> None:
         if self._audit is not None:

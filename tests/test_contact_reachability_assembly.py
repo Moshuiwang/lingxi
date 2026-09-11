@@ -105,7 +105,10 @@ class SuccessOutcomeTest(unittest.TestCase):
         self.assertEqual(store.unavailable, [])
         self.assertEqual(notifier.sent, [], "成功结局不该发任何管理群消息")
         self.assertEqual(audit.actions(), [AUDIT_MARKED_REACHABLE])
-        self.assertNotIn(OPEN_ID, repr(audit.records), "审计里的标识必须脱敏")
+        self.assertEqual(
+            audit.records, [(AUDIT_MARKED_REACHABLE, {})], "成功结局只留一条不带字段的审计动作"
+        )
+        self.assertNotIn(OPEN_ID, repr(audit.records), "审计不得携带任何标识")
 
 
 class FailureOutcomeTest(unittest.TestCase):
@@ -122,7 +125,15 @@ class FailureOutcomeTest(unittest.TestCase):
         self.assertIn(EMAIL, text)
         self.assertEqual(dedupe_key, TODO_DEDUPE_PREFIX + OPEN_ID)
         self.assertEqual(audit.actions(), [AUDIT_MARKED_UNAVAILABLE, AUDIT_TODO_NOTIFIED])
-        self.assertNotIn(OPEN_ID, repr(audit.records), "审计里的标识必须脱敏")
+        self.assertEqual(
+            audit.records,
+            [
+                (AUDIT_MARKED_UNAVAILABLE, {"error_code": "feishu_code_230013"}),
+                (AUDIT_TODO_NOTIFIED, {}),
+            ],
+            "失败结局的两条审计动作分别只带 error_code、不带字段",
+        )
+        self.assertNotIn(OPEN_ID, repr(audit.records), "审计不得携带任何标识")
 
     def test_a_missing_error_code_is_recorded_as_unknown(self) -> None:
         store, notifier = FakeStore(), FakeNotifier()
