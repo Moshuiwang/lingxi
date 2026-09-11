@@ -118,16 +118,22 @@
 #                                     记得手动清理（独立审查 P2-15 的登记延续）。
 #                                     **若未来把本脚本用于生产环境**，落盘前须
 #                                     补加密，本次改动不改变这一条。
-#   LINGXI_DRILL_INJECT_SYNTHETIC     是否注入合成到期样本并核对保留清理语义，
-#                                     只接受 `0` 或 `1`（默认 `1`）——**除这两个
-#                                     字面值外一律预检时响亮失败**，不静默当
-#                                     成"跳过"处理（例如误写成 `true`/`yes`会
-#                                     直接报错，不会悄悄退化成 0 那条最简路径；
-#                                     外审 codex gpt-5.6-sol 2026-09-11 指出的
-#                                     真实缺口）。`1` 时做完整核对；`0` 时只做
-#                                     备份/恢复/迁移/行数完整性检查（生产
-#                                     runbook 里最简的"确认能恢复"子集，不核对
-#                                     保留语义）——两种模式下行数回读都会执行。
+#   LINGXI_DRILL_INJECT_SYNTHETIC     是否注入合成到期样本并核对保留清理语义。
+#                                     **不设置、或设为空字符串**时按默认 `1`
+#                                     处理（shell 的 `${VAR:-1}` 语义——空字符串
+#                                     等同未设置，不是一个"合法取值"）；**一旦
+#                                     显式设成非空值，只接受 `0` 或 `1` 这两个
+#                                     字面值，其余一律预检时响亮失败**，不静默
+#                                     当成"跳过"处理（例如误写成 `true`/`yes`
+#                                     会直接报错，不会悄悄退化成 0 那条最简
+#                                     路径；外审 codex gpt-5.6-sol 2026-09-11
+#                                     指出的真实缺口，外审复核 2026-09-11 核对
+#                                     本段措辞与 `${LINGXI_DRILL_INJECT_SYNTHETIC:-1}`
+#                                     的空字符串行为一致）。`1` 时做完整核对；
+#                                     `0` 时只做备份/恢复/迁移/行数完整性检查
+#                                     （生产 runbook 里最简的"确认能恢复"子集，
+#                                     不核对保留语义）——两种模式下行数回读都
+#                                     会执行。
 #
 # 用法（预发/生产正式执行必须显式带 `LINGXI_DRILL_INJECT_SYNTHETIC=1`，不依赖
 # 默认值——命令本身就是这次演练做没做完整核对的凭据）：
@@ -208,9 +214,12 @@ run_source_tool() {
 
 step_preflight() {
   log "== 预检 =="
-  # 只接受 0 或 1，其余值响亮失败——`true`/`yes`/空字符串等一律不算"跳过"，
-  # 避免调用方笔误把本该核对保留语义的一次真实执行悄悄降级成最简子集
-  # （外审 codex gpt-5.6-sol 2026-09-11 指出的真实缺口）。
+  # 只接受 0 或 1，其余值响亮失败——`true`/`yes`等一律不算"跳过"，避免调用方
+  # 笔误把本该核对保留语义的一次真实执行悄悄降级成最简子集（外审 codex
+  # gpt-5.6-sol 2026-09-11 指出的真实缺口）。**空字符串不会走到这条判断**：
+  # 上面 `INJECT_SYNTHETIC="${LINGXI_DRILL_INJECT_SYNTHETIC:-1}"` 用的是 shell
+  # `:-` 语义，未设置或设为空字符串在赋值这一步就已经落回默认值 `1`，不是
+  # "0/1 之外的第三种取值"（外审复核 2026-09-11 核对头注释与这里的措辞一致）。
   if [[ "${INJECT_SYNTHETIC}" != "0" && "${INJECT_SYNTHETIC}" != "1" ]]; then
     echo "配置错误：LINGXI_DRILL_INJECT_SYNTHETIC 只接受 0 或 1，收到「${INJECT_SYNTHETIC}」——不是这两个字面值时不当成 0 处理，避免笔误静默跳过保留语义核对" >&2
     exit 1
@@ -649,24 +658,40 @@ step_verify() {
 
   # 真实行按主键集合核对，不只看总数（见 step_inject_synthetic 里 real_ids()
   # 的登记：只比总数会让"删错一行、多留一行、净数不变"这类问题被放过）。
+  #
+  # 安全边际集合的清理后核对**不重算时间谓词**，改成与下面「已到期」核对
+  # 同型的按主键存在性查询（外审复核 2026-09-11 指出的真实缺口）：若沿用
+  # `real_ids ... safe`（`expires_at > now() + interval '1 hour'`），清理后
+  # `now()` 已经推进到之后的时刻，阈值本身跟着后移——落在
+  # `(清理前 now()+1h, 清理后 now()+1h]` 这个窗口内、根本没被清理动过的真实行
+  # 会从重算出的"安全边际"集合里静默消失，被误判成"数据变化"而判故障。
+  # 直接按 `step_inject_synthetic` 里已经固定下来的那批主键查存在性，不重新
+  # 用任何时间点判断"现在算不算安全边际"，比对结果与耗时、与两次采样之间
+  # `now()` 走了多远都无关。
   local real_galaxy_safe_after real_sync_safe_after
-  real_galaxy_safe_after=$(real_ids galaxy_import_batch 'gib_drill_%' safe)
-  if [[ "${real_galaxy_safe_after}" != "${REAL_GALAXY_SAFE_BEFORE}" ]]; then
-    echo "核对失败：galaxy_import_batch 真实且未到期（安全边际）主键集合清理前后不一致，理应逐行不变：" >&2
-    echo "--- 清理前 ---" >&2
-    printf '%s\n' "${REAL_GALAXY_SAFE_BEFORE}" >&2
-    echo "--- 清理后 ---" >&2
-    printf '%s\n' "${real_galaxy_safe_after}" >&2
-    exit 1
+  if [[ -n "${REAL_GALAXY_SAFE_BEFORE}" ]]; then
+    real_galaxy_safe_after=$(docker exec "${DRILL_DB_CONTAINER}" psql -At -U "${DRILL_DB_USER}" -d "${DRILL_DB_NAME}" -c \
+      "SELECT id FROM galaxy_import_batch WHERE id IN ($(sql_in_list "${REAL_GALAXY_SAFE_BEFORE}")) ORDER BY id;")
+    if [[ "${real_galaxy_safe_after}" != "${REAL_GALAXY_SAFE_BEFORE}" ]]; then
+      echo "核对失败：galaxy_import_batch 以下真实且未到期（安全边际）主键理应逐行保留，但集合发生变化：" >&2
+      echo "--- 清理前 ---" >&2
+      printf '%s\n' "${REAL_GALAXY_SAFE_BEFORE}" >&2
+      echo "--- 清理后仍存在的 ---" >&2
+      printf '%s\n' "${real_galaxy_safe_after}" >&2
+      exit 1
+    fi
   fi
-  real_sync_safe_after=$(real_ids feishu_org_sync_run 'orgsync_drill_%' safe)
-  if [[ "${real_sync_safe_after}" != "${REAL_SYNC_SAFE_BEFORE}" ]]; then
-    echo "核对失败：feishu_org_sync_run 真实且未到期（安全边际）主键集合清理前后不一致，理应逐行不变：" >&2
-    echo "--- 清理前 ---" >&2
-    printf '%s\n' "${REAL_SYNC_SAFE_BEFORE}" >&2
-    echo "--- 清理后 ---" >&2
-    printf '%s\n' "${real_sync_safe_after}" >&2
-    exit 1
+  if [[ -n "${REAL_SYNC_SAFE_BEFORE}" ]]; then
+    real_sync_safe_after=$(docker exec "${DRILL_DB_CONTAINER}" psql -At -U "${DRILL_DB_USER}" -d "${DRILL_DB_NAME}" -c \
+      "SELECT id FROM feishu_org_sync_run WHERE id IN ($(sql_in_list "${REAL_SYNC_SAFE_BEFORE}")) ORDER BY id;")
+    if [[ "${real_sync_safe_after}" != "${REAL_SYNC_SAFE_BEFORE}" ]]; then
+      echo "核对失败：feishu_org_sync_run 以下真实且未到期（安全边际）主键理应逐行保留，但集合发生变化：" >&2
+      echo "--- 清理前 ---" >&2
+      printf '%s\n' "${REAL_SYNC_SAFE_BEFORE}" >&2
+      echo "--- 清理后仍存在的 ---" >&2
+      printf '%s\n' "${real_sync_safe_after}" >&2
+      exit 1
+    fi
   fi
 
   # 真实已到期行理应被清理函数删掉——这正是 V-投递-07 的本意：到期的低敏事实
