@@ -30,6 +30,7 @@ from lingxi.adapters.postgres_conversation import (
     PostgresGatewayStore,
     PostgresTaskQueue,
 )
+from lingxi.config.content import default_content_catalog
 from lingxi.core.conversation import BUSY_HINT_TEXT, EventPipeline, InboundMessage
 from lingxi.core.conversation.ports import HandledAs, OnboardingResult, OnboardingState
 from lingxi.core.ids import new_id
@@ -662,14 +663,28 @@ class NewCommandRaceTests(GatewayPostgresTestCase):
             # 不得混入 gateway.new_session 成功文案——否则用户会同时收到「仍在
             # 处理中」和「已开启新会话」两条自相矛盾的提示。两个线程共用同一条
             # CallLog，按 reply_to_message_id 只取 /new 这条事件自己的回复。
+            # 忙碌提示本身有两种合法取值：/new 这条线程读到占用任务时，它是否
+            # 已经落成 running_task_status == "queued" 取决于两个线程谁先落库，
+            # 因此回复可能是 gateway.busy_hint 或 gateway.busy_hint_rejected 之一
+            # （选取规则见 `_busy_hint_for`），二者都不算错。
             new_replies = [
                 fields["text"]
                 for name, fields in self.log.entries
                 if name == "reply.send_text" and fields["reply_to_message_id"] == "om_evt_new"
             ]
-            self.assertEqual(
+            self.assertEqual(len(new_replies), 1, "竞态落到忙碌分支时 /new 应恰好收到一条回复")
+            busy_hint_rejected_text = (
+                default_content_catalog().text("gateway.busy_hint_rejected").text
+            )
+            new_session_text = default_content_catalog().text("gateway.new_session").text
+            self.assertIn(
+                new_replies[0],
+                {BUSY_HINT_TEXT, busy_hint_rejected_text},
+                "竞态落到忙碌分支时回复必须是两条忙碌提示之一",
+            )
+            self.assertNotIn(
+                new_session_text,
                 new_replies,
-                [BUSY_HINT_TEXT],
                 "竞态落到忙碌分支时不得携带 /new 成功文案",
             )
 
