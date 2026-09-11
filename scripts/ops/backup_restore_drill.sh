@@ -22,9 +22,19 @@
 # `postgres:17`，其内建客户端天然是同版本，`docker exec` 到它身上不受此限制。
 #
 # **破坏半径（先读这一段再执行）**：
-#   - 对源库**唯一**的操作是两次只读连接：一次 `pg_isready` 预检、一次
-#     `pg_dump -Fc`；本脚本不建立任何写连接，不 stop/restart 任何服务，不重启
-#     任何容器，不触碰源库所在主机。
+#   - 对源库**只有**三次只读连接：`pg_isready` 预检、`pg_dump -Fc` 备份、
+#     恢复并迁移之后的一次逐表行数回读（`step_verify_row_counts`，只读
+#     `count(*)`）；本脚本不建立任何写连接，不 stop/restart 任何服务，不重启
+#     任何容器，不触碰源库所在主机（此前版本头注释漏记了行数回读这一次，
+#     外审 codex gpt-5.6-sol 2026-09-11 指出）。
+#   - **行数回读假设演练窗口内源库静默（无并发写入）**：`pg_dump` 与行数回读
+#     是两次独立连接，不共享同一快照——源库若在这两次连接之间有正常业务写入
+#     （新增/更新/删除任何一行），逐表计数就会出现差异，脚本按 `set -euo
+#     pipefail` 的一贯纪律判定失败退出。**这不代表恢复出了问题**，只代表
+#     源库在演练窗口内不是静止的；见 `step_verify_row_counts` 失败信息与下方
+#     「前提」。在预发/生产执行前，建议挑一个源库写入极少的窗口（回读语句本身
+#     耗时通常在秒级），或在差异出现后人工核对差异行是否对应这段时间内的正常
+#     业务写入。
 #   - 全部有副作用的操作只发生在本脚本新建的隔离容器/网络里（默认
 #     `lingxi-drill-db` / `lingxi-drill-net`），随脚本收尾一并销毁；隔离数据库
 #     密码现场随机生成，只作为该容器的环境变量存在，容器销毁即失效，不落盘、
@@ -40,8 +50,8 @@
 #     再销毁，不为了让脚本看起来"跑完"而在失败时静默擦掉现场。
 #   - **源库 DSN 只从环境变量读，本脚本不接受、也不解析任何命令行参数**；DSN
 #     本身不打印、不落日志——唯一例外是源库操作失败时，会把捕获到的错误文本
-#     经 `sed -E 's#://[^@[:space:]]*@#://<creds>@#g'` 脱敏后打到 stderr 供排障，
-#     脱敏覆盖 `postgresql://` 与脱敏前已转换出的形态。
+#     经 `mask()` 脱敏后打到 stderr 供排障，覆盖 URI 形态（`user:pass@`，含
+#     `postgresql+psycopg://`）与 keyword/URI 查询参数形态（`password=...`）。
 #
 # **前提**：
 #   - 在能以只读身份连到源库 DSN、且能 `docker run`（含 `--network host`）/
@@ -52,13 +62,28 @@
 #     `docker pull` 到（脚本不会静默重试拉取失败；缺镜像直接失败）。
 #   - 磁盘要有余量：dump 与隔离实例的数据量级与源库相当，加上三个镜像的本地
 #     层；执行前后各 `df -h` 一次自行核对，不由脚本代为判断磁盘是否够用。
+#   - **源库在整个演练窗口内应当基本静默**（见上方「破坏半径」行数回读一条）：
+#     `pg_dump` 与行数回读不在同一快照里，源库若持续有写入，行数比对会假红。
+#     这不是本脚本能替调用方判断的事，执行前自行确认窗口，执行中出现差异先
+#     核对是不是这段时间内的正常业务写入，不要不看原因就重跑。
 #
 # **失败后如何处理**：先用 `docker logs "${LINGXI_DRILL_DB_CONTAINER:-lingxi-drill-db}"`、
 # 查看恢复日志（脚本打印的 `RESTORE_LOG` 路径）和上面打印的最后一步取证；确认
-# 证据留存完毕后手动执行：
-#   docker rm -f "${LINGXI_DRILL_DB_CONTAINER:-lingxi-drill-db}"
+# 证据留存完毕后手动执行（**`docker rm` 必须带 `-v`**——隔离库装的是恢复出来的
+# 全部数据，不带 `-v` 删容器不删匿名卷，等于把这份数据原样留在宿主机上，外审
+# codex gpt-5.6-sol 2026-09-11 指出的真实缺口）：
+#   docker rm -f -v "${LINGXI_DRILL_DB_CONTAINER:-lingxi-drill-db}"
 #   docker network rm "${LINGXI_DRILL_NETWORK:-lingxi-drill-net}"
 #   rm -f <脚本打印的 dump/日志临时文件路径>
+#   docker volume ls --filter "label=com.docker.compose.project" # 仅供比对，本脚本不用 compose
+# `docker rm -v` 会清掉该容器挂的**全部**匿名卷（不止一个也一样，Docker 语义是
+# 按容器一次性回收，不是逐卷计数）；`step_isolate_and_restore` 探测到多于一个
+# 匿名卷时已经先行报错退出（见下方 P2-14 登记），那种情况下容器还没做任何
+# 恢复动作，直接按上面这条 `docker rm -f -v` 处理即可，不需要另外逐个
+# `docker volume rm`。若不放心，`docker inspect -f '{{ range .Mounts }}{{ if eq
+# .Type "volume" }}{{ .Name }}{{ "\n" }}{{ end }}{{ end }}' <容器名>` 先列出卷名，
+# `docker rm -f -v` 之后用同一条命令或 `docker volume inspect <卷名>` 回读确认
+# 不存在（`step_destroy` 成功路径就是这么核对的）。
 #
 # **可覆盖的环境变量**：
 #   LINGXI_DRILL_SOURCE_DSN           源库连接串，优先读取；未设时回落
@@ -94,13 +119,20 @@
 #                                     **若未来把本脚本用于生产环境**，落盘前须
 #                                     补加密，本次改动不改变这一条。
 #   LINGXI_DRILL_INJECT_SYNTHETIC     是否注入合成到期样本并核对保留清理语义，
-#                                     默认 1；设为 0 时只做备份/恢复/迁移/行数
-#                                     完整性检查（生产 runbook 里最简的"确认能
-#                                     恢复"子集，不核对保留语义）——两种模式下
-#                                     行数回读都会执行。
+#                                     只接受 `0` 或 `1`（默认 `1`）——**除这两个
+#                                     字面值外一律预检时响亮失败**，不静默当
+#                                     成"跳过"处理（例如误写成 `true`/`yes`会
+#                                     直接报错，不会悄悄退化成 0 那条最简路径；
+#                                     外审 codex gpt-5.6-sol 2026-09-11 指出的
+#                                     真实缺口）。`1` 时做完整核对；`0` 时只做
+#                                     备份/恢复/迁移/行数完整性检查（生产
+#                                     runbook 里最简的"确认能恢复"子集，不核对
+#                                     保留语义）——两种模式下行数回读都会执行。
 #
-# 用法：
+# 用法（预发/生产正式执行必须显式带 `LINGXI_DRILL_INJECT_SYNTHETIC=1`，不依赖
+# 默认值——命令本身就是这次演练做没做完整核对的凭据）：
 #   LINGXI_DRILL_SOURCE_DSN=postgresql://... \
+#   LINGXI_DRILL_INJECT_SYNTHETIC=1 \
 #   LINGXI_DRILL_SCHEDULER_IMAGE=ghcr.io/moshuiwang/lingxi-scheduler:<tag> \
 #   LINGXI_DRILL_MIGRATE_IMAGE=ghcr.io/moshuiwang/lingxi-migrate:<tag> \
 #     scripts/ops/backup_restore_drill.sh
@@ -126,9 +158,17 @@ require_cmd() {
   command -v "$1" >/dev/null 2>&1 || { echo "缺少命令：$1" >&2; exit 1; }
 }
 
-# 连接信息脱敏：唯一暴露面是「用户:口令@」这一段。覆盖 postgresql:// 与
-# postgresql+psycopg://（去引号前的原始形态），失败文本一律先过这一道再落 stderr。
-mask() { sed -E 's#://[^@[:space:]]*@#://<creds>@#g'; }
+# 连接信息脱敏：覆盖两种 DSN 形态各自暴露口令的位置。① URI 形态
+# `postgresql://user:pass@host/db`（含转换前的 `postgresql+psycopg://`）——
+# 口令在「用户:口令@」这一段；② keyword/value 形态 `host=... password=...`
+# 与 URI 查询参数形态 `postgresql://host/db?password=...`——两者口令都以
+# 字面 `password=` 开头，到下一个 `&` 或空白为止。只盖第一种曾经是外审
+# codex gpt-5.6-sol 2026-09-11 指出的真实缺口：libpq 三种 DSN 写法都合法，
+# 调用方给哪种形态本脚本不作限制，脱敏必须覆盖全部三种，不能只认 URI 的
+# user:pass@ 这一种。失败文本一律先过这一道再落 stderr。
+mask() {
+  sed -E 's#://[^@[:space:]]*@#://<creds>@#g; s#[Pp][Aa][Ss][Ss][Ww][Oo][Rr][Dd]=[^&[:space:]]*#password=<creds>#g'
+}
 
 # 源库连接串解析：优先 LINGXI_DRILL_SOURCE_DSN，缺省回落 LINGXI_MIGRATION_DSN
 # （部署 env 已有的同一份迁移 DSN，二选一，不要求同时设置）。两者都缺时只报
@@ -168,6 +208,13 @@ run_source_tool() {
 
 step_preflight() {
   log "== 预检 =="
+  # 只接受 0 或 1，其余值响亮失败——`true`/`yes`/空字符串等一律不算"跳过"，
+  # 避免调用方笔误把本该核对保留语义的一次真实执行悄悄降级成最简子集
+  # （外审 codex gpt-5.6-sol 2026-09-11 指出的真实缺口）。
+  if [[ "${INJECT_SYNTHETIC}" != "0" && "${INJECT_SYNTHETIC}" != "1" ]]; then
+    echo "配置错误：LINGXI_DRILL_INJECT_SYNTHETIC 只接受 0 或 1，收到「${INJECT_SYNTHETIC}」——不是这两个字面值时不当成 0 处理，避免笔误静默跳过保留语义核对" >&2
+    exit 1
+  fi
   SOURCE_DSN=$(resolve_source_dsn)
   # 命名碰撞断言（独立审查 P2-12 的登记延续）：DRILL_DB_CONTAINER 与
   # DRILL_NETWORK 是脚本同时创建、同时存在的两个不同类型对象，同名会让不显式
@@ -385,9 +432,13 @@ step_verify_row_counts() {
   target_counts=$(docker exec "${DRILL_DB_CONTAINER}" psql -A -t -F '|' -U "${DRILL_DB_USER}" -d "${DRILL_DB_NAME}" \
     -c "$(row_counts_sql)")
   if [[ "${source_counts}" != "${target_counts}" ]]; then
-    echo "核对失败：恢复并迁移到链头之后的逐表行数与源库不一致。" >&2
-    echo "本步假设源库在演练时已处于链头（本批合同顺序里 S-2-4 先迁移预发到链头，S-2-5 才跑本演练）；" >&2
-    echo "若源库落后链头，迁移会新增源库没有的表，这里会如实报告差异，不做静默容错。" >&2
+    echo "核对失败：恢复并迁移到链头之后的逐表行数与源库不一致。两种已知原因，先按下面排查，" >&2
+    echo "不要不看原因就重跑：" >&2
+    echo "① 源库在演练窗口内有正常业务写入——pg_dump 与本次行数回读是两次独立连接，不共享同一" >&2
+    echo "   快照，源库若持续写入，逐表计数会随之出现差异；这不代表恢复出了问题，代表源库不是" >&2
+    echo "   静止的（见脚本头「破坏半径」「前提」两处登记）。" >&2
+    echo "② 源库在演练时落后链头——本批合同顺序里 S-2-4 先迁移预发到链头、S-2-5 才跑本演练，" >&2
+    echo "   但若源库确实落后，迁移会新增源库没有的表，这里如实报告差异，不做静默容错。" >&2
     echo "--- 源库 ---" >&2
     printf '%s\n' "${source_counts}" >&2
     echo "--- 恢复并迁移后 ---" >&2
@@ -395,6 +446,41 @@ step_verify_row_counts() {
     exit 1
   fi
   log "行数回读通过：$(printf '%s\n' "${target_counts}" | grep -c .) 张表逐表一致"
+}
+
+# 真实（非本脚本合成）行的主键快照：按「安全边际未到期」（expires_at 比清理
+# 那一刻还有 1 小时以上余量，这一轮清理不该碰）与「已到期」（清理这一轮理应
+# 删掉，这正是 V-投递-07 的本意——到期的低敏事实按原始写入时间回收，不因为
+# 它是恢复出来的真实数据就网开一面）两类分别核对，不再只看总数（外审 codex
+# gpt-5.6-sol 2026-09-11 指出的真实缺口：旧版把全部非合成行当「真实且未
+# 到期」，源库里本就到期的真实行被正常清掉会被误判为故障；且只核对计数，
+# 删错一行、多留一行也可能净数不变而被放过）。1 小时余量避免把"采样时还有
+# 富余、但恰好在演练这几秒内跨过到期线"的边界行错判进"必须保留"集合——这类
+# 边界行本就该由下一轮清理处理，不属于本次演练断言的范围；处于安全边际与
+# 已到期之间的灰区同理不作断言。只覆盖被 `lingxi_retention_cleanup` 处理的
+# 两张表（galaxy_import_batch / feishu_org_sync_run）。
+real_ids() {
+  # $1 = 表名，$2 = 本脚本合成数据的 id 前缀（LIKE 模式，如 'gib_drill_%'），
+  # $3 = safe（安全边际未到期）｜expired（已到期）
+  local cmp
+  if [[ "$3" == "safe" ]]; then
+    cmp="expires_at > now() + interval '1 hour'"
+  else
+    cmp="expires_at <= now()"
+  fi
+  docker exec "${DRILL_DB_CONTAINER}" psql -At -U "${DRILL_DB_USER}" -d "${DRILL_DB_NAME}" -c \
+    "SELECT id FROM ${1} WHERE id NOT LIKE '${2}' AND ${cmp} ORDER BY id;"
+}
+
+# 把换行分隔的 ID 列表转成安全的 SQL IN (...) 值列表：单引号按 SQL 字面量规则
+# 加倍转义，不依赖 ID 内容不含特殊字符的假设。
+sql_in_list() {
+  local id out=""
+  while IFS= read -r id; do
+    [[ -z "${id}" ]] && continue
+    out+="'${id//\'/\'\'}',"
+  done <<<"$1"
+  printf '%s' "${out%,}"
 }
 
 step_inject_synthetic() {
@@ -428,12 +514,15 @@ step_inject_synthetic() {
     -c "SELECT id, started_at, expires_at, (expires_at <= now()) AS is_expired FROM galaxy_import_batch ORDER BY started_at;" \
     -c "SELECT id, started_at, expires_at, (expires_at <= now()) AS is_expired FROM feishu_org_sync_run ORDER BY started_at;"
 
-  # 真实恢复出来的对照行数（不含本步注入的合成行），供清理后原样核对——不是硬编码
-  # 的固定数字：源库会持续写入新的组织快照，写成常量会让脚本在下一次真实运行时
-  # 假红。
-  REAL_SYNC_RUN_COUNT_BEFORE=$(docker exec "${DRILL_DB_CONTAINER}" psql -U "${DRILL_DB_USER}" -d "${DRILL_DB_NAME}" -Atc \
-    "SELECT count(*) FROM feishu_org_sync_run WHERE id NOT LIKE 'orgsync_drill_%'")
-  log "真实恢复且未过期的 feishu_org_sync_run 对照行数：${REAL_SYNC_RUN_COUNT_BEFORE}"
+  # 真实（不含本步注入的合成行）主键快照，按「安全边际未到期」与「已到期」
+  # 两类分别记录，供清理后核对（见 real_ids() 函数文档；不是硬编码固定数字或
+  # 只看总数——源库会持续写入新的组织快照，写成常量或只比总数会让脚本在下一
+  # 次真实运行时假红或假绿）。四个变量是脚本全局状态，供 step_verify 使用。
+  REAL_GALAXY_SAFE_BEFORE=$(real_ids galaxy_import_batch 'gib_drill_%' safe)
+  REAL_SYNC_SAFE_BEFORE=$(real_ids feishu_org_sync_run 'orgsync_drill_%' safe)
+  REAL_GALAXY_EXPIRED_BEFORE=$(real_ids galaxy_import_batch 'gib_drill_%' expired)
+  REAL_SYNC_EXPIRED_BEFORE=$(real_ids feishu_org_sync_run 'orgsync_drill_%' expired)
+  log "真实主键快照：galaxy_import_batch 安全边际未到期 $(printf '%s\n' "${REAL_GALAXY_SAFE_BEFORE}" | grep -c .) 行／已到期 $(printf '%s\n' "${REAL_GALAXY_EXPIRED_BEFORE}" | grep -c .) 行；feishu_org_sync_run 安全边际未到期 $(printf '%s\n' "${REAL_SYNC_SAFE_BEFORE}" | grep -c .) 行／已到期 $(printf '%s\n' "${REAL_SYNC_EXPIRED_BEFORE}" | grep -c .) 行（已到期这组预期清理后消失）"
 }
 
 step_run_real_cleanup() {
@@ -452,9 +541,29 @@ step_run_real_cleanup() {
   # 校验，不代表这次演练用到任何外部凭据；mcp_token_encrypt_key 留空（默认
   # None）会让权限链清理里 mcp_sync_check 那一面按既有设计优雅跳过（记一条
   # 审计后继续），这正是"不带任何外部凭据"要求下的预期形态，不是缺陷。
+  # 结果判定不只打印 summary（外审 codex gpt-5.6-sol 2026-09-11 指出的真实
+  # 缺口：此前 run_once() 的返回值只打印，锁等待让路、权限链某一面没装配这类
+  # "看起来跑完但没做完"的状态不会让脚本非零退出）。先读各职责报告类型的
+  # 结构化字段（见 src/lingxi/apps/scheduler/retention.py 与
+  # adapters/retention.py 的 dataclass 定义），逐项按字段判定，不猜字段名：
+  #   - report is None：本轮未执行——本次演练用全新 threading.Event() 且从不
+  #     置位，正常路径不可能发生，出现即判失败。
+  #   - RetentionReport.blocked_tables 非空：保留清理有表因锁等待超时整批
+  #     让路，这一轮没做完，判失败（不是"删了 0 行"那种正常空转）。
+  #   - PermissionRetentionReport.checks_wired：唯一允许的"因缺凭据预期跳过"
+  #     白名单，且只白名单这一项——本次演练确定性不传
+  #     LINGXI_MCP_TOKEN_ENCRYPT_KEY（E-3 ⑤"不带任何外部凭据"），
+  #     mcp_sync_check 那一面因此确定性地不装配，checks_wired 必为 False；
+  #     不是 False 反而是异常（说明这次调用方式下密钥不知怎么被配置上了）。
+  #   - 其余三类（IdleConversationSweepDuty/ContentCaptureRetentionDuty 返回
+  #     裸 int；ExpiredCarrierRetentionDuty 内部四面互相独立重试，任一面失败
+  #     已经在职责自己的 run_once() 里 raise，不会安静返回）没有额外结构化
+  #     字段要看——它们的失败路径已经是 Python 异常，被本脚本 `set -e` 接住，
+  #     不需要在这里另外判定。
   docker run --rm --network "${DRILL_NETWORK}" -e "LINGXI_DRILL_DSN=${DRILL_DSN}" \
     --entrypoint python "${DRILL_SCHEDULER_IMAGE}" -c "
 import os
+import sys
 import threading
 
 from lingxi.apps.scheduler.assembly import _build_cleanup_duties
@@ -472,10 +581,27 @@ config = SchedulerConfig(
 )
 duties = _build_cleanup_duties(config, threading.Event(), StructuredLogAuditSink())
 print(f'已装配 {len(duties)} 项保留职责：' + '、'.join(duty.name for duty in duties))
+
+failures = []
 for duty in duties:
     report = duty.run_once()
     summary = getattr(report, 'summary', None)
     print(f'{duty.name}：{summary() if callable(summary) else report}')
+    if report is None:
+        failures.append(f'{duty.name}：本轮未执行（report is None），但本次演练从未请求停止，这是异常状态')
+        continue
+    blocked = getattr(report, 'blocked_tables', None)
+    if blocked:
+        failures.append(f'{duty.name}：以下表因锁等待超时整批让路，本轮未做完：' + '、'.join(blocked))
+    if hasattr(report, 'checks_wired') and report.checks_wired is not False:
+        failures.append(f'{duty.name}：checks_wired={report.checks_wired!r}，与本次演练确定性不配置 MCP 主密钥的预期（应为 False）不符')
+
+if failures:
+    print('保留职责结果核对失败：')
+    for line in failures:
+        print(f'  - {line}')
+    sys.exit(1)
+print(f'{len(duties)} 项保留职责结果核对通过：无阻塞表、无非白名单跳过。')
 "
 }
 
@@ -521,14 +647,53 @@ step_verify() {
     exit 1
   fi
 
-  local real_sync_run_count_after
-  real_sync_run_count_after=$(docker exec "${DRILL_DB_CONTAINER}" psql -U "${DRILL_DB_USER}" -d "${DRILL_DB_NAME}" -Atc \
-    "SELECT count(*) FROM feishu_org_sync_run WHERE id NOT LIKE 'orgsync_drill_%'")
-  if [[ "${real_sync_run_count_after}" != "${REAL_SYNC_RUN_COUNT_BEFORE}" ]]; then
-    echo "核对失败：真实恢复的 feishu_org_sync_run 对照行清理前 ${REAL_SYNC_RUN_COUNT_BEFORE} 行、清理后 ${real_sync_run_count_after} 行，理应逐行不变" >&2
+  # 真实行按主键集合核对，不只看总数（见 step_inject_synthetic 里 real_ids()
+  # 的登记：只比总数会让"删错一行、多留一行、净数不变"这类问题被放过）。
+  local real_galaxy_safe_after real_sync_safe_after
+  real_galaxy_safe_after=$(real_ids galaxy_import_batch 'gib_drill_%' safe)
+  if [[ "${real_galaxy_safe_after}" != "${REAL_GALAXY_SAFE_BEFORE}" ]]; then
+    echo "核对失败：galaxy_import_batch 真实且未到期（安全边际）主键集合清理前后不一致，理应逐行不变：" >&2
+    echo "--- 清理前 ---" >&2
+    printf '%s\n' "${REAL_GALAXY_SAFE_BEFORE}" >&2
+    echo "--- 清理后 ---" >&2
+    printf '%s\n' "${real_galaxy_safe_after}" >&2
     exit 1
   fi
-  log "核对通过：过期合成行已清除；未过期合成行与真实恢复行（含 feishu_org_sync_run 全部真实行）逐行保留。"
+  real_sync_safe_after=$(real_ids feishu_org_sync_run 'orgsync_drill_%' safe)
+  if [[ "${real_sync_safe_after}" != "${REAL_SYNC_SAFE_BEFORE}" ]]; then
+    echo "核对失败：feishu_org_sync_run 真实且未到期（安全边际）主键集合清理前后不一致，理应逐行不变：" >&2
+    echo "--- 清理前 ---" >&2
+    printf '%s\n' "${REAL_SYNC_SAFE_BEFORE}" >&2
+    echo "--- 清理后 ---" >&2
+    printf '%s\n' "${real_sync_safe_after}" >&2
+    exit 1
+  fi
+
+  # 真实已到期行理应被清理函数删掉——这正是 V-投递-07 的本意：到期的低敏事实
+  # 按原始写入时间回收，不因为它是恢复出来的真实数据就网开一面。逐主键核对
+  # 存在性，两张表分别处理；这组快照在 step_inject_synthetic 里为空是常态
+  # （生产/预发上保留清理正常按分钟跑，源库里通常不会积压真实已到期行），
+  # 非空时才有断言意义。
+  local remaining
+  if [[ -n "${REAL_GALAXY_EXPIRED_BEFORE}" ]]; then
+    remaining=$(docker exec "${DRILL_DB_CONTAINER}" psql -At -U "${DRILL_DB_USER}" -d "${DRILL_DB_NAME}" -c \
+      "SELECT id FROM galaxy_import_batch WHERE id IN ($(sql_in_list "${REAL_GALAXY_EXPIRED_BEFORE}")) ORDER BY id;")
+    if [[ -n "${remaining}" ]]; then
+      echo "核对失败：galaxy_import_batch 以下真实已到期主键理应被本轮清理，但仍存在：" >&2
+      printf '%s\n' "${remaining}" >&2
+      exit 1
+    fi
+  fi
+  if [[ -n "${REAL_SYNC_EXPIRED_BEFORE}" ]]; then
+    remaining=$(docker exec "${DRILL_DB_CONTAINER}" psql -At -U "${DRILL_DB_USER}" -d "${DRILL_DB_NAME}" -c \
+      "SELECT id FROM feishu_org_sync_run WHERE id IN ($(sql_in_list "${REAL_SYNC_EXPIRED_BEFORE}")) ORDER BY id;")
+    if [[ -n "${remaining}" ]]; then
+      echo "核对失败：feishu_org_sync_run 以下真实已到期主键理应被本轮清理，但仍存在：" >&2
+      printf '%s\n' "${remaining}" >&2
+      exit 1
+    fi
+  fi
+  log "核对通过：过期合成行已清除；真实未到期（安全边际）主键集合逐行不变；真实已到期主键（若有）已被清理。"
 }
 
 step_destroy() {
