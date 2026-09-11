@@ -476,9 +476,9 @@ docker compose --env-file deploy/.env.stage \
   -f deploy/compose.yaml -f deploy/compose.stage.yaml \
   --profile job run --rm migrate
 
-# 2. 再启动常驻服务
+# 2. 再启动常驻服务（scheduler + gateway + 常驻 queue worker，见上文 mvp profile 说明）
 docker compose --env-file deploy/.env.stage \
-  -f deploy/compose.yaml -f deploy/compose.stage.yaml up -d
+  -f deploy/compose.yaml -f deploy/compose.stage.yaml --profile mvp up -d
 
 # 3. 回读
 docker compose --env-file deploy/.env.stage \
