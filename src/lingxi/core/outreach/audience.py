@@ -13,6 +13,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from dataclasses import dataclass
+from datetime import datetime
 
 from lingxi.config.content import ContentCatalog, default_content_catalog
 from lingxi.core.outreach.welcome_card import WelcomeAudience, company_scope_text
@@ -33,6 +34,10 @@ SKIP_NO_METRICS = "no_metrics"
 SKIP_AMBIGUOUS_NAME = "roster_name_ambiguous"
 SKIP_COMPANY_NAME_MISSING = "company_name_missing"
 SKIP_METRIC_NAME_MISSING = "metric_name_missing"
+#: 上一次主动发送已经明确送不进去，且这个人此后没有再开口——再发只会再失败，
+#: 管理员在那次失败时已经收到过手动触达的待办。只有他再次入站（清掉标记）或
+#: 状态被更新后才会重新进入名单。「未知」不在此列：从没试过的人照常试发一次。
+SKIP_CONTACT_UNAVAILABLE = "contact_unavailable"
 
 
 @dataclass(frozen=True)
@@ -48,6 +53,8 @@ class SubjectFacts:
     roster_names: tuple[str, ...] = ()
     permission_version: int | None = None
     publish_id: str | None = None
+    outbound_unavailable_at: datetime | None = None
+    outbound_unavailable_code: str | None = None
 
 
 @dataclass(frozen=True)
@@ -119,6 +126,8 @@ def plan_outreach(
         return _skip(facts, SKIP_NOT_ACTIVE, active=False)
     if not (facts.open_id or "").strip():
         return _skip(facts, SKIP_NO_OPEN_ID, active=True)
+    if facts.outbound_unavailable_at is not None:
+        return _skip(facts, SKIP_CONTACT_UNAVAILABLE, active=True)
     display_name = _roster_display_name(facts)
     if display_name is None:
         return _skip(facts, SKIP_AMBIGUOUS_NAME, active=True)
@@ -197,6 +206,7 @@ __all__ = [
     "ENABLED_ACCOUNT_STATE",
     "SKIP_AMBIGUOUS_NAME",
     "SKIP_COMPANY_NAME_MISSING",
+    "SKIP_CONTACT_UNAVAILABLE",
     "SKIP_METRIC_NAME_MISSING",
     "SKIP_NOT_ACTIVE",
     "SKIP_NOT_FOUND",

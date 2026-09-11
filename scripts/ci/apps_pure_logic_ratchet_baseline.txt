@@ -30,7 +30,7 @@
 195	src/lingxi/apps/gateway/config.py
 486	src/lingxi/apps/gateway/delivery.py
 57	src/lingxi/apps/gateway/delivery_assembly.py
-502	src/lingxi/apps/gateway/document_delivery.py
+509	src/lingxi/apps/gateway/document_delivery.py
 155	src/lingxi/apps/gateway/event_handler.py
 80	src/lingxi/apps/gateway/group_mention_hint.py
 17	src/lingxi/apps/gateway/innertest.py
@@ -43,6 +43,7 @@
 447	src/lingxi/apps/reauthorize/__init__.py
 181	src/lingxi/apps/scheduler/__init__.py
 37	src/lingxi/apps/scheduler/alerting_assembly.py
+37	src/lingxi/apps/scheduler/contact_reachability_assembly.py
 420	src/lingxi/apps/scheduler/assembly.py
 293	src/lingxi/apps/scheduler/config.py
 275	src/lingxi/apps/scheduler/credential_rotation.py

@@ -11,11 +11,13 @@
 from __future__ import annotations
 
 import unittest
+from datetime import UTC, datetime
 
 from lingxi.config.content import default_content_catalog
 from lingxi.core.outreach.audience import (
     SKIP_AMBIGUOUS_NAME,
     SKIP_COMPANY_NAME_MISSING,
+    SKIP_CONTACT_UNAVAILABLE,
     SKIP_METRIC_NAME_MISSING,
     SKIP_NO_METRICS,
     SKIP_NO_OPEN_ID,
@@ -105,6 +107,19 @@ class NotSendableTest(unittest.TestCase):
         """停用的人收到「你现在可以开始提问」是一句当场被证伪的话。"""
         plan = _plan(_facts(account_state="suspended"))
         self.assertEqual(plan.skip_reason, SKIP_NOT_ACTIVE)
+
+    def test_a_person_marked_unreachable_is_skipped_with_that_reason(self) -> None:
+        plan = _plan(_facts(outbound_unavailable_at=datetime(2026, 9, 11, tzinfo=UTC)))
+
+        self.assertFalse(plan.sendable)
+        self.assertEqual(plan.skip_reason, SKIP_CONTACT_UNAVAILABLE)
+        self.assertTrue(plan.active, "跳过原因是联系不上，不是没开通")
+
+    def test_a_person_never_tried_before_is_still_sendable(self) -> None:
+        """「未知」不是拒绝值：从没试过的人照常进入名单，由这一次真实发送判定。"""
+        plan = _plan(_facts(outbound_unavailable_at=None))
+
+        self.assertTrue(plan.sendable)
 
     def test_a_person_without_an_open_id_is_skipped(self) -> None:
         plan = _plan(_facts(open_id=None))

@@ -331,6 +331,11 @@ REQUIRED_MODULES = (
     "lingxi.apps.scheduler.loop",
     "lingxi.apps.scheduler.assembly",
     "lingxi.apps.scheduler.alerting_assembly",
+    # 联系可达状态回调的装配：只被 `scripts/ops/outreach.py` 的 `build_dispatcher`
+    # 函数内 import，没有任何进程模块级 import 它，因此不进任何进程闭包、只登记在
+    # 这里。scripts/ 被 .dockerignore 排除，漏登记这条会让「装了这个模块」这件事只在
+    # 源码测试里为真，部署镜像里悄悄消失都不会变红。
+    "lingxi.apps.scheduler.contact_reachability_assembly",
     # 正式重授权是 scheduler 镜像里的**一次性**运维 job；scripts/ 被 .dockerignore
     # 排除，若这里漏掉 apps/reauthorize，源码测试仍会绿而部署 job 会在镜像内消失。
     "lingxi.apps.reauthorize",
@@ -556,6 +561,9 @@ REQUIRED_MODULES = (
     "lingxi.core.outreach.welcome_card",
     "lingxi.core.outreach.audience",
     "lingxi.core.outreach.dispatch",
+    # 主动发送结果 → 「说过话 / 联系不上」状态与管理员待办的判断（#673）。同上：
+    # 只被 `scripts/ops/outreach.py` 经装配模块函数内 import，没有进程模块级 import。
+    "lingxi.core.outreach.contact_reachability",
     "lingxi.adapters.feishu_user_card",
     "lingxi.adapters.postgres_outreach",
     "lingxi.adapters.admin_followup_recompute",

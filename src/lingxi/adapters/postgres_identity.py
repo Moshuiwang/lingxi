@@ -58,6 +58,12 @@ _PROVISIONING_ORDER: dict[str, int] = {
     "active": 4,
 }
 
+#: 「这个人是否说过话／能否投递」的三态读数（:meth:`PostgresAppUserStore.
+#: contact_reachability`）。未知不是拒绝值也不是可用值，是第三种结论。
+CONTACT_UNKNOWN = "unknown"
+CONTACT_REACHABLE = "reachable"
+CONTACT_UNAVAILABLE = "unavailable"
+
 
 @dataclass(frozen=True)
 class DirectoryLookup:
@@ -581,9 +587,10 @@ class PostgresAppUserStore:
         两道守卫都写在 ``WHERE`` 里，不在 Python 里先读后写：
         ``preprovision_notice_armed_at IS NULL`` 只挂起一次（同一份名单重跑是
         一次 0 行的空写，已被首聊消费掉的人也不会被重新挂起）；
-        ``NOT EXISTS (SELECT 1 FROM inbound_event ...)`` 这个人名下一条入站
-        事件都没有，即从来没跟我们说过话，对一个已经在聊的人说这句话只会
-        莫名其妙。返回是否真的挂起了。
+        ``first_inbound_at IS NULL`` 判定这个人从来没跟我们说过话，对一个已经
+        在聊的人说这句话只会莫名其妙——**不再查询** ``inbound_event``：那张表
+        按九十天上限整行删除，查询它会让一个真实聊过的老用户在证据过期后被
+        重新读成"从没说过话"（见迁移 ``0095``）。返回是否真的挂起了。
         """
         with (
             connect(self._dsn, timeouts=self._timeouts) as connection,
@@ -593,10 +600,8 @@ class PostgresAppUserStore:
                 """UPDATE app_user SET preprovision_notice_armed_at = now()
                     WHERE feishu_open_id = %s
                       AND preprovision_notice_armed_at IS NULL
-                      AND NOT EXISTS (
-                            SELECT 1 FROM inbound_event WHERE user_open_id = %s
-                          )""",
-                (open_id, open_id),
+                      AND first_inbound_at IS NULL""",
+                (open_id,),
             )
             armed = cursor.rowcount
         return bool(armed)
@@ -637,6 +642,88 @@ class PostgresAppUserStore:
         if changed:
             logger.info("开通中途停摆已收口 user=%s reason=%s", user_id, reason.strip())
         return bool(changed)
+
+    def record_contact_reachable(self, *, open_id: str, when: datetime) -> bool:
+        """真实入站或旁路成功证明这个人可达；把它落成不过期的当前状态。
+
+        ``first_inbound_at`` 只许往前、不许往后（``LEAST``）：历史回填可能带一个
+        比已记录更早的真实首次时刻，要能把它拨回去。``last_inbound_at`` 只前进
+        （``GREATEST``），不因迟到的回填往回拨。清空「不可达」标记守着**旧成功
+        不覆盖新失败**：只有这次成功不早于已记录的失败时刻才清掉，否则原样
+        保留。返回是否命中了一行。
+        """
+        with (
+            connect(self._dsn, timeouts=self._timeouts) as connection,
+            connection.cursor() as cursor,
+        ):
+            cursor.execute(
+                """UPDATE app_user SET
+                     first_inbound_at = LEAST(COALESCE(first_inbound_at, %(when)s), %(when)s),
+                     last_inbound_at = GREATEST(COALESCE(last_inbound_at, %(when)s), %(when)s),
+                     outbound_unavailable_at = CASE
+                         WHEN outbound_unavailable_at IS NULL
+                              OR outbound_unavailable_at <= %(when)s
+                         THEN NULL ELSE outbound_unavailable_at END,
+                     outbound_unavailable_code = CASE
+                         WHEN outbound_unavailable_at IS NULL
+                              OR outbound_unavailable_at <= %(when)s
+                         THEN NULL ELSE outbound_unavailable_code END
+                   WHERE feishu_open_id = %(open_id)s""",
+                {"when": when, "open_id": open_id},
+            )
+            changed = cursor.rowcount
+        return bool(changed)
+
+    def record_contact_unavailable(self, *, open_id: str, when: datetime, code: str) -> bool:
+        """旁路发送明确失败：记下时刻与原因码，供读侧判成「明确不可用」。
+
+        对称守卫**旧失败不覆盖新事实**：这次失败早于已记录的最近入站，或早于
+        已记录的失败时刻，就一行不改——那条更新的事实才是当前结论。线上调用
+        永远带当下时刻，守卫不会挡住它；挡住的是历史回填里比线上状态更旧的
+        证据。返回是否命中了一行（被守卫挡下同样计 0 行）。
+        """
+        with (
+            connect(self._dsn, timeouts=self._timeouts) as connection,
+            connection.cursor() as cursor,
+        ):
+            cursor.execute(
+                """UPDATE app_user
+                      SET outbound_unavailable_at = %(when)s,
+                          outbound_unavailable_code = %(code)s
+                    WHERE feishu_open_id = %(open_id)s
+                      AND (last_inbound_at IS NULL OR last_inbound_at < %(when)s)
+                      AND (outbound_unavailable_at IS NULL
+                           OR outbound_unavailable_at <= %(when)s)""",
+                {"when": when, "code": code, "open_id": open_id},
+            )
+            changed = cursor.rowcount
+        return bool(changed)
+
+    def contact_reachability(self, *, open_id: str) -> str | None:
+        """三态读数：``None`` 表示这个 open_id 查无此行。
+
+        有行时返回 :data:`CONTACT_UNAVAILABLE`/:data:`CONTACT_REACHABLE`/
+        :data:`CONTACT_UNKNOWN` 之一。**未知不折叠进已知可投递**：调用方要能
+        分辨"从没判定过"与"判定过且可投递"，未知的人不按可用处理。
+        """
+        with (
+            connect(self._dsn, timeouts=self._timeouts) as connection,
+            connection.cursor() as cursor,
+        ):
+            cursor.execute(
+                """SELECT first_inbound_at, outbound_unavailable_at
+                     FROM app_user WHERE feishu_open_id = %s""",
+                (open_id,),
+            )
+            row = cursor.fetchone()
+        if row is None:
+            return None
+        first_inbound_at, outbound_unavailable_at = row
+        if outbound_unavailable_at is not None:
+            return CONTACT_UNAVAILABLE
+        if first_inbound_at is not None:
+            return CONTACT_REACHABLE
+        return CONTACT_UNKNOWN
 
     def count(self) -> int:
         """``app_user`` 表的总行数（测试与运维核对用）。"""

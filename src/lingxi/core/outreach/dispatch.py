@@ -195,6 +195,35 @@ def _error_code(error: BaseException) -> str:
     return type(error).__name__
 
 
+#: 本仓唯一坐实的「机器人对该用户不可用」平台码，出处见
+#: ``docs/参考证据/飞书机器人主动私聊的跨组织前提.md``。其余 ``feishu_code_``
+#: 前缀的码（凭据、限流、参数类故障）说明的是「这次调用没成功」，不是「这个人
+#: 联系不上」；混进来会把一整批收件人错记成联系不上，因此只有这一个码坐实过
+#: 收件人级拒绝，其余保持未知。
+RECIPIENT_UNREACHABLE_CODES: frozenset[str] = frozenset({"feishu_code_230013"})
+
+
+def definite_delivery_failure_code(error: BaseException) -> str | None:
+    """一次发送异常是不是「平台明确拒绝这个收件人」；是则给出要落的错误码。
+
+    先解析出平台码：``error.code`` 本身带 ``feishu_code_`` 前缀就是它；转译成
+    ``notification_failed`` 的从 ``__cause__`` 掏一次。只有这个码落在
+    :data:`RECIPIENT_UNREACHABLE_CODES` 里才返回它——发送前检查、传输层异常、
+    结果不确定、凭据/限流/参数类平台错误都不在清单里，也掏不出/掏出的码不在
+    清单里的 ``notification_failed``，一律返回 ``None``：联系可达状态保持
+    原样，宁可保持未知也不冒充一次明确结论。
+    """
+    code = getattr(error, "code", None)
+    if isinstance(code, str) and code.startswith("feishu_code_"):
+        platform_code: str | None = code
+    elif code == "notification_failed":
+        cause_code = getattr(error.__cause__, "code", None)
+        platform_code = cause_code if isinstance(cause_code, str) else None
+    else:
+        platform_code = None
+    return platform_code if platform_code in RECIPIENT_UNREACHABLE_CODES else None
+
+
 class OutreachDispatcher:
     """渲染 → 认领记录 → 发送 → 记账/告警。只编排注入的接口，不做 I/O。"""
 
@@ -207,19 +236,24 @@ class OutreachDispatcher:
         store: OutreachRecordStore,
         audit: _AuditSink,
         send_outcome: Callable[[str, bool], Any] | None = None,
+        contact_outcome: Callable[[str, bool, str | None], Any] | None = None,
         catalog: ContentCatalog | None = None,
         style: WelcomeCardStyle = DEFAULT_WELCOME_CARD_STYLE,
         content_digest: str = "",
     ) -> None:
-        """接线出站口、记录口、审计出口与告警回调。
+        """接线出站口、记录口、审计出口、告警回调与联系可达状态回调。
 
-        ``content_digest`` 是 ``catalog`` 那一份内容的摘要（镜像内 + 可能的宿主机
-        覆盖文件），由装配方一次读齐后传进来；不给时审计退回内容版本号。
+        ``content_digest`` 是 ``catalog`` 那一份内容的摘要，配了宿主机覆盖文件时
+        由装配方一次读齐后传入；不给时审计退回内容版本号。``contact_outcome`` 在
+        正式发送（非预检）结果明确（送达或明确失败，不含"不确定"）时调用，参数为
+        ``(收件人 open_id, 是否送达, 失败时的错误码)``；本模块只报告结果，不认识
+        调用方拿它做什么。
         """
         self._sender = sender
         self._store = store
         self._audit = audit
         self._send_outcome = send_outcome
+        self._contact_outcome = contact_outcome
         self._catalog = catalog
         self._style = style
         self._content_digest = content_digest
@@ -276,17 +310,26 @@ class OutreachDispatcher:
             code = _error_code(error)
             self._store.mark_failed(record.record_id, error=code)
             self._notify_send_outcome(succeeded=False)
+            unknown = code == "notification_unknown"
+            # 只有坐实过的收件人级拒绝码才落「联系不上」：发送前检查、传输层
+            # 异常、凭据/限流问题与结果不确定都保持未知，不冒充一次明确结论。
+            definite_code = definite_delivery_failure_code(error)
+            if definite_code is not None:
+                self._notify_contact_outcome(
+                    target, purpose, succeeded=False, error_code=definite_code
+                )
             logger.error("主动发送失败 记录=%s error=%s", record.record_id, code)
             return self._finish(
                 target,
                 purpose,
                 card,
-                "unknown" if code == "notification_unknown" else STATUS_FAILED,
+                "unknown" if unknown else STATUS_FAILED,
                 error_code=code,
             )
         # 先报成功再记账：卡片已经在对方手里，告警状态机不该因为记账出问题而认为
         # 这一次投递失败。
         self._notify_send_outcome(succeeded=True)
+        self._notify_contact_outcome(target, purpose, succeeded=True, error_code=None)
         self._record_delivered(record, message_id)
         return self._finish(target, purpose, card, STATUS_DELIVERED, message_id=message_id)
 
@@ -324,6 +367,26 @@ class OutreachDispatcher:
         except Exception as error:  # 告警回调失败不能反过来打断发送收口
             logger.error("主动发送告警回调失败 error=%s", type(error).__name__)
 
+    def _notify_contact_outcome(
+        self,
+        target: OutreachTarget,
+        purpose: OutreachPurpose,
+        *,
+        succeeded: bool,
+        error_code: str | None,
+    ) -> None:
+        """把一次真正尝试的明确结果转给联系可达状态回调。
+
+        只在**正式发送**（非预检）时报告：预检收件人是管理员本人，把预检结果
+        记成目标用户的可达状态会张冠李戴。回调本身出问题不得反过来打断发送收口。
+        """
+        if self._contact_outcome is None or purpose is not OutreachPurpose.APPLY:
+            return
+        try:
+            self._contact_outcome(target.recipient_open_id, succeeded, error_code)
+        except Exception as error:  # 回调失败不能反过来打断发送收口
+            logger.error("联系可达状态回调失败 error=%s", type(error).__name__)
+
     def _finish(
         self,
         target: OutreachTarget,
@@ -356,6 +419,7 @@ class OutreachDispatcher:
 __all__ = [
     "OUTREACH_ALERT_CHANNEL",
     "REASON_RECIPIENT_CHANGED",
+    "RECIPIENT_UNREACHABLE_CODES",
     "STATUS_DELIVERED",
     "STATUS_FAILED",
     "STATUS_PENDING",
@@ -367,5 +431,6 @@ __all__ = [
     "OutreachTarget",
     "ReservedRecord",
     "UserCardSender",
+    "definite_delivery_failure_code",
     "outreach_dedupe_key",
 ]

@@ -11,7 +11,9 @@ from __future__ import annotations
 
 import unittest
 
+from lingxi.adapters.feishu_user_card import FeishuUserCardError
 from lingxi.config.content import default_content_catalog
+from lingxi.core.admin.innertest import InnertestError
 from lingxi.core.outreach.dispatch import (
     OUTREACH_ALERT_CHANNEL,
     REASON_RECIPIENT_CHANGED,
@@ -22,6 +24,7 @@ from lingxi.core.outreach.dispatch import (
     OutreachRecordingError,
     OutreachTarget,
     ReservedRecord,
+    definite_delivery_failure_code,
     outreach_dedupe_key,
 )
 from lingxi.core.outreach.welcome_card import WELCOME_CONTENT_KEY, WelcomeAudience, WelcomeCardStyle
@@ -144,7 +147,16 @@ class FakeAudit:
 
 
 class RejectedByFeishuError(RuntimeError):
+    """真实形态是 ``FeishuUserCardError``：``definite`` 与前缀码同时具备。"""
+
     code = "feishu_code_230013"
+    definite = True
+
+
+class UnknownOutcomeError(RuntimeError):
+    """结果不确定的失败——``_error_code`` 会把它折成 ``notification_unknown``。"""
+
+    code = "notification_unknown"
 
 
 def _dispatcher(store, sender, audit, outcomes=None):
@@ -448,6 +460,191 @@ class RecordingOutcomeTest(unittest.TestCase):
 
         self.assertEqual(outcome.status, STATUS_DELIVERED)
         self.assertIn("outreach.delivery_not_recorded", [action for action, _ in audit.records])
+
+
+class DefiniteDeliveryFailureCodeTest(unittest.TestCase):
+    """只有坐实过的收件人级拒绝码才给出结论，其余一律 ``None``（#673 复修）。
+
+    ``feishu_code_`` 前缀不等于「收件人级」：取令牌端点的任何非零码与发送端点的
+    频率限制同样带这个前缀，但它们是凭据/限流故障，不是「这个人联系不上」。
+    """
+
+    def test_a_recipient_unreachable_rejection_returns_its_own_code(self) -> None:
+        error = FeishuUserCardError("feishu_code_230013")
+        self.assertEqual(definite_delivery_failure_code(error), "feishu_code_230013")
+
+    def test_a_non_definite_transport_error_returns_none(self) -> None:
+        error = FeishuUserCardError("transport_error", definite=False)
+        self.assertIsNone(definite_delivery_failure_code(error))
+
+    def test_a_credential_failure_at_the_token_endpoint_returns_none(self) -> None:
+        """取令牌端点的非零码（如 ``feishu_code_10003``）是凭据故障，不是收件人拒绝。"""
+        error = FeishuUserCardError("feishu_code_10003")
+        self.assertIsNone(definite_delivery_failure_code(error))
+
+    def test_a_rate_limit_failure_at_the_send_endpoint_returns_none(self) -> None:
+        """发送端点的频率限制同样带 ``feishu_code_`` 前缀，但说明的是限流不是收件人。"""
+        error = FeishuUserCardError("feishu_code_99991400")
+        self.assertIsNone(definite_delivery_failure_code(error))
+
+    def test_a_pre_send_check_failure_returns_none(self) -> None:
+        self.assertIsNone(definite_delivery_failure_code(InnertestError("check_failed")))
+
+    def test_an_unauthorized_initiator_failure_returns_none(self) -> None:
+        self.assertIsNone(definite_delivery_failure_code(InnertestError("not_authorized")))
+
+    def test_an_unrecognised_runtime_error_returns_none(self) -> None:
+        self.assertIsNone(definite_delivery_failure_code(RuntimeError("boom")))
+
+    def test_a_translated_recipient_unreachable_failure_recovers_the_original_platform_code(
+        self,
+    ) -> None:
+        error = InnertestError("notification_failed")
+        error.__cause__ = FeishuUserCardError("feishu_code_230013")
+        self.assertEqual(definite_delivery_failure_code(error), "feishu_code_230013")
+
+    def test_a_translated_credential_failure_returns_none(self) -> None:
+        """cause 是令牌故障时，转译后的 ``notification_failed`` 同样不上报。"""
+        error = InnertestError("notification_failed")
+        error.__cause__ = FeishuUserCardError("feishu_code_10003")
+        self.assertIsNone(definite_delivery_failure_code(error))
+
+    def test_a_translated_failure_without_a_cause_returns_none(self) -> None:
+        """cause 丢了原始平台码，分不清是收件人拒绝还是凭据/限流故障，保持未知。"""
+        code = definite_delivery_failure_code(InnertestError("notification_failed"))
+        self.assertIsNone(code)
+
+
+class ContactOutcomeTest(unittest.TestCase):
+    """#673 旁路：正式发送的明确结果转给联系可达状态回调，预检与不确定结果不转。"""
+
+    def _dispatcher_with_contact(self, store, sender, audit, contact_calls: list[tuple]):
+        return OutreachDispatcher(
+            sender=sender,
+            store=store,
+            audit=audit,
+            contact_outcome=lambda open_id, ok, code: contact_calls.append((open_id, ok, code)),
+            catalog=CATALOG,
+        )
+
+    def test_a_successful_apply_send_is_reported_as_reachable(self) -> None:
+        store, sender, audit = FakeStore(), FakeSender(), FakeAudit()
+        calls: list[tuple] = []
+
+        self._dispatcher_with_contact(store, sender, audit, calls).deliver(
+            _target(), purpose=OutreachPurpose.APPLY
+        )
+
+        self.assertEqual(calls, [(OPEN_ID, True, None)])
+
+    def test_a_definite_failure_is_reported_as_unavailable_with_its_error_code(self) -> None:
+        store = FakeStore()
+        sender = FakeSender(errors=[RejectedByFeishuError()])
+        audit = FakeAudit()
+        calls: list[tuple] = []
+
+        self._dispatcher_with_contact(store, sender, audit, calls).deliver(
+            _target(), purpose=OutreachPurpose.APPLY
+        )
+
+        self.assertEqual(calls, [(OPEN_ID, False, "feishu_code_230013")])
+
+    def test_an_unknown_outcome_is_not_reported_as_a_definite_result(self) -> None:
+        """否定断言：结果不确定时不冒充"明确不可用"，回调根本不被调用。"""
+        store = FakeStore()
+        sender = FakeSender(errors=[UnknownOutcomeError()])
+        audit = FakeAudit()
+        calls: list[tuple] = []
+
+        self._dispatcher_with_contact(store, sender, audit, calls).deliver(
+            _target(), purpose=OutreachPurpose.APPLY
+        )
+
+        self.assertEqual(calls, [])
+
+    def test_a_pre_send_check_failure_is_not_reported(self) -> None:
+        """否定断言：发送前检查未过不是平台拒绝，联系状态保持原样。"""
+        store, sender, audit = (
+            FakeStore(),
+            FakeSender(errors=[InnertestError("check_failed")]),
+            FakeAudit(),
+        )
+        calls: list[tuple] = []
+
+        self._dispatcher_with_contact(store, sender, audit, calls).deliver(
+            _target(), purpose=OutreachPurpose.APPLY
+        )
+
+        self.assertEqual(calls, [])
+
+    def test_a_translated_definite_failure_recovers_the_original_platform_code(self) -> None:
+        """``CheckedInnertestSender`` 把平台拒绝统一成 notification_failed；原码要被找回。"""
+        error = InnertestError("notification_failed")
+        error.__cause__ = FeishuUserCardError("feishu_code_230013")
+        store, sender, audit = FakeStore(), FakeSender(errors=[error]), FakeAudit()
+        calls: list[tuple] = []
+
+        self._dispatcher_with_contact(store, sender, audit, calls).deliver(
+            _target(), purpose=OutreachPurpose.APPLY
+        )
+
+        self.assertEqual(calls, [(OPEN_ID, False, "feishu_code_230013")])
+
+    def test_a_precheck_send_never_reports_a_contact_outcome(self) -> None:
+        """否定断言：预检收件人是管理员本人，把预检结果记成目标用户状态会张冠李戴。"""
+        store, sender, audit = FakeStore(), FakeSender(), FakeAudit()
+        calls: list[tuple] = []
+        target = OutreachTarget(
+            recipient_open_id="ou_admin_precheck",
+            subject=f"ou_admin_precheck:run1:{USER_ID}",
+            audience=_audience(),
+        )
+
+        self._dispatcher_with_contact(store, sender, audit, calls).deliver(
+            target, purpose=OutreachPurpose.PRECHECK
+        )
+
+        self.assertEqual(calls, [])
+
+    def test_a_skipped_already_delivered_send_does_not_report_again(self) -> None:
+        """已经送达过、这次是空跳过：不是一次新的明确尝试，不该再报一次。"""
+        key = outreach_dedupe_key(
+            content_key=WELCOME_CONTENT_KEY, purpose=OutreachPurpose.APPLY, subject=USER_ID
+        )
+        store = FakeStore(existing={key: STATUS_DELIVERED})
+        sender, audit = FakeSender(), FakeAudit()
+        calls: list[tuple] = []
+
+        self._dispatcher_with_contact(store, sender, audit, calls).deliver(
+            _target(), purpose=OutreachPurpose.APPLY
+        )
+
+        self.assertEqual(sender.calls, [])
+        self.assertEqual(calls, [])
+
+    def test_a_raising_callback_does_not_break_delivery(self) -> None:
+        store, sender, audit = FakeStore(), FakeSender(), FakeAudit()
+        dispatcher = OutreachDispatcher(
+            sender=sender,
+            store=store,
+            audit=audit,
+            contact_outcome=lambda *args: (_ for _ in ()).throw(RuntimeError("挂了")),
+            catalog=CATALOG,
+        )
+
+        outcome = dispatcher.deliver(_target(), purpose=OutreachPurpose.APPLY)
+
+        self.assertEqual(outcome.status, STATUS_DELIVERED)
+
+    def test_no_contact_outcome_callback_configured_is_a_silent_no_op(self) -> None:
+        """未接线回调（默认 ``None``）不改变既有行为——旧调用方不受影响。"""
+        store, sender, audit = FakeStore(), FakeSender(), FakeAudit()
+
+        outcome = _dispatcher(store, sender, audit).deliver(
+            _target(), purpose=OutreachPurpose.APPLY
+        )
+
+        self.assertEqual(outcome.status, STATUS_DELIVERED)
 
 
 if __name__ == "__main__":

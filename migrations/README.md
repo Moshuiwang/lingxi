@@ -11,7 +11,7 @@
 | 当前事实 | 值 |
 | --- | --- |
 | 基线 revision（链首） | `20260806_baseline` |
-| head revision | `0093_admin_followup_depends_idx` |
+| head revision | `0095_contact_reachability` |
 | 配置文件 | 仓库根目录 `alembic.ini` |
 | revision 目录 | `migrations/alembic/versions/` |
 | 连接串环境变量 | `LINGXI_MIGRATION_DSN`（缺失即失败，无默认值） |
@@ -834,3 +834,11 @@ OAuth 路径已被 2026-07-28 决策排除；它们此前**不属于生产链**�
 ## `0093_admin_followup_depends_idx`（自引用外键补索引）
 
 [Issue #706](https://github.com/Moshuiwang/lingxi/issues/706)。`admin_action_followup.depends_on_id` 是自引用外键（`ON DELETE SET NULL`），此前没有索引：删除该表任意一行都要为「有没有别的行指向它」做一次全表扫描，删 N 行即 N 次全表扫描，清场 `DELETE` 因此呈平方级，见测试脚手架 `tests/test_admin_followup_postgres.py` 堆到万行后紧随其后的清场耗时实测。只补一条普通 `CREATE INDEX`（判定该表尚未上生产、目标环境无并发写入，不算「已有大表」，不需要 `CONCURRENTLY`，判定依据见迁移文件头部注释）。`downgrade()` 只删索引，不影响数据，回退不受表内是否有行影响。
+
+## `0094_document_creation_attempted`（建档意图先落检查点）
+
+[Issue #718](https://github.com/Moshuiwang/lingxi/issues/718)。`task_document_delivery_request` 新增可空 `creation_attempted_at`：在发起一次外部建档/建表调用**之前**先提交"已经打算发起"的时间戳。消费进程在"外部已创建、`document_id` 尚未提交"这条缝隙里被打断时，恢复逻辑看到"已尝试但没有编号"不再退回 `pending` 重新调用，而是转入人工核对——堵住用户收到两份相同文档的窗口。可空、不带默认值：`NULL` 就是"没有未决意图"，既有行的解释不变。降级直接 `DROP COLUMN`，不因表内有数据而失败。
+
+## `0095_contact_reachability`（说过话与联系可达状态）
+
+[Issue #673](https://github.com/Moshuiwang/lingxi/issues/673)。`app_user` 新增四列：`first_inbound_at` / `last_inbound_at`（首次 / 最近真实入站）与 `outbound_unavailable_at` / `outbound_unavailable_code`（最近一次主动发送明确送不进去的时刻与错误码）。「跟我们说过话」此前只能从按九十天整行删除的 `inbound_event` 推导，到期后老用户会被重新读成新人；四列是不按九十天删除的**当前状态**（数据库设计第九节 `app_user` 既有例外的延伸，不新建表、不新增一类例外）。新增 `inbound_event` 的 `AFTER INSERT` 触发器：每一条真实入站推进两个入站时间并清空"不可达"标记——这是四列独立于 `inbound_event` 生存期的唯一入站侧写入点，应用层不各自散着补写。再新增 `app_user` 的 `AFTER INSERT` 触发器：建档时把此前已经存在的入站事件（首聊常常先有事件、后有档案）认领进新行，否则这个人会被读成从没说过话。**不改** `inbound_event` 的九十天到期触发器与 `0054` 的受限清理函数。历史行的一次性回填是 `scripts/ops/backfill_contact_reachability.py`（四个来源、`--dry-run` 先出计数），不在 DDL 里掺数据搬运。降级删触发器、函数与四列，不因表内有数据而失败。

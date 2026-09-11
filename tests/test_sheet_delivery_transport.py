@@ -20,7 +20,12 @@ production_schema``/``reset_production_rows``），只新增表格分支特有�
 ⑥ worker 侧：终态成功且报告契约 ``sheet_request`` 非空 → 恰一行 ``pending``、
    ``delivery_type='sheet'``；终态失败或字段为空 → 零行；
 ⑦ ``write_terminal_event`` 的 ``document_request``/``sheet_request`` 互斥
-   校验（结构性纵深防线，不需要真库——检查发生在建立数据库连接之前）。
+   校验（结构性纵深防线，不需要真库——检查发生在建立数据库连接之前）；
+⑧ 创建中崩溃——建表已经真实成功，但检查点从未提交：恢复入口必须转
+   ``uncertain``，不得退回 ``pending`` 重新发起（会造出第二份表格）；判据是
+   spy 记录的外部建表调用次数，与 ``test_document_delivery_transport.py``
+   的文档分支同一用例、同一判据。另有一条"顺序"用例验证真实生产路径本身：
+   ``mark_creation_attempted`` 必须先于 ``create_spreadsheet`` 提交。
 
 变异锚点（任务卡登记）：
 - 删掉 ``_process_sheet_claim`` 里 ``if spreadsheet_token is None`` 判断（每次
@@ -35,7 +40,13 @@ production_schema``/``reset_production_rows``），只新增表格分支特有�
   ``except Exception``）→ ⑤红（ValueError 落进 uncertain 而不是 failed）；
 - 把 ``adapters/postgres_conversation/_queue_outbox.py`` 里
   ``document_request is not None and sheet_request is not None`` 的互斥校验删掉
-  → ⑦红（两者同传不再报错）。
+  → ⑦红（两者同传不再报错）；
+- 把 ``adapters/postgres_document_delivery.py::_reclaim_disposition`` 的判断
+  恒改为假 → ⑧红（``create_calls`` 变成 2，外部目标里出现第二份表格）；
+- 把 ``_process_sheet_claim`` 里调用 ``mark_creation_attempted`` 的那一行删掉
+  → "顺序"用例红（events 列表缺了 ``creation_attempted`` 这一项）；⑧那条
+  手工摆位用例不受影响——它的阶段一直接调用 ``store.mark_creation_
+  attempted``，不经过 ``_process_sheet_claim`` 本身。
 """
 
 from __future__ import annotations
@@ -391,6 +402,104 @@ class SheetDeliveryTransportTestCase(unittest.TestCase):
         )
         self.assertEqual(len(notifier.sent), 1)
         self.assertEqual(notifier.sent[0][0], self.REQUESTER_OPEN_ID)
+
+    def test_pending_creation_attempt_recovery_never_recreates_the_spreadsheet(self) -> None:
+        """表格分支同 ``test_document_delivery_transport.py`` 的创建中崩溃用例：
+        建表已经真实成功，进程在 ``mark_document_created`` 提交检查点之前崩溃。
+        判据是外部目标（``sheets.create_calls``，假外部系统自己的建表记录）里
+        这个标题的产物数量，不是看日志或状态机字段。
+        """
+
+        self._seed_pending_sheet_request(request_id="tds-creation-crash")
+        sheets = _SpySheets(
+            create_result=(
+                "sheet-creation-crash-1",
+                "https://example.feishu.cn/sheets/sheet-creation-crash-1",
+            )
+        )
+        notifier = _SpyNotifier()
+
+        # 阶段一：认领 + 记录尝试意图 + 外部真的建表成功——不提交检查点。
+        claims = self.store.claim_pending(limit=1)
+        self.assertEqual(len(claims), 1)
+        claim = claims[0]
+        self.store.mark_creation_attempted(request_id=claim.id)
+        sheets.create_spreadsheet(claim.title)
+        self.assertEqual(sheets.create_calls, ["标题"], "阶段一：外部真的建出了这份表格")
+
+        self.execute(
+            "UPDATE task_document_delivery_request SET updated_at = now() - interval '10 minutes' "
+            "WHERE id = %s",
+            (claim.id,),
+        )
+
+        # 阶段二：全新消费者跑一轮——这是真实的恢复入口。
+        consumer = DocumentDeliveryConsumer(
+            store=self.store, docx=object(), sheets=sheets, notifier=notifier
+        )
+        processed = consumer.run_once()
+
+        self.assertEqual(processed, 0, "这一行已经转 uncertain，不会被本轮当作 pending 认领")
+        self.assertEqual(
+            sheets.create_calls,
+            ["标题"],
+            "外部目标里这个标题的产物必须恰好一份，不得被恢复路径二次建表",
+        )
+        self.assertEqual(notifier.sent, [], "结果不明时不得发出就绪通知")
+        self.assertEqual(
+            self.scalar(
+                "SELECT status FROM task_document_delivery_request WHERE id = %s", (claim.id,)
+            ),
+            "uncertain",
+        )
+        self.assertIsNone(
+            self.scalar(
+                "SELECT document_id FROM task_document_delivery_request WHERE id = %s", (claim.id,)
+            ),
+            "本地从未记录过 document_id——这正是需要人工核对而非自动重排的原因",
+        )
+
+    def test_creation_attempted_checkpoint_precedes_create_spreadsheet_in_the_real_path(
+        self,
+    ) -> None:
+        """验的是真实生产路径（``run_once`` → ``_process_sheet_claim``），不是
+        手工摆位——``mark_creation_attempted`` 必须先于 ``create_spreadsheet``
+        本身提交。
+        """
+
+        events: list[str] = []
+
+        class _OrderedStore(PostgresDocumentDeliveryStore):
+            def mark_creation_attempted(self, *, request_id: str) -> None:
+                events.append("creation_attempted")
+                super().mark_creation_attempted(request_id=request_id)
+
+        class _OrderedSheets(_SpySheets):
+            def create_spreadsheet(self, title: str) -> tuple[str, str]:
+                events.append("create_spreadsheet")
+                return super().create_spreadsheet(title)
+
+        assert DSN is not None
+        self._seed_pending_sheet_request(request_id="tds-order")
+        sheets = _OrderedSheets(
+            create_result=("sheet-order-1", "https://example.feishu.cn/sheets/sheet-order-1"),
+            members=[
+                {
+                    "member_type": "openid",
+                    "member_id": self.REQUESTER_OPEN_ID,
+                    "perm": "full_access",
+                }
+            ],
+        )
+        notifier = _SpyNotifier()
+        consumer = DocumentDeliveryConsumer(
+            store=_OrderedStore(DSN), docx=object(), sheets=sheets, notifier=notifier
+        )
+
+        processed = consumer.run_once()
+
+        self.assertEqual(processed, 1)
+        self.assertEqual(events, ["creation_attempted", "create_spreadsheet"])
 
     # -- ② 授权降级 --------------------------------------------------------------
 

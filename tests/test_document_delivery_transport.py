@@ -19,12 +19,19 @@
    None``）→ 循环不注册，零行为差异（哨兵，不需要真库）；
 ⑥ worker 侧：终态成功且报告契约 ``document_request`` 非空 → 恰一行 ``pending``；
    终态失败，或字段为空 → 零行。
-⑦（opus 审查 P1-2）：一次被 ``reclaim_stale_processing`` 回收过的"慢消费者"最终
-   跑完建档，写检查点时发现持有权已经丢失（这一行已经被另一次认领接手并跑出了
-   不同的结论）→ 当场中止，全程 no-op（不写正文、不授权、不读回、不发通知），
-   已经落下的真实终态原样保留、不被覆盖。
+⑦（opus 审查 P1-2）：一次被 ``reclaim_stale_processing`` 回收过的"慢消费者"这才
+   轮到自己发起建档时，持有权已经不在它手里（这一行已经被另一次认领接手并跑出了
+   不同的结论）→ 当场中止，连建档调用本身都不会发起，全程 no-op（不建档、不写
+   正文、不授权、不读回、不发通知），已经落下的真实终态原样保留、不被覆盖；
+②d：创建中崩溃——外部建档已经真实成功，但 ``document_id`` 检查点从未提交：
+   恢复入口（``run_once``）必须转 ``uncertain``，不得因为 ``attempts`` 未耗尽
+   就退回 ``pending`` 重新发起（会造出第二份产物）；判据是 spy 记录的外部
+   创建调用次数，不是日志。markdown 建档、两步段落两条路径分别覆盖，表格
+   分支的同一用例在 ``test_sheet_delivery_transport.py``。另有一组"顺序"
+   用例，验的是真实生产路径而非手工摆位：``mark_creation_attempted`` 必须
+   先于对应的外部创建调用本身提交；
 
-①-④、⑥-⑦ 需要真库（唯一约束、CHECK、以及 ``write_terminal_event`` 与终态事务的
+①-④、⑥-⑦、②d 需要真库（唯一约束、CHECK、以及 ``write_terminal_event`` 与终态事务的
 真实交互不能靠假连接验证）；⑤ 是纯装配层判断，不接触数据库或网络。
 
 变异锚点（任务卡登记，2026-08-27 实测还原）：
@@ -40,10 +47,11 @@
   等价于把整条恢复分支废掉）→ ②b 红（正文写两遍）；
 - 把成功判据从"``read_members`` 确认 full_access"改成"四步没有抛异常就
   succeeded"（去掉 ``_has_confirmed_full_access`` 校验）→ ③红；
-- 把 ``adapters/postgres_document_delivery.py`` 四个 ``mark_*`` 的 ``rowcount``
-  检查删掉（静默无视 0 行）→ ⑦红（``docx.write_calls``/``grant_calls``/
-  ``read_calls`` 会变成非空，``notifier.sent`` 也会非空，且 ``document_id`` 会被
-  慢消费者的建档结果覆盖）；
+- 把 ``adapters/postgres_document_delivery.py`` 里 ``mark_creation_attempted``/
+  ``mark_document_created``/``mark_succeeded``/``mark_uncertain``/``mark_failed``
+  的 ``rowcount`` 检查删掉（静默无视 0 行）→ ⑦红（``docx.create_calls``/
+  ``write_calls``/``grant_calls``/``read_calls`` 会变成非空，``notifier.sent``
+  也会非空，且 ``document_id`` 会被慢消费者的建档结果覆盖）；
 - 把 ``adapters/feishu_docx_delivery.py`` 的 :data:`MAX_MARKDOWN_CHARS` 前置守卫
   删掉 → ②c 的"超长正文"用例红（会真的去发一次建档调用，也就是去撞 504）；
 - 把默认传输层"HTTP 5xx 不解析响应体、判结果不明"改回照常解析 → ②c 的"超时"
@@ -51,7 +59,16 @@
   完整文档）；
 - 把允许改走段落路径的捕获范围从 ``PRE_FLIGHT_DEGRADE_REASONS`` 放宽成"任何
   ``FeishuDocxDeliveryError``" → ②c 的"超时"用例红（会出现第二次建档调用）；
-- 把降级判据只绑在 ``data.warnings`` 上 → ②c 的 ``partial_success`` 用例红。
+- 把降级判据只绑在 ``data.warnings`` 上 → ②c 的 ``partial_success`` 用例红；
+- 把 ``adapters/postgres_document_delivery.py::_reclaim_disposition`` 里
+  ``document_id is None and creation_attempted_at is not None`` 的判断删掉/
+  恒为假 → ②d 两条用例都红（``one_shot_calls``/``create_calls`` 变成 2，
+  外部目标里出现第二份产物）；
+- 把 ``_create_docx_body``/``_process_sheet_claim`` 里调用
+  ``mark_creation_attempted`` 的那一行删掉 → 两条"顺序"用例红（events 列表
+  缺了 ``creation_attempted`` 这一项）；②d 那两条手工摆位用例不受影响——它们
+  的阶段一直接调用 ``store.mark_creation_attempted``，不经过这两个方法，
+  这正是需要"顺序"用例单独覆盖生产路径本身的原因。
 """
 
 from __future__ import annotations
@@ -234,6 +251,7 @@ class _RecordingDeliveryStore:
         self.notified: list[str] = []
         # Issue #499：降级检查点（迁移 0082）的调用记录。
         self.body_degraded: list[tuple[str, str]] = []
+        self.creation_attempted: list[str] = []
         self._unnotified = list(unnotified)
 
     # -- run_once 需要的循环级方法（只服务补发通知这个环节，其余返回空） -------
@@ -241,8 +259,8 @@ class _RecordingDeliveryStore:
     def fail_exhausted_pending(self) -> int:
         return 0
 
-    def reclaim_stale_processing(self) -> tuple[int, int]:
-        return (0, 0)
+    def reclaim_stale_processing(self) -> tuple[int, int, int]:
+        return (0, 0, 0)
 
     def claim_unnotified_succeeded(self, *, limit: int) -> list[Any]:
         pending, self._unnotified = self._unnotified, []
@@ -250,6 +268,9 @@ class _RecordingDeliveryStore:
 
     def claim_pending(self, *, limit: int) -> list[Any]:
         return []
+
+    def mark_creation_attempted(self, *, request_id: str) -> None:
+        self.creation_attempted.append(request_id)
 
     def mark_body_degraded(self, *, request_id: str, reason: str) -> None:
         self.body_degraded.append((request_id, reason))
@@ -740,6 +761,191 @@ class DocumentDeliveryTransportTestCase(unittest.TestCase):
         )
         self.assertEqual(len(notifier.sent), 1)
 
+    # -- ②d 创建中崩溃：外部已建、检查点未提交 ---------------------------------
+
+    def test_pending_creation_attempt_recovery_via_markdown_path_never_creates_a_second_document(
+        self,
+    ) -> None:
+        """一次建档服务端已经真实建出文档（外部目标已经有这份产物），进程在
+        ``mark_document_created`` 提交检查点之前崩溃：恢复入口必须转
+        ``uncertain``，不得因为 ``attempts`` 没耗尽就退回 ``pending`` 重新
+        发起——判据是外部目标（``docx.one_shot_calls``，这份假外部系统自己的
+        建档记录）里这个标题的产物数量，不是看日志或状态机字段。
+
+        阶段一手工模拟"外部已建、检查点未提交"：认领、记录尝试意图、调用一次
+        建档（外部真的建出来了），到此为止不再往下走。
+        """
+
+        self._seed_pending_request(request_id="tdd-markdown-crash", markdown="# 标题\n\n正文段落")
+        docx = _SpyDocx(create_result="doc-markdown-crash-1", markdown_convert_enabled=True)
+        notifier = _SpyNotifier()
+
+        claims = self.store.claim_pending(limit=1)
+        self.assertEqual(len(claims), 1)
+        claim = claims[0]
+        self.store.mark_creation_attempted(request_id=claim.id)
+        docx.create_document_with_markdown(claim.title, claim.markdown)
+        self.assertEqual(len(docx.one_shot_calls), 1, "阶段一：外部真的建出了这份文档")
+
+        self.execute(
+            "UPDATE task_document_delivery_request SET updated_at = now() - interval '10 minutes' "
+            "WHERE id = %s",
+            (claim.id,),
+        )
+
+        # 阶段二：全新消费者跑一轮——这是真实的恢复入口，不是直接摆弄状态机字段。
+        consumer = DocumentDeliveryConsumer(store=self.store, docx=docx, notifier=notifier)
+        processed = consumer.run_once()
+
+        self.assertEqual(processed, 0, "这一行已经转 uncertain，不会被本轮当作 pending 认领")
+        self.assertEqual(
+            len(docx.one_shot_calls),
+            1,
+            "外部目标里这个标题的产物必须恰好一份，不得被恢复路径二次建档",
+        )
+        self.assertEqual(notifier.sent, [], "结果不明时不得发出就绪通知")
+        self.assertEqual(
+            self.scalar(
+                "SELECT status FROM task_document_delivery_request WHERE id = %s", (claim.id,)
+            ),
+            "uncertain",
+        )
+        self.assertEqual(
+            self.scalar(
+                "SELECT last_error FROM task_document_delivery_request WHERE id = %s", (claim.id,)
+            ),
+            "creation_attempt_unconfirmed",
+        )
+        self.assertIsNone(
+            self.scalar(
+                "SELECT document_id FROM task_document_delivery_request WHERE id = %s", (claim.id,)
+            ),
+            "本地从未记录过 document_id——这正是需要人工核对而非自动重排的原因",
+        )
+
+    def test_pending_creation_attempt_recovery_via_paragraph_path_never_creates_a_second_document(
+        self,
+    ) -> None:
+        """同上一条用例，换成两步段落路径（``markdown`` 为空）：``create_document``
+        已经真实建出文档，进程在检查点提交之前崩溃。判据同样是外部目标
+        （``docx.create_calls``）里这个标题的产物数量。
+        """
+
+        self._seed_pending_request(request_id="tdd-paragraph-crash")
+        docx = _SpyDocx(create_result="doc-paragraph-crash-1")
+        notifier = _SpyNotifier()
+
+        claims = self.store.claim_pending(limit=1)
+        self.assertEqual(len(claims), 1)
+        claim = claims[0]
+        self.store.mark_creation_attempted(request_id=claim.id)
+        docx.create_document(claim.title)
+        self.assertEqual(docx.create_calls, ["标题"], "阶段一：外部真的建出了这份文档")
+
+        self.execute(
+            "UPDATE task_document_delivery_request SET updated_at = now() - interval '10 minutes' "
+            "WHERE id = %s",
+            (claim.id,),
+        )
+
+        consumer = DocumentDeliveryConsumer(store=self.store, docx=docx, notifier=notifier)
+        processed = consumer.run_once()
+
+        self.assertEqual(processed, 0)
+        self.assertEqual(
+            docx.create_calls,
+            ["标题"],
+            "外部目标里这个标题的产物必须恰好一份，不得被恢复路径二次建档",
+        )
+        self.assertEqual(notifier.sent, [])
+        self.assertEqual(
+            self.scalar(
+                "SELECT status FROM task_document_delivery_request WHERE id = %s", (claim.id,)
+            ),
+            "uncertain",
+        )
+
+    def test_creation_attempted_checkpoint_precedes_the_one_shot_call_in_the_real_path(
+        self,
+    ) -> None:
+        """②d 的另一半：验证的是真实生产路径（``run_once`` → ``_create_docx_
+        body``），不是像上面两条用例那样手工摆位——``mark_creation_attempted``
+        必须先于一次建档调用本身提交，否则"发起调用前先落检查点"就只是文档
+        字符串里的一句话。
+        """
+
+        events: list[str] = []
+
+        class _OrderedStore(PostgresDocumentDeliveryStore):
+            def mark_creation_attempted(self, *, request_id: str) -> None:
+                events.append("creation_attempted")
+                super().mark_creation_attempted(request_id=request_id)
+
+        class _OrderedDocx(_SpyDocx):
+            def create_document_with_markdown(self, title: str, markdown: str):
+                events.append("one_shot_call")
+                return super().create_document_with_markdown(title, markdown)
+
+        assert DSN is not None
+        self._seed_pending_request(request_id="tdd-order-markdown", markdown="# 标题\n\n正文段落")
+        docx = _OrderedDocx(
+            create_result="doc-order-markdown-1",
+            members=[
+                {
+                    "member_type": "openid",
+                    "member_id": self.REQUESTER_OPEN_ID,
+                    "perm": "full_access",
+                }
+            ],
+            markdown_convert_enabled=True,
+        )
+        notifier = _SpyNotifier()
+        consumer = DocumentDeliveryConsumer(store=_OrderedStore(DSN), docx=docx, notifier=notifier)
+
+        processed = consumer.run_once()
+
+        self.assertEqual(processed, 1)
+        self.assertEqual(events, ["creation_attempted", "one_shot_call"])
+
+    def test_creation_attempted_checkpoint_precedes_create_document_in_the_real_path(
+        self,
+    ) -> None:
+        """同上一条用例，换成两步段落路径（``markdown`` 为空）：``mark_creation_
+        attempted`` 必须先于 ``create_document`` 本身提交。
+        """
+
+        events: list[str] = []
+
+        class _OrderedStore(PostgresDocumentDeliveryStore):
+            def mark_creation_attempted(self, *, request_id: str) -> None:
+                events.append("creation_attempted")
+                super().mark_creation_attempted(request_id=request_id)
+
+        class _OrderedDocx(_SpyDocx):
+            def create_document(self, title: str) -> str:
+                events.append("create_document")
+                return super().create_document(title)
+
+        assert DSN is not None
+        self._seed_pending_request(request_id="tdd-order-paragraph")
+        docx = _OrderedDocx(
+            create_result="doc-order-paragraph-1",
+            members=[
+                {
+                    "member_type": "openid",
+                    "member_id": self.REQUESTER_OPEN_ID,
+                    "perm": "full_access",
+                }
+            ],
+        )
+        notifier = _SpyNotifier()
+        consumer = DocumentDeliveryConsumer(store=_OrderedStore(DSN), docx=docx, notifier=notifier)
+
+        processed = consumer.run_once()
+
+        self.assertEqual(processed, 1)
+        self.assertEqual(events, ["creation_attempted", "create_document"])
+
     def test_first_time_path_never_calls_read_body_children_and_behaves_unchanged(
         self,
     ) -> None:
@@ -962,16 +1168,17 @@ class DocumentDeliveryTransportTestCase(unittest.TestCase):
     def test_slow_consumer_after_reclaim_is_a_total_no_op_and_sends_no_notice(self) -> None:
         """一个"慢消费者"认领了一行，还没来得及提交建档检查点就被
         ``reclaim_stale_processing`` 判定为卡住并回收；这一行随后被一个更快的
-        消费者重新认领并跑到 ``succeeded``。慢消费者终于跑完自己的
-        ``create_document`` 后尝试提交检查点——此时持有权早已不在它手里，必须
-        当场中止、全程 no-op：不覆盖已经真实生效的终态，不写正文、不授权、
-        不读回、不发通知。
+        消费者重新认领并跑到 ``succeeded``。慢消费者这才轮到自己去发起建档——
+        此时持有权早已不在它手里，``mark_creation_attempted`` 在发起调用**之前**
+        就会发现这一点并中止，因此这次迟到的 ``create_document`` 连调用都不会
+        发生，遑论写正文、授权、读回、发通知：不覆盖已经真实生效的终态。
 
-        变异锚点：删掉 ``mark_document_created`` 的 rowcount 检查，本用例会变红
-        （``write_calls``/``grant_calls``/``read_calls`` 变成非空，
-        ``notifier.sent`` 也会非空，且 ``document_id`` 会被慢消费者的建档结果
-        "doc-slow" 覆盖，快消费者留下的 "doc-fast" 与 ``succeeded`` 终态都会
-        被悄悄破坏）。
+        变异锚点：删掉 ``mark_creation_attempted``/``mark_document_created``/
+        ``mark_succeeded`` 任意一个的 rowcount 检查，本用例都会变红——
+        ``create_calls``/``write_calls``/``grant_calls``/``read_calls`` 会变成
+        非空，``notifier.sent`` 也会非空，且 ``document_id`` 会被慢消费者的
+        建档结果 "doc-slow" 覆盖，快消费者留下的 "doc-fast" 与 ``succeeded``
+        终态都会被悄悄破坏。
         """
 
         self._seed_pending_request(request_id="tdd-slow")
@@ -988,8 +1195,8 @@ class DocumentDeliveryTransportTestCase(unittest.TestCase):
             "WHERE id = %s",
             (slow_claim.id,),
         )
-        requeued, failed = self.store.reclaim_stale_processing()
-        self.assertEqual((requeued, failed), (1, 0))
+        requeued, failed, uncertain = self.store.reclaim_stale_processing()
+        self.assertEqual((requeued, failed, uncertain), (1, 0, 0))
 
         # 阶段二：一个更快的消费者重新认领并跑完全部四步、落 succeeded。
         fast_claims = self.store.claim_pending(limit=1)
@@ -1002,15 +1209,17 @@ class DocumentDeliveryTransportTestCase(unittest.TestCase):
             "succeeded",
         )
 
-        # 阶段三：慢消费者这才跑完自己的 create_document，尝试提交检查点——用它
-        # 自己在阶段一拿到的、已经过期的 claim 对象（document_id 仍是 None）。
+        # 阶段三：慢消费者这才轮到自己发起建档——用它自己在阶段一拿到的、已经
+        # 过期的 claim 对象（document_id 仍是 None）。
         docx = _SpyDocx(create_result="doc-slow")
         notifier = _SpyNotifier()
         consumer = DocumentDeliveryConsumer(store=self.store, docx=docx, notifier=notifier)
 
         consumer._process_claim(slow_claim)
 
-        self.assertEqual(docx.create_calls, ["标题"], "慢消费者自己的建档调用确实发生了")
+        self.assertEqual(
+            docx.create_calls, [], "持有权在发起建档调用之前就已经丢失，不得真的发起这次调用"
+        )
         self.assertEqual(docx.write_calls, [], "不得续写正文")
         self.assertEqual(docx.grant_calls, [], "不得续授权")
         self.assertEqual(docx.read_calls, [], "不得续读回")

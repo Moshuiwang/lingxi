@@ -52,6 +52,10 @@ class OutreachGuardTests(unittest.TestCase):
             with (
                 self.subTest(scope=scope),
                 patch("lingxi.apps.scheduler.alerting_assembly.build_alerting_duty"),
+                patch(
+                    "lingxi.apps.scheduler.contact_reachability_assembly."
+                    "build_contact_reachability_recorder"
+                ),
                 patch("lingxi.apps.scheduler.innertest._build_probe") as builder,
             ):
                 dispatcher, _ = TOOL.build_dispatcher(config, "synthetic", initiated_by="admin")
