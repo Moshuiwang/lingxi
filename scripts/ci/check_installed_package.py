@@ -331,9 +331,10 @@ REQUIRED_MODULES = (
     "lingxi.apps.scheduler.loop",
     "lingxi.apps.scheduler.assembly",
     "lingxi.apps.scheduler.alerting_assembly",
-    # #673 联系可达状态回调装配：`scripts/ops/outreach.py` 的 `build_dispatcher`
-    # 函数内 import 它。scripts/ 被 .dockerignore 排除，漏登记这条会让「装了这个
-    # 模块」这件事只在源码测试里为真，部署镜像里悄悄消失都不会变红。
+    # 联系可达状态回调的装配：只被 `scripts/ops/outreach.py` 的 `build_dispatcher`
+    # 函数内 import，没有任何进程模块级 import 它，因此不进任何进程闭包、只登记在
+    # 这里。scripts/ 被 .dockerignore 排除，漏登记这条会让「装了这个模块」这件事只在
+    # 源码测试里为真，部署镜像里悄悄消失都不会变红。
     "lingxi.apps.scheduler.contact_reachability_assembly",
     # 正式重授权是 scheduler 镜像里的**一次性**运维 job；scripts/ 被 .dockerignore
     # 排除，若这里漏掉 apps/reauthorize，源码测试仍会绿而部署 job 会在镜像内消失。
@@ -790,10 +791,6 @@ PROCESS_RUNTIME_IMPORTS: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {
             "lingxi.apps.scheduler.loop",
             "lingxi.apps.scheduler.assembly",
             "lingxi.apps.scheduler.alerting_assembly",
-            # 理由见 REQUIRED_MODULES 同名条目：`scripts/ops/outreach.py` 函数内 import 它；
-            # 它顶层 import 的判断模块随它同一条发布理由。
-            "lingxi.apps.scheduler.contact_reachability_assembly",
-            "lingxi.core.outreach.contact_reachability",
             "lingxi.adapters.feishu_permission_bitable",
             "lingxi.adapters.feishu_user_message",
             "lingxi.adapters.query_mcp_probe",
