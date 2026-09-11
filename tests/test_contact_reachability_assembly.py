@@ -12,6 +12,7 @@ from lingxi.apps.scheduler.contact_reachability_assembly import _LogOnlyContactN
 from lingxi.core.outreach.contact_reachability import (
     AUDIT_MARKED_REACHABLE,
     AUDIT_MARKED_UNAVAILABLE,
+    AUDIT_STATE_WRITE_FAILED,
     AUDIT_TODO_NOTIFIED,
     AUDIT_TODO_NOTIFY_FAILED,
     TODO_DEDUPE_PREFIX,
@@ -52,17 +53,28 @@ class _Row:
 
 
 class FakeStore:
-    def __init__(self, *, email: str | None = EMAIL, lookup_raises: bool = False) -> None:
+    def __init__(
+        self,
+        *,
+        email: str | None = EMAIL,
+        lookup_raises: bool = False,
+        write_raises: bool = False,
+    ) -> None:
         self.reachable: list[tuple[str, datetime]] = []
         self.unavailable: list[tuple[str, datetime, str]] = []
         self._email = email
         self._lookup_raises = lookup_raises
+        self._write_raises = write_raises
 
     def record_contact_reachable(self, *, open_id: str, when: datetime) -> bool:
+        if self._write_raises:
+            raise RuntimeError("db down")
         self.reachable.append((open_id, when))
         return True
 
     def record_contact_unavailable(self, *, open_id: str, when: datetime, code: str) -> bool:
+        if self._write_raises:
+            raise RuntimeError("db down")
         self.unavailable.append((open_id, when, code))
         return True
 
@@ -109,6 +121,14 @@ class SuccessOutcomeTest(unittest.TestCase):
             audit.records, [(AUDIT_MARKED_REACHABLE, {})], "成功结局只留一条不带字段的审计动作"
         )
         self.assertNotIn(OPEN_ID, repr(audit.records), "审计不得携带任何标识")
+
+    def test_a_raising_store_is_audited_and_does_not_raise(self) -> None:
+        store, notifier, audit = FakeStore(write_raises=True), FakeNotifier(), RecordingAudit()
+
+        _recorder(store, notifier, audit)(OPEN_ID, True, None)
+
+        self.assertEqual(store.reachable, [])
+        self.assertEqual(audit.actions(), [AUDIT_STATE_WRITE_FAILED])
 
 
 class FailureOutcomeTest(unittest.TestCase):
@@ -170,6 +190,17 @@ class FailureOutcomeTest(unittest.TestCase):
 
         self.assertEqual(len(store.unavailable), 1)
         self.assertEqual(len(notifier.sent), 1)
+
+    def test_a_raising_store_is_audited_does_not_raise_and_sends_no_todo(self) -> None:
+        """落库异常时连状态是否写进去都不确定，不能再拿它去发一条待办。"""
+        store = FakeStore(write_raises=True)
+        notifier, audit = FakeNotifier(), RecordingAudit()
+
+        _recorder(store, notifier, audit)(OPEN_ID, False, "feishu_code_230013")
+
+        self.assertEqual(store.unavailable, [])
+        self.assertEqual(notifier.sent, [])
+        self.assertEqual(audit.actions(), [AUDIT_STATE_WRITE_FAILED])
 
 
 class LogOnlyOutletTest(unittest.TestCase):

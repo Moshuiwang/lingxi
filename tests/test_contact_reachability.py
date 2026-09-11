@@ -1,10 +1,10 @@
 """#673「跟我们说过话」状态留存：入站到期后不丢失，旁路两态各自可分辨。
 
-真库断言：迁移 `0095` 新增的触发器只能经真实入站调用点（``PostgresGatewayStore.
-transaction().insert_inbound_event``）走到 `app_user` 四列，不经种列；到期删除
-`inbound_event` 后四列不受影响是本单成立与否的唯一硬判据（见
-`AppUserSurvivesInboundEventExpiryTest`）。三态读数与「旧成功不覆盖新失败」见
-`ContactStateOrderingTest`。
+真库断言：迁移 `0095` 新增的两个触发器——入站侧（``PostgresGatewayStore.
+transaction().insert_inbound_event``）与建档侧（认领此前已存在的入站）——都只能
+经真实调用点走到 `app_user` 四列，不经种列；到期删除 `inbound_event` 后四列不受
+影响是本单成立与否的唯一硬判据（见 `AppUserSurvivesInboundEventExpiryTest`）。
+三态读数与「旧成功不覆盖新失败」见 `ContactStateOrderingTest`。
 """
 
 from __future__ import annotations
@@ -111,11 +111,19 @@ class RealInboundPathTest(ContactReachabilityPostgresTestCase):
             self._column(self.open_id, "first_inbound_at"),
         )
 
-    def test_an_inbound_event_for_someone_with_no_app_user_row_touches_nothing(self) -> None:
-        """否定断言：找不到人时是一次 0 行的空写，不抛异常、不建幽灵行。"""
-        self._insert_real_inbound_event(open_id="ou_nobody_at_all", event_id="evt_orphan")
+    def test_an_inbound_event_before_the_app_user_row_exists_is_adopted_at_provisioning(
+        self,
+    ) -> None:
+        """当时不建幽灵行：入站早于建档是一次 0 行的空写；建档后这条早到的事件被认领。"""
+        open_id = "ou_speaks_before_provisioning"
+        self._insert_real_inbound_event(open_id=open_id, event_id="evt_before_provisioning")
+        self.assertIsNone(self.store.get_by_open_id(open_id), "此时不建幽灵行")
 
-        self.assertIsNone(self._column("ou_nobody_at_all", "first_inbound_at"))
+        self._insert_app_user(open_id)
+
+        first = self._column(open_id, "first_inbound_at")
+        self.assertIsNotNone(first, "建档时应认领此前已经存在的入站事件")
+        self.assertEqual(first, self._column(open_id, "last_inbound_at"))
 
     def test_a_later_real_inbound_event_clears_a_recorded_unavailable_mark(self) -> None:
         """⑤：同一人后来成功入站会清掉「发不进去」这个标记。"""
@@ -161,6 +169,21 @@ class AppUserSurvivesInboundEventExpiryTest(ContactReachabilityPostgresTestCase)
         armed = self.store.mark_preprovision_notice_pending(open_id=self.open_id)
         self.assertFalse(armed, "入站事件已被清空，但持久状态仍记得这个人说过话")
         self.assertIsNone(self._column(self.open_id, "preprovision_notice_armed_at"))
+
+    def test_an_event_adopted_at_provisioning_time_also_survives_the_purge(self) -> None:
+        """③ 与②的组合：建档时认领的入站同样不随 `inbound_event` 到期消失。"""
+        open_id = "ou_speaks_before_provisioning_survives"
+        self._insert_real_inbound_event(open_id=open_id, event_id="evt_before_provisioning_2")
+        self._insert_app_user(open_id)
+        first_before = self._column(open_id, "first_inbound_at")
+        last_before = self._column(open_id, "last_inbound_at")
+        self.assertIsNotNone(first_before)
+
+        self._delete_all_inbound_events()
+
+        self.assertEqual(self._column(open_id, "first_inbound_at"), first_before)
+        self.assertEqual(self._column(open_id, "last_inbound_at"), last_before)
+        self.assertFalse(self.store.mark_preprovision_notice_pending(open_id=open_id))
 
 
 class ContactStateOrderingTest(ContactReachabilityPostgresTestCase):
@@ -235,6 +258,35 @@ class ContactStateOrderingTest(ContactReachabilityPostgresTestCase):
 
         self.assertFalse(written)
         self.assertEqual(self._column(self.open_id, "outbound_unavailable_code"), "newer")
+
+    def test_a_replayed_earlier_first_contact_moves_first_inbound_at_back(self) -> None:
+        """④ 回填拨得回真正首次：先记 now，再回放一条更早的证据，first 要往前拨。"""
+        now = datetime.now(UTC)
+        earlier = now - timedelta(days=30)
+        self.store.record_contact_reachable(open_id=self.open_id, when=now)
+
+        self.store.record_contact_reachable(open_id=self.open_id, when=earlier)
+
+        self.assertEqual(self._column(self.open_id, "first_inbound_at"), earlier)
+        self.assertEqual(self._column(self.open_id, "last_inbound_at"), now)
+
+    def test_a_backfilled_inbound_event_older_than_a_recorded_failure_does_not_clear_it(
+        self,
+    ) -> None:
+        """⑤ 对称守卫：比已记录失败更旧的入站事件（回填/延迟到达）不该把它清掉。"""
+        self.store.record_contact_unavailable(
+            open_id=self.open_id, when=datetime.now(UTC), code="feishu_code_230013"
+        )
+        stale = datetime.now(UTC) - timedelta(days=3)
+        with connect(self._dsn) as connection, connection.cursor() as cursor:
+            cursor.execute(
+                """INSERT INTO inbound_event
+                     (feishu_event_id, received_at, event_type, user_open_id, trace_id)
+                   VALUES (%s, %s, 'im.message.receive_v1', %s, %s)""",
+                ("evt_stale_backfill", stale, self.open_id, "trc_stale_backfill"),
+            )
+
+        self.assertEqual(self.store.contact_reachability(open_id=self.open_id), CONTACT_UNAVAILABLE)
 
     def test_a_live_failure_after_an_inbound_is_still_recorded(self) -> None:
         """对照组：失败晚于最近入站时照常落下——上两条不是"永远写不进去"。"""

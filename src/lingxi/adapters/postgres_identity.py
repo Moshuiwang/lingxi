@@ -646,11 +646,11 @@ class PostgresAppUserStore:
     def record_contact_reachable(self, *, open_id: str, when: datetime) -> bool:
         """真实入站或旁路成功证明这个人可达；把它落成不过期的当前状态。
 
-        ``first_inbound_at`` 只在从未写过时落一次（``COALESCE``）；
-        ``last_inbound_at`` 只前进（``GREATEST``），不因为一次迟到的回填把它
-        往回拨。清空「明确不可达」标记时守着**旧成功不覆盖新失败**：只有这次
-        成功不早于已记录的失败时刻，才把那条失败标记清掉，否则原样保留——
-        它比这次成功更新，才是真正的当前结论。返回是否命中了一行。
+        ``first_inbound_at`` 只许往前、不许往后（``LEAST``）：历史回填可能带一个
+        比已记录更早的真实首次时刻，要能把它拨回去。``last_inbound_at`` 只前进
+        （``GREATEST``），不因迟到的回填往回拨。清空「不可达」标记守着**旧成功
+        不覆盖新失败**：只有这次成功不早于已记录的失败时刻才清掉，否则原样
+        保留。返回是否命中了一行。
         """
         with (
             connect(self._dsn, timeouts=self._timeouts) as connection,
@@ -658,7 +658,7 @@ class PostgresAppUserStore:
         ):
             cursor.execute(
                 """UPDATE app_user SET
-                     first_inbound_at = COALESCE(first_inbound_at, %(when)s),
+                     first_inbound_at = LEAST(COALESCE(first_inbound_at, %(when)s), %(when)s),
                      last_inbound_at = GREATEST(COALESCE(last_inbound_at, %(when)s), %(when)s),
                      outbound_unavailable_at = CASE
                          WHEN outbound_unavailable_at IS NULL

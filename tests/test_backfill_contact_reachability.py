@@ -21,6 +21,7 @@ from lingxi.adapters.postgres import connect
 from lingxi.adapters.postgres_identity import (
     CONTACT_REACHABLE,
     CONTACT_UNAVAILABLE,
+    CONTACT_UNKNOWN,
     PostgresAppUserStore,
 )
 from lingxi.core.ids import new_id
@@ -221,6 +222,29 @@ class BackfillTest(unittest.TestCase):
 
         self.assertEqual(self._column("first_inbound_at"), first_first)
         self.assertEqual(self._column("last_inbound_at"), first_last)
+
+    def test_a_pre_send_check_failure_produces_no_negative_evidence(self) -> None:
+        """发送前检查失败不是「联系不上」：这一行不该被回填计成负面证据。"""
+        self._insert_outreach_message(
+            at=datetime.now(UTC), status="failed", last_error="check_failed"
+        )
+
+        evidence = TOOL.load_evidence(self._dsn)
+        TOOL.apply_evidence(self._dsn, evidence)
+
+        self.assertEqual(evidence, ())
+        self.assertEqual(self.store.contact_reachability(open_id=self.open_id), CONTACT_UNKNOWN)
+
+    def test_a_translated_definite_rejection_produces_negative_evidence(self) -> None:
+        """``notification_failed`` 是平台明确拒绝统一之后的码，仍要算一条负面证据。"""
+        self._insert_outreach_message(
+            at=datetime.now(UTC), status="failed", last_error="notification_failed"
+        )
+
+        evidence = TOOL.load_evidence(self._dsn)
+        TOOL.apply_evidence(self._dsn, evidence)
+
+        self.assertEqual(self.store.contact_reachability(open_id=self.open_id), CONTACT_UNAVAILABLE)
 
     def test_an_orphan_open_id_with_no_app_user_row_is_not_counted(self) -> None:
         with connect(self._dsn) as connection, connection.cursor() as cursor:

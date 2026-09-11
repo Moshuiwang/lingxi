@@ -23,11 +23,12 @@ from lingxi.core.identity.identifiers import redact_identifier
 
 logger = logging.getLogger(__name__)
 
-#: 审计动作名。四个都不携带任何标识；可追溯线索只在日志里，且一律脱敏。
+#: 审计动作名。五个都不携带任何标识；可追溯线索只在日志里，且一律脱敏。
 AUDIT_MARKED_REACHABLE = "outreach.contact_marked_reachable"
 AUDIT_MARKED_UNAVAILABLE = "outreach.contact_marked_unavailable"
 AUDIT_TODO_NOTIFIED = "outreach.contact_todo_notified"
 AUDIT_TODO_NOTIFY_FAILED = "outreach.contact_todo_notify_failed"
+AUDIT_STATE_WRITE_FAILED = "outreach.contact_state_write_failed"
 
 #: 群待办的去重键前缀：同一个人短时间内重复失败只占管理员一条待办。
 TODO_DEDUPE_PREFIX = "contact-unavailable:"
@@ -94,19 +95,35 @@ class ContactReachabilityRecorder:
         """成功记「说过话」；失败记「联系不上」并发管理员待办。"""
         now = self._clock()
         if succeeded:
-            self._store.record_contact_reachable(open_id=open_id, when=now)
+            if not self._write_state(
+                lambda: self._store.record_contact_reachable(open_id=open_id, when=now)
+            ):
+                return
             logger.info(
                 "联系可达状态已记录 outcome=%s open_id=%s", "reachable", redact_identifier(open_id)
             )
             self._record(AUDIT_MARKED_REACHABLE)
             return
         code = error_code or "unknown"
-        self._store.record_contact_unavailable(open_id=open_id, when=now, code=code)
+        if not self._write_state(
+            lambda: self._store.record_contact_unavailable(open_id=open_id, when=now, code=code)
+        ):
+            return
         logger.info(
             "联系可达状态已记录 outcome=%s open_id=%s", "unavailable", redact_identifier(open_id)
         )
         self._record(AUDIT_MARKED_UNAVAILABLE, error_code=code)
         self._send_admin_todo(open_id=open_id, error_code=code)
+
+    def _write_state(self, write: Callable[[], bool]) -> bool:
+        """落状态；异常只记审计与日志、不上抛——连状态是否落上都不确定，不发待办。"""
+        try:
+            write()
+        except Exception as error:
+            logger.error("联系可达状态落库失败 error=%s", type(error).__name__)
+            self._record(AUDIT_STATE_WRITE_FAILED, error=type(error).__name__)
+            return False
+        return True
 
     def _send_admin_todo(self, *, open_id: str, error_code: str) -> None:
         """查邮箱与发送任一步失败都不带走已经落库的状态。"""
@@ -137,6 +154,7 @@ class ContactReachabilityRecorder:
 __all__ = [
     "AUDIT_MARKED_REACHABLE",
     "AUDIT_MARKED_UNAVAILABLE",
+    "AUDIT_STATE_WRITE_FAILED",
     "AUDIT_TODO_NOTIFIED",
     "AUDIT_TODO_NOTIFY_FAILED",
     "TODO_DEDUPE_PREFIX",

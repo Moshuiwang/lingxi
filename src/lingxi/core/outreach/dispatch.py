@@ -195,6 +195,24 @@ def _error_code(error: BaseException) -> str:
     return type(error).__name__
 
 
+def definite_delivery_failure_code(error: BaseException) -> str | None:
+    """一次发送异常是不是「平台明确拒绝」；是则给出要落的联系不可达错误码。
+
+    ``None`` 表示这次失败没告诉我们这个人是否联系得上（发送前检查、传输层
+    异常、令牌问题、结果不确定都在此列），联系可达状态保持原样。经
+    ``CheckedInnertestSender`` 转译过的失败统一码是 ``notification_failed``，
+    从 ``__cause__`` 掏出原始平台码，不然待办只看得到一个不带原因的码。
+    """
+    if getattr(error, "definite", False) is True:
+        return _error_code(error)
+    if getattr(error, "code", None) == "notification_failed":
+        cause_code = getattr(error.__cause__, "code", None)
+        if isinstance(cause_code, str) and cause_code.startswith("feishu_code_"):
+            return cause_code
+        return "notification_failed"
+    return None
+
+
 class OutreachDispatcher:
     """渲染 → 认领记录 → 发送 → 记账/告警。只编排注入的接口，不做 I/O。"""
 
@@ -282,10 +300,13 @@ class OutreachDispatcher:
             self._store.mark_failed(record.record_id, error=code)
             self._notify_send_outcome(succeeded=False)
             unknown = code == "notification_unknown"
-            if not unknown:
-                # "不确定"（notification_unknown）不是"明确失败"：调用方分不清是否
-                # 真的送达，按未知处理，不把这个人记成明确不可用。
-                self._notify_contact_outcome(target, purpose, succeeded=False, error_code=code)
+            # 只有平台明确拒绝才落「联系不上」：发送前检查、传输层异常、令牌
+            # 问题与结果不确定都保持未知，不冒充一次明确结论。
+            definite_code = definite_delivery_failure_code(error)
+            if definite_code is not None:
+                self._notify_contact_outcome(
+                    target, purpose, succeeded=False, error_code=definite_code
+                )
             logger.error("主动发送失败 记录=%s error=%s", record.record_id, code)
             return self._finish(
                 target,
@@ -398,5 +419,6 @@ __all__ = [
     "OutreachTarget",
     "ReservedRecord",
     "UserCardSender",
+    "definite_delivery_failure_code",
     "outreach_dedupe_key",
 ]
