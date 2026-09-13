@@ -7,8 +7,9 @@
    一遍再上传——"产物写对了"和"产物真的写对了"是两回事，前者只是假设。
 2. **`biai-stage` 下载/导入校验**：从
    `epic-candidate-images-pr-<PR 编号>-<PR head sha>` artifact 下载并解压后，
-   `docker compose ... up` 之前必须先跑通本脚本；`--import` 会额外执行 `docker load`
-   并核对回读到的镜像 digest，证明"导入到本机 docker 的东西"与 manifest 记录的一致。
+   `docker compose ... up` 之前必须先跑通本脚本；`--import` 会额外从每个 tar 内读出
+   镜像的 config 摘要与 manifest 记录核对，再执行 `docker load`，证明"导入到本机
+   docker 的东西"与 manifest 记录的一致。
 
 判定分两层，任一层不一致都会让脚本以非零退出：
 
@@ -18,8 +19,11 @@
   - **来源绑定**（不需要 docker）：调用方可传入 `--expect-*`，与 manifest 记录的
     repository / PR 编号 / head sha / tree sha / run id 核对——防止"文件是对的，
     但对应的是另一个 PR 或另一次构建"。
-  - **导入一致**（`--import`，需要 docker）：`docker load` 之后回读每个镜像的 `.Id`，
-    核对与 manifest 记录的 image_digest 一致。
+  - **导入一致**（`--import`，需要 docker）：先从每个 tar 内的 `manifest.json` 读出
+    `Config` 指向的 config 摘要，核对与 manifest 记录的 image_digest 一致，再
+    `docker load` 确认导入成功。摘要取自 tar 本身、不经过 docker daemon，因此结论
+    不随本机存储驱动变化（Issue #765；`.Id` 在 overlay2 下是 config 摘要、在
+    containerd 快照器下却是 index 摘要，#729 两台真机实测）。
 
 全部失败一次性收集后统一报告，不在中途停下——这样 Stage 操作者一次就能看到全部问题，
 不必来回重跑。
@@ -40,12 +44,18 @@ import pathlib
 import re
 import subprocess
 import sys
+import tarfile
 from dataclasses import dataclass
 
 REQUIRED_SERVICES = ("gateway", "migrate", "scheduler", "worker")
 IMAGE_DIGEST_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
 TAR_SHA_RE = re.compile(r"^[0-9a-f]{64}$")
 SHA_RE = re.compile(r"^[0-9a-f]{40}$")
+# `docker save` 出的 tar 里 manifest.json 的 `Config` 字段：Docker 25 起是 OCI 布局的
+# `blobs/sha256/<64 位>`，更早的版本是 `<64 位>.json`。两种都认，别的形状一律拒绝。
+TAR_CONFIG_RE = re.compile(
+    r"^(?:blobs/sha256/(?P<oci>[0-9a-f]{64})|(?P<legacy>[0-9a-f]{64})\.json)$"
+)
 
 
 @dataclass(frozen=True)
@@ -219,46 +229,99 @@ def check_bundle_files(document: dict[str, object], bundle_dir: pathlib.Path) ->
     return failures
 
 
-COMPARABLE_STORAGE_DRIVER = "overlay2"
+class TarDigestError(RuntimeError):
+    """从制品 tar 内读不到可信的 config 摘要：manifest.json 缺失、`Config` 缺失或形状非法、
+    config blob 不在 tar 内、或 blob 内容的 sha256 与文件名不符。与「读到了但与清单记录
+    不一致」是两类问题，判红信息分开说。"""
 
 
-def storage_driver(runner=run_command) -> str | None:
-    """本机 docker 的存储驱动；读不到时返回 ``None``。
+def _tar_member_bytes(tar: tarfile.TarFile, name: str) -> bytes | None:
+    """按名字取一个普通文件成员的内容；不存在或不是普通文件时返回 None。"""
 
-    只用来判断「本机回读到的镜像标识与 manifest 里的 image_digest 是不是同一种
-    东西」。overlay2 下 ``docker inspect --format {{.Id}}`` 回读的就是可比对的那个
-    摘要；换成别的驱动（例如 containerd 快照器）时两者不同源，直接比会得出一句
-    **反向结论**——把「本机核验不了」说成「不一致」。
+    try:
+        member = tar.getmember(name)
+    except KeyError:
+        try:
+            member = tar.getmember(f"./{name}")
+        except KeyError:
+            return None
+    if not member.isfile():
+        return None
+    handle = tar.extractfile(member)
+    return None if handle is None else handle.read()
+
+
+def _tar_config_reference(tar: tarfile.TarFile) -> str:
+    """读 tar 内 manifest.json，返回唯一一个镜像条目的 `Config` 字段。"""
+
+    raw = _tar_member_bytes(tar, "manifest.json")
+    if raw is None:
+        raise TarDigestError("tar 内没有 manifest.json")
+    try:
+        entries = json.loads(raw)
+    except (json.JSONDecodeError, UnicodeDecodeError) as error:
+        raise TarDigestError(f"tar 内 manifest.json 不是合法 JSON：{error}") from error
+    if not isinstance(entries, list) or len(entries) != 1 or not isinstance(entries[0], dict):
+        raise TarDigestError("tar 内 manifest.json 必须恰好是一个镜像条目的列表")
+    config = entries[0].get("Config")
+    if not isinstance(config, str):
+        raise TarDigestError(f"tar 内 manifest.json 的 Config 字段缺失或不是字符串：{config!r}")
+    return config
+
+
+def read_tar_config_digest(tar_path: pathlib.Path) -> str:
+    """从 `docker save` 出的 tar 内读镜像的 config 摘要，形如 ``sha256:<64 位>``。
+
+    取的是 tar 内 manifest.json 的 `Config` 字段指向的 blob，并核对 blob 内容的
+    sha256 与文件名一致——摘要来自 tar 本身，不经过 docker daemon，因此与本机存储
+    驱动无关：overlay2 下 ``docker inspect .Id`` 回读的就是这个值，containerd 快照器
+    下回读的却是 index 摘要（Issue #729 两台真机实测），只有从 tar 直接取才是两种
+    存储上都同源的比对对象（Issue #765）。任何一步读不到都抛 ``TarDigestError``。
     """
 
-    result = runner(["docker", "info", "--format", "{{.Driver}}"])
-    if result.returncode != 0:
-        return None
-    driver = result.stdout.strip()
-    return driver or None
+    try:
+        with tarfile.open(tar_path) as tar:
+            config = _tar_config_reference(tar)
+            match = TAR_CONFIG_RE.fullmatch(config)
+            if match is None:
+                raise TarDigestError(f"tar 内 manifest.json 的 Config 形状不认识：{config!r}")
+            expected_hex = match.group("oci") or match.group("legacy")
+            blob = _tar_member_bytes(tar, config)
+    except tarfile.TarError as error:
+        # tarfile 的报错会把每种压缩方式各列一行，只留第一行就够定位。
+        summary = str(error).splitlines()[0] if str(error) else error.__class__.__name__
+        raise TarDigestError(f"不是可读的 tar：{summary}") from error
+    if blob is None:
+        raise TarDigestError(f"tar 内没有 Config 指向的 blob：{config}")
+    actual_hex = hashlib.sha256(blob).hexdigest()
+    if actual_hex != expected_hex:
+        raise TarDigestError(
+            f"config blob 内容的 sha256 是 {actual_hex}，与文件名 {config} 不符（tar 内部不自洽）"
+        )
+    return f"sha256:{actual_hex}"
 
 
 def import_and_check_digest(
     document: dict[str, object], bundle_dir: pathlib.Path, runner=run_command
 ) -> list[str]:
-    """`docker load` 每个 tar，回读 `.Id` 与 manifest 记录的 image_digest 核对。
+    """先从每个 tar 内读 config 摘要与 manifest 记录核对，再 `docker load` 确认导入成功。
 
-    `docker load` 会按 tar 内嵌的 RepoTags 自动打回原来的引用（即 manifest 里的
-    `reference`），因此 load 完直接对该引用 `docker inspect` 即可，不需要额外重新打 tag。
+    比对对象是 tar 内的摘要而不是导入后回读的 ``.Id``（Issue #765）：``.Id`` 在
+    overlay2 下是 config 摘要、在 containerd 快照器下却是 index 摘要（#729 两台真机
+    实测），拿它比只在 overlay2 上同源；tar 内 `manifest.json` 的 `Config` 不经过
+    docker，两种存储上都是同一个值，因此**结论不再依赖存储驱动**，也不再有
+    「本机无法核验」这一态。
 
-    **结论有三态**：一致 / 不一致 / **本机无法核验**。第三态是 Issue #707 收窄后
-    补的：只有 ``overlay2`` 驱动下回读到的 ``.Id`` 与 manifest 里的 ``image_digest``
-    同源，换成别的驱动时两者本就不是一种东西，直接比会把「本机核验不了」说成
-    「不一致」——一句反向结论比没有结论更糟。
-
-    **「无法核验」照样判红（fail-closed）**：它不是放行，只是不再冒充结论。因此
-    一份 digest 被改错的清单在任何驱动下都仍然是红的，新分支没有把真正的不一致
-    一起吞掉。**digest 回读仍是硬判据**，本次只改「说什么」，不改「放不放行」。
+    判红分两类、信息分开：**与清单记录不一致**（tar 里的镜像不是清单说的那个）与
+    **tar 内读不到摘要**（manifest.json / Config 缺失、形状非法、blob 缺失或内容
+    哈希不符）；两类都判红，不静默跳过。摘要对不上的 tar 不导入——不把没核对过的
+    东西打进本机 docker。`docker load` 失败与导入后读不到引用照旧判红：导入是否成功
+    仍要核，只是「一致 / 不一致」不再由回读值决定。`docker load` 会按 tar 内嵌的
+    RepoTags 自动打回原来的引用（即 manifest 里的 `reference`），load 完直接对该
+    引用 `docker inspect` 即可确认它在本机可读。
     """
 
     failures: list[str] = []
-    driver = storage_driver(runner)
-    comparable = driver == COMPARABLE_STORAGE_DRIVER
     images = document.get("images")
     if not isinstance(images, list):
         return failures
@@ -273,9 +336,27 @@ def import_and_check_digest(
         if not isinstance(tar_name, str) or not isinstance(reference, str):
             failures.append(f"镜像 {service} 缺少 tar 或 reference 字段，无法导入")
             continue
+        if not isinstance(expected_digest, str) or not IMAGE_DIGEST_RE.fullmatch(expected_digest):
+            failures.append(
+                f"镜像 {service} 的 manifest 条目缺少合法 image_digest（{expected_digest!r}），"
+                "无法核对，不导入"
+            )
+            continue
         tar_path = bundle_dir / tar_name
         if not tar_path.is_file():
             failures.append(f"镜像 {service} 的 tar 文件缺失，无法导入：{tar_path}")
+            continue
+
+        try:
+            actual_digest = read_tar_config_digest(tar_path)
+        except TarDigestError as error:
+            failures.append(f"镜像 {service} 的 tar 内读不到 config 摘要，不导入：{error}")
+            continue
+        if actual_digest != expected_digest:
+            failures.append(
+                f"镜像 {service} 的 tar 内 config 摘要是 {actual_digest}，manifest 记录 "
+                f"{expected_digest}（与清单记录不一致：tar 里的镜像与候选身份不一致，不导入）"
+            )
             continue
 
         load_result = runner(["docker", "load", "-i", str(tar_path)])
@@ -289,23 +370,6 @@ def import_and_check_digest(
         if inspect_result.returncode != 0:
             failures.append(
                 f"镜像 {service} 导入后读不到引用 {reference}：{inspect_result.stderr.strip()}"
-            )
-            continue
-        actual_digest = inspect_result.stdout.strip()
-        if actual_digest == expected_digest:
-            continue
-        if comparable:
-            failures.append(
-                f"镜像 {service} 导入后的 digest 是 {actual_digest}，manifest 记录 {expected_digest}"
-                "（导入的对象与候选身份不一致）"
-            )
-        else:
-            failures.append(
-                f"镜像 {service}：本机无法核验。回读到 {actual_digest}，manifest 记录 "
-                f"{expected_digest}，但本机存储驱动是 "
-                f"{driver or '读不到'}（可比对的是 {COMPARABLE_STORAGE_DRIVER}），"
-                "两者不同源，比出来的差异不构成「不一致」的结论。"
-                "换一台 overlay2 的机器核验，或用别的方式取同源摘要。"
             )
 
     return failures
@@ -327,7 +391,10 @@ def main() -> int:
         "--import",
         dest="do_import",
         action="store_true",
-        help="额外执行 docker load 并核对导入后的镜像 digest（需要本机 docker）",
+        help=(
+            "额外核对每个 tar 内的 config 摘要与 manifest 记录一致，"
+            "并执行 docker load 确认导入成功（需要本机 docker，结论不依赖存储驱动）"
+        ),
     )
     args = parser.parse_args()
 

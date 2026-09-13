@@ -7,13 +7,21 @@
 
 `check_bundle_files` 一组是任务卡要求的"变异会失败、恢复正确对象后通过"的可复现固化：
 构造一份自洽的候选包，改坏一个 tar 的字节，断言校验红；换回原字节，断言校验绿。
+
+`import_and_check_digest` 一组（Issue #765）的夹具是用 `tarfile` 现场构造的**真实 tar**：
+里面放 `docker save` 格式的 `manifest.json` 与它 `Config` 指向的 config blob，
+摘要由 blob 内容算出。docker 侧仍走 fake runner——比对对象已经不是回读值，fake runner
+只回答「load 成不成功、引用读不读得到」，存储驱动是什么对结论没有影响，用例专门钉住这点。
 """
 
 from __future__ import annotations
 
+import hashlib
 import importlib.util
+import io
 import json
 import sys
+import tarfile
 import tempfile
 import unittest
 from pathlib import Path
@@ -65,6 +73,49 @@ def _images(**overrides) -> list[dict]:
             if image["service"] == service:
                 image.update(patch)
     return images
+
+
+def _write_image_tar(
+    path: Path,
+    *,
+    config: bytes = b'{"architecture":"amd64","os":"linux"}',
+    layout: str = "oci",
+    manifest: object = None,
+    blob_name: str | None = None,
+    blob_content: bytes | None = None,
+) -> str:
+    """现场构造一份 `docker save` 形状的 tar，返回其 config 摘要 ``sha256:<64 位>``。
+
+    默认是自洽的：`manifest.json` 的 `Config` 指向 `blobs/sha256/<摘要>`（``layout="oci"``，
+    Docker 25 起的形状）或 `<摘要>.json`（``layout="legacy"``），blob 内容就是 ``config``。
+    要造坏样本时：``manifest`` 传入自定义对象（``None`` 之外的值原样写进 manifest.json，
+    传 ``False`` 则不写 manifest.json）；``blob_name`` / ``blob_content`` 改写 blob 的
+    名字或内容（``blob_name=""`` 表示不写 blob）。
+    """
+
+    digest_hex = hashlib.sha256(config).hexdigest()
+    config_reference = f"blobs/sha256/{digest_hex}" if layout == "oci" else f"{digest_hex}.json"
+    if manifest is None:
+        manifest = [
+            {
+                "Config": config_reference,
+                "RepoTags": ["lingxi-worker:build-a"],
+                "Layers": [],
+            }
+        ]
+    with tarfile.open(path, "w") as tar:
+
+        def add(name: str, payload: bytes) -> None:
+            info = tarfile.TarInfo(name)
+            info.size = len(payload)
+            tar.addfile(info, io.BytesIO(payload))
+
+        if manifest is not False:
+            add("manifest.json", json.dumps(manifest).encode("utf-8"))
+        name = config_reference if blob_name is None else blob_name
+        if name:
+            add(name, config if blob_content is None else blob_content)
+    return f"sha256:{digest_hex}"
 
 
 class RequiredServicesConsistencyTest(unittest.TestCase):
@@ -377,10 +428,14 @@ class LoadManifestTest(unittest.TestCase):
 
 
 class ImportAndDigestCheckTest(unittest.TestCase):
-    """`--import` 路径：docker load / inspect 都走 fake runner，不依赖本机 docker。"""
+    """`--import` 路径（Issue #765）：摘要从真实 tar 内读，docker 侧走 fake runner。
 
-    def _document(self) -> dict:
-        return {"images": [_image("worker", digest=DIGEST)]}
+    结论不再依赖存储驱动：fake runner 仍会回答 `docker info`，但被测函数不该再问它；
+    摘要对不上或读不到的 tar 不导入（不该有 `docker load` 调用）。
+    """
+
+    def _document(self, digest: str = DIGEST) -> dict:
+        return {"images": [_image("worker", digest=digest)]}
 
     def _fake_runner(
         self,
@@ -390,10 +445,12 @@ class ImportAndDigestCheckTest(unittest.TestCase):
         inspect_returncode=0,
         driver="overlay2",
         info_returncode=0,
+        calls: list | None = None,
     ):
         def runner(argv):
+            if calls is not None:
+                calls.append(argv)
             if argv[:2] == ["docker", "info"]:
-                # 默认 overlay2：既有用例的结论必须逐字不变（#707 收窄的硬要求）。
                 return VERIFIER.CommandResult(
                     info_returncode,
                     driver if info_returncode == 0 else "",
@@ -413,32 +470,245 @@ class ImportAndDigestCheckTest(unittest.TestCase):
 
         return runner
 
+    @staticmethod
+    def _loads(calls: list) -> list[str]:
+        """fake runner 收到的 `docker load` 调用里的 tar 路径。"""
+
+        return [argv[3] for argv in calls if argv[:2] == ["docker", "load"]]
+
+    # ---- ① 一致 ----------------------------------------------------------
+
     def test_matching_digest_passes(self) -> None:
         with tempfile.TemporaryDirectory() as raw_directory:
             directory = Path(raw_directory)
-            (directory / "lingxi-worker.tar").write_bytes(b"anything")
+            digest = _write_image_tar(directory / "lingxi-worker.tar")
             failures = VERIFIER.import_and_check_digest(
-                self._document(), directory, runner=self._fake_runner()
+                self._document(digest), directory, runner=self._fake_runner()
             )
             self.assertEqual(failures, [])
+
+    def test_legacy_layout_config_json_is_recognized(self) -> None:
+        """Docker 25 之前 `Config` 是 `<摘要>.json`，同样认。"""
+
+        with tempfile.TemporaryDirectory() as raw_directory:
+            directory = Path(raw_directory)
+            digest = _write_image_tar(directory / "lingxi-worker.tar", layout="legacy")
+            failures = VERIFIER.import_and_check_digest(
+                self._document(digest), directory, runner=self._fake_runner()
+            )
+            self.assertEqual(failures, [])
+
+    def test_matching_digest_passes_on_any_driver(self) -> None:
+        """摘要对得上时，任何驱动下都是「一致」，不因驱动判红。"""
+
+        with tempfile.TemporaryDirectory() as workdir:
+            directory = Path(workdir)
+            digest = _write_image_tar(directory / "lingxi-worker.tar")
+            for driver in ("overlay2", "containerd-snapshotter", "btrfs"):
+                failures = VERIFIER.import_and_check_digest(
+                    self._document(digest), directory, runner=self._fake_runner(driver=driver)
+                )
+                self.assertEqual(failures, [], driver)
+
+    def test_import_never_consults_the_storage_driver(self) -> None:
+        """结论不依赖存储驱动的钉住：被测函数一旦问 `docker info` 就判红。"""
+
+        def runner(argv):
+            if argv[:2] == ["docker", "info"]:
+                raise AssertionError("结论不该再依赖存储驱动，却调用了 docker info")
+            return VERIFIER.CommandResult(0, DIGEST, "")
+
+        with tempfile.TemporaryDirectory() as workdir:
+            directory = Path(workdir)
+            digest = _write_image_tar(directory / "lingxi-worker.tar")
+            self.assertEqual(
+                VERIFIER.import_and_check_digest(self._document(digest), directory, runner=runner),
+                [],
+            )
+            _write_image_tar(directory / "lingxi-worker.tar", config=b'{"other":1}')
+            failures = VERIFIER.import_and_check_digest(
+                self._document(digest), directory, runner=runner
+            )
+            self.assertEqual(len(failures), 1, failures)
+            self.assertIn("与清单记录不一致", failures[0])
+
+    # ---- ② 摘要被改错 → 不一致（不是「无法核验」），两种驱动下都红 ----------
 
     def test_mismatched_digest_after_import_is_caught(self) -> None:
         with tempfile.TemporaryDirectory() as raw_directory:
             directory = Path(raw_directory)
-            (directory / "lingxi-worker.tar").write_bytes(b"anything")
+            _write_image_tar(directory / "lingxi-worker.tar")
             failures = VERIFIER.import_and_check_digest(
-                self._document(), directory, runner=self._fake_runner(inspect_stdout=OTHER_DIGEST)
+                self._document(OTHER_DIGEST), directory, runner=self._fake_runner()
             )
             self.assertTrue(any("worker" in f and "不一致" in f for f in failures), failures)
 
-    def test_docker_load_failure_is_reported(self) -> None:
-        with tempfile.TemporaryDirectory() as raw_directory:
-            directory = Path(raw_directory)
+    def test_mismatch_on_overlay2_is_reported_as_inconsistent(self) -> None:
+        """overlay2 下摘要对不上，就是「不一致」——这条结论逐字不变。"""
+
+        with tempfile.TemporaryDirectory() as workdir:
+            directory = Path(workdir)
+            _write_image_tar(directory / "lingxi-worker.tar")
+            failures = VERIFIER.import_and_check_digest(
+                self._document("sha256:" + "b" * 64), directory, runner=self._fake_runner()
+            )
+        self.assertEqual(len(failures), 1, failures)
+        self.assertIn("与候选身份不一致", failures[0])
+        self.assertNotIn("本机无法核验", failures[0])
+
+    def test_wrong_digest_is_inconsistent_under_both_drivers_and_not_loaded(self) -> None:
+        """Issue #765 否定断言：config 摘要被改错的 tar，在 overlay2 与 containerd 两种
+        驱动回读下**都**判「与清单记录不一致」，不再出现「本机无法核验」；对不上的
+        tar 也不会被 `docker load` 进本机。"""
+
+        for driver in ("overlay2", "containerd-snapshotter"):
+            with tempfile.TemporaryDirectory() as workdir:
+                directory = Path(workdir)
+                calls: list = []
+                _write_image_tar(directory / "lingxi-worker.tar", config=b'{"tampered":true}')
+                failures = VERIFIER.import_and_check_digest(
+                    self._document(DIGEST),
+                    directory,
+                    runner=self._fake_runner(driver=driver, calls=calls),
+                )
+            self.assertEqual(len(failures), 1, (driver, failures))
+            self.assertIn("worker", failures[0])
+            self.assertIn("与清单记录不一致", failures[0])
+            self.assertNotIn("本机无法核验", failures[0])
+            self.assertNotIn("读不到", failures[0])
+            self.assertEqual(self._loads(calls), [], driver)
+
+    def test_mismatch_on_containerd_is_inconsistent_not_unverifiable(self) -> None:
+        """#707 的第三态由 #765 收回：containerd 快照器下同样给出明确结论。"""
+
+        with tempfile.TemporaryDirectory() as workdir:
+            directory = Path(workdir)
+            _write_image_tar(directory / "lingxi-worker.tar")
+            failures = VERIFIER.import_and_check_digest(
+                self._document("sha256:" + "b" * 64),
+                directory,
+                runner=self._fake_runner(
+                    inspect_stdout="sha256:" + "b" * 64, driver="containerd-snapshotter"
+                ),
+            )
+        self.assertEqual(len(failures), 1, failures)
+        self.assertIn("与清单记录不一致", failures[0])
+        self.assertNotIn("本机无法核验", failures[0])
+
+    def test_mismatch_on_btrfs_still_fails_closed(self) -> None:
+        """摘要对不上在任何驱动下都判红，不放行。"""
+
+        with tempfile.TemporaryDirectory() as workdir:
+            directory = Path(workdir)
+            _write_image_tar(directory / "lingxi-worker.tar")
+            failures = VERIFIER.import_and_check_digest(
+                self._document("sha256:" + "c" * 64),
+                directory,
+                runner=self._fake_runner(inspect_stdout="sha256:" + "c" * 64, driver="btrfs"),
+            )
+        self.assertTrue(failures, "摘要对不上时必须判红，不能放行")
+        self.assertIn("与清单记录不一致", failures[0])
+
+    def test_driver_unreadable_does_not_change_the_conclusion(self) -> None:
+        """连驱动都读不到也无所谓：摘要来自 tar，结论照样明确。"""
+
+        with tempfile.TemporaryDirectory() as workdir:
+            directory = Path(workdir)
+            digest = _write_image_tar(directory / "lingxi-worker.tar")
+            runner = self._fake_runner(inspect_stdout="sha256:" + "d" * 64, info_returncode=1)
+            self.assertEqual(
+                VERIFIER.import_and_check_digest(self._document(digest), directory, runner=runner),
+                [],
+            )
+            failures = VERIFIER.import_and_check_digest(
+                self._document("sha256:" + "d" * 64), directory, runner=runner
+            )
+        self.assertEqual(len(failures), 1, failures)
+        self.assertIn("与清单记录不一致", failures[0])
+        self.assertNotIn("本机无法核验", failures[0])
+
+    # ---- ③ tar 内读不到摘要 → 判红，信息是「读不到」而不是「不一致」 ------------
+
+    def _assert_unreadable(self, failures: list[str], calls: list, *hints: str) -> None:
+        self.assertEqual(len(failures), 1, failures)
+        self.assertIn("worker", failures[0])
+        self.assertIn("读不到 config 摘要", failures[0])
+        self.assertNotIn("不一致", failures[0])
+        self.assertNotIn("本机无法核验", failures[0])
+        for hint in hints:
+            self.assertIn(hint, failures[0])
+        self.assertEqual(self._loads(calls), [], "读不到的 tar 不该导入")
+
+    def _unreadable_case(self, **tar_kwargs) -> tuple[list[str], list]:
+        with tempfile.TemporaryDirectory() as workdir:
+            directory = Path(workdir)
+            calls: list = []
+            digest = _write_image_tar(directory / "lingxi-worker.tar", **tar_kwargs)
+            failures = VERIFIER.import_and_check_digest(
+                self._document(digest), directory, runner=self._fake_runner(calls=calls)
+            )
+        return failures, calls
+
+    def test_tar_without_manifest_json_is_unreadable(self) -> None:
+        failures, calls = self._unreadable_case(manifest=False)
+        self._assert_unreadable(failures, calls, "没有 manifest.json")
+
+    def test_tar_manifest_without_config_field_is_unreadable(self) -> None:
+        failures, calls = self._unreadable_case(manifest=[{"RepoTags": ["x:y"], "Layers": []}])
+        self._assert_unreadable(failures, calls, "Config 字段缺失")
+
+    def test_tar_manifest_with_unknown_config_shape_is_unreadable(self) -> None:
+        failures, calls = self._unreadable_case(
+            manifest=[{"Config": "sha256:" + "1" * 64, "RepoTags": [], "Layers": []}]
+        )
+        self._assert_unreadable(failures, calls, "形状不认识")
+
+    def test_tar_manifest_with_two_entries_is_unreadable(self) -> None:
+        entry = {"Config": "blobs/sha256/" + "1" * 64, "RepoTags": [], "Layers": []}
+        failures, calls = self._unreadable_case(manifest=[entry, entry])
+        self._assert_unreadable(failures, calls, "恰好是一个镜像条目")
+
+    def test_tar_manifest_not_a_list_is_unreadable(self) -> None:
+        failures, calls = self._unreadable_case(manifest={"Config": "blobs/sha256/" + "1" * 64})
+        self._assert_unreadable(failures, calls, "恰好是一个镜像条目")
+
+    def test_tar_manifest_not_json_is_unreadable(self) -> None:
+        with tempfile.TemporaryDirectory() as workdir:
+            directory = Path(workdir)
+            calls: list = []
+            with tarfile.open(directory / "lingxi-worker.tar", "w") as tar:
+                info = tarfile.TarInfo("manifest.json")
+                info.size = len(b"{not json")
+                tar.addfile(info, io.BytesIO(b"{not json"))
+            failures = VERIFIER.import_and_check_digest(
+                self._document(), directory, runner=self._fake_runner(calls=calls)
+            )
+        self._assert_unreadable(failures, calls, "不是合法 JSON")
+
+    def test_tar_missing_config_blob_is_unreadable(self) -> None:
+        failures, calls = self._unreadable_case(blob_name="")
+        self._assert_unreadable(failures, calls, "没有 Config 指向的 blob")
+
+    def test_tar_config_blob_content_mismatch_is_unreadable(self) -> None:
+        """文件名说的摘要与 blob 内容算出的不同：tar 内部不自洽，不能拿文件名当摘要。"""
+
+        failures, calls = self._unreadable_case(blob_content=b'{"forged":1}')
+        self._assert_unreadable(failures, calls, "tar 内部不自洽")
+
+    def test_not_a_tar_file_is_unreadable(self) -> None:
+        """随便一串字节不是 tar：以前的用例夹具就是这样，现在必须判红而不是放过。"""
+
+        with tempfile.TemporaryDirectory() as workdir:
+            directory = Path(workdir)
+            calls: list = []
             (directory / "lingxi-worker.tar").write_bytes(b"anything")
             failures = VERIFIER.import_and_check_digest(
-                self._document(), directory, runner=self._fake_runner(load_returncode=1)
+                self._document(), directory, runner=self._fake_runner(calls=calls)
             )
-            self.assertTrue(any("导入失败" in f for f in failures), failures)
+        self._assert_unreadable(failures, calls, "不是可读的 tar")
+        self.assertEqual(len(failures[0].splitlines()), 1, "报错应当只有一行")
+
+    # ---- ④ 既有失败分支逐条仍在（否定断言） -----------------------------------
 
     def test_missing_tar_before_import_is_caught(self) -> None:
         with tempfile.TemporaryDirectory() as raw_directory:
@@ -448,84 +718,89 @@ class ImportAndDigestCheckTest(unittest.TestCase):
             )
             self.assertTrue(any("缺失" in f for f in failures), failures)
 
-    def test_mismatch_on_overlay2_is_reported_as_inconsistent(self) -> None:
-        """overlay2 下回读值对不上，就是「不一致」——这条结论逐字不变。"""
+    def test_missing_image_digest_is_caught_before_import(self) -> None:
+        """清单条目没有 image_digest：不能拿 None 去比，也不能导入。"""
 
         with tempfile.TemporaryDirectory() as workdir:
             directory = Path(workdir)
-            (directory / "lingxi-worker.tar").write_bytes(b"x")
+            calls: list = []
+            _write_image_tar(directory / "lingxi-worker.tar")
+            document = {"images": [_image("worker")]}
+            del document["images"][0]["image_digest"]
             failures = VERIFIER.import_and_check_digest(
-                self._document(),
-                directory,
-                runner=self._fake_runner(inspect_stdout="sha256:" + "b" * 64),
+                document, directory, runner=self._fake_runner(calls=calls)
             )
         self.assertEqual(len(failures), 1, failures)
-        self.assertIn("与候选身份不一致", failures[0])
-        self.assertNotIn("本机无法核验", failures[0])
+        self.assertIn("image_digest", failures[0])
+        self.assertEqual(self._loads(calls), [])
 
-    def test_mismatch_on_another_driver_is_reported_as_unverifiable(self) -> None:
-        """换个存储驱动，回读值本来就不同源——**不能说成「不一致」**。
-
-        把「本机核验不了」说成「不一致」是一句反向结论，比没有结论更糟：看到的人
-        会去查一个并不存在的身份不符。
-        """
-
+    def test_malformed_image_digest_is_caught_before_import(self) -> None:
         with tempfile.TemporaryDirectory() as workdir:
             directory = Path(workdir)
-            (directory / "lingxi-worker.tar").write_bytes(b"x")
+            _write_image_tar(directory / "lingxi-worker.tar")
             failures = VERIFIER.import_and_check_digest(
-                self._document(),
-                directory,
-                runner=self._fake_runner(
-                    inspect_stdout="sha256:" + "b" * 64, driver="containerd-snapshotter"
+                self._document("sha256:short"), directory, runner=self._fake_runner()
+            )
+        self.assertEqual(len(failures), 1, failures)
+        self.assertIn("image_digest", failures[0])
+        shape_failures = VERIFIER.check_manifest_shape(
+            {"schema": 1, "images": _images(worker={"image_digest": "sha256:short"})}
+        )
+        self.assertTrue(
+            any("image_digest 形状非法" in f for f in shape_failures),
+            "check_manifest_shape 也必须拒绝形状非法的 image_digest",
+        )
+
+    def test_docker_load_failure_is_reported(self) -> None:
+        with tempfile.TemporaryDirectory() as raw_directory:
+            directory = Path(raw_directory)
+            digest = _write_image_tar(directory / "lingxi-worker.tar")
+            failures = VERIFIER.import_and_check_digest(
+                self._document(digest), directory, runner=self._fake_runner(load_returncode=1)
+            )
+            self.assertTrue(any("导入失败" in f for f in failures), failures)
+
+    def test_reference_unreadable_after_load_is_reported(self) -> None:
+        with tempfile.TemporaryDirectory() as raw_directory:
+            directory = Path(raw_directory)
+            digest = _write_image_tar(directory / "lingxi-worker.tar")
+            failures = VERIFIER.import_and_check_digest(
+                self._document(digest), directory, runner=self._fake_runner(inspect_returncode=1)
+            )
+            self.assertTrue(any("读不到引用" in f for f in failures), failures)
+
+    # ---- ⑤ 多镜像逐条核对，一条错整体红 ----------------------------------------
+
+    def test_four_images_are_checked_one_by_one_and_one_bad_entry_fails_the_bundle(self) -> None:
+        with tempfile.TemporaryDirectory() as workdir:
+            directory = Path(workdir)
+            calls: list = []
+            images = []
+            for service in ("scheduler", "migrate", "gateway", "worker"):
+                config = json.dumps({"service": service}).encode("utf-8")
+                digest = _write_image_tar(directory / f"lingxi-{service}.tar", config=config)
+                images.append(_image(service, digest=digest))
+            document = {"images": images}
+            self.assertEqual(
+                VERIFIER.import_and_check_digest(
+                    document, directory, runner=self._fake_runner(calls=calls)
                 ),
+                [],
+            )
+            self.assertEqual(len(self._loads(calls)), 4)
+
+            # 只改 gateway 的记录：整体红，且只点名 gateway；另外三个照常导入。
+            calls.clear()
+            document["images"][2]["image_digest"] = OTHER_DIGEST
+            failures = VERIFIER.import_and_check_digest(
+                document, directory, runner=self._fake_runner(calls=calls)
             )
         self.assertEqual(len(failures), 1, failures)
-        self.assertIn("本机无法核验", failures[0])
-        self.assertIn("containerd-snapshotter", failures[0])
-        self.assertNotIn("与候选身份不一致", failures[0])
-
-    def test_unverifiable_still_fails_closed(self) -> None:
-        """**「无法核验」照样判红**：它不是放行，只是不再冒充结论。
-
-        否定断言——第三态若被做成「放过去」，一份 digest 被改错的清单在非
-        overlay2 的机器上就会静默通过，而那正是本工具存在的唯一理由。
-        """
-
-        with tempfile.TemporaryDirectory() as workdir:
-            directory = Path(workdir)
-            (directory / "lingxi-worker.tar").write_bytes(b"x")
-            failures = VERIFIER.import_and_check_digest(
-                self._document(),
-                directory,
-                runner=self._fake_runner(inspect_stdout="sha256:" + "c" * 64, driver="btrfs"),
-            )
-        self.assertTrue(failures, "取不到同源摘要时必须判红，不能放行")
-
-    def test_driver_unreadable_is_also_unverifiable(self) -> None:
-        """连驱动都读不到时同样按「无法核验」处置，不猜一个默认值。"""
-
-        with tempfile.TemporaryDirectory() as workdir:
-            directory = Path(workdir)
-            (directory / "lingxi-worker.tar").write_bytes(b"x")
-            failures = VERIFIER.import_and_check_digest(
-                self._document(),
-                directory,
-                runner=self._fake_runner(inspect_stdout="sha256:" + "d" * 64, info_returncode=1),
-            )
-        self.assertEqual(len(failures), 1, failures)
-        self.assertIn("本机无法核验", failures[0])
-
-    def test_matching_digest_passes_on_any_driver(self) -> None:
-        """回读值本来就对得上时，任何驱动下都是「一致」，不因驱动判红。"""
-
-        with tempfile.TemporaryDirectory() as workdir:
-            directory = Path(workdir)
-            (directory / "lingxi-worker.tar").write_bytes(b"x")
-            failures = VERIFIER.import_and_check_digest(
-                self._document(), directory, runner=self._fake_runner(driver="btrfs")
-            )
-        self.assertEqual(failures, [])
+        self.assertIn("gateway", failures[0])
+        self.assertIn("与清单记录不一致", failures[0])
+        loaded = self._loads(calls)
+        self.assertEqual(len(loaded), 3)
+        self.assertFalse(any("gateway" in path for path in loaded), loaded)
 
 
 if __name__ == "__main__":
