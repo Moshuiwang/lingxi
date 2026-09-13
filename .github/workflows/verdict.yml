@@ -1,0 +1,272 @@
+name: Epic Verdict
+
+# 裁决层：`main` / `release/**` 的必需检查 `Epic Verdict` 由本工作流以独立 App 身份写出。
+#
+# 为什么要有它：`pull_request` 事件跑的是 PR 自带那一版工作流，而必需检查只按名字匹配、
+# 不看来源——一个 PR 可以在同一次提交里放松门禁，再由被它改过的门禁给自己盖章；
+# 甚至直接放一个同名普通作业顶替。能区分来源的只有 App 身份，所以规则集把 `Epic Verdict`
+# 的来源钉在 App `lingxi-verdict` 上，而该 App 的私钥只放在仅对 `main` 开放的
+# Environment `verdict` 里：`workflow_run` 一律运行默认分支上的这一份，PR 分支上的任何
+# 运行都拿不到那把钥匙。
+#
+# 判定规则在 scripts/ci/verdict_decision.py（同样取自默认分支，逐条用例钉住）：
+#   路径 a：PR 头提交的 .github/workflows 子树与基线分支相同 → 采信这次 Epic Full 的结论；
+#   路径 b：子树不同（PR 改了门禁定义）→ 由 main 版 ci.yml 以 test_ref 复跑一次，取复跑
+#           结论，并给 PR 贴标签「门禁定义已变更」+ 评论差异清单（事后可查，不阻塞）；
+#   外部仓库的头提交一律判红；非 pull_request 事件、非 ci.yml 产出的运行不裁决。
+#
+# 本工作流全程**不检出、不执行 PR 树上的任何文件**——唯一例外是路径 b 的复跑，那是
+# main 版 ci.yml 在自己的作业里检出被测提交，与今天 workflow_dispatch 跑任意 ref 同理。
+# 只有 `success` 算通过：GitHub 把 skipped / neutral 也算通过，这里不算。
+on:
+  workflow_run:
+    workflows: ["Epic Full"]
+    types: [completed]
+
+permissions:
+  contents: read
+
+# 同一头提交的裁决串行：两次 Epic Full 完成（例如有权限的身份重跑）不并发写同一个 check run。
+concurrency:
+  group: verdict-${{ github.event.workflow_run.head_sha }}
+  cancel-in-progress: false
+
+jobs:
+  decide:
+    name: Epic Verdict / decide
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      pull-requests: read
+    outputs:
+      path: ${{ steps.decide.outputs.path }}
+      write_check: ${{ steps.decide.outputs.write_check }}
+      conclusion: ${{ steps.decide.outputs.conclusion }}
+      summary: ${{ steps.decide.outputs.summary }}
+      head_sha: ${{ steps.decide.outputs.head_sha }}
+      pr_number: ${{ steps.decide.outputs.pr_number }}
+      base_label: ${{ steps.decide.outputs.base_label }}
+      run_url: ${{ steps.decide.outputs.run_url }}
+      diff: ${{ steps.decide.outputs.diff }}
+    steps:
+      # 检出的是默认分支（workflow_run 的 GITHUB_SHA = 默认分支最新提交），只为读取裁决脚本。
+      - name: 检出默认分支（只读裁决脚本）
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # pull_requests[] 偶尔为空（事件送达时 PR 尚未关联），按头提交反查一次；反查结果
+      # 与事件里的形状一致（number / base.ref / base.sha / head.sha），交给脚本统一选基线。
+      - name: 反查 PR 关联（仅当事件里为空）
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPOSITORY: ${{ github.repository }}
+          HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
+        run: |
+          set -euo pipefail
+          echo '[]' > "${RUNNER_TEMP}/fallback-pulls.json"
+          count=$(jq '.workflow_run.pull_requests | length' "${GITHUB_EVENT_PATH}")
+          if [ "${count}" = 0 ] && [ -n "${HEAD_SHA}" ]; then
+            gh api "repos/${REPOSITORY}/commits/${HEAD_SHA}/pulls" \
+              --jq '[.[] | {number: .number, base: {ref: .base.ref, sha: .base.sha}, head: {sha: .head.sha}}]' \
+              > "${RUNNER_TEMP}/fallback-pulls.json"
+            echo "事件里没有 PR 关联，按头提交反查到 $(jq length "${RUNNER_TEMP}/fallback-pulls.json") 条"
+          fi
+
+      - name: 选基线
+        id: plan
+        run: |
+          python3 scripts/ci/verdict_decision.py plan \
+            --event-file "${GITHUB_EVENT_PATH}" \
+            --fallback-pulls-file "${RUNNER_TEMP}/fallback-pulls.json" \
+            --github-output "${GITHUB_OUTPUT}"
+
+      # 只读 Git 对象：三侧 .github/workflows 子树的树对象 sha 与两侧文件清单。不 fetch、不检出。
+      # 默认分支那一侧取 github.sha（workflow_run 下 = 默认分支最新提交，也就是路径 b 复跑
+      # 所用定义的出处）：头提交已经是这份定义时，PR 自己那次运行与复跑等价，走路径 a。
+      - name: 取三侧 .github/workflows 子树
+        id: trees
+        if: steps.plan.outputs.needs_trees == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPOSITORY: ${{ github.repository }}
+          HEAD_SHA: ${{ steps.plan.outputs.head_sha }}
+          BASE_COMMITISH: ${{ steps.plan.outputs.base_sha || steps.plan.outputs.base_ref }}
+          DEFAULT_COMMIT: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          subtree() {
+            local tree github_tree
+            tree=$(gh api "repos/${REPOSITORY}/commits/$1" --jq '.commit.tree.sha')
+            github_tree=$(gh api "repos/${REPOSITORY}/git/trees/${tree}" \
+              --jq '.tree[] | select(.path == ".github" and .type == "tree") | .sha')
+            [ -n "${github_tree}" ] || return 0
+            gh api "repos/${REPOSITORY}/git/trees/${github_tree}" \
+              --jq '.tree[] | select(.path == "workflows" and .type == "tree") | .sha'
+          }
+          listing() {
+            if [ -n "$1" ]; then
+              gh api "repos/${REPOSITORY}/git/trees/$1?recursive=1" --jq '.tree'
+            else
+              echo '[]'
+            fi
+          }
+          head_tree=$(subtree "${HEAD_SHA}")
+          base_tree=$(subtree "${BASE_COMMITISH}")
+          default_tree=$(subtree "${DEFAULT_COMMIT}")
+          listing "${head_tree}" > "${RUNNER_TEMP}/head-workflows.json"
+          listing "${base_tree}" > "${RUNNER_TEMP}/base-workflows.json"
+          echo "head_tree=${head_tree}" >> "${GITHUB_OUTPUT}"
+          echo "base_tree=${base_tree}" >> "${GITHUB_OUTPUT}"
+          echo "default_tree=${default_tree}" >> "${GITHUB_OUTPUT}"
+          echo "头提交子树 ${head_tree:-缺失}；基线 ${BASE_COMMITISH} 子树 ${base_tree:-缺失}；默认分支 ${DEFAULT_COMMIT} 子树 ${default_tree:-缺失}"
+
+      - name: 裁决
+        id: decide
+        env:
+          HEAD_TREE: ${{ steps.trees.outputs.head_tree }}
+          BASE_TREE: ${{ steps.trees.outputs.base_tree }}
+          DEFAULT_TREE: ${{ steps.trees.outputs.default_tree }}
+        run: |
+          python3 scripts/ci/verdict_decision.py decide \
+            --event-file "${GITHUB_EVENT_PATH}" \
+            --fallback-pulls-file "${RUNNER_TEMP}/fallback-pulls.json" \
+            --head-tree "${HEAD_TREE}" \
+            --base-tree "${BASE_TREE}" \
+            --default-tree "${DEFAULT_TREE}" \
+            --head-listing-file "${RUNNER_TEMP}/head-workflows.json" \
+            --base-listing-file "${RUNNER_TEMP}/base-workflows.json" \
+            --github-output "${GITHUB_OUTPUT}"
+
+  # 路径 b：相对引用解析的是默认分支上的 ci.yml（不是 PR 那一版），test_ref 让它的各个
+  # checkout 步检出被测头提交。classify 因 event_name != pull_request 被跳过，gate / extras /
+  # image 走「非 PR 一律完整门禁」既有分支，candidate 只在三者全 success 时通过；不产出候选证明。
+  rerun:
+    name: Epic Verdict / rerun
+    needs: [decide]
+    if: needs.decide.outputs.path == 'b'
+    permissions:
+      contents: read
+    uses: ./.github/workflows/ci.yml
+    with:
+      test_ref: ${{ needs.decide.outputs.head_sha }}
+
+  # 路径 b 的留痕：标签 + 差异清单评论。与裁决写入互不依赖——这里失败不影响 Epic Verdict。
+  label:
+    name: Epic Verdict / label
+    needs: [decide]
+    if: needs.decide.outputs.path == 'b' && needs.decide.outputs.pr_number != ''
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      issues: write
+      pull-requests: write
+    steps:
+      - name: 贴标签「门禁定义已变更」并评论差异清单
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPOSITORY: ${{ github.repository }}
+          PR_NUMBER: ${{ needs.decide.outputs.pr_number }}
+          HEAD_SHA: ${{ needs.decide.outputs.head_sha }}
+          BASE_LABEL: ${{ needs.decide.outputs.base_label }}
+          DIFF_JSON: ${{ needs.decide.outputs.diff }}
+          TRIGGER_RUN_URL: ${{ needs.decide.outputs.run_url }}
+          VERDICT_RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          LABEL: 门禁定义已变更
+        run: |
+          set -euo pipefail
+          gh label create "${LABEL}" --force --color D93F0B \
+            --description '本 PR 改了 .github/workflows：Epic Verdict 取 main 版门禁复跑的结论'
+          gh api -X POST "repos/${REPOSITORY}/issues/${PR_NUMBER}/labels" -f "labels[]=${LABEL}"
+          marker="<!-- epic-verdict:${HEAD_SHA} -->"
+          if gh api "repos/${REPOSITORY}/issues/${PR_NUMBER}/comments" --paginate --jq '.[].body' \
+              | grep -qF "${marker}"; then
+            echo "同一头提交已评论过，不重复"
+            exit 0
+          fi
+          {
+            printf '%s\n' "${marker}"
+            printf '**门禁定义已变更**（Epic Verdict 路径 b）：头提交 `%s` 的 `.github/workflows` 与基线 `%s` 不同，' \
+              "${HEAD_SHA}" "${BASE_LABEL}"
+            printf 'PR 自己那次 [Epic Full](%s) 的结论不被采信，`Epic Verdict` 取 `main` 版 `ci.yml` 复跑的结论（[裁决运行](%s)）。\n\n' \
+              "${TRIGGER_RUN_URL}" "${VERDICT_RUN_URL}"
+            printf '差异文件：\n'
+            printf '%s' "${DIFF_JSON}" | jq -r '.[] | "- \(.)"'
+            printf '\n本评论只留痕、不阻塞；合并后这些定义即成为后续 PR 的基线（两步漂移残余已由产品负责人接受）。\n'
+          } > "${RUNNER_TEMP}/comment.md"
+          gh api -X POST "repos/${REPOSITORY}/issues/${PR_NUMBER}/comments" -F "body=@${RUNNER_TEMP}/comment.md"
+
+  # 唯一持有 App 私钥的作业：Environment `verdict` 只对 main 开放；写检查只用 App 令牌，
+  # 不用 GITHUB_TOKEN（Actions 身份写的检查规则集不采信）。
+  verdict:
+    name: Epic Verdict / write
+    needs: [decide, rerun]
+    if: >-
+      !cancelled() && needs.decide.result == 'success' &&
+      needs.decide.outputs.write_check == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    environment: verdict
+    permissions:
+      contents: read
+    steps:
+      - name: 检出默认分支（只读裁决脚本）
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: 换取裁决 App 的安装令牌（只要 checks 写权限）
+        id: app-token
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          app-id: ${{ secrets.VERDICT_APP_ID }}
+          private-key: ${{ secrets.VERDICT_APP_PRIVATE_KEY }}
+          permission-checks: write
+
+      - name: 定终局结论
+        id: final
+        env:
+          DECIDE_PATH: ${{ needs.decide.outputs.path }}
+          DECIDE_CONCLUSION: ${{ needs.decide.outputs.conclusion }}
+          DECIDE_SUMMARY: ${{ needs.decide.outputs.summary }}
+          RERUN_RESULT: ${{ needs.rerun.result }}
+        run: |
+          python3 scripts/ci/verdict_decision.py finalize \
+            --path "${DECIDE_PATH}" \
+            --conclusion "${DECIDE_CONCLUSION}" \
+            --rerun-result "${RERUN_RESULT}" \
+            --summary "${DECIDE_SUMMARY}" \
+            --github-output "${GITHUB_OUTPUT}"
+
+      - name: 写入或更新 Epic Verdict check run
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          APP_SLUG: ${{ steps.app-token.outputs.app-slug }}
+          REPOSITORY: ${{ github.repository }}
+          HEAD_SHA: ${{ needs.decide.outputs.head_sha }}
+          CONCLUSION: ${{ steps.final.outputs.conclusion }}
+          SUMMARY: ${{ steps.final.outputs.summary }}
+          VERDICT_RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          TRIGGER_RUN_URL: ${{ needs.decide.outputs.run_url }}
+        run: |
+          set -euo pipefail
+          existing=$(gh api "repos/${REPOSITORY}/commits/${HEAD_SHA}/check-runs?check_name=Epic%20Verdict&per_page=100" \
+            | python3 scripts/ci/verdict_decision.py check-run existing --app-slug "${APP_SLUG}")
+          full_summary=$(printf '%s\n裁决运行：%s\n触发运行：%s' "${SUMMARY}" "${VERDICT_RUN_URL}" "${TRIGGER_RUN_URL}")
+          if [ -n "${existing}" ]; then
+            python3 scripts/ci/verdict_decision.py check-run payload --update \
+              --head-sha "${HEAD_SHA}" --conclusion "${CONCLUSION}" \
+              --details-url "${VERDICT_RUN_URL}" --external-id "${GITHUB_RUN_ID}" \
+              --summary "${full_summary}" > "${RUNNER_TEMP}/check-run.json"
+            gh api -X PATCH "repos/${REPOSITORY}/check-runs/${existing}" \
+              --input "${RUNNER_TEMP}/check-run.json" --jq '"已更新 check run \(.id)：\(.name) = \(.conclusion)"'
+          else
+            python3 scripts/ci/verdict_decision.py check-run payload \
+              --head-sha "${HEAD_SHA}" --conclusion "${CONCLUSION}" \
+              --details-url "${VERDICT_RUN_URL}" --external-id "${GITHUB_RUN_ID}" \
+              --summary "${full_summary}" > "${RUNNER_TEMP}/check-run.json"
+            gh api -X POST "repos/${REPOSITORY}/check-runs" \
+              --input "${RUNNER_TEMP}/check-run.json" --jq '"已创建 check run \(.id)：\(.name) = \(.conclusion)"'
+          fi

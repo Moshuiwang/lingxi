@@ -8,13 +8,22 @@ on:
   # Story Fast 遇到部署、迁移、依赖或 CI 自身改动时复用同一份完整门禁，
   # 不在两个工作流里复制一套以后必然漂移的检查。
   workflow_call:
+    inputs:
+      # 裁决层（verdict.yml）路径 b 的复跑：默认分支版的本文件要检出并验证的头提交。
+      # 只有 verdict.yml 会传它；story.yml 的复用不传，pull_request 事件下 inputs 为空，
+      # 各 checkout 步的 `ref: ${{ inputs.test_ref || '' }}` 取到空串 = 各事件原本的默认 ref。
+      test_ref:
+        description: 复跑时检出的提交 sha；空 = 各事件默认 ref
+        type: string
+        required: false
+        default: ''
   workflow_dispatch:
 
 permissions:
   contents: read
 
 concurrency:
-  group: ci-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  group: ci-${{ github.workflow }}-${{ github.event.pull_request.number || inputs.test_ref || github.ref }}
   cancel-in-progress: true
 
 jobs:
@@ -38,6 +47,7 @@ jobs:
       - name: 检出代码与比较基线
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          ref: ${{ inputs.test_ref || '' }}
           persist-credentials: false
           fetch-depth: 0
 
@@ -89,6 +99,7 @@ jobs:
       - name: 检出代码
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          ref: ${{ inputs.test_ref || '' }}
           persist-credentials: false
 
       - name: 运行文档门禁
@@ -111,6 +122,7 @@ jobs:
       - name: 检出代码
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          ref: ${{ inputs.test_ref || '' }}
           persist-credentials: false
 
       - name: 运行 L1 用户可见资产轻门禁
@@ -160,6 +172,7 @@ jobs:
       - name: 检出代码
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          ref: ${{ inputs.test_ref || '' }}
           persist-credentials: false
           fetch-depth: 0
 
@@ -343,6 +356,7 @@ jobs:
       - name: 检出代码
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          ref: ${{ inputs.test_ref || '' }}
           persist-credentials: false
 
       - name: 配置 Python 运行时
@@ -455,12 +469,14 @@ jobs:
       - name: 检出代码（构建 A）
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          ref: ${{ inputs.test_ref || '' }}
           persist-credentials: false
           path: build-a
 
       - name: 检出代码（构建 B，路径刻意更长）
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          ref: ${{ inputs.test_ref || '' }}
           persist-credentials: false
           path: build-b-second-independent-checkout
 
@@ -738,6 +754,7 @@ jobs:
           needs.image.result == 'success'
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          ref: ${{ inputs.test_ref || '' }}
           persist-credentials: false
 
       - name: 写入候选身份
