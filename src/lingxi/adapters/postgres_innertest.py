@@ -162,19 +162,7 @@ class PostgresInnertestService:
         has_new = any(t[3] == "new" for t in targets)
         if has_new:
             self._pending_guard(cursor, principal, version)
-            now = datetime.now(UTC)
-            cursor.execute(
-                "INSERT INTO pending_action(id,action_type,target_open_id,"
-                "target_state_snapshot,initiated_by_open_id,confirm_deadline_at) "
-                "VALUES(%s,'innertest_additions',%s,%s,%s,%s)",
-                (
-                    action,
-                    principal.open_id,
-                    str(version),
-                    principal.open_id,
-                    now + timedelta(seconds=600),
-                ),
-            )
+            self._insert_pending_action(cursor, action, principal, version)
         cursor.execute(
             "INSERT INTO innertest_batch(id,scope,initiated_by,binding_id,binding_version,"
             "request_key,intent_digest,roster_version,target_digest,pending_action_id,status,trace_id) "
@@ -212,6 +200,32 @@ class PostgresInnertestService:
         self._audit(connection, batch, principal.open_id, trace, "prepared")
         return self._batch_view(connection, principal, batch)
 
+    @staticmethod
+    def _insert_pending_action(cursor, action, principal, version):
+        """同一目标同一时刻只允许一条在途待确认动作（迁移 0068 的部分唯一索引）。
+
+        守卫只看扩员这一类动作；别的管理动作正以这位管理员为目标时，唯一索引会在这里
+        拦下，按核心待确认路径的既有码拒绝——不能冒充「确认已过期」，也不能让裸的
+        数据库错误退化成「名单不可用」。
+        """
+        from psycopg.errors import UniqueViolation
+
+        try:
+            cursor.execute(
+                "INSERT INTO pending_action(id,action_type,target_open_id,"
+                "target_state_snapshot,initiated_by_open_id,confirm_deadline_at) "
+                "VALUES(%s,'innertest_additions',%s,%s,%s,%s)",
+                (
+                    action,
+                    principal.open_id,
+                    str(version),
+                    principal.open_id,
+                    datetime.now(UTC) + timedelta(seconds=600),
+                ),
+            )
+        except UniqueViolation as error:
+            raise InnertestError("target_has_pending_action") from error
+
     def _audit(self, connection, batch, subject, trace, action):
         """持久审计与状态一起提交；外部审计不可用同样回滚。"""
         with connection.cursor() as cursor:
@@ -247,13 +261,19 @@ class PostgresInnertestService:
         return batch_view(connection, self.scope, principal.open_id, batch)
 
     def _pending_guard(self, cursor, principal, version):
-        """旧确认可重新准备；不明卡片必须先核查，不能换键盲发。"""
+        """旧确认可重新准备；不明卡片必须先核查，不能换键盲发。
+
+        只看**扩员这一类**以本人为目标的在途动作：停用、恢复、本地权限三类动作也会
+        以同一位管理员为目标，它们不是扩员确认，过期与版本判定对它们没有意义，落到
+        这里只会被误报成「确认已过期」。按创建时间取最新一条，结果不依赖存储顺序。
+        """
         cursor.execute(
             "SELECT p.id,p.confirm_deadline_at,f.status,b.binding_version,b.roster_version,b.id,b.trace_id "
             "FROM pending_action p LEFT JOIN admin_action_followup f "
             "ON f.pending_action_id=p.id AND f.stage='confirmation_card_send' "
             "LEFT JOIN innertest_batch b ON b.pending_action_id=p.id "
-            "WHERE p.target_open_id=%s AND p.status='pending'",
+            "WHERE p.target_open_id=%s AND p.status='pending' "
+            "AND p.action_type='innertest_additions' ORDER BY p.created_at DESC,p.id DESC",
             (principal.open_id,),
         )
         row = cursor.fetchone()
