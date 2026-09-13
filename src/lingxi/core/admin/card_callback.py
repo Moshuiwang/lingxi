@@ -38,6 +38,15 @@ from lingxi.core.admin.card_dispatch import management_card_fingerprint
 from lingxi.core.admin.display_names import AdminDisplayNames
 from lingxi.core.admin.followup import FollowupCapacityError
 from lingxi.core.admin.innertest import InnertestError
+from lingxi.core.admin.management_card_states import (
+    DISPATCH_IDLE,
+    DISPATCH_INCOMPLETE,
+    DISPATCH_PUBLISHING,
+    STATE_CLOSED,
+    STATE_DISPATCHING,
+    STATE_INCOMPLETE,
+    STATE_READY,
+)
 from lingxi.core.admin.notification import (
     DECISION_CANCEL,
     DECISION_CONFIRM,
@@ -423,16 +432,16 @@ class AdminCardCallbackHandler(_ManagementCardCallbackMixin):
             if status is None:
                 return
             if pending.status is PendingActionStatus.EXECUTED:
-                state, dispatch_status = "dispatching", "publishing"
+                state, dispatch_status = STATE_DISPATCHING, DISPATCH_PUBLISHING
             elif pending.status is PendingActionStatus.CANCELLED:
                 # 这里是**确认卡**上的取消：确认卡处理完后原管理卡回到最新只读
                 # 快照并恢复表单。管理卡自身的"取消"按钮走
                 # ``handle_management_cancel``，才会把上下文置为 ``closed``。
-                state, dispatch_status = "ready", "idle"
+                state, dispatch_status = STATE_READY, DISPATCH_IDLE
             elif pending.status is PendingActionStatus.FAILED:
-                state, dispatch_status = "incomplete", "incomplete"
+                state, dispatch_status = STATE_INCOMPLETE, DISPATCH_INCOMPLETE
             else:
-                state, dispatch_status = "closed", "idle"
+                state, dispatch_status = STATE_CLOSED, DISPATCH_IDLE
             updated = store.update_state(
                 message_id=origin_message_id,
                 state=state,
@@ -447,7 +456,7 @@ class AdminCardCallbackHandler(_ManagementCardCallbackMixin):
                     state=state,
                     # ``idle`` 是持久层机器状态，不应原样出现在卡片的人类可见
                     # 文案；ready 分支传 None 让 renderer 只展示恢复后的表单。
-                    dispatch_status=None if state == "ready" else dispatch_status,
+                    dispatch_status=None if state == STATE_READY else dispatch_status,
                     trace_id=trace_id,
                 )
         except Exception as error:  # refresh is best effort after commit
