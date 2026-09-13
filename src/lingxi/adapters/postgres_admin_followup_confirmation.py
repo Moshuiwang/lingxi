@@ -4,6 +4,14 @@ from __future__ import annotations
 
 from lingxi.adapters.postgres_admin_followup import enqueue_followups
 from lingxi.core.admin.followup import FollowupSpec
+from lingxi.core.admin.management_card_states import (
+    DISPATCH_IDLE,
+    DISPATCH_INCOMPLETE,
+    DISPATCH_PUBLISHING,
+    STATE_DISPATCHING,
+    STATE_INCOMPLETE,
+    STATE_READY,
+)
 from lingxi.core.admin.pending_action import PendingActionStatus
 
 
@@ -27,10 +35,10 @@ def enqueue_confirmation(connection, *, pending, target_user_id, trace_id, notif
     )
     if pending.origin_card_message_id:
         states = {
-            PendingActionStatus.EXECUTED: ("dispatching", "publishing"),
-            PendingActionStatus.CANCELLED: ("ready", "idle"),
+            PendingActionStatus.EXECUTED: (STATE_DISPATCHING, DISPATCH_PUBLISHING),
+            PendingActionStatus.CANCELLED: (STATE_READY, DISPATCH_IDLE),
         }
-        state, dispatch = states.get(pending.status, ("incomplete", "incomplete"))
+        state, dispatch = states.get(pending.status, (STATE_INCOMPLETE, DISPATCH_INCOMPLETE))
         with connection.cursor() as cursor:
             cursor.execute(
                 "UPDATE management_card_context SET state=%s,"

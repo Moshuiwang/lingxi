@@ -18,13 +18,20 @@ from typing import Any
 from lingxi.core.admin.card_dispatch import ManagementCardContext, management_card_fingerprint
 from lingxi.core.admin.followup_effect import effect_lease_allowed
 from lingxi.core.admin.management_card import render_management_card
-from lingxi.core.permission.targeted_recompute import RecomputeKind
-
-from .management_status import (
+from lingxi.core.admin.management_card_states import (
+    STATE_CLOSED,
+    STATE_DISPATCHING,
+    SUBMITTED_STATES,
+)
+from lingxi.core.admin.management_status import (
     PUBLISHING_STATUS_TEXT,
+    publish_observation,
+    recovery_dispatch_status,
     rendered_dispatch_status,
     skipped_recompute_status_message,
+    translate_recompute_result,
 )
+from lingxi.core.permission.targeted_recompute import RecomputeKind
 
 # 内部观察窗口，不是产品承诺：观察期间管理员看到的是真话「正在下发」；观察放弃之后
 # 留在库里的「未完成」由每日批纠正。
@@ -70,7 +77,7 @@ class ManagementCardRefresher:
             display_identifier=context.identifier,
             catalog=self._catalog,
             display_names=self._display_names,
-            submitted=state in {"submitted", "dispatching"},
+            submitted=state in SUBMITTED_STATES,
             dispatch_status=rendered_dispatch_status(
                 status=status,
                 state=state,
@@ -78,7 +85,7 @@ class ManagementCardRefresher:
                 status_message=status_message,
             ),
             status_message=status_message,
-            closed=state == "closed",
+            closed=state == STATE_CLOSED,
         )
         sequence_kwargs: dict[str, Any] = {"message_id": context.message_id}
         if expected_card_sequence is not None:
@@ -131,17 +138,6 @@ class ManagementCardRecoveryScanner:
         self._clock = clock
         self._next_scan_at = 0.0
 
-    @staticmethod
-    def _dispatch_status_for(context: ManagementCardContext) -> str | None:
-        """从持久状态推出这张卡该显示哪一种下发状态。"""
-        if context.dispatch_status in {"publishing", "effective", "incomplete"}:
-            return context.dispatch_status
-        if context.state in {"dispatching", "submitted"}:
-            return "publishing"
-        if context.state in {"effective", "incomplete"}:
-            return context.state
-        return None
-
     def scan(self) -> int:
         """扫一批待刷新的卡片并逐张更新。
 
@@ -169,7 +165,7 @@ class ManagementCardRecoveryScanner:
                 context=context,
                 status=status,
                 state=context.state,
-                dispatch_status=self._dispatch_status_for(context),
+                dispatch_status=recovery_dispatch_status(context),
             )
             return 0 if refreshed is False else 1
         except Exception as error:
@@ -221,7 +217,7 @@ class RecomputeResultReporter:
         self._refresh(
             pending,
             complete=False,
-            state_override="dispatching",
+            state_override=STATE_DISPATCHING,
             status_message=PUBLISHING_STATUS_TEXT,
         )
         self._start_publish_observer(pending)
@@ -265,16 +261,18 @@ class RecomputeResultReporter:
             return
         try:
             context = self._context_store.lookup_context(message_id=origin_message_id)
-            if context is None or context.state == "closed":
+            if context is None or context.state == STATE_CLOSED:
                 return
             if not self._is_current_action(pending, origin_message_id):
                 return
             status = self._status_lookup(context.identifier)
             if status is None:
                 return
-            state = "effective" if complete else (state_override or "incomplete")
-            display, machine = self._status_texts(
-                context, complete=complete, state=state, status_message=status_message
+            outcome = translate_recompute_result(
+                context,
+                complete=complete,
+                status_message=status_message,
+                state_override=state_override,
             )
             update_kwargs = {}
             if getattr(self._context_store, "supports_action_guard", False) is True:
@@ -282,13 +280,16 @@ class RecomputeResultReporter:
             updated = self._context_store.update_state(
                 message_id=origin_message_id,
                 **update_kwargs,
-                state=state,
-                dispatch_status=machine,
+                state=outcome.state,
+                dispatch_status=outcome.machine,
                 snapshot_fingerprint=management_card_fingerprint(status),
             )
             if updated is not None:
                 self._refresher.update(
-                    context=updated, status=status, state=state, dispatch_status=display
+                    context=updated,
+                    status=status,
+                    state=outcome.state,
+                    dispatch_status=outcome.display,
                 )
         except Exception as error:
             self._audit.record(
@@ -316,23 +317,6 @@ class RecomputeResultReporter:
             return False
         return True
 
-    @staticmethod
-    def _status_texts(
-        context: Any, *, complete: bool, state: str, status_message: str | None
-    ) -> tuple[str, str]:
-        """算出这次回写的展示文本与机器可读状态。
-
-        Returns:
-            ``(展示给管理员的文本, 落库的机器状态)``。
-        """
-        if complete:
-            return "已生效", "effective"
-        if state == "dispatching":
-            return status_message or PUBLISHING_STATUS_TEXT, "publishing"
-        trace = context.last_trace_id or "当前操作"
-        display = status_message or f"下发未完成，最迟次日自动纠正 · 追溯号 {trace}"
-        return display, "incomplete"
-
     def _start_publish_observer(self, pending: Any) -> None:
         """起一条有界的守护线程，观察发布状态直到出结果或超时。"""
         origin_message_id = getattr(pending, "origin_card_message_id", None)
@@ -349,12 +333,9 @@ class RecomputeResultReporter:
         """轮询发布状态；超时按「未完成」收口，交给每日批纠正。"""
         deadline = time.monotonic() + MANAGEMENT_PUBLISH_OBSERVE_SECONDS
         while time.monotonic() < deadline:
-            publish_state = self._read_publish_state(pending, origin_message_id)
-            if publish_state == "published":
-                self._refresh(pending, complete=True)
-                return
-            if publish_state in {"failed", "superseded"}:
-                self._refresh(pending, complete=False)
+            complete = publish_observation(self._read_publish_state(pending, origin_message_id))
+            if complete is not None:
+                self._refresh(pending, complete=complete)
                 return
             threading.Event().wait(MANAGEMENT_PUBLISH_POLL_SECONDS)
         self._refresh(pending, complete=False)

@@ -31,6 +31,11 @@ from lingxi.core.admin.management_card import (
     ManagementCardTransport,
     render_management_card,
 )
+from lingxi.core.admin.management_card_states import (
+    DISPATCH_IDLE,
+    STATE_EFFECTIVE,
+    STATE_READY,
+)
 from lingxi.core.admin.notification import (
     AdminCardDeliveryRejected,
     AdminCardTransport,
@@ -253,8 +258,8 @@ class ManagementCardContext:
     card_sequence: int
     snapshot_fingerprint: str
     context_deadline_at: datetime
-    state: str = "ready"
-    dispatch_status: str = "idle"
+    state: str = STATE_READY
+    dispatch_status: str = DISPATCH_IDLE
     last_trace_id: str | None = None
     # 仅用于每日批补齐汇总的幂等水位；只有持久层确认 daily refresh/batch 已经补齐
     # 一条此前即时失败的操作时才置上，普通即时成功不会获得这项资格。
@@ -313,8 +318,8 @@ class ManagementCardContextStore:
         card_sequence: int = 2,
         state_version: int = 1,
         context_deadline_at: datetime | None = None,
-        state: str = "ready",
-        dispatch_status: str = "idle",
+        state: str = STATE_READY,
+        dispatch_status: str = DISPATCH_IDLE,
         last_trace_id: str | None = None,
     ) -> None:
         """管理卡发送成功后登记一条映射。
@@ -527,7 +532,7 @@ class ManagementCardContextStore:
                 last_trace_id=last_trace_id if last_trace_id is not None else context.last_trace_id,
                 daily_correction_reported_at=(
                     context.daily_correction_reported_at
-                    if state != "effective" or context.daily_correction_pending
+                    if state != STATE_EFFECTIVE or context.daily_correction_pending
                     else context.daily_correction_reported_at or datetime.now(UTC)
                 ),
                 # ``incomplete`` 只是失败状态，不足以证明每日批已补齐；保留既有

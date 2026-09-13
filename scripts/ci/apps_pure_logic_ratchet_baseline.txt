@@ -35,8 +35,7 @@
 80	src/lingxi/apps/gateway/group_mention_hint.py
 17	src/lingxi/apps/gateway/innertest.py
 20	src/lingxi/apps/gateway/log_redaction.py
-264	src/lingxi/apps/gateway/management_cards.py
-63	src/lingxi/apps/gateway/management_status.py
+254	src/lingxi/apps/gateway/management_cards.py
 22	src/lingxi/apps/gateway/onboarding.py
 32	src/lingxi/apps/innertest.py
 200	src/lingxi/apps/innertest_roster/__init__.py
