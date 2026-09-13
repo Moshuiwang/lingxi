@@ -6,6 +6,7 @@
 
 from __future__ import annotations
 
+import ast
 import re
 import unittest
 from pathlib import Path
@@ -80,11 +81,20 @@ class ManagementCardStatesMatchMigrationTests(unittest.TestCase):
         self.assertEqual(SUBMITTED_STATES, {STATE_SUBMITTED, STATE_DISPATCHING})
 
     def test_the_constants_module_imports_nothing(self) -> None:
-        """任何一层都能引用它而不带入闭包，前提是它自己一个 import 都没有。"""
+        """任何一层都能引用它而不带入闭包，前提是它自己一个 import 都没有。
+
+        按 AST 找 ``Import`` / ``ImportFrom`` 节点（含函数体内的延迟导入），不用正则：
+        单行锚点只能锚到文件首字符，永远判不红。
+        """
         import lingxi.core.admin.management_card_states as module
 
-        source = Path(module.__file__).read_text(encoding="utf-8")
-        self.assertNotRegex(source, r"^(from|import) ", "常量模块不得 import 任何东西")
+        tree = ast.parse(Path(module.__file__).read_text(encoding="utf-8"))
+        imports = [
+            ast.unparse(node)
+            for node in ast.walk(tree)
+            if isinstance(node, (ast.Import, ast.ImportFrom))
+        ]
+        self.assertEqual(imports, [], "常量模块不得 import 任何东西")
 
 
 def _context(*, state: str, dispatch_status: str, last_trace_id: str | None = "trc_1"):
