@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import unittest
 from datetime import UTC, datetime, timedelta
+from types import SimpleNamespace
 
 from lingxi.config.content import default_content_catalog
 from lingxi.core.admin.card_dispatch import (
@@ -1271,6 +1272,81 @@ class SuspendedUserGetsTheTruthNotADailyBatchPromiseTests(unittest.TestCase):
         visible = _render_incomplete(account_state="enabled", dispatch_status="incomplete")
         for fragment in self.TRUTH_FRAGMENTS:
             self.assertNotIn(fragment, visible)
+
+
+class RecomputeResultReporterWritesHumanReadableTextTests(unittest.TestCase):
+    """后台重算结果回写到卡片上的是给管理员看的话，不是英文机器态。
+
+    ``translate_recompute_result`` 算出 ``(state, display, machine)`` 三个值：落库的是
+    ``machine``，交给刷新器渲染到卡片上的必须是 ``display``（含追溯号那句）。两者接反，
+    库里照样是合法取值、既有断言照样绿，管理员却会在卡上看到 ``incomplete`` 这样的
+    英文字面——这里把「刷新器收到的逐字等于 display、且不等于 machine」钉死。
+    """
+
+    MESSAGE_ID = "om_reporter"
+
+    def _reporter(self, status: AdminUserStatusView):
+        from lingxi.apps.gateway.management_cards import RecomputeResultReporter
+
+        store = ManagementCardContextStore()
+        store.remember(
+            message_id=self.MESSAGE_ID,
+            card_id="card_reporter",
+            identifier="u@example.com",
+            chat_id="oc_1",
+            initiated_by_open_id="ou_admin",
+            snapshot_fingerprint=management_card_fingerprint(status),
+            context_deadline_at=datetime.now(UTC) + timedelta(hours=1),
+            last_trace_id="trc_reporter",
+        )
+        refresh = _Refresh()
+        reporter = RecomputeResultReporter(
+            context_store=store,
+            refresher=refresh,
+            status_lookup=lambda _identifier: status,
+            audit=_Audit(),
+        )
+        return reporter, store, refresh
+
+    def _assert_refresher_got_the_display_text(self, store, refresh, before, *, complete: bool):
+        from lingxi.core.admin.management_status import translate_recompute_result
+
+        expected = translate_recompute_result(before, complete=complete)
+        self.assertEqual(len(refresh.calls), 1, refresh.calls)
+        call = refresh.calls[0]
+        self.assertEqual(call["dispatch_status"], expected.display)
+        self.assertNotEqual(call["dispatch_status"], expected.machine)
+        self.assertEqual(call["state"], expected.state)
+        after = store.lookup_context(message_id=self.MESSAGE_ID)
+        self.assertEqual((after.state, after.dispatch_status), (expected.state, expected.machine))
+
+    def test_a_completed_recompute_refreshes_the_card_with_the_effective_wording(self) -> None:
+        status = _status()
+        reporter, store, refresh = self._reporter(status)
+        before = store.lookup_context(message_id=self.MESSAGE_ID)
+
+        reporter.on_completed(SimpleNamespace(id="pac_1", origin_card_message_id=self.MESSAGE_ID))
+
+        self._assert_refresher_got_the_display_text(store, refresh, before, complete=True)
+        self.assertEqual(refresh.calls[0]["dispatch_status"], "已生效")
+
+    def test_a_failed_recompute_refreshes_the_card_with_the_incomplete_wording(self) -> None:
+        status = _status()
+        reporter, store, refresh = self._reporter(status)
+        before = store.lookup_context(message_id=self.MESSAGE_ID)
+
+        reporter.on_failed(
+            SimpleNamespace(id="pac_1", origin_card_message_id=self.MESSAGE_ID), None
+        )
+
+        self._assert_refresher_got_the_display_text(store, refresh, before, complete=False)
+        self.assertEqual(
+            refresh.calls[0]["dispatch_status"],
+            "下发未完成，最迟次日自动纠正 · 追溯号 trc_reporter",
+        )
+        self.assertNotIn(
+            refresh.calls[0]["dispatch_status"], ("incomplete", "effective", "publishing", "idle")
+        )
 
 
 if __name__ == "__main__":
