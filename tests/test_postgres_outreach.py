@@ -15,11 +15,15 @@ from __future__ import annotations
 import json
 import os
 import unittest
+from datetime import UTC, datetime
 
 from postgres_schema import ensure_production_schema, psycopg_available, reset_production_rows
 
 from lingxi.adapters.postgres import connect
+from lingxi.adapters.postgres_identity import PostgresAppUserStore
 from lingxi.adapters.postgres_outreach import PostgresOutreachStore, PostgresOutreachSubjects
+from lingxi.config.content import default_content_catalog
+from lingxi.core.outreach.audience import SKIP_CONTACT_UNAVAILABLE, plan_outreach
 from lingxi.core.outreach.dispatch import STATUS_DELIVERED, STATUS_FAILED
 
 SKIP_REASON = (
@@ -36,6 +40,9 @@ CONTENT_KEY = "outreach.welcome"
 CONTENT_VERSION = "2026-09-05"
 STYLE = "header_markdown"
 PERMISSIONS_TEXT = '{"1011": ["充值金额"]}'
+#: 让 ``plan_outreach`` 能把上面这份权限装配成可发送的取值：公司编号与指标名都查得到中文名。
+COMPANY_NAMES = {"1011": "尼日利亚"}
+METRIC_LABELS = {"充值金额": "充值金额"}
 
 
 def _reserve_kwargs(**overrides):
@@ -327,6 +334,46 @@ class OutreachSubjectPostgresTest(unittest.TestCase):
         facts = self.subjects.facts_for("nobody@example.invalid")
         self.assertIsNone(facts.user_id)
         self.assertEqual(facts.roster_names, ())
+
+    def _plan(self):
+        return plan_outreach(
+            self.subjects.facts_for(EMAIL),
+            company_names=COMPANY_NAMES,
+            metric_labels=METRIC_LABELS,
+            total_company_count=43,
+            catalog=default_content_catalog(),
+        )
+
+    def test_a_contact_marked_unavailable_is_read_back_and_skipped_by_the_audience_plan(
+        self,
+    ) -> None:
+        """「联系不上」从写侧到名单侧的整条接线：``record_contact_unavailable`` 落下
+        ``outbound_unavailable_at`` / ``outbound_unavailable_code`` → ``facts_for``
+        把两列原样带回 → ``plan_outreach`` 据此给出 ``contact_unavailable``。
+
+        先证明同一个人在标记之前是可发送的：否则任何别的跳过原因都能让本用例
+        假绿。变异锚点：把 ``_SUBJECT_SQL`` 里 ``u.outbound_unavailable_at`` 换成
+        ``NULL``（或等价断线），本用例应变红（名单侧重新把这个人算成可发送）。
+        """
+        self._seed()
+        before = self._plan()
+        self.assertTrue(before.sendable, before.skip_reason)
+        self.assertIsNone(self.subjects.facts_for(EMAIL).outbound_unavailable_at)
+
+        marked_at = datetime.now(UTC)
+        written = PostgresAppUserStore(self.dsn).record_contact_unavailable(
+            open_id=OPEN_ID, when=marked_at, code="feishu_code_230013"
+        )
+        self.assertTrue(written)
+
+        facts = self.subjects.facts_for(EMAIL)
+        self.assertEqual(facts.outbound_unavailable_at, marked_at)
+        self.assertEqual(facts.outbound_unavailable_code, "feishu_code_230013")
+
+        after = self._plan()
+        self.assertFalse(after.sendable)
+        self.assertEqual(after.skip_reason, SKIP_CONTACT_UNAVAILABLE)
+        self.assertTrue(after.active, "跳过原因是联系不上，不是没开通")
 
 
 if __name__ == "__main__":
