@@ -236,6 +236,73 @@ class FinalizeTest(unittest.TestCase):
 
 
 class BaselineSelectionTest(unittest.TestCase):
+    def test_pull_request_to_unprotected_base_is_ignored(self):
+        """base 不是默认分支也不是 release/**：不能当基线，也不贴标签（pr 为空）。"""
+
+        for base_ref in (
+            "x-attacker",
+            "feat/other",
+            "epic/a",
+            "trace/770-w1",
+            "main-2",
+            "releases/1",
+        ):
+            with self.subTest(base_ref=base_ref):
+                run_facts = facts(pull_requests=[pull_request(number=5, base_ref=base_ref)])
+                baseline = vd.select_baseline(run_facts)
+                self.assertIsNone(baseline.pull_request)
+                self.assertEqual((baseline.base_ref, baseline.base_sha), ("main", ""))
+        self.assertTrue(vd.is_protected_base("main", "main"))
+        self.assertTrue(vd.is_protected_base("release/2.5", "main"))
+        self.assertFalse(vd.is_protected_base("x-attacker", "main"))
+        self.assertFalse(vd.is_protected_base("", "main"))
+
+    def test_attacker_branch_pull_request_cannot_shadow_the_main_pull_request(self):
+        """[PR→x-attacker, PR→main]：x 的子树与头提交相同也不算数，按 main 比较走路径 b。"""
+
+        attacker = pull_request(number=1, base_ref="x-attacker", base_sha="1" * 40)
+        real = pull_request(number=2, base_ref="main", base_sha=BASE)
+        run_facts = facts(pull_requests=[attacker, real], conclusion="success")
+        baseline = vd.select_baseline(run_facts)
+        self.assertEqual(baseline.pull_request.number, 2)
+        trees = vd.WorkflowTrees(head=TREE_OTHER, base=TREE_SAME, default_branch=TREE_SAME)
+        verdict = vd.decide(run_facts, baseline, trees)
+        self.assertEqual((verdict.path, verdict.conclusion), (vd.PATH_B, None))
+
+    def test_only_attacker_branch_pull_request_falls_back_to_default_branch(self):
+        """只有 PR→x：基线是默认分支，头提交与默认分支的子树不同就复跑。"""
+
+        run_facts = facts(
+            pull_requests=[pull_request(number=1, base_ref="x-attacker", base_sha="1" * 40)]
+        )
+        baseline = vd.select_baseline(run_facts)
+        self.assertIsNone(baseline.pull_request)
+        self.assertEqual(baseline.label, "main")
+        trees = vd.WorkflowTrees(head=TREE_OTHER, base=None, default_branch=TREE_SAME)
+        self.assertEqual(vd.decide(run_facts, baseline, trees).path, vd.PATH_B)
+        same = vd.WorkflowTrees(head=TREE_SAME, base=None, default_branch=TREE_SAME)
+        self.assertEqual(vd.decide(run_facts, baseline, same).path, vd.PATH_A)
+
+    def test_default_branch_base_is_preferred_over_release_base(self):
+        release = pull_request(number=1, base_ref="release/2.5", base_sha="1" * 40, head_sha=HEAD)
+        main = pull_request(number=2, base_ref="main", base_sha=BASE, head_sha="9" * 40)
+        baseline = vd.select_baseline(facts(pull_requests=[release, main]))
+        self.assertEqual(baseline.pull_request.number, 2)
+        only_release = vd.select_baseline(facts(pull_requests=[release]))
+        self.assertEqual(
+            (only_release.pull_request.number, only_release.base_ref), (1, "release/2.5")
+        )
+
+    def test_fallback_lookup_obeys_the_same_base_rule(self):
+        fallback = [
+            pull_request(number=11, base_ref="x-attacker", base_sha="1" * 40),
+            pull_request(number=12, base_ref="main", base_sha=BASE),
+        ]
+        baseline = vd.select_baseline(vd.parse_run_facts(event(pull_requests=[]), fallback))
+        self.assertEqual(baseline.pull_request.number, 12)
+        only_bad = vd.select_baseline(vd.parse_run_facts(event(pull_requests=[]), fallback[:1]))
+        self.assertIsNone(only_bad.pull_request)
+
     def test_prefers_pull_request_whose_head_matches_run(self):
         stale = pull_request(number=1, base_ref="release/2.5", base_sha="1" * 40, head_sha="9" * 40)
         current = pull_request(number=2, base_ref="main", base_sha=BASE, head_sha=HEAD)
@@ -626,6 +693,16 @@ class VerdictWorkflowShapeTest(unittest.TestCase):
         self.assertIn("pull-requests: write", body)
         self.assertIn("LABEL: " + vd.CHANGED_GATE_LABEL, body)
         self.assertNotIn("needs: [decide, rerun]", body)
+
+    def test_label_job_tells_gh_which_repository_without_a_checkout(self):
+        """没有 checkout 的作业里 gh 认不出远端：`gh label create` 必须有 GH_REPO 或 --repo。"""
+
+        body = _job_body(self.text, "label")
+        self.assertNotIn("actions/checkout", body)
+        self.assertIn("gh label create", body)
+        has_env = "GH_REPO: ${{ github.repository }}" in body
+        has_flag = re.search(r"gh label create[^\n]*--repo ", body) is not None
+        self.assertTrue(has_env or has_flag, "label 作业既没设 GH_REPO 也没给 --repo")
 
     def test_every_action_is_pinned_to_a_commit_sha(self):
         for line in re.findall(r"uses: [^\n]+", self.text):

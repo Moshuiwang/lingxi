@@ -17,9 +17,10 @@
 4. 子树不同（路径 b，PR 改了门禁定义）：由默认分支版 `ci.yml` 复跑一次，结论在
    复跑结束后由 `finalize` 给出，同样只有 `success` 算通过。
 
-`workflow_run.pull_requests[]` 为空时（例如事件送达时 PR 尚未关联）由工作流按头提交
-反查 PR；仍找不到就以默认分支为基线——比较的对象仍是受保护分支上的定义，只是
-无法贴标签与评论。
+基线只认 base 为默认分支或 `release/**` 的 PR（其余 base 一律忽略，见
+`is_protected_base`）。`workflow_run.pull_requests[]` 为空时由工作流按头提交反查 PR，
+两路同一规则；没有合格 PR 就以默认分支为基线——比较的对象仍是受保护分支上的定义，
+只是无法贴标签与评论。
 """
 
 from __future__ import annotations
@@ -133,12 +134,31 @@ def parse_run_facts(event: Mapping, fallback_pull_requests: Sequence[Mapping] = 
     )
 
 
-def select_baseline(facts: RunFacts) -> Baseline:
-    """选基线：优先头提交一致的 PR，其次第一条 PR，都没有就用默认分支。"""
+def is_protected_base(base_ref: str, default_branch: str) -> bool:
+    """基线只认受规则集保护的分支：默认分支或 `release/**`。
 
-    chosen = next((pr for pr in facts.pull_requests if pr.head_sha == facts.head_sha), None)
-    if chosen is None and facts.pull_requests:
-        chosen = facts.pull_requests[0]
+    `pull_requests[]` 与按头提交反查的结果都是不可信输入：同一头提交可以同时开一条
+    PR 到攻击者自己的分支 x（x = 默认分支 + 放松的门禁），若拿 x 当基线，路径 a 就会
+    采信 PR 自己那次运行。只有受保护分支上的定义才配当比较对象。
+    """
+
+    return base_ref == default_branch or base_ref.startswith("release/")
+
+
+def select_baseline(facts: RunFacts) -> Baseline:
+    """选基线：只在受保护 base 的 PR 里选，默认分支优先、其次头提交一致；没有就用默认分支。"""
+
+    eligible = [
+        pr for pr in facts.pull_requests if is_protected_base(pr.base_ref, facts.default_branch)
+    ]
+
+    def rank(pr: PullRequestRef) -> tuple[int, int]:
+        return (
+            0 if pr.base_ref == facts.default_branch else 1,
+            0 if pr.head_sha == facts.head_sha else 1,
+        )
+
+    chosen = min(eligible, key=rank) if eligible else None
     if chosen is None:
         return Baseline(pull_request=None, base_ref=facts.default_branch, base_sha="")
     return Baseline(pull_request=chosen, base_ref=chosen.base_ref, base_sha=chosen.base_sha)
