@@ -43,9 +43,9 @@
 447	src/lingxi/apps/reauthorize/__init__.py
 181	src/lingxi/apps/scheduler/__init__.py
 37	src/lingxi/apps/scheduler/alerting_assembly.py
-37	src/lingxi/apps/scheduler/contact_reachability_assembly.py
 420	src/lingxi/apps/scheduler/assembly.py
 293	src/lingxi/apps/scheduler/config.py
+37	src/lingxi/apps/scheduler/contact_reachability_assembly.py
 275	src/lingxi/apps/scheduler/credential_rotation.py
 569	src/lingxi/apps/scheduler/daily_report.py
 233	src/lingxi/apps/scheduler/daily_report_sections.py
@@ -67,9 +67,8 @@
 67	src/lingxi/apps/worker/content_capture.py
 87	src/lingxi/apps/worker/progress_reporting.py
 293	src/lingxi/apps/worker/report.py
-236	src/lingxi/apps/worker/report_extraction.py
+117	src/lingxi/apps/worker/report_extraction.py
 500	src/lingxi/apps/worker/service.py
 31	src/lingxi/apps/worker/service_ports.py
-181	src/lingxi/apps/worker/task_processing.py
 99	src/lingxi/apps/worker/terminal_outcome.py
 648	src/lingxi/apps/worker/turn.py

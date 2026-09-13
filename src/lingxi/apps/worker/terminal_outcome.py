@@ -16,8 +16,8 @@ from typing import Any
 
 from lingxi.apps.worker.report_extraction import _cap_log_token, sanitize_failure_signature
 from lingxi.apps.worker.service_ports import TerminalOutcomeCallback
-from lingxi.apps.worker.task_processing import TerminalDecision, TurnOutcome
 from lingxi.config.content_override import content_digest
+from lingxi.core.delivery.turn_outcome import TerminalDecision, TurnOutcome
 from lingxi.core.task_reference import reference_fields
 
 logger = logging.getLogger("lingxi.apps.worker.service")

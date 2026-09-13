@@ -157,6 +157,11 @@ REQUIRED_MODULES = (
     # 由 adapters.postgres_conversation 与 apps.worker.service 共同依赖。
     "lingxi.core.delivery",
     "lingxi.core.delivery.ports",
+    # 回合终态判定（真中断 → 其他失败 → 协议残骸 → 正文被拒发 → 成功）与回合报告
+    # 字段读取，从 apps/worker 平移进 core 的纯函数；`apps/worker/service.py`、
+    # `terminal_outcome.py`、`turn.py` 模块级 import。
+    "lingxi.core.delivery.turn_outcome",
+    "lingxi.core.delivery.turn_report",
     "lingxi.adapters.claude_agent_hooks",
     "lingxi.core.permission.galaxy_export",
     "lingxi.core.permission.galaxy_scope",
@@ -413,12 +418,12 @@ REQUIRED_MODULES = (
     # service.py 拆分（#592 B-1）：端口协议、巡检、终态审计与内容采集。
     "lingxi.apps.worker.content_capture",
     "lingxi.apps.worker.progress_reporting",
-    "lingxi.apps.worker.task_processing",
     "lingxi.apps.worker.housekeeping",
     "lingxi.apps.worker.service_ports",
     "lingxi.apps.worker.terminal_outcome",
-    # Trace #358 S-H-2（Issue #350 Gate G-3 裁定 Option A）纯移动拆分：8 个
-    # 报告字段提取纯函数从 service.py 搬出。`service.py` 顶部**模块级** import
+    # Trace #358 S-H-2（Issue #350 Gate G-3 裁定 Option A）纯移动拆分：模块级
+    # 纯函数从 service.py 搬出（其中读回合报告字段的一批后来再平移进
+    # `core.delivery.turn_report`）。`service.py` 顶部**模块级** import
     # 本模块，`apps/worker/cli.py` 也直接 `from .service import
     # _load_task_system_prompt`（经 service.py re-export），漏登记会让两条
     # 路径都装不上。
@@ -1076,7 +1081,6 @@ PROCESS_RUNTIME_IMPORTS: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {
             "lingxi.apps.worker.turn",
             "lingxi.apps.worker.content_capture",
             "lingxi.apps.worker.progress_reporting",
-            "lingxi.apps.worker.task_processing",
             "lingxi.apps.worker.housekeeping",
             "lingxi.apps.worker.service",
             "lingxi.apps.worker.service_ports",
@@ -1164,6 +1168,10 @@ PROCESS_RUNTIME_IMPORTS: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {
             # adapters.postgres_conversation 与 apps.worker.service 共同依赖。
             "lingxi.core.delivery",
             "lingxi.core.delivery.ports",
+            # 回合终态判定与回合报告字段读取（理由见 REQUIRED_MODULES 同名条目）：
+            # `apps/worker/service.py`、`terminal_outcome.py`、`turn.py` 模块级 import。
+            "lingxi.core.delivery.turn_outcome",
+            "lingxi.core.delivery.turn_report",
             "lingxi.core.execution",
             "lingxi.core.execution.audit",
             # 语义化等待进度（Issue #321 方向 C）：worker 用它的
