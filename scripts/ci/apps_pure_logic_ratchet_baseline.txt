@@ -43,9 +43,9 @@
 447	src/lingxi/apps/reauthorize/__init__.py
 181	src/lingxi/apps/scheduler/__init__.py
 37	src/lingxi/apps/scheduler/alerting_assembly.py
-37	src/lingxi/apps/scheduler/contact_reachability_assembly.py
 420	src/lingxi/apps/scheduler/assembly.py
 293	src/lingxi/apps/scheduler/config.py
+37	src/lingxi/apps/scheduler/contact_reachability_assembly.py
 275	src/lingxi/apps/scheduler/credential_rotation.py
 569	src/lingxi/apps/scheduler/daily_report.py
 233	src/lingxi/apps/scheduler/daily_report_sections.py
@@ -57,8 +57,8 @@
 331	src/lingxi/apps/scheduler/org_snapshot_sync.py
 436	src/lingxi/apps/scheduler/permission_publish.py
 86	src/lingxi/apps/scheduler/permission_readiness_assembly.py
-623	src/lingxi/apps/scheduler/permission_refresh.py
-135	src/lingxi/apps/scheduler/permission_refresh_ports.py
+504	src/lingxi/apps/scheduler/permission_refresh.py
+127	src/lingxi/apps/scheduler/permission_refresh_ports.py
 298	src/lingxi/apps/scheduler/roster_audit.py
 311	src/lingxi/apps/scheduler/stalled_provisioning.py
 290	src/lingxi/apps/trace/__init__.py
