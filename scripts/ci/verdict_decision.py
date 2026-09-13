@@ -10,17 +10,17 @@
 
 1. 触发运行不是 `pull_request` 事件、或不是 `.github/workflows/ci.yml` 产出的：不写检查。
 2. 头提交来自外部仓库：写 failure，外部仓库不裁决。
-3. 头提交的 `.github/workflows` 子树与基线分支相同、或与默认分支当前提交相同
-   （路径 a）：采信那次 `Epic Full` 的结论；只有 `success` 算通过，`skipped` /
-   `neutral` / `cancelled` 一律判红。与默认分支相同也算，是因为路径 b 复跑用的正是
-   默认分支的定义，头提交已经是这份定义时，PR 自己那次运行与复跑等价。
-4. 子树不同（路径 b，PR 改了门禁定义）：由默认分支版 `ci.yml` 复跑一次，结论在
-   复跑结束后由 `finalize` 给出，同样只有 `success` 算通过。
+3. 路径 a——同时满足：来源核验通过（头分支从未面向非受保护分支开过 PR，见
+   `Taint`）、有面向受保护分支的 PR 当基线、头提交的 `.github/workflows` 子树与该
+   基线相同：采信那次 `Epic Full` 的结论；只有 `success` 算通过，`skipped` /
+   `neutral` / `cancelled` 一律判红。
+4. 其余一律路径 b：由默认分支版 `ci.yml` 以头提交复跑一次，结论在复跑结束后由
+   `finalize` 给出，同样只有 `success` 算通过。
 
 基线只认 base 为默认分支或 `release/**` 的 PR（其余 base 一律忽略，见
 `is_protected_base`）。`workflow_run.pull_requests[]` 为空时由工作流按头提交反查 PR，
-两路同一规则；没有合格 PR 就以默认分支为基线——比较的对象仍是受保护分支上的定义，
-只是无法贴标签与评论。
+两路同一规则；没有合格 PR 就以默认分支为基线做子树比对与差异清单，但不采信触发
+运行（路径 b），也无法贴标签与评论。
 """
 
 from __future__ import annotations
@@ -198,15 +198,77 @@ def map_run_conclusion(conclusion: str | None) -> str:
 
 @dataclass(frozen=True)
 class WorkflowTrees:
-    """三侧 `.github/workflows` 子树的树对象 sha；取不到的一侧为 None。"""
+    """头提交与基线两侧 `.github/workflows` 子树的树对象 sha；取不到的一侧为 None。
+
+    没有合格 PR 时基线是默认分支，那份子树只用于比对与差异清单，绝不据此采信触发
+    运行：头提交的定义与默认分支相同，不等于触发它的那次运行用的是这份定义。
+    """
 
     head: str | None
     base: str | None
-    default_branch: str | None = None
 
 
-def decide(facts: RunFacts, baseline: Baseline, trees: WorkflowTrees) -> Verdict:
-    """给出初步裁决：跳过 / 拒绝 / 路径 a（有结论）/ 路径 b（等复跑）。"""
+TAINT_QUERY_OK = "ok"
+
+
+@dataclass(frozen=True)
+class Taint:
+    """触发运行的来源核验：头分支是否曾面向非受保护分支开过 PR（含已关闭）。
+
+    触发运行只带 `head_branch` / `head_sha`，不带「是哪条 PR 触发的」。攻击者可以保持
+    头提交的定义与主干相同，另建可写分支 x（`ci.yml` 改成面向 x 触发、恒成功、名字仍叫
+    Epic Full），开一条辅助 PR 到 x：那次运行 event / path / 仓库都合格，事后关掉辅助 PR，
+    按头提交反查（只回 open + merged）就看不见它了。所以按头分支查 `state=all` 的全部
+    PR，只要有一条 base 非受保护，这个头分支的所有运行都不得走路径 a；查询失败同样
+    视为受染——查不到不等于没有。
+    """
+
+    status: str
+    reasons: tuple[str, ...] = ()
+
+    @property
+    def tainted(self) -> bool:
+        return self.status != TAINT_QUERY_OK or bool(self.reasons)
+
+    @property
+    def summary(self) -> str:
+        if self.status != TAINT_QUERY_OK:
+            return f"来源核验失败（{self.status or '未知'}），不采信触发运行"
+        if self.reasons:
+            return (
+                "头分支曾面向非受保护分支开 PR（" + "、".join(self.reasons) + "），不采信触发运行"
+            )
+        return "来源核验通过"
+
+
+def assess_taint(
+    head_branch_pull_requests: Iterable[Mapping], default_branch: str, status: str
+) -> Taint:
+    """按头分支的全部 PR（`state=all`）判定受染；`status` 非 ok 直接受染。"""
+
+    if status != TAINT_QUERY_OK:
+        return Taint(status=status or "unknown")
+    reasons = []
+    for item in head_branch_pull_requests:
+        base_ref = str((item.get("base") or {}).get("ref") or "")
+        if not is_protected_base(base_ref, default_branch):
+            state = str(item.get("state") or "?")
+            reasons.append(f"#{item.get('number', '?')}→{base_ref or '?'}（{state}）")
+    return Taint(status=TAINT_QUERY_OK, reasons=tuple(reasons))
+
+
+def definitions_differ(trees: WorkflowTrees) -> bool:
+    """头提交的门禁定义是否与基线不同；任一侧缺失也算不同（标签与差异评论据此触发）。"""
+
+    return not (trees.head and trees.head == trees.base)
+
+
+def decide(facts: RunFacts, baseline: Baseline, trees: WorkflowTrees, taint: Taint) -> Verdict:
+    """给出初步裁决：跳过 / 拒绝 / 路径 a（有结论）/ 路径 b（等复跑）。
+
+    路径 a 三个条件缺一不可：来源核验通过、有面向受保护分支的 PR 当基线、头提交的
+    `.github/workflows` 子树与该基线相同。任何一条不成立都复跑，绝不采信触发运行。
+    """
 
     early = precheck(facts)
     if early is not None:
@@ -214,30 +276,29 @@ def decide(facts: RunFacts, baseline: Baseline, trees: WorkflowTrees) -> Verdict
     run_label = f"run {facts.run_id} 结论 {facts.conclusion or '无'}"
     tree_label = (
         f"{WORKFLOWS_DIRECTORY} 子树：头提交 {trees.head or '缺失'}，"
-        f"基线 {baseline.label} {trees.base or '缺失'}，"
-        f"默认分支当前 {trees.default_branch or '缺失'}"
+        f"基线 {baseline.label} {trees.base or '缺失'}"
     )
-    if trees.head and trees.head == trees.base:
-        matched = f"与基线 {baseline.label} 相同"
-    elif trees.head and trees.head == trees.default_branch:
-        matched = "与默认分支当前提交相同"
-    else:
-        matched = ""
-    if matched:
+    if taint.tainted:
+        why = taint.summary
+    elif baseline.pull_request is None:
+        why = f"没有面向受保护分支的 PR（基线暂取默认分支 {baseline.label}）"
+    elif not definitions_differ(trees):
         return Verdict(
             path=PATH_A,
             write_check=True,
             conclusion=map_run_conclusion(facts.conclusion),
-            summary=f"路径 a（门禁定义{matched}）：采信 {run_label}；{tree_label}",
+            summary=(
+                f"路径 a（门禁定义与基线 {baseline.label} 相同，{taint.summary}）："
+                f"采信 {run_label}；{tree_label}"
+            ),
         )
+    else:
+        why = f"门禁定义与基线 {baseline.label} 不同"
     return Verdict(
         path=PATH_B,
         write_check=True,
         conclusion=None,
-        summary=(
-            f"路径 b（门禁定义与基线、默认分支都不同）：不采信 {run_label}，"
-            f"由默认分支版 ci.yml 复跑头提交；{tree_label}"
-        ),
+        summary=f"路径 b（{why}）：不采信 {run_label}，由默认分支版 ci.yml 复跑头提交；{tree_label}",
     )
 
 
@@ -371,15 +432,16 @@ def _command_decide(args: argparse.Namespace) -> None:
     fallback = _load_json(args.fallback_pulls_file) if args.fallback_pulls_file else []
     facts = parse_run_facts(_load_json(args.event_file), fallback)
     baseline = select_baseline(facts)
-    trees = WorkflowTrees(
-        head=args.head_tree or None,
-        base=args.base_tree or None,
-        default_branch=args.default_tree or None,
-    )
-    verdict = decide(facts, baseline, trees)
+    trees = WorkflowTrees(head=args.head_tree or None, base=args.base_tree or None)
+    head_branch_pulls: list = []
+    if args.taint_query_status == TAINT_QUERY_OK and args.head_branch_pulls_file:
+        head_branch_pulls = _load_json(args.head_branch_pulls_file)
+    taint = assess_taint(head_branch_pulls, facts.default_branch, args.taint_query_status)
+    verdict = decide(facts, baseline, trees, taint)
+    definitions_changed = definitions_differ(trees)
     diff: list[str] = []
     listings = (args.base_listing_file, args.head_listing_file)
-    if verdict.path == PATH_B and all(path and Path(path).is_file() for path in listings):
+    if definitions_changed and all(path and Path(path).is_file() for path in listings):
         diff = workflow_tree_diff(
             _load_json(args.base_listing_file), _load_json(args.head_listing_file)
         )
@@ -395,6 +457,7 @@ def _command_decide(args: argparse.Namespace) -> None:
             "base_label": baseline.label,
             "run_id": facts.run_id or "",
             "run_url": facts.run_url,
+            "definitions_changed": "true" if definitions_changed else "false",
             "diff": json.dumps(diff, ensure_ascii=False),
         },
     )
@@ -442,7 +505,12 @@ def build_parser() -> argparse.ArgumentParser:
     decision.add_argument("--fallback-pulls-file")
     decision.add_argument("--head-tree", default="")
     decision.add_argument("--base-tree", default="")
-    decision.add_argument("--default-tree", default="")
+    decision.add_argument("--head-branch-pulls-file")
+    decision.add_argument(
+        "--taint-query-status",
+        default="",
+        help="按头分支查 state=all 全部 PR 的结果：ok 或失败原因；非 ok 一律路径 b",
+    )
     decision.add_argument("--head-listing-file")
     decision.add_argument("--base-listing-file")
     decision.add_argument("--github-output")

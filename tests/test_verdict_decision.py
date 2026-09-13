@@ -89,10 +89,28 @@ def facts(**kwargs):
     return vd.parse_run_facts(event(**kwargs))
 
 
-def decide(head_tree=TREE_SAME, base_tree=TREE_SAME, default_tree=TREE_SAME, **kwargs):
+CLEAN = vd.Taint(status=vd.TAINT_QUERY_OK)
+
+
+def taint_from(*entries, status=vd.TAINT_QUERY_OK, default_branch="main"):
+    """按头分支的 PR 清单（state=all 形状）构造来源核验结果。"""
+
+    return vd.assess_taint(list(entries), default_branch, status)
+
+
+def head_branch_pull(number, base_ref, state="open", head_sha=HEAD):
+    return {
+        "number": number,
+        "state": state,
+        "base": {"ref": base_ref, "sha": "1" * 40},
+        "head": {"sha": head_sha},
+    }
+
+
+def decide(head_tree=TREE_SAME, base_tree=TREE_SAME, taint=CLEAN, **kwargs):
     run_facts = facts(**kwargs)
-    trees = vd.WorkflowTrees(head=head_tree, base=base_tree, default_branch=default_tree)
-    return vd.decide(run_facts, vd.select_baseline(run_facts), trees)
+    trees = vd.WorkflowTrees(head=head_tree, base=base_tree)
+    return vd.decide(run_facts, vd.select_baseline(run_facts), trees, taint)
 
 
 class DecisionRulesTest(unittest.TestCase):
@@ -153,51 +171,86 @@ class DecisionRulesTest(unittest.TestCase):
         self.assertIn("main@" + BASE[:12], verdict.summary)
 
     def test_changed_workflow_tree_takes_path_b_and_waits_for_rerun(self):
-        for head_tree, base_tree, default_tree in (
-            (TREE_OTHER, TREE_SAME, TREE_SAME),
-            (None, TREE_SAME, TREE_SAME),
-            ("", TREE_SAME, TREE_SAME),
-            (TREE_SAME, None, None),
-            (TREE_SAME, "", ""),
-            (None, None, None),
-            (TREE_OTHER, TREE_SAME, "e" * 40),
+        for head_tree, base_tree in (
+            (TREE_OTHER, TREE_SAME),
+            (None, TREE_SAME),
+            ("", TREE_SAME),
+            (TREE_SAME, None),
+            (TREE_SAME, ""),
+            (None, None),
+            ("", ""),
         ):
-            with self.subTest(head=head_tree, base=base_tree, default=default_tree):
-                verdict = decide(
-                    head_tree=head_tree,
-                    base_tree=base_tree,
-                    default_tree=default_tree,
-                    conclusion="success",
-                )
+            with self.subTest(head=head_tree, base=base_tree):
+                verdict = decide(head_tree=head_tree, base_tree=base_tree, conclusion="success")
                 self.assertEqual(verdict.path, vd.PATH_B)
                 self.assertTrue(verdict.write_check)
                 self.assertIsNone(verdict.conclusion)
                 self.assertIn("不采信", verdict.summary)
+                self.assertTrue(vd.definitions_differ(vd.WorkflowTrees(head_tree, base_tree)))
+        self.assertFalse(vd.definitions_differ(vd.WorkflowTrees(TREE_SAME, TREE_SAME)))
 
-    def test_head_identical_to_default_branch_takes_path_a_even_if_base_differs(self):
-        """main → release/** 的同步 PR：头提交已是默认分支的定义，复跑与自身运行等价。"""
+    def test_head_identical_to_default_branch_but_not_to_base_still_reruns(self):
+        """头提交的定义与 main 相同、与基线 release/** 不同：不能据此采信触发运行。"""
 
         verdict = decide(
             head_tree=TREE_SAME,
             base_tree=TREE_OTHER,
-            default_tree=TREE_SAME,
             conclusion="success",
             pull_requests=[pull_request(base_ref="release/2.5", base_sha="1" * 40)],
         )
-        self.assertEqual((verdict.path, verdict.conclusion), (vd.PATH_A, vd.SUCCESS))
-        self.assertIn("与默认分支当前提交相同", verdict.summary)
-        failed = decide(
-            head_tree=TREE_SAME, base_tree=TREE_OTHER, default_tree=TREE_SAME, conclusion="failure"
-        )
-        self.assertEqual((failed.path, failed.conclusion), (vd.PATH_A, vd.FAILURE))
+        self.assertEqual((verdict.path, verdict.conclusion), (vd.PATH_B, None))
+        self.assertIn("不同", verdict.summary)
 
-    def test_empty_head_tree_never_matches_an_empty_default_tree(self):
-        for head_tree, default_tree in ((None, None), ("", ""), ("", None), (None, "")):
-            with self.subTest(head=head_tree, default=default_tree):
-                verdict = decide(
-                    head_tree=head_tree, base_tree=TREE_OTHER, default_tree=default_tree
-                )
-                self.assertEqual(verdict.path, vd.PATH_B)
+    def test_helper_pull_request_to_attacker_branch_taints_even_when_closed(self):
+        """辅助 PR H→x 已关闭：按头分支 state=all 仍能看到，全部运行不得走路径 a。"""
+
+        taint = taint_from(
+            head_branch_pull(1, "main", state="open"),
+            head_branch_pull(2, "x-attacker", state="closed"),
+        )
+        self.assertTrue(taint.tainted)
+        verdict = decide(taint=taint, conclusion="success")
+        self.assertEqual((verdict.path, verdict.conclusion), (vd.PATH_B, None))
+        self.assertIn("#2→x-attacker（closed）", verdict.summary)
+        self.assertIn("不采信", verdict.summary)
+
+    def test_helper_pull_request_from_another_branch_name_taints_that_branch_only(self):
+        """辅助 PR 从分支 y 开到 x（run.head_branch = y）：y 的运行受染，诚实分支 feat 不受染。"""
+
+        malicious = taint_from(head_branch_pull(3, "x-attacker", state="open"))
+        self.assertEqual(decide(taint=malicious, conclusion="success").path, vd.PATH_B)
+        honest = taint_from(head_branch_pull(4, "main", state="open"))
+        self.assertFalse(honest.tainted)
+        verdict = decide(taint=honest, conclusion="success")
+        self.assertEqual((verdict.path, verdict.conclusion), (vd.PATH_A, vd.SUCCESS))
+
+    def test_honest_feature_branch_without_taint_takes_path_a(self):
+        clean = taint_from(
+            head_branch_pull(5, "main", state="closed"),
+            head_branch_pull(6, "release/2.5", state="open"),
+            head_branch_pull(7, "main", state="open"),
+        )
+        self.assertFalse(clean.tainted)
+        self.assertEqual(clean.summary, "来源核验通过")
+        verdict = decide(taint=clean, conclusion="success")
+        self.assertEqual((verdict.path, verdict.conclusion), (vd.PATH_A, vd.SUCCESS))
+        self.assertIn("来源核验通过", verdict.summary)
+
+    def test_failed_taint_query_is_not_the_same_as_no_taint(self):
+        for status in ("failed", "", "unknown", None):
+            with self.subTest(status=status):
+                taint = vd.assess_taint([], "main", status)
+                self.assertTrue(taint.tainted)
+                self.assertIn("来源核验失败", taint.summary)
+                verdict = decide(taint=taint, conclusion="success")
+                self.assertEqual((verdict.path, verdict.conclusion), (vd.PATH_B, None))
+
+    def test_no_eligible_pull_request_never_trusts_the_run_even_with_identical_trees(self):
+        for pull_requests in ([], [pull_request(number=9, base_ref="x-attacker")]):
+            with self.subTest(pull_requests=pull_requests):
+                verdict = decide(pull_requests=pull_requests, conclusion="success")
+                self.assertEqual((verdict.path, verdict.conclusion), (vd.PATH_B, None))
+                self.assertIn("没有面向受保护分支的 PR", verdict.summary)
 
     def test_path_b_success_of_own_run_is_never_trusted(self):
         verdict = decide(head_tree=TREE_OTHER, conclusion="success")
@@ -265,12 +318,12 @@ class BaselineSelectionTest(unittest.TestCase):
         run_facts = facts(pull_requests=[attacker, real], conclusion="success")
         baseline = vd.select_baseline(run_facts)
         self.assertEqual(baseline.pull_request.number, 2)
-        trees = vd.WorkflowTrees(head=TREE_OTHER, base=TREE_SAME, default_branch=TREE_SAME)
-        verdict = vd.decide(run_facts, baseline, trees)
+        trees = vd.WorkflowTrees(head=TREE_OTHER, base=TREE_SAME)
+        verdict = vd.decide(run_facts, baseline, trees, CLEAN)
         self.assertEqual((verdict.path, verdict.conclusion), (vd.PATH_B, None))
 
     def test_only_attacker_branch_pull_request_falls_back_to_default_branch(self):
-        """只有 PR→x：基线是默认分支，头提交与默认分支的子树不同就复跑。"""
+        """只有 PR→x：基线暂取默认分支（只为比对与标签），子树相同与否都复跑。"""
 
         run_facts = facts(
             pull_requests=[pull_request(number=1, base_ref="x-attacker", base_sha="1" * 40)]
@@ -278,10 +331,10 @@ class BaselineSelectionTest(unittest.TestCase):
         baseline = vd.select_baseline(run_facts)
         self.assertIsNone(baseline.pull_request)
         self.assertEqual(baseline.label, "main")
-        trees = vd.WorkflowTrees(head=TREE_OTHER, base=None, default_branch=TREE_SAME)
-        self.assertEqual(vd.decide(run_facts, baseline, trees).path, vd.PATH_B)
-        same = vd.WorkflowTrees(head=TREE_SAME, base=None, default_branch=TREE_SAME)
-        self.assertEqual(vd.decide(run_facts, baseline, same).path, vd.PATH_A)
+        trees = vd.WorkflowTrees(head=TREE_OTHER, base=TREE_SAME)
+        self.assertEqual(vd.decide(run_facts, baseline, trees, CLEAN).path, vd.PATH_B)
+        same = vd.WorkflowTrees(head=TREE_SAME, base=TREE_SAME)
+        self.assertEqual(vd.decide(run_facts, baseline, same, CLEAN).path, vd.PATH_B)
 
     def test_default_branch_base_is_preferred_over_release_base(self):
         release = pull_request(number=1, base_ref="release/2.5", base_sha="1" * 40, head_sha=HEAD)
@@ -327,9 +380,9 @@ class BaselineSelectionTest(unittest.TestCase):
         self.assertEqual(
             (baseline.base_ref, baseline.base_sha, baseline.label), ("main", "", "main")
         )
-        trees = vd.WorkflowTrees(head=TREE_SAME, base=TREE_SAME, default_branch=TREE_SAME)
-        verdict = vd.decide(without, baseline, trees)
-        self.assertEqual((verdict.path, verdict.conclusion), (vd.PATH_A, vd.SUCCESS))
+        trees = vd.WorkflowTrees(head=TREE_SAME, base=TREE_SAME)
+        verdict = vd.decide(without, baseline, trees, CLEAN)
+        self.assertEqual((verdict.path, verdict.conclusion), (vd.PATH_B, None))
 
     def test_fallback_is_ignored_when_event_already_lists_pull_requests(self):
         fallback = [pull_request(number=42)]
@@ -426,6 +479,9 @@ class CommandLineTest(unittest.TestCase):
             (temp / "head.json").write_text(
                 json.dumps([{"path": "ci.yml", "sha": "2", "type": "blob"}]), encoding="utf-8"
             )
+            (temp / "head-branch-pulls.json").write_text(
+                json.dumps([head_branch_pull(700, "main")]), encoding="utf-8"
+            )
             plan_output = temp / "plan.txt"
             self.run_cli(
                 "plan",
@@ -448,11 +504,13 @@ class CommandLineTest(unittest.TestCase):
                 str(temp / "event.json"),
                 "--fallback-pulls-file",
                 str(temp / "fallback.json"),
+                "--head-branch-pulls-file",
+                str(temp / "head-branch-pulls.json"),
+                "--taint-query-status",
+                "ok",
                 "--head-tree",
                 TREE_OTHER,
                 "--base-tree",
-                TREE_SAME,
-                "--default-tree",
                 TREE_SAME,
                 "--head-listing-file",
                 str(temp / "head.json"),
@@ -465,6 +523,7 @@ class CommandLineTest(unittest.TestCase):
             self.assertEqual(outputs["path"], vd.PATH_B)
             self.assertEqual(outputs["write_check"], "true")
             self.assertEqual(outputs["conclusion"], "")
+            self.assertEqual(outputs["definitions_changed"], "true")
             self.assertEqual(json.loads(outputs["diff"]), ["修改 `ci.yml`"])
             self.assertEqual(outputs["pr_number"], "700")
             final_output = temp / "final.txt"
@@ -508,6 +567,44 @@ class CommandLineTest(unittest.TestCase):
             )
             outputs = self.parse_outputs(decide_output)
             self.assertEqual((outputs["path"], outputs["write_check"]), (vd.PATH_SKIP, "false"))
+
+    def test_decide_cli_reruns_when_a_closed_helper_pull_request_taints_the_branch(self):
+        """定义与基线相同也不采信：路径 b 且 definitions_changed=false（不贴标签、无差异）。"""
+
+        with tempfile.TemporaryDirectory() as directory:
+            temp = Path(directory)
+            (temp / "event.json").write_text(
+                json.dumps(event(conclusion="success")), encoding="utf-8"
+            )
+            (temp / "head-branch-pulls.json").write_text(
+                json.dumps(
+                    [head_branch_pull(700, "main"), head_branch_pull(701, "x-attacker", "closed")]
+                ),
+                encoding="utf-8",
+            )
+            for status, marker in (("ok", "#701→x-attacker（closed）"), ("failed", "来源核验失败")):
+                with self.subTest(status=status):
+                    decide_output = temp / f"decide-{status}.txt"
+                    self.run_cli(
+                        "decide",
+                        "--event-file",
+                        str(temp / "event.json"),
+                        "--head-branch-pulls-file",
+                        str(temp / "head-branch-pulls.json"),
+                        "--taint-query-status",
+                        status,
+                        "--head-tree",
+                        TREE_SAME,
+                        "--base-tree",
+                        TREE_SAME,
+                        "--github-output",
+                        str(decide_output),
+                    )
+                    outputs = self.parse_outputs(decide_output)
+                    self.assertEqual((outputs["path"], outputs["conclusion"]), (vd.PATH_B, ""))
+                    self.assertEqual(outputs["definitions_changed"], "false")
+                    self.assertEqual(json.loads(outputs["diff"]), [])
+                    self.assertIn(marker, outputs["summary"])
 
     def test_check_run_existing_and_payload_commands(self):
         listing = json.dumps(
@@ -685,9 +782,13 @@ class VerdictWorkflowShapeTest(unittest.TestCase):
 
     def test_label_job_is_independent_of_the_verdict_and_needs_no_app_secret(self):
         body = _job_body(self.text, "label")
-        self.assertIn(
-            "if: needs.decide.outputs.path == 'b' && needs.decide.outputs.pr_number != ''", body
-        )
+        condition = re.search(r"^    if: >-\n((?:      [^\n]*\n)+)", body, re.M).group(1)
+        for clause in (
+            "needs.decide.outputs.path == 'b'",
+            "needs.decide.outputs.definitions_changed == 'true'",
+            "needs.decide.outputs.pr_number != ''",
+        ):
+            self.assertIn(clause, condition, clause)
         self.assertNotIn("environment:", body)
         self.assertIn("issues: write", body)
         self.assertIn("pull-requests: write", body)
@@ -720,6 +821,19 @@ class VerdictWorkflowShapeTest(unittest.TestCase):
         block = _top_level_block(self.text, "concurrency")
         self.assertIn("group: verdict-${{ github.event.workflow_run.head_sha }}", block)
         self.assertIn("cancel-in-progress: false", block)
+
+    def test_decide_job_verifies_run_source_by_head_branch_and_fails_closed(self):
+        """来源核验：按 head_branch 查 state=all 的全部 PR，失败时把非 ok 状态交给脚本。"""
+
+        body = _job_body(self.text, "decide")
+        self.assertIn("HEAD_BRANCH: ${{ github.event.workflow_run.head_branch }}", body)
+        self.assertRegex(body, r'gh api "repos/\$\{REPOSITORY\}/pulls\?state=all&[^"]*head=')
+        self.assertIn("status=failed", body)
+        self.assertIn("status=ok", body)
+        self.assertIn("TAINT_QUERY_STATUS: ${{ steps.taint.outputs.status }}", body)
+        self.assertIn('--taint-query-status "${TAINT_QUERY_STATUS}"', body)
+        self.assertIn('--head-branch-pulls-file "${RUNNER_TEMP}/head-branch-pulls.json"', body)
+        self.assertNotIn("default-tree", body)
 
 
 class CiWorkflowTestRefTest(unittest.TestCase):

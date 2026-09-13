@@ -10,9 +10,11 @@ name: Epic Verdict
 # 运行都拿不到那把钥匙。
 #
 # 判定规则在 scripts/ci/verdict_decision.py（同样取自默认分支，逐条用例钉住）：
-#   路径 a：PR 头提交的 .github/workflows 子树与基线分支相同 → 采信这次 Epic Full 的结论；
-#   路径 b：子树不同（PR 改了门禁定义）→ 由 main 版 ci.yml 以 test_ref 复跑一次，取复跑
-#           结论，并给 PR 贴标签「门禁定义已变更」+ 评论差异清单（事后可查，不阻塞）；
+#   路径 a：来源核验通过（头分支从未面向非受保护分支开 PR，含已关闭）、有面向 main /
+#           release/** 的 PR 当基线、PR 头提交的 .github/workflows 子树与该基线相同 →
+#           采信这次 Epic Full 的结论；
+#   路径 b：其余一律由 main 版 ci.yml 以 test_ref 复跑一次，取复跑结论；PR 改了门禁定义时
+#           另给 PR 贴标签「门禁定义已变更」+ 评论差异清单（事后可查，不阻塞）；
 #   外部仓库的头提交一律判红；非 pull_request 事件、非 ci.yml 产出的运行不裁决。
 #
 # 本工作流全程**不检出、不执行 PR 树上的任何文件**——唯一例外是路径 b 的复跑，那是
@@ -48,6 +50,7 @@ jobs:
       pr_number: ${{ steps.decide.outputs.pr_number }}
       base_label: ${{ steps.decide.outputs.base_label }}
       run_url: ${{ steps.decide.outputs.run_url }}
+      definitions_changed: ${{ steps.decide.outputs.definitions_changed }}
       diff: ${{ steps.decide.outputs.diff }}
     steps:
       # 检出的是默认分支（workflow_run 的 GITHUB_SHA = 默认分支最新提交），只为读取裁决脚本。
@@ -74,6 +77,35 @@ jobs:
             echo "事件里没有 PR 关联，按头提交反查到 $(jq length "${RUNNER_TEMP}/fallback-pulls.json") 条"
           fi
 
+      # 来源核验（失败关闭）：触发运行只带 head_branch，不带「哪条 PR 触发的」。按头分支查
+      # state=all 的全部 PR（含已关闭），只要有一条 base 不是默认分支 / release/**，这个头分支
+      # 的运行一律不采信、走路径 b；查询失败也按受染处理——查不到不等于没有。
+      - name: 按头分支核验来源（state=all）
+        id: taint
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPOSITORY: ${{ github.repository }}
+          OWNER: ${{ github.repository_owner }}
+          HEAD_BRANCH: ${{ github.event.workflow_run.head_branch }}
+        run: |
+          set -euo pipefail
+          echo '[]' > "${RUNNER_TEMP}/head-branch-pulls.json"
+          status=failed
+          if [ -n "${HEAD_BRANCH}" ]; then
+            head_param=$(jq -rn --arg value "${OWNER}:${HEAD_BRANCH}" '$value | @uri')
+            if gh api "repos/${REPOSITORY}/pulls?state=all&per_page=100&head=${head_param}" --paginate \
+                --jq '.[] | {number: .number, state: .state, base: {ref: .base.ref, sha: .base.sha}, head: {sha: .head.sha}}' \
+                | jq -s '.' > "${RUNNER_TEMP}/head-branch-pulls.json"; then
+              status=ok
+              echo "头分支 ${HEAD_BRANCH} 共 $(jq length "${RUNNER_TEMP}/head-branch-pulls.json") 条 PR（含已关闭）"
+            else
+              echo '按头分支查 PR 失败：本次不采信触发运行' >&2
+            fi
+          else
+            echo '触发运行没有 head_branch：本次不采信触发运行' >&2
+          fi
+          echo "status=${status}" >> "${GITHUB_OUTPUT}"
+
       - name: 选基线
         id: plan
         run: |
@@ -82,10 +114,9 @@ jobs:
             --fallback-pulls-file "${RUNNER_TEMP}/fallback-pulls.json" \
             --github-output "${GITHUB_OUTPUT}"
 
-      # 只读 Git 对象：三侧 .github/workflows 子树的树对象 sha 与两侧文件清单。不 fetch、不检出。
-      # 默认分支那一侧取 github.sha（workflow_run 下 = 默认分支最新提交，也就是路径 b 复跑
-      # 所用定义的出处）：头提交已经是这份定义时，PR 自己那次运行与复跑等价，走路径 a。
-      - name: 取三侧 .github/workflows 子树
+      # 只读 Git 对象：两侧 .github/workflows 子树的树对象 sha 与文件清单。不 fetch、不检出。
+      # 没有合格 PR 时基线是默认分支，那份子树只用于比对与差异清单，不用于采信触发运行。
+      - name: 取两侧 .github/workflows 子树
         id: trees
         if: steps.plan.outputs.needs_trees == 'true'
         env:
@@ -93,7 +124,6 @@ jobs:
           REPOSITORY: ${{ github.repository }}
           HEAD_SHA: ${{ steps.plan.outputs.head_sha }}
           BASE_COMMITISH: ${{ steps.plan.outputs.base_sha || steps.plan.outputs.base_ref }}
-          DEFAULT_COMMIT: ${{ github.sha }}
         run: |
           set -euo pipefail
           subtree() {
@@ -114,27 +144,26 @@ jobs:
           }
           head_tree=$(subtree "${HEAD_SHA}")
           base_tree=$(subtree "${BASE_COMMITISH}")
-          default_tree=$(subtree "${DEFAULT_COMMIT}")
           listing "${head_tree}" > "${RUNNER_TEMP}/head-workflows.json"
           listing "${base_tree}" > "${RUNNER_TEMP}/base-workflows.json"
           echo "head_tree=${head_tree}" >> "${GITHUB_OUTPUT}"
           echo "base_tree=${base_tree}" >> "${GITHUB_OUTPUT}"
-          echo "default_tree=${default_tree}" >> "${GITHUB_OUTPUT}"
-          echo "头提交子树 ${head_tree:-缺失}；基线 ${BASE_COMMITISH} 子树 ${base_tree:-缺失}；默认分支 ${DEFAULT_COMMIT} 子树 ${default_tree:-缺失}"
+          echo "头提交子树 ${head_tree:-缺失}；基线 ${BASE_COMMITISH} 子树 ${base_tree:-缺失}"
 
       - name: 裁决
         id: decide
         env:
           HEAD_TREE: ${{ steps.trees.outputs.head_tree }}
           BASE_TREE: ${{ steps.trees.outputs.base_tree }}
-          DEFAULT_TREE: ${{ steps.trees.outputs.default_tree }}
+          TAINT_QUERY_STATUS: ${{ steps.taint.outputs.status }}
         run: |
           python3 scripts/ci/verdict_decision.py decide \
             --event-file "${GITHUB_EVENT_PATH}" \
             --fallback-pulls-file "${RUNNER_TEMP}/fallback-pulls.json" \
+            --head-branch-pulls-file "${RUNNER_TEMP}/head-branch-pulls.json" \
+            --taint-query-status "${TAINT_QUERY_STATUS}" \
             --head-tree "${HEAD_TREE}" \
             --base-tree "${BASE_TREE}" \
-            --default-tree "${DEFAULT_TREE}" \
             --head-listing-file "${RUNNER_TEMP}/head-workflows.json" \
             --base-listing-file "${RUNNER_TEMP}/base-workflows.json" \
             --github-output "${GITHUB_OUTPUT}"
@@ -152,11 +181,14 @@ jobs:
     with:
       test_ref: ${{ needs.decide.outputs.head_sha }}
 
-  # 路径 b 的留痕：标签 + 差异清单评论。与裁决写入互不依赖——这里失败不影响 Epic Verdict。
+  # 「门禁定义已变更」的留痕：标签 + 差异清单评论，只在定义真的与基线不同时贴（来源受染
+  # 但定义相同的路径 b 不贴）。与裁决写入互不依赖——这里失败不影响 Epic Verdict。
   label:
     name: Epic Verdict / label
     needs: [decide]
-    if: needs.decide.outputs.path == 'b' && needs.decide.outputs.pr_number != ''
+    if: >-
+      needs.decide.outputs.path == 'b' && needs.decide.outputs.definitions_changed == 'true' &&
+      needs.decide.outputs.pr_number != ''
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     permissions:
