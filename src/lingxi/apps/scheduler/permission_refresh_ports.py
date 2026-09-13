@@ -1,7 +1,8 @@
 """每日权限重算职责的端口协议、原因码与报告形状。
 
-只放形状与取值域，不放判定：判定住在
-:mod:`~lingxi.apps.scheduler.permission_refresh`。
+只放形状与取值域，不放判定：整轮前置判据与计数住在
+:mod:`~lingxi.apps.scheduler.permission_refresh`，逐用户决策树住在两个入口共用的
+:mod:`~lingxi.core.permission.user_decision_tree`。
 
 审计与报告**只记计数与分类原因码**，不记姓名、邮箱、权限内容或任何外部标识原值。
 """
@@ -17,6 +18,12 @@ from lingxi.core.identity.roster_audit import ArchivedIdentity
 from lingxi.core.identity.roster_snapshot import StoredSnapshotFacts
 from lingxi.core.permission.decision_chain import AllScopeExpander, LocalOverrideReader
 from lingxi.core.permission.merge_sources import REASON_LOCAL_OVERRIDE_READ_FAILED
+from lingxi.core.permission.user_decision_tree import (
+    Decision,
+    DecisionStore,
+    PublishHistory,
+    TokenCipherReader,
+)
 
 _UTC = UTC
 
@@ -151,64 +158,14 @@ class _GalaxySnapshotReader(Protocol):
     def load_current(self) -> Any: ...
 
 
-class _TokenCipherReader(Protocol):
-    """令牌**密文**的只读口。
-
-    这里刻意只声明 :meth:`token_cipher` 一个方法：签发口
-    （``issue_token``）不在这个协议里，因此"在每日刷新里顺手签一份令牌"这件事，
-    在类型上就写不出来（模块文档「令牌：只读既有，绝不签发」）。
-    """
-
-    def token_cipher(self, user_id: str) -> str | None: ...
-
-
-class _PublishHistory(Protocol):
-    """「这个人在发布链上有没有留下过足迹」的只读口。
-
-    单独声明成一个只有一个方法的协议，理由与 :class:`_TokenCipherReader` 相同：
-    撤权那一路只需要回答"有没有"，把整个发布 outbox 的写侧摆在这里，等于让"顺手改一下
-    那条意图"在类型上变得可写。装配时传进来的确实是同一个存储对象。
-    """
-
-    def has_publish_footprint(self, user_id: str) -> bool: ...
-
-
-class _Decision(Protocol):
-    enqueued: bool
-    # 本次决定顺带清掉的已送达、随会话保留投递正文事件数（S-P-5，
-    # 只有调用 ``record_decision(clear_delivered_content=True)`` 且
-    # 真的走到 ``ENQUEUED`` 时才可能非零；本职责只如实把它写进审计计数，不自己
-    # 判断"要不要清"——那条判定连同事务边界只有 ``record_decision`` 一处实现。
-    cleared_events: int
-
-
-class _DecisionStore(Protocol):
-    """权限决定的落库口。
-
-    **版本推进与幂等完全由它承担**：本职责不读、不写、不比较权限版本，也不自己判断「这次权限
-    有没有变化」。那条判定连同它的锁与事务边界只有一处实现。
-
-    ``require_enabled_account`` 是**必填**关键字参数（同一条结构性防复发纪律）：授权侧传
-    ``True``、撤权侧传 ``False``。账号状态复检落在实现那把**已经持有的**行锁里，本职责一个
-    字都不复制——它只负责在被挡时把结果翻译成自己的计数与审计。
-    """
-
-    def record_decision(
-        self,
-        *,
-        user_id: str,
-        row: Any,
-        reason: str,
-        require_enabled_account: bool,
-        decided_at: datetime,
-        clear_delivered_content: bool = False,
-    ) -> _Decision: ...
-
-
-# 「全部」组的补行口与本地覆盖的按用户读取口：形状由决定链定义，三入口共用一份，
-# 这里只保留本模块沿用的名字。两个口都只认纯类型的覆盖条目、不认数据库行标识——
-# 本职责要的是「这个用户当前生效的覆盖条目有哪些」，不需要收回单条覆盖的能力。
-# 未装配与读取失败在调用方眼里是**不同**的两件事，判据见决定链模块。
+# 令牌密文只读口、发布足迹只读口与权限决定落库口：形状由两个入口共用的逐用户决策树
+# 定义（只读既有密文、绝不签发；撤权只问"有没有足迹"；版本推进与幂等全在落库口），
+# 这里只保留本模块沿用的名字。「全部」组的补行口与本地覆盖的按用户读取口同理，形状由
+# 决定链定义，三入口共用一份；未装配与读取失败在调用方眼里是**不同**的两件事。
+_TokenCipherReader = TokenCipherReader
+_PublishHistory = PublishHistory
+_Decision = Decision
+_DecisionStore = DecisionStore
 _LegacyAllScopeExpander = AllScopeExpander
 _LocalOverrideReader = LocalOverrideReader
 

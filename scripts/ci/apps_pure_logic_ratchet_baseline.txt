@@ -56,8 +56,8 @@
 331	src/lingxi/apps/scheduler/org_snapshot_sync.py
 436	src/lingxi/apps/scheduler/permission_publish.py
 86	src/lingxi/apps/scheduler/permission_readiness_assembly.py
-623	src/lingxi/apps/scheduler/permission_refresh.py
-135	src/lingxi/apps/scheduler/permission_refresh_ports.py
+504	src/lingxi/apps/scheduler/permission_refresh.py
+127	src/lingxi/apps/scheduler/permission_refresh_ports.py
 298	src/lingxi/apps/scheduler/roster_audit.py
 311	src/lingxi/apps/scheduler/stalled_provisioning.py
 290	src/lingxi/apps/trace/__init__.py

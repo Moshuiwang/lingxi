@@ -335,9 +335,9 @@ class MergeCallSiteDisciplineTest(unittest.TestCase):
     """每一处合并调用都必须**显式**声明是哪一种通配。
 
     ``full_access_wildcard`` 曾经的默认值 ``True`` 正是一次真实漏接的根因。签名侧的
-    必填纪律钉在 ``tests/test_permission_merge_sources.py``；这里钉的是另一半——四个
-    调用点里**没有任何一个**靠默认值。变异锚点：把任一调用点的
-    ``full_access_wildcard=`` 参数删掉，本用例由绿转红。
+    必填纪律钉在 ``tests/test_permission_merge_sources.py``；这里钉的是另一半——两个
+    调用点（每日批与即时动作共用的逐用户决策树、首聊开通）里**没有任何一个**靠默认值。
+    变异锚点：把任一调用点的 ``full_access_wildcard=`` 参数删掉，本用例由绿转红。
     """
 
     def test_every_call_site_passes_the_flag_by_keyword(self) -> None:
@@ -353,7 +353,7 @@ class MergeCallSiteDisciplineTest(unittest.TestCase):
                 passed = any(word.arg == "full_access_wildcard" for word in node.keywords)
                 call_sites.append((str(path.relative_to(SOURCE_ROOT)), node.lineno, passed))
 
-        self.assertGreaterEqual(len(call_sites), 4, "扫描面变空就等于这条断言恒真")
+        self.assertGreaterEqual(len(call_sites), 2, "扫描面变空就等于这条断言恒真")
         self.assertEqual([site for site in call_sites if not site[2]], [])
 
 

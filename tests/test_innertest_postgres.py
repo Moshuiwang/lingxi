@@ -242,6 +242,62 @@ class InnertestPostgresTests(unittest.TestCase):
                     cursor.execute("SELECT pg_sleep(1)")
         self.assertLess(time.monotonic() - started, 0.5)
 
+    def test_other_pending_action_on_the_admin_is_not_mistaken_for_a_stale_confirmation(self):
+        """以同一管理员为目标的**非内测**在途动作，不能让扩员准备返回「确认已过期」。
+
+        守卫只看扩员这一类动作；别的动作占着「同一目标一条在途」的名额时，由唯一索引
+        拦下并按既有码拒绝。变异锚点：去掉守卫查询里的 ``action_type`` 过滤，这条会
+        重新落回 ``stale_confirmation``。
+        """
+        deadline = datetime.now(UTC) + timedelta(seconds=600)
+        self.sql(
+            "INSERT INTO pending_action(id,action_type,target_open_id,target_state_snapshot,"
+            "initiated_by_open_id,confirm_deadline_at) "
+            "VALUES('pac_suspend','suspend_user','ou_admin','enabled','ou_other',%s)",
+            (deadline,),
+        )
+        with self.assertRaises(InnertestError) as caught:
+            self.prepare()
+        self.assertNotEqual(caught.exception.code, "stale_confirmation")
+        self.assertEqual(caught.exception.code, "target_has_pending_action")
+        # 别人的动作原封不动：既没被翻成过期，也没被记成扩员失效。
+        self.assertEqual(
+            self.sql("SELECT status,reason FROM pending_action WHERE id='pac_suspend'"),
+            [("pending", None)],
+        )
+        self.assertEqual(self.sql("SELECT count(*) FROM innertest_batch"), [(0,)])
+        self.audit.record.assert_not_called()
+        # 那条动作一落终态，名额让出，同一位管理员照常准备。
+        self.sql(
+            "UPDATE pending_action SET status='cancelled',decided_at=now() WHERE id='pac_suspend'"
+        )
+        self.assertEqual(self.prepare()["state"], "pending")
+
+    def test_fresh_confirmation_blocks_and_expired_confirmation_is_released(self):
+        """守卫自己的两条分支：在途未过期 → 拒绝换键；已过期 → 落 expired 后放行新批。"""
+        old = self.prepare()
+        with self.assertRaisesRegex(InnertestError, "stale_confirmation"):
+            self.prepare(key="second")
+        self.sql(
+            "UPDATE pending_action SET confirm_deadline_at=now() - interval '1 second' WHERE id=%s",
+            (old["pending_action_id"],),
+        )
+        new = self.prepare(key="second")
+        self.assertNotEqual(new["batch_id"], old["batch_id"])
+        self.assertEqual(new["state"], "pending")
+        self.assertEqual(
+            self.service.get_batch(self.principal, batch_id=old["batch_id"])["state"], "expired"
+        )
+        self.assertEqual(
+            self.sql(
+                "SELECT status,reason FROM pending_action WHERE id=%s", (old["pending_action_id"],)
+            ),
+            [("expired", "stale_confirmation")],
+        )
+        self.assertEqual(
+            self.sql("SELECT count(*) FROM innertest_audit WHERE action='expired'"), [(1,)]
+        )
+
     def test_binding_version_change_can_prepare_new_but_unknown_card_cannot(self):
         old = self.prepare()
         self.sql("UPDATE innertest_admin_binding SET version=2")

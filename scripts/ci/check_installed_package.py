@@ -272,6 +272,9 @@ REQUIRED_MODULES = (
     # 本地覆盖这条来源的读取与完整性检查（权威决定链前两段）：每日重算、定向重算
     # 与首聊开通三个入口都模块级 import 它，随它们同一条发布理由。
     "lingxi.core.permission.decision_chain",
+    # 逐用户权限决策树（权威决定链的计算与提交两段）：每日重算与管理员即时动作共用
+    # 一份，`permission_refresh.py` 与 `targeted_recompute.py` 都在模块级 import 它。
+    "lingxi.core.permission.user_decision_tree",
     # 存量差集导入/职位范围预授权的落库细节，从 `postgres_local_permission.py`
     # 按体量棘轮纯移动拆出（#592 可读性批）；`postgres_local_permission.py`
     # 顶层 import 它，随它同一条发布理由，见下面 scheduler/gateway 闭包同名注释。
@@ -829,6 +832,9 @@ PROCESS_RUNTIME_IMPORTS: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {
             "lingxi.adapters.postgres_local_permission_import",
             "lingxi.core.permission.merge_sources",
             "lingxi.core.permission.decision_chain",
+            # 逐用户权限决策树：`permission_refresh.py` 模块级 import（理由见
+            # REQUIRED_MODULES 同名条目）。
+            "lingxi.core.permission.user_decision_tree",
             # 存量差集导入纯逻辑（rc25 S-1）：`onboarding_runner`/`permission_refresh`/
             # `postgres_local_permission` 模块级 import；开通链两步编排随 runner 进闭包。
             "lingxi.core.permission.legacy_diff",
@@ -1386,6 +1392,9 @@ PROCESS_RUNTIME_IMPORTS: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {
             # 上面 scheduler 组同名注释），这是它**第一次**也随 gateway 进程的运行
             # 依赖闭包一起发布。
             "lingxi.core.permission.targeted_recompute",
+            # 逐用户权限决策树：`targeted_recompute.py` 模块级 import，随它一起进
+            # gateway 的运行依赖闭包（理由见 REQUIRED_MODULES 同名条目）。
+            "lingxi.core.permission.user_decision_tree",
             "lingxi.adapters.postgres_targeted_recompute_lookup",
             "lingxi.adapters.postgres_permission_recompute_trigger",
             "lingxi.core.identity.roster_audit",
