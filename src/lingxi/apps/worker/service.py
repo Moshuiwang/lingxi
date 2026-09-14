@@ -265,13 +265,13 @@ class WorkerService:
 
     @staticmethod
     def _run_observer(callback: Callable[[], None] | None, label: str) -> None:
-        """调用一个可留空的观测出口；失败只记异常类型，任务职责继续运行。"""
+        """调用一个可留空的旁路出口；失败只记异常类型，主流程不受影响。"""
         if callback is None:
             return
         try:
             callback()
         except Exception as error:
-            logger.error("worker %s失败，任务职责继续运行 error=%s", label, type(error).__name__)
+            logger.error("worker %s失败，主流程不受影响 error=%s", label, type(error).__name__)
 
     # ------------------------------------------------------------------
     # 一个任务的完整生命周期
