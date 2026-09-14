@@ -1,0 +1,19 @@
+{
+  "schema": 1,
+  "values": {
+    "LINGXI_INNERTEST_SCOPE": "scope-placeholder",
+    "LINGXI_INNERTEST_BINDING_ID": "binding-example-placeholder",
+    "LINGXI_INNERTEST_SOCKET_PATH": "/run/lingxi-innertest/admin.sock",
+    "LINGXI_INNERTEST_BINDING_PATH": "/etc/lingxi/innertest/binding.json"
+  },
+  "files": {
+    "scheduler": {
+      "company_function_metric_map.toml": "0000000000000000000000000000000000000000000000000000000000000000",
+      "content.override.toml": "1111111111111111111111111111111111111111111111111111111111111111"
+    },
+    "worker": {
+      "system_prompt.md": "2222222222222222222222222222222222222222222222222222222222222222",
+      "content.override.toml": "3333333333333333333333333333333333333333333333333333333333333333"
+    }
+  }
+}

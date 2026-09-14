@@ -1,0 +1,15 @@
+{
+  "schema": 1,
+  "host": "host-placeholder",
+  "environment": "stage",
+  "project": "lingxi-stage-placeholder",
+  "deploy_root": "/opt/lingxi-placeholder/deploy",
+  "config_root": "/opt/lingxi-placeholder/config",
+  "bundle_root": "/opt/lingxi-placeholder/control-bundles",
+  "relay_root": "/opt/lingxi-placeholder/relay",
+  "lock_path": "/opt/lingxi-placeholder/deploy/host.lock",
+  "docker": "/usr/bin/docker",
+  "approval_sources": [
+    "https://github.com/Moshuiwang/lingxi/issues/770"
+  ]
+}
