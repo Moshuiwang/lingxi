@@ -57,6 +57,9 @@ SCHEDULER_CREDENTIAL_ROTATION = (
 )
 GATEWAY_CONFIG = REPOSITORY_ROOT / "src" / "lingxi" / "apps" / "gateway" / "config.py"
 WORKER_CONFIG = REPOSITORY_ROOT / "src" / "lingxi" / "apps" / "worker" / "config.py"
+QA_CORPUS_SCRIPT = REPOSITORY_ROOT / "scripts" / "ops" / "qa_corpus.py"
+#: 模型执行环境或入站入口所在的服务：问答留存语料的导出根所在卷一律不得挂给它们。
+EXPORT_ROOT_FORBIDDEN_SERVICES = ("worker", "worker-queue", "gateway")
 USER_ENVIRONMENT_ADAPTER = REPOSITORY_ROOT / "src" / "lingxi" / "adapters" / "user_environment.py"
 # Agent SDK 回合的工作目录（`ClaudeAgentOptions.cwd`，见 apps/worker/config.py 的
 # `workspace` 与 adapters/claude_agent_session.py 的 `build_agent_options`）。
@@ -866,6 +869,71 @@ def check_qa_corpus_declaration() -> list[str]:
         failures.append(
             f"deploy/验收前部署配置清单.md 未登记 {variable}：按本文件既有惯例，新增的配置项"
             "须登记在清单里，说明它由哪里给值、缺失时行为如何。"
+        )
+    return failures
+
+
+def check_qa_corpus_export_root() -> list[str]:
+    """问答留存语料导出物「落地即受控」的机械保证（Issue #664）。
+
+    ``scripts/ops/qa_corpus.py export`` 只把文件写到环境变量 ``LINGXI_QA_CORPUS_EXPORT_ROOT``
+    指向的目录正下方；这个变量由基线 compose 在 scheduler 的 ``environment:`` 块声明，值必须：
+
+    1. 是字面量绝对路径，不得 ``${}`` 插值——插值等于把导出根交回可抄的外部文件；
+    2. 落在 scheduler 某个**具名持久卷**的挂载点之下且该挂载可写——容器本地路径随镜像替换
+       消失，绑定挂载的宿主目录权限不由本仓库控制；
+    3. 那个卷在四份 compose 里都不得挂给 ``worker`` / ``worker-queue`` / ``gateway``——前两者
+       是模型执行环境，后者是入站入口，导出的明文语料一旦被它们看见就不再受控；
+    4. 变量名不得出现在这三个服务的任何块里，``deploy/.env.example`` 不得有赋值行。
+    """
+
+    variable = module_constant(QA_CORPUS_SCRIPT, "EXPORT_ROOT_VAR")
+    if not variable:
+        return [
+            "读不到 scripts/ops/qa_corpus.py 的 EXPORT_ROOT_VAR（常量被重命名或改写时同步本检查）"
+        ]
+    failures: list[str] = []
+    base = strip_comments(read(COMPOSE_BASE))
+    scheduler = service_block(base, "scheduler")
+    if scheduler is None:
+        return [f"{display(COMPOSE_BASE)} 找不到 service `scheduler`"]
+    declared = _environment_value(scheduler, variable)
+    if declared is None:
+        return [f"{display(COMPOSE_BASE)} 的 scheduler 没有在 `environment:` 里声明 `{variable}`"]
+    root = declared.strip("\"'")
+    if "${" in root or not root.startswith("/"):
+        failures.append(f"`{variable}: {declared}` 必须是字面量绝对路径，不得 ${{}} 插值或相对路径")
+    volume = next(
+        (
+            (source, mode)
+            for source, target, mode in _volume_mounts(scheduler)
+            if root.startswith(target.rstrip("/") + "/") and re.fullmatch(r"[\w-]+", source)
+        ),
+        None,
+    )
+    if volume is None:
+        failures.append(f"导出根 `{root}` 不在 scheduler 任何具名持久卷的挂载点之下")
+        return failures
+    source, mode = volume
+    if mode == "ro":
+        failures.append(f"导出根所在卷 `{source}` 在 scheduler 上挂成了只读，导出写不进去")
+    for path in (COMPOSE_BASE, COMPOSE_STAGE, COMPOSE_PROD, COMPOSE_INNERTEST):
+        text = strip_comments(read(path))
+        for service in EXPORT_ROOT_FORBIDDEN_SERVICES:
+            block = service_block(text, service) or ""
+            if any(mounted == source for mounted, _target, _mode in _volume_mounts(block)):
+                failures.append(
+                    f"{display(path)} 把导出根所在卷 `{source}` 挂给了 `{service}`：模型执行环境"
+                    "或入站入口一旦能看到导出的明文语料，「落地即受控」就不成立"
+                )
+            if variable in block:
+                failures.append(
+                    f"{display(path)} 的 `{service}` 块出现了 `{variable}`：只有 scheduler 导出"
+                )
+    if re.search(rf"^\s*{re.escape(variable)}=", read(ENV_EXAMPLE), re.MULTILINE):
+        failures.append(
+            f"deploy/.env.example 出现了 {variable} 的赋值行：导出根由 compose 的 environment "
+            "块声明，写进 env 文件不会生效，示范一个不生效的赋值就是在教人配错"
         )
     return failures
 
@@ -2442,6 +2510,7 @@ def main() -> int:
         ("内测轮内容级采集正式环境防护", check_content_capture_prod_guard),
         ("生产覆盖声明部署环境", check_prod_declares_deploy_environment),
         ("问答留存语料开关只由环境 compose 声明", check_qa_corpus_declaration),
+        ("问答留存语料导出根落在 scheduler 专属持久卷内", check_qa_corpus_export_root),
         ("scheduler 用户环境卷挂载", check_scheduler_user_volume),
         ("worker-queue 工作目录与用户目录隔离", check_worker_workspace_isolation),
         ("六服务资源限制结构", check_resource_limits),

@@ -994,3 +994,79 @@ docker compose --env-file deploy/.env.prod \
 - 没注册：`未配置 LINGXI_INNERTEST_SCOPE：不注册受限管理入口，…（不阻止启动）`
 
 读不到其中任何一句，说明 scheduler 根本没走到这段装配，先查它是不是起来了。
+
+## 十六、#664 问答留存语料：读取 / 检索 / 导出脚本姿势与纪律（生产；Trace #770 批次 3 补入）
+
+> **证据边界如实**：本节的姿势只有本机用例证据（无库 + 一次性真库容器），**预发与生产都还没有
+> 跑过**；生产升级到含迁移 `0098` 的版本之后 `qa_corpus` 才开始有行。读取权不随管理员身份自动
+> 获得——`read` / `export` 只认 `qa_corpus_reader` 登记表里生效的读取者，管理员要读也得先给
+> 自己 `grant`。
+
+姿势与 §十二、§十三 同构（脚本本体经 stdin 执行、容器内不落脚本文件），子命令与参数写在 `-` 之后。
+`<管理员>` 是一位登记在案且当前有效的管理员 `open_id`（`grant` / `revoke` 的发起人闸），`<读取者>`
+是已被 `grant` 的读取者 `open_id`（`read` / `export` 的发起人闸；本人不要求是管理员）：
+
+```bash
+cd /home/bi-ai-deploy/projects/lingxi
+
+# ① 授予读取角色（幂等：已生效就原样返回，不重复登记；每次各留一行审计）
+docker compose --env-file deploy/.env.prod \
+  -f deploy/compose.yaml -f deploy/compose.prod.yaml \
+  exec -T scheduler python -B - --initiated-by <管理员> \
+    grant --open-id <读取者> --label corpus-reader \
+  < scripts/ops/qa_corpus.py
+
+# ② 读取：按人 / 时间窗（含起不含止，不带时区按 UTC）/ 关键词至少给一项；默认 20 行、硬顶 200
+docker compose --env-file deploy/.env.prod \
+  -f deploy/compose.yaml -f deploy/compose.prod.yaml \
+  exec -T scheduler python -B - --initiated-by <读取者> \
+    read --open-id <某用户 open_id> --since 2026-09-01 --until 2026-09-08 --limit 20 \
+  < scripts/ops/qa_corpus.py
+
+# ③ 导出：同一组过滤条件，全部命中行写成 JSON 行文件；--out 只能是文件名
+docker compose --env-file deploy/.env.prod \
+  -f deploy/compose.yaml -f deploy/compose.prod.yaml \
+  exec -T scheduler python -B - --initiated-by <读取者> \
+    export --keyword <关键词> --out 20260914-<主题>.jsonl \
+  < scripts/ops/qa_corpus.py
+
+# ④ 容量：行数与表总字节数，不含正文、不留审计（读取者或管理员都可看）
+docker compose --env-file deploy/.env.prod \
+  -f deploy/compose.yaml -f deploy/compose.prod.yaml \
+  exec -T scheduler python -B - --initiated-by <管理员> stats \
+  < scripts/ops/qa_corpus.py
+
+# ⑤ 撤销读取角色（之后该人 read / export 立即被拒）
+docker compose --env-file deploy/.env.prod \
+  -f deploy/compose.yaml -f deploy/compose.prod.yaml \
+  exec -T scheduler python -B - --initiated-by <管理员> revoke --open-id <读取者> \
+  < scripts/ops/qa_corpus.py
+```
+
+判读与纪律：
+
+- **`read` 会把明文正文（问题、用户实收正文、模型原文、工具调用）打印到标准输出**。不要在有落盘
+  记录的会话里跑（`script`、终端录制、tmux 日志、CI、任何会把输出存起来的地方）；要留档走 `export`。
+  标准输出不是导出通道。
+- **顺序是失败关闭的**：鉴权 → 查询 →（导出：写文件 → 算摘要）→ 审计行提交 → 才输出 / 保留文件。
+  发起人不是生效读取者时结构上没有一条语料查询发生，输出只有固定文案；审计行写不进去时 `read`
+  一行都不打印、`export` 删掉刚写的文件，退出码 `3`。
+- **导出物落地即受控**：文件只能落在 `LINGXI_QA_CORPUS_EXPORT_ROOT` 指向的目录正下方（生产
+  为凭据持久卷内的 `/var/lib/lingxi/credentials/qa-corpus-exports`，目录 `0700`、文件 `0600`，
+  `O_CREAT|O_EXCL|O_NOFOLLOW` 新建：已存在、是符号链接、带路径分隔符或 `..` 一律拒绝）。这个卷
+  只有 scheduler（与一次性 `reauthorize` 作业）挂载、worker 与 gateway 看不到，由
+  `scripts/ci/check_deploy_contract.py::check_qa_corpus_export_root` 钉住。取文件用
+  `docker compose … cp scheduler:/var/lib/lingxi/credentials/qa-corpus-exports/<文件名> <本机受控路径>`，
+  取走后**删掉容器内那份**（`exec -T scheduler rm /var/lib/lingxi/credentials/qa-corpus-exports/<文件名>`），
+  本机那份按同等纪律保管；谁取谁清。
+- **审计回读**：`read` / `export` / `grant` / `revoke` 各在运营审计账留一行「已执行」（操作名
+  `corpus.read` / `corpus.export` / `corpus.reader_grant` / `corpus.reader_revoke`），操作号即脚本输出的
+  `qcr_…`；回读命令与 §12.4 同一段脚本。行里只有发起人、角色快照（非管理员为空）、条数、摘要
+  （读取：返回行标识有序列表的摘要；导出：文件 sha256）、证据指针（`corpus_window:<起>_<止>` /
+  `corpus_export:<文件名>`），**关键词与正文都不在账上**；审计账按既有规则九十天到期。
+- **参数写全称**：`allow_abbrev=False`，前缀缩写被拒而不是被猜。`--initiated-by` 是自报身份，挡误操作、
+  挡不住冒认，与 §十二、§十三 同名闸同一性质。
+- **退出码**：`0` 跑完；`2` 什么都没做（参数、鉴权、配置或目标不合格，查询本身失败也算）；`3` 查询或
+  文件已经发生但审计没落下——结果已扣住 / 文件已删除，先回读审计账再决定要不要重跑。
+- **容量只告警不删**：`stats` 给行数与字节；删除只走登记在迁移 `0098` 文件头的受控 SQL，执行前后各留
+  一行审计（`corpus.purge`）。scheduler 侧的水位告警职责尚未接线（核心判定 `capacity_watermark` 已备）。
