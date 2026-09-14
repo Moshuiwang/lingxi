@@ -234,6 +234,13 @@ REQUIRED_MODULES = (
     # wheel 里没有这个模块"正是 V-部署-10 要挡的形状。
     "lingxi.core.innertest_content_capture",
     "lingxi.adapters.postgres_content_capture",
+    # 内容留存共用的凭据形状过滤：从内测采集模块搬出的纯函数，内测采集与问答留存语料
+    # 两条通道共用一份判据；由 core.innertest_content_capture 模块级 import。
+    "lingxi.core.content_redaction",
+    # 问答留存语料（合同「数据保留与删除」第三条例外）：记录形状与构造在 core，落库在
+    # adapters，worker 侧记录器按开关装配（见下面 PROCESS_RUNTIME_IMPORTS 的 worker 闭包）。
+    "lingxi.core.qa_corpus",
+    "lingxi.adapters.postgres_qa_corpus",
     # 同一张表的**到期删除**侧（对抗审查 2026-09-02 C-7）：由 lingxi-scheduler 的
     # 保留清理职责在函数内 import。刻意与写入侧分成两个模块——写入侧要
     # `ContentCaptureRecord`，那个类会把整个 `core.execution` 拉进 scheduler 的
@@ -1212,6 +1219,8 @@ PROCESS_RUNTIME_IMPORTS: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {
             # apps.worker.service/apps.worker.cli 模块级 import。
             "lingxi.core.innertest_content_capture",
             "lingxi.adapters.postgres_content_capture",
+            # 内容留存共用的凭据形状过滤，由 core.innertest_content_capture 模块级 import。
+            "lingxi.core.content_redaction",
             # 年份接地护栏第二层（Issue #326 批次 5 卡 E）：由 apps/worker/
             # service.py 模块级 import，import 本身不依赖开关；运行时检测仅在
             # 内容采集开启（content_capture_writer 非空）时才会被调用执行。
