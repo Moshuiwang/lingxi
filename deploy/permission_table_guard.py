@@ -16,7 +16,6 @@ import shlex
 import stat
 import subprocess
 import sys
-import tempfile
 import uuid
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
@@ -24,9 +23,8 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 from urllib.error import HTTPError, URLError
-from urllib.parse import unquote, urlsplit, urlunsplit, urlencode, quote
+from urllib.parse import quote, unquote, urlencode, urlsplit, urlunsplit
 from urllib.request import Request, urlopen
-
 
 SCHEMA_VERSION = 1
 ENVIRONMENT = "stage"
@@ -57,6 +55,7 @@ class GuardError(RuntimeError):
     """可安全输出的失败分类；实例消息不携带配置值或表格正文。"""
 
     def __init__(self, code: str) -> None:
+        """保存可安全输出的错误代码。"""
         self.code = code
         super().__init__(code)
 
@@ -73,6 +72,7 @@ class GuardConfig:
     dsn: str = ""
 
     def __repr__(self) -> str:
+        """返回不含敏感值的表示。"""
         return "GuardConfig(<redacted>)"
 
 
@@ -212,7 +212,9 @@ def _base_url(value: str) -> str:
     return text.rstrip("/")
 
 
-def load_config(path: Path, *, need_database: bool = False, need_feishu: bool = False) -> GuardConfig:
+def load_config(
+    path: Path, *, need_database: bool = False, need_feishu: bool = False
+) -> GuardConfig:
     """读取并校验本次命令需要的配置。"""
     values = _parse_env_file(path)
     if need_database:
@@ -334,6 +336,7 @@ class PermissionTableClient:
         page_size: int = DEFAULT_PAGE_SIZE,
         max_pages: int = DEFAULT_MAX_PAGES,
     ) -> None:
+        """初始化分页读取与记录操作所需的客户端配置。"""
         if (
             isinstance(page_size, bool)
             or not isinstance(page_size, int)
@@ -375,7 +378,11 @@ class PermissionTableClient:
             url,
             body={"app_id": self._config.app_id, "app_secret": self._config.app_secret},
         )
-        if response.status < 200 or response.status >= 300 or not isinstance(response.payload, Mapping):
+        if (
+            response.status < 200
+            or response.status >= 300
+            or not isinstance(response.payload, Mapping)
+        ):
             raise GuardError("feishu_token_error")
         if response.payload.get("code") not in (None, 0, "0"):
             raise GuardError("feishu_token_error")
@@ -408,7 +415,9 @@ class PermissionTableClient:
             for item in items:
                 if not isinstance(item, Mapping):
                     raise GuardError("feishu_page_invalid")
-                rows.append(TableRow(_record_id(item.get("record_id")), _fields(item.get("fields"))))
+                rows.append(
+                    TableRow(_record_id(item.get("record_id")), _fields(item.get("fields")))
+                )
             has_more = data.get("has_more")
             if not isinstance(has_more, bool):
                 if page_token is None and items_absent and has_more is None:
@@ -486,9 +495,7 @@ def _secure_json_write(work_dir: Path, prefix: str, payload: Any) -> Path:
         for _ in range(4):
             candidate = work_dir / f".{prefix}-{uuid.uuid4().hex}.tmp"
             try:
-                descriptor = os.open(
-                    candidate, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600
-                )
+                descriptor = os.open(candidate, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
             except FileExistsError:
                 continue
             temporary = candidate
@@ -597,14 +604,14 @@ def _validate_ledger(path: Path) -> tuple[LedgerEntry, ...]:
     return tuple(entries)
 
 
-def run_backup(config: GuardConfig, work_dir: Path, *, client: PermissionTableClient | None = None) -> int:
+def run_backup(
+    config: GuardConfig, work_dir: Path, *, client: PermissionTableClient | None = None
+) -> int:
     """备份整张权限表并读回校验行数与文件摘要。"""
     active_client = client or PermissionTableClient(config)
     snapshot = active_client.list_rows()
     _log(f"backup=fetch pages={snapshot.pages} rows={len(snapshot.rows)}")
-    rows = [
-        {"record_id": row.record_id, "fields": dict(row.fields)} for row in snapshot.rows
-    ]
+    rows = [{"record_id": row.record_id, "fields": dict(row.fields)} for row in snapshot.rows]
     payload = {
         "schema": SCHEMA_VERSION,
         "taken_at": _iso_now(),
@@ -656,7 +663,9 @@ def _safe_psql_dsn(dsn: str) -> tuple[str, str | None]:
         host_part = parsed.netloc.rsplit("@", 1)[-1]
         user_part = parsed.netloc.rsplit("@", 1)[0].split(":", 1)[0]
         safe_netloc = f"{user_part}@{host_part}"
-        safe_url = urlunsplit((parsed.scheme, safe_netloc, parsed.path, parsed.query, parsed.fragment))
+        safe_url = urlunsplit(
+            (parsed.scheme, safe_netloc, parsed.path, parsed.query, parsed.fragment)
+        )
         return safe_url, unquote(password)
     try:
         tokens = shlex.split(text)
@@ -718,9 +727,7 @@ def _run_psql(dsn: str, since: datetime, *, psql_bin: str = "psql") -> Any:
         raise GuardError("psql_output_invalid") from error
 
 
-def run_ledger(
-    config: GuardConfig, work_dir: Path, since: str, *, psql_bin: str = "psql"
-) -> int:
+def run_ledger(config: GuardConfig, work_dir: Path, since: str, *, psql_bin: str = "psql") -> int:
     """从预发库导出指定时间之后已发布的外部记录台账。"""
     parsed_since = _parse_timestamp(since)
     raw_rows = _run_psql(config.dsn, parsed_since, psql_bin=psql_bin)
@@ -767,10 +774,14 @@ def _load_inputs(
     return backup, ledger, _file_sha256(ledger_path)
 
 
-def _changed_ids(backup: Mapping[str, Mapping[str, str]], current: Mapping[str, Mapping[str, str]]) -> set[str]:
+def _changed_ids(
+    backup: Mapping[str, Mapping[str, str]], current: Mapping[str, Mapping[str, str]]
+) -> set[str]:
     """计算三类差异的记录标识并合并。"""
     common = set(backup) & set(current)
-    updates = {identifier for identifier in common if dict(backup[identifier]) != dict(current[identifier])}
+    updates = {
+        identifier for identifier in common if dict(backup[identifier]) != dict(current[identifier])
+    }
     return updates | (set(current) - set(backup)) | (set(backup) - set(current))
 
 
@@ -874,7 +885,12 @@ def _execute_revert(
             client.update_row(identifier, expected)
             actual = client.read_row(identifier)
         except GuardError as error:
-            _report_revert_failure(completed, identifier, (*restore_remaining[index + 1 :], *delete_remaining), error.code)
+            _report_revert_failure(
+                completed,
+                identifier,
+                (*restore_remaining[index + 1 :], *delete_remaining),
+                error.code,
+            )
             return 1
         mismatch = _same_fields(expected, actual)
         if mismatch:
@@ -896,10 +912,17 @@ def _execute_revert(
             client.delete_row(identifier)
             actual = client.read_row(identifier)
         except GuardError as error:
-            _report_revert_failure(completed, identifier, tuple(delete_remaining[index + 1 :]), error.code)
+            _report_revert_failure(
+                completed, identifier, tuple(delete_remaining[index + 1 :]), error.code
+            )
             return 1
         if actual is not None:
-            _report_revert_failure(completed, identifier, tuple(delete_remaining[index + 1 :]), "delete_readback_present")
+            _report_revert_failure(
+                completed,
+                identifier,
+                tuple(delete_remaining[index + 1 :]),
+                "delete_readback_present",
+            )
             return 1
         completed.append(identifier)
         _log(f"revert=delete record={identifier} result=deleted")
@@ -923,15 +946,20 @@ def run_diff(
     snapshot = active_client.list_rows()
     current = _row_map(snapshot.rows)
     common = set(backup.rows) & set(current)
-    updates = sorted(identifier for identifier in common if backup.rows[identifier] != current[identifier])
+    updates = sorted(
+        identifier for identifier in common if backup.rows[identifier] != current[identifier]
+    )
     created = sorted(set(current) - set(backup.rows))
     deleted = sorted(set(backup.rows) - set(current))
     _log(f"diff=fetch pages={snapshot.pages} rows={len(current)}")
     for label, identifiers in (("updates", updates), ("new", created), ("deleted", deleted)):
-        marked = ",".join(
-            f"{identifier}[{'ledger' if identifier in ledger_ids else 'outside'}]"
-            for identifier in identifiers
-        ) or "-"
+        marked = (
+            ",".join(
+                f"{identifier}[{'ledger' if identifier in ledger_ids else 'outside'}]"
+                for identifier in identifiers
+            )
+            or "-"
+        )
         _log(f"diff={label} count={len(identifiers)} ids={marked}")
     return 0
 
@@ -990,14 +1018,18 @@ def run_verify(
     if failures:
         _log(f"verify=failed checked={checked} failures={','.join(failures)}", error=True)
         return 1
-    _log(f"verify=ok checked={checked} unresolved={sum(entry.record_id is None for entry in ledger)}")
+    _log(
+        f"verify=ok checked={checked} unresolved={sum(entry.record_id is None for entry in ledger)}"
+    )
     return 0
 
 
 def _parser() -> argparse.ArgumentParser:
     """构造命令行解析器。"""
     parser = argparse.ArgumentParser(description="预发权限发布表备份与撤回守卫")
-    parser.add_argument("--env-file", required=True, help="scheduler 环境文件，必须为 0600 且属主为当前用户")
+    parser.add_argument(
+        "--env-file", required=True, help="scheduler 环境文件，必须为 0600 且属主为当前用户"
+    )
     parser.add_argument("--work-dir", required=True, help="0700 工作目录")
     commands = parser.add_subparsers(dest="command", required=True)
     commands.add_parser("backup", help="备份整张权限发布表")

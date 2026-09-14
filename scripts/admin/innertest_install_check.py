@@ -11,6 +11,11 @@ from pathlib import Path
 
 
 def check(manifest):
+    """校验安装清单与宿主权限。
+
+    socket 目录不能由 root 持有：scheduler 以容器 UID 运行，需要在目录内创建
+    socket 和锁文件；目录的父级仍必须由 root 保护。
+    """
     errors = []
     minimum_python = (3, 11)
     if sys.version_info < minimum_python:
@@ -25,16 +30,19 @@ def check(manifest):
         "socket_directory",
         "relay_uid",
         "relay_gid",
+        "socket_owner_uid",
+        "socket_gid",
         "authorized_keys",
     }
     if set(manifest) != required or manifest.get("schema_revision") != 1:
+        return {"ok": False, "errors": ["schema_invalid"]}
+    if any(type(manifest[key]) is not int for key in ("socket_owner_uid", "socket_gid")):
         return {"ok": False, "errors": ["schema_invalid"]}
     for key in (
         "python",
         "relay",
         "relay_config",
         "binding",
-        "socket_directory",
         "authorized_keys",
     ):
         path = Path(manifest[key])
@@ -46,6 +54,31 @@ def check(manifest):
                     break
         except OSError:
             errors.append(key + "_missing")
+    socket_directory = Path(manifest["socket_directory"])
+    try:
+        info = socket_directory.lstat()
+        if stat.S_ISLNK(info.st_mode):
+            errors.append("socket_directory_symlink")
+        if (
+            info.st_uid != manifest["socket_owner_uid"]
+            or manifest["socket_owner_uid"] in (0, 65534)
+            or manifest["socket_owner_uid"] == manifest["relay_uid"]
+        ):
+            errors.append("socket_directory_owner_invalid")
+        if info.st_gid != manifest["socket_gid"]:
+            errors.append("socket_directory_group_invalid")
+        if stat.S_IMODE(info.st_mode) != 0o750:
+            errors.append("socket_directory_mode_invalid")
+    except OSError:
+        errors.append("socket_directory_missing")
+    try:
+        for item in (socket_directory.parent, *socket_directory.parent.parents):
+            info = item.lstat()
+            if info.st_uid != 0 or info.st_mode & 0o022 or stat.S_ISLNK(info.st_mode):
+                errors.append("socket_directory_parent_not_protected")
+                break
+    except OSError:
+        errors.append("socket_directory_parent_not_protected")
     try:
         if (
             hashlib.sha256(Path(manifest["relay"]).read_bytes()).hexdigest()

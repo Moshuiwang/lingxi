@@ -12,9 +12,8 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
-from urllib.parse import parse_qs, urlsplit
 from unittest import mock
-
+from urllib.parse import parse_qs, urlsplit
 
 REPOSITORY_ROOT = Path(__file__).parents[1]
 GUARD_PATH = (REPOSITORY_ROOT / "deploy" / "permission_table_guard.py").resolve()
@@ -131,7 +130,9 @@ class FakeTransport:
         return {"code": 0, "data": {"items": items, "has_more": False}}
 
 
-def _client(config: GUARD.GuardConfig, transport: FakeTransport, **kwargs: object) -> GUARD.PermissionTableClient:
+def _client(
+    config: GUARD.GuardConfig, transport: FakeTransport, **kwargs: object
+) -> GUARD.PermissionTableClient:
     return GUARD.PermissionTableClient(config, transport=transport, **kwargs)
 
 
@@ -202,7 +203,13 @@ class PermissionTableGuardTest(unittest.TestCase):
             self.assertEqual(payload["row_count"], 3)
             self.assertEqual(payload["row_count"], len(payload["rows"]))
             self.assertEqual(
-                len([call for call in transport.calls if call[0] == "GET" and "/records?" in call[1]]),
+                len(
+                    [
+                        call
+                        for call in transport.calls
+                        if call[0] == "GET" and "/records?" in call[1]
+                    ]
+                ),
                 3,
             )
             config = _config(directory)
@@ -218,7 +225,9 @@ class PermissionTableGuardTest(unittest.TestCase):
     def test_backup_stores_only_app_token_digest(self) -> None:
         with tempfile.TemporaryDirectory() as raw_directory:
             directory = Path(raw_directory)
-            backup_path = _backup(directory, {"rec-1": _fields(1)}, transport=FakeTransport({"rec-1": _fields(1)}))
+            backup_path = _backup(
+                directory, {"rec-1": _fields(1)}, transport=FakeTransport({"rec-1": _fields(1)})
+            )
             payload = backup_path.read_text(encoding="utf-8")
             self.assertIn(CIPHER, payload)
             self.assertNotIn(APP_TOKEN, payload)
@@ -272,11 +281,22 @@ class PermissionTableGuardTest(unittest.TestCase):
                 directory,
                 original,
                 current,
-                [{"record_id": "rec-1", "record_key": EMAIL, "published_at": "2026-09-14T00:01:00Z", "outbox_id": "out-1"}],
+                [
+                    {
+                        "record_id": "rec-1",
+                        "record_key": EMAIL,
+                        "published_at": "2026-09-14T00:01:00Z",
+                        "outbox_id": "out-1",
+                    }
+                ],
             )
-            result = GUARD.run_revert(config, directory, backup_path, ledger_path, client=_client(config, transport))
+            result = GUARD.run_revert(
+                config, directory, backup_path, ledger_path, client=_client(config, transport)
+            )
             self.assertEqual(result, 0)
-            self.assertEqual([call[0] for call in transport.calls if call[0] in ("PUT", "DELETE")], [])
+            self.assertEqual(
+                [call[0] for call in transport.calls if call[0] in ("PUT", "DELETE")], []
+            )
             plan_path = sorted(directory.glob("revert-plan-*.json"))[0]
             self.assertEqual(stat.S_IMODE(plan_path.stat().st_mode), 0o600)
             plan = json.loads(plan_path.read_text(encoding="utf-8"))
@@ -290,7 +310,14 @@ class PermissionTableGuardTest(unittest.TestCase):
                 directory,
                 {"rec-1": _fields(1)},
                 {"rec-1": {**_fields(1), "status": "changed"}},
-                [{"record_id": "rec-1", "record_key": EMAIL, "published_at": "2026-09-14T00:01:00Z", "outbox_id": "out-1"}],
+                [
+                    {
+                        "record_id": "rec-1",
+                        "record_key": EMAIL,
+                        "published_at": "2026-09-14T00:01:00Z",
+                        "outbox_id": "out-1",
+                    }
+                ],
             )
             result = GUARD.run_revert(
                 config,
@@ -301,20 +328,37 @@ class PermissionTableGuardTest(unittest.TestCase):
                 client=_client(config, transport),
             )
             self.assertEqual(result, 1)
-            self.assertEqual([call[0] for call in transport.calls if call[0] in ("PUT", "DELETE")], [])
+            self.assertEqual(
+                [call[0] for call in transport.calls if call[0] in ("PUT", "DELETE")], []
+            )
 
     def test_revert_restores_all_seven_fields_for_ledger_rows_in_backup(self) -> None:
         with tempfile.TemporaryDirectory() as raw_directory:
             directory = Path(raw_directory)
             original = {"rec-1": _fields(1)}
-            current = {"rec-1": {**_fields(1), "record_key": "changed@example.invalid", "token_cipher": "old-cipher"}}
+            current = {
+                "rec-1": {
+                    **_fields(1),
+                    "record_key": "changed@example.invalid",
+                    "token_cipher": "old-cipher",
+                }
+            }
             config, backup_path, ledger_path, transport = _write_diff_state(
                 directory,
                 original,
                 current,
-                [{"record_id": "rec-1", "record_key": EMAIL, "published_at": "2026-09-14T00:01:00Z", "outbox_id": "out-1"}],
+                [
+                    {
+                        "record_id": "rec-1",
+                        "record_key": EMAIL,
+                        "published_at": "2026-09-14T00:01:00Z",
+                        "outbox_id": "out-1",
+                    }
+                ],
             )
-            dry_result = GUARD.run_revert(config, directory, backup_path, ledger_path, client=_client(config, transport))
+            dry_result = GUARD.run_revert(
+                config, directory, backup_path, ledger_path, client=_client(config, transport)
+            )
             self.assertEqual(dry_result, 0)
             digest = _plan_digest(directory)
             result = GUARD.run_revert(
@@ -339,9 +383,18 @@ class PermissionTableGuardTest(unittest.TestCase):
                 directory,
                 {"rec-1": _fields(1)},
                 {"rec-1": _fields(1), "rec-new": _fields(2)},
-                [{"record_id": "rec-new", "record_key": EMAIL, "published_at": "2026-09-14T00:01:00Z", "outbox_id": "out-new"}],
+                [
+                    {
+                        "record_id": "rec-new",
+                        "record_key": EMAIL,
+                        "published_at": "2026-09-14T00:01:00Z",
+                        "outbox_id": "out-new",
+                    }
+                ],
             )
-            GUARD.run_revert(config, directory, backup_path, ledger_path, client=_client(config, transport))
+            GUARD.run_revert(
+                config, directory, backup_path, ledger_path, client=_client(config, transport)
+            )
             digest = _plan_digest(directory)
             result = GUARD.run_revert(
                 config,
@@ -366,8 +419,12 @@ class PermissionTableGuardTest(unittest.TestCase):
             config, backup_path, ledger_path, transport = _write_diff_state(
                 directory, original, current, []
             )
-            GUARD.run_revert(config, directory, backup_path, ledger_path, client=_client(config, transport))
-            plan = json.loads(sorted(directory.glob("revert-plan-*.json"))[0].read_text(encoding="utf-8"))
+            GUARD.run_revert(
+                config, directory, backup_path, ledger_path, client=_client(config, transport)
+            )
+            plan = json.loads(
+                sorted(directory.glob("revert-plan-*.json"))[0].read_text(encoding="utf-8")
+            )
             self.assertEqual(plan["restore"], [])
             self.assertEqual(plan["delete"], [])
             self.assertEqual(plan["skip"], ["rec-1", "rec-production-new"])
@@ -380,7 +437,9 @@ class PermissionTableGuardTest(unittest.TestCase):
                 client=_client(config, transport),
             )
             self.assertEqual(result, 0)
-            self.assertEqual([call[0] for call in transport.calls if call[0] in ("PUT", "DELETE")], [])
+            self.assertEqual(
+                [call[0] for call in transport.calls if call[0] in ("PUT", "DELETE")], []
+            )
 
     def test_revert_stops_on_readback_mismatch_and_is_rerunnable(self) -> None:
         with tempfile.TemporaryDirectory() as raw_directory:
@@ -395,27 +454,56 @@ class PermissionTableGuardTest(unittest.TestCase):
                 original,
                 current,
                 [
-                    {"record_id": "rec-1", "record_key": EMAIL, "published_at": "2026-09-14T00:01:00Z", "outbox_id": "out-1"},
-                    {"record_id": "rec-2", "record_key": EMAIL, "published_at": "2026-09-14T00:01:01Z", "outbox_id": "out-2"},
+                    {
+                        "record_id": "rec-1",
+                        "record_key": EMAIL,
+                        "published_at": "2026-09-14T00:01:00Z",
+                        "outbox_id": "out-1",
+                    },
+                    {
+                        "record_id": "rec-2",
+                        "record_key": EMAIL,
+                        "published_at": "2026-09-14T00:01:01Z",
+                        "outbox_id": "out-2",
+                    },
                 ],
             )
-            GUARD.run_revert(config, directory, backup_path, ledger_path, client=_client(config, transport))
+            GUARD.run_revert(
+                config, directory, backup_path, ledger_path, client=_client(config, transport)
+            )
             digest = _plan_digest(directory)
             transport.mismatch_ids = {"rec-2"}
             first = GUARD.run_revert(
-                config, directory, backup_path, ledger_path, confirm=digest, client=_client(config, transport)
+                config,
+                directory,
+                backup_path,
+                ledger_path,
+                confirm=digest,
+                client=_client(config, transport),
             )
             self.assertEqual(first, 1)
-            self.assertEqual(len([call for call in transport.calls if call[0] == "PUT" and "/rec-2" in call[1]]), 1)
+            self.assertEqual(
+                len([call for call in transport.calls if call[0] == "PUT" and "/rec-2" in call[1]]),
+                1,
+            )
             self.assertEqual(transport.rows["rec-1"], original["rec-1"])
             self.assertNotEqual(transport.rows["rec-2"], original["rec-2"])
-            rec1_puts_before = len([call for call in transport.calls if call[0] == "PUT" and "/rec-1" in call[1]])
+            rec1_puts_before = len(
+                [call for call in transport.calls if call[0] == "PUT" and "/rec-1" in call[1]]
+            )
             transport.mismatch_ids = set()
             second = GUARD.run_revert(
-                config, directory, backup_path, ledger_path, confirm=digest, client=_client(config, transport)
+                config,
+                directory,
+                backup_path,
+                ledger_path,
+                confirm=digest,
+                client=_client(config, transport),
             )
             self.assertEqual(second, 0)
-            rec1_puts_after = len([call for call in transport.calls if call[0] == "PUT" and "/rec-1" in call[1]])
+            rec1_puts_after = len(
+                [call for call in transport.calls if call[0] == "PUT" and "/rec-1" in call[1]]
+            )
             self.assertEqual(rec1_puts_after, rec1_puts_before)
             self.assertEqual(transport.rows, original)
 
@@ -436,9 +524,19 @@ class PermissionTableGuardTest(unittest.TestCase):
             self.assertNotIn(CIPHER, stdout.getvalue() + stderr.getvalue())
             ledger_path = _ledger_file(
                 directory,
-                [{"record_id": "rec-1", "record_key": EMAIL, "published_at": "2026-09-14T00:01:00Z", "outbox_id": "out-1"}],
+                [
+                    {
+                        "record_id": "rec-1",
+                        "record_key": EMAIL,
+                        "published_at": "2026-09-14T00:01:00Z",
+                        "outbox_id": "out-1",
+                    }
+                ],
             )
-            with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+            with (
+                contextlib.redirect_stdout(io.StringIO()),
+                contextlib.redirect_stderr(io.StringIO()),
+            ):
                 GUARD.run_revert(
                     config,
                     directory,
