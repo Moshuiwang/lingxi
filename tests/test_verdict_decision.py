@@ -337,6 +337,15 @@ class TokenVerificationTest(unittest.TestCase):
             with self.subTest(base_ref=base_ref):
                 self.assertTrue(self.check(good_claims(base_ref=base_ref)).ok)
 
+    def test_claim_level_prefix_variants_are_rejected(self):
+        for base_ref in ("main-evil", "mainx", "Main", "main/"):
+            with self.subTest(base_ref=base_ref):
+                result = self.check(good_claims(base_ref=base_ref))
+                self.assertEqual(result.status, vd.TOKEN_INVALID)
+                self.assertTrue(
+                    any("base_ref" in reason for reason in result.reasons), result.reasons
+                )
+
     def test_is_trusted_base_accepts_only_the_default_branch(self):
         self.assertTrue(vd.is_trusted_base("main", "main"))
         # 这里传入的是 normalize_branch 后的分支名，前缀由 normalize_branch 负责剥除。
@@ -349,6 +358,11 @@ class TokenVerificationTest(unittest.TestCase):
         ):
             with self.subTest(base_ref=base_ref):
                 self.assertFalse(vd.is_trusted_base(base_ref, "main"))
+
+    def test_empty_default_branch_trusts_nothing(self):
+        for base_ref in ("", "main"):
+            with self.subTest(base_ref=base_ref):
+                self.assertFalse(vd.is_trusted_base(base_ref, ""))
 
     def test_run_id_mismatch_is_rejected(self):
         for run_id in ("123457", 123457, "", None):
@@ -862,11 +876,69 @@ def _jobs(workflow_code: str) -> list[str]:
     )
 
 
+VERDICT_ENVIRONMENT_MARKER = "environment: verdict"
+# 只允许出现在 verdict.yml 的标记：Environment `verdict`、两个 App 秘密、换 App 令牌的动作。
+VERDICT_ONLY_MARKERS = (
+    VERDICT_ENVIRONMENT_MARKER,
+    "secrets.VERDICT_APP_ID",
+    "secrets.VERDICT_APP_PRIVATE_KEY",
+    "actions/create-github-app-token",
+)
+
+
+def _verdict_environment_lines(workflow_code: str) -> list[str]:
+    """逐行找出把 Environment 设成 `verdict` 的行（不解析 YAML，测试不依赖 PyYAML）。
+
+    两种写法都算：标量写法 `environment: verdict`，以及 `environment:` 映射块里缩进更深的
+    `name: verdict`；允许加引号与行尾注释。整行注释由调用方先用 _strip_comments 去掉。
+    """
+    lines = workflow_code.splitlines()
+    hits = []
+    for index, line in enumerate(lines):
+        if re.fullmatch(r"\s*environment:\s*['\"]?verdict['\"]?\s*(?:#.*)?", line):
+            hits.append(line)
+            continue
+        if not re.fullmatch(r"\s*environment:\s*(?:#.*)?", line):
+            continue
+        environment_indent = len(line) - len(line.lstrip())
+        for nested in lines[index + 1 :]:
+            if not nested.strip():
+                continue
+            if len(nested) - len(nested.lstrip()) <= environment_indent:
+                break
+            if re.fullmatch(r"\s*name:\s*['\"]?verdict['\"]?\s*(?:#.*)?", nested):
+                hits.append(nested)
+    return hits
+
+
+def _verdict_marker_hits(workflow_text: str) -> dict[str, int]:
+    """统计一份工作流原文里每个 VERDICT_ONLY_MARKERS 命中的行数，整行注释不计。"""
+    code = _strip_comments(workflow_text)
+    hits = {VERDICT_ENVIRONMENT_MARKER: len(_verdict_environment_lines(code))}
+    for marker in VERDICT_ONLY_MARKERS[1:]:
+        hits[marker] = sum(marker in line for line in code.splitlines())
+    return hits
+
+
 def _pyproject_cryptography_pin() -> str:
     text = (ROOT / "pyproject.toml").read_text(encoding="utf-8")
     match = re.search(r'"cryptography==([0-9][0-9A-Za-z.]*)"', text)
     assert match is not None
     return match.group(1)
+
+
+class CodeownersShapeTest(unittest.TestCase):
+    def test_verdict_ownership_is_narrow_and_covers_all_decision_files(self):
+        text = (ROOT / ".github/CODEOWNERS").read_text(encoding="utf-8")
+        for line in (
+            "/.github/CODEOWNERS @Moshuiwang",
+            "/.github/workflows/verdict.yml @Moshuiwang",
+            "/scripts/ci/verdict_decision.py @Moshuiwang",
+            "/tests/test_verdict_decision.py @Moshuiwang",
+        ):
+            with self.subTest(line=line):
+                self.assertIn(f"\n{line}\n", f"\n{text}\n")
+        self.assertNotIn("\n/.github/workflows/ @Moshuiwang\n", f"\n{text}\n")
 
 
 class VerdictWorkflowShapeTest(unittest.TestCase):
@@ -890,6 +962,30 @@ class VerdictWorkflowShapeTest(unittest.TestCase):
             "schedule",
         ):
             self.assertNotIn(forbidden, on_block, forbidden)
+
+    def test_comments_do_not_claim_release_branches_are_trusted(self):
+        ci = CI_WORKFLOW.read_text(encoding="utf-8")
+        for text in (self.raw, ci):
+            self.assertNotIn("base 是 main / release/**", text)
+            self.assertNotIn("面向受保护分支的 PR 触发的", text)
+        self.assertIn("pull_request 事件、base 是默认分支", self.raw)
+        self.assertIn("面向默认分支的 PR 触发的", ci)
+
+    def test_only_verdict_workflow_references_the_verdict_environment_and_app_secrets(self):
+        workflows = sorted((ROOT / ".github/workflows").glob("*.yml"))
+        hits_by_name = {
+            workflow.name: _verdict_marker_hits(workflow.read_text(encoding="utf-8"))
+            for workflow in workflows
+        }
+        self.assertIn("verdict.yml", hits_by_name)
+        for marker in VERDICT_ONLY_MARKERS:
+            with self.subTest(marker=marker):
+                # 先证明模式本身能命中 verdict.yml，免得模式写错后「其它工作流零命中」变成空断言。
+                self.assertGreaterEqual(hits_by_name["verdict.yml"][marker], 1)
+                self.assertEqual(
+                    [name for name, hits in hits_by_name.items() if hits[marker]],
+                    ["verdict.yml"],
+                )
 
     def test_top_level_permissions_are_read_only(self):
         self.assertEqual(_top_level_block(self.text, "permissions").strip(), "contents: read")

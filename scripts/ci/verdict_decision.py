@@ -156,7 +156,7 @@ def is_protected_base(base_ref: str, default_branch: str) -> bool:
 def is_trusted_base(base_ref: str, default_branch: str) -> bool:
     """路径 a 只信与默认分支相等的已规范化分支名。"""
 
-    return base_ref == default_branch
+    return bool(default_branch) and base_ref == default_branch
 
 
 def select_baseline(facts: RunFacts) -> Baseline:
