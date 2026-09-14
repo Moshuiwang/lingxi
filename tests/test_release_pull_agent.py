@@ -216,10 +216,12 @@ class PullHarness:
             log("deployer")
             operation = args[args.index("--state-directory") + 2]
             state_dir = args[args.index("--state-directory") + 1]
+            host = json.load(open(args[args.index("--host-contract") + 1], encoding="utf-8"))
+            failed_marker = os.path.join(state_dir, ".fake-apply-failed")
             if operation == "plan":
                 request = json.load(open(args[args.index("--request") + 1], encoding="utf-8"))
                 plan = dict(request)
-                plan.update({"schema":1, "host":"synthetic-host", "environment":"stage", "project":"synthetic-project"})
+                plan.update({"schema":1, "host":host["host"], "environment":host["environment"], "project":host["project"]})
                 path = os.path.join(state_dir, plan["id"] + ".plan.json")
                 with open(path, "w", encoding="utf-8") as stream:
                     json.dump(plan, stream, ensure_ascii=False, sort_keys=True, indent=2)
@@ -228,6 +230,39 @@ class PullHarness:
             elif operation == "apply":
                 if os.environ.get("DEPLOY_MODE") == "timeout":
                     time.sleep(4)
+                # 与 deploy_runtime.Runtime.installation_receipt 相同的六条校验：收据指纹绑进
+                # 计划、键集合、schema、环境 / 项目、目标新包摘要、绑定版本、六项核对全真。
+                plan_path = os.path.join(state_dir, args[args.index("apply") + 1] + ".plan.json")
+                plan = json.load(open(plan_path, encoding="utf-8"))
+                channel = plan["channel"]
+                receipt_path = os.path.join(host["config_root"], "deployment-installation.json")
+                try:
+                    receipt = json.load(open(receipt_path, encoding="utf-8"))
+                    mismatched = (
+                        hashlib.sha256(canonical(receipt)).hexdigest() != channel.get("installation_receipt_sha256")
+                        or set(receipt) != {"schema", "environment", "project", "bundle_sha256", "binding_version", "checks"}
+                        or receipt["schema"] != 1
+                        or receipt["environment"] != plan["environment"]
+                        or receipt["project"] != plan["project"]
+                        or receipt["bundle_sha256"] != plan["new"]["control_bundle"]["sha256"]
+                        or receipt["binding_version"] != channel.get("binding_version")
+                        or receipt["checks"] != {
+                            "sudo_policy": True,
+                            "sshd_policy": True,
+                            "credential_owner": True,
+                            "authorized_peer": True,
+                            "wrong_uid_rejected": True,
+                            "container_peer_rejected": True,
+                        }
+                    )
+                except (OSError, ValueError, KeyError, TypeError):
+                    mismatched = True
+                if mismatched:
+                    log("receipt-check", {"result":"installation_receipt_missing_or_mismatched"})
+                    open(failed_marker, "w", encoding="utf-8").close()
+                    print("installation_receipt_missing_or_mismatched", file=sys.stderr)
+                    raise SystemExit(1)
+                log("receipt-check", {"result":"ok"})
                 approval_path = args[args.index("--approval") + 1]
                 approval = json.load(open(approval_path, encoding="utf-8"))
                 approval_sha = hashlib.sha256(canonical(approval)).hexdigest()
@@ -241,7 +276,10 @@ class PullHarness:
                         stream.write(approval_sha)
                 print("{}")
             elif operation == "status":
-                print(json.dumps({"status":os.environ.get("DEPLOY_STATUS", "verified")}))
+                status = os.environ.get("DEPLOY_STATUS", "verified")
+                if os.path.exists(failed_marker):
+                    status = "failed"
+                print(json.dumps({"status":status}))
             else:
                 raise SystemExit(7)
             """,
@@ -296,6 +334,10 @@ class PullHarness:
             "approval_sources": ["https://github.com/Moshuiwang/lingxi/issues/770"],
         }
         self.host_path = _json(self.root / "host-contract.json", self.host)
+        self.receipt_path = self.config_root / "deployment-installation.json"
+        self.bootstrap_bundle_sha256 = "c" * 64
+        self.install_receipt()
+        self.install_channel_materials()
         self.config = {
             "schema": 1,
             "repository": "Moshuiwang/lingxi",
@@ -336,6 +378,61 @@ class PullHarness:
     def _write_env(self):
         self._old_env = os.environ.copy()
         os.environ.update(self._env)
+
+    def receipt(self, bundle_sha256: str | None = None, **overrides) -> dict:
+        """引导安装时人工写定的收据；六项核对全真，bundle_sha256 默认是引导安装的包摘要。"""
+        value = {
+            "schema": 1,
+            "environment": self.host["environment"],
+            "project": self.host["project"],
+            "bundle_sha256": bundle_sha256 or self.bootstrap_bundle_sha256,
+            "binding_version": 1,
+            "checks": {name: True for name in AGENT.INSTALLATION_RECEIPT_CHECKS},
+        }
+        value.update(overrides)
+        return value
+
+    def install_receipt(self, bundle_sha256: str | None = None, **overrides) -> dict:
+        value = self.receipt(bundle_sha256, **overrides)
+        _write(self.receipt_path, AGENT.canonical(value), 0o600)
+        return value
+
+    def read_receipt(self) -> dict:
+        return json.loads(self.receipt_path.read_text(encoding="utf-8"))
+
+    def bundle_sha256(self, tag: str) -> str:
+        manifest = json.loads((self.manifests / (tag + ".json")).read_text())
+        return manifest["control_bundle"]["sha256"]
+
+    def install_channel_materials(self):
+        """首次部署（没有旧计划）时 _host_materials 需要的 binding 与 relay 非秘密材料。"""
+        _json(
+            self.config_root / "innertest" / "binding.json",
+            {
+                "schema_revision": 1,
+                "binding_id": "synthetic-binding",
+                "host_uid": 41001,
+                "peer_uid": 51001,
+                "uid_map_sha256": "d" * 64,
+                "socket_gid": 42001,
+            },
+            0o644,
+        )
+        (self.config_root / "innertest").chmod(0o755)
+        relay_directory = self.relay_root / ("e" * 64)
+        _json(
+            relay_directory / "innertest-relay.json",
+            {
+                "schema_revision": 1,
+                "socket_path": "/run/lingxi-innertest/admin.sock",
+                "relay_uid": 41001,
+                "socket_owner_uid": 10001,
+            },
+            0o644,
+        )
+        _json(relay_directory / "installation.json", {"relay_sha256": "f" * 64}, 0o644)
+        relay_directory.chmod(0o755)
+        (self.relay_root / "current").symlink_to(relay_directory.name)
 
     def close(self):
         os.environ.clear()
@@ -431,6 +528,9 @@ class PullHarness:
         plan = {
             "schema": 1,
             "id": "old-plan",
+            "host": self.host["host"],
+            "environment": self.host["environment"],
+            "project": self.host["project"],
             "operation": "apply",
             "approval_source": self.host["approval_sources"][0],
             "new": old,
@@ -483,6 +583,13 @@ class PullHarness:
         plan["id"] = "continuing-plan"
         plan["new"] = json.loads((self.manifests / (self.target_tag + ".json")).read_text())
         plan["approval_source"] = self.host["approval_sources"][0]
+        # 中断前那一轮已把收据刷成目标新包；接续轮沿用计划里的收据指纹，不再改收据。
+        receipt = self.install_receipt(self.bundle_sha256(self.target_tag))
+        plan["channel"] = {
+            "synthetic": True,
+            "binding_version": receipt["binding_version"],
+            "installation_receipt_sha256": AGENT.fingerprint(receipt),
+        }
         _json(self.state / "continuing-plan.plan.json", plan)
         value = self.base_state()
         value.update(
@@ -856,6 +963,345 @@ class AgentTests(unittest.TestCase):
         self.assertFalse(any(call["kind"] == "bundle-install" for call in self.calls()))
         self.assertFalse(list(self.harness.state.glob(".release-*")))
 
+    def test_bundle_digest_mismatch_then_retry_is_not_skipped(self):
+        """探针场景：v2.4.3 已验证且摘要已记、容器仍跑 v2.4.3，rc.10 的附件被篡改。
+
+        修复前第一轮把 ``target_tag`` 记成 rc.10 而 ``deployer_state`` / ``verified_digests``
+        仍是 v2.4.3 的，第二轮状态账级幂等就把 rc.10 误判成 ``already_in_place`` 并把最高已
+        部署版本抬到 rc.10：新目标从此被静默跳过，且防降级会拿失真的版本号拒绝真正的目标。
+        """
+        harness = self.harness
+        harness.state_for_verified_target(harness.old_tag)
+        harness.set_running_containers(harness.old_tag)
+        harness.set_env(DOCKER_MODE="records")
+        original = harness.asset.read_bytes()
+        harness.asset.write_bytes(b"tampered package")
+        messages = []
+
+        def sender(message, env, timeout):
+            messages.append(message)
+
+        for round_number in (1, 2):
+            harness.log.unlink(missing_ok=True)
+            code, output = self.run_agent(sender=sender)
+            self.assertEqual(code, 0, round_number)
+            self.assertIn("阶段=bundle 结果码=bundle_digest_mismatch", output)
+            self.assertNotIn("结果码=already_in_place", output)
+            state = self.read_state()
+            self.assertEqual(state["last_result"], "bundle_digest_mismatch")
+            self.assertEqual(state["consecutive_failures"], round_number)
+            # 状态账仍指向已在位的 v2.4.3：目标、部署器状态、最高已部署版本、已验证摘要都不动。
+            self.assertEqual(state["target_tag"], harness.old_tag)
+            self.assertEqual(state["deployer_state"], "verified")
+            self.assertEqual(state["highest_deployed_tag"], harness.old_tag)
+            self.assertEqual(state["verified_digests"], harness.expected_digests(harness.old_tag))
+            self.assertEqual(state["plan_id"], "old-plan")
+            # 每轮都重新下载核对，而不是只读回读容器就收口；篡改包不会走到部署器。
+            self.assertTrue(
+                any(call["kind"] == "gh" and "download" in call["argv"] for call in self.calls())
+            )
+            self.assertFalse(any(call["kind"] == "deployer" for call in self.calls()))
+        self.assertEqual(len(messages), 1)
+        # 附件修好后同一目标正常部署，状态账才推进到 rc.10，并发一条恢复。
+        harness.asset.write_bytes(original)
+        harness.log.unlink()
+        code, output = self.run_agent(sender=sender)
+        self.assertEqual(code, 0)
+        self.assertNotIn("结果码=already_in_place", output)
+        state = self.read_state()
+        self.assertEqual(state["last_result"], "verified")
+        self.assertEqual(state["target_tag"], harness.target_tag)
+        self.assertEqual(state["highest_deployed_tag"], harness.target_tag)
+        self.assertEqual(state["verified_digests"], harness.expected_digests(harness.target_tag))
+        self.assertTrue(
+            any(call["kind"] == "deployer" and "apply" in call["argv"] for call in self.calls())
+        )
+        self.assertEqual(len(messages), 3)
+        self.assertIn("recovered", messages[1])
+        self.assertIn("verified", messages[2])
+
+    def test_failed_or_refused_rounds_never_advance_deployed_state(self):
+        """任何失败、拒绝或未知结果都不把状态账推进到未验证的目标。
+
+        基线：v2.4.3 已验证且摘要已记，容器仍跑 v2.4.3，新目标 rc.10 到来。第一轮按各结果码
+        注入故障：``highest_deployed_tag`` / ``verified_digests`` 必须原样，且状态账绝不会同时
+        声称「目标 == rc.10 且 verified」；计划落盘前的失败连 ``target_tag`` / ``plan_id`` 也不动，
+        计划落盘后的失败只记可接续身份。第二轮排除故障后同一目标必须真正走到 apply 并 ``verified``，
+        而不是被状态账级幂等判成 ``already_in_place``。
+        """
+
+        def both_releases(h: PullHarness) -> list[dict]:
+            return [h._release(h.old_tag, False), h._release(h.target_tag, True)]
+
+        def set_hooks(h: PullHarness, programs: list[str]):
+            config = dict(h.config)
+            config["pre_apply_hooks"] = programs
+            h.config_path = _json(h.config_path, config)
+
+        def start_patch(saved: dict, target: str, **kwargs):
+            saved["patch"] = patch.object(AGENT, target, **kwargs)
+            saved["patch"].start()
+            # 某一例在排除故障前断言失败时，补丁也不能漏到后面的用例；重复 stop 是空操作。
+            self.addCleanup(saved["patch"].stop)
+
+        def hide_plan_and_old_release(h: PullHarness, saved: dict):
+            # 旧计划文件丢失且旧版本不在 Release 列表：运行容器反查不到当前版本。
+            (h.state / "old-plan.plan.json").unlink()
+            h.set_releases([h._release(h.target_tag, True)])
+
+        def hide_target_manifest(h: PullHarness, saved: dict):
+            (h.manifests / (h.target_tag + ".json")).rename(h.manifests / "hidden.json")
+
+        def restore_target_manifest(h: PullHarness, saved: dict):
+            (h.manifests / "hidden.json").rename(h.manifests / (h.target_tag + ".json"))
+
+        def tamper_asset(h: PullHarness, saved: dict):
+            saved["asset"] = h.asset.read_bytes()
+            h.asset.write_bytes(b"tampered package")
+
+        def break_installed_manifest(h: PullHarness, saved: dict):
+            saved["source"] = h.installed_manifest.read_text(encoding="utf-8")
+            _exec(h.installed_manifest, "#!/usr/bin/env python3\nraise SystemExit(1)\n")
+
+        def break_public_config(h: PullHarness, saved: dict):
+            _write(h.public_config, "{not json", 0o644)
+
+        def restore_public_config(h: PullHarness, saved: dict):
+            _json(
+                h.public_config,
+                {"schema": 1, "values": {}, "files": {"scheduler": {}, "worker": {}}},
+                0o644,
+            )
+
+        def unsafe_hook(h: PullHarness, saved: dict):
+            # 临时目录里的钩子程序不是 root 属主：一个都不执行。
+            set_hooks(h, [str(h.hook_fail)])
+
+        def failing_hook(h: PullHarness, saved: dict):
+            set_hooks(h, [str(h.hook_fail)])
+            start_patch(saved, "_hook_program_protected", return_value=True)
+
+        def clear_failing_hook(h: PullHarness, saved: dict):
+            saved["patch"].stop()
+            set_hooks(h, [])
+
+        def apply_timeout(h: PullHarness, saved: dict):
+            config = dict(h.config)
+            config["deploy_timeout_seconds"] = 1
+            h.config_path = _json(h.config_path, config)
+            h.set_env(DEPLOY_MODE="timeout")
+
+        def status_verified_with_new_approval(h: PullHarness, saved: dict):
+            h.set_env(DEPLOY_STATUS="verified")
+            # 假部署器把首次 apply 的批准指纹钉在状态目录；failed 后重新 plan 会换批准。
+            (h.state / ".fake-approval-sha").unlink()
+
+        # (名称, 结果码, 阶段, 计划已落盘, 注入故障, 排除故障)
+        cases = [
+            (
+                "release_list_unavailable",
+                "release_list_unavailable",
+                "release_list",
+                False,
+                lambda h, s: h.set_releases([]),
+                lambda h, s: h.set_releases(both_releases(h)),
+            ),
+            (
+                "downgrade_refused",
+                "downgrade_refused",
+                "version_order",
+                False,
+                lambda h, s: h.set_releases(
+                    [h._release(h.old_tag, False), h._release("v2.4.3-rc.9", True)]
+                ),
+                lambda h, s: h.set_releases(both_releases(h)),
+            ),
+            (
+                "unknown_idempotence_docker_daemon",
+                "unknown",
+                "idempotence",
+                False,
+                lambda h, s: h.set_env(DOCKER_MODE="daemon"),
+                lambda h, s: h.set_env(DOCKER_MODE="records"),
+            ),
+            (
+                "unknown_idempotence_manifest_unresolvable",
+                "unknown",
+                "idempotence",
+                False,
+                hide_target_manifest,
+                restore_target_manifest,
+            ),
+            (
+                "unknown_current_release",
+                "unknown",
+                "current_release",
+                False,
+                hide_plan_and_old_release,
+                lambda h, s: h.set_releases(both_releases(h)),
+            ),
+            (
+                "bundle_digest_mismatch",
+                "bundle_digest_mismatch",
+                "bundle",
+                False,
+                tamper_asset,
+                lambda h, s: h.asset.write_bytes(s["asset"]),
+            ),
+            (
+                "unknown_bundle_download_failed",
+                "unknown",
+                "bundle",
+                False,
+                lambda h, s: h.set_env(ASSET_FILE=str(h.root / "missing.tar")),
+                lambda h, s: h.set_env(ASSET_FILE=str(h.asset)),
+            ),
+            (
+                "unknown_frozen_manifest",
+                "unknown",
+                "frozen_manifest",
+                False,
+                break_installed_manifest,
+                lambda h, s: _exec(h.installed_manifest, s["source"]),
+            ),
+            (
+                "installation_receipt_unusable",
+                "installation_receipt_unusable",
+                "installation_receipt",
+                False,
+                lambda h, s: h.install_receipt(
+                    checks=dict(h.receipt()["checks"], sudo_policy=False)
+                ),
+                lambda h, s: h.install_receipt(),
+            ),
+            (
+                "unknown_plan",
+                "unknown",
+                "plan",
+                False,
+                break_public_config,
+                restore_public_config,
+            ),
+            (
+                "unknown_approval",
+                "unknown",
+                "approval",
+                True,
+                lambda h, s: start_patch(
+                    s, "_make_approval", side_effect=AGENT.AgentError("plan_expired")
+                ),
+                lambda h, s: s["patch"].stop(),
+            ),
+            (
+                "pre_apply_hook_unsafe",
+                "pre_apply_hook_unsafe",
+                "pre_apply_hook",
+                True,
+                unsafe_hook,
+                lambda h, s: set_hooks(h, []),
+            ),
+            (
+                "pre_apply_hook_failed",
+                "pre_apply_hook_failed",
+                "pre_apply_hook",
+                True,
+                failing_hook,
+                clear_failing_hook,
+            ),
+            (
+                "deploy_timeout",
+                "deploy_timeout",
+                "apply",
+                True,
+                apply_timeout,
+                lambda h, s: h.set_env(DEPLOY_MODE="normal"),
+            ),
+            (
+                "failed",
+                "failed",
+                "status",
+                True,
+                lambda h, s: h.set_env(DEPLOY_STATUS="failed"),
+                status_verified_with_new_approval,
+            ),
+            (
+                "unknown_status",
+                "unknown",
+                "status",
+                True,
+                lambda h, s: h.set_env(DEPLOY_STATUS="bogus"),
+                lambda h, s: h.set_env(DEPLOY_STATUS="verified"),
+            ),
+            (
+                "running",
+                "running",
+                "status",
+                True,
+                lambda h, s: h.set_env(DEPLOY_STATUS="running"),
+                lambda h, s: h.set_env(DEPLOY_STATUS="verified"),
+            ),
+        ]
+        for name, result, stage, checkpointed, inject, clear in cases:
+            with self.subTest(case=name):
+                self.harness.close()
+                harness = self.harness = PullHarness()
+                self.addCleanup(harness.close)
+                harness.state_for_verified_target(harness.old_tag)
+                harness.set_running_containers(harness.old_tag)
+                harness.set_releases(both_releases(harness))
+                harness.set_env(DOCKER_MODE="records")
+                messages = []
+                saved: dict = {}
+                inject(harness, saved)
+                code, output = self.run_agent(
+                    sender=lambda message, env, timeout: messages.append(message)
+                )
+                self.assertEqual(code, 0)
+                self.assertIn(f"阶段={stage} 结果码={result}", output)
+                self.assertNotIn("结果码=already_in_place", output)
+                state = self.read_state()
+                self.assertEqual(state["last_result"], result)
+                self.assertEqual(state["highest_deployed_tag"], harness.old_tag)
+                self.assertEqual(
+                    state["verified_digests"], harness.expected_digests(harness.old_tag)
+                )
+                # 核心不变量：没写出 verified 的目标，状态账不会同时说「目标 == 它且 verified」。
+                self.assertFalse(
+                    state["target_tag"] == harness.target_tag
+                    and state["deployer_state"] == "verified"
+                )
+                if checkpointed:
+                    # 计划落盘后只记可接续身份：新目标、新计划、非 verified 的部署器状态。
+                    self.assertEqual(state["target_tag"], harness.target_tag)
+                    self.assertNotEqual(state["plan_id"], "old-plan")
+                    self.assertNotEqual(state["deployer_state"], "verified")
+                else:
+                    self.assertEqual(state["target_tag"], harness.old_tag)
+                    self.assertEqual(state["plan_id"], "old-plan")
+                    self.assertFalse(any(call["kind"] == "deployer" for call in self.calls()))
+                clear(harness, saved)
+                harness.log.unlink(missing_ok=True)
+                code, output = self.run_agent(
+                    sender=lambda message, env, timeout: messages.append(message)
+                )
+                self.assertEqual(code, 0)
+                self.assertNotIn("结果码=already_in_place", output)
+                state = self.read_state()
+                self.assertEqual(state["last_result"], "verified")
+                self.assertEqual(state["target_tag"], harness.target_tag)
+                self.assertEqual(state["deployer_state"], "verified")
+                self.assertEqual(state["highest_deployed_tag"], harness.target_tag)
+                self.assertEqual(
+                    state["verified_digests"], harness.expected_digests(harness.target_tag)
+                )
+                self.assertTrue(
+                    any(
+                        call["kind"] == "deployer" and "apply" in call["argv"]
+                        for call in self.calls()
+                    )
+                )
+                self.assertIn("verified", messages[-1])
+
     def test_uses_the_newly_installed_bundle_scripts(self):
         self.harness.state_for_old()
         messages = []
@@ -1220,6 +1666,298 @@ class AgentTests(unittest.TestCase):
         self.assertNotIn(self.harness.sentinel, output)
         self.assertNotIn(self.harness.sentinel, "\n".join(messages))
         self.assertIn(self.harness.sentinel, log_text)
+
+    def receipt_calls(self) -> list[str]:
+        return [call["result"] for call in self.calls() if call["kind"] == "receipt-check"]
+
+    def latest_plan(self) -> dict:
+        approval = json.loads(next(self.harness.state.glob("pull-*.approval.json")).read_text())
+        return json.loads((self.harness.state / (approval["plan_id"] + ".plan.json")).read_text())
+
+    def test_installation_receipt_bundle_sha_is_refreshed_before_plan(self):
+        harness = self.harness
+        prev_path = harness.receipt_path.with_name(harness.receipt_path.name + ".prev")
+        target_sha = harness.bundle_sha256(harness.target_tag)
+        self.assertNotEqual(target_sha, harness.bootstrap_bundle_sha256)
+        messages = []
+
+        def sender(message, env, timeout):
+            messages.append(message)
+
+        def assert_refreshed(output: str):
+            # 假部署器按 deploy_runtime.installation_receipt 的六条校验放行：不刷新就会在
+            # 这里得到 installation_receipt_missing_or_mismatched。
+            self.assertEqual(self.receipt_calls(), ["ok"])
+            state = self.read_state()
+            self.assertEqual(state["last_result"], "verified")
+            self.assertEqual(state["target_tag"], harness.target_tag)
+            receipt = harness.read_receipt()
+            self.assertEqual(receipt, harness.receipt(target_sha))
+            self.assertEqual(stat.S_IMODE(harness.receipt_path.stat().st_mode), 0o600)
+            self.assertEqual(prev_path.read_bytes(), AGENT.canonical(harness.receipt()))
+            self.assertEqual(stat.S_IMODE(prev_path.stat().st_mode), 0o600)
+            # 刷新发生在新包装好之后、plan 之前。
+            self.assertLess(
+                output.index("阶段=installation_receipt 结果码=refreshed"),
+                output.index("阶段=plan 结果码=written"),
+            )
+            kinds = [call["kind"] for call in self.calls()]
+            self.assertLess(kinds.index("bundle-install"), kinds.index("receipt-check"))
+            plan = self.latest_plan()
+            self.assertEqual(
+                plan["channel"]["installation_receipt_sha256"], AGENT.fingerprint(receipt)
+            )
+            self.assertEqual(plan["channel"]["binding_version"], receipt["binding_version"])
+
+        with self.subTest(case="first_deployment_without_previous_plan_reads_host_materials"):
+            # 引导安装后的第一次部署：没有旧计划，通道事实由 _host_materials 从磁盘收集。
+            harness.set_releases(
+                [
+                    harness._release(harness.old_tag, False),
+                    harness._release(harness.target_tag, True),
+                ]
+            )
+            harness.set_running_containers(harness.old_tag)
+            harness.set_env(DOCKER_MODE="records")
+            code, output = self.run_agent(sender=sender)
+            self.assertEqual(code, 0)
+            assert_refreshed(output)
+            self.assertEqual(self.latest_plan()["channel"]["relay_sha256"], "f" * 64)
+        with self.subTest(case="next_version_with_previous_plan_rebinds_receipt_fingerprint"):
+            # 有旧计划时通道沿用旧计划，但收据指纹与绑定版本必须来自刚刷新的收据。
+            for path in (harness.log, harness.state / "pull-agent.json", prev_path):
+                path.unlink()
+            (harness.state / ".fake-approval-sha").unlink()
+            for path in harness.state.glob("pull-*"):
+                path.unlink()
+            harness.install_receipt()
+            harness.state_for_old()
+            harness.set_env(DOCKER_MODE="mismatch")
+            code, output = self.run_agent(sender=sender)
+            self.assertEqual(code, 0)
+            assert_refreshed(output)
+            plan = self.latest_plan()
+            self.assertTrue(plan["channel"]["synthetic"])
+            self.assertNotEqual(
+                plan["channel"]["installation_receipt_sha256"],
+                AGENT.fingerprint(harness.receipt()),
+            )
+        with self.subTest(case="same_bundle_sha_is_left_unchanged_without_backup"):
+            harness.log.unlink()
+            prev_path.unlink()
+            (harness.state / ".fake-approval-sha").unlink()
+            before = harness.receipt_path.stat()
+            state = self.read_state()
+            state["deployer_state"] = "failed"
+            harness.save_state(state)
+            harness.set_env(DOCKER_MODE="records")
+            code, output = self.run_agent(sender=sender)
+            self.assertEqual(code, 0)
+            self.assertIn("阶段=installation_receipt 结果码=unchanged", output)
+            self.assertEqual(harness.receipt_path.stat().st_mtime_ns, before.st_mtime_ns)
+            self.assertEqual(harness.receipt_path.stat().st_ino, before.st_ino)
+            self.assertFalse(prev_path.exists())
+            self.assertEqual(self.receipt_calls(), ["ok"])
+            self.assertEqual(self.read_state()["last_result"], "verified")
+        self.assertFalse(list(harness.config_root.glob(".pending-*")))
+        self.assertTrue(all("verified" in message for message in messages))
+
+    def test_receipt_with_false_checks_or_wrong_environment_is_not_touched(self):
+        harness = self.harness
+        prev_path = harness.receipt_path.with_name(harness.receipt_path.name + ".prev")
+        messages = []
+
+        def sender(message, env, timeout):
+            messages.append(message)
+
+        broken = {
+            "one_check_false": dict(
+                checks=dict(harness.receipt()["checks"], container_peer_rejected=False)
+            ),
+            "check_missing": dict(
+                checks={
+                    name: True
+                    for name in AGENT.INSTALLATION_RECEIPT_CHECKS
+                    if name != "sudo_policy"
+                }
+            ),
+            "wrong_environment": dict(environment="production"),
+            "wrong_project": dict(project="another-project"),
+            "binding_version_missing": dict(binding_version=None),
+            "extra_key": dict(installed_by="someone"),
+            "wrong_schema": dict(schema=2),
+        }
+        for name, overrides in broken.items():
+            with self.subTest(case=name):
+                harness.log.unlink(missing_ok=True)
+                prev_path.unlink(missing_ok=True)
+                harness.state_for_old()
+                receipt = harness.install_receipt(**overrides)
+                if name == "binding_version_missing":
+                    self.assertIsNone(receipt["binding_version"])
+                before = harness.receipt_path.stat()
+                raw = harness.receipt_path.read_bytes()
+                messages.clear()
+                for round_number in (1, 2):
+                    code, output = self.run_agent(sender=sender)
+                    self.assertEqual(code, 0, round_number)
+                    self.assertIn(
+                        "阶段=installation_receipt 结果码=installation_receipt_unusable", output
+                    )
+                    state = self.read_state()
+                    self.assertEqual(state["last_result"], "installation_receipt_unusable")
+                    self.assertEqual(state["consecutive_failures"], round_number)
+                    # 状态账仍指向已在位的旧目标，不把没部署的目标记成在位或已验证。
+                    self.assertEqual(state["target_tag"], harness.old_tag)
+                    self.assertEqual(state["deployer_state"], "verified")
+                    self.assertEqual(state["plan_id"], "old-plan")
+                # 零写入：收据字节、修改时间、inode 都不变，没有备份、没有临时文件。
+                self.assertEqual(harness.receipt_path.read_bytes(), raw)
+                self.assertEqual(harness.receipt_path.stat().st_mtime_ns, before.st_mtime_ns)
+                self.assertEqual(harness.receipt_path.stat().st_ino, before.st_ino)
+                self.assertFalse(prev_path.exists())
+                self.assertFalse(list(harness.config_root.glob(".pending-*")))
+                # 不 plan、不 apply；告警一次，去重键含结果码与目标 tag。
+                self.assertFalse(any(call["kind"] == "deployer" for call in self.calls()))
+                self.assertFalse(list(harness.state.glob("*.request.json")))
+                self.assertTrue(any(call["kind"] == "bundle-install" for call in self.calls()))
+                self.assertEqual(len(messages), 1)
+                self.assertIn("installation_receipt_unusable", messages[0])
+                self.assertIn("阶段：installation_receipt", messages[0])
+                self.assertIn(
+                    f"installation_receipt_unusable:{harness.target_tag}", state["alerts"]
+                )
+        with self.subTest(case="missing_receipt"):
+            harness.log.unlink(missing_ok=True)
+            harness.state_for_old()
+            harness.receipt_path.unlink()
+            messages.clear()
+            code, output = self.run_agent(sender=sender)
+            self.assertEqual(code, 0)
+            self.assertIn("reason=json_file_unavailable", output)
+            self.assertEqual(self.read_state()["last_result"], "installation_receipt_unusable")
+            self.assertFalse(harness.receipt_path.exists())
+            self.assertFalse(prev_path.exists())
+            self.assertFalse(any(call["kind"] == "deployer" for call in self.calls()))
+        with self.subTest(case="group_readable_receipt_is_rejected_like_the_deployer_does"):
+            harness.log.unlink(missing_ok=True)
+            harness.state_for_old()
+            harness.install_receipt()
+            harness.receipt_path.chmod(0o640)
+            raw = harness.receipt_path.read_bytes()
+            code, output = self.run_agent(sender=sender)
+            self.assertEqual(code, 0)
+            self.assertIn("reason=json_file_permissions", output)
+            self.assertEqual(self.read_state()["last_result"], "installation_receipt_unusable")
+            self.assertEqual(harness.receipt_path.read_bytes(), raw)
+            self.assertEqual(stat.S_IMODE(harness.receipt_path.stat().st_mode), 0o640)
+            self.assertFalse(prev_path.exists())
+        with self.subTest(case="repaired_receipt_recovers_and_deploys"):
+            harness.log.unlink(missing_ok=True)
+            messages.clear()
+            harness.install_receipt()
+            code, _ = self.run_agent(sender=sender)
+            self.assertEqual(code, 0)
+            self.assertEqual(self.read_state()["last_result"], "verified")
+            self.assertEqual(self.receipt_calls(), ["ok"])
+            self.assertTrue(any("recovered" in message for message in messages))
+            self.assertEqual(
+                harness.read_receipt()["bundle_sha256"], harness.bundle_sha256(harness.target_tag)
+            )
+        with self.subTest(case="continuing_plan_never_touches_the_receipt"):
+            harness.log.unlink(missing_ok=True)
+            prev_path.unlink(missing_ok=True)
+            (harness.state / ".fake-approval-sha").unlink(missing_ok=True)
+            harness.state_for_continuation()
+            before = harness.receipt_path.stat()
+            raw = harness.receipt_path.read_bytes()
+            harness.set_env(DOCKER_MODE="match", DEPLOY_STATUS="running")
+            code, output = self.run_agent(sender=sender)
+            self.assertEqual(code, 0)
+            self.assertNotIn("阶段=installation_receipt", output)
+            self.assertEqual(self.read_state()["deployer_state"], "running")
+            self.assertEqual(self.receipt_calls(), ["ok"])
+            self.assertEqual(harness.receipt_path.read_bytes(), raw)
+            self.assertEqual(harness.receipt_path.stat().st_mtime_ns, before.st_mtime_ns)
+            self.assertFalse(prev_path.exists())
+
+    def test_receipt_refresh_is_atomic_and_private(self):
+        harness = self.harness
+        path = harness.receipt_path
+        prev_path = path.with_name(path.name + ".prev")
+        new_sha = harness.bundle_sha256(harness.target_tag)
+        # 收据由人手写：字节形态不必是代理的规范编码，备份也必须逐字节保留原样。
+        handwritten = json.dumps(harness.receipt(), ensure_ascii=False, indent=4).encode()
+        _write(path, handwritten, 0o600)
+        before = path.stat()
+        refreshed, changed = AGENT.refresh_installation_receipt(harness.host, new_sha)
+        self.assertTrue(changed)
+        self.assertEqual(refreshed, harness.receipt(new_sha))
+        self.assertEqual(path.read_bytes(), AGENT.canonical(harness.receipt(new_sha)))
+        self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o600)
+        # 原子替换：新内容来自另一个 inode，不是原地截断重写；备份等于旧字节且同样私有。
+        self.assertNotEqual(path.stat().st_ino, before.st_ino)
+        self.assertEqual(prev_path.read_bytes(), handwritten)
+        self.assertEqual(stat.S_IMODE(prev_path.stat().st_mode), 0o600)
+        self.assertFalse(list(harness.config_root.glob(".pending-*")))
+        # 同一摘要再刷一次：不写盘、不动备份。
+        after = path.stat()
+        prev_before = prev_path.stat()
+        self.assertEqual(
+            AGENT.refresh_installation_receipt(harness.host, new_sha), (refreshed, False)
+        )
+        self.assertEqual(path.stat().st_mtime_ns, after.st_mtime_ns)
+        self.assertEqual(prev_path.stat().st_mtime_ns, prev_before.st_mtime_ns)
+
+        # 替换失败时旧收据原样保留、不留半份临时文件；备份写成后主文件替换失败亦然。
+        _write(path, handwritten, 0o600)
+        prev_path.unlink()
+        real_replace = os.replace
+
+        def fail_on(target: Path):
+            def fake_replace(source, destination, *args, **kwargs):
+                if Path(destination) == target:
+                    raise OSError("synthetic replace failure")
+                return real_replace(source, destination, *args, **kwargs)
+
+            return fake_replace
+
+        for name, target in (("backup", prev_path), ("receipt", path)):
+            with self.subTest(failure=name):
+                with patch.object(AGENT.os, "replace", side_effect=fail_on(target)):
+                    with self.assertRaises(AGENT.AgentError) as raised:
+                        AGENT.refresh_installation_receipt(harness.host, new_sha)
+                self.assertEqual(raised.exception.code, "installation_receipt_write_failed")
+                self.assertEqual(path.read_bytes(), handwritten)
+                self.assertFalse(list(harness.config_root.glob(".pending-*")))
+                if name == "backup":
+                    self.assertFalse(prev_path.exists())
+                else:
+                    self.assertEqual(prev_path.read_bytes(), handwritten)
+        # 配置根可被组 / 其他主体写入时拒绝写回：与部署器 installation_directory 同一条规则。
+        prev_path.unlink()
+        harness.config_root.chmod(0o775)
+        try:
+            with self.assertRaises(AGENT.AgentError) as raised:
+                AGENT.refresh_installation_receipt(harness.host, new_sha)
+        finally:
+            harness.config_root.chmod(0o755)
+        self.assertEqual(raised.exception.code, "installation_receipt_write_failed")
+        self.assertEqual(path.read_bytes(), handwritten)
+        self.assertFalse(prev_path.exists())
+        # 整轮视角：写回失败与收据不可用同一结果码，日志给出原因，不 plan。
+        harness.state_for_old()
+        messages = []
+        with patch.object(AGENT.os, "replace", side_effect=fail_on(path)):
+            code, output = self.run_agent(
+                sender=lambda message, env, timeout: messages.append(message)
+            )
+        self.assertEqual(code, 0)
+        self.assertIn("reason=installation_receipt_write_failed", output)
+        self.assertEqual(self.read_state()["last_result"], "installation_receipt_unusable")
+        self.assertEqual(path.read_bytes(), handwritten)
+        self.assertFalse(any(call["kind"] == "deployer" for call in self.calls()))
+        self.assertEqual(len(messages), 1)
 
     def test_systemd_units_shape(self):
         service = (ROOT / "deploy/monitoring-units/lingxi-release-pull.service").read_text()
