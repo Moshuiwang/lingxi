@@ -1,7 +1,7 @@
-"""受限通道只读三工具的数据库适配：只组合既有只读口，本模块零写库。
+"""受限通道只读三工具的数据库适配与通道分发：只读口零写库，准备工具另见 ``restricted_admin_prepare``。
 
 身份仍由扩员服务的 ``authenticate`` 每请求现读；这里只在拿到已验证主体之后查数据。
-每次调用写一行结构化审计（工具名、结果码、耗时、追溯号），不含查询正文。
+只读与准备工具每次调用都写一行结构化审计（工具名、结果码、耗时、追溯号），不含查询正文。
 """
 
 from __future__ import annotations
@@ -14,6 +14,7 @@ from lingxi.adapters.postgres import DEFAULT_POSTGRES_TIMEOUTS, PostgresTimeouts
 from lingxi.core.admin.innertest import TOOL_NAMES, InnertestError, envelope
 from lingxi.core.admin.restricted_tools import (
     DEFAULT_PENDING_ACTIONS,
+    PREPARE_TOOL_NAMES,
     READ_ONLY_TOOL_NAMES,
     candidate_lists,
     pending_action_item,
@@ -81,7 +82,7 @@ class RestrictedAdminQueries:
         """银河摘要、本地覆盖与合成结果都在同一次现读上计算。"""
         del principal
         open_id, status = self._status(identifier)
-        metric_map, positions = self._catalog()
+        metric_map, positions = self.catalog()
         return permission_sources_result(
             trace_id=call_trace_id,
             identifier=identifier,
@@ -91,7 +92,7 @@ class RestrictedAdminQueries:
             candidates=candidate_lists(metric_map=metric_map, positions=positions),
         )
 
-    def _catalog(self):
+    def catalog(self):
         """两份映射文件各自失败关闭为「不可读」，不用随包默认顶替外置文件。"""
         from lingxi.adapters.company_function_metric_map_file import (
             load_company_function_metric_map,
@@ -112,7 +113,7 @@ class RestrictedAdminQueries:
         self, principal, *, call_trace_id, pending_action_id=None, limit=None, status=None
     ):
         """只投影本人发起的动作；别人的编号与查无同样是 ``not_found``。"""
-        rows = self._pending_rows(
+        rows = self.pending_rows(
             principal.open_id,
             pending_action_id=pending_action_id,
             limit=DEFAULT_PENDING_ACTIONS if limit is None else limit,
@@ -121,13 +122,23 @@ class RestrictedAdminQueries:
         items = []
         for row in rows:
             remaining()
-            followups = self._followups.list_for_action(pending_action_id=row["id"])
-            items.append(pending_action_item(row, followups))
+            items.append(self._item(row))
         return pending_actions_result(
             trace_id=call_trace_id, items=items, single=pending_action_id is not None
         )
 
-    def _pending_rows(self, open_id, *, pending_action_id, limit, status):
+    def _item(self, row):
+        """一行动作 + 它的全部阶段引用，投影成只读形状。"""
+        return pending_action_item(
+            row, self._followups.list_for_action(pending_action_id=row["id"])
+        )
+
+    def action_item(self, open_id, pending_action_id):
+        """本人的一条动作投影；不是本人发起或查无即 ``None``，供准备工具回显结果。"""
+        rows = self.pending_rows(open_id, pending_action_id=pending_action_id, limit=1, status=None)
+        return self._item(rows[0]) if rows else None
+
+    def pending_rows(self, open_id, *, pending_action_id, limit, status):
         """固定列、固定谓词的只读 SELECT，不接受客户端 SQL。"""
         with connect(self._dsn, timeouts=self._timeouts) as connection, connection.cursor() as cur:
             if pending_action_id is not None:
@@ -154,11 +165,16 @@ class RestrictedAdminQueries:
 
 
 class RestrictedChannelService:
-    """受限通道的工具分发：扩员三工具交既有服务，只读三工具交查询适配并逐次审计。"""
+    """受限通道的工具分发：扩员三工具交既有服务，只读与准备工具各交适配并逐次审计。
 
-    def __init__(self, *, innertest, queries, audit):
-        """``innertest`` 同时是身份权威；``audit`` 不接收查询正文。"""
+    分发表就是登记式工具集合的三段：没有任何名字会落到确认、取消或执行——通道里根本
+    没有这样的方法可分发。
+    """
+
+    def __init__(self, *, innertest, queries, audit, prepare=None):
+        """``innertest`` 同时是身份权威；``audit`` 不接收查询正文；``prepare`` 未装配即拒绝。"""
         self._innertest, self._queries, self._audit = innertest, queries, audit
+        self._prepare = prepare
 
     def authenticate(self, uid):
         """身份链一字不改：内核 UID → 受保护绑定 → 登记表角色，每请求现读。"""
@@ -168,16 +184,18 @@ class RestrictedChannelService:
         """工具名不是可执行字符串，只分发登记过的固定方法。"""
         if name in TOOL_NAMES:
             return self._innertest.call(principal, name, args)
-        if name not in READ_ONLY_TOOL_NAMES:
-            raise InnertestError("invalid_request")
-        return self._call_read_only(principal, name, args)
+        if name in READ_ONLY_TOOL_NAMES:
+            return self._call_audited(self._queries, principal, name, args)
+        if name in PREPARE_TOOL_NAMES and self._prepare is not None:
+            return self._call_audited(self._prepare, principal, name, args)
+        raise InnertestError("invalid_request")
 
-    def _call_read_only(self, principal, name, args):
+    def _call_audited(self, target, principal, name, args):
         """每次调用一行审计：成功、业务拒绝与意外异常都留痕，异常不带正文。"""
         trace_id, started = new_id("trc"), time.monotonic()
         failure = None
         try:
-            result = getattr(self._queries, name)(principal, call_trace_id=trace_id, **args)
+            result = getattr(target, name)(principal, call_trace_id=trace_id, **args)
             code = result["code"]
         except InnertestError as error:
             result, code = envelope(error.code, trace_id=trace_id, state="rejected"), error.code
@@ -189,6 +207,7 @@ class RestrictedChannelService:
             result_code=code,
             elapsed_ms=int((time.monotonic() - started) * 1000),
             trace_id=trace_id,
+            pending_action_id=(result or {}).get("pending_action_id"),
         )
         if failure is not None:
             raise InnertestError("query_unavailable") from failure

@@ -10,10 +10,11 @@ from postgres_schema import ensure_production_schema, psycopg_available, reset_p
 
 from lingxi.adapters.admin_registry import PostgresAdminQueries, seed_admin_registry_entry
 from lingxi.adapters.innertest_mcp import InnertestMcpSession
-from lingxi.adapters.postgres import connect
+from lingxi.adapters.postgres import DEFAULT_POSTGRES_TIMEOUTS, connect
 from lingxi.adapters.postgres_admin_followup import PostgresFollowupStore, enqueue_followups
 from lingxi.adapters.postgres_innertest import PostgresInnertestService
 from lingxi.adapters.postgres_local_permission import PostgresLocalPermissionOverrideStore
+from lingxi.adapters.restricted_admin_prepare import build_restricted_prepare
 from lingxi.adapters.restricted_admin_queries import (
     RestrictedAdminQueries,
     RestrictedChannelService,
@@ -27,13 +28,27 @@ from lingxi.core.permission.local_override import OverrideDirection
 
 DSN = os.environ.get("LINGXI_POSTGRES_DSN")
 TRACE = "01ARZ3NDEKTSV4RRFFQ69G5FAV"
-SIX_TOOLS = (
+ELEVEN_TOOLS = (
     ("list_innertest_members", {}),
     ("prepare_innertest_additions", {"request_key": "k", "emails": ["p@example.test"]}),
     ("get_innertest_batch", {"batch_id": "b"}),
     ("get_user_status", {"identifier": "ou_target"}),
     ("get_user_permission_sources", {"identifier": "ou_target"}),
     ("get_pending_actions", {}),
+    ("prepare_suspend_user", {"identifier": "ou_target"}),
+    ("prepare_resume_user", {"identifier": "ou_target"}),
+    (
+        "prepare_grant_position",
+        {"identifier": "ou_target", "position_name": "A商务", "company_scope": "1", "reason": "r"},
+    ),
+    (
+        "prepare_revoke_permission",
+        {"override_id": "lpo_01ARZ3NDEKTSV4RRFFQ69G5FAV", "reason": "r"},
+    ),
+    (
+        "prepare_revoke_permission_by_scope",
+        {"identifier": "ou_target", "company_id": "1", "metric_name": "vat_rate", "reason": "r"},
+    ),
 )
 COUNTED_TABLES = (
     "app_user",
@@ -44,6 +59,7 @@ COUNTED_TABLES = (
     "innertest_batch",
     "innertest_audit",
     "inbound_event",
+    "operation_audit",
 )
 
 
@@ -71,15 +87,23 @@ class RestrictedAdminPostgresTests(unittest.TestCase):
             ),
             audit=self.audit,
         )
+        admin_queries, followups = PostgresAdminQueries(DSN), PostgresFollowupStore(DSN)
+        readonly = RestrictedAdminQueries(
+            DSN, queries=admin_queries, followups=followups, metric_map_path=None
+        )
         self.service = RestrictedChannelService(
             innertest=innertest,
-            queries=RestrictedAdminQueries(
-                DSN,
-                queries=PostgresAdminQueries(DSN),
-                followups=PostgresFollowupStore(DSN),
-                metric_map_path=None,
-            ),
+            queries=readonly,
             audit=self.audit,
+            prepare=build_restricted_prepare(
+                DSN,
+                audit=self.audit,
+                metric_map_path=None,
+                timeouts=DEFAULT_POSTGRES_TIMEOUTS,
+                queries=admin_queries,
+                readonly=readonly,
+                store=followups,
+            ),
         )
         self.session = InnertestMcpSession(peer_uid=1234, service=self.service)
         self.request("initialize", {"protocolVersion": "2025-11-25"})
@@ -231,24 +255,29 @@ class RestrictedAdminPostgresTests(unittest.TestCase):
         self.assertEqual(other["structuredContent"]["code"], "not_found")
         self.assertEqual(self.counts(), before)
 
-    def test_unbound_uid_and_registry_revocation_reject_all_six_tools(self):
+    def test_unbound_uid_and_registry_revocation_reject_all_eleven_tools(self):
         self.add_user()
         with self.assertRaisesRegex(InnertestError, "not_authenticated"):
             self.service.authenticate(1235)
-        for name, arguments in SIX_TOOLS:
+        for name, arguments in ELEVEN_TOOLS:
             self.assertIn("result", self.tool(name, arguments))
+        prepared = self.tool("get_pending_actions", {})["result"]["structuredContent"]
+        self.assertEqual(prepared["count"], 1)
         self.sql(
             "UPDATE admin_registry SET entry_status='revoked', revoked_at=now() "
             "WHERE feishu_open_id='ou_admin'"
         )
-        for name, arguments in SIX_TOOLS:
+        before = self.counts()
+        for name, arguments in ELEVEN_TOOLS:
             self.assertEqual(self.tool(name, arguments)["error"]["message"], "not_authorized")
         self.assertEqual(self.request("tools/list")["error"]["message"], "not_authorized")
+        self.assertEqual(self.counts(), before)
         seed_admin_registry_entry(DSN, feishu_open_id="ou_admin", label="合成管理员")
-        self.assertIn("result", self.tool(*SIX_TOOLS[3]))
+        self.assertIn("result", self.tool(*ELEVEN_TOOLS[3]))
         self.sql("UPDATE innertest_admin_binding SET enabled=false WHERE id='binding'")
-        for name, arguments in SIX_TOOLS:
+        for name, arguments in ELEVEN_TOOLS:
             self.assertEqual(self.tool(name, arguments)["error"]["message"], "binding_disabled")
+        self.assertEqual(self.counts(), before)
         self.assertEqual(
             {row["result_code"] for row in self.audited(READ_ONLY_TOOL_NAMES[2])}, {"ok"}
         )

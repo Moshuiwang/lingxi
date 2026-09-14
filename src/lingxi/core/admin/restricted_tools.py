@@ -1,25 +1,37 @@
-"""受限通道的工具全集与只读三工具的纯逻辑：入参校验、返回形状、查无语义。
+"""受限通道的工具全集与只读 / 准备工具的纯逻辑：入参校验、命令转译、返回形状。
 
 只读工具不进待确认载体、不写库、不猜相似人：标识查无就是 ``not_found``。权限来源的
 合成沿用发布链同一纯函数（翻译 + 两源合并），银河一侧读不到时明确报「不可读」而不是
-算成零权限。``reused_count`` 与 ``retained_by_galaxy`` 由差集补齐切片填值，这里先固定
-位置、值为 ``None``。
+算成零权限。五个准备工具不直调任何仓储：结构化参数逐字转译成私聊命令文本，交管理命令
+路由走同一条角色判定、自我目标防呆、准备判定与审计；转译前的字段约束就是命令语法本身
+（转译结果解析不出命令即拒绝），两条入口对同一意图必然得到同一结论。通道里没有任何
+工具能确认、取消或执行：确认只发生在发起人本人的飞书卡片上。
 """
 
 from __future__ import annotations
 
 import json
+import re
 from collections.abc import Mapping, Sequence
 from dataclasses import asdict
+from functools import partial
 from typing import Any
 
+from lingxi.core.admin.commands import AdminCommandKind, parse_admin_command
 from lingxi.core.admin.innertest import (
     INNERTEST_TOOLS,
     InnertestError,
     ToolRegistry,
     ToolSpec,
     envelope,
+    target_digest,
 )
+from lingxi.core.admin.pending_action import (
+    LOCAL_PERMISSION_ACTION_TYPES,
+    PendingActionType,
+    local_permission_pairs,
+)
+from lingxi.core.admin.router_ports import AdminRouteOutcome
 from lingxi.core.permission.local_override import ResolvedLocalOverrides
 from lingxi.core.permission.merge_sources import merge_permission_sources
 from lingxi.core.permission.metric_translation import (
@@ -29,7 +41,41 @@ from lingxi.core.permission.metric_translation import (
 from lingxi.core.permission.publish_row import ADMIN_FULL_ACCESS_FUNCTION
 
 READ_ONLY_TOOL_NAMES = ("get_user_status", "get_user_permission_sources", "get_pending_actions")
+PREPARE_TOOL_NAMES = (
+    "prepare_suspend_user",
+    "prepare_resume_user",
+    "prepare_grant_position",
+    "prepare_revoke_permission",
+    "prepare_revoke_permission_by_scope",
+)
+#: 每个准备工具对应的待确认动作类型；抑制没有发起入口，因此没有准备工具。
+PREPARE_ACTION_TYPES: dict[str, PendingActionType] = {
+    PREPARE_TOOL_NAMES[0]: PendingActionType.SUSPEND_USER,
+    PREPARE_TOOL_NAMES[1]: PendingActionType.RESUME_USER,
+    PREPARE_TOOL_NAMES[2]: PendingActionType.LOCAL_PERMISSION_GRANT,
+    PREPARE_TOOL_NAMES[3]: PendingActionType.LOCAL_PERMISSION_REVOKE,
+    PREPARE_TOOL_NAMES[4]: PendingActionType.LOCAL_PERMISSION_REVOKE,
+}
 PENDING_ACTION_STATUSES = ("pending", "executed", "cancelled", "expired", "failed")
+REASON_MAX_LENGTH = 500
+#: 撞上同目标在途唯一索引时路由给出的判定码；准备工具据此再判一次是否同一意图。
+TARGET_HAS_PENDING_ACTION_CODE = "target_has_pending_action"
+#: 路由回复键 → 工具结果码；拒绝键的结果码取判定码本身，不在这张表里。
+_OUTCOME_CODES = {
+    "admin.write_action_pending": "ok",
+    "admin.write_action_unavailable": "unavailable",
+    "admin.write_action_card_send_failed": "card_send_failed",
+    "admin.internal_error": "internal_error",
+}
+_REJECTED_KEY = "admin.write_action_rejected"
+_LEDGER_IDENTIFIER = re.compile(r"[A-Za-z0-9_-]{1,64}")
+#: 「已确认」不等于「已生效」：发布观察阶段的状态单独映射，不并进动作状态。
+_PUBLISH_STATES = {
+    "succeeded": "published",
+    "failed": "failed",
+    "unknown": "unknown",
+    "skipped": "skipped",
+}
 MAX_PENDING_ACTIONS = 20
 DEFAULT_PENDING_ACTIONS = 10
 
@@ -124,8 +170,126 @@ READ_ONLY_TOOLS = (
     ),
 )
 
-#: 受限通道对外的全集：扩员三工具 + 只读三工具；写动作的准备工具由后续切片追加。
-CHANNEL_TOOLS = ToolRegistry(INNERTEST_TOOLS + READ_ONLY_TOOLS)
+
+def _single_token(args, key):
+    """单段参数：非空、不含任何空白、不超长；缺省即拒绝。"""
+    value = args.get(key)
+    if (
+        not isinstance(value, str)
+        or not value
+        or len(value) > 128
+        or value != "".join(value.split())
+    ):
+        raise InnertestError("invalid_request")
+    return value
+
+
+def _reason_text(args):
+    """原因文本：折叠空白后非空且不超过 500 字，与命令解析对多段原因的还原一致。"""
+    value = args.get("reason")
+    if not isinstance(value, str):
+        raise InnertestError("invalid_request")
+    collapsed = " ".join(value.split())
+    if not collapsed or len(collapsed) > REASON_MAX_LENGTH:
+        raise InnertestError("invalid_request")
+    return collapsed
+
+
+def prepare_command_text(name, args):
+    """把准备工具的结构化参数逐字转译成私聊命令文本；未知工具名即拒绝。"""
+    if name in PREPARE_TOOL_NAMES[:2]:
+        verb = "suspend" if name == PREPARE_TOOL_NAMES[0] else "resume"
+        return f"/admin {verb} {_single_token(args, 'identifier')}"
+    if name == PREPARE_TOOL_NAMES[2]:
+        return "/admin grant_position " + " ".join(
+            (
+                _single_token(args, "identifier"),
+                _single_token(args, "position_name"),
+                _single_token(args, "company_scope"),
+                _reason_text(args),
+            )
+        )
+    if name == PREPARE_TOOL_NAMES[3]:
+        key = "override_id" if "override_id" in args else "group_id"
+        return f"/admin revoke_permission {_single_token(args, key)} {_reason_text(args)}"
+    if name == PREPARE_TOOL_NAMES[4]:
+        return "/admin revoke_permission " + " ".join(
+            (
+                _single_token(args, "identifier"),
+                _single_token(args, "company_id"),
+                _single_token(args, "metric_name"),
+                _reason_text(args),
+            )
+        )
+    raise InnertestError("invalid_request")
+
+
+def _validate_prepare(name, args):
+    """转译后的文本必须能解析成对应命令：字段形状约束就是命令语法本身。"""
+    if name == PREPARE_TOOL_NAMES[3] and ("override_id" in args) == ("group_id" in args):
+        raise InnertestError("invalid_request")
+    parsed = parse_admin_command(prepare_command_text(name, args))
+    if parsed.kind is AdminCommandKind.UNKNOWN:
+        raise InnertestError("invalid_request")
+    return args
+
+
+_REASON = {"type": "string", "minLength": 1, "maxLength": REASON_MAX_LENGTH}
+_PREPARE_SCHEMAS = (
+    ("准备停用一个用户，等待本人飞书确认", {"identifier": _IDENTIFIER}, ["identifier"], None),
+    ("准备恢复一个已停用用户，等待本人飞书确认", {"identifier": _IDENTIFIER}, ["identifier"], None),
+    (
+        "准备按银河职位 × 公司范围补充本地权限（范围为公司编号或 *），等待本人飞书确认",
+        {
+            "identifier": _IDENTIFIER,
+            "position_name": _IDENTIFIER,
+            "company_scope": _IDENTIFIER,
+            "reason": _REASON,
+        },
+        ["identifier", "position_name", "company_scope", "reason"],
+        None,
+    ),
+    (
+        "准备按覆盖行（lpo_）或授权组（lpg_ / 旧 pac_）编号撤销本地权限，等待本人飞书确认",
+        {"override_id": _IDENTIFIER, "group_id": _IDENTIFIER, "reason": _REASON},
+        ["reason"],
+        [{"required": ["override_id"]}, {"required": ["group_id"]}],
+    ),
+    (
+        "准备按用户 × 公司 × 指标撤销一条本地权限，等待本人飞书确认",
+        {
+            "identifier": _IDENTIFIER,
+            "company_id": _IDENTIFIER,
+            "metric_name": _IDENTIFIER,
+            "reason": _REASON,
+        },
+        ["identifier", "company_id", "metric_name", "reason"],
+        None,
+    ),
+)
+
+
+def _prepare_spec(name, description, properties, required, one_of):
+    schema = dict(
+        type="object", properties=properties, additionalProperties=False, required=required
+    )
+    if one_of is not None:
+        schema["oneOf"] = one_of
+    return ToolSpec(
+        name=name,
+        description=description,
+        input_schema=schema,
+        validate=partial(_validate_prepare, name),
+    )
+
+
+PREPARE_TOOLS = tuple(
+    _prepare_spec(name, *fields)
+    for name, fields in zip(PREPARE_TOOL_NAMES, _PREPARE_SCHEMAS, strict=True)
+)
+
+#: 受限通道对外的全集：扩员三工具 + 只读三工具 + 准备五工具，共十一个。
+CHANNEL_TOOLS = ToolRegistry(INNERTEST_TOOLS + READ_ONLY_TOOLS + PREPARE_TOOLS)
 
 
 def _iso(value):
@@ -281,16 +445,33 @@ def candidate_lists(*, metric_map, positions) -> dict[str, Any]:
     )
 
 
-def pending_action_item(row: Mapping[str, Any], followups: Sequence[Any]) -> dict[str, Any]:
-    """一条待确认动作的只读投影；阶段状态如实映射，不把「已确认」说成「已生效」。"""
-    payload = row.get("payload")
+def parsed_payload(payload) -> dict[str, Any] | None:
+    """待确认动作的 JSON 载荷；缺省或损坏都按「没有载荷」处理。"""
     try:
         parsed = json.loads(payload) if payload else None
     except ValueError:
-        parsed = None
+        return None
+    return parsed if isinstance(parsed, dict) else None
+
+
+def publish_state(followups: Sequence[Any]) -> str | None:
+    """发布观察阶段的结论：只有它成功才是「已生效」；没有该阶段时为 ``None``。"""
+    states = [ref.status for ref in followups if ref.stage == "publish_observe"]
+    if not states:
+        return None
+    return _PUBLISH_STATES.get(states[-1], "in_progress")
+
+
+def pending_action_item(row: Mapping[str, Any], followups: Sequence[Any]) -> dict[str, Any]:
+    """一条待确认动作的只读投影；阶段状态如实映射，不把「已确认」说成「已生效」。"""
+    parsed = parsed_payload(row.get("payload"))
+    action_type = row["action_type"]
+    pairs = local_permission_pairs(parsed) if parsed is not None else ()
+    is_grant = action_type == PendingActionType.LOCAL_PERMISSION_GRANT.value
+    is_revoke = action_type == PendingActionType.LOCAL_PERMISSION_REVOKE.value
     return dict(
         pending_action_id=row["id"],
-        action_type=row["action_type"],
+        action_type=action_type,
         status=row["status"],
         target_open_id=row["target_open_id"],
         initiated_by_open_id=row["initiated_by_open_id"],
@@ -302,8 +483,10 @@ def pending_action_item(row: Mapping[str, Any], followups: Sequence[Any]) -> dic
         decided_by_open_id=row.get("decided_by_open_id"),
         payload=parsed,
         followups=followup_items(followups),
-        reused_count=None,
-        retained_by_galaxy=None,
+        publish_state=publish_state(followups),
+        new_count=len(pairs) if is_grant else None,
+        reused_count=(parsed or {}).get("reused_count", 0) if is_grant else None,
+        retained_by_galaxy=(parsed or {}).get("galaxy_retained") if is_revoke else None,
     )
 
 
@@ -312,3 +495,94 @@ def pending_actions_result(*, trace_id, items, single) -> dict[str, Any]:
     if single and not items:
         raise InnertestError("not_found")
     return envelope(trace_id=trace_id, actions=list(items), count=len(items))
+
+
+def prepare_code(outcome: AdminRouteOutcome) -> str:
+    """路由结论 → 工具结果码：未按管理员处理即 ``not_authorized``，拒绝键取判定码。"""
+    if not outcome.handled:
+        return "not_authorized"
+    if outcome.content_key == _REJECTED_KEY:
+        return outcome.decision_code or "rejected"
+    return _OUTCOME_CODES.get(outcome.content_key, "invalid_request")
+
+
+def prepare_result(*, trace_id, code, message, action=None, candidates=None, reused=False):
+    """准备工具的结果信封：成功时附待确认动作投影，拒绝时附路由的回复文案。"""
+    result = envelope(
+        code,
+        trace_id=trace_id,
+        state="pending" if code == "ok" else "rejected",
+        message=message,
+        pending_action_id=None if action is None else action["pending_action_id"],
+        action=action,
+        reused_pending_action=reused,
+        candidates=candidates,
+    )
+    if code == "ok":
+        result["next_action"] = "await_admin_confirmation"
+    return result
+
+
+def request_intent(name, args, *, target, metric_name=None) -> tuple[str, ...]:
+    """一次准备请求的意图摘要；``target`` 是已反查的目标（用户或覆盖 / 组编号）。"""
+    action = PREPARE_ACTION_TYPES[name].value
+    if name in PREPARE_TOOL_NAMES[:2]:
+        return (action, target)
+    reason = _reason_text(args)
+    if name == PREPARE_TOOL_NAMES[2]:
+        scope = args["company_scope"]
+        if scope.casefold() in {"all", "全部"}:
+            scope = "*"
+        return (action, target, args["position_name"], scope, reason)
+    if name == PREPARE_TOOL_NAMES[3]:
+        return (action, target, reason)
+    return (action, target, args["company_id"], metric_name or args["metric_name"], reason)
+
+
+def row_intents(row: Mapping[str, Any]) -> frozenset[tuple[str, ...]]:
+    """一条在途待确认动作可以对应的全部意图摘要（撤销有按编号与按范围两种形状）。"""
+    action, target = row["action_type"], row["target_open_id"]
+    payload = parsed_payload(row.get("payload")) or {}
+    if action == PendingActionType.LOCAL_PERMISSION_GRANT.value:
+        fields = (payload.get("position_name"), payload.get("company_scope"), payload.get("reason"))
+        return frozenset({(action, target, *fields)})
+    if action != PendingActionType.LOCAL_PERMISSION_REVOKE.value:
+        return frozenset({(action, target)})
+    reason = payload.get("reason")
+    intents = {
+        (action, payload[key], reason)
+        for key in ("override_id", "permission_group_id")
+        if payload.get(key)
+    }
+    if payload.get("company_id") and payload.get("metric_name"):
+        intents.add((action, target, payload["company_id"], payload["metric_name"], reason))
+    return frozenset(intents)
+
+
+def operation_target(pending) -> dict[str, Any]:
+    """五种写动作在运营审计账上的目标字段：种类、数量、摘要、目标用户与计数。"""
+    payload = parsed_payload(pending.payload) or {}
+    pairs = local_permission_pairs(payload)
+    ids, kind, counts = [pending.target_open_id], "user", {}
+    if pending.action_type is PendingActionType.LOCAL_PERMISSION_REVOKE:
+        ids = list(payload.get("override_ids") or [payload.get("override_id")])
+        kind = "override_group" if payload.get("permission_group_id") else "override"
+        counts = {"revoked": len(pairs)}
+        retained = payload.get("galaxy_retained")
+        if isinstance(retained, int) and not isinstance(retained, bool):
+            counts["galaxy_retained"] = retained
+    elif pending.action_type in LOCAL_PERMISSION_ACTION_TYPES:
+        counts = {"new": len(pairs), "reused": int(payload.get("reused_count") or 0)}
+    ids = [str(value) for value in ids if value]
+    return dict(
+        target_kind=kind,
+        target_count=len(ids),
+        target_digest="sha256:" + target_digest(ids),
+        target_user_id=ledger_identifier(pending.target_open_id),
+        result_counts=counts,
+    )
+
+
+def ledger_identifier(value) -> str | None:
+    """账上的标识列只收固定形状；邮箱这类原文不进账（调用方只留摘要）。"""
+    return value if isinstance(value, str) and _LEDGER_IDENTIFIER.fullmatch(value) else None
