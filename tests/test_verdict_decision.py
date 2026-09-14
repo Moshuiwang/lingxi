@@ -33,6 +33,8 @@ import time
 import unittest
 from pathlib import Path
 
+import yaml
+
 ROOT = Path(__file__).resolve().parents[1]
 SCRIPT = ROOT / "scripts/ci/verdict_decision.py"
 VERDICT_WORKFLOW = ROOT / ".github/workflows/verdict.yml"
@@ -342,6 +344,9 @@ class TokenVerificationTest(unittest.TestCase):
             with self.subTest(base_ref=base_ref):
                 result = self.check(good_claims(base_ref=base_ref))
                 self.assertEqual(result.status, vd.TOKEN_INVALID)
+                self.assertTrue(
+                    any("base_ref" in reason for reason in result.reasons), result.reasons
+                )
 
     def test_is_trusted_base_accepts_only_the_default_branch(self):
         self.assertTrue(vd.is_trusted_base("main", "main"))
@@ -873,6 +878,38 @@ def _jobs(workflow_code: str) -> list[str]:
     )
 
 
+def _contains_verdict_environment(value: object) -> bool:
+    if isinstance(value, dict):
+        environment = value.get("environment")
+        if environment == "verdict" or (
+            isinstance(environment, dict) and environment.get("name") == "verdict"
+        ):
+            return True
+        return any(_contains_verdict_environment(child) for child in value.values())
+    if isinstance(value, list):
+        return any(_contains_verdict_environment(child) for child in value)
+    return False
+
+
+def _raw_has_verdict_environment(text: str) -> bool:
+    lines = text.splitlines()
+    for index, line in enumerate(lines):
+        if re.fullmatch(r"\s*environment:\s*['\"]?verdict['\"]?\s*(?:#.*)?", line):
+            return True
+        if not re.fullmatch(r"\s*environment:\s*(?:#.*)?", line):
+            continue
+        environment_indent = len(line) - len(line.lstrip())
+        for nested in lines[index + 1 :]:
+            if not nested.strip() or nested.lstrip().startswith("#"):
+                continue
+            nested_indent = len(nested) - len(nested.lstrip())
+            if nested_indent <= environment_indent:
+                break
+            if re.fullmatch(r"\s*name:\s*['\"]?verdict['\"]?\s*(?:#.*)?", nested):
+                return True
+    return False
+
+
 def _pyproject_cryptography_pin() -> str:
     text = (ROOT / "pyproject.toml").read_text(encoding="utf-8")
     match = re.search(r'"cryptography==([0-9][0-9A-Za-z.]*)"', text)
@@ -884,6 +921,7 @@ class CodeownersShapeTest(unittest.TestCase):
     def test_verdict_ownership_is_narrow_and_covers_all_decision_files(self):
         text = (ROOT / ".github/CODEOWNERS").read_text(encoding="utf-8")
         for line in (
+            "/.github/CODEOWNERS @Moshuiwang",
             "/.github/workflows/verdict.yml @Moshuiwang",
             "/scripts/ci/verdict_decision.py @Moshuiwang",
             "/tests/test_verdict_decision.py @Moshuiwang",
@@ -922,6 +960,33 @@ class VerdictWorkflowShapeTest(unittest.TestCase):
             self.assertNotIn("面向受保护分支的 PR 触发的", text)
         self.assertIn("pull_request 事件、base 是默认分支", self.raw)
         self.assertIn("面向默认分支的 PR 触发的", ci)
+
+    def test_only_verdict_workflow_references_the_verdict_environment_and_app_secrets(self):
+        workflows = sorted((ROOT / ".github/workflows").glob("*.yml"))
+        parsed_environment_hits = []
+        raw_environment_hits = []
+        raw_by_name = {}
+        for workflow in workflows:
+            raw = workflow.read_text(encoding="utf-8")
+            raw_by_name[workflow.name] = raw
+            parsed = yaml.safe_load(raw) or {}
+            if _contains_verdict_environment(parsed):
+                parsed_environment_hits.append(workflow.name)
+            if _raw_has_verdict_environment(raw):
+                raw_environment_hits.append(workflow.name)
+
+        self.assertEqual(parsed_environment_hits, ["verdict.yml"])
+        self.assertEqual(raw_environment_hits, ["verdict.yml"])
+        for marker in (
+            "secrets.VERDICT_APP_ID",
+            "secrets.VERDICT_APP_PRIVATE_KEY",
+            "actions/create-github-app-token",
+        ):
+            with self.subTest(marker=marker):
+                self.assertEqual(
+                    [name for name, raw in raw_by_name.items() if marker in raw],
+                    ["verdict.yml"],
+                )
 
     def test_top_level_permissions_are_read_only(self):
         self.assertEqual(_top_level_block(self.text, "permissions").strip(), "contents: read")
