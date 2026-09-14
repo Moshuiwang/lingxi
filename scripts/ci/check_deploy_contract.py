@@ -57,6 +57,9 @@ SCHEDULER_CREDENTIAL_ROTATION = (
 )
 GATEWAY_CONFIG = REPOSITORY_ROOT / "src" / "lingxi" / "apps" / "gateway" / "config.py"
 WORKER_CONFIG = REPOSITORY_ROOT / "src" / "lingxi" / "apps" / "worker" / "config.py"
+QA_CORPUS_SCRIPT = REPOSITORY_ROOT / "scripts" / "ops" / "qa_corpus.py"
+#: 模型执行环境或入站入口所在的服务：问答留存语料的导出根所在卷一律不得挂给它们。
+EXPORT_ROOT_FORBIDDEN_SERVICES = ("worker", "worker-queue", "gateway")
 USER_ENVIRONMENT_ADAPTER = REPOSITORY_ROOT / "src" / "lingxi" / "adapters" / "user_environment.py"
 # Agent SDK 回合的工作目录（`ClaudeAgentOptions.cwd`，见 apps/worker/config.py 的
 # `workspace` 与 adapters/claude_agent_session.py 的 `build_agent_options`）。
@@ -792,6 +795,166 @@ def check_content_capture_prod_guard() -> list[str]:
     return failures
 
 
+def check_qa_corpus_declaration() -> list[str]:
+    """问答留存语料开关（合同「数据保留与删除」第三条例外，Issue #664）的等价门禁。
+
+    这条通道**只在预发与生产开**，开关值写死在两份环境 compose 的 ``worker-queue``
+    ``environment:`` 块里——compose 的 ``environment:`` 覆盖 ``env_file``，抄 env 文件既开
+    不了也关不了，因此不需要内测采集那样的第二确认变量；等价的机械保证由本检查承担：
+
+    1. ``compose.stage.yaml`` 与 ``compose.prod.yaml`` 的 ``worker-queue`` 必须在
+       ``environment:`` 里声明该变量，值精确 ``"1"``、不得是 ``${}`` 插值——插值的默认值
+       与外部 env 文件一样可抄，会把「生产升级后开始写入」变回一个看部署者心情的事实。
+    2. 变量名不得出现在 ``compose.yaml`` / ``compose.innertest.yaml``（基线与内测覆盖不
+       该替环境做这个决定），也不得出现在两份环境 compose 的其它 service 块（一次性
+       ``worker`` job 走 turn 模式、没有任务标识，写了也是误导）。
+    3. ``deploy/.env.example`` 不得出现该变量的赋值行，只许注释说明「此项在 compose
+       声明」——示范一个不会生效的赋值就是在教人配错。
+    4. ``deploy/验收前部署配置清单.md`` 须登记。
+    """
+
+    variable = module_constant(WORKER_CONFIG, "QA_CORPUS_RETENTION_VAR")
+    if not variable:
+        return [
+            "读不到 apps/worker/config.py 的 QA_CORPUS_RETENTION_VAR（常量被重命名或改写成"
+            "非字面量赋值时，check_qa_corpus_declaration 需要同步更新）"
+        ]
+
+    failures: list[str] = []
+    for path in (COMPOSE_STAGE, COMPOSE_PROD):
+        text = strip_comments(read(path))
+        block = service_block(text, "worker-queue")
+        if block is None:
+            failures.append(f"{display(path)} 找不到 service `worker-queue`")
+            continue
+        declared = _environment_value(block, variable)
+        if declared is None:
+            failures.append(
+                f"{display(path)} 的 `worker-queue` 没有在 `environment:` 里声明 `{variable}`。"
+                "问答留存语料只靠这条入库声明开启；写进外部 env 文件不算——compose 的 "
+                "environment 覆盖 env_file，抄来的值既开不了也关不了。"
+            )
+        elif "${" in declared or declared.strip("\"'") != "1":
+            failures.append(
+                f"{display(path)} 的 `worker-queue` 声明 `{variable}: {declared}`，"
+                '值必须是精确的 "1" 字面量（不得用 ${} 插值）。apps/worker/config.py 只接受'
+                ' "1"，其它值启动即失败；插值等于把开关交回可抄的外部文件。'
+            )
+        if text.count(variable) > block.count(variable):
+            failures.append(
+                f"{display(path)} 在 `worker-queue` 之外也出现了 `{variable}`：只有常驻队列"
+                "消费者处理带任务标识的真实问数，别的 service 块写它只会误导。"
+            )
+
+    for path in (COMPOSE_BASE, COMPOSE_INNERTEST):
+        if variable in strip_comments(read(path)):
+            failures.append(
+                f"{display(path)} 中出现 {variable!r}：开关只在两份环境 compose 的 worker-queue "
+                "块声明，基线与内测覆盖文件不得替环境做这个决定。"
+            )
+
+    env_text = read(ENV_EXAMPLE)
+    if re.search(rf"^\s*{re.escape(variable)}=", env_text, re.MULTILINE):
+        failures.append(
+            f"deploy/.env.example 出现了 {variable} 的赋值行：这个值由 compose 的 environment "
+            "块声明，写进 env 文件不会生效，示范一个不生效的赋值就是在教人配错。"
+        )
+    elif variable not in env_text:
+        failures.append(
+            f"deploy/.env.example 没有提到 {variable}：至少要有一行注释说明它在 compose 声明、"
+            "不从 env 文件读，否则运维不知道这个开关存在。"
+        )
+
+    if variable not in read(DEPLOY_CHECKLIST):
+        failures.append(
+            f"deploy/验收前部署配置清单.md 未登记 {variable}：按本文件既有惯例，新增的配置项"
+            "须登记在清单里，说明它由哪里给值、缺失时行为如何。"
+        )
+    return failures
+
+
+def check_qa_corpus_export_root() -> list[str]:
+    """问答留存语料导出物「落地即受控」的机械保证（Issue #664）。
+
+    ``scripts/ops/qa_corpus.py export`` 只把文件写到环境变量 ``LINGXI_QA_CORPUS_EXPORT_ROOT``
+    指向的目录正下方；这个变量由基线 compose 在 scheduler 的 ``environment:`` 块声明，值必须：
+
+    1. 是字面量绝对路径，值里不得有任何 ``$``——``${VAR}`` 与 ``$VAR`` 都是 compose 插值，
+       插值等于把导出根交回可抄的外部文件；
+    2. 落在 scheduler 某个**具名持久卷**的挂载点之下且该挂载可写——容器本地路径随镜像替换
+       消失，绑定挂载的宿主目录权限不由本仓库控制；
+    3. 那个卷在四份 compose 里都不得挂给 ``worker`` / ``worker-queue`` / ``gateway``——前两者
+       是模型执行环境，后者是入站入口，导出的明文语料一旦被它们看见就不再受控；
+    4. 变量名在四份 compose 里只许出现基线 scheduler 块那一处：环境覆盖文件（stage / prod /
+       innertest）的任何 service 块都不得再声明它——compose 覆盖文件的同名键会替换基线的值，
+       只查基线等于让覆盖文件把导出根改到卷外；``deploy/.env.example`` 不得有赋值行。
+    """
+
+    variable = module_constant(QA_CORPUS_SCRIPT, "EXPORT_ROOT_VAR")
+    if not variable:
+        return [
+            "读不到 scripts/ops/qa_corpus.py 的 EXPORT_ROOT_VAR（常量被重命名或改写时同步本检查）"
+        ]
+    failures: list[str] = []
+    base = strip_comments(read(COMPOSE_BASE))
+    scheduler = service_block(base, "scheduler")
+    if scheduler is None:
+        return [f"{display(COMPOSE_BASE)} 找不到 service `scheduler`"]
+    declared = _environment_value(scheduler, variable)
+    if declared is None:
+        return [f"{display(COMPOSE_BASE)} 的 scheduler 没有在 `environment:` 里声明 `{variable}`"]
+    root = declared.strip("\"'")
+    if "$" in root or not root.startswith("/"):
+        failures.append(
+            f"`{variable}: {declared}` 必须是字面量绝对路径，不得含 `$`（${{VAR}} 与 $VAR 都是"
+            "插值）或写成相对路径"
+        )
+    if base.count(variable) != 1:
+        failures.append(
+            f"{display(COMPOSE_BASE)} 出现了 {base.count(variable)} 处 `{variable}`：只许 scheduler "
+            "的 environment 块声明一次，别处再写一份就分不清哪一份生效"
+        )
+    for path in (COMPOSE_STAGE, COMPOSE_PROD, COMPOSE_INNERTEST):
+        if variable in strip_comments(read(path)):
+            failures.append(
+                f"{display(path)} 出现了 `{variable}`：导出根只由基线 compose 的 scheduler 块声明，"
+                "覆盖文件的同名键会替换基线的值，任何 service 块都不得再声明它"
+            )
+    volume = next(
+        (
+            (source, mode)
+            for source, target, mode in _volume_mounts(scheduler)
+            if root.startswith(target.rstrip("/") + "/") and re.fullmatch(r"[\w-]+", source)
+        ),
+        None,
+    )
+    if volume is None:
+        failures.append(f"导出根 `{root}` 不在 scheduler 任何具名持久卷的挂载点之下")
+        return failures
+    source, mode = volume
+    if mode == "ro":
+        failures.append(f"导出根所在卷 `{source}` 在 scheduler 上挂成了只读，导出写不进去")
+    for path in (COMPOSE_BASE, COMPOSE_STAGE, COMPOSE_PROD, COMPOSE_INNERTEST):
+        text = strip_comments(read(path))
+        for service in EXPORT_ROOT_FORBIDDEN_SERVICES:
+            block = service_block(text, service) or ""
+            if any(mounted == source for mounted, _target, _mode in _volume_mounts(block)):
+                failures.append(
+                    f"{display(path)} 把导出根所在卷 `{source}` 挂给了 `{service}`：模型执行环境"
+                    "或入站入口一旦能看到导出的明文语料，「落地即受控」就不成立"
+                )
+            if variable in block:
+                failures.append(
+                    f"{display(path)} 的 `{service}` 块出现了 `{variable}`：只有 scheduler 导出"
+                )
+    if re.search(rf"^\s*{re.escape(variable)}=", read(ENV_EXAMPLE), re.MULTILINE):
+        failures.append(
+            f"deploy/.env.example 出现了 {variable} 的赋值行：导出根由 compose 的 environment "
+            "块声明，写进 env 文件不会生效，示范一个不生效的赋值就是在教人配错"
+        )
+    return failures
+
+
 def _volume_mounts(service_text: str) -> list[tuple[str, str, str | None]]:
     """解析某个 service 块下 ``volumes:`` 列表的每一项，返回
     ``(source, target, mode)`` 三元组列表；``mode`` 是 ``:ro``/``:rw`` 这类第三段
@@ -1464,6 +1627,93 @@ def check_compose_interpolation_is_yaml_safe() -> list[str]:
             "那条渲染门禁不读 deploy/.env.prod，缺一个就整段渲染不出来——"
             "而它只在最晚的 `Epic Full / image` 作业里跑（PR #506 实测）。"
         )
+    return failures
+
+
+# ---- compose 文件不得使用 YAML 锚点 / 别名 / 合并键 ---------------------------
+# 本文件的每一条 compose 门禁（service_block、_environment_value、按块 count……）
+# 都按**文本块**判定，不做完整 YAML 解析。锚点 + 别名会让「文本写在哪个块」与
+# 「值在哪个块生效」分离：在一个 service 的 `x-` 扩展映射里用 `&开关` 定义值，在
+# 另一个 service 用 `<<: *开关` 合并进去——逐块计数的门禁只看见前者，后者那份生效
+# 的声明对它不可见。与其把每条门禁改成 YAML 解析，不如在源头禁掉这三种语法：
+# 本仓四份 compose 从未需要它们。注释与引号内的 `&` / `*` / `<<:` 不算。
+#: 锚点 `&名`、别名 `*名` 只在**节点起始处**出现：行首缩进之后、`键: ` 之后、`- ` 之后、
+#: 流式 `[` `{` `,` 之后；纯量中间的 `2>&1`、`a*b`、`ls *.log` 都不是。合并键 `<<:` 同样
+#: 只在键位置出现。名字按规范取非空白、非流式指示符的任意字符。
+_YAML_ANCHOR_ALIAS_OR_MERGE = re.compile(
+    r"(?:^\s*|:\s+|-\s+|[\[{,]\s*)((?:[&*][^\s\[\]{},]+)|<<\s*:)"
+)
+_YAML_BLOCK_SCALAR_HEADER = re.compile(r"(?:^|:|-)\s*[|>](?:[+-]?[0-9]?|[0-9]?[+-]?)\s*$")
+
+
+def _yaml_code_only(line: str) -> str:
+    """去掉一行 YAML 里的注释与引号内容，只留会被解析成结构的部分。
+
+    引号只在纯量起始处（行首、空白、`[` `{` `,` 之后）才开引号——`it's` 里的撇号是
+    字面量；`#` 只在行首或紧跟空白时才开注释。单引号里 `''`、双引号里 `\\"` 是转义。
+    """
+
+    kept: list[str] = []
+    quote: str | None = None
+    index = 0
+    while index < len(line):
+        character = line[index]
+        if quote is not None:
+            if character == "\\" and quote == '"':
+                index += 2
+                continue
+            if character == quote:
+                if quote == "'" and line[index + 1 : index + 2] == "'":
+                    index += 2
+                    continue
+                quote = None
+            index += 1
+            continue
+        at_scalar_start = index == 0 or line[index - 1] in " \t[{,"
+        if character in "'\"" and at_scalar_start:
+            quote = character
+        elif character == "#" and (index == 0 or line[index - 1] in " \t"):
+            break
+        else:
+            kept.append(character)
+        index += 1
+    return "".join(kept)
+
+
+def _yaml_structural_lines(text: str):
+    """逐行产出 (行号, 去掉注释与引号内容后的文本)，跳过块标量（`|` / `>`）的正文行。"""
+
+    block_indent: int | None = None
+    for number, raw in enumerate(text.splitlines(), start=1):
+        indent = len(raw) - len(raw.lstrip())
+        if block_indent is not None:
+            if not raw.strip() or indent > block_indent:
+                continue
+            block_indent = None
+        code = _yaml_code_only(raw)
+        if _YAML_BLOCK_SCALAR_HEADER.search(code):
+            block_indent = indent
+        yield number, code
+
+
+def check_compose_has_no_yaml_anchors() -> list[str]:
+    """四份 compose 文件不得出现 YAML 锚点（`&名`）、别名（`*名`）与合并键（`<<:`）。
+
+    理由见本段头注：本文件所有 compose 门禁按文本块计数，别名会让文本位置与生效
+    位置分离，逐块判定的门禁看不见经别名合并进去的那份声明。
+    """
+
+    failures: list[str] = []
+    for path in (COMPOSE_BASE, COMPOSE_STAGE, COMPOSE_PROD, COMPOSE_INNERTEST):
+        for number, code in _yaml_structural_lines(read(path)):
+            match = _YAML_ANCHOR_ALIAS_OR_MERGE.search(code)
+            if match:
+                failures.append(
+                    f"{display(path)}:{number} 使用了 YAML 锚点 / 别名 / 合并键 "
+                    f"`{match.group(1)}`：本仓 compose 门禁按文本块计数，别名会让"
+                    "「文本写在哪个 service 块」与「值在哪个 service 生效」分离，逐块判定的"
+                    "门禁看不见经别名合并进去的声明；请把值直接写在生效的那个 service 块里"
+                )
     return failures
 
 
@@ -2363,12 +2613,15 @@ def main() -> int:
         ("闸⑤配置项 .env.example 示范覆盖", check_onboarding_gate_env_example),
         ("内测轮内容级采集正式环境防护", check_content_capture_prod_guard),
         ("生产覆盖声明部署环境", check_prod_declares_deploy_environment),
+        ("问答留存语料开关只由环境 compose 声明", check_qa_corpus_declaration),
+        ("问答留存语料导出根落在 scheduler 专属持久卷内", check_qa_corpus_export_root),
         ("scheduler 用户环境卷挂载", check_scheduler_user_volume),
         ("worker-queue 工作目录与用户目录隔离", check_worker_workspace_isolation),
         ("六服务资源限制结构", check_resource_limits),
         ("受限内测入口装配覆盖文件", check_innertest_compose_overlay),
         ("worker-queue /tmp 内存盘上限分环境显式", check_worker_tmpfs_capacity),
         ("compose 插值占位符 YAML 安全与渲染可行", check_compose_interpolation_is_yaml_safe),
+        ("compose 文件不用 YAML 锚点 / 别名 / 合并键", check_compose_has_no_yaml_anchors),
         ("日志留存下限", check_log_retention_floor),
         ("Compose 部署契约", check_compose_contract),
         ("Dockerfile 契约", check_dockerfile),

@@ -2439,5 +2439,252 @@ class ContentCaptureProdGuardTest(unittest.TestCase):
         self.assertTrue(any("验收前部署配置清单.md" in f for f in failures), failures)
 
 
+class QaCorpusDeclarationTest(unittest.TestCase):
+    """``check_qa_corpus_declaration``（Issue #664）：问答留存语料开关只由两份环境 compose
+    的 worker-queue 块声明精确 "1"，别处一律不得出现，.env.example 只许注释。
+    """
+
+    STAGE = 'worker-queue:\n  environment:\n    LINGXI_QA_CORPUS_RETENTION: "1"\n'
+    PROD = (
+        "worker:\n"
+        "  environment:\n"
+        '    LINGXI_DEPLOY_ENVIRONMENT: "prod"\n'
+        "worker-queue:\n"
+        "  environment:\n"
+        '    LINGXI_DEPLOY_ENVIRONMENT: "prod"\n'
+        '    LINGXI_QA_CORPUS_RETENTION: "1"\n'
+    )
+    ENV_EXAMPLE = (
+        "# 文件五：deploy/.env.stage.worker-queue —— 常驻队列消费者\n"
+        "LINGXI_POSTGRES_DSN=postgresql://x\n"
+        "# LINGXI_QA_CORPUS_RETENTION 不在这份文件里配：由 compose 的 environment 块声明\n"
+        "# ===========================================================================\n"
+        "# 文件六：deploy/.env.stage.migrate\n"
+    )
+
+    def _run(
+        self,
+        *,
+        base: str = "",
+        stage: str | None = None,
+        prod: str | None = None,
+        innertest: str = "",
+        env_example: str | None = None,
+        checklist: str = "登记：LINGXI_QA_CORPUS_RETENTION 由 compose 声明。",
+    ) -> list[str]:
+        directory = Path(self.enterContext(__import__("tempfile").TemporaryDirectory()))
+        paths = {}
+        for name, body in (
+            ("compose.yaml", base),
+            ("compose.stage.yaml", self.STAGE if stage is None else stage),
+            ("compose.prod.yaml", self.PROD if prod is None else prod),
+            ("compose.innertest.yaml", innertest),
+        ):
+            path = directory / name
+            path.write_text(
+                f"services:\n{textwrap.indent(textwrap.dedent(body), '  ')}", encoding="utf-8"
+            )
+            paths[name] = path
+        env_path = directory / ".env.example"
+        env_path.write_text(self.ENV_EXAMPLE if env_example is None else env_example, "utf-8")
+        checklist_path = directory / "checklist.md"
+        checklist_path.write_text(checklist, encoding="utf-8")
+        originals = (
+            CONTRACT.COMPOSE_BASE,
+            CONTRACT.COMPOSE_STAGE,
+            CONTRACT.COMPOSE_PROD,
+            CONTRACT.COMPOSE_INNERTEST,
+            CONTRACT.ENV_EXAMPLE,
+            CONTRACT.DEPLOY_CHECKLIST,
+        )
+        CONTRACT.COMPOSE_BASE = paths["compose.yaml"]
+        CONTRACT.COMPOSE_STAGE = paths["compose.stage.yaml"]
+        CONTRACT.COMPOSE_PROD = paths["compose.prod.yaml"]
+        CONTRACT.COMPOSE_INNERTEST = paths["compose.innertest.yaml"]
+        CONTRACT.ENV_EXAMPLE = env_path
+        CONTRACT.DEPLOY_CHECKLIST = checklist_path
+        try:
+            return CONTRACT.check_qa_corpus_declaration()
+        finally:
+            (
+                CONTRACT.COMPOSE_BASE,
+                CONTRACT.COMPOSE_STAGE,
+                CONTRACT.COMPOSE_PROD,
+                CONTRACT.COMPOSE_INNERTEST,
+                CONTRACT.ENV_EXAMPLE,
+                CONTRACT.DEPLOY_CHECKLIST,
+            ) = originals
+
+    def test_real_repository_state_passes(self) -> None:
+        """真实仓库状态必须通过——防止本检查因为文件结构变化而变成空转。"""
+
+        self.assertEqual(CONTRACT.check_qa_corpus_declaration(), [])
+
+    def test_a_clean_declared_set_passes(self) -> None:
+        self.assertEqual(self._run(), [])
+
+    def test_removing_the_prod_declaration_is_caught(self) -> None:
+        """变异验红 ①：把生产的声明删掉——生产升级后就不会开始写入。"""
+
+        failures = self._run(prod=self.PROD.replace('    LINGXI_QA_CORPUS_RETENTION: "1"\n', ""))
+
+        self.assertTrue(
+            any("compose.prod.yaml" in f and "没有在 `environment:` 里声明" in f for f in failures),
+            failures,
+        )
+
+    def test_the_variable_written_into_the_base_compose_is_caught(self) -> None:
+        """变异验红 ②：写进 compose.yaml——dev / CI 都会跟着开，环境决定被基线替做了。"""
+
+        failures = self._run(
+            base='worker-queue:\n  environment:\n    LINGXI_QA_CORPUS_RETENTION: "1"\n'
+        )
+
+        self.assertTrue(any("compose.yaml" in f and "基线" in f for f in failures), failures)
+
+    def test_an_assignment_line_in_env_example_is_caught(self) -> None:
+        """变异验红 ③：.env.example 示范一个赋值行——写进 env 文件不会生效，等于教人配错。"""
+
+        failures = self._run(
+            env_example=self.ENV_EXAMPLE.replace(
+                "# LINGXI_QA_CORPUS_RETENTION 不在这份文件里配：由 compose 的 environment 块声明\n",
+                "LINGXI_QA_CORPUS_RETENTION=1\n",
+            )
+        )
+
+        self.assertTrue(any(".env.example" in f and "赋值行" in f for f in failures), failures)
+
+    def test_an_interpolated_or_non_one_value_is_caught(self) -> None:
+        for value in ('"${LINGXI_QA_CORPUS_RETENTION:-1}"', '"true"', '"0"'):
+            with self.subTest(value=value):
+                failures = self._run(
+                    stage=f"worker-queue:\n  environment:\n    LINGXI_QA_CORPUS_RETENTION: {value}\n"
+                )
+                self.assertTrue(
+                    any("compose.stage.yaml" in f and '精确的 "1"' in f for f in failures), failures
+                )
+
+    def test_a_declaration_on_another_service_block_is_caught(self) -> None:
+        failures = self._run(
+            prod=self.PROD.replace(
+                '    LINGXI_DEPLOY_ENVIRONMENT: "prod"\nworker-queue',
+                '    LINGXI_DEPLOY_ENVIRONMENT: "prod"\n    LINGXI_QA_CORPUS_RETENTION: "1"\nworker-queue',
+                1,
+            )
+        )
+
+        self.assertTrue(any("之外也出现了" in f for f in failures), failures)
+
+    def test_missing_env_example_mention_and_checklist_entry_are_caught(self) -> None:
+        failures = self._run(
+            env_example="# 文件五：什么都没提\n", checklist="这份清单没有登记语料开关。"
+        )
+
+        self.assertTrue(any(".env.example 没有提到" in f for f in failures), failures)
+        self.assertTrue(any("验收前部署配置清单.md" in f for f in failures), failures)
+
+    def test_an_anchor_defined_switch_merged_into_another_service_is_caught_by_the_anchor_gate(
+        self,
+    ) -> None:
+        """锚点绕过：在 worker-queue 的 x- 扩展映射里定义开关、别的 service 用 <<: 合并进去。
+
+        按块计数的 check_qa_corpus_declaration 只看见 worker-queue 那一处、判绿；仓库级的
+        锚点断言（ComposeYamlAnchorTest）负责把这种写法整体拒掉。
+        """
+
+        prod = (
+            "worker:\n"
+            "  <<: *corpus\n"
+            "worker-queue:\n"
+            "  x-corpus: &corpus\n"
+            "    environment:\n"
+            '      LINGXI_DEPLOY_ENVIRONMENT: "prod"\n'
+            '      LINGXI_QA_CORPUS_RETENTION: "1"\n'
+            "  environment:\n"
+            '    LINGXI_DEPLOY_ENVIRONMENT: "prod"\n'
+            '    LINGXI_QA_CORPUS_RETENTION: "1"\n'
+        )
+        directory = Path(self.enterContext(__import__("tempfile").TemporaryDirectory()))
+        path = directory / "compose.prod.yaml"
+        path.write_text(f"services:\n{textwrap.indent(prod, '  ')}", encoding="utf-8")
+        original = CONTRACT.COMPOSE_PROD
+        CONTRACT.COMPOSE_PROD = path
+        try:
+            failures = CONTRACT.check_compose_has_no_yaml_anchors()
+        finally:
+            CONTRACT.COMPOSE_PROD = original
+        self.assertEqual(len([f for f in failures if "compose.prod.yaml" in f]), 2, failures)
+        self.assertTrue(any("`&corpus`" in f for f in failures), failures)
+        self.assertTrue(any("`<<:`" in f for f in failures), failures)
+
+
+class ComposeYamlAnchorTest(unittest.TestCase):
+    """``check_compose_has_no_yaml_anchors``：四份 compose 一律不得用锚点 / 别名 / 合并键。
+
+    本文件所有 compose 门禁按文本块计数，别名会让文本位置与生效位置分离；注释与引号内
+    的 ``&`` / ``*`` / ``<<:`` 不算，块标量（``|`` / ``>``）正文也不算。
+    """
+
+    CLEAN = (
+        "services:\n"
+        "  scheduler:\n"
+        "    image: ghcr.io/x/y:1  # 注释里的 &anchor 与 *alias 不算\n"
+        "    command: sh -c 'run 2>&1 && ls *.log'\n"
+        '    environment:\n      CRON: "*/5 * * * *"\n'
+        "    healthcheck:\n      test: >\n        &not *an <<: anchor\n"
+        "  gateway:\n    image: ghcr.io/x/y:1\n"
+    )
+
+    def _run(self, **bodies: str) -> list[str]:
+        directory = Path(self.enterContext(__import__("tempfile").TemporaryDirectory()))
+        names = ("COMPOSE_BASE", "COMPOSE_STAGE", "COMPOSE_PROD", "COMPOSE_INNERTEST")
+        files = {
+            "COMPOSE_BASE": "compose.yaml",
+            "COMPOSE_STAGE": "compose.stage.yaml",
+            "COMPOSE_PROD": "compose.prod.yaml",
+            "COMPOSE_INNERTEST": "compose.innertest.yaml",
+        }
+        originals = {name: getattr(CONTRACT, name) for name in names}
+        try:
+            for name in names:
+                path = directory / files[name]
+                path.write_text(bodies.get(name, self.CLEAN), encoding="utf-8")
+                setattr(CONTRACT, name, path)
+            return CONTRACT.check_compose_has_no_yaml_anchors()
+        finally:
+            for name, value in originals.items():
+                setattr(CONTRACT, name, value)
+
+    def test_real_repository_state_passes(self) -> None:
+        self.assertEqual(CONTRACT.check_compose_has_no_yaml_anchors(), [])
+
+    def test_comments_quotes_block_scalars_and_plain_text_are_not_anchors(self) -> None:
+        self.assertEqual(self._run(), [])
+
+    def test_a_merge_key_added_anywhere_is_caught(self) -> None:
+        """变异验红：加一处 `<<: *x` → 红。"""
+
+        for name in ("COMPOSE_BASE", "COMPOSE_STAGE", "COMPOSE_PROD", "COMPOSE_INNERTEST"):
+            with self.subTest(file=name):
+                failures = self._run(**{name: self.CLEAN + "  worker:\n    <<: *x\n"})
+                self.assertEqual(len(failures), 1, failures)
+                self.assertIn("`<<:`", failures[0])
+                self.assertIn(":13 ", failures[0])
+
+    def test_anchors_and_aliases_in_block_and_flow_positions_are_caught(self) -> None:
+        for line, token in (
+            ("    x-env: &shared\n", "&shared"),
+            ("    environment: *shared\n", "*shared"),
+            ("    - *shared\n", "*shared"),
+            ("    args: [*a, b]\n", "*a"),
+            ("    args: {<<: *a}\n", "<<:"),
+            ("    <<:  *a\n", "<<:"),
+        ):
+            with self.subTest(line=line):
+                failures = self._run(COMPOSE_PROD=self.CLEAN + "  worker:\n" + line)
+                self.assertEqual(len(failures), 1, failures)
+                self.assertIn(f"`{token}`", failures[0])
+
+
 if __name__ == "__main__":
     unittest.main()

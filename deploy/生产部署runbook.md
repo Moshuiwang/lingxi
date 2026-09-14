@@ -725,6 +725,33 @@ docker compose --env-file deploy/.env.prod \
 | 4 | `--initiated-by` 是生效管理员 | 由 ① dry-run 自查（不是则退出 2、零写入） | dry-run 正常打印清单与计数 |
 | 5 | 专用授权令牌不在 5 分钟续期间隔内（§12.2） | scheduler 日志最近一条「专用授权续期成功」的时刻 | 距今 ≥ 5 分钟 |
 
+### 12.4 审计回读：运营审计账 `operation_audit`（Issue #675 补入）
+
+每次 `--apply` 在运营审计账上留下同一操作号的三类行：执行前一行「已准备」（`prepared`，
+管理员闸之后、装配之前写；**写不进去脚本退出码 2、一个人都不执行**），逐人一行「已执行」
+（`executed`，结果码 `provisioned` / `skipped:<原因码>` / `failed_<异常类型名>` /
+`already_active_grant_not_applied`，证据指向该人的追溯号），末尾一行运行汇总（结果码
+`completed` / `partial`，计数 成功 / 跳过 / 失败 / 已开通未应用 / 未记账 / 总数）。操作号
+（`opr_…`）在脚本输出里「本次操作号」一行；逐人行或汇总写失败**不改任何人的结局**，脚本
+退出码 3 并说明「清单是完整结果、不要据此重跑」。回读只打印阶段、入口、身份、结果码与计数，
+不落文件、账里本来也没有邮箱与正文：
+
+```bash
+docker compose --env-file deploy/.env.prod \
+  -f deploy/compose.yaml -f deploy/compose.prod.yaml \
+  exec -T scheduler python -B - <操作号> <<'EOF'
+import os, sys
+from lingxi.adapters.postgres_operation_audit import PostgresOperationAudit
+for row in PostgresOperationAudit(os.environ["LINGXI_POSTGRES_DSN"]).for_operation(sys.argv[1]):
+    entry = row.entry
+    print(
+        row.created_at.isoformat(timespec="seconds"), entry.phase.value, entry.entry_point.value,
+        "发起", entry.initiated_by, "确认", entry.decided_by or "-",
+        "结果", entry.result_code or "-", dict(entry.result_counts) or "",
+    )
+EOF
+```
+
 ## 十三、#586 主动告知（欢迎卡）执行姿势（生产；体验批 Trace #606 补入）
 
 > **前提与去留**：本节只在「产品负责人裁定本次窗口要主动告知已开通的人」时执行，执行时点在 §十二
@@ -801,6 +828,13 @@ docker compose --env-file deploy/.env.prod \
 - **幂等**：同一份名单重跑**零新增发送**（已 `delivered` 的人直接跳过）。因此「不确定上次跑到哪里」
   时的正确动作是原样重跑，不是挑人重发。
 - **`--list` 不需要名单**，也不发送任何东西；清单本身不落库，需要留档请自行保存输出。
+- **审计回读（运营审计账 `operation_audit`，Issue #675 补入）**：`--precheck` 与 `--apply` 两档各自
+  在账上留下同一操作号（即脚本输出「操作号」一行的本次运行号 `prk_…`）的三类行：收件人闸门之后、
+  出站口构造之前一行「已准备」（**写不进去退出码 2、零发送**）；逐人一行「已执行」（结果码
+  `delivered` / `already_delivered` / `skipped:<原因码>` / `failed…` / `unknown…` /
+  `delivered_not_recorded`，证据指向 `outreach_message` 的去重键，不带邮箱、姓名与正文）；末尾一行
+  运行汇总。逐人行或汇总写失败不改任何人的结局，退出码 3 并说明「清单是完整结果、不要据此重跑」。
+  dry-run 与 `--list` 一行都不写。回读命令与 §12.4 同一段脚本，只把 `<操作号>` 换成 `prk_…`。
 
 ## 十四、扩充预开通人员的完整步骤（生产；体验批 Trace #606 补入）
 
@@ -885,6 +919,19 @@ dry-run 打印的条数与这张表对不上，说明职位列命中的键跟预
 
 判读要点：写筛选条件之前先问一句「谁会意外满足这组条件」。答不上来就改成白名单。
 
+### 14.8 审计回读：内测扩员在运营审计账上的四类行（Issue #675 补入）
+
+经受限入口准备的每一批扩员，以**批次号**（`ibt_…`，工具回执里的 `batch_id`）为操作号在
+`operation_audit` 上留行：准备时一行「已准备」（入口 `restricted_channel`，带人数与目标摘要）；
+本人点击确认卡后一行「已确认」（入口 `feishu_card`，`decided_by` 是点击者本人）或「已取消」；
+过期、资料漂移、授权变化这些明确拒绝一行「已拒绝」（结果码 `expired` / `failed`）；随后
+scheduler 后台两个阶段逐人各一行「已执行」（入口 `scheduler_followup`，结果码
+`succeeded:completed` / `succeeded:check_passed` / `failed:<原因码>`，证据分别指向
+`admin_action_followup` 与 `innertest_check` 的记录）。准备、确认、取消、拒绝四类行与批次
+状态同一事务提交——账写不进去整笔回滚、批次不成立；后台阶段的逐人行写失败只记一条
+`operation_audit.write_failed` 日志，阶段结果不变。扩员专用窄表 `innertest_audit` 照旧
+双写，不删。回读命令与 §12.4 同一段脚本，`<操作号>` 换成批次号 `ibt_…`。
+
 ## 十五、受限内测入口装配点（默认关闭的可选覆盖）
 
 这一节说明怎么打开 `deploy/compose.innertest.yaml`——一份默认不生效的可选覆盖文件，
@@ -947,3 +994,79 @@ docker compose --env-file deploy/.env.prod \
 - 没注册：`未配置 LINGXI_INNERTEST_SCOPE：不注册受限管理入口，…（不阻止启动）`
 
 读不到其中任何一句，说明 scheduler 根本没走到这段装配，先查它是不是起来了。
+
+## 十六、#664 问答留存语料：读取 / 检索 / 导出脚本姿势与纪律（生产；Trace #770 批次 3 补入）
+
+> **证据边界如实**：本节的姿势只有本机用例证据（无库 + 一次性真库容器），**预发与生产都还没有
+> 跑过**；生产升级到含迁移 `0098` 的版本之后 `qa_corpus` 才开始有行。读取权不随管理员身份自动
+> 获得——`read` / `export` 只认 `qa_corpus_reader` 登记表里生效的读取者，管理员要读也得先给
+> 自己 `grant`。
+
+姿势与 §十二、§十三 同构（脚本本体经 stdin 执行、容器内不落脚本文件），子命令与参数写在 `-` 之后。
+`<管理员>` 是一位登记在案且当前有效的管理员 `open_id`（`grant` / `revoke` 的发起人闸），`<读取者>`
+是已被 `grant` 的读取者 `open_id`（`read` / `export` 的发起人闸；本人不要求是管理员）：
+
+```bash
+cd /home/bi-ai-deploy/projects/lingxi
+
+# ① 授予读取角色（幂等：已生效就原样返回，不重复登记；每次各留一行审计）
+docker compose --env-file deploy/.env.prod \
+  -f deploy/compose.yaml -f deploy/compose.prod.yaml \
+  exec -T scheduler python -B - --initiated-by <管理员> \
+    grant --open-id <读取者> --label corpus-reader \
+  < scripts/ops/qa_corpus.py
+
+# ② 读取：按人 / 时间窗（含起不含止，不带时区按 UTC）/ 关键词至少给一项；默认 20 行、硬顶 200
+docker compose --env-file deploy/.env.prod \
+  -f deploy/compose.yaml -f deploy/compose.prod.yaml \
+  exec -T scheduler python -B - --initiated-by <读取者> \
+    read --open-id <某用户 open_id> --since 2026-09-01 --until 2026-09-08 --limit 20 \
+  < scripts/ops/qa_corpus.py
+
+# ③ 导出：同一组过滤条件，全部命中行写成 JSON 行文件；--out 只能是文件名
+docker compose --env-file deploy/.env.prod \
+  -f deploy/compose.yaml -f deploy/compose.prod.yaml \
+  exec -T scheduler python -B - --initiated-by <读取者> \
+    export --keyword <关键词> --out 20260914-<主题>.jsonl \
+  < scripts/ops/qa_corpus.py
+
+# ④ 容量：行数与表总字节数，不含正文、不留审计（读取者或管理员都可看）
+docker compose --env-file deploy/.env.prod \
+  -f deploy/compose.yaml -f deploy/compose.prod.yaml \
+  exec -T scheduler python -B - --initiated-by <管理员> stats \
+  < scripts/ops/qa_corpus.py
+
+# ⑤ 撤销读取角色（之后该人 read / export 立即被拒）
+docker compose --env-file deploy/.env.prod \
+  -f deploy/compose.yaml -f deploy/compose.prod.yaml \
+  exec -T scheduler python -B - --initiated-by <管理员> revoke --open-id <读取者> \
+  < scripts/ops/qa_corpus.py
+```
+
+判读与纪律：
+
+- **`read` 会把明文正文（问题、用户实收正文、模型原文、工具调用）打印到标准输出**。不要在有落盘
+  记录的会话里跑（`script`、终端录制、tmux 日志、CI、任何会把输出存起来的地方）；要留档走 `export`。
+  标准输出不是导出通道。
+- **顺序是失败关闭的**：鉴权 → 查询 →（导出：写文件 → 算摘要）→ 审计行提交 → 才输出 / 保留文件。
+  发起人不是生效读取者时结构上没有一条语料查询发生，输出只有固定文案；审计行写不进去时 `read`
+  一行都不打印、`export` 删掉刚写的文件，退出码 `3`。
+- **导出物落地即受控**：文件只能落在 `LINGXI_QA_CORPUS_EXPORT_ROOT` 指向的目录正下方（生产
+  为凭据持久卷内的 `/var/lib/lingxi/credentials/qa-corpus-exports`，目录 `0700`、文件 `0600`，
+  `O_CREAT|O_EXCL|O_NOFOLLOW` 新建：已存在、是符号链接、带路径分隔符或 `..` 一律拒绝）。这个卷
+  只有 scheduler（与一次性 `reauthorize` 作业）挂载、worker 与 gateway 看不到，由
+  `scripts/ci/check_deploy_contract.py::check_qa_corpus_export_root` 钉住。取文件用
+  `docker compose … cp scheduler:/var/lib/lingxi/credentials/qa-corpus-exports/<文件名> <本机受控路径>`，
+  取走后**删掉容器内那份**（`exec -T scheduler rm /var/lib/lingxi/credentials/qa-corpus-exports/<文件名>`），
+  本机那份按同等纪律保管；谁取谁清。
+- **审计回读**：`read` / `export` / `grant` / `revoke` 各在运营审计账留一行「已执行」（操作名
+  `corpus.read` / `corpus.export` / `corpus.reader_grant` / `corpus.reader_revoke`），操作号即脚本输出的
+  `qcr_…`；回读命令与 §12.4 同一段脚本。行里只有发起人、角色快照（非管理员为空）、条数、摘要
+  （读取：返回行标识有序列表的摘要；导出：文件 sha256）、证据指针（`corpus_window:<起>_<止>` /
+  `corpus_export:<文件名>`），**关键词与正文都不在账上**；审计账按既有规则九十天到期。
+- **参数写全称**：`allow_abbrev=False`，前缀缩写被拒而不是被猜。`--initiated-by` 是自报身份，挡误操作、
+  挡不住冒认，与 §十二、§十三 同名闸同一性质。
+- **退出码**：`0` 跑完；`2` 什么都没做（参数、鉴权、配置或目标不合格，查询本身失败也算）；`3` 查询或
+  文件已经发生但审计没落下——结果已扣住 / 文件已删除，先回读审计账再决定要不要重跑。
+- **容量只告警不删**：`stats` 给行数与字节；删除只走登记在迁移 `0098` 文件头的受控 SQL，执行前后各留
+  一行审计（`corpus.purge`）。scheduler 侧的水位告警职责尚未接线（核心判定 `capacity_watermark` 已备）。

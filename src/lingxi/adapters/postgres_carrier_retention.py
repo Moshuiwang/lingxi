@@ -217,10 +217,16 @@ class PostgresCarrierRetention:
                 )
                 redacted = cursor.rowcount
                 from lingxi.adapters.postgres_innertest_retention import purge_innertest_history
+                from lingxi.adapters.postgres_operation_audit import (
+                    purge_expired_operation_audit,
+                )
 
                 purge_innertest_history(connection, now=moment, limit=batch)
-        if redacted:
-            logger.info("待确认操作已到期脱敏 条数=%s", redacted)
+                audit_purged = purge_expired_operation_audit(connection, now=moment, limit=batch)
+        if redacted or audit_purged:
+            logger.info(
+                "待确认操作已到期脱敏 条数=%s 运营审计已到期删除 条数=%s", redacted, audit_purged
+            )
         return redacted
 
     def purge_expired_queue_failure_notices(

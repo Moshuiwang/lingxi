@@ -127,6 +127,12 @@ services:
     environment:
       # Issue #496 / Trace #502：stage 与生产执行并发合同均固定为 4。
       LINGXI_WORKER_MAX_CONCURRENCY: "4"
+      # 问答留存语料通道（产品合同「数据保留与删除」第三条例外，Issue #664）：预发与
+      # 生产都开，值只在这里声明——compose 的 `environment:` 覆盖 `env_file`，抄 env
+      # 文件既开不了也关不了；dev / CI 的基线 compose 不声明即关。scripts/ci/
+      # check_deploy_contract.py 的 check_qa_corpus_declaration 钉住「两份环境 compose
+      # 的 worker-queue 都声明精确 "1"、别处一律不出现」。
+      LINGXI_QA_CORPUS_RETENTION: "1"
       # 隔离边界（Trace #544 S-2b / 报告 W-1）：Agent SDK 回合的工作目录**必须**
       # 与用户环境根（lingxi-users 卷的挂载点 /var/lib/lingxi/users）互不包含。
       # 这不是洁癖：那个目录下每个用户各有一份 0440 的 .mcp.json，里面是**该用户
