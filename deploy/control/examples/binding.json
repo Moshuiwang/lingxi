@@ -1,0 +1,8 @@
+{
+  "schema_revision": 1,
+  "binding_id": "binding-example-placeholder",
+  "host_uid": 41001,
+  "peer_uid": 51001,
+  "uid_map_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "socket_gid": 42001
+}
