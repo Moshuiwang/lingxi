@@ -13,6 +13,7 @@ from typing import Any, Protocol
 
 from lingxi.apps.worker.config import WorkerConfig
 from lingxi.core.innertest_content_capture import ContentCaptureRecord
+from lingxi.core.qa_corpus import QaCorpusRecord
 from lingxi.core.user_memory import RenderedUserMemoryPrompt
 
 
@@ -21,7 +22,6 @@ class QueueListener(Protocol):
 
     def wait(self, *, timeout_seconds: float) -> bool:
         """等一次通知；返回是否真的等到。"""
-        ...
 
 
 class UserMemoryReader(Protocol):
@@ -33,7 +33,6 @@ class UserMemoryReader(Protocol):
 
     def fetch_prompt_segment(self, *, user_id: str) -> RenderedUserMemoryPrompt | None:
         """取这个人的记忆片段；没有记忆时返回 ``None``。"""
-        ...
 
 
 ExecutorFactory = Callable[[WorkerConfig, Callable[[], None]], Any]
@@ -45,12 +44,12 @@ YearGroundingSuspectCallback = Callable[[Mapping[str, object]], None]
 
 @dataclass(frozen=True)
 class WorkerObservers:
-    """装配层注入的六个观测出口，全部可留空。
+    """装配层注入的七个观测出口，全部可留空。
 
-    心跳、任务滞留告警、告警状态机推进、终态审计、内容采集、年份护栏。留空的那一项整体跳过：
-    **没有装配方就没有输出**，不假装写了一条实际被吞掉的记录。本服务是纯组装对象，不知道
-    自己会被哪个进程入口装配，也不该假设标准库日志已经配过 handler——真实队列 worker 刻意
-    不做日志初始化，默认阈值会把 INFO 悄悄吞掉。
+    心跳、任务滞留告警、告警状态机推进、终态审计、内容采集、语料留存、年份护栏。留空的那一项
+    整体跳过：**没有装配方就没有输出**，不假装写了一条实际被吞掉的记录。本服务是纯组装对象，
+    不知道自己会被哪个进程入口装配，也不该假设标准库日志已经配过 handler——真实队列 worker
+    刻意不做日志初始化，默认阈值会把 INFO 悄悄吞掉。
     """
 
     heartbeat: HeartbeatCallback | None = None
@@ -58,6 +57,7 @@ class WorkerObservers:
     on_alert_tick: Callable[[], None] | None = None
     on_terminal_outcome: TerminalOutcomeCallback | None = None
     content_capture_writer: Callable[[ContentCaptureRecord], None] | None = None
+    qa_corpus_writer: Callable[[QaCorpusRecord], bool] | None = None
     on_year_grounding_suspect: YearGroundingSuspectCallback | None = None
 
 

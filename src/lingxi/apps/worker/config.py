@@ -110,10 +110,14 @@ DEPLOY_ENVIRONMENT_VAR = "LINGXI_DEPLOY_ENVIRONMENT"
 PRODUCTION_ENVIRONMENT_VALUES = ("prod", "production", "生产")
 
 # 文档交付触发机制：默认关闭——关闭时 apps/worker/turn.py 完全不挂 delivery
-# MCP 服务，行为与本开关加入之前逐字节一致。校验姿态照抄
-# ``_innertest_content_capture`` 的主开关：只接受精确值 ``"1"``，错配按启动
-# 即失败处理，不悄悄当作未开启。
+# MCP 服务，行为与本开关加入之前逐字节一致。校验姿态与其它开关同一份
+# ``_exact_flag``：只接受精确值 ``"1"``，错配按启动即失败处理，不悄悄当作未开启。
 DOCUMENT_DELIVERY_ENABLED_VAR = "DOCUMENT_DELIVERY_ENABLED"
+
+# 问答留存语料（产品合同「数据保留与删除」第三条例外）的开关：裸变量名，值写死在两份
+# 环境 compose 的 worker-queue `environment:` 块里（覆盖 env_file，抄 env 文件既开
+# 不了也关不了），dev 与 CI 不声明即关。完整判定见 ``_qa_corpus_retention``。
+QA_CORPUS_RETENTION_VAR = "LINGXI_QA_CORPUS_RETENTION"
 
 
 class WorkerConfigError(ValueError):
@@ -209,6 +213,9 @@ class WorkerConfig:
     # 持有工具名字面量（唯一事实来源是 document_delivery.DELIVER_DOCUMENT_
     # TOOL_NAME）。
     document_delivery_enabled: bool = False
+    # 问答留存语料：默认 False——只有部署 compose 声明精确 "1" 才开，直接构造与
+    # loader 路径行为一致；开着时每个任务收口后写一行 qa_corpus。
+    qa_corpus_retention_enabled: bool = False
     # 入口校验后的完整 HTTPS URL；保留路径，适配器只用 scheme + host + port
     # 做同源判定。正式配置必须经 load_config 注入；空值仅兼容旧的直接构造测试，
     # 不会由入口放行。
@@ -245,6 +252,11 @@ class WorkerConfig:
             mode_label="output_safety_canary",
             prompt_label="system_prompt",
         )
+
+    @property
+    def captures_raw_content(self) -> bool:
+        """内测采集与语料留存任一通道开启，回合就构造原始素材收集器（收集器是机制不是通道）。"""
+        return self.innertest_content_capture_enabled or self.qa_corpus_retention_enabled
 
 
 def _require_worker_env_vars(env: Mapping[str, str], *, require_question: bool) -> None:
@@ -320,10 +332,7 @@ def _build_worker_config(
         session_root=_text(env, "SESSION_ROOT"),
         session_cleanup_batch_limit=_positive_int(env, "SESSION_CLEANUP_BATCH_LIMIT", 20),
         session_disk_budget_bytes=_positive_int(
-            env,
-            "SESSION_DISK_BUDGET_BYTES",
-            DEFAULT_SESSION_DISK_BUDGET_BYTES,
-            allow_zero=True,
+            env, "SESSION_DISK_BUDGET_BYTES", DEFAULT_SESSION_DISK_BUDGET_BYTES, allow_zero=True
         ),
         session_disk_low_water_ratio=_low_water_ratio(env),
         session_reclaim_min_age_seconds=_duration(
@@ -335,6 +344,7 @@ def _build_worker_config(
         innertest_content_capture_enabled=content_capture_enabled,
         innertest_content_capture_misconfigured=content_capture_misconfigured,
         document_delivery_enabled=_document_delivery_enabled(env),
+        qa_corpus_retention_enabled=_qa_corpus_retention(env),
     )
 
 
@@ -489,18 +499,48 @@ def _user_env_root(env: Mapping[str, str]) -> str | None:
     真正的存在性与可读性核对留给 queue 模式启动预检。
     """
     value = (env.get("LINGXI_USER_ENV_ROOT") or "").strip()
-    if not value:
-        return None
+    return _normalized_absolute_path("环境变量 LINGXI_USER_ENV_ROOT", value) if value else None
+
+
+def _normalized_absolute_path(label: str, value: str) -> str:
+    """路径类配置的共同形态：不含空白、以 ``/`` 开头且归一化后逐字节相同。
+
+    不回显收到的值：形态错误的路径本身不敏感，但保持与本文件其它校验同一条"误接
+    进来的可能是别的东西"纪律，不因为这一条是路径就破例。
+    """
     if any(character.isspace() for character in value):
-        raise WorkerConfigError("环境变量 LINGXI_USER_ENV_ROOT 不得包含空白字符（不回显取到的值）")
+        raise WorkerConfigError(f"{label} 不得包含空白字符（不回显取到的值）")
     if not value.startswith("/") or posixpath.normpath(value) != value:
-        # 不回显收到的值：形态错误的路径本身不敏感，但保持与本文件其它校验
-        # 同一条"误接进来的可能是别的东西"纪律，不因为这一条是路径就破例。
         raise WorkerConfigError(
-            "环境变量 LINGXI_USER_ENV_ROOT 必须是绝对且已规范化的路径"
+            f"{label} 必须是绝对且已规范化的路径"
             "（不含 `..`、`.`、连续斜杠或多余的尾部斜杠；不回显取到的值）"
         )
     return value
+
+
+def _exact_flag(env: Mapping[str, str], variable: str) -> bool:
+    """只接受精确 ``"1"`` 的开关：未配置或为空即关，其它任何值启动即失败——错配不是未配。"""
+    flag = (env.get(variable) or "").strip()
+    if not flag:
+        return False
+    if flag != "1":
+        raise WorkerConfigError(f'环境变量 {variable} 只接受精确值 "1"（不回显收到的值）')
+    return True
+
+
+def _document_delivery_enabled(env: Mapping[str, str]) -> bool:
+    """文档交付触发开关：未配置即关，错配不是未配。"""
+    return _exact_flag(env, f"{ENV_PREFIX}{DOCUMENT_DELIVERY_ENABLED_VAR}")
+
+
+def _qa_corpus_retention(env: Mapping[str, str]) -> bool:
+    """问答留存语料开关：未配置或为空即关；只接受精确 ``"1"``，错配启动即失败。
+
+    值来自入库的 compose ``environment:`` 声明而不是宿主机 env 文件，因此不需要第二确认
+    变量——那道确认当初是为「两个变量都在可抄的 env 文件里」设计的。残余（如实登记）：
+    仓库外的覆盖文件与本地 env 仍能开，与内测采集通道同一条边界。
+    """
+    return _exact_flag(env, QA_CORPUS_RETENTION_VAR)
 
 
 def _innertest_content_capture(env: Mapping[str, str]) -> tuple[bool, bool]:
@@ -513,13 +553,8 @@ def _innertest_content_capture(env: Mapping[str, str]) -> tuple[bool, bool]:
     的 env 文件整份复制进生产会带走两个变量，生产 compose 声明覆盖
     env_file 已堵死这条路径，最后防线仍是部署操作纪律。
     """
-    flag = (env.get(CONTENT_CAPTURE_FLAG_VAR) or "").strip()
-    if not flag:
+    if not _exact_flag(env, CONTENT_CAPTURE_FLAG_VAR):
         return False, False
-    if flag != "1":
-        raise WorkerConfigError(
-            f'环境变量 {CONTENT_CAPTURE_FLAG_VAR} 只接受精确值 "1"（不回显收到的值）'
-        )
     if declares_production(env):
         # 代码侧兜底：环境自称是生产，采集一律不生效，两个变量配得再对也
         # 不行。misconfigured=True 让调用方打一条显眼的启动告警，但不阻止
@@ -542,23 +577,6 @@ def declares_production(env: Mapping[str, str]) -> bool:
     return value.strip().casefold() in PRODUCTION_ENVIRONMENT_VALUES
 
 
-def _document_delivery_enabled(env: Mapping[str, str]) -> bool:
-    """文档交付触发开关。
-
-    未配置或为空：``False``——未配置就是未启用。配置了但不是精确的
-    ``"1"``：启动即失败（与 ``_innertest_content_capture`` 的主开关同一
-    姿态）——错配不是未配。
-    """
-    flag = (env.get(f"{ENV_PREFIX}{DOCUMENT_DELIVERY_ENABLED_VAR}") or "").strip()
-    if not flag:
-        return False
-    if flag != "1":
-        raise WorkerConfigError(
-            f'{ENV_PREFIX}{DOCUMENT_DELIVERY_ENABLED_VAR} 只接受精确值 "1"（不回显收到的值）'
-        )
-    return True
-
-
 def _system_prompt_file(env: Mapping[str, str]) -> str | None:
     """读取 ``LINGXI_WORKER_SYSTEM_PROMPT_FILE``（默认提示词文件路径）。
 
@@ -569,18 +587,7 @@ def _system_prompt_file(env: Mapping[str, str]) -> str | None:
     降级为无提示词执行并留告警，不影响进程存活。
     """
     value = _text(env, "SYSTEM_PROMPT_FILE")
-    if not value:
-        return None
-    if any(character.isspace() for character in value):
-        raise WorkerConfigError(
-            f"{ENV_PREFIX}SYSTEM_PROMPT_FILE 不得包含空白字符（不回显取到的值）"
-        )
-    if not value.startswith("/") or posixpath.normpath(value) != value:
-        raise WorkerConfigError(
-            f"{ENV_PREFIX}SYSTEM_PROMPT_FILE 必须是绝对且已规范化的路径"
-            "（不含 `..`、`.`、连续斜杠或多余的尾部斜杠；不回显取到的值）"
-        )
-    return value
+    return _normalized_absolute_path(f"{ENV_PREFIX}SYSTEM_PROMPT_FILE", value) if value else None
 
 
 def _external_texts(env: Mapping[str, str]) -> tuple[tuple[str, str], ...]:

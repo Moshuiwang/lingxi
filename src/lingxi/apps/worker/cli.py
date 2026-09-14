@@ -28,6 +28,7 @@ from typing import Any, TextIO
 
 from lingxi.adapters.postgres_content_capture import PostgresContentCaptureWriter
 from lingxi.adapters.postgres_conversation import PostgresTaskQueue, PostgresTaskQueueListener
+from lingxi.adapters.postgres_qa_corpus import PostgresQaCorpus
 from lingxi.adapters.postgres_user_memory import PostgresUserMemoryReader
 from lingxi.apps.liveness import touch_liveness
 from lingxi.config.content_override import log_content_source
@@ -196,35 +197,25 @@ def _check_queue_mode_prereqs(
     DSN、``user_env_root``、workspace 三项分别对应队列消费、用户 MCP 配置
     读取、Agent SDK 工作目录三个必要前提。
     """
+
+    def fail(message: str) -> None:
+        _emit_queue_config_error(out=out, err=err, config=config, message=message)
+
     dsn = env.get("LINGXI_POSTGRES_DSN", "").strip()
     if not dsn:
-        _emit_queue_config_error(
-            out=out, err=err, config=config, message="队列 worker 缺少 LINGXI_POSTGRES_DSN"
-        )
+        fail("队列 worker 缺少 LINGXI_POSTGRES_DSN")
         return None
     _log_env_detached(err, config, detached_env_vars)
     if not config.user_env_root:
-        _emit_queue_config_error(
-            out=out, err=err, config=config, message="队列 worker 缺少 LINGXI_USER_ENV_ROOT"
-        )
+        fail("队列 worker 缺少 LINGXI_USER_ENV_ROOT")
         return None
     if not _ensure_user_env_root_available(config.user_env_root, err=err, trace_id=config.trace_id):
-        _emit_queue_config_error(
-            out=out,
-            err=err,
-            config=config,
-            message="LINGXI_USER_ENV_ROOT 不可用：路径不存在、不可读，或不是目录",
-        )
+        fail("LINGXI_USER_ENV_ROOT 不可用：路径不存在、不可读，或不是目录")
         return None
     if config.workspace is not None and not _ensure_worker_workspace(
         config.workspace, err=err, trace_id=config.trace_id
     ):
-        _emit_queue_config_error(
-            out=out,
-            err=err,
-            config=config,
-            message=f"{ENV_PREFIX}WORKSPACE 不可用：既不存在也无法创建，或存在但不是可写目录",
-        )
+        fail(f"{ENV_PREFIX}WORKSPACE 不可用：既不存在也无法创建，或存在但不是可写目录")
         return None
     return dsn
 
@@ -234,9 +225,10 @@ def _build_worker_service(
 ) -> WorkerService:
     """装配 queue 模式所需的 ``WorkerService`` 及其协作对象。
 
-    内容级采集写入方只在开关真正开启时才构造，与该 DSN 建立完全独立于队列
-    消费的写路径；用户记忆读取适配器恒装配——queue 模式是唯一真正处理用户
-    任务的路径，不像内容采集那样受开关控制。
+    内容级采集与问答留存语料的写入方各自只在开关真正开启时才构造，与该 DSN 建立
+    完全独立于队列消费的写路径；语料开关开着还是关着都记一行启动日志（只记布尔，
+    不回显任何配置值），生产升级后「开始写入」要能从启动日志核对。用户记忆读取
+    适配器恒装配——queue 模式是唯一真正处理用户任务的路径，不受开关控制。
     """
     alerting_duty = _build_alerting_duty(err=err, trace_id=config.trace_id)
     session_root = _resolve_session_root(config, env)
@@ -254,6 +246,8 @@ def _build_worker_service(
         if config.innertest_content_capture_enabled
         else None
     )
+    corpus_enabled = config.qa_corpus_retention_enabled
+    _log(err, config.trace_id, "info", "worker.qa_corpus_retention_enabled", enabled=corpus_enabled)
     return WorkerService(
         config=config,
         queue=PostgresTaskQueue(dsn, reuse_polling_connection=True),
@@ -264,6 +258,7 @@ def _build_worker_service(
             on_alert_tick=alerting_duty.run_once,
             on_terminal_outcome=_terminal_outcome_sink(err=err, trace_id=config.trace_id),
             content_capture_writer=content_capture_writer,
+            qa_corpus_writer=PostgresQaCorpus(dsn).record if corpus_enabled else None,
             on_year_grounding_suspect=_year_grounding_suspect_sink(
                 err=err, trace_id=config.trace_id
             ),
