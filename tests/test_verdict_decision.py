@@ -116,9 +116,7 @@ def good_claims(**overrides):
 
 OK_TOKEN = vd.TokenCheck(status=vd.TOKEN_OK, claims=good_claims())
 MISSING_TOKEN = vd.TokenCheck(status=vd.TOKEN_MISSING)
-BAD_TOKEN = vd.TokenCheck(
-    status=vd.TOKEN_INVALID, reasons=("base_ref='x-attacker' 不是受保护分支",)
-)
+BAD_TOKEN = vd.TokenCheck(status=vd.TOKEN_INVALID, reasons=("base_ref='x-attacker' 不是默认分支",))
 
 
 def decide(head_tree=TREE_SAME, base_tree=TREE_SAME, token=OK_TOKEN, **kwargs):
@@ -302,17 +300,55 @@ class TokenVerificationTest(unittest.TestCase):
         )
         self.assertIn("run 123456", result.summary)
 
-    def test_base_ref_outside_protected_branches_is_rejected(self):
-        for base_ref in ("x-attacker", "refs/heads/x-attacker", "epic/a", "trace/770", "", None):
+    def test_release_base_ref_is_not_trusted(self):
+        for base_ref in ("release/2.5", "refs/heads/release/2.5", "release/evil"):
+            with self.subTest(base_ref=base_ref):
+                result = self.check(good_claims(base_ref=base_ref))
+                self.assertEqual(result.status, vd.TOKEN_INVALID)
+                self.assertTrue(
+                    any(
+                        "base_ref" in reason and "不是默认分支" in reason
+                        for reason in result.reasons
+                    ),
+                    result.reasons,
+                )
+        for base_ref in ("main", "refs/heads/main"):
+            with self.subTest(base_ref=base_ref):
+                self.assertTrue(self.check(good_claims(base_ref=base_ref)).ok)
+
+    def test_base_ref_outside_default_branch_is_rejected(self):
+        for base_ref in (
+            "x-attacker",
+            "refs/heads/x-attacker",
+            "epic/a",
+            "trace/770",
+            "release/2.5",
+            "refs/heads/release/2.5",
+            "",
+            None,
+        ):
             with self.subTest(base_ref=base_ref):
                 result = self.check(good_claims(base_ref=base_ref))
                 self.assertEqual(result.status, vd.TOKEN_INVALID)
                 self.assertTrue(
                     any("base_ref" in reason for reason in result.reasons), result.reasons
                 )
-        for base_ref in ("main", "refs/heads/main", "release/2.5", "refs/heads/release/2.5"):
+        for base_ref in ("main", "refs/heads/main"):
             with self.subTest(base_ref=base_ref):
                 self.assertTrue(self.check(good_claims(base_ref=base_ref)).ok)
+
+    def test_is_trusted_base_accepts_only_the_default_branch(self):
+        self.assertTrue(vd.is_trusted_base("main", "main"))
+        # 这里传入的是 normalize_branch 后的分支名，前缀由 normalize_branch 负责剥除。
+        for base_ref in (
+            "release/2.5",
+            "release/",
+            "main-evil",
+            "",
+            "refs/heads/main",
+        ):
+            with self.subTest(base_ref=base_ref):
+                self.assertFalse(vd.is_trusted_base(base_ref, "main"))
 
     def test_run_id_mismatch_is_rejected(self):
         for run_id in ("123457", 123457, "", None):
@@ -455,6 +491,8 @@ class FallbackBaselineTest(unittest.TestCase):
                 )
         self.assertTrue(vd.is_protected_base("main", "main"))
         self.assertTrue(vd.is_protected_base("release/2.5", "main"))
+        # 标签面与信任面分离。
+        self.assertFalse(vd.is_trusted_base("release/2.5", "main"))
         self.assertFalse(vd.is_protected_base("x-attacker", "main"))
         self.assertFalse(vd.is_protected_base("", "main"))
 
@@ -648,7 +686,8 @@ class CommandLineTest(unittest.TestCase):
 
     def test_decide_with_attacker_base_token_or_missing_token_takes_path_b(self):
         for claims, with_token, marker in (
-            (good_claims(base_ref="x-attacker"), True, "不是受保护分支"),
+            (good_claims(base_ref="x-attacker"), True, "不是默认分支"),
+            (good_claims(base_ref="release/2.5"), True, "不是默认分支"),
             (good_claims(), False, "没有身份凭证"),
         ):
             with self.subTest(marker=marker):
@@ -1150,6 +1189,7 @@ class DocumentationTest(unittest.TestCase):
             "OIDC",
             "`id-token: write`",
             vd.CHANGED_GATE_LABEL,
+            "只认默认分支",
         ):
             self.assertIn(marker, text, marker)
 
