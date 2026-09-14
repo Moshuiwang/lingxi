@@ -50,10 +50,10 @@ class LinuxProtocolTests(unittest.TestCase):
         self.assertFalse(Path(self.path).exists())
         shutil.rmtree(self.root)
 
-    def client_script(self, uid, gid, source):
+    def client_script(self, uid, gid, source, timeout=10):
         code = f"import os;os.setgroups([]);os.setgid({gid});os.setuid({uid});" + source
         return subprocess.run(
-            [sys.executable, "-c", code], capture_output=True, text=True, timeout=10
+            [sys.executable, "-c", code], capture_output=True, text=True, timeout=timeout
         )
 
     def test_actual_peer_uid_acl_and_protected_mapping(self):
@@ -85,7 +85,7 @@ class LinuxProtocolTests(unittest.TestCase):
         with self.assertRaisesRegex(InnertestError, "binding_not_protected"):
             load_binding(binding)
 
-    def test_real_sdk_stdio_relay_three_tools(self):
+    def test_real_sdk_stdio_relay_six_tools(self):
         relay = self.root / "innertest_relay.py"
         shutil.copy(
             str(Path(__file__).resolve().parents[1] / "scripts/admin/innertest_relay.py"), relay
@@ -116,17 +116,57 @@ class LinuxProtocolTests(unittest.TestCase):
                     hello = await session.initialize()
                     self.assertEqual(hello.protocolVersion, "2025-11-25")
                     tools = await session.list_tools()
-                    self.assertEqual(len(tools.tools), 3)
+                    self.assertEqual(len(tools.tools), 6)
                     result = await session.call_tool(
                         "prepare_innertest_additions",
                         {"request_key": "same", "emails": ["a@example.test"]},
                     )
                     self.assertFalse(result.isError)
+                    await asyncio.sleep(30)
+                    result = await session.call_tool("get_user_status", {"identifier": "ou_x"})
+                    self.assertFalse(result.isError)
+                    self.assertEqual(len((await session.list_tools()).tools), 6)
                     self.service.enabled = False
                     with self.assertRaises(Exception):
                         await session.list_tools()
 
         asyncio.run(run())
+
+    def test_idle_lifetime_is_separate_from_half_packet_budget(self):
+        source = (
+            f"import socket,json,time;s=socket.socket(socket.AF_UNIX);s.connect({self.path!r});"
+            's.sendall(b\'{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05"}}\\n\');'
+            "print(s.recv(8192).decode());"
+            's.sendall(b\'{"jsonrpc":"2.0","method":"notifications/initialized"}\\n\');'
+            f"h=socket.socket(socket.AF_UNIX);h.connect({self.path!r});h.sendall(b'{{\"jsonrpc\"');"
+            "time.sleep(31);h.settimeout(2);print(repr(h.recv(1)));"
+            's.sendall(b\'{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{"cursor":"x"}}\\n\');'
+            "s.settimeout(5);print(s.recv(65536).decode())"
+        )
+        result = self.client_script(1234, 1234, source, timeout=60)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        hello, half_packet, listing = [line for line in result.stdout.split("\n") if line]
+        self.assertEqual(json.loads(hello)["result"]["protocolVersion"], "2025-11-25")
+        self.assertEqual(half_packet, "b''")
+        self.assertEqual(len(json.loads(listing)["result"]["tools"]), 6)
+
+    def test_short_idle_lifetime_closes_idle_connection(self):
+        self.listener.drain_until(time.monotonic() + 2)
+        self.listener = InnertestSocketListener(
+            path=self.path,
+            service=self.service,
+            db_slots=FollowupDatabaseBudget(),
+            socket_gid=1234,
+            idle_seconds=1,
+        )
+        self.listener.start()
+        client = socket.socket(socket.AF_UNIX)
+        try:
+            client.connect(self.path)
+            client.settimeout(3)
+            self.assertEqual(client.recv(1), b"")
+        finally:
+            client.close()
 
     def test_four_connection_bound_and_stop_cleanup(self):
         clients = []

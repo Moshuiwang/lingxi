@@ -10,6 +10,7 @@
 
 ### Added
 
+- **管理员可以用自己的 Agent 客户端（Claude CLI / Codex）经受限 SSH 通道查用户状态、权限来源与待确认动作**：通道对任意客户端版本都能完成握手、忽略通知帧、空闲连接不再五秒即断（默认 30 分钟），工具面从扩员三工具扩成六个（新增 `get_user_status` / `get_user_permission_sources` / `get_pending_actions`，只读、零写库、每次调用一行审计）；普通用户在四层上都不可达（系统层、UID 层、参数层、登记表层各有否定断言）。停用 / 恢复 / 授权 / 撤销的「准备」工具在下一张卡（Issue [#716](https://github.com/Moshuiwang/lingxi/issues/716)）。
 - **运营操作从此有一张持久的审计账**：新表 `operation_audit`（迁移 `0097`）记录每一次运营操作「谁发起、谁确认、谁执行、目的与目标范围、结果、证据指针」，只追加不可改、九十天后自动删除；此前这些只在进程日志里、跨进程不可关联。本批只建载体与读写口，预开通、欢迎卡、内测扩员三件操作的接入随后续切片（Issue [#788](https://github.com/Moshuiwang/lingxi/issues/788)）。
 
 ### Fixed
