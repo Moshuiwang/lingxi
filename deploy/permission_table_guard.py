@@ -12,6 +12,7 @@ import argparse
 import hashlib
 import json
 import os
+import re
 import shlex
 import stat
 import subprocess
@@ -23,7 +24,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 from urllib.error import HTTPError, URLError
-from urllib.parse import quote, unquote, urlencode, urlsplit, urlunsplit
+from urllib.parse import quote, unquote, urlencode, urlsplit
 from urllib.request import Request, urlopen
 
 SCHEMA_VERSION = 1
@@ -120,6 +121,15 @@ class LedgerEntry:
 
 
 @dataclass(frozen=True)
+class RowState:
+    """一个撤回目标行在计划时刻的存在状态与内容摘要；只有摘要，不含字段值。"""
+
+    present: bool
+    current_sha256: str | None
+    backup_sha256: str | None
+
+
+@dataclass(frozen=True)
 class RevertPlan:
     """根据同一时刻的表、备份和台账计算出的最小撤回范围。"""
 
@@ -127,6 +137,7 @@ class RevertPlan:
     delete_ids: tuple[str, ...]
     skipped_ids: tuple[str, ...]
     unresolved_outbox_ids: tuple[str, ...]
+    row_states: dict[str, RowState]
     summary_sha256: str
 
 
@@ -650,23 +661,47 @@ SELECT COALESCE(
 """
 
 
-def _safe_psql_dsn(dsn: str) -> tuple[str, str | None]:
-    """把口令移到 ``PGPASSWORD``，避免出现在 psql 命令行参数。"""
-    if not isinstance(dsn, str) or not dsn.strip():
-        raise GuardError("database_dsn_missing")
-    text = dsn.strip()
+URL_DSN_SCHEME = re.compile(r"^postgres(?:ql)?(?:\+[A-Za-z0-9_]+)?$")
+PSQL_URL_SCHEME = "postgresql"
+
+
+def _safe_url_dsn(text: str) -> tuple[str, str | None]:
+    """拆出 URL 形 DSN 里 userinfo 与 ``?password=`` 两处口令，并归一方案名。
+
+    接受 ``postgresql://``、``postgres://`` 与 ``postgresql+<驱动>://``（例如
+    ``postgresql+psycopg://``），交给 psql 前统一写成 ``postgresql://``；其他方案名
+    一律拒绝。查询串里除 ``password`` 之外的参数原样保留，不重新编码。两处都写了
+    口令时取查询参数那一个，与 libpq 的解析顺序一致。
+    """
     parsed = urlsplit(text)
-    if parsed.scheme in ("postgres", "postgresql") and parsed.netloc:
-        password = parsed.password
-        if password is None:
-            return text, None
-        host_part = parsed.netloc.rsplit("@", 1)[-1]
-        user_part = parsed.netloc.rsplit("@", 1)[0].split(":", 1)[0]
-        safe_netloc = f"{user_part}@{host_part}"
-        safe_url = urlunsplit(
-            (parsed.scheme, safe_netloc, parsed.path, parsed.query, parsed.fragment)
-        )
-        return safe_url, unquote(password)
+    if not URL_DSN_SCHEME.match(parsed.scheme):
+        raise GuardError("database_dsn_invalid")
+    password: str | None = None
+    if parsed.password is not None:
+        password = unquote(parsed.password)
+    userinfo, separator, host_part = parsed.netloc.rpartition("@")
+    safe_netloc = f"{userinfo.split(':', 1)[0]}@{host_part}" if separator else host_part
+    kept: list[str] = []
+    for pair in parsed.query.split("&"):
+        if not pair:
+            continue
+        key, _, value = pair.partition("=")
+        if unquote(key).lower() == "password":
+            password = unquote(value)
+            continue
+        kept.append(pair)
+    # 不用 urlunsplit：netloc 为空（Unix socket 写法 ``postgresql:///db?host=…``）时它会
+    # 丢掉 ``//``，libpq 就认不出这是 URL。
+    safe_url = f"{PSQL_URL_SCHEME}://{safe_netloc}{parsed.path}"
+    if kept:
+        safe_url = f"{safe_url}?{'&'.join(kept)}"
+    if parsed.fragment:
+        safe_url = f"{safe_url}#{parsed.fragment}"
+    return safe_url, password
+
+
+def _safe_keyword_dsn(text: str) -> tuple[str, str | None]:
+    """去掉键值形 DSN 里的 ``password=`` 项；写法认不出时拒绝而不是放行。"""
     try:
         tokens = shlex.split(text)
     except ValueError as error:
@@ -681,6 +716,16 @@ def _safe_psql_dsn(dsn: str) -> tuple[str, str | None]:
     if "password" in text.lower() and password_value is None:
         raise GuardError("database_dsn_invalid")
     return " ".join(shlex.quote(token) for token in safe_tokens), password_value
+
+
+def _safe_psql_dsn(dsn: str) -> tuple[str, str | None]:
+    """把口令移到 ``PGPASSWORD``，避免出现在 psql 命令行参数（同机其他用户可见）。"""
+    if not isinstance(dsn, str) or not dsn.strip():
+        raise GuardError("database_dsn_missing")
+    text = dsn.strip()
+    if "://" in text:
+        return _safe_url_dsn(text)
+    return _safe_keyword_dsn(text)
 
 
 def _run_psql(dsn: str, since: datetime, *, psql_bin: str = "psql") -> Any:
@@ -713,12 +758,13 @@ def _run_psql(dsn: str, since: datetime, *, psql_bin: str = "psql") -> Any:
             check=False,
             env=environment,
         )
-    except FileNotFoundError as error:
-        raise GuardError("psql_not_found") from error
-    except subprocess.TimeoutExpired as error:
-        raise GuardError("psql_timeout") from error
-    except OSError as error:
-        raise GuardError("psql_failed") from error
+    except FileNotFoundError:
+        raise GuardError("psql_not_found") from None
+    except subprocess.TimeoutExpired:
+        # 子进程异常自带完整命令行；不链到守卫异常上，避免 DSN 随回溯回显。
+        raise GuardError("psql_timeout") from None
+    except OSError:
+        raise GuardError("psql_failed") from None
     if result.returncode != 0:
         raise GuardError("psql_failed")
     try:
@@ -790,40 +836,88 @@ def _ledger_ids(entries: Sequence[LedgerEntry]) -> set[str]:
     return {entry.record_id for entry in entries if entry.record_id is not None}
 
 
+def _fields_sha256(fields: Mapping[str, str]) -> str:
+    """七字段内容的摘要；计划文件与确认摘要只携带它，不携带字段值。"""
+    encoded = json.dumps(
+        {name: fields.get(name, "") for name in FIELD_NAMES},
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+
+def _row_states(
+    backup_rows: Mapping[str, Mapping[str, str]],
+    current: Mapping[str, Mapping[str, str]],
+    identifiers: Sequence[str],
+) -> dict[str, RowState]:
+    """记录每个撤回目标行的存在状态、当前内容摘要与备份值摘要。"""
+    states: dict[str, RowState] = {}
+    for identifier in identifiers:
+        current_fields = current.get(identifier)
+        backup_fields = backup_rows.get(identifier)
+        states[identifier] = RowState(
+            present=current_fields is not None,
+            current_sha256=None if current_fields is None else _fields_sha256(current_fields),
+            backup_sha256=None if backup_fields is None else _fields_sha256(backup_fields),
+        )
+    return states
+
+
+def _row_states_payload(states: Mapping[str, RowState]) -> dict[str, dict[str, Any]]:
+    """把目标行状态压成可写入计划文件与摘要输入的纯字典。"""
+    return {
+        identifier: {
+            "present": state.present,
+            "current_sha256": state.current_sha256,
+            "backup_sha256": state.backup_sha256,
+        }
+        for identifier, state in sorted(states.items())
+    }
+
+
 def _plan(
     backup: BackupSnapshot,
     ledger: Sequence[LedgerEntry],
     current: Mapping[str, Mapping[str, str]],
     ledger_sha256: str,
 ) -> RevertPlan:
-    """只按台账外部记录标识生成可确认摘要。"""
+    """只按台账外部记录标识生成可确认摘要。
+
+    摘要绑定备份与台账两个文件的摘要、撤回记录清单、未解析清单，以及每个撤回目标行
+    此刻的存在状态、当前七字段内容摘要和备份中对应值的摘要。目标行在确认前被改或被
+    删，摘要就会变化；台账外的行不进入摘要——撤回从不写它们，它们只在计划里列为跳过。
+    """
     scoped = _ledger_ids(ledger)
     restore_ids = tuple(sorted(scoped & set(backup.rows)))
     delete_ids = tuple(sorted(scoped - set(backup.rows)))
     skipped_ids = tuple(sorted(_changed_ids(backup.rows, current) - scoped))
     unresolved = tuple(sorted(entry.outbox_id for entry in ledger if entry.record_id is None))
+    row_states = _row_states(backup.rows, current, (*restore_ids, *delete_ids))
     summary = {
         "schema": SCHEMA_VERSION,
         "backup_sha256": backup.file_sha256,
         "ledger_sha256": ledger_sha256,
         "restore": restore_ids,
         "delete": delete_ids,
-        "skip": skipped_ids,
         "unresolved": unresolved,
+        "rows": _row_states_payload(row_states),
     }
     encoded = json.dumps(summary, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
     digest = hashlib.sha256(encoded.encode("utf-8")).hexdigest()
-    return RevertPlan(restore_ids, delete_ids, skipped_ids, unresolved, digest)
+    return RevertPlan(restore_ids, delete_ids, skipped_ids, unresolved, row_states, digest)
 
 
 def _plan_payload(plan: RevertPlan) -> dict[str, Any]:
-    """生成不含表格正文的计划文件。"""
+    """生成不含表格正文的计划文件；``rows`` 只有摘要，供两次干跑之间定位变化行。"""
     return {
         "schema": SCHEMA_VERSION,
         "restore": list(plan.restore_ids),
         "delete": list(plan.delete_ids),
         "skip": list(plan.skipped_ids),
         "unresolved": list(plan.unresolved_outbox_ids),
+        "rows": _row_states_payload(plan.row_states),
         "summary_sha256": plan.summary_sha256,
     }
 
@@ -973,7 +1067,11 @@ def run_revert(
     *,
     client: PermissionTableClient | None = None,
 ) -> int:
-    """默认只写计划；摘要确认正确后才执行台账范围内的撤回。"""
+    """默认只写计划；摘要确认正确后才执行台账范围内的撤回。
+
+    确认摘要相符后、发出第一条写入前，再取一次现表逐行比对撤回目标行的存在状态与
+    七字段内容；任一行与确认时刻不同即停止、零写入、退出 1，只打印变化行的记录标识。
+    """
     backup, ledger, ledger_sha256 = _load_inputs(backup_path, ledger_path, config)
     active_client = client or PermissionTableClient(config)
     snapshot = active_client.list_rows()
@@ -988,7 +1086,25 @@ def run_revert(
         _log("revert=refused reason=confirm_mismatch writes=0", error=True)
         return 1
     _log("revert=confirmed")
-    return _execute_revert(active_client, backup, plan, current)
+    refreshed_snapshot = active_client.list_rows()
+    refreshed = _row_map(refreshed_snapshot.rows)
+    changed = tuple(
+        identifier
+        for identifier in (*plan.restore_ids, *plan.delete_ids)
+        if current.get(identifier) != refreshed.get(identifier)
+    )
+    _log(
+        f"revert=recheck pages={refreshed_snapshot.pages} rows={len(refreshed)} "
+        f"changed={len(changed)}"
+    )
+    if changed:
+        _log(
+            "revert=stopped reason=rows_changed_before_execute "
+            f"changed={_ids_text(changed)} writes=0",
+            error=True,
+        )
+        return 1
+    return _execute_revert(active_client, backup, plan, refreshed)
 
 
 def run_verify(
