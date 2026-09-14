@@ -121,7 +121,14 @@ for arg in "$@"; do
   prev="${arg}"
 done
 if [ -n "${sqlfile}" ]; then
-  cp "${sqlfile}" "${LINGXI_TEST_LAST_SQL}"
+  if grep -q "DELETE FROM lingxi_monitoring.sample" "${sqlfile}"; then
+    printf 'prune\n' >> "${LINGXI_TEST_SQL_TRACE}"
+    cp "${sqlfile}" "${LINGXI_TEST_PRUNE_SQL}"
+    echo "LINGXI_MONITORING_PRUNED=0"
+  else
+    printf 'push\n' >> "${LINGXI_TEST_SQL_TRACE}"
+    cp "${sqlfile}" "${LINGXI_TEST_LAST_SQL}"
+  fi
 fi
 exit 0
 FAKE_PSQL
@@ -131,9 +138,12 @@ push_data_dir="${push_work_dir}/data"
 mkdir -p "${push_data_dir}"
 printf '{"a":1}\n{"a":2}\n' > "${push_data_dir}/resource-20260829.log"
 last_sql_file="${push_work_dir}/last_sql_seen.sql"
+prune_sql_file="${push_work_dir}/prune_sql_seen.sql"
+sql_trace_file="${push_work_dir}/sql_trace"
 
 env -i PATH="${push_bin_dir}:${PATH}" MONITORING_DSN="postgresql://fake" \
   LINGXI_MONITORING_DIR="${push_data_dir}" LINGXI_TEST_LAST_SQL="${last_sql_file}" \
+  LINGXI_TEST_PRUNE_SQL="${prune_sql_file}" LINGXI_TEST_SQL_TRACE="${sql_trace_file}" \
   bash "${monitoring_dir}/push_to_monitoring.sh" >/dev/null 2>&1
 
 cursor_file="${push_data_dir}/.push-state/resource-20260829.log.cursor"
@@ -153,10 +163,24 @@ else
   fail_count=$((fail_count + 1))
 fi
 
+if [[ "$(cat "${sql_trace_file}" 2>/dev/null)" == $'push\nprune' ]] \
+   && grep -q "DELETE FROM lingxi_monitoring.sample" "${prune_sql_file}" \
+   && grep -q "interval '30 days'" "${prune_sql_file}" \
+   && grep -q "pruned=0" "${push_data_dir}/.push-state/push.log"; then
+  printf 'PASS: push_to_monitoring.sh 在成功上推后执行 30 天 sample 收缩并记录 pruned=N\n'
+  pass_count=$((pass_count + 1))
+else
+  printf 'FAIL: push_to_monitoring.sh 未按成功上推后收缩 30 天前 sample\n' >&2
+  cat "${sql_trace_file}" >&2 2>/dev/null || true
+  cat "${prune_sql_file}" >&2 2>/dev/null || true
+  fail_count=$((fail_count + 1))
+fi
+
 # 第二轮：源文件没有新增行，cursor 已经等于总行数，应该直接跳过、不再调用
 # psql——push.log 行数应该与第一轮之后完全一致。
 env -i PATH="${push_bin_dir}:${PATH}" MONITORING_DSN="postgresql://fake" \
   LINGXI_MONITORING_DIR="${push_data_dir}" LINGXI_TEST_LAST_SQL="${last_sql_file}" \
+  LINGXI_TEST_PRUNE_SQL="${prune_sql_file}" LINGXI_TEST_SQL_TRACE="${sql_trace_file}" \
   bash "${monitoring_dir}/push_to_monitoring.sh" >/dev/null 2>&1
 push_log_lines_after_second=$(wc -l < "${push_data_dir}/.push-state/push.log" 2>/dev/null || echo 0)
 
@@ -167,6 +191,48 @@ else
   printf 'FAIL: push_to_monitoring.sh 第二轮在没有新增行时仍然推送了一次\n' >&2
   fail_count=$((fail_count + 1))
 fi
+
+# 上推失败时只能记失败并保留 cursor，不能进入 sample 收缩。
+failure_work_dir=$(mktemp -d)
+failure_bin_dir="${failure_work_dir}/bin"
+mkdir -p "${failure_bin_dir}"
+cat > "${failure_bin_dir}/psql" <<'FAKE_PSQL_FAILURE'
+#!/bin/sh
+prev=""
+sqlfile=""
+for arg in "$@"; do
+  if [ "${prev}" = "-f" ]; then
+    sqlfile="${arg}"
+  fi
+  prev="${arg}"
+done
+if grep -q "DELETE FROM lingxi_monitoring.sample" "${sqlfile}"; then
+  printf 'prune\n' >> "${LINGXI_TEST_SQL_TRACE}"
+  exit 9
+fi
+printf 'push\n' >> "${LINGXI_TEST_SQL_TRACE}"
+exit 1
+FAKE_PSQL_FAILURE
+chmod +x "${failure_bin_dir}/psql"
+
+failure_data_dir="${failure_work_dir}/data"
+mkdir -p "${failure_data_dir}"
+printf '{"a":1}\n' > "${failure_data_dir}/resource-20260829.log"
+failure_sql_trace="${failure_work_dir}/sql_trace"
+env -i PATH="${failure_bin_dir}:${PATH}" MONITORING_DSN="postgresql://fake" \
+  LINGXI_MONITORING_DIR="${failure_data_dir}" LINGXI_TEST_SQL_TRACE="${failure_sql_trace}" \
+  bash "${monitoring_dir}/push_to_monitoring.sh" >/dev/null 2>&1
+
+if [[ "$(cat "${failure_sql_trace}" 2>/dev/null)" == "push" ]] \
+   && ! grep -q "prune" "${failure_sql_trace}" 2>/dev/null; then
+  printf 'PASS: push_to_monitoring.sh 上推失败时不执行 DELETE\n'
+  pass_count=$((pass_count + 1))
+else
+  printf 'FAIL: push_to_monitoring.sh 上推失败后错误执行 DELETE\n' >&2
+  cat "${failure_sql_trace}" >&2 2>/dev/null || true
+  fail_count=$((fail_count + 1))
+fi
+rm -rf "${failure_work_dir}"
 
 rm -rf "${push_work_dir}"
 
