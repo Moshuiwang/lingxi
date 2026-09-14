@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import re
 import sys
 import unittest
 from pathlib import Path
@@ -99,6 +100,13 @@ class ControlExamplesTests(unittest.TestCase):
         for marker in ("三路否定", "回退", "historical", "提升即放行"):
             with self.subTest(marker=marker):
                 self.assertIn(marker, runbook)
+        self.assertIn("/bin/sh", runbook)
+        self.assertRegex(runbook, r"(?m)^.*forced-command.*nologin.*$")
+
+    def test_runbook_code_blocks_have_no_bare_python3(self) -> None:
+        runbook = (DEPLOY_ROOT / "control" / "引导安装.md").read_text(encoding="utf-8")
+        code_blocks = re.findall(r"```[^\n]*\n(.*?)```", runbook, flags=re.DOTALL)
+        self.assertFalse(re.search(r"(^|\s)python3\s", "\n".join(code_blocks), flags=re.MULTILINE))
 
 
 if __name__ == "__main__":
