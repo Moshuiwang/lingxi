@@ -12,9 +12,8 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
-from urllib.parse import parse_qs, urlsplit
 from unittest import mock
-
+from urllib.parse import parse_qs, urlsplit
 
 REPOSITORY_ROOT = Path(__file__).parents[1]
 GUARD_PATH = (REPOSITORY_ROOT / "deploy" / "permission_table_guard.py").resolve()

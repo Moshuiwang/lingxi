@@ -16,7 +16,6 @@ import shlex
 import stat
 import subprocess
 import sys
-import tempfile
 import uuid
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
@@ -24,9 +23,8 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 from urllib.error import HTTPError, URLError
-from urllib.parse import unquote, urlsplit, urlunsplit, urlencode, quote
+from urllib.parse import quote, unquote, urlencode, urlsplit, urlunsplit
 from urllib.request import Request, urlopen
-
 
 SCHEMA_VERSION = 1
 ENVIRONMENT = "stage"
@@ -57,6 +55,7 @@ class GuardError(RuntimeError):
     """可安全输出的失败分类；实例消息不携带配置值或表格正文。"""
 
     def __init__(self, code: str) -> None:
+        """保存可安全输出的错误代码。"""
         self.code = code
         super().__init__(code)
 
@@ -73,6 +72,7 @@ class GuardConfig:
     dsn: str = ""
 
     def __repr__(self) -> str:
+        """返回不含敏感值的表示。"""
         return "GuardConfig(<redacted>)"
 
 
@@ -334,6 +334,7 @@ class PermissionTableClient:
         page_size: int = DEFAULT_PAGE_SIZE,
         max_pages: int = DEFAULT_MAX_PAGES,
     ) -> None:
+        """初始化分页读取与记录操作所需的客户端配置。"""
         if (
             isinstance(page_size, bool)
             or not isinstance(page_size, int)

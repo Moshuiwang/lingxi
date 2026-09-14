@@ -13,11 +13,12 @@ import io
 import pathlib
 import sys
 import unittest
+from collections.abc import Callable
 from contextlib import ExitStack, redirect_stderr, redirect_stdout
 from dataclasses import dataclass, fields, replace
 from datetime import UTC, datetime
 from functools import partial
-from typing import Any, Callable
+from typing import Any
 from unittest import mock
 
 from lingxi.core.permission.targeted_recompute import (
