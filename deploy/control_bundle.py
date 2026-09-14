@@ -57,9 +57,10 @@ ASSET = "lingxi-control.tar"
 # 调用方会读的位置，出现即视为打包器越界或包被改写。前缀按路径段匹配（deploy2/ 不算）。
 ALLOWED_PREFIXES = ("deploy/", "scripts/ci/", "scripts/admin/")
 # 任何版本的控制包都必须带的文件：v2.4.3（rc.98）那 15 个成员里，部署器（lingxi_deploy /
-# deploy_state / deploy_runtime / control_bundle）、发布清单工具、compose 三份、内测通道契约、
-# relay 与安装自检是被真正读取的；README 与两份 sshd 示例只供人看，不在此列。索引缺任一项即拒，
-# 防止「索引自洽但少了部署器」的包通过核对。此清单只能随真实读取关系变化而增减。
+# deploy_state / deploy_runtime / control_bundle）、发布清单工具、compose 三份、relay 与安装
+# 自检是被真正读取的；deploy/control/contract.json 是随包分发的通道契约，运行时不读，只有 CI
+# 与文档引用，留在必备清单以保证包完整；README 与两份 sshd 示例只供人看，不在此列。索引缺
+# 任一项即拒，防止「索引自洽但少了部署器」的包通过核对。此清单只能随真实读取关系变化而增减。
 REQUIRED_FILES = (
     "deploy/lingxi_deploy.py",
     "deploy/deploy_state.py",
@@ -163,8 +164,8 @@ def build(root: Path, output: Path, commit: str):
 
 
 def allowed_path(name: str) -> bool:
-    """包内文件路径策略：三前缀之下、每段非空且不是 . / ..、不以 / 结尾。"""
-    if not isinstance(name, str) or not name.startswith(ALLOWED_PREFIXES):
+    """包内文件路径策略：三前缀之下、每段非空且不是 . / ..、不以 / 结尾、不含 NUL。"""
+    if not isinstance(name, str) or not name.startswith(ALLOWED_PREFIXES) or "\x00" in name:
         return False
     return all(part not in ("", ".", "..") for part in name.split("/"))
 

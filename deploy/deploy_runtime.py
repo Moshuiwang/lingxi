@@ -204,10 +204,21 @@ class Runtime:
         所以「完全无标签」只可能是接管之前的手工启动，不可能是部署器产物。
         中断在「首个服务更新后」再接续（``changed``）时，剩下的旧容器仍是
         无标签的，同样按 ``old`` 侧接受。
+        豁免只在本机首次由部署器接管时生效：``lingxi_deploy.execute`` 在 preflight
+        通过后才写 ``lock_path`` 同目录的 ``host.active.json``，本机从未由部署器
+        部署过时它不存在；同一首次计划中断后接续时它记着本计划的 ``id``。它记着
+        其它计划（本机已由部署器部署过）或形状异常时，无标签容器不再享受豁免，
+        按原规则拒绝——部署过之后再出现的无标签容器不可能是「接管前的旧服务」。
         """
         current = self.containers(plan["project"])
         ledger = read_json(self.state_directory / (plan["id"] + ".state.json"))
         changed = "start" in ledger["stages"] or plan["operation"] == "recover"
+        try:
+            active = read_json(Path(self.host["lock_path"]).with_suffix(".active.json"))
+        except FileNotFoundError:
+            first_takeover = True
+        else:
+            first_takeover = isinstance(active, dict) and active.get("id") == plan["id"]
         if not changed and set(current) != set(SERVICES):
             raise DeployError("service_inventory_changed")
         choices = [("old", plan["recovery"]["config_sha256"])]
@@ -222,7 +233,7 @@ class Runtime:
                 same_image = (
                     actual["image"].split("@")[-1] == release["images"][service].split("@")[-1]
                 )
-                takeover = side == "old" and unlabeled
+                takeover = side == "old" and unlabeled and first_takeover
                 same_config = (
                     takeover
                     or release["schema"] != 2

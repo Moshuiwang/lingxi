@@ -5,8 +5,10 @@ v2.4.3 的 15 成员控制包被 2.5.0 工具拒绝，预发升级停在 `curren
 「子集包 / 超集包能过」和「越界路径、缺必备文件、tar 与索引不一致、安装目录多放少放都拒」。
 """
 
+import io
 import json
 import os
+import tarfile
 import tempfile
 import unittest
 from pathlib import Path
@@ -21,10 +23,15 @@ LEGACY_FILES = (
     "deploy/control/README.md",
 )
 FUTURE_FILE = "deploy/control/examples/future.json"
+NUL_FILE = "deploy/a\x00b"
 
 
-def craft(root, tar_files, index_files):
-    """tar 与索引可以不一致地造包，用来钉住「多一个 / 少一个都拒」。"""
+def craft(root, tar_files, index_files, *, pax=False):
+    """tar 与索引可以不一致地造包，用来钉住「多一个 / 少一个都拒」。
+
+    ustar 头把路径按 NUL 字节截断（``NUL_FILE`` 读回成 ``deploy/a``），含 NUL 的成员名
+    要靠 pax 扩展头才能原样读回；``pax=True`` 时每个成员都带 ``path`` 扩展头。
+    """
     contents = {}
     for name in {*tar_files, *index_files}:
         source = ROOT / name
@@ -53,7 +60,16 @@ def craft(root, tar_files, index_files):
     archived = {name: contents[name] for name in tar_files}
     archived[bundle.INDEX] = index_bytes
     path = root / bundle.ASSET
-    archive(path, archived)
+    if pax:
+        with tarfile.open(path, "w") as stream:
+            for name, raw in archived.items():
+                item = tarfile.TarInfo(name)
+                item.pax_headers = {"path": name}
+                item.size = len(raw)
+                item.mode = 0o444
+                stream.addfile(item, io.BytesIO(raw))
+    else:
+        archive(path, archived)
     metadata = {
         "asset": bundle.ASSET,
         "sha256": bundle.digest(path.read_bytes()),
@@ -127,9 +143,35 @@ class CrossVersionRejectTests(unittest.TestCase):
             "deploy2/x",
             "src/lingxi/x.py",
             bundle.INDEX,
+            NUL_FILE,
+            "deploy/\x00",
+            "deploy/x\x00",
         ):
             with self.subTest(name=name):
                 self.assertFalse(bundle.allowed_path(name))
+
+    def test_nul_byte_path_rejected_even_when_tar_and_index_agree(self):
+        # tar（pax 扩展头保住 NUL）与索引完全一致、逐成员摘要 / 体量 / 模式都对，只有路径含
+        # NUL：不拒的话 verify 会放行，随后 install 在写文件时抛 ValueError 而不是 BundleError。
+        with tempfile.TemporaryDirectory() as tmp:
+            files = (*bundle.REQUIRED_FILES, NUL_FILE)
+            pkg, metadata = craft(Path(tmp), files, files, pax=True)
+            with tarfile.open(pkg, "r:") as archive_:
+                self.assertIn(NUL_FILE, archive_.getnames())
+            with self.assertRaises(bundle.BundleError):
+                bundle.verify(pkg, metadata)
+        # 只有索引含 NUL 路径、tar 没带：同样拒。
+        with tempfile.TemporaryDirectory() as tmp:
+            pkg, metadata = craft(Path(tmp), bundle.REQUIRED_FILES, files)
+            with self.assertRaises(bundle.BundleError):
+                bundle.verify(pkg, metadata)
+
+    def test_index_path_used_as_both_file_and_directory_rejected(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            files = (*bundle.REQUIRED_FILES, "deploy/x", "deploy/x/y")
+            pkg, metadata = craft(Path(tmp), files, files)
+            with self.assertRaisesRegex(bundle.BundleError, "同时作为文件和目录"):
+                bundle.verify(pkg, metadata)
 
     def test_out_of_bounds_paths_in_index_and_tar_rejected(self):
         for evil in ("scripts/evil.py", "etc/passwd", "deploy//x", "deploy/./x"):

@@ -87,7 +87,7 @@ class RuntimeTests(unittest.TestCase):
 
     @staticmethod
     def unlabeled_services(release):
-        """部署器接管前由人手工启动的容器：镜像来自 release，三枚 io.lingxi.* 标签全缺。"""
+        """部署器接管前由人手工启动的容器：镜像来自 release，被读取的两枚 io.lingxi.* 标签都缺。"""
         return {
             name: {
                 "image": release["images"]["worker" if name == "worker-queue" else name],
@@ -161,6 +161,42 @@ class RuntimeTests(unittest.TestCase):
             current["gateway"]["bundle_sha256"] = plan["old"]["control_bundle"]["sha256"]
             with self.assertRaisesRegex(state.DeployError, "^unplanned_service"):
                 self.runtime.verify_service_inventory(plan)
+
+    def test_first_takeover_exemption_only_before_host_has_been_deployed(self):
+        plan = self.takeover_plan()
+        state.atomic_write(self.root / (plan["id"] + ".state.json"), {"stages": {}})
+        active = Path(self.host["lock_path"]).with_suffix(".active.json")
+        current = self.unlabeled_services(plan["old"])
+        with patch.object(self.runtime, "containers", return_value=current):
+            # a. 没有 host.active.json：本机从未由部署器部署过，首次接管通过。
+            self.assertFalse(active.exists())
+            self.runtime.verify_service_inventory(plan)
+            # b. 标记指向另一个已 verified 的计划：本机已由部署器部署过，无标签容器按原规则拒。
+            state.atomic_write(
+                active, {"id": "earlier-deploy", "plan_sha256": "0" * 64, "status": "verified"}
+            )
+            with self.assertRaisesRegex(state.DeployError, "^unplanned_service"):
+                self.runtime.verify_service_inventory(plan)
+            # 形状异常（没有 id / 不是对象）视为非首次：拒。
+            state.atomic_write(active, {"status": "verified"})
+            with self.assertRaisesRegex(state.DeployError, "^unplanned_service"):
+                self.runtime.verify_service_inventory(plan)
+            state.atomic_write(active, [plan["id"]])
+            with self.assertRaisesRegex(state.DeployError, "^unplanned_service"):
+                self.runtime.verify_service_inventory(plan)
+            # c. 标记指向同一计划（running）：同一首次计划中断后接续，仍放行。
+            state.atomic_write(
+                active, {"id": plan["id"], "plan_sha256": "0" * 64, "status": "running"}
+            )
+            self.runtime.verify_service_inventory(plan)
+            # 收窄只影响无标签容器：带全标签的旧容器在标记指向别的计划时照常通过。
+            state.atomic_write(
+                active, {"id": "earlier-deploy", "plan_sha256": "0" * 64, "status": "verified"}
+            )
+            for service in current.values():
+                service["config_sha256"] = plan["recovery"]["config_sha256"]
+                service["bundle_sha256"] = plan["old"]["control_bundle"]["sha256"]
+            self.runtime.verify_service_inventory(plan)
 
     def test_missing_business_modules_report_unavailable_without_starting_services(self):
         with patch.object(self.runtime, "docker", return_value=(1, "")) as docker:
