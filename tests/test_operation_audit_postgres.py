@@ -11,6 +11,9 @@
 5. 载体清理的待确认操作那一面同一事务里带走到期的审计行；
 6. 整行 ``::text`` 扫描找不到样本秘密——秘密在模型层就被拒绝，库里从未出现过。
 
+7. 迁移 ``0097`` 在探针库上：表非空时拒绝降级且一行不丢，空表时降级把表与两只函数
+   一并带走、再前滚回来。
+
 另有一条不需要数据库的源码守卫：到期清理函数必须有生产调用方。
 数据全部为虚构化名，不含任何真实人员数据。
 """
@@ -19,12 +22,15 @@ from __future__ import annotations
 
 import ast
 import inspect
+import logging
 import os
 import unittest
+import uuid
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from urllib.parse import urlsplit, urlunsplit
 
-from postgres_schema import psycopg_available
+from postgres_schema import ALEMBIC_INI, psycopg_available
 
 from lingxi.core.admin.operation_audit import (
     EntryPoint,
@@ -394,6 +400,105 @@ class OperationAuditPostgresTest(unittest.TestCase):
                 )
                 self.assertEqual(hits, [(0,)])
         self.assertEqual(len(self._ids()), 1)
+
+
+def _run_alembic(dsn: str, action: str, target: str) -> None:
+    """进程内跑 ``alembic <upgrade|downgrade> <target>``，进出各存取一次 logger 的 disabled 位。
+
+    与 ``postgres_schema.alembic_upgrade_head`` 同一个理由：``env.py`` 的 ``fileConfig``
+    会禁用当时已存在的全部 logger，跨用例污染别的模块的 ``assertLogs``。
+    """
+
+    from alembic import command
+    from alembic.config import Config
+
+    config = Config(str(ALEMBIC_INI))
+    previous = os.environ.get("LINGXI_MIGRATION_DSN")
+    os.environ["LINGXI_MIGRATION_DSN"] = dsn
+    manager = logging.root.manager
+    disabled_before = {
+        name: logger.disabled
+        for name, logger in manager.loggerDict.items()
+        if isinstance(logger, logging.Logger)
+    }
+    try:
+        getattr(command, action)(config, target)
+    finally:
+        if previous is None:
+            os.environ.pop("LINGXI_MIGRATION_DSN", None)
+        else:
+            os.environ["LINGXI_MIGRATION_DSN"] = previous
+        for name, was_disabled in disabled_before.items():
+            logger = manager.loggerDict.get(name)
+            if isinstance(logger, logging.Logger):
+                logger.disabled = was_disabled
+
+
+@unittest.skipUnless(os.environ.get("LINGXI_POSTGRES_DSN") and psycopg_available(), SKIP_REASON)
+class RevisionDowngradeTest(unittest.TestCase):
+    """迁移 ``0097`` 的降级边界：有记录就拒绝、一行不丢；空表才完整逆转。"""
+
+    PARENT = "0096_plpgsql_search_path"
+    OBJECTS_SQL = (
+        "SELECT to_regclass('public.operation_audit') IS NOT NULL,"
+        " to_regprocedure('public.operation_audit_fix_expiry()') IS NOT NULL,"
+        " to_regprocedure('public.operation_audit_append_only()') IS NOT NULL"
+    )
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        import psycopg
+
+        cls._psycopg = psycopg
+        cls._dsn = os.environ["LINGXI_POSTGRES_DSN"]
+
+    def _admin(self, sql: str, dsn: str | None = None) -> list[tuple]:
+        with (
+            self._psycopg.connect(dsn or self._dsn, autocommit=True) as connection,
+            connection.cursor() as cursor,
+        ):
+            cursor.execute(sql)
+            return cursor.fetchall() if cursor.description else []
+
+    def _probe_database(self) -> str:
+        name = f"lingxi_opa_probe_{uuid.uuid4().hex[:8]}"
+        self._admin(f"CREATE DATABASE {name}")
+        self.addCleanup(self._admin, f"DROP DATABASE IF EXISTS {name} WITH (FORCE)")
+        parts = urlsplit(self._dsn)
+        return urlunsplit(parts._replace(path=f"/{name}"))
+
+    def test_a_populated_table_refuses_downgrade_and_an_empty_one_reverts_completely(
+        self,
+    ) -> None:
+        probe = self._probe_database()
+        _run_alembic(probe, "upgrade", "0097_operation_audit")
+        self._admin(
+            "INSERT INTO operation_audit (id, operation_id, operation, phase, initiated_by,"
+            " actor_roles, entry_point) VALUES ('opa_keep', 'opr_keep', 'preprovision.apply',"
+            " 'prepared', 'ou_admin_fake', '', 'ops_script')",
+            probe,
+        )
+
+        with self.assertRaises(Exception) as caught:
+            _run_alembic(probe, "downgrade", self.PARENT)
+
+        self.assertIn("compatible recovery", str(caught.exception))
+        self.assertEqual(self._admin(self.OBJECTS_SQL, probe), [(True, True, True)])
+        self.assertEqual(self._admin("SELECT id FROM operation_audit", probe), [("opa_keep",)])
+        self.assertEqual(
+            self._admin("SELECT version_num FROM alembic_version", probe),
+            [("0097_operation_audit",)],
+        )
+
+        self._admin("DELETE FROM operation_audit", probe)
+        _run_alembic(probe, "downgrade", self.PARENT)
+        self.assertEqual(self._admin(self.OBJECTS_SQL, probe), [(False, False, False)])
+        self.assertEqual(
+            self._admin("SELECT version_num FROM alembic_version", probe), [(self.PARENT,)]
+        )
+
+        _run_alembic(probe, "upgrade", "0097_operation_audit")
+        self.assertEqual(self._admin(self.OBJECTS_SQL, probe), [(True, True, True)])
 
 
 if __name__ == "__main__":
