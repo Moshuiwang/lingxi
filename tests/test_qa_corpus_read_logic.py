@@ -12,6 +12,7 @@ import hashlib
 import importlib.util
 import io
 import json
+import os
 import stat
 import sys
 import tempfile
@@ -595,6 +596,7 @@ class ExportTest(ScriptTestCase):
         path = self.root / "batch.jsonl"
         self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o600)
         self.assertEqual(stat.S_IMODE(self.root.stat().st_mode), 0o700)
+        self.assertEqual([p.name for p in self.root.iterdir()], ["batch.jsonl"])  # 无 .part 残留
         lines = path.read_bytes().splitlines(keepends=True)
         self.assertEqual(len(lines), 3)
         entry = self.ledger.entries[0]
@@ -630,9 +632,100 @@ class ExportTest(ScriptTestCase):
         code, _out, err = self._export("--out", "link.jsonl")
 
         self.assertEqual(code, 2)
-        self.assertIn("导出文件不可建", err)
+        self.assertIn("已存在", err)
         self.assertEqual(victim.read_text(encoding="utf-8"), "原有内容")
         self.assertEqual(self.ledger.entries, [])
+        self.assertEqual(self.corpus.calls, [])
+
+        # 同名符号链接挂在临时名上：按残留报告，同样零写入、目标不动。
+        (self.root / "link.jsonl").unlink()
+        (self.root / ".link.jsonl.part").symlink_to(victim)
+        code, _out, err = self._export("--out", "link.jsonl")
+        self.assertEqual(code, 2)
+        self.assertIn("残留", err)
+        self.assertEqual(victim.read_text(encoding="utf-8"), "原有内容")
+        self.assertEqual(self.corpus.calls, [])
+
+        # 存在性检查之后才被挂上的符号链接：建文件这一步本身仍以 O_NOFOLLOW|O_EXCL 拒绝。
+        root_fd = TOOL.open_export_root(self.root)
+        self.addCleanup(os.close, root_fd)
+        with self.assertRaisesRegex(TOOL.ExportRootError, "导出文件不可建"):
+            TOOL.create_export_file(root_fd, ".link.jsonl.part")
+        self.assertEqual(victim.read_text(encoding="utf-8"), "原有内容")
+
+    def test_a_leftover_staging_file_is_reported_and_never_overwritten(self) -> None:
+        self.root.mkdir(mode=0o700)
+        leftover = self.root / ".a.jsonl.part"
+        leftover.write_text("上次被杀时留下的半截", encoding="utf-8")
+
+        code, out, err = self._export("--out", "a.jsonl")
+
+        self.assertEqual(code, 2)
+        self.assertEqual(out, "")
+        self.assertIn(".a.jsonl.part", err)
+        self.assertIn("残留", err)
+        self.assertEqual(leftover.read_text(encoding="utf-8"), "上次被杀时留下的半截")
+        self.assertEqual([p.name for p in self.root.iterdir()], [".a.jsonl.part"])
+        self.assertEqual(self.corpus.calls, [])
+        self.assertEqual(self.ledger.entries, [])
+
+    def test_the_final_name_never_exists_before_the_audit_row_and_an_interrupt_leaves_nothing(
+        self,
+    ) -> None:
+        """审计提交前只有临时名；`KeyboardInterrupt`（非 `Exception`）打在审计前也不留任何文件。"""
+
+        observed: list[tuple[bool, bool]] = []
+
+        def interrupted(entry: OperationAuditEntry) -> str:
+            observed.append(
+                ((self.root / "a.jsonl").exists(), (self.root / ".a.jsonl.part").exists())
+            )
+            raise KeyboardInterrupt
+
+        self.ledger.record = interrupted
+        with self.assertRaises(KeyboardInterrupt):
+            self._export("--out", "a.jsonl")
+
+        self.assertEqual(observed, [(False, True)])  # 审计时刻：最终名不存在、临时名已写好
+        self.assertEqual(list(self.root.iterdir()), [])
+
+        # 中断打在写入中途（查询迭代到一半）也一样：临时名删掉、最终名从未出现。
+        def broken(chosen: CorpusFilter):
+            yield _rows(1)[0]
+            observed.append(
+                ((self.root / "a.jsonl").exists(), (self.root / ".a.jsonl.part").exists())
+            )
+            raise KeyboardInterrupt
+
+        self.corpus.iter_export = broken
+        with self.assertRaises(KeyboardInterrupt):
+            self._export("--out", "a.jsonl")
+        self.assertEqual(observed[-1], (False, True))
+        self.assertEqual(list(self.root.iterdir()), [])
+        self.assertEqual(self.ledger.entries, [])
+
+    def test_a_rename_failure_after_the_audit_row_keeps_the_staged_file_and_exits_3(self) -> None:
+        original = TOOL.publish_export
+        self._patch(
+            "publish_export",
+            lambda root_fd, name: (
+                "临时文件未能改名为最终名（PermissionError），"
+                f"文件仍在 {TOOL.staging_name(name)}，请人工改名。"
+            ),
+        )
+        code, out, err = self._export("--out", "a.jsonl")
+
+        self.assertEqual(code, 3)
+        self.assertEqual(out, "")
+        self.assertIn("已落账", err)
+        self.assertIn(".a.jsonl.part", err)
+        self.assertEqual(len(self.ledger.entries), 1)
+        self.assertEqual([p.name for p in self.root.iterdir()], [".a.jsonl.part"])
+        # 留在临时名上的文件由人工改名；真正的改名口在同一目录上是可行的。
+        root_fd = TOOL.open_export_root(self.root)
+        self.addCleanup(os.close, root_fd)
+        self.assertIsNone(original(root_fd, "a.jsonl"))
+        self.assertEqual([p.name for p in self.root.iterdir()], ["a.jsonl"])
 
     def test_a_symlinked_or_loose_root_is_refused(self) -> None:
         real = self.root.parent / "real"
@@ -855,6 +948,31 @@ class ExportRootDeployCheckTest(unittest.TestCase):
             )
         )
         self.assertTrue(any("字面量绝对路径" in f for f in failures), failures)
+
+    def test_a_bare_dollar_interpolation_is_caught_too(self) -> None:
+        """变异验红：`$VAR` 不带花括号同样是 compose 插值，只拒 `${` 会放过它。"""
+
+        for value in ("$LINGXI_EXPORT_ROOT", "/var/lib/lingxi/credentials/$SUBDIR"):
+            with self.subTest(value=value):
+                failures = self._run(
+                    base=self.BASE.replace("/var/lib/lingxi/credentials/qa-corpus-exports", value)
+                )
+                self.assertTrue(any("字面量绝对路径" in f for f in failures), failures)
+
+    def test_a_redeclaration_in_any_overlay_service_block_is_caught(self) -> None:
+        """变异验红：stage / prod / innertest 任何 service 块再声明导出根都拒，scheduler 也不例外。"""
+
+        overlay = "scheduler:\n  environment:\n    LINGXI_QA_CORPUS_EXPORT_ROOT: /tmp/elsewhere\n"
+        for name in ("stage", "prod", "innertest"):
+            with self.subTest(file=name):
+                failures = self._run(**{name: overlay})
+                self.assertTrue(
+                    any(f"compose.{name}.yaml" in f and "覆盖文件" in f for f in failures), failures
+                )
+        failures = self._run(
+            base=self.BASE + "worker:\n  environment:\n    LINGXI_QA_CORPUS_EXPORT_ROOT: /x\n"
+        )
+        self.assertTrue(any("出现了 2 处" in f for f in failures), failures)
 
     def test_a_root_outside_every_named_volume_is_caught(self) -> None:
         failures = self._run(

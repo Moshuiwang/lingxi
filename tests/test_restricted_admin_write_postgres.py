@@ -198,19 +198,50 @@ class RestrictedAdminWriteTests(unittest.TestCase):
             failed = self.prepare_suspend()
         self.assertEqual((failed["ok"], failed["code"]), (False, "card_send_failed"))
         self.assertEqual(failed["action"]["status"], "failed")
+        failed_id = failed["action"]["pending_action_id"]
         self.assertEqual(
             self.sql("SELECT count(*) FROM pending_action WHERE status='pending'"), [(0,)]
         )
         self.assertEqual(self.counts()["admin_action_followup"], 0)
-        self.assertEqual(self.counts()["operation_audit"], 0)
+        # 阶段登记失败：待确认操作已转 failed，账上尽力补一行 rejected 作痕迹（无 prepared 行）。
+        self.assertEqual(self.counts()["operation_audit"], 1)
+        (rejected,) = self.ledger(failed_id)
+        self.assertEqual(
+            rejected[:5],
+            ("rejected", "restricted_channel", "admin.suspend_user", failed_id, ADMIN),
+        )
+        self.assertEqual(rejected[5], "permission_admin,ops_admin,super_admin")
+        self.assertEqual(
+            (rejected[8], rejected[9], rejected[10], rejected[12], rejected[13]),
+            (
+                "user",
+                TARGET,
+                "prepare_ledger_failed:RuntimeError",
+                "pending_action:" + failed_id,
+                failed_id,
+            ),
+        )
+        self.assertEqual(self.structured("operation_audit.write_failed"), [])
         with patch(
             "lingxi.adapters.followup_confirm_card_sender.record_operation_audit",
             side_effect=RuntimeError("synthetic-ledger-failure"),
         ):
             failed = self.prepare_suspend()
         self.assertEqual(failed["code"], "card_send_failed")
+        self.assertEqual(failed["action"]["status"], "failed")
         self.assertEqual(self.counts()["admin_action_followup"], 0)
-        self.assertEqual(self.counts()["operation_audit"], 0)
+        # 账本身写不进：补 rejected 行同样失败，只留一行结构化日志，结论不变。
+        self.assertEqual(self.counts()["operation_audit"], 1)
+        self.assertEqual(
+            self.structured("operation_audit.write_failed"),
+            [
+                dict(
+                    pending_action_id=failed["action"]["pending_action_id"],
+                    phase="rejected",
+                    error="RuntimeError",
+                )
+            ],
+        )
         self.assertEqual(self.account_state(), "enabled")
 
     # ------------------------------------------------------------------ 场景 2

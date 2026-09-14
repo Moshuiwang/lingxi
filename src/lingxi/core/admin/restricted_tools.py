@@ -4,8 +4,9 @@
 合成沿用发布链同一纯函数（翻译 + 两源合并），银河一侧读不到时明确报「不可读」而不是
 算成零权限。五个准备工具不直调任何仓储：结构化参数逐字转译成私聊命令文本，交管理命令
 路由走同一条角色判定、自我目标防呆、准备判定与审计；转译前的字段约束就是命令语法本身
-（转译结果解析不出命令即拒绝），两条入口对同一意图必然得到同一结论。通道里没有任何
-工具能确认、取消或执行：确认只发生在发起人本人的飞书卡片上。
+（转译结果解析不出命令即拒绝），且解析结果须与结构化入参逐字段一致（按编号撤销的入参必须
+是编号形状、按范围撤销的用户标识不得长成编号），两条入口对同一意图必然得到同一结论。
+通道里没有任何工具能确认、取消或执行：确认只发生在发起人本人的飞书卡片上。
 """
 
 from __future__ import annotations
@@ -17,7 +18,7 @@ from dataclasses import asdict
 from functools import partial
 from typing import Any
 
-from lingxi.core.admin.commands import AdminCommandKind, parse_admin_command
+from lingxi.core.admin.commands import AdminCommand, AdminCommandKind, parse_admin_command
 from lingxi.core.admin.innertest import (
     INNERTEST_TOOLS,
     InnertestError,
@@ -32,6 +33,7 @@ from lingxi.core.admin.pending_action import (
     local_permission_pairs,
 )
 from lingxi.core.admin.router_ports import AdminRouteOutcome
+from lingxi.core.ids import is_ulid
 from lingxi.core.permission.local_override import ResolvedLocalOverrides
 from lingxi.core.permission.merge_sources import merge_permission_sources
 from lingxi.core.permission.metric_translation import (
@@ -69,6 +71,18 @@ _OUTCOME_CODES = {
 }
 _REJECTED_KEY = "admin.write_action_rejected"
 _LEDGER_IDENTIFIER = re.compile(r"[A-Za-z0-9_-]{1,64}")
+#: 覆盖行 / 授权组编号的固定前缀（``lpo_`` 行、``lpg_`` 组、旧 ``pac_`` 组），与命令解析对
+#: ``revoke_permission`` 两种形状的判据同源：按编号撤销的入参必须长成这样，按范围撤销的用户
+#: 标识绝不能长成这样——否则转译出的文本会被解析成另一种形状、撤成整组。
+_OVERRIDE_REFERENCE_PREFIXES = ("lpo_", "lpg_", "pac_")
+#: 准备工具名 → 转译文本应当解析出的命令种类。
+_PREPARE_COMMAND_KINDS = {
+    PREPARE_TOOL_NAMES[0]: AdminCommandKind.SUSPEND_USER,
+    PREPARE_TOOL_NAMES[1]: AdminCommandKind.RESUME_USER,
+    PREPARE_TOOL_NAMES[2]: AdminCommandKind.GRANT_POSITION_PERMISSION,
+    PREPARE_TOOL_NAMES[3]: AdminCommandKind.REVOKE_PERMISSION,
+    PREPARE_TOOL_NAMES[4]: AdminCommandKind.REVOKE_PERMISSION,
+}
 #: 「已确认」不等于「已生效」：发布观察阶段的状态单独映射，不并进动作状态。
 _PUBLISH_STATES = {
     "succeeded": "published",
@@ -195,6 +209,23 @@ def _reason_text(args):
     return collapsed
 
 
+def _override_reference(args, key):
+    """覆盖行 / 授权组编号：固定前缀 + ULID，与命令解析认定「按编号撤销」的判据同形。"""
+    value = _single_token(args, key)
+    prefix = next((p for p in _OVERRIDE_REFERENCE_PREFIXES if value.startswith(p)), None)
+    if prefix is None or not is_ulid(value[len(prefix) :]):
+        raise InnertestError("invalid_request")
+    return value
+
+
+def _user_identifier(args):
+    """按范围撤销的用户标识：单段，且不得以覆盖行 / 授权组编号的前缀开头。"""
+    value = _single_token(args, "identifier")
+    if value.startswith(_OVERRIDE_REFERENCE_PREFIXES):
+        raise InnertestError("invalid_request")
+    return value
+
+
 def prepare_command_text(name, args):
     """把准备工具的结构化参数逐字转译成私聊命令文本；未知工具名即拒绝。"""
     if name in PREPARE_TOOL_NAMES[:2]:
@@ -211,11 +242,11 @@ def prepare_command_text(name, args):
         )
     if name == PREPARE_TOOL_NAMES[3]:
         key = "override_id" if "override_id" in args else "group_id"
-        return f"/admin revoke_permission {_single_token(args, key)} {_reason_text(args)}"
+        return f"/admin revoke_permission {_override_reference(args, key)} {_reason_text(args)}"
     if name == PREPARE_TOOL_NAMES[4]:
         return "/admin revoke_permission " + " ".join(
             (
-                _single_token(args, "identifier"),
+                _user_identifier(args),
                 _single_token(args, "company_id"),
                 _single_token(args, "metric_name"),
                 _reason_text(args),
@@ -224,12 +255,44 @@ def prepare_command_text(name, args):
     raise InnertestError("invalid_request")
 
 
+def expected_command(name, args) -> AdminCommand:
+    """结构化入参本应解析成的命令：动作种类、目标类别与各字段逐一对应，供转译后核对。"""
+    kind = _PREPARE_COMMAND_KINDS[name]
+    if name in PREPARE_TOOL_NAMES[:2]:
+        return AdminCommand(kind=kind, identifier=args["identifier"])
+    reason = _reason_text(args)
+    if name == PREPARE_TOOL_NAMES[2]:
+        scope = args["company_scope"]
+        return AdminCommand(
+            kind=kind,
+            identifier=args["identifier"],
+            position_name=args["position_name"],
+            company_scope="*" if scope.casefold() in {"all", "全部"} else scope,
+            reason=reason,
+        )
+    if name == PREPARE_TOOL_NAMES[3]:
+        return AdminCommand(
+            kind=kind, identifier=args.get("override_id") or args["group_id"], reason=reason
+        )
+    return AdminCommand(
+        kind=kind,
+        identifier=args["identifier"],
+        company_id=args["company_id"],
+        metric_name=args["metric_name"],
+        reason=reason,
+    )
+
+
 def _validate_prepare(name, args):
-    """转译后的文本必须能解析成对应命令：字段形状约束就是命令语法本身。"""
+    """转译后的文本必须解析回**同一条**命令：种类、目标类别与各字段逐一核对，不一致即拒。
+
+    只看「解析得出命令」不够——``revoke_permission`` 有按编号与按范围两种形状，靠首段
+    形状分辨，一个长成组编号的「用户标识」会让按范围撤销的文本被解析成撤整组。
+    """
     if name == PREPARE_TOOL_NAMES[3] and ("override_id" in args) == ("group_id" in args):
         raise InnertestError("invalid_request")
     parsed = parse_admin_command(prepare_command_text(name, args))
-    if parsed.kind is AdminCommandKind.UNKNOWN:
+    if parsed.kind is AdminCommandKind.UNKNOWN or parsed != expected_command(name, args):
         raise InnertestError("invalid_request")
     return args
 

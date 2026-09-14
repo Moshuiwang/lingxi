@@ -16,7 +16,9 @@ from lingxi.core.admin.followup import FollowupRef
 from lingxi.core.admin.innertest import InnertestError, envelope
 from lingxi.core.admin.pending_action import PendingAction, PendingActionStatus, PendingActionType
 from lingxi.core.admin.restricted_tools import (
+    CHANNEL_TOOLS,
     candidate_lists,
+    expected_command,
     operation_target,
     pending_action_item,
     pending_actions_result,
@@ -506,6 +508,66 @@ class CommandTranslationTests(unittest.TestCase):
             prepare_command_text("prepare_suppress_metric", {"identifier": "ou_target"})
         with self.assertRaisesRegex(InnertestError, "invalid_request"):
             prepare_command_text("prepare_suspend_user", {"identifier": "ou target"})
+
+    def test_every_positive_shape_passes_validation_and_parses_to_the_expected_command(self):
+        for name, args, text in TRANSLATIONS:
+            self.assertEqual(CHANNEL_TOOLS.validate(name, dict(args)), args)
+            self.assertEqual(parse_admin_command(text), expected_command(name, args))
+
+    def test_a_group_id_in_the_by_scope_identifier_slot_cannot_become_a_whole_group_revoke(self):
+        """两种撤销工具不可串用：用户标识长成编号形状会让文本被解析成「撤整组」，一律拒。"""
+        group = "lpg_01ARZ3NDEKTSV4RRFFQ69G5FAV"
+        by_scope = {"company_id": "1011", "metric_name": "vat_rate", "reason": "撤销"}
+        # 串用后的文本按私聊语法确实会被解析成整组撤销——这正是要挡住的。
+        parsed = parse_admin_command(f"/admin revoke_permission {group} 1011 vat_rate 撤销")
+        self.assertEqual(
+            (parsed.kind, parsed.identifier), (AdminCommandKind.REVOKE_PERMISSION, group)
+        )
+        self.assertIsNone(parsed.company_id)
+        for identifier in ("lpg_G", group, "lpo_01ARZ3NDEKTSV4RRFFQ69G5FAV", "pac_x", "lpo_"):
+            with self.subTest(identifier=identifier):
+                args = dict(by_scope, identifier=identifier)
+                with self.assertRaisesRegex(InnertestError, "invalid_request"):
+                    prepare_command_text("prepare_revoke_permission_by_scope", args)
+                with self.assertRaisesRegex(InnertestError, "invalid_request"):
+                    CHANNEL_TOOLS.validate("prepare_revoke_permission_by_scope", args)
+
+    def test_the_by_id_revoke_only_accepts_override_or_group_reference_shapes(self):
+        for key, value in (
+            ("override_id", "ou_target"),
+            ("override_id", "t@example.test"),
+            ("group_id", "lpg_G"),
+            ("group_id", "lpg_"),
+            ("override_id", "lpg_01ARZ3NDEKTSV4RRFFQ69G5FAV 1011"),
+        ):
+            with self.subTest(key=key, value=value):
+                with self.assertRaisesRegex(InnertestError, "invalid_request"):
+                    prepare_command_text("prepare_revoke_permission", {key: value, "reason": "r"})
+        self.assertEqual(
+            prepare_command_text(
+                "prepare_revoke_permission",
+                {"group_id": "pac_01ARZ3NDEKTSV4RRFFQ69G5FAV", "reason": "旧组"},
+            ),
+            "/admin revoke_permission pac_01ARZ3NDEKTSV4RRFFQ69G5FAV 旧组",
+        )
+
+    def test_a_parsed_command_that_differs_from_the_arguments_is_refused(self):
+        """逐字段核对：转译能解析、种类也对，但解析出的字段与入参不同（标识被归一化）仍拒。"""
+        args = {
+            "identifier": "mailto:t@example.test",
+            "company_id": "1011",
+            "metric_name": "vat_rate",
+            "reason": "撤销",
+        }
+        parsed = parse_admin_command(
+            prepare_command_text("prepare_revoke_permission_by_scope", args)
+        )
+        self.assertIs(parsed.kind, AdminCommandKind.REVOKE_PERMISSION)
+        self.assertEqual(parsed.identifier, "t@example.test")
+        with self.assertRaisesRegex(InnertestError, "invalid_request"):
+            CHANNEL_TOOLS.validate("prepare_revoke_permission_by_scope", args)
+        with self.assertRaisesRegex(InnertestError, "invalid_request"):
+            CHANNEL_TOOLS.validate("prepare_suspend_user", {"identifier": "mailto:t@example.test"})
 
     def test_prepare_code_maps_router_outcomes(self):
         self.assertEqual(prepare_code(AdminRouteOutcome(handled=False)), "not_authorized")
