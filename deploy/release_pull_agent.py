@@ -1677,8 +1677,10 @@ def _run_locked(
         else:
             old_manifest = None
             if state.get("deployer_state") == "verified" and isinstance(previous, dict):
+                # 外部在位只更新 target_tag，不换 plan_id：此时该计划的 new 已不是
+                # 运行中的版本，只有 new.tag 仍等于状态账 target_tag 才可作为 old。
                 candidate = previous.get("new")
-                if isinstance(candidate, dict):
+                if isinstance(candidate, dict) and candidate.get("tag") == state.get("target_tag"):
                     old_manifest = candidate
             if old_manifest is None:
                 try:
