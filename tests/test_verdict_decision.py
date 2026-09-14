@@ -337,6 +337,12 @@ class TokenVerificationTest(unittest.TestCase):
             with self.subTest(base_ref=base_ref):
                 self.assertTrue(self.check(good_claims(base_ref=base_ref)).ok)
 
+    def test_claim_level_prefix_variants_are_rejected(self):
+        for base_ref in ("main-evil", "mainx", "Main", "main/"):
+            with self.subTest(base_ref=base_ref):
+                result = self.check(good_claims(base_ref=base_ref))
+                self.assertEqual(result.status, vd.TOKEN_INVALID)
+
     def test_is_trusted_base_accepts_only_the_default_branch(self):
         self.assertTrue(vd.is_trusted_base("main", "main"))
         # 这里传入的是 normalize_branch 后的分支名，前缀由 normalize_branch 负责剥除。
@@ -349,6 +355,11 @@ class TokenVerificationTest(unittest.TestCase):
         ):
             with self.subTest(base_ref=base_ref):
                 self.assertFalse(vd.is_trusted_base(base_ref, "main"))
+
+    def test_empty_default_branch_trusts_nothing(self):
+        for base_ref in ("", "main"):
+            with self.subTest(base_ref=base_ref):
+                self.assertFalse(vd.is_trusted_base(base_ref, ""))
 
     def test_run_id_mismatch_is_rejected(self):
         for run_id in ("123457", 123457, "", None):
@@ -869,6 +880,19 @@ def _pyproject_cryptography_pin() -> str:
     return match.group(1)
 
 
+class CodeownersShapeTest(unittest.TestCase):
+    def test_verdict_ownership_is_narrow_and_covers_all_decision_files(self):
+        text = (ROOT / ".github/CODEOWNERS").read_text(encoding="utf-8")
+        for line in (
+            "/.github/workflows/verdict.yml @Moshuiwang",
+            "/scripts/ci/verdict_decision.py @Moshuiwang",
+            "/tests/test_verdict_decision.py @Moshuiwang",
+        ):
+            with self.subTest(line=line):
+                self.assertIn(f"\n{line}\n", f"\n{text}\n")
+        self.assertNotIn("\n/.github/workflows/ @Moshuiwang\n", f"\n{text}\n")
+
+
 class VerdictWorkflowShapeTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -890,6 +914,14 @@ class VerdictWorkflowShapeTest(unittest.TestCase):
             "schedule",
         ):
             self.assertNotIn(forbidden, on_block, forbidden)
+
+    def test_comments_do_not_claim_release_branches_are_trusted(self):
+        ci = CI_WORKFLOW.read_text(encoding="utf-8")
+        for text in (self.raw, ci):
+            self.assertNotIn("base 是 main / release/**", text)
+            self.assertNotIn("面向受保护分支的 PR 触发的", text)
+        self.assertIn("pull_request 事件、base 是默认分支", self.raw)
+        self.assertIn("面向默认分支的 PR 触发的", ci)
 
     def test_top_level_permissions_are_read_only(self):
         self.assertEqual(_top_level_block(self.text, "permissions").strip(), "contents: read")

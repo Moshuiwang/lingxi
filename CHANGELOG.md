@@ -16,6 +16,7 @@
 ### Changed
 
 - **候选镜像包核验工具不再依赖本机镜像存储驱动**：`verify_epic_candidate_bundle.py --import` 改为先从每个 tar 内的 `manifest.json` 读出 config 摘要与清单比对，再逐个导入；在 containerd 快照器存储的机器上也能给出「一致 / 不一致」，摘要对不上或读不到的 tar 不导入（Issue [#765](https://github.com/Moshuiwang/lingxi/issues/765)）。
+- **裁决层的代码审查范围收窄**：只对 `verdict.yml`、`verdict_decision.py` 和 `test_verdict_decision.py` 保留产品负责人审批，其他工作流改动由主干版门禁复跑裁决（Issue [#748](https://github.com/Moshuiwang/lingxi/issues/748)）。
 
 ## [2.4.3] - 2026-09-11
 

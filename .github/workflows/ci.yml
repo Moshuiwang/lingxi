@@ -641,7 +641,7 @@ jobs:
     # 裁决层（verdict.yml）的信任来源：本作业在 pull_request 事件下向 GitHub 要一枚 OIDC
     # 身份凭证（受众固定为 lingxi-epic-verdict）并留成制品。凭证由 GitHub 签名，声明里
     # 带着 run_id / base_ref / event_name / sha，PR 改不了也伪造不了；裁决层据此判断
-    # 「这次 Epic Full 是不是面向受保护分支的 PR 触发的」。id-token: write 只给本作业；
+    # 「这次 Epic Full 是不是面向默认分支的 PR 触发的」。id-token: write 只给本作业；
     # 本仓没有任何云端信任策略依赖这枚凭证，它只当签名记录用。
     permissions:
       contents: read
