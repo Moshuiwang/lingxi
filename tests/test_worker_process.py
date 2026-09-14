@@ -71,7 +71,7 @@ def _make_user_env_root(testcase: unittest.TestCase, *, seed_user_id: str | None
                     "mcpServers": {
                         "query": {
                             "type": "http",
-                            "url": "https://example.invalid/mcp",
+                            "url": "https://mcp.example.invalid/mcp",
                             "headers": {"Authorization": "Bearer test-token"},
                         }
                     }

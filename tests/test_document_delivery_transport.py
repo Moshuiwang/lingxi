@@ -134,7 +134,7 @@ def _seed_user_mcp_config(user_id: str) -> None:
                 "mcpServers": {
                     "query": {
                         "type": "http",
-                        "url": "https://example.invalid/mcp",
+                        "url": "https://mcp.example.invalid/mcp",
                         "headers": {"Authorization": "Bearer test-token"},
                     }
                 }
@@ -1689,6 +1689,7 @@ class WorkerDocumentRequestInsertionTestCase(unittest.TestCase):
             heartbeat_interval_seconds=0.05,
             poll_interval_seconds=0.05,
             user_env_root=_USER_ENV_ROOT_DIR.name,
+            query_mcp_endpoint="https://mcp.example.invalid/query",
         )
 
     def _document_request_rows(self, task_id: str) -> list[tuple[str, str]]:
