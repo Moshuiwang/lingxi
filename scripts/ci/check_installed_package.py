@@ -239,6 +239,9 @@ REQUIRED_MODULES = (
     "lingxi.core.content_redaction",
     # 问答留存语料（合同「数据保留与删除」第三条例外）：记录形状与构造在 core，落库在
     # adapters，worker 侧记录器按开关装配（见下面 PROCESS_RUNTIME_IMPORTS 的 worker 闭包）。
+    # 同两个模块的读取侧（检索 / 分批导出 / 容量 / 窄读取角色表）只被随 scheduler 镜像
+    # 运行的 `scripts/ops/qa_corpus.py` 在函数内 import，没有进程模块级 import——与
+    # outreach 那条受控运行脚本同一形状，制品少了它们脚本才会发现。
     "lingxi.core.qa_corpus",
     "lingxi.adapters.postgres_qa_corpus",
     # 同一张表的**到期删除**侧（对抗审查 2026-09-02 C-7）：由 lingxi-scheduler 的
