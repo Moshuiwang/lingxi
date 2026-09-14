@@ -648,6 +648,43 @@ class AgentTests(unittest.TestCase):
         self.assertEqual(sum("plan" in call["argv"] for call in deployer), 1)
         self.assertEqual(sum("apply" in call["argv"] for call in deployer), 2)
 
+    def test_stale_or_tampered_approval_is_rewritten_not_reused(self):
+        self.harness.state_for_old()
+        self.harness.set_env(DEPLOY_STATUS="running")
+        first_code, _ = self.run_agent()
+        self.assertEqual(first_code, 0)
+        approval_path = next(self.harness.state.glob("*.approval.json"))
+        plan_path = self.harness.state / (
+            json.loads(approval_path.read_text())["plan_id"] + ".plan.json"
+        )
+        plan = json.loads(plan_path.read_text())
+        good_approval = json.loads(approval_path.read_text())
+        # 假部署器把首个批准指纹记在标记文件里；此处只验证代理侧重写，先移除标记。
+        marker = self.harness.state / ".fake-approval-sha"
+        tampered = dict(good_approval)
+        tampered["plan_sha256"] = "f" * 64
+        stale = dict(good_approval)
+        stale["expires_at"] = time_value() - 5
+        for name, broken in (("tampered", tampered), ("stale", stale)):
+            with self.subTest(name=name):
+                _json(approval_path, broken)
+                marker.unlink(missing_ok=True)
+                with self.assertRaises(AGENT.AgentError):
+                    AGENT.validate_approval(plan, broken)
+                code, output = self.run_agent()
+                self.assertEqual(code, 0)
+                self.assertIn("approval_written", output)
+                self.assertNotIn("approval_reused", output)
+                rewritten = json.loads(approval_path.read_text())
+                self.assertNotEqual(rewritten, broken)
+                self.assertEqual(rewritten["plan_sha256"], AGENT.fingerprint(plan))
+                AGENT.validate_approval(plan, rewritten)
+                self.assertEqual(self.read_state()["approval_sha256"], AGENT.fingerprint(rewritten))
+                self.assertEqual(self.read_state()["plan_id"], plan["id"])
+        deployer = [call for call in self.calls() if call["kind"] == "deployer"]
+        self.assertEqual(sum("plan" in call["argv"] for call in deployer), 1)
+        self.assertEqual(sum("apply" in call["argv"] for call in deployer), 3)
+
     def test_old_release_comes_from_last_verified_plan_or_running_containers(self):
         self.harness.state_for_old()
         self.harness.set_env(DEPLOY_STATUS="running")
@@ -679,6 +716,45 @@ class AgentTests(unittest.TestCase):
         self.assertEqual(code, 0)
         request = next(self.harness.state.glob("*.request.json"))
         self.assertEqual(json.loads(request.read_text())["old"]["tag"], self.harness.old_tag)
+
+    def test_external_in_place_then_next_version_takes_old_from_running_containers(self):
+        # 第一轮：状态账仍指向 new.tag == v2.4.3 的旧计划，容器却已被外部装到 rc.10。
+        self.harness.state_for_old()
+        self.harness.set_env(DOCKER_MODE="match", DEPLOY_STATUS="running")
+        messages = []
+        code, _ = self.run_agent(sender=lambda message, env, timeout: messages.append(message))
+        self.assertEqual(code, 0)
+        state = self.read_state()
+        self.assertEqual(state["last_result"], "already_in_place_external")
+        self.assertEqual(state["deployer_state"], "verified")
+        self.assertEqual(state["target_tag"], self.harness.target_tag)
+        self.assertEqual(state["plan_id"], "old-plan")
+        self.assertFalse(list(self.harness.state.glob("*.request.json")))
+        # 第二轮：rc.11 到来，容器仍运行 rc.10；old 必须是 rc.10，不是旧计划的 v2.4.3。
+        next_tag = "v2.5.0-rc.11"
+        self.harness._make_manifest(next_tag, formal=False, seed="5")
+        self.harness.set_releases(
+            [
+                self.harness._release(self.harness.old_tag, False),
+                self.harness._release(self.harness.target_tag, True),
+                self.harness._release(next_tag, True),
+            ]
+        )
+        code, _ = self.run_agent(sender=lambda message, env, timeout: messages.append(message))
+        self.assertEqual(code, 0)
+        request = json.loads(next(self.harness.state.glob("*.request.json")).read_text())
+        self.assertEqual(request["new"]["tag"], next_tag)
+        self.assertEqual(request["old"]["tag"], self.harness.target_tag)
+        self.assertEqual(request["current_heads"], request["old"]["migration_heads"])
+        self.assertEqual(
+            request["recovery"]["target_manifest_sha256"], AGENT.fingerprint(request["old"])
+        )
+        self.assertNotEqual(
+            request["recovery"]["target_manifest_sha256"], AGENT.fingerprint(request["new"])
+        )
+        self.assertEqual(self.read_state()["target_tag"], next_tag)
+        self.assertEqual(self.read_state()["last_result"], "running")
+        self.assertEqual(messages, [])
 
     def test_recovery_target_never_points_at_new(self):
         self.harness.state_for_old()
@@ -838,8 +914,19 @@ class AgentTests(unittest.TestCase):
         self.assertGreaterEqual(int(timeout.split("=", 1)[1]), 3600)
         exec_line = next(line for line in service.splitlines() if line.startswith("ExecStart="))
         self.assertFalse(any("=" in arg for arg in exec_line.split()[1:]))
-        drop_in = (ROOT / "deploy/monitoring-units/10-local.conf.example").read_text()
-        self.assertRegex(drop_in, r"(?m)^User=<部署用户>$")
+        # 拉取代理的 drop-in 必须写 User=root（§八），仓库 service 只以注释说明它来自 drop-in。
+        self.assertNotRegex(service, r"(?m)^User=")
+        user_comments = [
+            line for line in service.splitlines() if line.startswith("#") and "User=" in line
+        ]
+        self.assertTrue(any("drop-in" in line for line in user_comments))
+        self.assertTrue(any("User=root" in line for line in user_comments))
+        document = (ROOT / "deploy/拉取代理.md").read_text()
+        self.assertIn(
+            "本机 drop-in `lingxi-release-pull.service.d/10-local.conf`，其中 `[Service]` 为 `User=root`",
+            document,
+        )
+        self.assertIn("仓库 service 不含活动的 `User=`", document)
 
     def test_control_bundle_files_include_agent_units_doc_and_examples(self):
         spec = importlib.util.spec_from_file_location(
