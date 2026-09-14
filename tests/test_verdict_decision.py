@@ -33,8 +33,6 @@ import time
 import unittest
 from pathlib import Path
 
-import yaml
-
 ROOT = Path(__file__).resolve().parents[1]
 SCRIPT = ROOT / "scripts/ci/verdict_decision.py"
 VERDICT_WORKFLOW = ROOT / ".github/workflows/verdict.yml"
@@ -878,36 +876,48 @@ def _jobs(workflow_code: str) -> list[str]:
     )
 
 
-def _contains_verdict_environment(value: object) -> bool:
-    if isinstance(value, dict):
-        environment = value.get("environment")
-        if environment == "verdict" or (
-            isinstance(environment, dict) and environment.get("name") == "verdict"
-        ):
-            return True
-        return any(_contains_verdict_environment(child) for child in value.values())
-    if isinstance(value, list):
-        return any(_contains_verdict_environment(child) for child in value)
-    return False
+VERDICT_ENVIRONMENT_MARKER = "environment: verdict"
+# 只允许出现在 verdict.yml 的标记：Environment `verdict`、两个 App 秘密、换 App 令牌的动作。
+VERDICT_ONLY_MARKERS = (
+    VERDICT_ENVIRONMENT_MARKER,
+    "secrets.VERDICT_APP_ID",
+    "secrets.VERDICT_APP_PRIVATE_KEY",
+    "actions/create-github-app-token",
+)
 
 
-def _raw_has_verdict_environment(text: str) -> bool:
-    lines = text.splitlines()
+def _verdict_environment_lines(workflow_code: str) -> list[str]:
+    """逐行找出把 Environment 设成 `verdict` 的行（不解析 YAML，测试不依赖 PyYAML）。
+
+    两种写法都算：标量写法 `environment: verdict`，以及 `environment:` 映射块里缩进更深的
+    `name: verdict`；允许加引号与行尾注释。整行注释由调用方先用 _strip_comments 去掉。
+    """
+    lines = workflow_code.splitlines()
+    hits = []
     for index, line in enumerate(lines):
         if re.fullmatch(r"\s*environment:\s*['\"]?verdict['\"]?\s*(?:#.*)?", line):
-            return True
+            hits.append(line)
+            continue
         if not re.fullmatch(r"\s*environment:\s*(?:#.*)?", line):
             continue
         environment_indent = len(line) - len(line.lstrip())
         for nested in lines[index + 1 :]:
-            if not nested.strip() or nested.lstrip().startswith("#"):
+            if not nested.strip():
                 continue
-            nested_indent = len(nested) - len(nested.lstrip())
-            if nested_indent <= environment_indent:
+            if len(nested) - len(nested.lstrip()) <= environment_indent:
                 break
             if re.fullmatch(r"\s*name:\s*['\"]?verdict['\"]?\s*(?:#.*)?", nested):
-                return True
-    return False
+                hits.append(nested)
+    return hits
+
+
+def _verdict_marker_hits(workflow_text: str) -> dict[str, int]:
+    """统计一份工作流原文里每个 VERDICT_ONLY_MARKERS 命中的行数，整行注释不计。"""
+    code = _strip_comments(workflow_text)
+    hits = {VERDICT_ENVIRONMENT_MARKER: len(_verdict_environment_lines(code))}
+    for marker in VERDICT_ONLY_MARKERS[1:]:
+        hits[marker] = sum(marker in line for line in code.splitlines())
+    return hits
 
 
 def _pyproject_cryptography_pin() -> str:
@@ -963,28 +973,17 @@ class VerdictWorkflowShapeTest(unittest.TestCase):
 
     def test_only_verdict_workflow_references_the_verdict_environment_and_app_secrets(self):
         workflows = sorted((ROOT / ".github/workflows").glob("*.yml"))
-        parsed_environment_hits = []
-        raw_environment_hits = []
-        raw_by_name = {}
-        for workflow in workflows:
-            raw = workflow.read_text(encoding="utf-8")
-            raw_by_name[workflow.name] = raw
-            parsed = yaml.safe_load(raw) or {}
-            if _contains_verdict_environment(parsed):
-                parsed_environment_hits.append(workflow.name)
-            if _raw_has_verdict_environment(raw):
-                raw_environment_hits.append(workflow.name)
-
-        self.assertEqual(parsed_environment_hits, ["verdict.yml"])
-        self.assertEqual(raw_environment_hits, ["verdict.yml"])
-        for marker in (
-            "secrets.VERDICT_APP_ID",
-            "secrets.VERDICT_APP_PRIVATE_KEY",
-            "actions/create-github-app-token",
-        ):
+        hits_by_name = {
+            workflow.name: _verdict_marker_hits(workflow.read_text(encoding="utf-8"))
+            for workflow in workflows
+        }
+        self.assertIn("verdict.yml", hits_by_name)
+        for marker in VERDICT_ONLY_MARKERS:
             with self.subTest(marker=marker):
+                # 先证明模式本身能命中 verdict.yml，免得模式写错后「其它工作流零命中」变成空断言。
+                self.assertGreaterEqual(hits_by_name["verdict.yml"][marker], 1)
                 self.assertEqual(
-                    [name for name, raw in raw_by_name.items() if marker in raw],
+                    [name for name, hits in hits_by_name.items() if hits[marker]],
                     ["verdict.yml"],
                 )
 
