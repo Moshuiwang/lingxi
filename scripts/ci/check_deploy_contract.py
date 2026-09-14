@@ -792,6 +792,84 @@ def check_content_capture_prod_guard() -> list[str]:
     return failures
 
 
+def check_qa_corpus_declaration() -> list[str]:
+    """问答留存语料开关（合同「数据保留与删除」第三条例外，Issue #664）的等价门禁。
+
+    这条通道**只在预发与生产开**，开关值写死在两份环境 compose 的 ``worker-queue``
+    ``environment:`` 块里——compose 的 ``environment:`` 覆盖 ``env_file``，抄 env 文件既开
+    不了也关不了，因此不需要内测采集那样的第二确认变量；等价的机械保证由本检查承担：
+
+    1. ``compose.stage.yaml`` 与 ``compose.prod.yaml`` 的 ``worker-queue`` 必须在
+       ``environment:`` 里声明该变量，值精确 ``"1"``、不得是 ``${}`` 插值——插值的默认值
+       与外部 env 文件一样可抄，会把「生产升级后开始写入」变回一个看部署者心情的事实。
+    2. 变量名不得出现在 ``compose.yaml`` / ``compose.innertest.yaml``（基线与内测覆盖不
+       该替环境做这个决定），也不得出现在两份环境 compose 的其它 service 块（一次性
+       ``worker`` job 走 turn 模式、没有任务标识，写了也是误导）。
+    3. ``deploy/.env.example`` 不得出现该变量的赋值行，只许注释说明「此项在 compose
+       声明」——示范一个不会生效的赋值就是在教人配错。
+    4. ``deploy/验收前部署配置清单.md`` 须登记。
+    """
+
+    variable = module_constant(WORKER_CONFIG, "QA_CORPUS_RETENTION_VAR")
+    if not variable:
+        return [
+            "读不到 apps/worker/config.py 的 QA_CORPUS_RETENTION_VAR（常量被重命名或改写成"
+            "非字面量赋值时，check_qa_corpus_declaration 需要同步更新）"
+        ]
+
+    failures: list[str] = []
+    for path in (COMPOSE_STAGE, COMPOSE_PROD):
+        text = strip_comments(read(path))
+        block = service_block(text, "worker-queue")
+        if block is None:
+            failures.append(f"{display(path)} 找不到 service `worker-queue`")
+            continue
+        declared = _environment_value(block, variable)
+        if declared is None:
+            failures.append(
+                f"{display(path)} 的 `worker-queue` 没有在 `environment:` 里声明 `{variable}`。"
+                "问答留存语料只靠这条入库声明开启；写进外部 env 文件不算——compose 的 "
+                "environment 覆盖 env_file，抄来的值既开不了也关不了。"
+            )
+        elif "${" in declared or declared.strip("\"'") != "1":
+            failures.append(
+                f"{display(path)} 的 `worker-queue` 声明 `{variable}: {declared}`，"
+                '值必须是精确的 "1" 字面量（不得用 ${} 插值）。apps/worker/config.py 只接受'
+                ' "1"，其它值启动即失败；插值等于把开关交回可抄的外部文件。'
+            )
+        if text.count(variable) > block.count(variable):
+            failures.append(
+                f"{display(path)} 在 `worker-queue` 之外也出现了 `{variable}`：只有常驻队列"
+                "消费者处理带任务标识的真实问数，别的 service 块写它只会误导。"
+            )
+
+    for path in (COMPOSE_BASE, COMPOSE_INNERTEST):
+        if variable in strip_comments(read(path)):
+            failures.append(
+                f"{display(path)} 中出现 {variable!r}：开关只在两份环境 compose 的 worker-queue "
+                "块声明，基线与内测覆盖文件不得替环境做这个决定。"
+            )
+
+    env_text = read(ENV_EXAMPLE)
+    if re.search(rf"^\s*{re.escape(variable)}=", env_text, re.MULTILINE):
+        failures.append(
+            f"deploy/.env.example 出现了 {variable} 的赋值行：这个值由 compose 的 environment "
+            "块声明，写进 env 文件不会生效，示范一个不生效的赋值就是在教人配错。"
+        )
+    elif variable not in env_text:
+        failures.append(
+            f"deploy/.env.example 没有提到 {variable}：至少要有一行注释说明它在 compose 声明、"
+            "不从 env 文件读，否则运维不知道这个开关存在。"
+        )
+
+    if variable not in read(DEPLOY_CHECKLIST):
+        failures.append(
+            f"deploy/验收前部署配置清单.md 未登记 {variable}：按本文件既有惯例，新增的配置项"
+            "须登记在清单里，说明它由哪里给值、缺失时行为如何。"
+        )
+    return failures
+
+
 def _volume_mounts(service_text: str) -> list[tuple[str, str, str | None]]:
     """解析某个 service 块下 ``volumes:`` 列表的每一项，返回
     ``(source, target, mode)`` 三元组列表；``mode`` 是 ``:ro``/``:rw`` 这类第三段
@@ -2363,6 +2441,7 @@ def main() -> int:
         ("闸⑤配置项 .env.example 示范覆盖", check_onboarding_gate_env_example),
         ("内测轮内容级采集正式环境防护", check_content_capture_prod_guard),
         ("生产覆盖声明部署环境", check_prod_declares_deploy_environment),
+        ("问答留存语料开关只由环境 compose 声明", check_qa_corpus_declaration),
         ("scheduler 用户环境卷挂载", check_scheduler_user_volume),
         ("worker-queue 工作目录与用户目录隔离", check_worker_workspace_isolation),
         ("六服务资源限制结构", check_resource_limits),
