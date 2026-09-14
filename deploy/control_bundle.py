@@ -31,6 +31,15 @@ FILES = (
     "deploy/control/sshd_config.example",
     "deploy/control/authorized_keys.example",
     "deploy/control/README.md",
+    "deploy/release_pull_agent.py",
+    "deploy/monitoring-units/lingxi-release-pull.service",
+    "deploy/monitoring-units/lingxi-release-pull.timer",
+    "deploy/拉取代理.md",
+    "deploy/control/引导安装.md",
+    "deploy/control/examples/host-contract.json",
+    "deploy/control/examples/public-config.json",
+    "deploy/control/examples/binding.json",
+    "deploy/control/examples/innertest-relay.json",
 )
 INDEX = "control-index.json"
 ASSET = "lingxi-control.tar"

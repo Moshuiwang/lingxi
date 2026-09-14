@@ -20,7 +20,16 @@ deploy = importlib.import_module("lingxi_deploy")
 
 
 def package(root):
-    contents = {name: (ROOT / name).read_bytes() for name in bundle.FILES}
+    # 本工作树刻意没有另一张卡交付的五份控制包示例；这里只在临时包内补齐
+    # 非秘密占位字节，不能把它们伪造回仓库，否则会掩盖两张卡的交付边界。
+    contents = {}
+    for name in bundle.FILES:
+        source = ROOT / name
+        contents[name] = (
+            source.read_bytes()
+            if source.is_file()
+            else ("temporary control fixture: " + name + "\n").encode()
+        )
     entries = [
         {
             "path": name,
