@@ -50,7 +50,8 @@ PINNED_SEARCH_PATH = "search_path=pg_catalog, pg_temp"
 CLEANUP_FUNCTION = "public.lingxi_retention_cleanup(timestamptz, integer)"
 RETENTION_WINDOW = timedelta(hours=2160)
 
-# 21 个函数逐个点名：19 个由 0096 固定，2 个（清理函数与删除防线）由 0054 建时即固定。
+# 23 个函数逐个点名：19 个由 0096 固定，2 个（清理函数与删除防线）由 0054 建时即固定，
+# 2 个（运营审计账的两只触发器）由 0097 建时即在定义语句里固定。
 ALTER_ONLY_FUNCTIONS = (
     "feishu_org_sync_run_fix_expiry",
     "galaxy_import_batch_fix_expiry",
@@ -75,7 +76,10 @@ REDEFINED_FUNCTIONS = (
     "app_user_adopt_prior_inbound",
 )
 ALREADY_PINNED_FUNCTIONS = ("lingxi_reject_premature_delete", "lingxi_retention_cleanup")
-ALL_PLPGSQL_FUNCTIONS = ALTER_ONLY_FUNCTIONS + REDEFINED_FUNCTIONS + ALREADY_PINNED_FUNCTIONS
+LATER_REVISION_FUNCTIONS = ("operation_audit_fix_expiry", "operation_audit_append_only")
+ALL_PLPGSQL_FUNCTIONS = (
+    ALTER_ONLY_FUNCTIONS + REDEFINED_FUNCTIONS + ALREADY_PINNED_FUNCTIONS + LATER_REVISION_FUNCTIONS
+)
 
 # (函数名, 必须出现的限定引用, 不得再出现的未限定引用)。7 处逐条列出。
 QUALIFIED_REFERENCES = (
@@ -343,7 +347,7 @@ class EveryFunctionIsPinnedTest(SearchPathPostgresTestCase):
             )
         }
         self.assertEqual(actual, set(ALL_PLPGSQL_FUNCTIONS))
-        self.assertEqual(len(ALL_PLPGSQL_FUNCTIONS), 21)
+        self.assertEqual(len(ALL_PLPGSQL_FUNCTIONS), 23)
 
     def test_the_seven_table_references_are_schema_qualified(self) -> None:
         for name, qualified, unqualified in QUALIFIED_REFERENCES:

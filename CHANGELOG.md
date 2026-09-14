@@ -8,6 +8,10 @@
 
 2.5.0 开发中（Trace [#770](https://github.com/Moshuiwang/lingxi/issues/770)），本节随批次合入逐条追加。
 
+### Added
+
+- **运营操作从此有一张持久的审计账**：新表 `operation_audit`（迁移 `0097`）记录每一次运营操作「谁发起、谁确认、谁执行、目的与目标范围、结果、证据指针」，只追加不可改、九十天后自动删除；此前这些只在进程日志里、跨进程不可关联。本批只建载体与读写口，预开通、欢迎卡、内测扩员三件操作的接入随后续切片（Issue [#788](https://github.com/Moshuiwang/lingxi/issues/788)）。
+
 ### Fixed
 
 - **预发权限发布表新增宿主侧备份、台账、差异、干跑撤回与读回核对守卫**：撤回只认预发 `publish_outbox` 台账中的外部记录标识，写表前备份与显式摘要确认成为升级前后的安全边界（Trace [#770](https://github.com/Moshuiwang/lingxi/issues/770)）。
