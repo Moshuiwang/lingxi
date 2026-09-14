@@ -1,22 +1,26 @@
-"""裁决层 `Epic Verdict` 的钉住用例：判定纯函数、两份工作流的形状、复跑上下文的调度。
+"""裁决层 `Epic Verdict` 的钉住用例：判定纯函数、凭证验签、三份工作流的形状、复跑上下文的调度。
 
-三组断言各挡一类退化：
+四组断言各挡一类退化：
 1. `scripts/ci/verdict_decision.py` 的每条规则——事件 / 路径先决、外部仓库判红、
    路径 a 只认 `success`（`skipped` / `neutral` / `cancelled` 都判红）、路径 b 等复跑、
-   `pull_requests[]` 为空的基线回退、check run 的查找与请求体。
-2. `.github/workflows/verdict.yml` 的安全形状——只由 `workflow_run` 触发、顶层只读、
+   备用基线只认受保护 base、check run 的查找与请求体。
+2. OIDC 身份凭证——本地 RSA 密钥对造 JWKS 与令牌：正确、`base_ref=x-attacker`、
+   `run_id` 不符、`aud` 不符、签名错、`sha` 不符、过期但其他都对（采信）、算法 / kid /
+   格式不对、制品缺失；只有凭证合格且子树相同才走路径 a。
+3. `.github/workflows/verdict.yml` 的安全形状——只由 `workflow_run` 触发、顶层只读、
    App 私钥只进 Environment `verdict` 那一个作业、写检查不用 GITHUB_TOKEN、本工作流
-   自己的 checkout 从不检出 PR 头提交、复跑经 `test_ref` 交给 main 版 `ci.yml`。
-3. `.github/workflows/ci.yml` 的 `test_ref` 消费——每个 checkout 步都带、复跑上下文
-   （event_name = workflow_run）下 classify 跳过、gate / extras / image 照跑、candidate
-   仍要求三者全 success 且不写候选证明。
+   自己的 checkout 从不检出 PR 头提交、decide 作业有验签与 JWKS 地址。
+4. `.github/workflows/ci.yml` 的 `test_ref` 消费与 `id-token: write` 只给 candidate 作业；
+   复跑上下文（event_name = workflow_run）下 classify 跳过、gate / extras / image 照跑、
+   candidate 仍要求三者全 success 且不写候选证明。
 
-变异实测：把 `map_run_conclusion` 改成 `conclusion in ("success", "skipped")`，
-`test_path_a_only_success_passes` 应判红；还原后清 `__pycache__` 复跑应绿。
+变异实测：把 `verify_signature` 改成不验直接返回声明，签名错的用例应判红；把
+`claim_problems` 里的 `base_ref` 检查放开，`x-attacker` 用例应判红；还原后复绿。
 """
 
 from __future__ import annotations
 
+import base64
 import importlib.util
 import json
 import os
@@ -25,6 +29,7 @@ import subprocess
 import sys
 import tempfile
 import textwrap
+import time
 import unittest
 from pathlib import Path
 
@@ -41,8 +46,10 @@ vd = importlib.import_module("verdict_decision")
 REPOSITORY = "Moshuiwang/lingxi"
 HEAD = "a" * 40
 BASE = "b" * 40
+MERGE = "e" * 40
 TREE_SAME = "c" * 40
 TREE_OTHER = "d" * 40
+RUN_ID = 123456
 
 
 def _load_by_path(path: Path, name: str):
@@ -65,7 +72,7 @@ def event(
     if pull_requests is None:
         pull_requests = [pull_request()]
     run = {
-        "id": 123456,
+        "id": RUN_ID,
         "event": run_event,
         "path": path,
         "head_sha": head_sha,
@@ -89,28 +96,35 @@ def facts(**kwargs):
     return vd.parse_run_facts(event(**kwargs))
 
 
-CLEAN = vd.Taint(status=vd.TAINT_QUERY_OK)
-
-
-def taint_from(*entries, status=vd.TAINT_QUERY_OK, default_branch="main"):
-    """按头分支的 PR 清单（state=all 形状）构造来源核验结果。"""
-
-    return vd.assess_taint(list(entries), default_branch, status)
-
-
-def head_branch_pull(number, base_ref, state="open", head_sha=HEAD):
-    return {
-        "number": number,
-        "state": state,
-        "base": {"ref": base_ref, "sha": "1" * 40},
-        "head": {"sha": head_sha},
+def good_claims(**overrides):
+    claims = {
+        "aud": vd.TOKEN_AUDIENCE,
+        "iss": vd.TOKEN_ISSUER,
+        "repository": REPOSITORY,
+        "run_id": str(RUN_ID),
+        "event_name": "pull_request",
+        "base_ref": "main",
+        "head_ref": "feat/x",
+        "sha": MERGE,
+        "ref": "refs/pull/700/merge",
+        "workflow_ref": f"{REPOSITORY}/.github/workflows/ci.yml@refs/pull/700/merge",
+        "exp": int(time.time()) + 600,
     }
+    claims.update(overrides)
+    return claims
 
 
-def decide(head_tree=TREE_SAME, base_tree=TREE_SAME, taint=CLEAN, **kwargs):
+OK_TOKEN = vd.TokenCheck(status=vd.TOKEN_OK, claims=good_claims())
+MISSING_TOKEN = vd.TokenCheck(status=vd.TOKEN_MISSING)
+BAD_TOKEN = vd.TokenCheck(
+    status=vd.TOKEN_INVALID, reasons=("base_ref='x-attacker' 不是受保护分支",)
+)
+
+
+def decide(head_tree=TREE_SAME, base_tree=TREE_SAME, token=OK_TOKEN, **kwargs):
     run_facts = facts(**kwargs)
     trees = vd.WorkflowTrees(head=head_tree, base=base_tree)
-    return vd.decide(run_facts, vd.select_baseline(run_facts), trees, taint)
+    return vd.decide(run_facts, vd.select_baseline(run_facts), trees, token)
 
 
 class DecisionRulesTest(unittest.TestCase):
@@ -130,7 +144,7 @@ class DecisionRulesTest(unittest.TestCase):
                 self.assertEqual(verdict.path, vd.PATH_SKIP)
                 self.assertFalse(verdict.write_check)
 
-    def test_fork_head_is_rejected_even_with_identical_trees(self):
+    def test_fork_head_is_rejected_even_with_a_good_token(self):
         for head_repository in ("someone/lingxi", "Moshuiwang/other", None, ""):
             with self.subTest(head_repository=head_repository):
                 verdict = decide(head_repository=head_repository)
@@ -163,14 +177,14 @@ class DecisionRulesTest(unittest.TestCase):
                 self.assertTrue(verdict.write_check)
                 self.assertEqual(verdict.conclusion, vd.FAILURE)
 
-    def test_path_a_summary_names_run_and_trees(self):
+    def test_path_a_summary_names_token_run_and_trees(self):
         verdict = decide()
         self.assertIn("路径 a", verdict.summary)
+        self.assertIn("身份凭证验签通过", verdict.summary)
         self.assertIn("123456", verdict.summary)
         self.assertIn(TREE_SAME, verdict.summary)
-        self.assertIn("main@" + BASE[:12], verdict.summary)
 
-    def test_changed_workflow_tree_takes_path_b_and_waits_for_rerun(self):
+    def test_changed_workflow_tree_takes_path_b_even_with_a_good_token(self):
         for head_tree, base_tree in (
             (TREE_OTHER, TREE_SAME),
             (None, TREE_SAME),
@@ -189,68 +203,23 @@ class DecisionRulesTest(unittest.TestCase):
                 self.assertTrue(vd.definitions_differ(vd.WorkflowTrees(head_tree, base_tree)))
         self.assertFalse(vd.definitions_differ(vd.WorkflowTrees(TREE_SAME, TREE_SAME)))
 
-    def test_head_identical_to_default_branch_but_not_to_base_still_reruns(self):
-        """头提交的定义与 main 相同、与基线 release/** 不同：不能据此采信触发运行。"""
-
-        verdict = decide(
-            head_tree=TREE_SAME,
-            base_tree=TREE_OTHER,
-            conclusion="success",
-            pull_requests=[pull_request(base_ref="release/2.5", base_sha="1" * 40)],
-        )
-        self.assertEqual((verdict.path, verdict.conclusion), (vd.PATH_B, None))
-        self.assertIn("不同", verdict.summary)
-
-    def test_helper_pull_request_to_attacker_branch_taints_even_when_closed(self):
-        """辅助 PR H→x 已关闭：按头分支 state=all 仍能看到，全部运行不得走路径 a。"""
-
-        taint = taint_from(
-            head_branch_pull(1, "main", state="open"),
-            head_branch_pull(2, "x-attacker", state="closed"),
-        )
-        self.assertTrue(taint.tainted)
-        verdict = decide(taint=taint, conclusion="success")
-        self.assertEqual((verdict.path, verdict.conclusion), (vd.PATH_B, None))
-        self.assertIn("#2→x-attacker（closed）", verdict.summary)
-        self.assertIn("不采信", verdict.summary)
-
-    def test_helper_pull_request_from_another_branch_name_taints_that_branch_only(self):
-        """辅助 PR 从分支 y 开到 x（run.head_branch = y）：y 的运行受染，诚实分支 feat 不受染。"""
-
-        malicious = taint_from(head_branch_pull(3, "x-attacker", state="open"))
-        self.assertEqual(decide(taint=malicious, conclusion="success").path, vd.PATH_B)
-        honest = taint_from(head_branch_pull(4, "main", state="open"))
-        self.assertFalse(honest.tainted)
-        verdict = decide(taint=honest, conclusion="success")
-        self.assertEqual((verdict.path, verdict.conclusion), (vd.PATH_A, vd.SUCCESS))
-
-    def test_honest_feature_branch_without_taint_takes_path_a(self):
-        clean = taint_from(
-            head_branch_pull(5, "main", state="closed"),
-            head_branch_pull(6, "release/2.5", state="open"),
-            head_branch_pull(7, "main", state="open"),
-        )
-        self.assertFalse(clean.tainted)
-        self.assertEqual(clean.summary, "来源核验通过")
-        verdict = decide(taint=clean, conclusion="success")
-        self.assertEqual((verdict.path, verdict.conclusion), (vd.PATH_A, vd.SUCCESS))
-        self.assertIn("来源核验通过", verdict.summary)
-
-    def test_failed_taint_query_is_not_the_same_as_no_taint(self):
-        for status in ("failed", "", "unknown", None):
-            with self.subTest(status=status):
-                taint = vd.assess_taint([], "main", status)
-                self.assertTrue(taint.tainted)
-                self.assertIn("来源核验失败", taint.summary)
-                verdict = decide(taint=taint, conclusion="success")
+    def test_missing_or_invalid_token_never_trusts_the_run_even_with_identical_trees(self):
+        for token, marker in ((MISSING_TOKEN, "没有身份凭证"), (BAD_TOKEN, "身份凭证不合格")):
+            with self.subTest(status=token.status):
+                verdict = decide(token=token, conclusion="success")
                 self.assertEqual((verdict.path, verdict.conclusion), (vd.PATH_B, None))
+                self.assertIn(marker, verdict.summary)
+                self.assertIn("不采信", verdict.summary)
 
-    def test_no_eligible_pull_request_never_trusts_the_run_even_with_identical_trees(self):
-        for pull_requests in ([], [pull_request(number=9, base_ref="x-attacker")]):
-            with self.subTest(pull_requests=pull_requests):
-                verdict = decide(pull_requests=pull_requests, conclusion="success")
-                self.assertEqual((verdict.path, verdict.conclusion), (vd.PATH_B, None))
-                self.assertIn("没有面向受保护分支的 PR", verdict.summary)
+    def test_pull_request_lists_do_not_influence_trust(self):
+        """事件里的 PR 关联（含攻击者的 PR→x）只影响备用基线，采信只看凭证。"""
+
+        attacker_only = [pull_request(number=1, base_ref="x-attacker", base_sha="1" * 40)]
+        self.assertEqual(decide(pull_requests=attacker_only, token=OK_TOKEN).path, vd.PATH_A)
+        self.assertEqual(decide(pull_requests=[], token=OK_TOKEN).path, vd.PATH_A)
+        self.assertEqual(
+            decide(pull_requests=[pull_request()], token=MISSING_TOKEN).path, vd.PATH_B
+        )
 
     def test_path_b_success_of_own_run_is_never_trusted(self):
         verdict = decide(head_tree=TREE_OTHER, conclusion="success")
@@ -258,6 +227,184 @@ class DecisionRulesTest(unittest.TestCase):
         self.assertEqual(
             vd.finalize(verdict.path, None, "failure", verdict.summary).conclusion, vd.FAILURE
         )
+
+
+def _b64url(data: bytes) -> str:
+    return base64.urlsafe_b64encode(data).rstrip(b"=").decode("ascii")
+
+
+class TokenFixtures:
+    """本地 RSA 密钥对：造 JWKS，签令牌。只在测试里生成，永不进仓库。"""
+
+    @classmethod
+    def build(cls):
+        from cryptography.hazmat.primitives.asymmetric import rsa
+
+        fixtures = cls()
+        fixtures.key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+        fixtures.other_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+        fixtures.kid = "test-key-1"
+        fixtures.jwks = {"keys": [cls.jwk(fixtures.key, fixtures.kid)]}
+        return fixtures
+
+    @staticmethod
+    def jwk(key, kid: str) -> dict:
+        numbers = key.public_key().public_numbers()
+        return {
+            "kty": "RSA",
+            "kid": kid,
+            "use": "sig",
+            "alg": "RS256",
+            "n": _b64url(numbers.n.to_bytes((numbers.n.bit_length() + 7) // 8, "big")),
+            "e": _b64url(numbers.e.to_bytes((numbers.e.bit_length() + 7) // 8, "big")),
+        }
+
+    def token(self, claims: dict, *, key=None, header: dict | None = None) -> str:
+        from cryptography.hazmat.primitives import hashes
+        from cryptography.hazmat.primitives.asymmetric import padding
+
+        header = header or {"alg": "RS256", "typ": "JWT", "kid": self.kid}
+        signing_input = (
+            _b64url(json.dumps(header, separators=(",", ":")).encode())
+            + "."
+            + _b64url(json.dumps(claims, separators=(",", ":")).encode())
+        )
+        signature = (key or self.key).sign(
+            signing_input.encode("ascii"), padding.PKCS1v15(), hashes.SHA256()
+        )
+        return signing_input + "." + _b64url(signature)
+
+
+DEFAULT = object()
+EXPECTED = vd.ExpectedClaims(
+    repository=REPOSITORY, run_id=str(RUN_ID), head_sha=HEAD, default_branch="main"
+)
+MERGE_PARENTS = (BASE, HEAD)
+
+
+class TokenVerificationTest(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.fx = TokenFixtures.build()
+
+    def check(
+        self, claims=None, *, token=DEFAULT, jwks=None, parents=MERGE_PARENTS, expected=EXPECTED
+    ):
+        text = token if token is not DEFAULT else self.fx.token(claims or good_claims())
+        return vd.check_token(text, self.fx.jwks if jwks is None else jwks, expected, parents)
+
+    def test_correct_token_is_accepted_and_exposes_base_ref_and_pull_request(self):
+        result = self.check()
+        self.assertEqual((result.status, result.reasons), (vd.TOKEN_OK, ()))
+        self.assertTrue(result.ok)
+        self.assertEqual(
+            (result.base_ref, result.sha, result.pull_request_number), ("main", MERGE, 700)
+        )
+        self.assertIn("run 123456", result.summary)
+
+    def test_base_ref_outside_protected_branches_is_rejected(self):
+        for base_ref in ("x-attacker", "refs/heads/x-attacker", "epic/a", "trace/770", "", None):
+            with self.subTest(base_ref=base_ref):
+                result = self.check(good_claims(base_ref=base_ref))
+                self.assertEqual(result.status, vd.TOKEN_INVALID)
+                self.assertTrue(
+                    any("base_ref" in reason for reason in result.reasons), result.reasons
+                )
+        for base_ref in ("main", "refs/heads/main", "release/2.5", "refs/heads/release/2.5"):
+            with self.subTest(base_ref=base_ref):
+                self.assertTrue(self.check(good_claims(base_ref=base_ref)).ok)
+
+    def test_run_id_mismatch_is_rejected(self):
+        for run_id in ("123457", 123457, "", None):
+            with self.subTest(run_id=run_id):
+                result = self.check(good_claims(run_id=run_id))
+                self.assertEqual(result.status, vd.TOKEN_INVALID)
+                self.assertTrue(any(reason.startswith("run_id=") for reason in result.reasons))
+        self.assertTrue(self.check(good_claims(run_id=RUN_ID)).ok)
+
+    def test_audience_mismatch_is_rejected(self):
+        for aud in ("other", ["other"], "", None, ["lingxi-epic-verdict-2"]):
+            with self.subTest(aud=aud):
+                result = self.check(good_claims(aud=aud))
+                self.assertEqual(result.status, vd.TOKEN_INVALID)
+                self.assertTrue(any(reason.startswith("aud=") for reason in result.reasons))
+        self.assertTrue(self.check(good_claims(aud=[vd.TOKEN_AUDIENCE, "other"])).ok)
+
+    def test_wrong_signature_is_rejected(self):
+        forged = self.fx.token(good_claims(), key=self.fx.other_key)
+        result = self.check(token=forged)
+        self.assertEqual(result.status, vd.TOKEN_INVALID)
+        self.assertEqual(result.reasons, ("凭证签名不符",))
+        self.assertEqual(result.claims, {})
+        tampered = self.fx.token(good_claims()).rsplit(".", 1)[0] + "." + _b64url(b"\x00" * 256)
+        self.assertEqual(self.check(token=tampered).status, vd.TOKEN_INVALID)
+
+    def test_sha_must_bind_to_the_head_commit(self):
+        unbound = self.check(good_claims(sha="9" * 40), parents=(BASE, "8" * 40))
+        self.assertEqual(unbound.status, vd.TOKEN_INVALID)
+        self.assertTrue(any(reason.startswith("sha=") for reason in unbound.reasons))
+        self.assertEqual(self.check(good_claims(), parents=None).status, vd.TOKEN_INVALID)
+        self.assertEqual(self.check(good_claims(), parents=()).status, vd.TOKEN_INVALID)
+        self.assertTrue(self.check(good_claims(sha=HEAD), parents=None).ok)
+        self.assertTrue(self.check(good_claims(), parents=MERGE_PARENTS).ok)
+
+    def test_expired_token_is_still_accepted_when_everything_else_matches(self):
+        result = self.check(good_claims(exp=int(time.time()) - 86400))
+        self.assertTrue(result.ok)
+
+    def test_algorithm_kid_and_format_are_enforced(self):
+        none_alg = self.fx.token(
+            good_claims(), header={"alg": "none", "typ": "JWT", "kid": self.fx.kid}
+        )
+        self.assertEqual(self.check(token=none_alg).status, vd.TOKEN_INVALID)
+        hs256 = self.fx.token(
+            good_claims(), header={"alg": "HS256", "typ": "JWT", "kid": self.fx.kid}
+        )
+        self.assertEqual(self.check(token=hs256).status, vd.TOKEN_INVALID)
+        unknown_kid = self.fx.token(
+            good_claims(), header={"alg": "RS256", "typ": "JWT", "kid": "nope"}
+        )
+        self.assertEqual(self.check(token=unknown_kid).status, vd.TOKEN_INVALID)
+        for broken in ("not-a-jwt", "a.b", "a.b.c", ""):
+            with self.subTest(broken=broken):
+                status = self.check(token=broken).status
+                self.assertIn(status, (vd.TOKEN_INVALID, vd.TOKEN_MISSING))
+        self.assertEqual(self.check(token=None).status, vd.TOKEN_MISSING)
+        self.assertEqual(self.check(jwks={}).status, vd.TOKEN_INVALID)
+
+    def test_other_claims_are_enforced(self):
+        cases = {
+            "event_name": ("workflow_dispatch", "workflow_run", ""),
+            "repository": ("Moshuiwang/other", "someone/lingxi", ""),
+            "iss": ("https://token.actions.githubusercontent.com/evil", "", None),
+            "workflow_ref": (
+                f"{REPOSITORY}/.github/workflows/fake.yml@refs/pull/700/merge",
+                "someone/lingxi/.github/workflows/ci.yml@refs/pull/700/merge",
+                "",
+            ),
+        }
+        for claim, values in cases.items():
+            for value in values:
+                with self.subTest(claim=claim, value=value):
+                    result = self.check(good_claims(**{claim: value}))
+                    self.assertEqual(result.status, vd.TOKEN_INVALID)
+                    self.assertTrue(
+                        any(reason.startswith(f"{claim}=") for reason in result.reasons)
+                    )
+
+    def test_base_commitish_prefers_the_merge_parent(self):
+        run_facts = facts()
+        self.assertEqual(vd.base_commitish_for(OK_TOKEN, run_facts, MERGE_PARENTS), BASE)
+        direct = vd.TokenCheck(status=vd.TOKEN_OK, claims=good_claims(sha=HEAD))
+        self.assertEqual(vd.base_commitish_for(direct, run_facts, ()), "main")
+
+    def test_decide_trusts_only_a_verified_token(self):
+        verified = self.check()
+        self.assertEqual(decide(token=verified).path, vd.PATH_A)
+        self.assertEqual(
+            decide(token=self.check(good_claims(base_ref="x-attacker"))).path, vd.PATH_B
+        )
+        self.assertEqual(decide(token=self.check(token=None)).path, vd.PATH_B)
 
 
 class FinalizeTest(unittest.TestCase):
@@ -288,10 +435,10 @@ class FinalizeTest(unittest.TestCase):
                     vd.finalize(path, conclusion, "success", "s")
 
 
-class BaselineSelectionTest(unittest.TestCase):
-    def test_pull_request_to_unprotected_base_is_ignored(self):
-        """base 不是默认分支也不是 release/**：不能当基线，也不贴标签（pr 为空）。"""
+class FallbackBaselineTest(unittest.TestCase):
+    """凭证不可用时的备用基线：只认受保护 base；它只影响标签与差异清单。"""
 
+    def test_pull_request_to_unprotected_base_is_ignored(self):
         for base_ref in (
             "x-attacker",
             "feat/other",
@@ -301,93 +448,40 @@ class BaselineSelectionTest(unittest.TestCase):
             "releases/1",
         ):
             with self.subTest(base_ref=base_ref):
-                run_facts = facts(pull_requests=[pull_request(number=5, base_ref=base_ref)])
-                baseline = vd.select_baseline(run_facts)
+                baseline = vd.select_baseline(facts(pull_requests=[pull_request(5, base_ref)]))
                 self.assertIsNone(baseline.pull_request)
-                self.assertEqual((baseline.base_ref, baseline.base_sha), ("main", ""))
+                self.assertEqual(
+                    (baseline.base_ref, baseline.base_sha, baseline.label), ("main", "", "main")
+                )
         self.assertTrue(vd.is_protected_base("main", "main"))
         self.assertTrue(vd.is_protected_base("release/2.5", "main"))
         self.assertFalse(vd.is_protected_base("x-attacker", "main"))
         self.assertFalse(vd.is_protected_base("", "main"))
 
-    def test_attacker_branch_pull_request_cannot_shadow_the_main_pull_request(self):
-        """[PR→x-attacker, PR→main]：x 的子树与头提交相同也不算数，按 main 比较走路径 b。"""
-
-        attacker = pull_request(number=1, base_ref="x-attacker", base_sha="1" * 40)
-        real = pull_request(number=2, base_ref="main", base_sha=BASE)
-        run_facts = facts(pull_requests=[attacker, real], conclusion="success")
-        baseline = vd.select_baseline(run_facts)
-        self.assertEqual(baseline.pull_request.number, 2)
-        trees = vd.WorkflowTrees(head=TREE_OTHER, base=TREE_SAME)
-        verdict = vd.decide(run_facts, baseline, trees, CLEAN)
-        self.assertEqual((verdict.path, verdict.conclusion), (vd.PATH_B, None))
-
-    def test_only_attacker_branch_pull_request_falls_back_to_default_branch(self):
-        """只有 PR→x：基线暂取默认分支（只为比对与标签），子树相同与否都复跑。"""
-
-        run_facts = facts(
-            pull_requests=[pull_request(number=1, base_ref="x-attacker", base_sha="1" * 40)]
-        )
-        baseline = vd.select_baseline(run_facts)
-        self.assertIsNone(baseline.pull_request)
-        self.assertEqual(baseline.label, "main")
-        trees = vd.WorkflowTrees(head=TREE_OTHER, base=TREE_SAME)
-        self.assertEqual(vd.decide(run_facts, baseline, trees, CLEAN).path, vd.PATH_B)
-        same = vd.WorkflowTrees(head=TREE_SAME, base=TREE_SAME)
-        self.assertEqual(vd.decide(run_facts, baseline, same, CLEAN).path, vd.PATH_B)
-
-    def test_default_branch_base_is_preferred_over_release_base(self):
+    def test_default_branch_base_is_preferred_then_matching_head(self):
         release = pull_request(number=1, base_ref="release/2.5", base_sha="1" * 40, head_sha=HEAD)
-        main = pull_request(number=2, base_ref="main", base_sha=BASE, head_sha="9" * 40)
-        baseline = vd.select_baseline(facts(pull_requests=[release, main]))
-        self.assertEqual(baseline.pull_request.number, 2)
+        main_stale = pull_request(number=2, base_ref="main", base_sha=BASE, head_sha="9" * 40)
+        main_current = pull_request(number=3, base_ref="main", base_sha=BASE, head_sha=HEAD)
+        self.assertEqual(
+            vd.select_baseline(facts(pull_requests=[release, main_stale])).pull_request.number, 2
+        )
+        self.assertEqual(
+            vd.select_baseline(facts(pull_requests=[main_stale, main_current])).pull_request.number,
+            3,
+        )
         only_release = vd.select_baseline(facts(pull_requests=[release]))
         self.assertEqual(
-            (only_release.pull_request.number, only_release.base_ref), (1, "release/2.5")
+            (only_release.pull_request.number, only_release.label), (1, "release/2.5@" + "1" * 12)
         )
-
-    def test_fallback_lookup_obeys_the_same_base_rule(self):
-        fallback = [
-            pull_request(number=11, base_ref="x-attacker", base_sha="1" * 40),
-            pull_request(number=12, base_ref="main", base_sha=BASE),
-        ]
-        baseline = vd.select_baseline(vd.parse_run_facts(event(pull_requests=[]), fallback))
-        self.assertEqual(baseline.pull_request.number, 12)
-        only_bad = vd.select_baseline(vd.parse_run_facts(event(pull_requests=[]), fallback[:1]))
-        self.assertIsNone(only_bad.pull_request)
-
-    def test_prefers_pull_request_whose_head_matches_run(self):
-        stale = pull_request(number=1, base_ref="release/2.5", base_sha="1" * 40, head_sha="9" * 40)
-        current = pull_request(number=2, base_ref="main", base_sha=BASE, head_sha=HEAD)
-        baseline = vd.select_baseline(facts(pull_requests=[stale, current]))
-        self.assertEqual(baseline.pull_request.number, 2)
-        self.assertEqual((baseline.base_ref, baseline.base_sha), ("main", BASE))
-        self.assertEqual(baseline.label, "main@" + BASE[:12])
-
-    def test_falls_back_to_first_pull_request_when_no_head_matches(self):
-        stale = pull_request(number=1, base_ref="release/2.5", base_sha="1" * 40, head_sha="9" * 40)
-        baseline = vd.select_baseline(facts(pull_requests=[stale]))
-        self.assertEqual(baseline.pull_request.number, 1)
-        self.assertEqual(baseline.base_ref, "release/2.5")
 
     def test_empty_pull_requests_uses_fallback_lookup_then_default_branch(self):
-        fallback = [pull_request(number=42, base_ref="main", base_sha=BASE)]
+        fallback = [pull_request(number=42), pull_request(number=43, base_ref="x-attacker")]
         with_fallback = vd.parse_run_facts(event(pull_requests=[]), fallback)
-        self.assertEqual([pr.number for pr in with_fallback.pull_requests], [42])
-        without = vd.parse_run_facts(event(pull_requests=[]), [])
-        baseline = vd.select_baseline(without)
-        self.assertIsNone(baseline.pull_request)
-        self.assertEqual(
-            (baseline.base_ref, baseline.base_sha, baseline.label), ("main", "", "main")
-        )
-        trees = vd.WorkflowTrees(head=TREE_SAME, base=TREE_SAME)
-        verdict = vd.decide(without, baseline, trees, CLEAN)
-        self.assertEqual((verdict.path, verdict.conclusion), (vd.PATH_B, None))
-
-    def test_fallback_is_ignored_when_event_already_lists_pull_requests(self):
-        fallback = [pull_request(number=42)]
-        run_facts = vd.parse_run_facts(event(pull_requests=[pull_request(number=7)]), fallback)
-        self.assertEqual([pr.number for pr in run_facts.pull_requests], [7])
+        self.assertEqual(vd.select_baseline(with_fallback).pull_request.number, 42)
+        without = vd.select_baseline(vd.parse_run_facts(event(pull_requests=[]), []))
+        self.assertIsNone(without.pull_request)
+        ignored = vd.parse_run_facts(event(pull_requests=[pull_request(number=7)]), fallback)
+        self.assertEqual([pr.number for pr in ignored.pull_requests], [7])
 
 
 class TreeDiffAndCheckRunTest(unittest.TestCase):
@@ -443,6 +537,10 @@ class TreeDiffAndCheckRunTest(unittest.TestCase):
 class CommandLineTest(unittest.TestCase):
     """命令行入口按工作流的调用方式各跑一遍（`python -B`，不留字节码）。"""
 
+    @classmethod
+    def setUpClass(cls):
+        cls.fx = TokenFixtures.build()
+
     def run_cli(self, *args, stdin_text=None):
         result = subprocess.run(
             [sys.executable, "-B", str(SCRIPT), *args],
@@ -466,48 +564,121 @@ class CommandLineTest(unittest.TestCase):
             index = end + 1
         return outputs
 
-    def test_plan_then_decide_path_b_writes_outputs_and_diff(self):
+    def write_fixtures(self, temp: Path, claims: dict, *, parents=MERGE_PARENTS, with_token=True):
+        (temp / "event.json").write_text(json.dumps(event(conclusion="success")), encoding="utf-8")
+        (temp / "fallback.json").write_text("[]", encoding="utf-8")
+        (temp / "jwks.json").write_text(json.dumps(self.fx.jwks), encoding="utf-8")
+        if with_token:
+            (temp / "token.jwt").write_text(self.fx.token(claims), encoding="utf-8")
+        if parents is not None:
+            (temp / "parents.json").write_text(json.dumps(list(parents)), encoding="utf-8")
+        (temp / "base.json").write_text(
+            json.dumps([{"path": "ci.yml", "sha": "1", "type": "blob"}]), encoding="utf-8"
+        )
+        (temp / "head.json").write_text(
+            json.dumps([{"path": "ci.yml", "sha": "2", "type": "blob"}]), encoding="utf-8"
+        )
+
+    def situation_args(self, temp: Path) -> list[str]:
+        return [
+            "--event-file",
+            str(temp / "event.json"),
+            "--fallback-pulls-file",
+            str(temp / "fallback.json"),
+            "--token-file",
+            str(temp / "token.jwt"),
+            "--jwks-file",
+            str(temp / "jwks.json"),
+            "--merge-parents-file",
+            str(temp / "parents.json"),
+        ]
+
+    def test_verify_plan_decide_with_a_good_token_take_path_a(self):
         with tempfile.TemporaryDirectory() as directory:
             temp = Path(directory)
-            (temp / "event.json").write_text(
-                json.dumps(event(conclusion="success")), encoding="utf-8"
+            self.write_fixtures(temp, good_claims())
+            verify_out = temp / "verify.txt"
+            self.run_cli("verify", *self.situation_args(temp), "--github-output", str(verify_out))
+            verify = self.parse_outputs(verify_out)
+            self.assertEqual(
+                (verify["token_status"], verify["token_sha"], verify["head_sha"]),
+                ("ok", MERGE, HEAD),
             )
-            (temp / "fallback.json").write_text("[]", encoding="utf-8")
-            (temp / "base.json").write_text(
-                json.dumps([{"path": "ci.yml", "sha": "1", "type": "blob"}]), encoding="utf-8"
-            )
-            (temp / "head.json").write_text(
-                json.dumps([{"path": "ci.yml", "sha": "2", "type": "blob"}]), encoding="utf-8"
-            )
-            (temp / "head-branch-pulls.json").write_text(
-                json.dumps([head_branch_pull(700, "main")]), encoding="utf-8"
-            )
-            plan_output = temp / "plan.txt"
-            self.run_cli(
-                "plan",
-                "--event-file",
-                str(temp / "event.json"),
-                "--fallback-pulls-file",
-                str(temp / "fallback.json"),
-                "--github-output",
-                str(plan_output),
-            )
-            plan = self.parse_outputs(plan_output)
+            plan_out = temp / "plan.txt"
+            self.run_cli("plan", *self.situation_args(temp), "--github-output", str(plan_out))
+            plan = self.parse_outputs(plan_out)
             self.assertEqual(plan["needs_trees"], "true")
             self.assertEqual(
-                (plan["head_sha"], plan["pr_number"], plan["base_sha"]), (HEAD, "700", BASE)
+                (plan["pr_number"], plan["base_sha"], plan["base_label"]),
+                ("700", BASE, "main@" + BASE[:12]),
             )
-            decide_output = temp / "decide.txt"
+            self.assertEqual(plan["token_status"], "ok")
+            decide_out = temp / "decide.txt"
             self.run_cli(
                 "decide",
-                "--event-file",
-                str(temp / "event.json"),
-                "--fallback-pulls-file",
-                str(temp / "fallback.json"),
-                "--head-branch-pulls-file",
-                str(temp / "head-branch-pulls.json"),
-                "--taint-query-status",
-                "ok",
+                *self.situation_args(temp),
+                "--head-tree",
+                TREE_SAME,
+                "--base-tree",
+                TREE_SAME,
+                "--github-output",
+                str(decide_out),
+            )
+            outputs = self.parse_outputs(decide_out)
+            self.assertEqual((outputs["path"], outputs["conclusion"]), (vd.PATH_A, vd.SUCCESS))
+            self.assertEqual(
+                (outputs["definitions_changed"], outputs["pr_number"]), ("false", "700")
+            )
+
+    def test_verify_reports_signature_problems_before_merge_parents_are_known(self):
+        with tempfile.TemporaryDirectory() as directory:
+            temp = Path(directory)
+            self.write_fixtures(temp, good_claims(), parents=None)
+            out = temp / "verify.txt"
+            self.run_cli("verify", *self.situation_args(temp), "--github-output", str(out))
+            self.assertEqual(self.parse_outputs(out)["token_status"], "ok")
+            (temp / "token.jwt").write_text(
+                self.fx.token(good_claims(), key=self.fx.other_key), encoding="utf-8"
+            )
+            out2 = temp / "verify2.txt"
+            self.run_cli("verify", *self.situation_args(temp), "--github-output", str(out2))
+            bad = self.parse_outputs(out2)
+            self.assertEqual((bad["token_status"], bad["token_sha"]), ("invalid", ""))
+            self.assertIn("签名不符", bad["token_reasons"])
+
+    def test_decide_with_attacker_base_token_or_missing_token_takes_path_b(self):
+        for claims, with_token, marker in (
+            (good_claims(base_ref="x-attacker"), True, "不是受保护分支"),
+            (good_claims(), False, "没有身份凭证"),
+        ):
+            with self.subTest(marker=marker):
+                with tempfile.TemporaryDirectory() as directory:
+                    temp = Path(directory)
+                    self.write_fixtures(temp, claims, with_token=with_token)
+                    decide_out = temp / "decide.txt"
+                    self.run_cli(
+                        "decide",
+                        *self.situation_args(temp),
+                        "--head-tree",
+                        TREE_SAME,
+                        "--base-tree",
+                        TREE_SAME,
+                        "--github-output",
+                        str(decide_out),
+                    )
+                    outputs = self.parse_outputs(decide_out)
+                    self.assertEqual((outputs["path"], outputs["conclusion"]), (vd.PATH_B, ""))
+                    self.assertEqual(outputs["definitions_changed"], "false")
+                    self.assertIn(marker, outputs["summary"])
+
+    def test_decide_path_b_with_changed_definitions_emits_diff_and_finalize_maps_rerun(self):
+        with tempfile.TemporaryDirectory() as directory:
+            temp = Path(directory)
+            self.write_fixtures(temp, good_claims())
+            decide_out = temp / "decide.txt"
+            self.run_cli(
+                "decide",
+                *self.situation_args(temp),
                 "--head-tree",
                 TREE_OTHER,
                 "--base-tree",
@@ -517,16 +688,12 @@ class CommandLineTest(unittest.TestCase):
                 "--base-listing-file",
                 str(temp / "base.json"),
                 "--github-output",
-                str(decide_output),
+                str(decide_out),
             )
-            outputs = self.parse_outputs(decide_output)
-            self.assertEqual(outputs["path"], vd.PATH_B)
-            self.assertEqual(outputs["write_check"], "true")
-            self.assertEqual(outputs["conclusion"], "")
-            self.assertEqual(outputs["definitions_changed"], "true")
+            outputs = self.parse_outputs(decide_out)
+            self.assertEqual((outputs["path"], outputs["definitions_changed"]), (vd.PATH_B, "true"))
             self.assertEqual(json.loads(outputs["diff"]), ["修改 `ci.yml`"])
-            self.assertEqual(outputs["pr_number"], "700")
-            final_output = temp / "final.txt"
+            final_out = temp / "final.txt"
             self.run_cli(
                 "finalize",
                 "--path",
@@ -538,9 +705,9 @@ class CommandLineTest(unittest.TestCase):
                 "--summary",
                 outputs["summary"],
                 "--github-output",
-                str(final_output),
+                str(final_out),
             )
-            final = self.parse_outputs(final_output)
+            final = self.parse_outputs(final_out)
             self.assertEqual(final["conclusion"], vd.FAILURE)
             self.assertIn("复跑结果 cancelled → failure", final["summary"])
 
@@ -555,8 +722,10 @@ class CommandLineTest(unittest.TestCase):
                 "plan", "--event-file", str(temp / "event.json"), "--github-output", str(output)
             )
             plan = self.parse_outputs(output)
-            self.assertEqual(plan["needs_trees"], "false")
-            self.assertEqual(plan["pr_number"], "")
+            self.assertEqual(
+                (plan["needs_trees"], plan["pr_number"], plan["token_status"]),
+                ("false", "", "missing"),
+            )
             decide_output = temp / "decide.txt"
             self.run_cli(
                 "decide",
@@ -567,44 +736,6 @@ class CommandLineTest(unittest.TestCase):
             )
             outputs = self.parse_outputs(decide_output)
             self.assertEqual((outputs["path"], outputs["write_check"]), (vd.PATH_SKIP, "false"))
-
-    def test_decide_cli_reruns_when_a_closed_helper_pull_request_taints_the_branch(self):
-        """定义与基线相同也不采信：路径 b 且 definitions_changed=false（不贴标签、无差异）。"""
-
-        with tempfile.TemporaryDirectory() as directory:
-            temp = Path(directory)
-            (temp / "event.json").write_text(
-                json.dumps(event(conclusion="success")), encoding="utf-8"
-            )
-            (temp / "head-branch-pulls.json").write_text(
-                json.dumps(
-                    [head_branch_pull(700, "main"), head_branch_pull(701, "x-attacker", "closed")]
-                ),
-                encoding="utf-8",
-            )
-            for status, marker in (("ok", "#701→x-attacker（closed）"), ("failed", "来源核验失败")):
-                with self.subTest(status=status):
-                    decide_output = temp / f"decide-{status}.txt"
-                    self.run_cli(
-                        "decide",
-                        "--event-file",
-                        str(temp / "event.json"),
-                        "--head-branch-pulls-file",
-                        str(temp / "head-branch-pulls.json"),
-                        "--taint-query-status",
-                        status,
-                        "--head-tree",
-                        TREE_SAME,
-                        "--base-tree",
-                        TREE_SAME,
-                        "--github-output",
-                        str(decide_output),
-                    )
-                    outputs = self.parse_outputs(decide_output)
-                    self.assertEqual((outputs["path"], outputs["conclusion"]), (vd.PATH_B, ""))
-                    self.assertEqual(outputs["definitions_changed"], "false")
-                    self.assertEqual(json.loads(outputs["diff"]), [])
-                    self.assertIn(marker, outputs["summary"])
 
     def test_check_run_existing_and_payload_commands(self):
         listing = json.dumps(
@@ -674,7 +805,8 @@ def _job_body(workflow: str, job_name: str) -> str:
 
 
 def _strip_comments(text: str) -> str:
-    return "\n".join(line for line in text.splitlines() if not line.lstrip().startswith("#"))
+    kept = [line for line in text.splitlines() if not line.lstrip().startswith("#")]
+    return "\n".join(kept) + "\n"
 
 
 def _top_level_block(workflow: str, key: str) -> str:
@@ -685,14 +817,25 @@ def _top_level_block(workflow: str, key: str) -> str:
     return match.group(1)
 
 
+def _jobs(workflow_code: str) -> list[str]:
+    return re.findall(
+        r"^  ([A-Za-z0-9_-]+):\n", _top_level_block(workflow_code, "jobs"), re.MULTILINE
+    )
+
+
+def _pyproject_cryptography_pin() -> str:
+    text = (ROOT / "pyproject.toml").read_text(encoding="utf-8")
+    match = re.search(r'"cryptography==([0-9][0-9A-Za-z.]*)"', text)
+    assert match is not None
+    return match.group(1)
+
+
 class VerdictWorkflowShapeTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.raw = VERDICT_WORKFLOW.read_text(encoding="utf-8")
         cls.text = _strip_comments(cls.raw)
-        cls.jobs = re.findall(
-            r"^  ([A-Za-z0-9_-]+):\n", _top_level_block(cls.text, "jobs"), re.MULTILINE
-        )
+        cls.jobs = _jobs(cls.text)
 
     def test_triggered_only_by_completed_epic_full_runs(self):
         on_block = _top_level_block(self.text, "on")
@@ -712,7 +855,7 @@ class VerdictWorkflowShapeTest(unittest.TestCase):
     def test_top_level_permissions_are_read_only(self):
         self.assertEqual(_top_level_block(self.text, "permissions").strip(), "contents: read")
 
-    def test_every_job_declares_permissions_without_write_to_contents_or_actions(self):
+    def test_every_job_declares_minimal_permissions(self):
         for job in self.jobs:
             body = _job_body(self.text, job)
             with self.subTest(job=job):
@@ -720,6 +863,8 @@ class VerdictWorkflowShapeTest(unittest.TestCase):
                 self.assertNotRegex(body, r"contents:\s*write")
                 self.assertNotRegex(body, r"actions:\s*write")
                 self.assertNotIn("packages:", body)
+                if job != "rerun":
+                    self.assertNotIn("id-token", body)
 
     def test_app_private_key_only_reaches_the_environment_guarded_job(self):
         guarded = [
@@ -767,6 +912,7 @@ class VerdictWorkflowShapeTest(unittest.TestCase):
         self.assertIn("uses: ./.github/workflows/ci.yml", body)
         self.assertIn("test_ref: ${{ needs.decide.outputs.head_sha }}", body)
         self.assertIn("if: needs.decide.outputs.path == 'b'", body)
+        self.assertIn("id-token: write", body)
         self.assertNotIn("secrets:", body)
 
     def test_own_checkouts_never_take_a_ref(self):
@@ -774,11 +920,27 @@ class VerdictWorkflowShapeTest(unittest.TestCase):
             r"uses: actions/checkout@([0-9a-f]{40})[^\n]*\n((?:        [^\n]*\n)*)", self.text
         )
         self.assertGreaterEqual(len(checkouts), 1)
-        for sha, block in checkouts:
+        for _sha, block in checkouts:
             self.assertNotIn("ref:", block)
             self.assertIn("persist-credentials: false", block)
             self.assertNotIn("allow-unsafe-pr-checkout", block)
         self.assertNotRegex(self.text, r"git (fetch|checkout|clone)")
+
+    def test_decide_job_verifies_the_oidc_token_offline_against_github_jwks(self):
+        body = _job_body(self.text, "decide")
+        self.assertIn("actions: read", body)
+        self.assertIn('gh run download "${RUN_ID}"', body)
+        self.assertIn('--name "epic-verdict-token-${HEAD_SHA}"', body)
+        self.assertIn(vd.TOKEN_JWKS_URL, body)
+        self.assertIn(f"'cryptography=={_pyproject_cryptography_pin()}'", body)
+        self.assertRegex(body, r"uses: actions/setup-python@[0-9a-f]{40}")
+        self.assertIn("scripts/ci/verdict_decision.py verify", body)
+        self.assertIn('--token-file "${RUNNER_TEMP}/verdict-token/token.jwt"', body)
+        self.assertIn('--jwks-file "${RUNNER_TEMP}/jwks.json"', body)
+        self.assertIn('--merge-parents-file "${RUNNER_TEMP}/merge-parents.json"', body)
+        self.assertRegex(body, r'gh api "repos/\$\{REPOSITORY\}/git/commits/\$\{TOKEN_SHA\}"')
+        self.assertNotIn("pulls?state=all", body)
+        self.assertNotIn("cat ", body)
 
     def test_label_job_is_independent_of_the_verdict_and_needs_no_app_secret(self):
         body = _job_body(self.text, "label")
@@ -796,8 +958,6 @@ class VerdictWorkflowShapeTest(unittest.TestCase):
         self.assertNotIn("needs: [decide, rerun]", body)
 
     def test_label_job_tells_gh_which_repository_without_a_checkout(self):
-        """没有 checkout 的作业里 gh 认不出远端：`gh label create` 必须有 GH_REPO 或 --repo。"""
-
         body = _job_body(self.text, "label")
         self.assertNotIn("actions/checkout", body)
         self.assertIn("gh label create", body)
@@ -813,7 +973,7 @@ class VerdictWorkflowShapeTest(unittest.TestCase):
                 self.assertRegex(line, r"uses: [\w.-]+/[\w.-]+@[0-9a-f]{40} # v\d")
 
     def test_workflow_calls_only_known_subcommands(self):
-        allowed = {"plan", "decide", "finalize", "check-run"}
+        allowed = {"verify", "plan", "decide", "finalize", "check-run"}
         calls = re.findall(r"scripts/ci/verdict_decision\.py (\S+)", self.text)
         self.assertEqual(set(calls), allowed)
 
@@ -821,19 +981,6 @@ class VerdictWorkflowShapeTest(unittest.TestCase):
         block = _top_level_block(self.text, "concurrency")
         self.assertIn("group: verdict-${{ github.event.workflow_run.head_sha }}", block)
         self.assertIn("cancel-in-progress: false", block)
-
-    def test_decide_job_verifies_run_source_by_head_branch_and_fails_closed(self):
-        """来源核验：按 head_branch 查 state=all 的全部 PR，失败时把非 ok 状态交给脚本。"""
-
-        body = _job_body(self.text, "decide")
-        self.assertIn("HEAD_BRANCH: ${{ github.event.workflow_run.head_branch }}", body)
-        self.assertRegex(body, r'gh api "repos/\$\{REPOSITORY\}/pulls\?state=all&[^"]*head=')
-        self.assertIn("status=failed", body)
-        self.assertIn("status=ok", body)
-        self.assertIn("TAINT_QUERY_STATUS: ${{ steps.taint.outputs.status }}", body)
-        self.assertIn('--taint-query-status "${TAINT_QUERY_STATUS}"', body)
-        self.assertIn('--head-branch-pulls-file "${RUNNER_TEMP}/head-branch-pulls.json"', body)
-        self.assertNotIn("default-tree", body)
 
 
 class CiWorkflowTestRefTest(unittest.TestCase):
@@ -854,15 +1001,17 @@ class CiWorkflowTestRefTest(unittest.TestCase):
             on_block, r"      test_ref:\n(?:        [^\n]*\n)*        required: false\n"
         )
         self.assertNotIn("pull_request_target", on_block)
-        self.assertNotRegex(
-            on_block,
-            r"^  push:",
-        )
+        self.assertNotRegex(on_block, r"^  push:")
 
-    def test_story_reuse_keeps_calling_without_inputs(self):
-        story = STORY_WORKFLOW.read_text(encoding="utf-8")
+    def test_story_reuse_grants_id_token_but_passes_no_inputs(self):
+        story = _strip_comments(STORY_WORKFLOW.read_text(encoding="utf-8"))
         self.assertIn("uses: ./.github/workflows/ci.yml", story)
         self.assertNotIn("test_ref", story)
+        full = _job_body(story, "full")
+        self.assertIn("id-token: write", full)
+        for job in _jobs(story):
+            if job != "full":
+                self.assertNotIn("id-token", _job_body(story, job), job)
 
     def test_every_checkout_step_consumes_test_ref(self):
         checkouts = re.findall(
@@ -880,6 +1029,46 @@ class CiWorkflowTestRefTest(unittest.TestCase):
             "group: ci-${{ github.workflow }}-${{ github.event.pull_request.number || inputs.test_ref || github.ref }}",
             block,
         )
+
+    def test_id_token_write_only_on_the_candidate_job(self):
+        self.assertEqual(_top_level_block(self.code, "permissions").strip(), "contents: read")
+        for job in _jobs(self.code):
+            body = _job_body(self.code, job)
+            with self.subTest(job=job):
+                if job == "candidate":
+                    self.assertRegex(
+                        body,
+                        r"\n    permissions:\n      contents: read\n      id-token: write\n",
+                    )
+                else:
+                    self.assertNotIn("id-token", body)
+
+    def test_candidate_issues_the_oidc_token_only_for_pull_requests_and_never_prints_it(self):
+        body = _job_body(self.code, "candidate")
+        mint = re.search(
+            r"      - name: 签发裁决层身份凭证[^\n]*\n((?:        [^\n]*\n|\n)+?)(?=      - name: )",
+            body,
+        )
+        self.assertIsNotNone(mint)
+        mint_block = mint.group(1)
+        self.assertIn("if: github.event_name == 'pull_request' && !cancelled()", mint_block)
+        self.assertIn("continue-on-error: true", mint_block)
+        self.assertIn(f"AUDIENCE: {vd.TOKEN_AUDIENCE}", mint_block)
+        self.assertIn("ACTIONS_ID_TOKEN_REQUEST_URL", mint_block)
+        self.assertIn("&audience=${AUDIENCE}", mint_block)
+        self.assertIn("jq -r '.value' > \"${out}/token.jwt\"", mint_block)
+        self.assertNotRegex(mint_block, r"(echo|cat|printf)[^\n]*token\.jwt")
+        upload = re.search(r"      - name: 留存身份凭证供裁决层验签\n((?:        [^\n]*\n)+)", body)
+        self.assertIsNotNone(upload)
+        upload_block = upload.group(1)
+        self.assertIn("steps.verdict-token.outcome == 'success'", upload_block)
+        self.assertIn("github.event_name == 'pull_request'", upload_block)
+        self.assertIn(
+            "name: epic-verdict-token-${{ github.event.pull_request.head.sha }}", upload_block
+        )
+        self.assertIn("overwrite: true", upload_block)
+        self.assertEqual(self.code.count("continue-on-error: true"), 2)
+        self.assertEqual(body.count("continue-on-error: true"), 2)
 
     def test_rerun_context_skips_classify_and_runs_full_gate(self):
         helpers = self.scheduling
@@ -951,9 +1140,17 @@ class CiWorkflowTestRefTest(unittest.TestCase):
 
 
 class DocumentationTest(unittest.TestCase):
-    def test_gate_doc_names_the_third_tier_and_the_recovery_path(self):
+    def test_gate_doc_names_the_third_tier_the_token_and_the_recovery_path(self):
         text = (ROOT / "docs/技术设计/验证与门禁.md").read_text(encoding="utf-8")
-        for marker in ("`Epic Verdict`", "路径 a", "路径 b", "恢复路径", vd.CHANGED_GATE_LABEL):
+        for marker in (
+            "`Epic Verdict`",
+            "路径 a",
+            "路径 b",
+            "恢复路径",
+            "OIDC",
+            "`id-token: write`",
+            vd.CHANGED_GATE_LABEL,
+        ):
             self.assertIn(marker, text, marker)
 
 

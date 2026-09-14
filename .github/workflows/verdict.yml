@@ -10,9 +10,9 @@ name: Epic Verdict
 # 运行都拿不到那把钥匙。
 #
 # 判定规则在 scripts/ci/verdict_decision.py（同样取自默认分支，逐条用例钉住）：
-#   路径 a：来源核验通过（头分支从未面向非受保护分支开 PR，含已关闭）、有面向 main /
-#           release/** 的 PR 当基线、PR 头提交的 .github/workflows 子树与该基线相同 →
-#           采信这次 Epic Full 的结论；
+#   路径 a：触发运行留下的 OIDC 身份凭证验签通过、声明合格（签给本仓这次 run、
+#           pull_request 事件、base 是 main / release/**）、且 PR 头提交的 .github/workflows
+#           子树与凭证声明的 base 分支相同 → 采信这次 Epic Full 的结论；
 #   路径 b：其余一律由 main 版 ci.yml 以 test_ref 复跑一次，取复跑结论；PR 改了门禁定义时
 #           另给 PR 贴标签「门禁定义已变更」+ 评论差异清单（事后可查，不阻塞）；
 #   外部仓库的头提交一律判红；非 pull_request 事件、非 ci.yml 产出的运行不裁决。
@@ -37,9 +37,10 @@ jobs:
   decide:
     name: Epic Verdict / decide
     runs-on: ubuntu-24.04
-    timeout-minutes: 5
+    timeout-minutes: 8
     permissions:
       contents: read
+      actions: read
       pull-requests: read
     outputs:
       path: ${{ steps.decide.outputs.path }}
@@ -77,34 +78,63 @@ jobs:
             echo "事件里没有 PR 关联，按头提交反查到 $(jq length "${RUNNER_TEMP}/fallback-pulls.json") 条"
           fi
 
-      # 来源核验（失败关闭）：触发运行只带 head_branch，不带「哪条 PR 触发的」。按头分支查
-      # state=all 的全部 PR（含已关闭），只要有一条 base 不是默认分支 / release/**，这个头分支
-      # 的运行一律不采信、走路径 b；查询失败也按受染处理——查不到不等于没有。
-      - name: 按头分支核验来源（state=all）
-        id: taint
+      # 信任来源：触发运行在 candidate 作业里留下的 OIDC 身份凭证（制品 epic-verdict-token-<头 sha>）。
+      # 凭证由 GitHub 签名，声明里写着这次运行的 run_id / base_ref / event_name / sha，PR 改不了。
+      # 取不到制品、取不到 JWKS、验签或任一声明不符，都不采信、走路径 b。
+      - name: 取触发运行留下的身份凭证制品
+        id: token
         env:
           GH_TOKEN: ${{ github.token }}
           REPOSITORY: ${{ github.repository }}
-          OWNER: ${{ github.repository_owner }}
-          HEAD_BRANCH: ${{ github.event.workflow_run.head_branch }}
+          RUN_ID: ${{ github.event.workflow_run.id }}
+          HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
         run: |
           set -euo pipefail
-          echo '[]' > "${RUNNER_TEMP}/head-branch-pulls.json"
-          status=failed
-          if [ -n "${HEAD_BRANCH}" ]; then
-            head_param=$(jq -rn --arg value "${OWNER}:${HEAD_BRANCH}" '$value | @uri')
-            if gh api "repos/${REPOSITORY}/pulls?state=all&per_page=100&head=${head_param}" --paginate \
-                --jq '.[] | {number: .number, state: .state, base: {ref: .base.ref, sha: .base.sha}, head: {sha: .head.sha}}' \
-                | jq -s '.' > "${RUNNER_TEMP}/head-branch-pulls.json"; then
-              status=ok
-              echo "头分支 ${HEAD_BRANCH} 共 $(jq length "${RUNNER_TEMP}/head-branch-pulls.json") 条 PR（含已关闭）"
-            else
-              echo '按头分支查 PR 失败：本次不采信触发运行' >&2
-            fi
+          rm -rf "${RUNNER_TEMP}/verdict-token"
+          if [ -n "${RUN_ID}" ] && [ -n "${HEAD_SHA}" ] \
+             && gh run download "${RUN_ID}" --repo "${REPOSITORY}" \
+                  --name "epic-verdict-token-${HEAD_SHA}" --dir "${RUNNER_TEMP}/verdict-token" \
+             && [ -s "${RUNNER_TEMP}/verdict-token/token.jwt" ]; then
+            echo '已取到身份凭证制品（不打印）'
           else
-            echo '触发运行没有 head_branch：本次不采信触发运行' >&2
+            rm -rf "${RUNNER_TEMP}/verdict-token"
+            echo '触发运行没有身份凭证制品：本次不采信、走路径 b' >&2
           fi
-          echo "status=${status}" >> "${GITHUB_OUTPUT}"
+          curl -sSf --max-time 30 https://token.actions.githubusercontent.com/.well-known/jwks \
+            -o "${RUNNER_TEMP}/jwks.json" \
+            || { rm -f "${RUNNER_TEMP}/jwks.json"; echo '取 JWKS 失败：本次不采信、走路径 b' >&2; }
+
+      # 验签只用标准库 + cryptography（与 pyproject 的锁版一致），不引入新的第三方 action。
+      - name: 配置 Python 运行时
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: '3.12'
+
+      - name: 安装验签依赖（锁版）
+        run: python3 -m pip install --quiet --disable-pip-version-check 'cryptography==45.0.7'
+
+      - name: 验签并核对声明
+        id: verify
+        run: |
+          python3 scripts/ci/verdict_decision.py verify \
+            --event-file "${GITHUB_EVENT_PATH}" \
+            --token-file "${RUNNER_TEMP}/verdict-token/token.jwt" \
+            --jwks-file "${RUNNER_TEMP}/jwks.json" \
+            --github-output "${GITHUB_OUTPUT}"
+
+      # 凭证里的 sha 在 pull_request 事件下是临时合并提交：取它的父提交，既把凭证绑到头提交
+      # （第二个父提交 = 头提交），也拿到运行时真正被合并进去的 base 顶点（第一个父提交）。
+      - name: 取凭证所指合并提交的父提交
+        if: steps.verify.outputs.token_status == 'ok' && steps.verify.outputs.token_sha != steps.verify.outputs.head_sha
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPOSITORY: ${{ github.repository }}
+          TOKEN_SHA: ${{ steps.verify.outputs.token_sha }}
+        run: |
+          set -euo pipefail
+          gh api "repos/${REPOSITORY}/git/commits/${TOKEN_SHA}" --jq '[.parents[].sha]' \
+            > "${RUNNER_TEMP}/merge-parents.json" \
+            || { rm -f "${RUNNER_TEMP}/merge-parents.json"; echo '取不到凭证所指提交的父提交：本次不采信、走路径 b' >&2; }
 
       - name: 选基线
         id: plan
@@ -112,10 +142,14 @@ jobs:
           python3 scripts/ci/verdict_decision.py plan \
             --event-file "${GITHUB_EVENT_PATH}" \
             --fallback-pulls-file "${RUNNER_TEMP}/fallback-pulls.json" \
+            --token-file "${RUNNER_TEMP}/verdict-token/token.jwt" \
+            --jwks-file "${RUNNER_TEMP}/jwks.json" \
+            --merge-parents-file "${RUNNER_TEMP}/merge-parents.json" \
             --github-output "${GITHUB_OUTPUT}"
 
       # 只读 Git 对象：两侧 .github/workflows 子树的树对象 sha 与文件清单。不 fetch、不检出。
-      # 没有合格 PR 时基线是默认分支，那份子树只用于比对与差异清单，不用于采信触发运行。
+      # 凭证合格时基线 = 合并提交的第一个父提交；否则退回事件里的 PR 或默认分支，那份子树
+      # 只用于比对与差异清单，不用于采信触发运行。
       - name: 取两侧 .github/workflows 子树
         id: trees
         if: steps.plan.outputs.needs_trees == 'true'
@@ -155,13 +189,13 @@ jobs:
         env:
           HEAD_TREE: ${{ steps.trees.outputs.head_tree }}
           BASE_TREE: ${{ steps.trees.outputs.base_tree }}
-          TAINT_QUERY_STATUS: ${{ steps.taint.outputs.status }}
         run: |
           python3 scripts/ci/verdict_decision.py decide \
             --event-file "${GITHUB_EVENT_PATH}" \
             --fallback-pulls-file "${RUNNER_TEMP}/fallback-pulls.json" \
-            --head-branch-pulls-file "${RUNNER_TEMP}/head-branch-pulls.json" \
-            --taint-query-status "${TAINT_QUERY_STATUS}" \
+            --token-file "${RUNNER_TEMP}/verdict-token/token.jwt" \
+            --jwks-file "${RUNNER_TEMP}/jwks.json" \
+            --merge-parents-file "${RUNNER_TEMP}/merge-parents.json" \
             --head-tree "${HEAD_TREE}" \
             --base-tree "${BASE_TREE}" \
             --head-listing-file "${RUNNER_TEMP}/head-workflows.json" \
@@ -175,8 +209,11 @@ jobs:
     name: Epic Verdict / rerun
     needs: [decide]
     if: needs.decide.outputs.path == 'b'
+    # candidate 作业声明了 id-token: write，调用方必须放行否则该作业直接失败；复跑的
+    # event_name 是 workflow_run，凭证不会签发，签发了裁决层也不采信。
     permissions:
       contents: read
+      id-token: write
     uses: ./.github/workflows/ci.yml
     with:
       test_ref: ${{ needs.decide.outputs.head_sha }}

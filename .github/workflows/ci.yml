@@ -638,6 +638,14 @@ jobs:
     if: always()
     needs: [classify, docs, l1, gate, extras, image]
     timeout-minutes: 3
+    # 裁决层（verdict.yml）的信任来源：本作业在 pull_request 事件下向 GitHub 要一枚 OIDC
+    # 身份凭证（受众固定为 lingxi-epic-verdict）并留成制品。凭证由 GitHub 签名，声明里
+    # 带着 run_id / base_ref / event_name / sha，PR 改不了也伪造不了；裁决层据此判断
+    # 「这次 Epic Full 是不是面向受保护分支的 PR 触发的」。id-token: write 只给本作业；
+    # 本仓没有任何云端信任策略依赖这枚凭证，它只当签名记录用。
+    permissions:
+      contents: read
+      id-token: write
 
     steps:
       - name: 确认完整门禁全部通过
@@ -786,3 +794,42 @@ jobs:
           path: ${{ runner.temp }}/epic-candidate/candidate.json
           if-no-files-found: error
           retention-days: 30
+
+      # 裁决层的身份凭证（见本作业 permissions 处的说明）。只在 pull_request 事件签发：
+      # workflow_dispatch 与 workflow_call（裁决层复跑）不签发，签发了也不会被采信。
+      # 门禁红了也签——裁决层据此直接判红，不必再复跑一遍。凭证不打印；两步都
+      # continue-on-error：签不出来只是让裁决层退回复跑，不改变 Epic Full 自己的结论。
+      - name: 签发裁决层身份凭证（OIDC，不打印）
+        id: verdict-token
+        if: github.event_name == 'pull_request' && !cancelled()
+        continue-on-error: true
+        env:
+          AUDIENCE: lingxi-epic-verdict
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          BASE_REF: ${{ github.base_ref }}
+        run: |
+          set -euo pipefail
+          out="${RUNNER_TEMP}/epic-verdict-token"
+          mkdir -p "${out}"
+          curl -sSf --max-time 30 -H "Authorization: bearer ${ACTIONS_ID_TOKEN_REQUEST_TOKEN}" \
+            "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=${AUDIENCE}" \
+            | jq -r '.value' > "${out}/token.jwt"
+          test -s "${out}/token.jwt"
+          jq -n --arg run_id "${GITHUB_RUN_ID}" --arg run_attempt "${GITHUB_RUN_ATTEMPT}" \
+            --arg head_sha "${HEAD_SHA}" --arg tested_sha "${GITHUB_SHA}" --arg base_ref "${BASE_REF}" \
+            --arg pr_number "${PR_NUMBER}" --arg audience "${AUDIENCE}" \
+            '{run_id: $run_id, run_attempt: $run_attempt, head_sha: $head_sha, tested_sha: $tested_sha,
+              base_ref: $base_ref, pr_number: $pr_number, audience: $audience}' > "${out}/facts.json"
+          echo "已签发身份凭证：run ${GITHUB_RUN_ID}、头提交 ${HEAD_SHA}、base ${BASE_REF}（凭证本身不打印）"
+
+      - name: 留存身份凭证供裁决层验签
+        if: github.event_name == 'pull_request' && !cancelled() && steps.verdict-token.outcome == 'success'
+        continue-on-error: true
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: epic-verdict-token-${{ github.event.pull_request.head.sha }}
+          path: ${{ runner.temp }}/epic-verdict-token
+          if-no-files-found: error
+          retention-days: 7
+          overwrite: true

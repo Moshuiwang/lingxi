@@ -136,6 +136,13 @@ jobs:
     name: Story / high-risk full
     needs: classify
     if: needs.classify.outputs.mode == 'full'
+    # 被复用的 ci.yml 里 candidate 作业声明了 id-token: write（裁决层的身份凭证）；
+    # 调用方不放行这一项，被调用的作业会因权限不足直接失败。这里只是放行，
+    # 凭证只在 pull_request 事件签发，本工作流的 PR 事件签出的凭证 base_ref 是
+    # epic/**，裁决层不采信。
+    permissions:
+      contents: read
+      id-token: write
     uses: ./.github/workflows/ci.yml
 
   story-result:

@@ -10,33 +10,40 @@
 
 1. 触发运行不是 `pull_request` 事件、或不是 `.github/workflows/ci.yml` 产出的：不写检查。
 2. 头提交来自外部仓库：写 failure，外部仓库不裁决。
-3. 路径 a——同时满足：来源核验通过（头分支从未面向非受保护分支开过 PR，见
-   `Taint`）、有面向受保护分支的 PR 当基线、头提交的 `.github/workflows` 子树与该
-   基线相同：采信那次 `Epic Full` 的结论；只有 `success` 算通过，`skipped` /
-   `neutral` / `cancelled` 一律判红。
+3. 路径 a——同时满足：触发运行留下的 OIDC 身份凭证验签通过且声明合格（谁签、签给
+   哪次运行、面向哪条受保护分支，见 `check_token`）、头提交的 `.github/workflows`
+   子树与凭证声明的 base 分支（运行时被合并进去的那个提交）相同：采信那次 `Epic Full`
+   的结论；只有 `success` 算通过，`skipped` / `neutral` / `cancelled` 一律判红。
 4. 其余一律路径 b：由默认分支版 `ci.yml` 以头提交复跑一次，结论在复跑结束后由
    `finalize` 给出，同样只有 `success` 算通过。
 
-基线只认 base 为默认分支或 `release/**` 的 PR（其余 base 一律忽略，见
-`is_protected_base`）。`workflow_run.pull_requests[]` 为空时由工作流按头提交反查 PR，
-两路同一规则；没有合格 PR 就以默认分支为基线做子树比对与差异清单，但不采信触发
-运行（路径 b），也无法贴标签与评论。
+事件里的 `pull_requests[]` 与按头提交反查的结果只用于贴标签与差异清单（见
+`select_baseline`），不再作为采信依据：触发运行属于哪条 PR，只信 GitHub 签发的凭证。
 """
 
 from __future__ import annotations
 
 import argparse
+import base64
 import json
+import re
 import sys
 import uuid
 from collections.abc import Iterable, Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 CHECK_NAME = "Epic Verdict"
 TRIGGER_WORKFLOW_PATH = ".github/workflows/ci.yml"
 WORKFLOWS_DIRECTORY = ".github/workflows"
 CHANGED_GATE_LABEL = "门禁定义已变更"
+
+# OIDC 身份凭证：只签给本仓的裁决层这一个受众；签发方是 GitHub Actions 的 OIDC 提供者。
+TOKEN_AUDIENCE = "lingxi-epic-verdict"
+TOKEN_ISSUER = "https://token.actions.githubusercontent.com"
+TOKEN_JWKS_URL = f"{TOKEN_ISSUER}/.well-known/jwks"
+TOKEN_ARTIFACT_PREFIX = "epic-verdict-token-"
+TOKEN_FILE_NAME = "token.jwt"
 
 PATH_A = "a"
 PATH_B = "b"
@@ -45,6 +52,10 @@ PATH_SKIP = "跳过"
 
 SUCCESS = "success"
 FAILURE = "failure"
+
+TOKEN_OK = "ok"
+TOKEN_MISSING = "missing"
+TOKEN_INVALID = "invalid"
 
 
 @dataclass(frozen=True)
@@ -84,7 +95,9 @@ class Baseline:
 
     @property
     def label(self) -> str:
-        return f"{self.base_ref}@{self.base_sha[:12]}" if self.base_sha else self.base_ref
+        if re.fullmatch(r"[0-9a-f]{40}", self.base_sha or ""):
+            return f"{self.base_ref}@{self.base_sha[:12]}"
+        return self.base_ref
 
 
 @dataclass(frozen=True)
@@ -135,18 +148,17 @@ def parse_run_facts(event: Mapping, fallback_pull_requests: Sequence[Mapping] = 
 
 
 def is_protected_base(base_ref: str, default_branch: str) -> bool:
-    """基线只认受规则集保护的分支：默认分支或 `release/**`。
-
-    `pull_requests[]` 与按头提交反查的结果都是不可信输入：同一头提交可以同时开一条
-    PR 到攻击者自己的分支 x（x = 默认分支 + 放松的门禁），若拿 x 当基线，路径 a 就会
-    采信 PR 自己那次运行。只有受保护分支上的定义才配当比较对象。
-    """
+    """受规则集保护的分支：默认分支或 `release/**`；只有它们上的定义才配当比较对象。"""
 
     return base_ref == default_branch or base_ref.startswith("release/")
 
 
 def select_baseline(facts: RunFacts) -> Baseline:
-    """选基线：只在受保护 base 的 PR 里选，默认分支优先、其次头提交一致；没有就用默认分支。"""
+    """凭证不可用时的备用基线：只在受保护 base 的 PR 里选，默认分支优先；没有就用默认分支。
+
+    这条基线只用于贴标签与差异清单，不决定采不采信触发运行——事件里的 PR 关联与
+    反查结果都是攻击者可以影响的输入（同一头提交可以另开 PR 到自己的分支）。
+    """
 
     eligible = [
         pr for pr in facts.pull_requests if is_protected_base(pr.base_ref, facts.default_branch)
@@ -165,7 +177,7 @@ def select_baseline(facts: RunFacts) -> Baseline:
 
 
 def precheck(facts: RunFacts) -> Verdict | None:
-    """规则 1 与规则 2：不需要子树信息就能定的两种结果；都不命中返回 None。"""
+    """规则 1 与规则 2：不需要凭证与子树就能定的两种结果；都不命中返回 None。"""
 
     if facts.event != "pull_request" or facts.workflow_path != TRIGGER_WORKFLOW_PATH:
         return Verdict(
@@ -196,65 +208,209 @@ def map_run_conclusion(conclusion: str | None) -> str:
     return SUCCESS if conclusion == SUCCESS else FAILURE
 
 
-@dataclass(frozen=True)
-class WorkflowTrees:
-    """头提交与基线两侧 `.github/workflows` 子树的树对象 sha；取不到的一侧为 None。
+# ---------------------------------------------------------------------------
+# OIDC 身份凭证：验签（标准库 + cryptography）与声明核对
+# ---------------------------------------------------------------------------
 
-    没有合格 PR 时基线是默认分支，那份子树只用于比对与差异清单，绝不据此采信触发
-    运行：头提交的定义与默认分支相同，不等于触发它的那次运行用的是这份定义。
+
+class TokenError(ValueError):
+    """凭证不可用：格式、签名或声明不合格。"""
+
+
+def _b64url_decode(segment: str) -> bytes:
+    padded = segment + "=" * (-len(segment) % 4)
+    return base64.urlsafe_b64decode(padded.encode("ascii"))
+
+
+def parse_jwt(token: str) -> tuple[dict, dict, bytes, bytes]:
+    """拆 JWT：返回 (头部, 声明, 待签名字节, 签名字节)。"""
+
+    parts = token.strip().split(".")
+    if len(parts) != 3 or not all(parts):
+        raise TokenError("凭证不是三段式 JWT")
+    try:
+        header = json.loads(_b64url_decode(parts[0]))
+        claims = json.loads(_b64url_decode(parts[1]))
+        signature = _b64url_decode(parts[2])
+    except (ValueError, UnicodeDecodeError) as error:
+        raise TokenError(f"凭证段落无法解码：{error}") from error
+    if not isinstance(header, dict) or not isinstance(claims, dict):
+        raise TokenError("凭证头部或声明不是对象")
+    signing_input = f"{parts[0]}.{parts[1]}".encode("ascii")
+    return header, claims, signing_input, signature
+
+
+def _int_from_b64url(value: str) -> int:
+    return int.from_bytes(_b64url_decode(value), "big")
+
+
+def verify_signature(token: str, jwks: Mapping) -> dict:
+    """用 JWKS 验 RS256 签名，通过则返回声明；只认 `alg=RS256` 与 JWKS 里同 `kid` 的 RSA 键。"""
+
+    from cryptography.exceptions import InvalidSignature
+    from cryptography.hazmat.primitives import hashes
+    from cryptography.hazmat.primitives.asymmetric import padding, rsa
+
+    header, claims, signing_input, signature = parse_jwt(token)
+    if header.get("alg") != "RS256":
+        raise TokenError(f"凭证算法不是 RS256：{header.get('alg')!r}")
+    kid = header.get("kid")
+    candidates = [
+        key
+        for key in (jwks.get("keys") or [])
+        if isinstance(key, Mapping) and key.get("kty") == "RSA" and key.get("kid") == kid
+    ]
+    if not kid or not candidates:
+        raise TokenError(f"JWKS 里没有凭证头部的 kid={kid!r}")
+    jwk = candidates[0]
+    try:
+        public_key = rsa.RSAPublicNumbers(
+            _int_from_b64url(str(jwk["e"])), _int_from_b64url(str(jwk["n"]))
+        ).public_key()
+    except (KeyError, ValueError) as error:
+        raise TokenError(f"JWKS 键无法构造 RSA 公钥：{error}") from error
+    try:
+        public_key.verify(signature, signing_input, padding.PKCS1v15(), hashes.SHA256())
+    except InvalidSignature as error:
+        raise TokenError("凭证签名不符") from error
+    return claims
+
+
+@dataclass(frozen=True)
+class ExpectedClaims:
+    """裁决层对凭证声明的要求。"""
+
+    repository: str
+    run_id: str
+    head_sha: str
+    default_branch: str
+    audience: str = TOKEN_AUDIENCE
+    issuer: str = TOKEN_ISSUER
+    workflow_path: str = TRIGGER_WORKFLOW_PATH
+
+
+def normalize_branch(ref: str) -> str:
+    """`refs/heads/main` 与 `main` 视为同一条分支。"""
+
+    return ref[len("refs/heads/") :] if ref.startswith("refs/heads/") else ref
+
+
+def pull_request_number_from_ref(ref: str) -> int | None:
+    """`refs/pull/123/merge` → 123；其他形状返回 None。"""
+
+    match = re.fullmatch(r"refs/pull/(\d+)/merge", ref or "")
+    return int(match.group(1)) if match else None
+
+
+def claim_problems(
+    claims: Mapping, expected: ExpectedClaims, merge_parents: Sequence[str] | None
+) -> list[str]:
+    """逐条核对声明，返回全部不符项（空列表即合格）。
+
+    `exp` 刻意不核：凭证只当签名记录用，重放已由 `run_id` 绑定挡住。`sha` 在
+    `pull_request` 事件下是临时合并提交，要么直接等于头提交，要么其父提交里含头提交
+    （`merge_parents` 由工作流按 `sha` 取回；取不到视为不符）。
     """
 
-    head: str | None
-    base: str | None
-
-
-TAINT_QUERY_OK = "ok"
+    problems: list[str] = []
+    audience = claims.get("aud")
+    audiences = audience if isinstance(audience, list) else [audience]
+    if expected.audience not in audiences:
+        problems.append(f"aud={audience!r}")
+    if claims.get("iss") != expected.issuer:
+        problems.append(f"iss={claims.get('iss')!r}")
+    if claims.get("repository") != expected.repository:
+        problems.append(f"repository={claims.get('repository')!r}")
+    if str(claims.get("run_id")) != str(expected.run_id):
+        problems.append(f"run_id={claims.get('run_id')!r}")
+    if claims.get("event_name") != "pull_request":
+        problems.append(f"event_name={claims.get('event_name')!r}")
+    base_ref = normalize_branch(str(claims.get("base_ref") or ""))
+    if not is_protected_base(base_ref, expected.default_branch):
+        problems.append(f"base_ref={claims.get('base_ref')!r} 不是受保护分支")
+    workflow_ref = str(claims.get("workflow_ref") or "")
+    if not workflow_ref.startswith(f"{expected.repository}/{expected.workflow_path}@"):
+        problems.append(f"workflow_ref={workflow_ref!r}")
+    sha = str(claims.get("sha") or "")
+    if sha != expected.head_sha and expected.head_sha not in list(merge_parents or []):
+        problems.append(f"sha={sha or '?'} 与头提交 {expected.head_sha} 无绑定")
+    return problems
 
 
 @dataclass(frozen=True)
-class Taint:
-    """触发运行的来源核验：头分支是否曾面向非受保护分支开过 PR（含已关闭）。
-
-    触发运行只带 `head_branch` / `head_sha`，不带「是哪条 PR 触发的」。攻击者可以保持
-    头提交的定义与主干相同，另建可写分支 x（`ci.yml` 改成面向 x 触发、恒成功、名字仍叫
-    Epic Full），开一条辅助 PR 到 x：那次运行 event / path / 仓库都合格，事后关掉辅助 PR，
-    按头提交反查（只回 open + merged）就看不见它了。所以按头分支查 `state=all` 的全部
-    PR，只要有一条 base 非受保护，这个头分支的所有运行都不得走路径 a；查询失败同样
-    视为受染——查不到不等于没有。
-    """
+class TokenCheck:
+    """凭证核验结果：`ok` 才可作为采信依据。"""
 
     status: str
     reasons: tuple[str, ...] = ()
+    claims: Mapping = field(default_factory=dict)
 
     @property
-    def tainted(self) -> bool:
-        return self.status != TAINT_QUERY_OK or bool(self.reasons)
+    def ok(self) -> bool:
+        return self.status == TOKEN_OK
+
+    @property
+    def base_ref(self) -> str:
+        return normalize_branch(str(self.claims.get("base_ref") or ""))
+
+    @property
+    def sha(self) -> str:
+        return str(self.claims.get("sha") or "")
+
+    @property
+    def pull_request_number(self) -> int | None:
+        return pull_request_number_from_ref(str(self.claims.get("ref") or ""))
 
     @property
     def summary(self) -> str:
-        if self.status != TAINT_QUERY_OK:
-            return f"来源核验失败（{self.status or '未知'}），不采信触发运行"
-        if self.reasons:
-            return (
-                "头分支曾面向非受保护分支开 PR（" + "、".join(self.reasons) + "），不采信触发运行"
-            )
-        return "来源核验通过"
+        if self.status == TOKEN_MISSING:
+            return "没有身份凭证（触发运行未留下制品）"
+        if self.status == TOKEN_INVALID:
+            return "身份凭证不合格（" + "；".join(self.reasons) + "）"
+        return f"身份凭证验签通过（run {self.claims.get('run_id')}，base {self.base_ref}）"
 
 
-def assess_taint(
-    head_branch_pull_requests: Iterable[Mapping], default_branch: str, status: str
-) -> Taint:
-    """按头分支的全部 PR（`state=all`）判定受染；`status` 非 ok 直接受染。"""
+def check_token(
+    token: str | None,
+    jwks: Mapping | None,
+    expected: ExpectedClaims,
+    merge_parents: Sequence[str] | None,
+) -> TokenCheck:
+    """验签 + 核声明；任何一步不过都不采信。"""
 
-    if status != TAINT_QUERY_OK:
-        return Taint(status=status or "unknown")
-    reasons = []
-    for item in head_branch_pull_requests:
-        base_ref = str((item.get("base") or {}).get("ref") or "")
-        if not is_protected_base(base_ref, default_branch):
-            state = str(item.get("state") or "?")
-            reasons.append(f"#{item.get('number', '?')}→{base_ref or '?'}（{state}）")
-    return Taint(status=TAINT_QUERY_OK, reasons=tuple(reasons))
+    if not token or not token.strip():
+        return TokenCheck(status=TOKEN_MISSING)
+    if not jwks:
+        return TokenCheck(status=TOKEN_INVALID, reasons=("没有取到 JWKS，无法验签",))
+    try:
+        claims = verify_signature(token, jwks)
+    except TokenError as error:
+        return TokenCheck(status=TOKEN_INVALID, reasons=(str(error),))
+    problems = claim_problems(claims, expected, merge_parents)
+    if problems:
+        return TokenCheck(status=TOKEN_INVALID, reasons=tuple(problems), claims=claims)
+    return TokenCheck(status=TOKEN_OK, claims=claims)
+
+
+def base_commitish_for(token: TokenCheck, facts: RunFacts, merge_parents: Sequence[str]) -> str:
+    """凭证合格时的基线提交：合并提交的第一个父提交（运行时的 base 顶点），否则 base 分支名。"""
+
+    if token.sha != facts.head_sha and merge_parents:
+        return merge_parents[0]
+    return token.base_ref
+
+
+# ---------------------------------------------------------------------------
+# 裁决
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class WorkflowTrees:
+    """头提交与基线两侧 `.github/workflows` 子树的树对象 sha；取不到的一侧为 None。"""
+
+    head: str | None
+    base: str | None
 
 
 def definitions_differ(trees: WorkflowTrees) -> bool:
@@ -263,11 +419,11 @@ def definitions_differ(trees: WorkflowTrees) -> bool:
     return not (trees.head and trees.head == trees.base)
 
 
-def decide(facts: RunFacts, baseline: Baseline, trees: WorkflowTrees, taint: Taint) -> Verdict:
+def decide(facts: RunFacts, baseline: Baseline, trees: WorkflowTrees, token: TokenCheck) -> Verdict:
     """给出初步裁决：跳过 / 拒绝 / 路径 a（有结论）/ 路径 b（等复跑）。
 
-    路径 a 三个条件缺一不可：来源核验通过、有面向受保护分支的 PR 当基线、头提交的
-    `.github/workflows` 子树与该基线相同。任何一条不成立都复跑，绝不采信触发运行。
+    路径 a 两个条件缺一不可：凭证合格、头提交的 `.github/workflows` 子树与凭证声明的
+    base 分支相同。任何一条不成立都复跑，绝不采信触发运行。
     """
 
     early = precheck(facts)
@@ -278,22 +434,20 @@ def decide(facts: RunFacts, baseline: Baseline, trees: WorkflowTrees, taint: Tai
         f"{WORKFLOWS_DIRECTORY} 子树：头提交 {trees.head or '缺失'}，"
         f"基线 {baseline.label} {trees.base or '缺失'}"
     )
-    if taint.tainted:
-        why = taint.summary
-    elif baseline.pull_request is None:
-        why = f"没有面向受保护分支的 PR（基线暂取默认分支 {baseline.label}）"
+    if not token.ok:
+        why = token.summary
     elif not definitions_differ(trees):
         return Verdict(
             path=PATH_A,
             write_check=True,
             conclusion=map_run_conclusion(facts.conclusion),
             summary=(
-                f"路径 a（门禁定义与基线 {baseline.label} 相同，{taint.summary}）："
+                f"路径 a（{token.summary}，门禁定义与基线 {baseline.label} 相同）："
                 f"采信 {run_label}；{tree_label}"
             ),
         )
     else:
-        why = f"门禁定义与基线 {baseline.label} 不同"
+        why = f"{token.summary}，但门禁定义与基线 {baseline.label} 不同"
     return Verdict(
         path=PATH_B,
         write_check=True,
@@ -406,38 +560,125 @@ def write_github_output(path: str | None, values: Mapping[str, object]) -> None:
         sys.stdout.write(rendered)
 
 
+# ---------------------------------------------------------------------------
+# 命令行：工作流只做取值与调用
+# ---------------------------------------------------------------------------
+
+
 def _load_json(path: str) -> object:
     return json.loads(Path(path).read_text(encoding="utf-8"))
 
 
-def _command_plan(args: argparse.Namespace) -> None:
-    fallback = _load_json(args.fallback_pulls_file) if args.fallback_pulls_file else []
+def _optional_json(path: str | None) -> object | None:
+    if path and Path(path).is_file():
+        return _load_json(path)
+    return None
+
+
+def _optional_text(path: str | None) -> str | None:
+    if path and Path(path).is_file():
+        return Path(path).read_text(encoding="utf-8")
+    return None
+
+
+@dataclass(frozen=True)
+class Situation:
+    """一次调用读到的全部输入：事实、备用基线、凭证核验、合并提交父提交。"""
+
+    facts: RunFacts
+    fallback_baseline: Baseline
+    token: TokenCheck
+    merge_parents: tuple[str, ...]
+
+    @property
+    def baseline(self) -> Baseline:
+        if self.token.ok:
+            base_sha = base_commitish_for(self.token, self.facts, self.merge_parents)
+            pull_request = None
+            number = self.token.pull_request_number
+            if number is not None:
+                pull_request = PullRequestRef(
+                    number, self.token.base_ref, base_sha, self.facts.head_sha
+                )
+            return Baseline(
+                pull_request=pull_request, base_ref=self.token.base_ref, base_sha=base_sha
+            )
+        return self.fallback_baseline
+
+    @property
+    def pull_request_number(self) -> str:
+        pull_request = self.baseline.pull_request
+        return str(pull_request.number) if pull_request else ""
+
+
+def _situation(args: argparse.Namespace) -> Situation:
+    fallback = _optional_json(getattr(args, "fallback_pulls_file", None)) or []
     facts = parse_run_facts(_load_json(args.event_file), fallback)
-    baseline = select_baseline(facts)
-    early = precheck(facts)
+    merge_parents = tuple(
+        str(item) for item in (_optional_json(getattr(args, "merge_parents_file", None)) or [])
+    )
+    expected = ExpectedClaims(
+        repository=facts.repository,
+        run_id=str(facts.run_id or ""),
+        head_sha=facts.head_sha,
+        default_branch=facts.default_branch,
+        audience=getattr(args, "audience", TOKEN_AUDIENCE) or TOKEN_AUDIENCE,
+    )
+    token = check_token(
+        _optional_text(getattr(args, "token_file", None)),
+        _optional_json(getattr(args, "jwks_file", None)),
+        expected,
+        merge_parents,
+    )
+    return Situation(facts, select_baseline(facts), token, merge_parents)
+
+
+def _command_verify(args: argparse.Namespace) -> None:
+    """只验签与核不依赖合并提交的声明，输出凭证里的 `sha` 供工作流取父提交。"""
+
+    situation = _situation(args)
+    token = situation.token
+    reasons = [reason for reason in token.reasons if not reason.startswith("sha=")]
+    signature_ok = token.status == TOKEN_OK or (
+        token.status == TOKEN_INVALID and token.claims and not reasons
+    )
+    write_github_output(
+        args.github_output,
+        {
+            "token_status": TOKEN_OK if signature_ok else token.status,
+            "token_reasons": "；".join(reasons),
+            "token_sha": token.sha if token.claims else "",
+            "head_sha": situation.facts.head_sha,
+        },
+    )
+    print(f"凭证：{'验签通过、声明合格' if signature_ok else token.summary}")
+
+
+def _command_plan(args: argparse.Namespace) -> None:
+    situation = _situation(args)
+    early = precheck(situation.facts)
+    baseline = situation.baseline
     write_github_output(
         args.github_output,
         {
             "needs_trees": "false" if early is not None else "true",
-            "head_sha": facts.head_sha,
-            "pr_number": baseline.pull_request.number if baseline.pull_request else "",
+            "head_sha": situation.facts.head_sha,
+            "pr_number": situation.pull_request_number,
             "base_ref": baseline.base_ref,
             "base_sha": baseline.base_sha,
             "base_label": baseline.label,
+            "token_status": situation.token.status,
+            "token_summary": situation.token.summary,
         },
     )
+    print(f"基线 {baseline.label}；{situation.token.summary}")
 
 
 def _command_decide(args: argparse.Namespace) -> None:
-    fallback = _load_json(args.fallback_pulls_file) if args.fallback_pulls_file else []
-    facts = parse_run_facts(_load_json(args.event_file), fallback)
-    baseline = select_baseline(facts)
+    situation = _situation(args)
+    baseline = situation.baseline
     trees = WorkflowTrees(head=args.head_tree or None, base=args.base_tree or None)
-    head_branch_pulls: list = []
-    if args.taint_query_status == TAINT_QUERY_OK and args.head_branch_pulls_file:
-        head_branch_pulls = _load_json(args.head_branch_pulls_file)
-    taint = assess_taint(head_branch_pulls, facts.default_branch, args.taint_query_status)
-    verdict = decide(facts, baseline, trees, taint)
+    verdict = decide(situation.facts, baseline, trees, situation.token)
     definitions_changed = definitions_differ(trees)
     diff: list[str] = []
     listings = (args.base_listing_file, args.head_listing_file)
@@ -452,11 +693,11 @@ def _command_decide(args: argparse.Namespace) -> None:
             "write_check": "true" if verdict.write_check else "false",
             "conclusion": verdict.conclusion or "",
             "summary": verdict.summary,
-            "head_sha": facts.head_sha,
-            "pr_number": baseline.pull_request.number if baseline.pull_request else "",
+            "head_sha": situation.facts.head_sha,
+            "pr_number": situation.pull_request_number,
             "base_label": baseline.label,
-            "run_id": facts.run_id or "",
-            "run_url": facts.run_url,
+            "run_id": situation.facts.run_id or "",
+            "run_url": situation.facts.run_url,
             "definitions_changed": "true" if definitions_changed else "false",
             "diff": json.dumps(diff, ensure_ascii=False),
         },
@@ -490,30 +731,34 @@ def _command_check_run(args: argparse.Namespace) -> None:
     print(json.dumps(check_run_payload(spec, update=args.update), ensure_ascii=False))
 
 
+def _add_situation_arguments(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("--event-file", required=True)
+    parser.add_argument("--fallback-pulls-file")
+    parser.add_argument("--token-file", help="触发运行留下的身份凭证（JWT）")
+    parser.add_argument("--jwks-file", help="GitHub OIDC 提供者的 JWKS")
+    parser.add_argument("--merge-parents-file", help="凭证 sha 所指提交的父提交清单（JSON 数组）")
+    parser.add_argument("--audience", default=TOKEN_AUDIENCE)
+    parser.add_argument("--github-output")
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     commands = parser.add_subparsers(dest="command", required=True)
 
+    verify = commands.add_parser("verify", help="验签并核对声明，输出凭证里的 sha")
+    _add_situation_arguments(verify)
+    verify.set_defaults(func=_command_verify)
+
     plan = commands.add_parser("plan", help="选基线：输出要比较的 PR 与基线提交")
-    plan.add_argument("--event-file", required=True)
-    plan.add_argument("--fallback-pulls-file")
-    plan.add_argument("--github-output")
+    _add_situation_arguments(plan)
     plan.set_defaults(func=_command_plan)
 
     decision = commands.add_parser("decide", help="给出初步裁决")
-    decision.add_argument("--event-file", required=True)
-    decision.add_argument("--fallback-pulls-file")
+    _add_situation_arguments(decision)
     decision.add_argument("--head-tree", default="")
     decision.add_argument("--base-tree", default="")
-    decision.add_argument("--head-branch-pulls-file")
-    decision.add_argument(
-        "--taint-query-status",
-        default="",
-        help="按头分支查 state=all 全部 PR 的结果：ok 或失败原因；非 ok 一律路径 b",
-    )
     decision.add_argument("--head-listing-file")
     decision.add_argument("--base-listing-file")
-    decision.add_argument("--github-output")
     decision.set_defaults(func=_command_decide)
 
     final = commands.add_parser("finalize", help="复跑结束后定终局结论")
