@@ -725,6 +725,33 @@ docker compose --env-file deploy/.env.prod \
 | 4 | `--initiated-by` 是生效管理员 | 由 ① dry-run 自查（不是则退出 2、零写入） | dry-run 正常打印清单与计数 |
 | 5 | 专用授权令牌不在 5 分钟续期间隔内（§12.2） | scheduler 日志最近一条「专用授权续期成功」的时刻 | 距今 ≥ 5 分钟 |
 
+### 12.4 审计回读：运营审计账 `operation_audit`（Issue #675 补入）
+
+每次 `--apply` 在运营审计账上留下同一操作号的三类行：执行前一行「已准备」（`prepared`，
+管理员闸之后、装配之前写；**写不进去脚本退出码 2、一个人都不执行**），逐人一行「已执行」
+（`executed`，结果码 `provisioned` / `skipped:<原因码>` / `failed_<异常类型名>` /
+`already_active_grant_not_applied`，证据指向该人的追溯号），末尾一行运行汇总（结果码
+`completed` / `partial`，计数 成功 / 跳过 / 失败 / 已开通未应用 / 未记账 / 总数）。操作号
+（`opr_…`）在脚本输出里「本次操作号」一行；逐人行或汇总写失败**不改任何人的结局**，脚本
+退出码 3 并说明「清单是完整结果、不要据此重跑」。回读只打印阶段、入口、身份、结果码与计数，
+不落文件、账里本来也没有邮箱与正文：
+
+```bash
+docker compose --env-file deploy/.env.prod \
+  -f deploy/compose.yaml -f deploy/compose.prod.yaml \
+  exec -T scheduler python -B - <操作号> <<'EOF'
+import os, sys
+from lingxi.adapters.postgres_operation_audit import PostgresOperationAudit
+for row in PostgresOperationAudit(os.environ["LINGXI_POSTGRES_DSN"]).for_operation(sys.argv[1]):
+    entry = row.entry
+    print(
+        row.created_at.isoformat(timespec="seconds"), entry.phase.value, entry.entry_point.value,
+        "发起", entry.initiated_by, "确认", entry.decided_by or "-",
+        "结果", entry.result_code or "-", dict(entry.result_counts) or "",
+    )
+EOF
+```
+
 ## 十三、#586 主动告知（欢迎卡）执行姿势（生产；体验批 Trace #606 补入）
 
 > **前提与去留**：本节只在「产品负责人裁定本次窗口要主动告知已开通的人」时执行，执行时点在 §十二
@@ -801,6 +828,13 @@ docker compose --env-file deploy/.env.prod \
 - **幂等**：同一份名单重跑**零新增发送**（已 `delivered` 的人直接跳过）。因此「不确定上次跑到哪里」
   时的正确动作是原样重跑，不是挑人重发。
 - **`--list` 不需要名单**，也不发送任何东西；清单本身不落库，需要留档请自行保存输出。
+- **审计回读（运营审计账 `operation_audit`，Issue #675 补入）**：`--precheck` 与 `--apply` 两档各自
+  在账上留下同一操作号（即脚本输出「操作号」一行的本次运行号 `prk_…`）的三类行：收件人闸门之后、
+  出站口构造之前一行「已准备」（**写不进去退出码 2、零发送**）；逐人一行「已执行」（结果码
+  `delivered` / `already_delivered` / `skipped:<原因码>` / `failed…` / `unknown…` /
+  `delivered_not_recorded`，证据指向 `outreach_message` 的去重键，不带邮箱、姓名与正文）；末尾一行
+  运行汇总。逐人行或汇总写失败不改任何人的结局，退出码 3 并说明「清单是完整结果、不要据此重跑」。
+  dry-run 与 `--list` 一行都不写。回读命令与 §12.4 同一段脚本，只把 `<操作号>` 换成 `prk_…`。
 
 ## 十四、扩充预开通人员的完整步骤（生产；体验批 Trace #606 补入）
 
@@ -884,6 +918,19 @@ dry-run 打印的条数与这张表对不上，说明职位列命中的键跟预
 这一张。**反向条件的失效是安静的**——它不报错，只会多圈进一个没想到的人，而消息发出去不可撤回。
 
 判读要点：写筛选条件之前先问一句「谁会意外满足这组条件」。答不上来就改成白名单。
+
+### 14.8 审计回读：内测扩员在运营审计账上的四类行（Issue #675 补入）
+
+经受限入口准备的每一批扩员，以**批次号**（`ibt_…`，工具回执里的 `batch_id`）为操作号在
+`operation_audit` 上留行：准备时一行「已准备」（入口 `restricted_channel`，带人数与目标摘要）；
+本人点击确认卡后一行「已确认」（入口 `feishu_card`，`decided_by` 是点击者本人）或「已取消」；
+过期、资料漂移、授权变化这些明确拒绝一行「已拒绝」（结果码 `expired` / `failed`）；随后
+scheduler 后台两个阶段逐人各一行「已执行」（入口 `scheduler_followup`，结果码
+`succeeded:completed` / `succeeded:check_passed` / `failed:<原因码>`，证据分别指向
+`admin_action_followup` 与 `innertest_check` 的记录）。准备、确认、取消、拒绝四类行与批次
+状态同一事务提交——账写不进去整笔回滚、批次不成立；后台阶段的逐人行写失败只记一条
+`operation_audit.write_failed` 日志，阶段结果不变。扩员专用窄表 `innertest_audit` 照旧
+双写，不删。回读命令与 §12.4 同一段脚本，`<操作号>` 换成批次号 `ibt_…`。
 
 ## 十五、受限内测入口装配点（默认关闭的可选覆盖）
 

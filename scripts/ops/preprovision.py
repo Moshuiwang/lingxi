@@ -45,9 +45,10 @@
    人工点击，每一次半途而废都会在库里留下一批状态不一致的人。
 4. **预开通期间静默**：不向名单内用户发送任何消息；他第一次发消息时才补一句
    `onboarding.preprovisioned_first_chat`（由开通链/会话层负责，不是本脚本）。
-5. **逐人失败关闭、不阻塞其他人**：报告以本脚本打印的清单为主。审计出口是结构化
-   日志（仓库里**没有** `audit_event` 表），逐人可行动的报告只有这份清单——跑完即散，
-   请产品负责人自行保存。
+5. **逐人失败关闭、不阻塞其他人**：报告以本脚本打印的清单为主。每次 `--apply` 在
+   运营审计账 `operation_audit` 上留下同一操作号的「已准备」、逐人「已执行」与运行
+   汇总三类行（谁发起、判定时刻角色、结果码、追溯号——不含邮箱与异常正文），可事后
+   按操作号回读；逐人**可行动**的报告仍只有这份清单——跑完即散，请产品负责人自行保存。
 
 ## 输入：名单 CSV，三列 `email` / `position` / `company_scope`
 
@@ -127,13 +128,22 @@ from __future__ import annotations
 
 import argparse
 import csv
+import hashlib
 import os
+import re
 import sys
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from lingxi.core.admin.operation_audit import (
+    EntryPoint,
+    OperationAuditEntry,
+    OperationPhase,
+    executor_label,
+)
+from lingxi.core.admin.registry import AdminRole
 from lingxi.core.identity.preprovision import (
     ORIGIN_PREPROVISION as _CHAIN_ORIGIN_PREPROVISION,
 )
@@ -172,6 +182,16 @@ OUTCOME_FAILED_PREFIX = "failed_"
 #: "成功预开通"就是把「权限没给」报成「都办妥了」——单独归类、不进 provisioned。
 #: 要不要给已 active 用户补上名单权限是产品语义，等产品负责人裁定后另行处理。
 OUTCOME_ALREADY_ACTIVE_GRANT_NOT_APPLIED = "already_active_grant_not_applied"
+
+#: 运营审计账上的操作名、目的码、目标种类与执行者服务名；一次 `--apply` 运行 = 一个
+#: 操作号（`opr_` ULID），「已准备」、逐人「已执行」与运行汇总三类行都挂在它上面。
+OPERATION_PREPROVISION_APPLY = "preprovision.apply"
+PURPOSE_PREPROVISION_ROSTER = "preprovision_roster"
+TARGET_KIND_ROSTER = "roster"
+EXECUTOR_SERVICE = "scheduler-script:preprovision"
+
+#: 逐人结果码里原因段允许的形状；账上没有自由文本列，不合形状的原因宁可不记。
+_RESULT_DETAIL = re.compile(r"^[A-Za-z0-9_.-]{1,55}$")
 
 
 class RosterError(ValueError):
@@ -216,9 +236,11 @@ class PersonOutcome:
 
 @dataclass
 class PreprovisionReport:
-    """一次 ``--apply`` 的逐人结局与计数。"""
+    """一次 ``--apply`` 的逐人结局与计数。``audit_unrecorded`` 是没写进运营审计账的人数：
+    它不改变任何人的结局，只让退出码变成 3，提醒把清单留好。"""
 
     outcomes: list[PersonOutcome] = field(default_factory=list)
+    audit_unrecorded: int = 0
 
     @property
     def provisioned(self) -> int:
@@ -433,6 +455,7 @@ def run_preprovision(
     start_system: Callable[..., Any],
     initiated_by_open_id: str,
     trace_id_factory: Callable[[], str],
+    ledger: OperationLedger | None = None,
 ) -> PreprovisionReport:
     """逐人调用开通链的系统触发入口并汇总结果。
 
@@ -440,27 +463,32 @@ def run_preprovision(
     只让这一个人计入 ``failed_<异常类型名>``，其余人照常继续——一次批量预开通里某个人
     的身份定位失败、令牌解密失败或外部写入失败，都不该让名单上其他二十几个人一起没有
     结果。异常正文不记录（可能带邮箱、姓名）。
+
+    给出 ``ledger`` 时每个人的终态在运营审计账上各留一行；那一行写不进去**不改结局、
+    不中断后面的人**，只计入 ``audit_unrecorded``——开通已经发生了，账没记上不能把它
+    报成没发生。
     """
 
     report = PreprovisionReport()
     for item in items:
+        trace_id = trace_id_factory()
         try:
             result = start_system(
                 email=item.email,
-                trace_id=trace_id_factory(),
+                trace_id=trace_id,
                 origin=ORIGIN_PREPROVISION,
                 initiated_by_open_id=initiated_by_open_id,
                 preprovision_grant=item.plan,
             )
         except Exception as error:  # noqa: BLE001 - 逐人失败关闭，见方法文档
-            report.outcomes.append(
-                PersonOutcome(
-                    email=item.email,
-                    outcome=f"{OUTCOME_FAILED_PREFIX}{type(error).__name__}",
-                )
+            outcome = PersonOutcome(
+                email=item.email, outcome=f"{OUTCOME_FAILED_PREFIX}{type(error).__name__}"
             )
-            continue
-        report.outcomes.append(_classify(item.email, result))
+        else:
+            outcome = _classify(item.email, result)
+        report.outcomes.append(outcome)
+        if ledger is not None and not ledger.record_person(outcome, trace_id=trace_id):
+            report.audit_unrecorded += 1
     return report
 
 
@@ -509,7 +537,121 @@ def print_report(report: PreprovisionReport) -> None:
             f"（{OUTCOME_ALREADY_ACTIVE_GRANT_NOT_APPLIED}）——不计入成功；"
             "是否给已 active 用户补授权待产品负责人裁定，本脚本不静默扩权。"
         )
-    print("本清单不落库（仓库没有 audit_event 表，审计出口是结构化日志），请自行保存。")
+    print("本清单不落库，请自行保存；逐人终态已按本次操作号记入运营审计账 operation_audit。")
+
+
+def roster_digest(emails: Iterable[str]) -> str:
+    """名单目标集合的摘要：去重、排序后的归一邮箱按行连接取 sha256。
+
+    账上只记摘要不记邮箱：它回答「这次跑的是不是那份名单」，而不把人员数据搬进账里。
+    """
+
+    canonical = "\n".join(sorted(set(emails)))
+    return "sha256:" + hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def audit_result_code(outcome: str, reason: str | None) -> str:
+    """逐人结局在审计账上的结果码：``<结局>[:<原因码>]``；原因不是固定码形状就只记结局。
+
+    原因来自开通链的固定码（``mcp_sync_timeout`` 这类），但类型上是自由字符串；不合
+    形状的值宁可少记也不塞进账里——账上没有自由文本列，这是它不会藏住凭据的全部依据。
+    """
+
+    if reason and _RESULT_DETAIL.match(reason) and len(outcome) + 1 + len(reason) <= 64:
+        return f"{outcome}:{reason}"
+    return outcome
+
+
+@dataclass(frozen=True)
+class OperationLedger:
+    """本次 ``--apply`` 在运营审计账上的落笔：操作号、发起人、判定时刻的角色快照与名单
+    摘要绑在一起，三类行只补各自的结果。
+
+    ``record_prepared`` 写不进去原样抛出——那是执行前的闸；其余三个写口只返回是否写成，
+    因为它们记的事已经发生，账没记上不能把它报成没发生。
+    """
+
+    sink: Any
+    operation_id: str
+    initiated_by: str
+    actor_roles: frozenset[AdminRole]
+    target_count: int
+    target_digest: str
+
+    def _entry(self, phase: OperationPhase, **fields: Any) -> OperationAuditEntry:
+        return OperationAuditEntry(
+            operation_id=self.operation_id,
+            operation=OPERATION_PREPROVISION_APPLY,
+            phase=phase,
+            initiated_by=self.initiated_by,
+            actor_roles=self.actor_roles,
+            entry_point=EntryPoint.OPS_SCRIPT,
+            purpose=PURPOSE_PREPROVISION_ROSTER,
+            target_kind=TARGET_KIND_ROSTER,
+            **fields,
+        )
+
+    def _executed(self, **fields: Any) -> OperationAuditEntry:
+        return self._entry(
+            OperationPhase.EXECUTED,
+            executor=executor_label(EXECUTOR_SERVICE, run_id=self.operation_id),
+            **fields,
+        )
+
+    def record_prepared(self) -> None:
+        """「已准备」：管理员闸已过、装配尚未开始；写不进去就不执行任何一人。"""
+
+        self.sink.record(
+            self._entry(
+                OperationPhase.PREPARED,
+                target_count=self.target_count,
+                target_digest=self.target_digest,
+            )
+        )
+
+    def record_not_started(self, error_type: str) -> bool:
+        """装配失败：一个人都没跑，账上补一行 ``not_started:<异常类型名>``。"""
+
+        return self._try(lambda: self._executed(result_code=f"not_started:{error_type}"))
+
+    def record_person(self, outcome: PersonOutcome, *, trace_id: str) -> bool:
+        """逐人一行：结果码按清单分类，证据指向这个人的追溯号；不带邮箱。"""
+
+        return self._try(
+            lambda: self._executed(
+                result_code=audit_result_code(outcome.outcome, outcome.reason),
+                evidence_ref=f"trace:{trace_id}",
+                trace_id=trace_id,
+            )
+        )
+
+    def record_run(self, report: PreprovisionReport) -> bool:
+        """运行汇总一行：成功 / 跳过 / 失败 / 已开通未应用 / 未记账 的计数。"""
+
+        return self._try(
+            lambda: self._executed(
+                result_code="completed" if report.failed == 0 else "partial",
+                result_counts={
+                    "provisioned": report.provisioned,
+                    "skipped": report.skipped,
+                    "failed": report.failed,
+                    "grant_not_applied": report.grant_not_applied,
+                    "audit_unrecorded": report.audit_unrecorded,
+                    "total": len(report.outcomes),
+                },
+                target_count=self.target_count,
+                target_digest=self.target_digest,
+            )
+        )
+
+    def _try(self, build: Callable[[], OperationAuditEntry]) -> bool:
+        """构造与落库都在这一层兜住：条目被模型拒绝与账写不进去对调用方是同一件事。"""
+
+        try:
+            self.sink.record(build())
+        except Exception:  # noqa: BLE001 - 已发生的事不能因为账没记上而改结论，见类文档
+            return False
+        return True
 
 
 # ---------------------------------------------------------------------------
@@ -538,6 +680,21 @@ def initiated_by_is_registered_admin(lookup: Any, open_id: str) -> bool:
     from lingxi.core.admin.registry import is_authorized_admin
 
     return is_authorized_admin(lookup.active_entry(open_id=open_id))
+
+
+def actor_roles_snapshot(lookup: Any, open_id: str) -> frozenset[AdminRole]:
+    """审计行里的角色快照：从登记表现读，没有 active 条目就是空集，不从闸门结论反推。"""
+
+    entry = lookup.active_entry(open_id=open_id)
+    return entry.roles if entry is not None else frozenset()
+
+
+def resolve_operation_audit(dsn: str) -> Any:
+    """运营审计账的自开连接写口；单独成函数是给单测一个注入点。"""
+
+    from lingxi.adapters.postgres_operation_audit import PostgresOperationAudit
+
+    return PostgresOperationAudit(dsn)
 
 
 def resolve_start_system(dsn: str) -> tuple[Callable[..., Any], Callable[[], None]]:
@@ -734,12 +891,44 @@ def main(argv: list[str] | None = None) -> int:
         )
         return 0
 
+    return _apply(dsn, items, initiated_by_open_id=initiated_by_open_id)
+
+
+def _apply(dsn: str, items: Sequence[PreprovisionItem], *, initiated_by_open_id: str) -> int:
+    """``--apply``：先在运营审计账写「已准备」，写不进去就一个人都不执行。
+
+    这是产品合同「写操作的审计记录无法可靠保存时，用户状态不得改变」在批量脚本上的
+    落点；账在闸门之后、装配之前写，因此拒绝时既没起线程池也没碰任何一人。
+    """
+
     from lingxi.core.ids import new_id
+
+    operation_id = new_id("opr")
+    try:
+        ledger = OperationLedger(
+            sink=resolve_operation_audit(dsn),
+            operation_id=operation_id,
+            initiated_by=initiated_by_open_id,
+            actor_roles=actor_roles_snapshot(
+                resolve_admin_registry_lookup(dsn), initiated_by_open_id
+            ),
+            target_count=len(items),
+            target_digest=roster_digest(item.email for item in items),
+        )
+        ledger.record_prepared()
+    except Exception as error:  # noqa: BLE001 - 审计账写不进去一律 fail-closed
+        print(f"运营审计账写不进去，未执行任何一人：{type(error).__name__}", file=sys.stderr)
+        return 2
+    print(
+        f"本次操作号 {operation_id}：运营审计账已记「已准备」，逐人结果与汇总随后写入同一操作号。"
+    )
 
     try:
         start_system, shutdown = resolve_start_system(dsn)
     except Exception as error:  # noqa: BLE001 - 装配起不来一律 fail-closed
         print(f"开通编排装配失败，未执行任何一人：{type(error).__name__}: {error}", file=sys.stderr)
+        if not ledger.record_not_started(type(error).__name__):
+            print("运营审计账的「未开始」行也没写进去，请把本输出留档。", file=sys.stderr)
         return 2
 
     # 谁建谁清：`build_loop` 已经 `start()` 了开通执行器的线程池，无论这一批跑成什么
@@ -751,10 +940,20 @@ def main(argv: list[str] | None = None) -> int:
             initiated_by_open_id=initiated_by_open_id,
             # 追溯号与入站事件那条路径同形（裸 ULID，不带前缀），见 adapters/feishu_events.py。
             trace_id_factory=lambda: new_id("trc").split("_", 1)[1],
+            ledger=ledger,
         )
     finally:
         shutdown()
     print_report(report)
+    run_recorded = ledger.record_run(report)
+    if report.audit_unrecorded or not run_recorded:
+        print(
+            f"运营审计账未完整记下这次运行（逐人未记 {report.audit_unrecorded} 人、"
+            f"运行汇总{'已记' if run_recorded else '未记'}）：以上清单是完整结果，请留档；"
+            f"退出码 3，不是失败，不要据此重跑。操作号 {operation_id}。",
+            file=sys.stderr,
+        )
+        return 3
     return 0
 
 
