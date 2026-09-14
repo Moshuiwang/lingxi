@@ -23,12 +23,12 @@ def wire_innertest(config, *, loop, duties, audit):
         return
     from lingxi.adapters.innertest_binding import load_binding
     from lingxi.adapters.innertest_socket import InnertestSocketListener
-    from lingxi.apps.innertest import build_innertest_service
+    from lingxi.apps.scheduler.restricted_admin import build_restricted_service
 
     if not config.innertest_binding_path or not config.innertest_socket_path:
         raise ValueError("内测管理入口缺少受保护绑定或 socket 配置")
     binding = load_binding(config.innertest_binding_path)
-    service = build_innertest_service(config, audit, binding=binding)
+    service = build_restricted_service(config, audit, binding=binding, slots=loop.followup_db_slots)
     consumer = _build_followup_consumer(config, loop=loop, duties=duties, audit=audit)
     listener = InnertestSocketListener(
         path=config.innertest_socket_path,

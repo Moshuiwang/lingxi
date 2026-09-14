@@ -18,6 +18,7 @@ from lingxi.core.admin.followup import ShutdownReport
 MAX_BYTES = 65536
 MAX_CONNECTIONS = 4
 REQUEST_SECONDS = 5
+IDLE_SECONDS = 30 * 60
 
 
 def peer_uid(connection):
@@ -30,10 +31,12 @@ def peer_uid(connection):
 class InnertestSocketListener:
     """每个短请求串行占一个数据库槽，网络等待不占数据库槽。"""
 
-    def __init__(self, *, path, service, db_slots, socket_gid=None, stop=None):
+    def __init__(
+        self, *, path, service, db_slots, socket_gid=None, stop=None, idle_seconds=IDLE_SECONDS
+    ):
         """只保存固定服务端配置，不从客户端接收路径或 UID。"""
         self.path, self.service, self.db_slots = path, service, db_slots
-        self.socket_gid = socket_gid
+        self.socket_gid, self.idle_seconds = socket_gid, idle_seconds
         self._path_owner = SocketPathOwner(path)
         self._stop = threading.Event() if stop is None else stop
         self._thread = None
@@ -80,7 +83,7 @@ class InnertestSocketListener:
         )
 
     def _run(self):
-        """连接状态有界；空闲/半包五秒关闭，不能占住开通池。"""
+        """连接状态有界：半包五秒关闭，空闲到期关闭；交互式客户端可在两请求间停留。"""
         selector = selectors.DefaultSelector()
         clients = {}
         try:
@@ -93,8 +96,9 @@ class InnertestSocketListener:
                         self._accept(selector, clients)
                     else:
                         self._read(selector, clients, key.fileobj)
+                now = time.monotonic()
                 for client, state in tuple(clients.items()):
-                    if time.monotonic() >= state[2]:
+                    if now >= state[2] or (state[3] is not None and now >= state[3]):
                         self._close(selector, clients, client)
         finally:
             for client in tuple(clients):
@@ -112,13 +116,17 @@ class InnertestSocketListener:
                 return
             session = InnertestMcpSession(peer_uid=peer_uid(client), service=self.service)
             client.setblocking(False)
-            clients[client] = [bytearray(), session, time.monotonic() + REQUEST_SECONDS]
+            clients[client] = [bytearray(), session, time.monotonic() + self.idle_seconds, None]
             selector.register(client, selectors.EVENT_READ)
         except Exception:
             client.close()
 
     def _read(self, selector, clients, client):
-        """协议不支持批量请求；超大行在 JSON 解析前拒绝。"""
+        """协议不支持批量请求；超大行在 JSON 解析前拒绝。
+
+        状态四元组：缓冲、会话、空闲截止、半包截止。半包截止只在缓冲里留有未收完整的
+        行时存在——一条完整行处理完即清除，空闲截止则在每次收到字节后顺延。
+        """
         state = clients[client]
         try:
             data = client.recv(MAX_BYTES + 1)
@@ -144,7 +152,11 @@ class InnertestSocketListener:
                     client.sendall(json.dumps(response, ensure_ascii=False).encode() + b"\n")
                     client.setblocking(False)
                 self._finished += 1
-                state[2] = time.monotonic() + REQUEST_SECONDS
+            state[2] = time.monotonic() + self.idle_seconds
+            if not state[0]:
+                state[3] = None
+            elif state[3] is None:
+                state[3] = time.monotonic() + REQUEST_SECONDS
         except (OSError, ValueError):
             self._close(selector, clients, client)
 

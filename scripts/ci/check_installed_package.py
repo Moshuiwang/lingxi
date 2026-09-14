@@ -589,6 +589,11 @@ REQUIRED_MODULES = (
     "lingxi.adapters.innertest_socket",
     "lingxi.adapters.innertest_socket_path",
     "lingxi.adapters.innertest_probe",
+    # 受限通道的 Agent 客户端切片：只读三工具的纯逻辑（core）、只读查询适配（adapters）
+    # 与 scheduler 侧装配工厂；`wire_innertest` 函数内 import 工厂，理由同上。
+    "lingxi.core.admin.restricted_tools",
+    "lingxi.adapters.restricted_admin_queries",
+    "lingxi.apps.scheduler.restricted_admin",
     "lingxi.adapters.postgres_admin_followup",
     "lingxi.adapters.postgres_admin_followup_confirmation",
     "lingxi.adapters.postgres_admin_followup_projection",
@@ -687,6 +692,9 @@ PROCESS_RUNTIME_IMPORTS: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {
             "lingxi.adapters.postgres_pending_action_execution",
             "lingxi.apps.innertest",
             "lingxi.apps.scheduler.innertest",
+            "lingxi.apps.scheduler.restricted_admin",
+            "lingxi.adapters.restricted_admin_queries",
+            "lingxi.core.admin.restricted_tools",
             "lingxi.core.admin.followup_consumer",
             "lingxi.core.admin.followup_effect",
             "lingxi.core.admin.followup_renewal",
