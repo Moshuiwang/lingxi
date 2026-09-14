@@ -177,7 +177,10 @@ def _permission_scope_block(
             else (company_label if company_label is not None else scope)
         )
         reason = payload.get("reason", "")
-        return f"职位：{role}\n公司范围：{scope_display}\n原因：{reason}\n"
+        return (
+            f"职位：{role}\n公司范围：{scope_display}\n"
+            f"{_reused_pairs_line(payload)}原因：{reason}\n"
+        )
     company_display = company_label if company_label is not None else payload.get("company_id", "")
     metric_display = metric_label if metric_label is not None else payload.get("metric_name", "")
     reason = payload.get("reason", "")
@@ -185,6 +188,45 @@ def _permission_scope_block(
         f"{_direction_prefix(payload)}"
         f"范围：公司 {company_display} · 指标 {metric_display}\n原因：{reason}\n"
     )
+
+
+def _reused_pairs_line(payload: Mapping[str, Any]) -> str:
+    """差集补齐后的一行「本次新增 N 项、已有 M 项沿用」（含结尾换行）。
+
+    只在准备阶段确实沿用了已持有项（``reused_count`` > 0）时出现；整笔都是新项的
+    payload 没有这个键或值为 0，卡片正文逐字节不变。``N`` 直接数 ``pairs``——它就是
+    确认后真正会写入的行数，不另存一份可能漂移的数字。
+    """
+    reused = payload.get("reused_count")
+    if not isinstance(reused, int) or isinstance(reused, bool) or reused <= 0:
+        return ""
+    pairs = payload.get("pairs")
+    added = len(pairs) if isinstance(pairs, (list, tuple)) else 0
+    return f"本次新增 {added} 项、已有 {reused} 项沿用\n"
+
+
+#: 撤销回执里银河来源回显的两种措辞。``galaxy_retained`` 由准备阶段现算并随
+#: payload 持久化：整数是「撤掉之后经银河仍持有几项」，``None`` 是当时读不到银河
+#: 来源——两者必须分开说，把读不到写成 0 项会让管理员误以为用户从此查不到。
+_GALAXY_RETAINED_TEXT = "该用户经银河来源仍持有其中 {count} 项"
+_GALAXY_UNREADABLE_TEXT = "银河来源暂不可读"
+
+
+def describe_galaxy_retention(pending: PendingAction) -> str | None:
+    """撤销动作的银河来源回显句；不是撤销、payload 不可用或没有这项回显时返回 ``None``。
+
+    供发起人终态卡（``card_callback._outcome_text``）与管理群广播
+    （:func:`_group_outcome_text`）共用同一句，两处不允许出现不同说法。
+    """
+    if pending.action_type is not PendingActionType.LOCAL_PERMISSION_REVOKE:
+        return None
+    payload = _permission_payload(pending)
+    if payload is None or "galaxy_retained" not in payload:
+        return None
+    retained = payload["galaxy_retained"]
+    if isinstance(retained, int) and not isinstance(retained, bool):
+        return _GALAXY_RETAINED_TEXT.format(count=retained)
+    return _GALAXY_UNREADABLE_TEXT
 
 
 def _permission_scope_suffix(
@@ -473,9 +515,11 @@ def _group_outcome_text(pending: PendingAction) -> str:
     """
     if pending.status is PendingActionStatus.EXECUTED:
         payload = _permission_payload(pending)
-        if payload is not None and payload.get("position_name"):
-            return "操作已记录，权限正在下发"
-        return "已确认执行；操作已记录，权限正在下发"
+        recorded = "操作已记录，权限正在下发"
+        if payload is None or not payload.get("position_name"):
+            recorded = f"已确认执行；{recorded}"
+        retention = describe_galaxy_retention(pending)
+        return f"{recorded}；{retention}" if retention else recorded
     if pending.status is PendingActionStatus.CANCELLED:
         return "已取消"
     if pending.status is PendingActionStatus.EXPIRED:

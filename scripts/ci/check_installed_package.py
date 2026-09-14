@@ -284,6 +284,9 @@ REQUIRED_MODULES = (
     # 顶层 import 它，随它同一条发布理由，见下面 scheduler/gateway 闭包同名注释。
     "lingxi.adapters.postgres_local_permission_import",
     "lingxi.core.permission.merge_sources",
+    # 撤销回执「经银河来源仍持有 K 项」的纯计数：`adapters/admin_registry.py` 模块级
+    # import 它构造银河指标映射，随管理查询口进 scheduler 与 gateway 两个闭包。
+    "lingxi.core.permission.galaxy_retention",
     # 存量用户首聊差集导入的纯逻辑（rc25 S-1，Issue #540）：开通编排、每日/定向重算
     # 与本地覆盖适配器都消费它（见下面 scheduler/gateway 闭包）；开通链的两步编排
     # （翻译一次 + 导入）从 onboarding_runner 拆出（体量棘轮）。
@@ -839,6 +842,9 @@ PROCESS_RUNTIME_IMPORTS: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {
             "lingxi.adapters.postgres_local_permission",
             "lingxi.adapters.postgres_local_permission_import",
             "lingxi.core.permission.merge_sources",
+            # 撤销回执的银河来源计数：`adapters.admin_registry` 模块级 import（理由见
+            # REQUIRED_MODULES 同名条目）。
+            "lingxi.core.permission.galaxy_retention",
             "lingxi.core.permission.decision_chain",
             # 逐用户权限决策树：`permission_refresh.py` 模块级 import（理由见
             # REQUIRED_MODULES 同名条目）。
@@ -1420,6 +1426,9 @@ PROCESS_RUNTIME_IMPORTS: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {
             "lingxi.adapters.galaxy_import",
             "lingxi.core.permission.account_match",
             "lingxi.core.permission.merge_sources",
+            # 撤销回执的银河来源计数：`adapters.admin_registry` 模块级 import（理由见
+            # REQUIRED_MODULES 同名条目）。
+            "lingxi.core.permission.galaxy_retention",
             # 存量差集导入纯逻辑（rc25 S-1）：随 `adapters.postgres_local_permission`、
             # `core.permission.targeted_recompute` 进入 gateway 闭包。
             "lingxi.core.permission.legacy_diff",

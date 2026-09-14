@@ -21,7 +21,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta
 from typing import Any
 
-from lingxi.adapters.admin_registry import admin_registry_entry_from_row
+from lingxi.adapters.admin_registry import PostgresAdminQueries, admin_registry_entry_from_row
 from lingxi.adapters.postgres_conversation import _Transaction
 from lingxi.adapters.postgres_local_permission import (
     DuplicateActiveOverrideError,
@@ -39,9 +39,13 @@ from lingxi.core.admin.pending_action import (
     PendingActionStatus,
     PendingActionType,
     PrepareDecision,
+    decide_prepare,
     format_in_flight_conflict_message,
+    local_permission_pairs,
+    narrow_grant_payload,
 )
 from lingxi.core.ids import new_id
+from lingxi.core.permission.galaxy_retention import retained_by_galaxy
 from lingxi.core.permission.local_override import (
     LocalPermissionOverrideEntry,
     OverrideDirection,
@@ -49,6 +53,7 @@ from lingxi.core.permission.local_override import (
 from lingxi.core.permission.position_override import (
     PositionPermissionExpansion,
     expand_position_scope,
+    split_missing_pairs,
 )
 
 #: 收回的自我目标防呆拒绝码/文案：取值与 ``core/admin/router.
@@ -251,15 +256,15 @@ class _ExecutionMixin:
                 is_group_revoke_action=is_group_revoke_action,
             )
         if is_local_permission_action:
-            current_state = self._resolve_local_permission_current_state(
+            return self._resolve_local_permission_state(
                 cursor,
                 target_open_id=target_open_id,
                 action_type=action_type,
                 position_expansion=position_expansion,
                 company_id=company_id,
                 metric_name=metric_name,
+                payload=payload,
             )
-            return current_state, payload, resolved_target_open_id
         current_state = self._resolve_account_state_current(cursor, target_open_id=target_open_id)
         return current_state, payload, resolved_target_open_id
 
@@ -364,27 +369,50 @@ class _ExecutionMixin:
     ) -> PrepareOutcome | tuple[str | None, str | None, str]:
         """收回动作的目标解析。
 
-        返回 ``(current_state, payload, resolved_target_open_id)``，或一个
-        拒绝的 :class:`PrepareOutcome`（自我目标防呆）。新职位+范围授权在
-        管理卡上是一个整体，一次收回必须覆盖该组全部展开行
-        （``_resolve_group_revoke_target``）；历史 ``permission_group_id
-        IS NULL`` 行按单条 override 定位（``_resolve_single_revoke_target``）。
-        自我目标防呆放在这里、不在 router 层：router 拿到的只是一个不透明
-        override_id，查库之前无法判断属主是不是操作者本人。
+        返回 ``(current_state, payload, resolved_target_open_id)``，或一个拒绝的
+        :class:`PrepareOutcome`（自我目标防呆——router 拿到的只是不透明 override_id，
+        查库之前无法判断属主是不是操作者本人）。新职位+范围授权在管理卡上是一个
+        整体，一次收回覆盖该组全部展开行（``_resolve_group_revoke_target``）；历史
+        ``permission_group_id IS NULL`` 行按单条定位（``_resolve_single_revoke_target``）。
+        可撤销的目标再补一次银河来源回显（``_attach_galaxy_retention``）。
         """
         if is_group_revoke_action:
-            return self._resolve_group_revoke_target(
+            resolved = self._resolve_group_revoke_target(
                 cursor,
                 group_id=target_open_id,
                 initiated_by_open_id=initiated_by_open_id,
                 reason=reason,
             )
-        return self._resolve_single_revoke_target(
-            cursor,
-            override_id=target_open_id,
-            initiated_by_open_id=initiated_by_open_id,
-            reason=reason,
+        else:
+            resolved = self._resolve_single_revoke_target(
+                cursor,
+                override_id=target_open_id,
+                initiated_by_open_id=initiated_by_open_id,
+                reason=reason,
+            )
+        if isinstance(resolved, PrepareOutcome) or resolved[0] != "active" or resolved[1] is None:
+            return resolved
+        current_state, payload, owner_open_id = resolved
+        payload = self._attach_galaxy_retention(payload, owner_open_id=owner_open_id)
+        return current_state, payload, owner_open_id
+
+    def _attach_galaxy_retention(self, payload: str, *, owner_open_id: str) -> str:
+        """撤销 payload 追加 ``galaxy_retained``：被撤各项里银河来源仍覆盖的项数。
+
+        只读回显、不改任何权限规则：在准备时刻现算一次并随 payload 持久化，确认卡、
+        终态卡、群通知与后续查询都从同一份数字渲染。任一快照或映射读不到时记
+        ``None``，渲染层据此写「暂不可读」而不是把不确定当成 0 项。
+        """
+        data = json.loads(payload)
+        galaxy_map = PostgresAdminQueries(self._dsn, timeouts=self._timeouts).galaxy_metric_map(
+            open_id=owner_open_id, metric_map_path=self._metric_map_path
         )
+        data["galaxy_retained"] = (
+            None
+            if galaxy_map is None
+            else retained_by_galaxy(local_permission_pairs(data), galaxy_map)
+        )
+        return json.dumps(data, ensure_ascii=False)
 
     @staticmethod
     def _resolve_group_revoke_target(
@@ -466,7 +494,7 @@ class _ExecutionMixin:
         return entry_status, payload, owner_open_id
 
     @staticmethod
-    def _resolve_local_permission_current_state(
+    def _resolve_local_permission_state(
         cursor: Any,
         *,
         target_open_id: str,
@@ -474,38 +502,44 @@ class _ExecutionMixin:
         position_expansion: PositionPermissionExpansion | None,
         company_id: str | None,
         metric_name: str | None,
-    ) -> str | None:
-        """授权/抑制动作的"目标当前状态"。
+        payload: str | None,
+    ) -> PrepareOutcome | tuple[str | None, str | None, str]:
+        """授权/抑制动作的"目标当前状态"与差集后的 payload。
 
-        按 ``payload`` 里的公司×指标键，查是否已有 ``entry_status='active'``
-        的同极性同键行，得到 ``"absent"``/``"present"`` 写入
-        ``target_state_snapshot``——与 ``account_state`` 是同一列，只是取值域
-        不同，``decide_prepare``/``decide_confirm`` 不需要关心这个区别。
+        按 payload 里的公司×指标键对照该用户当前生效的同极性行：一项都不缺记
+        ``"present"``（补充授权在这里直接给出带项数的拒绝）；否则记 ``"absent"``
+        写入 ``target_state_snapshot``，补充授权的 payload 收窄到缺的那几项并记下
+        沿用数——本地库内部重叠按差集补齐，不再整笔拒绝。
         """
-        cursor.execute(
-            "SELECT id, account_state FROM app_user WHERE feishu_open_id = %s",
-            (target_open_id,),
-        )
+        cursor.execute("SELECT id FROM app_user WHERE feishu_open_id = %s", (target_open_id,))
         row = cursor.fetchone()
-        user_id = row[0] if row is not None else None
-        if user_id is None:
-            return None
+        if row is None:
+            return None, payload, target_open_id
         direction = _DIRECTION_BY_ACTION_TYPE[action_type]
-        pairs = (
+        cursor.execute(
+            "SELECT company_id, metric_name FROM local_permission_override"
+            " WHERE user_id = %s AND direction = %s AND entry_status = 'active'",
+            (row[0], direction.value),
+        )
+        requested = (
             position_expansion.pairs
             if position_expansion is not None
             else ((company_id, metric_name),)
         )
-        for pair_company_id, pair_metric_name in pairs:
-            cursor.execute(
-                "SELECT 1 FROM local_permission_override"
-                " WHERE user_id = %s AND direction = %s AND company_id = %s"
-                "   AND metric_name = %s AND entry_status = 'active'",
-                (user_id, direction.value, pair_company_id, pair_metric_name),
-            )
-            if cursor.fetchone() is not None:
-                return "present"
-        return "absent"
+        missing, reused = split_missing_pairs(requested, cursor.fetchall())
+        is_grant = action_type is PendingActionType.LOCAL_PERMISSION_GRANT
+        if not missing:
+            if is_grant:
+                decision = decide_prepare(
+                    action_type=action_type,
+                    current_account_state="present",
+                    held_pair_count=len(reused),
+                )
+                return PrepareOutcome(decision=decision)
+            return "present", payload, target_open_id
+        if is_grant and reused and payload is not None:
+            payload = narrow_grant_payload(payload, missing=missing, reused_count=len(reused))
+        return "absent", payload, target_open_id
 
     @staticmethod
     def _resolve_account_state_current(cursor: Any, *, target_open_id: str) -> str | None:
