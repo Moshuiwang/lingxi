@@ -62,17 +62,13 @@ FIXED_SAMPLES = (
     ),
     _FixedSample("被抑制清空", "fully_suppressed", DecisionBranch.REVOKED),
     _FixedSample("零银河有本地授权", "zero_galaxy_local_grant", DecisionBranch.PUBLISHED),
-    _FixedSample(
-        "零银河本地授权被同键抑制", "zero_galaxy_suppressed", DecisionBranch.REVOKED
-    ),
+    _FixedSample("零银河本地授权被同键抑制", "zero_galaxy_suppressed", DecisionBranch.REVOKED),
     _FixedSample(
         "零银河无本地授权且无足迹",
         "zero_galaxy_without_local_grant",
         DecisionBranch.REVOKE_WITHOUT_FOOTPRINT,
     ),
-    _FixedSample(
-        "撤销后迟到补齐", "revoked_before_late_backfill", DecisionBranch.REVOKED
-    ),
+    _FixedSample("撤销后迟到补齐", "revoked_before_late_backfill", DecisionBranch.REVOKED),
     _FixedSample("正常全通过", "normal", DecisionBranch.PUBLISHED),
 )
 
@@ -110,9 +106,7 @@ def _sample_inputs(sample: _FixedSample) -> dict[str, Any]:
         )
     elif sample.key == "zero_galaxy_local_grant":
         inputs["galaxy"] = refresh.galaxy_snapshot(roles=())
-        inputs["local_overrides"] = refresh.FakeLocalOverrides(
-            {USER: (refresh._override_entry(),)}
-        )
+        inputs["local_overrides"] = refresh.FakeLocalOverrides({USER: (refresh._override_entry(),)})
     elif sample.key == "zero_galaxy_suppressed":
         inputs["galaxy"] = refresh.galaxy_snapshot(roles=())
         inputs["local_overrides"] = refresh.FakeLocalOverrides(
@@ -358,6 +352,7 @@ def _wrong_branch(decision: UserDecision, target: DecisionBranch) -> UserDecisio
 
 def _mutated_method(original: Callable[..., Any], target: DecisionBranch, hits: list[int]):
     """生成一个只改共享返回点的临时方法，供两个入口用例集共同承受。"""
+
     def mutated(self, *args: Any, **kwargs: Any) -> UserDecision:
         decision = original(self, *args, **kwargs)
         if isinstance(decision, UserDecision) and decision.branch is target:
