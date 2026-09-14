@@ -1236,6 +1236,10 @@ PROCESS_RUNTIME_IMPORTS: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {
             "lingxi.adapters.innertest_confirmation_card",
             "lingxi.adapters.postgres_identity",
             "lingxi.adapters.postgres_innertest",
+            # 扩员的确认 / 取消 / 拒绝在 gateway 的卡片回调事务里落运营审计账
+            # （`postgres_innertest._audit` 模块级 import 写口与核心模型）。
+            "lingxi.adapters.postgres_operation_audit",
+            "lingxi.core.admin.operation_audit",
             "lingxi.adapters.postgres_innertest_confirmation",
             "lingxi.adapters.postgres_innertest_locator",
             "lingxi.adapters.postgres_innertest_roster",
