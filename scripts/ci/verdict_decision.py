@@ -11,7 +11,7 @@
 1. 触发运行不是 `pull_request` 事件、或不是 `.github/workflows/ci.yml` 产出的：不写检查。
 2. 头提交来自外部仓库：写 failure，外部仓库不裁决。
 3. 路径 a——同时满足：触发运行留下的 OIDC 身份凭证验签通过且声明合格（谁签、签给
-   哪次运行、面向哪条受保护分支，见 `check_token`）、头提交的 `.github/workflows`
+   哪次运行、面向默认分支，见 `check_token`）、头提交的 `.github/workflows`
    子树与凭证声明的 base 分支（运行时被合并进去的那个提交）相同：采信那次 `Epic Full`
    的结论；只有 `success` 算通过，`skipped` / `neutral` / `cancelled` 一律判红。
 4. 其余一律路径 b：由默认分支版 `ci.yml` 以头提交复跑一次，结论在复跑结束后由
@@ -148,9 +148,15 @@ def parse_run_facts(event: Mapping, fallback_pull_requests: Sequence[Mapping] = 
 
 
 def is_protected_base(base_ref: str, default_branch: str) -> bool:
-    """受规则集保护的分支：默认分支或 `release/**`；只有它们上的定义才配当比较对象。"""
+    """受规则集保护的分支：默认分支或 `release/**`；只用于贴标签与差异清单，不是信任判断。"""
 
     return base_ref == default_branch or base_ref.startswith("release/")
+
+
+def is_trusted_base(base_ref: str, default_branch: str) -> bool:
+    """路径 a 只信与默认分支相等的已规范化分支名。"""
+
+    return base_ref == default_branch
 
 
 def select_baseline(facts: RunFacts) -> Baseline:
@@ -326,8 +332,10 @@ def claim_problems(
     if claims.get("event_name") != "pull_request":
         problems.append(f"event_name={claims.get('event_name')!r}")
     base_ref = normalize_branch(str(claims.get("base_ref") or ""))
-    if not is_protected_base(base_ref, expected.default_branch):
-        problems.append(f"base_ref={claims.get('base_ref')!r} 不是受保护分支")
+    if not is_trusted_base(base_ref, expected.default_branch):
+        problems.append(
+            f"base_ref={claims.get('base_ref')!r} 不是默认分支（进 release/** 的 PR 一律复跑）"
+        )
     workflow_ref = str(claims.get("workflow_ref") or "")
     if not workflow_ref.startswith(f"{expected.repository}/{expected.workflow_path}@"):
         problems.append(f"workflow_ref={workflow_ref!r}")
