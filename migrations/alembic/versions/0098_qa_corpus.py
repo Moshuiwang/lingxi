@@ -47,7 +47,7 @@ Revises: 0097_operation_audit
 
 ## ``qa_corpus_reader``
 
-合同要求「只有为此设立的窄读取角色可读」。独立登记表而不是给 ``admin_registry`` 加第四列
+合同写明「只有为此设立的窄读取角色可读」。独立登记表而不是给 ``admin_registry`` 加第四列
 （那张表有「active ⇒ 三类全真」的 CHECK 与全集判定，改动爆炸半径大）。``label`` 是角色化
 标签不是姓名；同一 ``feishu_open_id`` 同一时刻至多一条 ``active``（部分唯一索引，形状同
 ``admin_registry``）。授予与撤销的命令、读取与导出的审计接入是后续工作项。
