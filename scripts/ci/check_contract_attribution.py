@@ -383,7 +383,7 @@ GROUNDED_ATTRIBUTIONS: tuple[GroundedAttribution, ...] = (
         "统一用户记录与权限变化",
     ),
     GroundedAttribution(
-        "src/lingxi/apps/scheduler/permission_refresh.py",
+        "src/lingxi/core/permission/user_decision_tree.py",
         "# 建档合同要求人员 ID 必填，但存档里真的没有时，匹配层会直接抛错。",
         "开通流程",
     ),

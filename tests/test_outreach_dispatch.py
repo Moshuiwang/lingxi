@@ -17,6 +17,7 @@ from lingxi.core.admin.innertest import InnertestError
 from lingxi.core.outreach.dispatch import (
     OUTREACH_ALERT_CHANNEL,
     REASON_RECIPIENT_CHANGED,
+    RECIPIENT_UNREACHABLE_CODES,
     STATUS_DELIVERED,
     STATUS_FAILED,
     OutreachDispatcher,
@@ -485,6 +486,23 @@ class DefiniteDeliveryFailureCodeTest(unittest.TestCase):
     def test_a_rate_limit_failure_at_the_send_endpoint_returns_none(self) -> None:
         """发送端点的频率限制同样带 ``feishu_code_`` 前缀，但说明的是限流不是收件人。"""
         error = FeishuUserCardError("feishu_code_99991400")
+        self.assertIsNone(definite_delivery_failure_code(error))
+
+    def test_a_sibling_code_in_the_2300_family_returns_none(self) -> None:
+        """清单成员判定是整码相等，不是 ``2300`` 族前缀：``230049``「仍在发送」是
+        结果不明，``230001`` 是参数类故障，都不是「这个人联系不上」。
+
+        变异锚点：把成员判改成 ``startswith("feishu_code_2300")``，本用例应变红。
+        """
+        for code in ("feishu_code_230049", "feishu_code_230001"):
+            with self.subTest(code=code):
+                self.assertNotIn(code, RECIPIENT_UNREACHABLE_CODES)
+                self.assertIsNone(definite_delivery_failure_code(FeishuUserCardError(code)))
+
+    def test_a_translated_sibling_code_in_the_2300_family_returns_none(self) -> None:
+        """从 ``__cause__`` 掏出来的平台码走同一条成员判定，族内近邻同样保持未知。"""
+        error = InnertestError("notification_failed")
+        error.__cause__ = FeishuUserCardError("feishu_code_230049")
         self.assertIsNone(definite_delivery_failure_code(error))
 
     def test_a_pre_send_check_failure_returns_none(self) -> None:

@@ -41,16 +41,16 @@ from lingxi.apps.worker.service_ports import (
     UserMemoryReader,
     WorkerObservers,
 )
-from lingxi.apps.worker.task_processing import (
+from lingxi.apps.worker.terminal_outcome import TerminalOutcomeAudit
+from lingxi.apps.worker.turn import WorkerTurnExecutor
+from lingxi.config.content import ContentCatalog, default_content_catalog
+from lingxi.core.delivery.ports import DeliveryEventType, TerminalKind, assert_content_allowed
+from lingxi.core.delivery.turn_outcome import (
     TerminalDecision,
     TurnOutcome,
     decide_terminal,
     empty_outcome,
 )
-from lingxi.apps.worker.terminal_outcome import TerminalOutcomeAudit
-from lingxi.apps.worker.turn import WorkerTurnExecutor
-from lingxi.config.content import ContentCatalog, default_content_catalog
-from lingxi.core.delivery.ports import DeliveryEventType, TerminalKind, assert_content_allowed
 from lingxi.core.task_reference import append_failure_reference, reference_fields, valid_trace_id
 
 logger = logging.getLogger(__name__)

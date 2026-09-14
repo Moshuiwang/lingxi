@@ -29,6 +29,13 @@ from lingxi.core.admin.card_callback_ports import (
 )
 from lingxi.core.admin.card_dispatch import ManagementCardContext, management_card_fingerprint
 from lingxi.core.admin.management_card import ADMIN_ACTION_GRANT
+from lingxi.core.admin.management_card_states import (
+    DISPATCH_IDLE,
+    DISPATCH_PUBLISHING,
+    STATE_CLOSED,
+    STATE_DISPATCHING,
+    STATE_SUBMITTED,
+)
 from lingxi.core.admin.views import AdminUserStatusView
 
 
@@ -377,7 +384,7 @@ class _ManagementCardCallbackMixin:
                 "admin.card_callback.management_identifier_mismatch", trace_id=trace_id
             )
             return _ManagementContextCheck(context=context, status=None, forbidden=True)
-        if context.state in {"closed", "submitted", "dispatching"}:
+        if context.state in {STATE_CLOSED, STATE_SUBMITTED, STATE_DISPATCHING}:
             # 已关闭的卡不得因为一次过期回调重放而重新变成写入口；一次表单
             # 提交已经产生确认卡后，重复投递不得再创建第二个逻辑操作。终态
             # 生效/不完整仍保持可操作——渲染层会对着最新快照恢复表单。
@@ -408,8 +415,8 @@ class _ManagementCardCallbackMixin:
             refreshed_context = (
                 store.update_state(
                     message_id=message_id,
-                    state="closed",
-                    dispatch_status="idle",
+                    state=STATE_CLOSED,
+                    dispatch_status=DISPATCH_IDLE,
                     snapshot_fingerprint=fingerprint,
                     last_trace_id=trace_id,
                 )
@@ -425,7 +432,7 @@ class _ManagementCardCallbackMixin:
         self._refresh_management_card(
             context=refreshed_context,
             status=status,
-            state="closed",
+            state=STATE_CLOSED,
             status_message="数据已变化，请重新查询",
             trace_id=trace_id,
         )
@@ -511,16 +518,16 @@ class _ManagementCardCallbackMixin:
         try:
             updated = self._management_context_store.update_state(
                 message_id=message_id,
-                state="submitted",
-                dispatch_status="publishing",
+                state=STATE_SUBMITTED,
+                dispatch_status=DISPATCH_PUBLISHING,
                 last_trace_id=trace_id,
             )
             if updated is not None and status is not None:
                 self._refresh_management_card(
                     context=updated,
                     status=status,
-                    state="submitted",
-                    dispatch_status="publishing",
+                    state=STATE_SUBMITTED,
+                    dispatch_status=DISPATCH_PUBLISHING,
                     trace_id=trace_id,
                 )
         except Exception as error:  # database/card update is best effort
@@ -585,15 +592,15 @@ class _ManagementCardCallbackMixin:
         try:
             updated = self._management_context_store.update_state(
                 message_id=message_id,
-                state="closed",
-                dispatch_status="idle",
+                state=STATE_CLOSED,
+                dispatch_status=DISPATCH_IDLE,
                 last_trace_id=trace_id,
             )
             if updated is not None and status is not None:
                 self._refresh_management_card(
                     context=updated,
                     status=status,
-                    state="closed",
+                    state=STATE_CLOSED,
                     trace_id=trace_id,
                 )
         except Exception as error:

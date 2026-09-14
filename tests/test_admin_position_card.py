@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import unittest
 from datetime import UTC, datetime, timedelta
+from types import SimpleNamespace
 
 from lingxi.config.content import default_content_catalog
 from lingxi.core.admin.card_dispatch import (
@@ -1187,7 +1188,7 @@ class SuspendedUserGetsTheTruthNotADailyBatchPromiseTests(unittest.TestCase):
     def test_the_account_not_enabled_skip_renders_the_truth(self) -> None:
         """SKIPPED/account_not_enabled 走新文案。"""
 
-        from lingxi.apps.gateway.management_status import (
+        from lingxi.core.admin.management_status import (
             skipped_recompute_status_message,
         )
 
@@ -1206,7 +1207,7 @@ class SuspendedUserGetsTheTruthNotADailyBatchPromiseTests(unittest.TestCase):
     def test_that_truth_actually_reaches_the_rendered_card(self) -> None:
         """真话必须真的出现在管理员看到的那张卡上，不只是回调的返回值。"""
 
-        from lingxi.apps.gateway.management_status import (
+        from lingxi.core.admin.management_status import (
             skipped_recompute_status_message,
         )
 
@@ -1240,7 +1241,7 @@ class SuspendedUserGetsTheTruthNotADailyBatchPromiseTests(unittest.TestCase):
     def test_other_skip_reasons_keep_the_original_wording(self) -> None:
         """反向对照三：其余跳过原因确实可能被日批纠正，行为逐字节不变。"""
 
-        from lingxi.apps.gateway.management_status import (
+        from lingxi.core.admin.management_status import (
             skipped_recompute_status_message,
         )
 
@@ -1273,92 +1274,80 @@ class SuspendedUserGetsTheTruthNotADailyBatchPromiseTests(unittest.TestCase):
             self.assertNotIn(fragment, visible)
 
 
-if __name__ == "__main__":
-    unittest.main()
+class RecomputeResultReporterWritesHumanReadableTextTests(unittest.TestCase):
+    """后台重算结果回写到卡片上的是给管理员看的话，不是英文机器态。
 
-
-class SuspendedUserTransientTextTests(unittest.TestCase):
-    """#493 块 B 第二条（Trace #544）：**对已停用目标操作时的瞬时文案**。
-
-    终态早已被 rc24 F5 纠正成那句真话，可是**瞬时**这一行还在说「操作已记录，权限
-    正在下发」——对一个已停用的目标，下发根本不会发生（发布层在 ``app_user`` 行锁里
-    就挡住了非 ``enabled`` 账号的非空授权）。管理员先看到一句不成立的承诺、隔一会儿
-    才被终态纠正，是展示面失真。这里让瞬时与终态说同一句话。
+    ``translate_recompute_result`` 算出 ``(state, display, machine)`` 三个值：落库的是
+    ``machine``，交给刷新器渲染到卡片上的必须是 ``display``（含追溯号那句）。两者接反，
+    库里照样是合法取值、既有断言照样绿，管理员却会在卡上看到 ``incomplete`` 这样的
+    英文字面——这里把「刷新器收到的逐字等于 display、且不等于 machine」钉死。
     """
 
-    TRUTH_FRAGMENTS = ("已停用", "不会下发")
-    PUBLISHING_PROMISE = "权限正在下发"
+    MESSAGE_ID = "om_reporter"
 
-    def _rendered(self, *, account_state: str, **overrides) -> str | None:
-        from lingxi.apps.gateway.management_status import rendered_dispatch_status
+    def _reporter(self, status: AdminUserStatusView):
+        from lingxi.apps.gateway.management_cards import RecomputeResultReporter
 
-        status = AdminUserStatusView(
-            identifier="ou_target",
-            provisioning_state="active",
-            account_state=account_state,
-            permission_version=1,
-            updated_at="2026-09-02T12:00:00+00:00",
+        store = ManagementCardContextStore()
+        store.remember(
+            message_id=self.MESSAGE_ID,
+            card_id="card_reporter",
+            identifier="u@example.com",
+            chat_id="oc_1",
+            initiated_by_open_id="ou_admin",
+            snapshot_fingerprint=management_card_fingerprint(status),
+            context_deadline_at=datetime.now(UTC) + timedelta(hours=1),
+            last_trace_id="trc_reporter",
         )
-        fields = {"state": "dispatching", "dispatch_status": None, "status_message": None}
-        fields.update(overrides)
-        return rendered_dispatch_status(status=status, **fields)
+        refresh = _Refresh()
+        reporter = RecomputeResultReporter(
+            context_store=store,
+            refresher=refresh,
+            status_lookup=lambda _identifier: status,
+            audit=_Audit(),
+        )
+        return reporter, store, refresh
 
-    def test_suspended_target_never_sees_the_publishing_promise(self) -> None:
-        for name, fields in (
-            ("即时路径已算好的文案", {"status_message": "操作已记录，权限正在下发"}),
-            ("状态机 dispatching", {"state": "dispatching"}),
-            ("状态机 submitted", {"state": "submitted"}),
-            ("恢复 scanner 重画", {"state": "unknown", "dispatch_status": "publishing"}),
-        ):
-            with self.subTest(name=name):
-                visible = self._rendered(account_state="suspended", **fields)
-                assert visible is not None
-                self.assertNotIn(self.PUBLISHING_PROMISE, visible)
-                for fragment in self.TRUTH_FRAGMENTS:
-                    self.assertIn(fragment, visible)
+    def _assert_refresher_got_the_display_text(self, store, refresh, before, *, complete: bool):
+        from lingxi.core.admin.management_status import translate_recompute_result
 
-    def test_enabled_target_still_sees_the_publishing_line(self) -> None:
-        """反向对照一：账号正常的用户，瞬时这一行逐字不变。"""
+        expected = translate_recompute_result(before, complete=complete)
+        self.assertEqual(len(refresh.calls), 1, refresh.calls)
+        call = refresh.calls[0]
+        self.assertEqual(call["dispatch_status"], expected.display)
+        self.assertNotEqual(call["dispatch_status"], expected.machine)
+        self.assertEqual(call["state"], expected.state)
+        after = store.lookup_context(message_id=self.MESSAGE_ID)
+        self.assertEqual((after.state, after.dispatch_status), (expected.state, expected.machine))
 
-        visible = self._rendered(account_state="enabled")
-        self.assertEqual(visible, "操作已记录，权限正在下发")
+    def test_a_completed_recompute_refreshes_the_card_with_the_effective_wording(self) -> None:
+        status = _status()
+        reporter, store, refresh = self._reporter(status)
+        before = store.lookup_context(message_id=self.MESSAGE_ID)
 
-    def test_other_states_of_a_suspended_target_are_untouched(self) -> None:
-        """反向对照二：只改写「正在下发」这一句——「已生效」「已取消」各有自己的判据，
-        不在这里顺手一起改写。"""
+        reporter.on_completed(SimpleNamespace(id="pac_1", origin_card_message_id=self.MESSAGE_ID))
 
-        self.assertEqual(self._rendered(account_state="suspended", state="effective"), "已生效")
-        self.assertEqual(self._rendered(account_state="suspended", state="closed"), "已取消")
+        self._assert_refresher_got_the_display_text(store, refresh, before, complete=True)
+        self.assertEqual(refresh.calls[0]["dispatch_status"], "已生效")
 
-    def test_a_status_view_without_account_state_keeps_the_old_wording(self) -> None:
-        """反向对照三：读不到账号状态时按"没有额外信息"处理，行为逐字不变
-        （与 ``is_account_not_enabled`` 同一姿态，保护旧测试替身）。"""
+    def test_a_failed_recompute_refreshes_the_card_with_the_incomplete_wording(self) -> None:
+        status = _status()
+        reporter, store, refresh = self._reporter(status)
+        before = store.lookup_context(message_id=self.MESSAGE_ID)
 
-        from lingxi.apps.gateway.management_status import rendered_dispatch_status
+        reporter.on_failed(
+            SimpleNamespace(id="pac_1", origin_card_message_id=self.MESSAGE_ID), None
+        )
 
-        class _StatusWithoutAccountState:
-            identifier = "ou_target"
-
+        self._assert_refresher_got_the_display_text(store, refresh, before, complete=False)
         self.assertEqual(
-            rendered_dispatch_status(
-                status=_StatusWithoutAccountState(),
-                state="dispatching",
-                dispatch_status=None,
-                status_message=None,
-            ),
-            "操作已记录，权限正在下发",
+            refresh.calls[0]["dispatch_status"],
+            "下发未完成，最迟次日自动纠正 · 追溯号 trc_reporter",
+        )
+        self.assertNotIn(
+            refresh.calls[0]["dispatch_status"], ("incomplete", "effective", "publishing", "idle")
         )
 
-    def test_the_publishing_literal_has_exactly_one_home(self) -> None:
-        """撤除重复字面量（#493 块 B）：``apps/gateway/__init__.py`` 此前另抄了两份，
-        改一处漏两处。"""
 
-        from pathlib import Path
-
-        import lingxi.apps.gateway as gateway_package
-        from lingxi.apps.gateway.management_status import PUBLISHING_STATUS_TEXT
-
-        source = (Path(gateway_package.__file__)).read_text(encoding="utf-8")
-
-        self.assertEqual(PUBLISHING_STATUS_TEXT, "操作已记录，权限正在下发")
-        self.assertNotIn(f'"{PUBLISHING_STATUS_TEXT}"', source)
+if __name__ == "__main__":
+    unittest.main()

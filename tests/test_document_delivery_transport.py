@@ -95,6 +95,7 @@ from lingxi.adapters.feishu_user_message import FeishuUserMessages
 from lingxi.adapters.postgres import connect
 from lingxi.adapters.postgres_conversation import PostgresTaskQueue
 from lingxi.adapters.postgres_document_delivery import (
+    MAX_CLAIM_ATTEMPTS,
     DocumentDeliveryClaim,
     PostgresDocumentDeliveryStore,
 )
@@ -863,6 +864,55 @@ class DocumentDeliveryTransportTestCase(unittest.TestCase):
                 "SELECT status FROM task_document_delivery_request WHERE id = %s", (claim.id,)
             ),
             "uncertain",
+        )
+
+    def test_reclaim_prefers_uncertain_over_attempts_exhausted_when_creation_was_attempted(
+        self,
+    ) -> None:
+        """回收判定的优先级：``attempts`` 已经耗尽、``creation_attempted_at`` 非空、
+        ``document_id`` 仍为空 → 必须是 ``uncertain``，不是 ``failed`` /
+        ``attempts_exhausted``。「已尝试建档但无编号」说明外部可能已经有一份产物，
+        这一行需要人工核对；判成 ``failed`` 会把这条线索当成普通耗尽悄悄合上。
+
+        变异锚点：把 ``_reclaim_disposition`` 里「attempts 耗尽」的判定提到「已尝试
+        建档但无编号」之前，本用例应变红（去向变成 ``failed`` / ``attempts_exhausted``）。
+        """
+
+        self._seed_pending_request(request_id="tdd-exhausted-attempted")
+
+        claims = self.store.claim_pending(limit=1)
+        self.assertEqual(len(claims), 1)
+        claim = claims[0]
+        self.assertIsNone(claim.document_id)
+        self.store.mark_creation_attempted(request_id=claim.id)
+        # 把 attempts 直接推到上限并回拨 updated_at：模拟"最后一次重试也在建档
+        # 中途消失"，回收窗口到期时 attempts 与 creation_attempted_at 同时成立。
+        self.execute(
+            "UPDATE task_document_delivery_request "
+            "SET attempts = %s, updated_at = now() - interval '10 minutes' WHERE id = %s",
+            (MAX_CLAIM_ATTEMPTS, claim.id),
+        )
+
+        requeued, failed, uncertain = self.store.reclaim_stale_processing()
+
+        self.assertEqual((requeued, failed, uncertain), (0, 0, 1))
+        self.assertEqual(
+            self.scalar(
+                "SELECT status FROM task_document_delivery_request WHERE id = %s", (claim.id,)
+            ),
+            "uncertain",
+        )
+        self.assertEqual(
+            self.scalar(
+                "SELECT last_error FROM task_document_delivery_request WHERE id = %s", (claim.id,)
+            ),
+            "creation_attempt_unconfirmed",
+            "attempts 耗尽不得盖过「已尝试建档但无编号」这条更要紧的线索",
+        )
+        self.assertIsNone(
+            self.scalar(
+                "SELECT document_id FROM task_document_delivery_request WHERE id = %s", (claim.id,)
+            )
         )
 
     def test_creation_attempted_checkpoint_precedes_the_one_shot_call_in_the_real_path(
