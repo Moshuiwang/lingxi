@@ -879,12 +879,15 @@ def check_qa_corpus_export_root() -> list[str]:
     ``scripts/ops/qa_corpus.py export`` 只把文件写到环境变量 ``LINGXI_QA_CORPUS_EXPORT_ROOT``
     指向的目录正下方；这个变量由基线 compose 在 scheduler 的 ``environment:`` 块声明，值必须：
 
-    1. 是字面量绝对路径，不得 ``${}`` 插值——插值等于把导出根交回可抄的外部文件；
+    1. 是字面量绝对路径，值里不得有任何 ``$``——``${VAR}`` 与 ``$VAR`` 都是 compose 插值，
+       插值等于把导出根交回可抄的外部文件；
     2. 落在 scheduler 某个**具名持久卷**的挂载点之下且该挂载可写——容器本地路径随镜像替换
        消失，绑定挂载的宿主目录权限不由本仓库控制；
     3. 那个卷在四份 compose 里都不得挂给 ``worker`` / ``worker-queue`` / ``gateway``——前两者
        是模型执行环境，后者是入站入口，导出的明文语料一旦被它们看见就不再受控；
-    4. 变量名不得出现在这三个服务的任何块里，``deploy/.env.example`` 不得有赋值行。
+    4. 变量名在四份 compose 里只许出现基线 scheduler 块那一处：环境覆盖文件（stage / prod /
+       innertest）的任何 service 块都不得再声明它——compose 覆盖文件的同名键会替换基线的值，
+       只查基线等于让覆盖文件把导出根改到卷外；``deploy/.env.example`` 不得有赋值行。
     """
 
     variable = module_constant(QA_CORPUS_SCRIPT, "EXPORT_ROOT_VAR")
@@ -901,8 +904,22 @@ def check_qa_corpus_export_root() -> list[str]:
     if declared is None:
         return [f"{display(COMPOSE_BASE)} 的 scheduler 没有在 `environment:` 里声明 `{variable}`"]
     root = declared.strip("\"'")
-    if "${" in root or not root.startswith("/"):
-        failures.append(f"`{variable}: {declared}` 必须是字面量绝对路径，不得 ${{}} 插值或相对路径")
+    if "$" in root or not root.startswith("/"):
+        failures.append(
+            f"`{variable}: {declared}` 必须是字面量绝对路径，不得含 `$`（${{VAR}} 与 $VAR 都是"
+            "插值）或写成相对路径"
+        )
+    if base.count(variable) != 1:
+        failures.append(
+            f"{display(COMPOSE_BASE)} 出现了 {base.count(variable)} 处 `{variable}`：只许 scheduler "
+            "的 environment 块声明一次，别处再写一份就分不清哪一份生效"
+        )
+    for path in (COMPOSE_STAGE, COMPOSE_PROD, COMPOSE_INNERTEST):
+        if variable in strip_comments(read(path)):
+            failures.append(
+                f"{display(path)} 出现了 `{variable}`：导出根只由基线 compose 的 scheduler 块声明，"
+                "覆盖文件的同名键会替换基线的值，任何 service 块都不得再声明它"
+            )
     volume = next(
         (
             (source, mode)
@@ -1610,6 +1627,93 @@ def check_compose_interpolation_is_yaml_safe() -> list[str]:
             "那条渲染门禁不读 deploy/.env.prod，缺一个就整段渲染不出来——"
             "而它只在最晚的 `Epic Full / image` 作业里跑（PR #506 实测）。"
         )
+    return failures
+
+
+# ---- compose 文件不得使用 YAML 锚点 / 别名 / 合并键 ---------------------------
+# 本文件的每一条 compose 门禁（service_block、_environment_value、按块 count……）
+# 都按**文本块**判定，不做完整 YAML 解析。锚点 + 别名会让「文本写在哪个块」与
+# 「值在哪个块生效」分离：在一个 service 的 `x-` 扩展映射里用 `&开关` 定义值，在
+# 另一个 service 用 `<<: *开关` 合并进去——逐块计数的门禁只看见前者，后者那份生效
+# 的声明对它不可见。与其把每条门禁改成 YAML 解析，不如在源头禁掉这三种语法：
+# 本仓四份 compose 从未需要它们。注释与引号内的 `&` / `*` / `<<:` 不算。
+#: 锚点 `&名`、别名 `*名` 只在**节点起始处**出现：行首缩进之后、`键: ` 之后、`- ` 之后、
+#: 流式 `[` `{` `,` 之后；纯量中间的 `2>&1`、`a*b`、`ls *.log` 都不是。合并键 `<<:` 同样
+#: 只在键位置出现。名字按规范取非空白、非流式指示符的任意字符。
+_YAML_ANCHOR_ALIAS_OR_MERGE = re.compile(
+    r"(?:^\s*|:\s+|-\s+|[\[{,]\s*)((?:[&*][^\s\[\]{},]+)|<<\s*:)"
+)
+_YAML_BLOCK_SCALAR_HEADER = re.compile(r"(?:^|:|-)\s*[|>](?:[+-]?[0-9]?|[0-9]?[+-]?)\s*$")
+
+
+def _yaml_code_only(line: str) -> str:
+    """去掉一行 YAML 里的注释与引号内容，只留会被解析成结构的部分。
+
+    引号只在纯量起始处（行首、空白、`[` `{` `,` 之后）才开引号——`it's` 里的撇号是
+    字面量；`#` 只在行首或紧跟空白时才开注释。单引号里 `''`、双引号里 `\\"` 是转义。
+    """
+
+    kept: list[str] = []
+    quote: str | None = None
+    index = 0
+    while index < len(line):
+        character = line[index]
+        if quote is not None:
+            if character == "\\" and quote == '"':
+                index += 2
+                continue
+            if character == quote:
+                if quote == "'" and line[index + 1 : index + 2] == "'":
+                    index += 2
+                    continue
+                quote = None
+            index += 1
+            continue
+        at_scalar_start = index == 0 or line[index - 1] in " \t[{,"
+        if character in "'\"" and at_scalar_start:
+            quote = character
+        elif character == "#" and (index == 0 or line[index - 1] in " \t"):
+            break
+        else:
+            kept.append(character)
+        index += 1
+    return "".join(kept)
+
+
+def _yaml_structural_lines(text: str):
+    """逐行产出 (行号, 去掉注释与引号内容后的文本)，跳过块标量（`|` / `>`）的正文行。"""
+
+    block_indent: int | None = None
+    for number, raw in enumerate(text.splitlines(), start=1):
+        indent = len(raw) - len(raw.lstrip())
+        if block_indent is not None:
+            if not raw.strip() or indent > block_indent:
+                continue
+            block_indent = None
+        code = _yaml_code_only(raw)
+        if _YAML_BLOCK_SCALAR_HEADER.search(code):
+            block_indent = indent
+        yield number, code
+
+
+def check_compose_has_no_yaml_anchors() -> list[str]:
+    """四份 compose 文件不得出现 YAML 锚点（`&名`）、别名（`*名`）与合并键（`<<:`）。
+
+    理由见本段头注：本文件所有 compose 门禁按文本块计数，别名会让文本位置与生效
+    位置分离，逐块判定的门禁看不见经别名合并进去的那份声明。
+    """
+
+    failures: list[str] = []
+    for path in (COMPOSE_BASE, COMPOSE_STAGE, COMPOSE_PROD, COMPOSE_INNERTEST):
+        for number, code in _yaml_structural_lines(read(path)):
+            match = _YAML_ANCHOR_ALIAS_OR_MERGE.search(code)
+            if match:
+                failures.append(
+                    f"{display(path)}:{number} 使用了 YAML 锚点 / 别名 / 合并键 "
+                    f"`{match.group(1)}`：本仓 compose 门禁按文本块计数，别名会让"
+                    "「文本写在哪个 service 块」与「值在哪个 service 生效」分离，逐块判定的"
+                    "门禁看不见经别名合并进去的声明；请把值直接写在生效的那个 service 块里"
+                )
     return failures
 
 
@@ -2517,6 +2621,7 @@ def main() -> int:
         ("受限内测入口装配覆盖文件", check_innertest_compose_overlay),
         ("worker-queue /tmp 内存盘上限分环境显式", check_worker_tmpfs_capacity),
         ("compose 插值占位符 YAML 安全与渲染可行", check_compose_interpolation_is_yaml_safe),
+        ("compose 文件不用 YAML 锚点 / 别名 / 合并键", check_compose_has_no_yaml_anchors),
         ("日志留存下限", check_log_retention_floor),
         ("Compose 部署契约", check_compose_contract),
         ("Dockerfile 契约", check_dockerfile),

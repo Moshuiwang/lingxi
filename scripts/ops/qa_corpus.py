@@ -19,22 +19,27 @@
   `--limit` 默认 20、硬顶 200。正文只打印到标准输出，**不要在有落盘记录的会话里跑**。
 - `export`：同一组过滤条件，全部命中行写成 JSON 行文件。`--out` 只能是**文件名**，文件落在
   受控导出根（环境变量 `LINGXI_QA_CORPUS_EXPORT_ROOT`，由 compose 声明在 scheduler 的
-  持久卷内）正下方，`O_CREAT|O_EXCL|O_NOFOLLOW` 建 0600 文件：已存在、是符号链接、带路径
-  分隔符或 `..` 一律拒绝。标准输出不作导出通道，只报文件名、行数与文件摘要。
+  持久卷内）正下方。写入先落**临时名** `.<文件名>.part`（同目录、`O_CREAT|O_EXCL|O_NOFOLLOW`
+  建 0600、写完 `fsync`），审计行提交后才改名成最终名——最终名在审计落账之前从不存在，
+  进程被杀最多留下一个临时名。最终名或临时名已存在、是符号链接、带路径分隔符或 `..`
+  一律拒绝，不覆盖任何东西；发现同名临时名残留只报告、请人工检查后清理。标准输出不作
+  导出通道，只报文件名、行数与文件摘要。
 - `stats`：行数与表总字节数，不含任何正文，不留审计。
 - `grant` / `revoke`：授予 / 撤销 `--open-id` 的读取角色；发起人必须是一位生效的已登记
   管理员（三类角色全真），读取者本人**不要求**是管理员。
 
 ## 顺序（失败关闭）与退出码
 
-鉴权 → 查询 →（导出：写文件 → 算摘要）→ **审计行提交** → 才输出 / 保留文件。任何读取
-之前先过 `is_authorized_corpus_reader`：被拒时结构上没有一条语料查询发生，输出只有固定
-文案。审计行写不进去：`read` 不打印任何一行，`export` 删掉刚写的文件，退出码 3。
-授予 / 撤销与各自的审计行在同一事务提交，审计写不进去角色变更一起回滚。
+鉴权 → 查询 →（导出：写临时名 → 算摘要）→ **审计行提交** →（导出：改成最终名）→ 才输出 /
+保留文件。任何读取之前先过 `is_authorized_corpus_reader`：被拒时结构上没有一条语料查询
+发生，输出只有固定文案。审计行写不进去：`read` 不打印任何一行，`export` 删掉临时名，
+退出码 3。导出在审计之前被任何异常打断（含 `KeyboardInterrupt` 这类非 `Exception`）都先删
+临时名再抛出。授予 / 撤销与各自的审计行在同一事务提交，审计写不进去角色变更一起回滚。
 
 退出码：`0` 跑完；`2` **什么都没做**（参数、鉴权、配置或目标不合格，查询本身失败也算）；
 `3` 查询或文件已经发生但审计没能落下——结果已被扣住 / 文件已删除，看到 `3` 先查审计账
-再决定要不要重跑。
+再决定要不要重跑。唯一例外：审计已落账但临时名改不成最终名时同样退出码 3，文件留在
+临时名上，标准错误写明审计标识与临时名，由人工改名。
 
 ## 审计行（运营审计账 `operation_audit`）
 
@@ -413,6 +418,35 @@ def open_export_root(root: Path) -> int:
     return root_fd
 
 
+def staging_name(name: str) -> str:
+    """最终名对应的临时名：同目录、前缀 ``.``、后缀 ``.part``，审计落账前只写它。"""
+    return f".{name}.part"
+
+
+def _exists_in_root(root_fd: int, name: str) -> bool:
+    """导出根正下方是否已有这个名字（符号链接本身也算，不跟随）；查不出来即拒绝。"""
+    try:
+        os.lstat(name, dir_fd=root_fd)
+    except FileNotFoundError:
+        return False
+    except OSError as error:
+        raise ExportRootError(
+            f"导出根内 {name} 的状态查不出来（{type(error).__name__}）。"
+        ) from None
+    return True
+
+
+def refuse_existing_export(root_fd: int, name: str) -> None:
+    """最终名或临时名任一已存在都拒绝：前者不覆盖，后者只报告残留、请人工检查后清理。"""
+    if _exists_in_root(root_fd, staging_name(name)):
+        raise ExportRootError(
+            f"发现同名临时文件 {staging_name(name)} 残留（上一次导出可能被中断），不覆盖；"
+            "请先查审计账并人工检查后清理，未做任何操作。"
+        )
+    if _exists_in_root(root_fd, name):
+        raise ExportRootError(f"导出文件 {name} 已存在，不覆盖，未做任何操作。")
+
+
 def create_export_file(root_fd: int, name: str) -> int:
     """在导出根正下方新建 0600 文件；已存在、是符号链接一律拒绝，不覆盖任何东西。"""
     try:
@@ -421,6 +455,18 @@ def create_export_file(root_fd: int, name: str) -> int:
         )
     except OSError as error:
         raise ExportRootError(f"导出文件不可建（{type(error).__name__}），零写入。") from None
+
+
+def publish_export(root_fd: int, name: str) -> str | None:
+    """审计落账之后把临时名改成最终名（同目录）；改不成返回说明，文件留在临时名上。"""
+    try:
+        os.rename(staging_name(name), name, src_dir_fd=root_fd, dst_dir_fd=root_fd)
+    except OSError as error:
+        return (
+            f"临时文件未能改名为最终名（{type(error).__name__}），文件仍在 {staging_name(name)}，"
+            "请人工改名。"
+        )
+    return None
 
 
 def write_export(fd: int, rows: Iterable[Any]) -> tuple[int, int, str]:
@@ -521,7 +567,12 @@ def run_read(dsn: str, arguments: argparse.Namespace, *, initiated_by: str) -> i
 def run_export(
     dsn: str, arguments: argparse.Namespace, *, initiated_by: str, environment: Any = os.environ
 ) -> int:
-    """鉴权 → 受控根与文件 → 分批写入并算摘要 → 审计 → 才保留文件并报告。"""
+    """鉴权 → 受控根与临时名 → 分批写入并算摘要 → 审计 → 才改成最终名并报告。
+
+    最终名在审计行提交之前从不存在：写入全部落在临时名上，审计落账后一次 ``rename``。
+    审计之前的任何异常——包括 ``KeyboardInterrupt`` 这类不是 ``Exception`` 的中断——都
+    先删掉临时名再处理，进程被杀留不下带最终名的无审计明文。
+    """
     rejection = reject_reader(resolve_readers(dsn), initiated_by)
     if rejection is not None:
         raise GateRejectedError(rejection)
@@ -529,7 +580,8 @@ def run_export(
     root_fd = open_export_root(export_root_from_environment(environment))
     try:
         chosen = build_filter(arguments, user_id=_target_user(dsn, arguments))
-        file_fd = create_export_file(root_fd, name)
+        refuse_existing_export(root_fd, name)
+        file_fd = create_export_file(root_fd, staging_name(name))
         run_id = new_id("qcr")
         try:
             row_count, user_count, hexdigest = write_export(
@@ -547,12 +599,19 @@ def run_export(
                 file_hexdigest=hexdigest,
             )
             audit_id = resolve_operation_audit(dsn).record(entry)
-        except Exception as error:  # 文件已建、审计没落下：文件不能留
-            outcome = _discard_export(root_fd, name)
+        except BaseException as error:  # 临时名已建、审计没落下：文件不能留，中断也一样
+            outcome = _discard_export(root_fd, staging_name(name))
+            if not isinstance(error, Exception):
+                print(f"导出被中断（{type(error).__name__}），{outcome}", file=sys.stderr)
+                raise
             print(f"导出未完成或审计未能写入（{type(error).__name__}），{outcome}", file=sys.stderr)
             return EXIT_UNAUDITED
+        failure = publish_export(root_fd, name)
     finally:
         os.close(root_fd)
+    if failure is not None:
+        print(f"审计 {audit_id} 已落账，但{failure}", file=sys.stderr)
+        return EXIT_UNAUDITED
     print(
         f"已导出 {row_count} 行 → {name} · {entry.target_digest} · 操作号 {run_id} · 审计 {audit_id}"
     )

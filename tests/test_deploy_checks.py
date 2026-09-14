@@ -2583,6 +2583,108 @@ class QaCorpusDeclarationTest(unittest.TestCase):
         self.assertTrue(any(".env.example 没有提到" in f for f in failures), failures)
         self.assertTrue(any("验收前部署配置清单.md" in f for f in failures), failures)
 
+    def test_an_anchor_defined_switch_merged_into_another_service_is_caught_by_the_anchor_gate(
+        self,
+    ) -> None:
+        """锚点绕过：在 worker-queue 的 x- 扩展映射里定义开关、别的 service 用 <<: 合并进去。
+
+        按块计数的 check_qa_corpus_declaration 只看见 worker-queue 那一处、判绿；仓库级的
+        锚点断言（ComposeYamlAnchorTest）负责把这种写法整体拒掉。
+        """
+
+        prod = (
+            "worker:\n"
+            "  <<: *corpus\n"
+            "worker-queue:\n"
+            "  x-corpus: &corpus\n"
+            "    environment:\n"
+            '      LINGXI_DEPLOY_ENVIRONMENT: "prod"\n'
+            '      LINGXI_QA_CORPUS_RETENTION: "1"\n'
+            "  environment:\n"
+            '    LINGXI_DEPLOY_ENVIRONMENT: "prod"\n'
+            '    LINGXI_QA_CORPUS_RETENTION: "1"\n'
+        )
+        directory = Path(self.enterContext(__import__("tempfile").TemporaryDirectory()))
+        path = directory / "compose.prod.yaml"
+        path.write_text(f"services:\n{textwrap.indent(prod, '  ')}", encoding="utf-8")
+        original = CONTRACT.COMPOSE_PROD
+        CONTRACT.COMPOSE_PROD = path
+        try:
+            failures = CONTRACT.check_compose_has_no_yaml_anchors()
+        finally:
+            CONTRACT.COMPOSE_PROD = original
+        self.assertEqual(len([f for f in failures if "compose.prod.yaml" in f]), 2, failures)
+        self.assertTrue(any("`&corpus`" in f for f in failures), failures)
+        self.assertTrue(any("`<<:`" in f for f in failures), failures)
+
+
+class ComposeYamlAnchorTest(unittest.TestCase):
+    """``check_compose_has_no_yaml_anchors``：四份 compose 一律不得用锚点 / 别名 / 合并键。
+
+    本文件所有 compose 门禁按文本块计数，别名会让文本位置与生效位置分离；注释与引号内
+    的 ``&`` / ``*`` / ``<<:`` 不算，块标量（``|`` / ``>``）正文也不算。
+    """
+
+    CLEAN = (
+        "services:\n"
+        "  scheduler:\n"
+        "    image: ghcr.io/x/y:1  # 注释里的 &anchor 与 *alias 不算\n"
+        "    command: sh -c 'run 2>&1 && ls *.log'\n"
+        '    environment:\n      CRON: "*/5 * * * *"\n'
+        "    healthcheck:\n      test: >\n        &not *an <<: anchor\n"
+        "  gateway:\n    image: ghcr.io/x/y:1\n"
+    )
+
+    def _run(self, **bodies: str) -> list[str]:
+        directory = Path(self.enterContext(__import__("tempfile").TemporaryDirectory()))
+        names = ("COMPOSE_BASE", "COMPOSE_STAGE", "COMPOSE_PROD", "COMPOSE_INNERTEST")
+        files = {
+            "COMPOSE_BASE": "compose.yaml",
+            "COMPOSE_STAGE": "compose.stage.yaml",
+            "COMPOSE_PROD": "compose.prod.yaml",
+            "COMPOSE_INNERTEST": "compose.innertest.yaml",
+        }
+        originals = {name: getattr(CONTRACT, name) for name in names}
+        try:
+            for name in names:
+                path = directory / files[name]
+                path.write_text(bodies.get(name, self.CLEAN), encoding="utf-8")
+                setattr(CONTRACT, name, path)
+            return CONTRACT.check_compose_has_no_yaml_anchors()
+        finally:
+            for name, value in originals.items():
+                setattr(CONTRACT, name, value)
+
+    def test_real_repository_state_passes(self) -> None:
+        self.assertEqual(CONTRACT.check_compose_has_no_yaml_anchors(), [])
+
+    def test_comments_quotes_block_scalars_and_plain_text_are_not_anchors(self) -> None:
+        self.assertEqual(self._run(), [])
+
+    def test_a_merge_key_added_anywhere_is_caught(self) -> None:
+        """变异验红：加一处 `<<: *x` → 红。"""
+
+        for name in ("COMPOSE_BASE", "COMPOSE_STAGE", "COMPOSE_PROD", "COMPOSE_INNERTEST"):
+            with self.subTest(file=name):
+                failures = self._run(**{name: self.CLEAN + "  worker:\n    <<: *x\n"})
+                self.assertEqual(len(failures), 1, failures)
+                self.assertIn("`<<:`", failures[0])
+                self.assertIn(":13 ", failures[0])
+
+    def test_anchors_and_aliases_in_block_and_flow_positions_are_caught(self) -> None:
+        for line, token in (
+            ("    x-env: &shared\n", "&shared"),
+            ("    environment: *shared\n", "*shared"),
+            ("    - *shared\n", "*shared"),
+            ("    args: [*a, b]\n", "*a"),
+            ("    args: {<<: *a}\n", "<<:"),
+            ("    <<:  *a\n", "<<:"),
+        ):
+            with self.subTest(line=line):
+                failures = self._run(COMPOSE_PROD=self.CLEAN + "  worker:\n" + line)
+                self.assertEqual(len(failures), 1, failures)
+                self.assertIn(f"`{token}`", failures[0])
+
 
 if __name__ == "__main__":
     unittest.main()
