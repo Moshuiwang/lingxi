@@ -5,11 +5,11 @@ from __future__ import annotations
 import importlib.util
 import json
 import re
+import stat
 import sys
 import unittest
 from pathlib import Path
 from unittest.mock import patch
-
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
 DEPLOY_ROOT = REPOSITORY_ROOT / "deploy"
@@ -55,15 +55,15 @@ class ControlExamplesTests(unittest.TestCase):
     def test_relay_example_reaches_install_relay_shape_branch_only(self) -> None:
         configuration = _read_json("innertest-relay.json")
 
-        class ShapeBranchReached(Exception):
+        class ShapeBranchReachedError(Exception):
             pass
 
         with patch.object(
             CONTROL_BUNDLE,
             "verify_install",
-            side_effect=ShapeBranchReached,
+            side_effect=ShapeBranchReachedError,
         ) as verify_install:
-            with self.assertRaises(ShapeBranchReached):
+            with self.assertRaises(ShapeBranchReachedError):
                 CONTROL_BUNDLE.install_relay(
                     Path("/placeholder/control-bundles"),
                     {"sha256": "b" * 64},
@@ -94,6 +94,24 @@ class ControlExamplesTests(unittest.TestCase):
         for forbidden in (b"ssh-ed25519 AAAA", b"biai", b"biplus", b"/home/wangzp"):
             with self.subTest(forbidden=forbidden):
                 self.assertNotIn(forbidden, sample_bytes)
+
+    def test_stage_permission_backup_hook_is_safe_placeholder(self) -> None:
+        hook = EXAMPLES_ROOT / "hooks" / "stage-permission-table-backup.sh"
+        self.assertTrue(hook.is_file())
+        self.assertEqual(stat.S_IMODE(hook.stat().st_mode), 0o755)
+        text = hook.read_text(encoding="utf-8")
+        self.assertIn("backup", text)
+        self.assertIn("exec", text)
+        for forbidden in ("/home/wangzp", "/tmp/", "localhost", "127.0.0.1"):
+            with self.subTest(forbidden=forbidden):
+                self.assertNotIn(forbidden, text)
+        self.assertTrue(
+            {
+                "deploy/permission_table_guard.py",
+                "deploy/权限发布表预发防护.md",
+                "deploy/control/examples/hooks/stage-permission-table-backup.sh",
+            }.issubset(CONTROL_BUNDLE.FILES)
+        )
 
     def test_runbook_contains_required_markers(self) -> None:
         runbook = (DEPLOY_ROOT / "control" / "引导安装.md").read_text(encoding="utf-8")
