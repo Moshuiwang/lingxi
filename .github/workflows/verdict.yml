@@ -11,7 +11,7 @@ name: Epic Verdict
 #
 # 判定规则在 scripts/ci/verdict_decision.py（同样取自默认分支，逐条用例钉住）：
 #   路径 a：触发运行留下的 OIDC 身份凭证验签通过、声明合格（签给本仓这次 run、
-#           pull_request 事件、base 是 main / release/**）、且 PR 头提交的 .github/workflows
+#           pull_request 事件、base 是默认分支）、且 PR 头提交的 .github/workflows
 #           子树与凭证声明的 base 分支相同 → 采信这次 Epic Full 的结论；
 #   路径 b：其余一律由 main 版 ci.yml 以 test_ref 复跑一次，取复跑结论；PR 改了门禁定义时
 #           另给 PR 贴标签「门禁定义已变更」+ 评论差异清单（事后可查，不阻塞）；
