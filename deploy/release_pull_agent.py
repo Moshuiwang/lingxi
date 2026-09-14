@@ -74,6 +74,8 @@ RELEASE_TAG = re.compile(
     r"^v(?P<major>0|[1-9][0-9]*)\.(?P<minor>0|[1-9][0-9]*)\.(?P<patch>0|[1-9][0-9]*)"
     r"(?:-rc\.(?P<rc>[1-9][0-9]*))?$"
 )
+# 只请求 gh 2.97 `release list --json` 手册列出的字段；页面地址按仓库 + 标签构造。
+RELEASE_LIST_JSON_FIELDS = ("tagName", "isPrerelease", "isDraft", "publishedAt")
 REPOSITORY = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
 APPROVAL_SOURCE = re.compile(
     r"^https://github\.com/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+/"
@@ -86,7 +88,10 @@ DEPLOYER_STATES = frozenset({"planned", "running", "verified", "failed", "unknow
 FAILURE_CODES = frozenset(
     {
         "release_list_unavailable",
+        "downgrade_refused",
+        "external_change_detected",
         "bundle_digest_mismatch",
+        "pre_apply_hook_unsafe",
         "pre_apply_hook_failed",
         "deploy_timeout",
         "failed",
@@ -95,7 +100,16 @@ FAILURE_CODES = frozenset(
     }
 )
 IMMEDIATE_ALERT_CODES = frozenset(
-    {"bundle_digest_mismatch", "pre_apply_hook_failed", "deploy_timeout", "failed", "unknown"}
+    {
+        "downgrade_refused",
+        "external_change_detected",
+        "bundle_digest_mismatch",
+        "pre_apply_hook_unsafe",
+        "pre_apply_hook_failed",
+        "deploy_timeout",
+        "failed",
+        "unknown",
+    }
 )
 HEALTHY_CODES = frozenset({"verified", "already_in_place", "already_in_place_external"})
 ALERT_ENV_KEYS = (
@@ -246,6 +260,9 @@ def _base_state(host: dict) -> dict:
         "deployer_state": None,
         "approval_sha256": None,
         "bundle_digest": None,
+        "highest_deployed_tag": None,
+        "verified_digests": None,
+        "external_change_tag": None,
         "alerts": {},
     }
 
@@ -402,8 +419,8 @@ def _gh_env(config: dict) -> dict[str, str]:
     return env
 
 
-def release_version_key(tag: str) -> tuple[int, int, int, int]:
-    """返回可用于语义比较的版本数字元组。"""
+def release_version_key(tag: str) -> tuple[int, int, int, int, int]:
+    """返回可用于语义比较的版本数字元组；正式版高于同号的任何候选版。"""
     match = RELEASE_TAG.fullmatch(tag)
     if not match:
         raise AgentError("release_tag_invalid")
@@ -411,8 +428,26 @@ def release_version_key(tag: str) -> tuple[int, int, int, int]:
         int(match["major"]),
         int(match["minor"]),
         int(match["patch"]),
+        0 if match["rc"] else 1,
         int(match["rc"] or 0),
     )
+
+
+def is_downgrade(target: str, deployed: str | None) -> bool:
+    """目标版本低于已部署版本才算降级；同版本不算。"""
+    if deployed is None:
+        return False
+    return release_version_key(target) < release_version_key(deployed)
+
+
+def _valid_tag(value: object) -> str | None:
+    return value if isinstance(value, str) and RELEASE_TAG.fullmatch(value) else None
+
+
+def _higher_tag(first: str | None, second: str | None) -> str | None:
+    if first is None or second is None:
+        return first or second
+    return second if is_downgrade(first, second) else first
 
 
 def _release_tag(item: object) -> str | None:
@@ -471,7 +506,7 @@ def _list_releases(config: dict) -> list:
             "--limit",
             "100",
             "--json",
-            "tagName,isPrerelease,isDraft,publishedAt,url",
+            ",".join(RELEASE_LIST_JSON_FIELDS),
         ),
         timeout=config["poll_timeout_seconds"],
         env=_gh_env(config),
@@ -676,15 +711,33 @@ def _inspect_digests(host: dict, manifest: dict, timeout: int) -> dict[str, str]
     return _inspect_running_digests(host, timeout)
 
 
+def _expected_digests(manifest: dict) -> dict[str, str]:
+    """把清单按三个常驻服务容器展开成可与运行回读逐项比较的摘要。"""
+    return {
+        service: manifest["images"][MANIFEST_SERVICE_FOR_CONTAINER[service]].rsplit("@", 1)[1]
+        for service in RUNNING_SERVICES
+    }
+
+
+def _state_digests(state: dict) -> dict[str, str] | None:
+    """状态账记录的已验证摘要；形状不完整时视为没有记录。"""
+    value = state.get("verified_digests")
+    if (
+        not isinstance(value, dict)
+        or set(value) != set(RUNNING_SERVICES)
+        or any(
+            not isinstance(item, str) or not IMAGE_DIGEST.fullmatch(item) for item in value.values()
+        )
+    ):
+        return None
+    return dict(value)
+
+
 def _all_digests_match(actual: dict[str, str], manifest: dict) -> bool:
     """三个常驻服务必须逐项命中；拉在本机但未运行不算在位。"""
     if set(actual) != set(RUNNING_SERVICES):
         return False
-    return all(
-        actual.get(service)
-        == manifest["images"][MANIFEST_SERVICE_FOR_CONTAINER[service]].rsplit("@", 1)[1]
-        for service in RUNNING_SERVICES
-    )
+    return actual == _expected_digests(manifest)
 
 
 def _bundle_metadata(doc: dict) -> dict:
@@ -896,9 +949,13 @@ def _previous_plan(state: dict, state_directory: Path) -> dict | None:
 
 
 def _plan_is_continuable(state: dict, plan: dict, tag: str) -> bool:
-    """中断状态只沿用同一计划 ID，禁止借接续名义重新 plan。"""
+    """中断状态只沿用同一计划 ID，禁止借接续名义重新 plan。
+
+    已验证目标被外部改动后，同一目标不再沿旧计划接续：每轮只回读等待人工核对。
+    """
     return (
         state.get("deployer_state") in {"planned", "running", "unknown"}
+        and state.get("external_change_tag") != tag
         and state.get("plan_id") == plan.get("id")
         and isinstance(plan.get("new"), dict)
         and plan["new"].get("tag") == tag
@@ -1217,6 +1274,22 @@ def _write_approval(state_directory: Path, approval: dict) -> Path:
     return path
 
 
+def _hook_program_protected(path: str) -> bool:
+    """钩子程序及其全部祖先目录须为 root 属主、无组 / 其他写权限且非符号链接。
+
+    与受限通道自检同一规则：任何一级可被非 root 主体改写，钩子就可能被替换。
+    """
+    program = Path(path)
+    try:
+        for item in (program, *program.parents):
+            info = os.lstat(item)
+            if info.st_uid != 0 or info.st_mode & 0o022 or stat.S_ISLNK(info.st_mode):
+                return False
+    except OSError:
+        return False
+    return True
+
+
 def _run_hook(
     path: str,
     host_path: Path,
@@ -1348,22 +1421,30 @@ def send_alert(message: str, env_file: Path, timeout_seconds: int) -> None:
 
 
 def _alert_message(
-    host: dict, tag: str | None, stage: str, result: str, plan_id: str | None
+    host: dict,
+    tag: str | None,
+    stage: str,
+    result: str,
+    plan_id: str | None,
+    deployed_tag: str | None = None,
 ) -> str:
-    """告警正文只含合同字段，不带 URL、凭据和日志原文。"""
-    fields = (
+    """告警正文只含合同字段，不带 URL、凭据和日志原文；降级拒绝另附已部署版本。"""
+    fields = [
         ("主机", host["host"]),
         ("环境", host["environment"]),
         ("标签", tag or "未知"),
         ("阶段", stage),
         ("结果码", result),
         ("计划 ID", plan_id or "未知"),
-    )
+    ]
+    if deployed_tag is not None:
+        fields.append(("最高已部署版本", deployed_tag))
     return "\n".join(f"{key}：{value}" for key, value in fields)
 
 
-def _alert_key(result: str, tag: str | None) -> str:
-    return result + ":" + (tag or "none")
+def _alert_key(result: str, tag: str | None, deployed_tag: str | None = None) -> str:
+    key = result + ":" + (tag or "none")
+    return key if deployed_tag is None else key + ":" + deployed_tag
 
 
 def _audit_fields(state: dict) -> dict[str, object]:
@@ -1425,7 +1506,15 @@ def _finish(  # noqa: PLR0913
     bundle_digest: str | None = None,
     approval_source: str | None = None,
     release_record: dict | None = None,
+    deployed_tag: str | None = None,
+    verified_digests: dict[str, str] | None = None,
+    remember_target: bool = True,
 ) -> int:
+    """收口一轮：写状态账并按结果码告警。
+
+    ``deployed_tag`` 只会抬高、不会降低状态账的最高已部署版本；降级拒绝时它同时进入
+    去重键和正文。``remember_target=False`` 让被拒目标不覆盖状态账里已在位的目标。
+    """
     next_state = dict(state)
     next_state.update(
         {
@@ -1440,10 +1529,13 @@ def _finish(  # noqa: PLR0913
         next_state["consecutive_failures"] = int(state.get("consecutive_failures", 0)) + 1
     else:
         next_state["consecutive_failures"] = 0
-    if tag is not None:
-        next_state["target_tag"] = tag
+    logged_url = next_state.get("release_url")
     if release_url is not None:
-        next_state["release_url"] = _safe_url(release_url, config["repository"], tag or "unknown")
+        logged_url = _safe_url(release_url, config["repository"], tag or "unknown")
+    if tag is not None and remember_target:
+        next_state["target_tag"] = tag
+    if release_url is not None and remember_target:
+        next_state["release_url"] = logged_url
     if plan_id is not None:
         next_state["plan_id"] = plan_id
     if deployer_state is not None:
@@ -1454,6 +1546,16 @@ def _finish(  # noqa: PLR0913
         next_state["bundle_digest"] = bundle_digest
     if approval_source is not None:
         next_state["approval_source"] = approval_source
+    if deployed_tag is not None:
+        next_state["highest_deployed_tag"] = _higher_tag(
+            _valid_tag(state.get("highest_deployed_tag")), deployed_tag
+        )
+    if verified_digests is not None:
+        next_state["verified_digests"] = dict(verified_digests)
+    if result in HEALTHY_CODES:
+        next_state["external_change_tag"] = None
+    elif result == "external_change_detected":
+        next_state["external_change_tag"] = tag
     if release_record is not None:
         for source, target in (
             ("run_id", "candidate_run_id"),
@@ -1466,7 +1568,7 @@ def _finish(  # noqa: PLR0913
         stage,
         result,
         tag=tag,
-        release_url=next_state.get("release_url"),
+        release_url=logged_url,
         plan_id=plan_id,
         **_audit_fields(next_state),
     )
@@ -1497,11 +1599,12 @@ def _finish(  # noqa: PLR0913
             should_alert = True
         if should_alert:
             alert_tag = tag or next_state.get("target_tag")
-            key = _alert_key(result, alert_tag)
+            detail = deployed_tag if result == "downgrade_refused" else None
+            key = _alert_key(result, alert_tag, detail)
             _send_once(
                 next_state,
                 key,
-                _alert_message(host, alert_tag, stage, result, plan_id),
+                _alert_message(host, alert_tag, stage, result, plan_id, detail),
                 active=result in IMMEDIATE_ALERT_CODES or result == "release_list_unavailable",
                 config=config,
                 state_directory=state_directory,
@@ -1559,6 +1662,105 @@ def _discover_current_release(
     return None
 
 
+def _refuse_downgrade(
+    state: dict,
+    host: dict,
+    config: dict,
+    state_directory: Path,
+    tag: str,
+    release_url: str,
+    deployed_tag: str,
+) -> int:
+    """目标低于已部署版本时不 plan、不下载；回退只能走部署器独立批准的恢复路径。"""
+    _log(
+        "version_order",
+        "downgrade_refused",
+        tag=tag,
+        release_url=release_url,
+        deployed=deployed_tag,
+    )
+    return _finish(
+        state,
+        host,
+        config,
+        state_directory,
+        result="downgrade_refused",
+        stage="version_order",
+        tag=tag,
+        release_url=release_url,
+        deployed_tag=deployed_tag,
+        remember_target=False,
+    )
+
+
+def _recheck_verified_target(
+    state: dict,
+    host: dict,
+    config: dict,
+    state_directory: Path,
+    tag: str,
+    release_url: str,
+) -> int:
+    """已验证目标每轮仍回读运行容器；不一致只告警等待人工核对，不自动重部署。
+
+    回读本身失败记 ``unknown`` 但不改部署器状态，下一轮继续回读；外部改动持续期间
+    每轮只比对，直到容器回到已验证摘要或出现新的目标。
+    """
+    expected = _state_digests(state)
+    try:
+        if expected is None:
+            with tempfile.TemporaryDirectory(prefix=".release-", dir=state_directory) as name:
+                manifest = _resolve_manifest(
+                    config["release_manifest"],
+                    config,
+                    config["repository"],
+                    tag,
+                    host["environment"],
+                    Path(name),
+                )
+            expected = _expected_digests(manifest)
+        actual = _inspect_running_digests(host, config["poll_timeout_seconds"])
+    except AgentError:
+        _log("idempotence", "unknown", tag=tag, release_url=release_url)
+        return _finish(
+            state,
+            host,
+            config,
+            state_directory,
+            result="unknown",
+            stage="idempotence",
+            tag=tag,
+            release_url=release_url,
+        )
+    if actual == expected:
+        _log("idempotence", "already_in_place", tag=tag, release_url=release_url)
+        return _finish(
+            state,
+            host,
+            config,
+            state_directory,
+            result="already_in_place",
+            stage="idempotence",
+            tag=tag,
+            release_url=release_url,
+            deployer_state="verified",
+            deployed_tag=tag,
+            verified_digests=expected,
+        )
+    _log("idempotence", "external_change_detected", tag=tag, release_url=release_url)
+    return _finish(
+        state,
+        host,
+        config,
+        state_directory,
+        result="external_change_detected",
+        stage="idempotence",
+        tag=tag,
+        release_url=release_url,
+        deployer_state="unknown",
+    )
+
+
 def _run_locked(
     host_path: Path, config_path: Path, state_directory: Path, host: dict, config: dict
 ) -> int:
@@ -1587,7 +1789,7 @@ def _run_locked(
             stage="release_list",
         )
     tag = _release_tag(selected)
-    release_url = _safe_url(selected.get("url"), config["repository"], tag)
+    release_url = _safe_url(None, config["repository"], tag)
     release_audit = {
         "run_id": None,
         "promotion_run_id": None,
@@ -1602,23 +1804,17 @@ def _run_locked(
     )
     previous = _previous_plan(state, state_directory)
     continuing = _plan_is_continuable(state, previous or {}, tag)
+    highest_deployed = _valid_tag(state.get("highest_deployed_tag"))
+    if not continuing and is_downgrade(tag, highest_deployed):
+        return _refuse_downgrade(
+            state, host, config, state_directory, tag, release_url, highest_deployed
+        )
     if (
         not continuing
-        and state.get("deployer_state") == "verified"
         and state.get("target_tag") == tag
+        and (state.get("deployer_state") == "verified" or state.get("external_change_tag") == tag)
     ):
-        _log("idempotence", "already_in_place", tag=tag, release_url=release_url)
-        return _finish(
-            state,
-            host,
-            config,
-            state_directory,
-            result="already_in_place",
-            stage="idempotence",
-            tag=tag,
-            release_url=release_url,
-            deployer_state="verified",
-        )
+        return _recheck_verified_target(state, host, config, state_directory, tag, release_url)
 
     with tempfile.TemporaryDirectory(prefix=".release-", dir=state_directory) as temporary_name:
         temporary = Path(temporary_name)
@@ -1671,6 +1867,8 @@ def _run_locked(
                 release_url=release_url,
                 deployer_state="verified",
                 release_record=release_audit,
+                deployed_tag=tag,
+                verified_digests=_expected_digests(configured_manifest),
             )
         if continuing:
             old_manifest = previous.get("old") if isinstance(previous, dict) else None
@@ -1708,6 +1906,12 @@ def _run_locked(
                 release_url=release_url,
                 deployer_state="unknown",
                 release_record=release_audit,
+            )
+        # 运行中的版本也是已部署版本：状态账没记到的外部安装同样不允许被降级覆盖。
+        deployed_tag = _higher_tag(highest_deployed, _valid_tag(old_manifest.get("tag")))
+        if not continuing and deployed_tag is not None and is_downgrade(tag, deployed_tag):
+            return _refuse_downgrade(
+                state, host, config, state_directory, tag, release_url, deployed_tag
             )
 
         try:
@@ -1959,6 +2163,23 @@ def _run_locked(
             release_record=release_audit,
         )
         _log("approval", approval_result, tag=tag, plan_id=plan["id"])
+        if not all(_hook_program_protected(hook) for hook in config["pre_apply_hooks"]):
+            _log("pre_apply_hook", "pre_apply_hook_unsafe", tag=tag, plan_id=plan["id"])
+            return _finish(
+                state,
+                host,
+                config,
+                state_directory,
+                result="pre_apply_hook_unsafe",
+                stage="pre_apply_hook",
+                tag=tag,
+                release_url=release_url,
+                plan_id=plan["id"],
+                deployer_state="planned",
+                approval_sha256=approval_sha,
+                bundle_digest=configured_manifest["control_bundle"]["sha256"],
+                release_record=release_audit,
+            )
         try:
             for hook in config["pre_apply_hooks"]:
                 _run_hook(
@@ -2033,6 +2254,7 @@ def _run_locked(
             deployer_state = "unknown"
         result = deployer_state
         _log("status", result, tag=tag, plan_id=plan["id"], deployer_state=deployer_state)
+        verified = deployer_state == "verified"
         return _finish(
             state,
             host,
@@ -2047,6 +2269,8 @@ def _run_locked(
             approval_sha256=approval_sha,
             bundle_digest=configured_manifest["control_bundle"]["sha256"],
             release_record=release_audit,
+            deployed_tag=tag if verified else None,
+            verified_digests=_expected_digests(configured_manifest) if verified else None,
         )
 
 
