@@ -424,6 +424,7 @@ def worker_env(**overrides):
         "LINGXI_WORKER_READONLY_TOOLS": READ_ONLY_TOOL,
         "LINGXI_WORKER_AUDIT_INPUT_FIELDS": "metric",
         "LINGXI_WORKER_TRACE_ID": "01J0000000000000000TEST000",
+        "LINGXI_QUERY_MCP_ENDPOINT": "https://mcp.example.invalid/query",
     }
     env.update({key: value for key, value in overrides.items() if value is not None})
     return env
@@ -1345,6 +1346,40 @@ class WorkerConfigTest(unittest.TestCase):
         from lingxi.apps.worker.config import load_config
 
         return load_config(worker_env(**overrides))
+
+    def test_query_mcp_endpoint_is_required(self) -> None:
+        from lingxi.apps.worker.config import WorkerConfigError
+
+        for value in (None, "", "   "):
+            with self.subTest(value=value):
+                env = worker_env()
+                if value is None:
+                    env.pop("LINGXI_QUERY_MCP_ENDPOINT")
+                else:
+                    env["LINGXI_QUERY_MCP_ENDPOINT"] = value
+                with self.assertRaises(WorkerConfigError) as caught:
+                    from lingxi.apps.worker.config import load_config
+
+                    load_config(env)
+                self.assertIn("LINGXI_QUERY_MCP_ENDPOINT", str(caught.exception))
+                self.assertIn("缺失", str(caught.exception))
+
+    def test_query_mcp_endpoint_shape_is_validated_without_echoing_value(self) -> None:
+        from lingxi.apps.worker.config import WorkerConfigError
+
+        invalid_values = (
+            "https://",
+            "http://mcp.example.invalid",
+            "https://user:pass@mcp.example.invalid",
+            "https://[::1",
+        )
+        for value in invalid_values:
+            with self.subTest(value=value):
+                with self.assertRaises(WorkerConfigError) as caught:
+                    self._load(LINGXI_QUERY_MCP_ENDPOINT=value)
+                message = str(caught.exception)
+                self.assertIn("LINGXI_QUERY_MCP_ENDPOINT", message)
+                self.assertNotIn(value, message)
 
     def test_worker_queue_concurrency_defaults_to_the_approved_hard_limit(self) -> None:
         config = self._load()
@@ -2409,6 +2444,31 @@ class WorkerCliTest(unittest.TestCase):
         payload = json.loads(completed.stdout)
         self.assertEqual(payload["failure"]["code"], "config_error")
         self.assertIn("LINGXI_WORKER_QUESTION", payload["failure"]["message"])
+
+    def test_queue_mode_exits_3_and_claims_nothing_when_endpoint_missing(self) -> None:
+        from unittest.mock import patch
+
+        from lingxi.apps.worker.cli import main
+
+        class FakeQueue:
+            def __init__(self) -> None:
+                self.claim_calls = 0
+
+            def claim(self, *args, **kwargs):
+                del args, kwargs
+                self.claim_calls += 1
+                return []
+
+        env = worker_env(LINGXI_WORKER_MODE="queue")
+        env.pop("LINGXI_QUERY_MCP_ENDPOINT")
+        stdout, stderr = io.StringIO(), io.StringIO()
+        fake_queue = FakeQueue()
+        with patch("lingxi.apps.worker.cli.PostgresTaskQueue", return_value=fake_queue) as factory:
+            code = main(env=env, stdout=stdout, stderr=stderr)
+
+        self.assertEqual(code, 3)
+        self.assertFalse(factory.called)
+        self.assertEqual(fake_queue.claim_calls, 0)
 
     def test_cli_prints_one_json_object_on_stdout_and_structured_logs_on_stderr(self) -> None:
         from lingxi.apps.worker.cli import main

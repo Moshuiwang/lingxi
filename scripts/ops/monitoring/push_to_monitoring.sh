@@ -99,6 +99,8 @@ log() {
   printf '%s %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$*" >> "${LOG_FILE}"
 }
 
+push_succeeded=0
+
 # 把一个源文件里"上一次已推送行数之后"的新增行推给监控库；只有 psql 成功执行
 # 完整段 SQL（`ON_ERROR_STOP=1` + 显式外层事务）才前移 cursor。
 #
@@ -190,10 +192,42 @@ SQL
     error_count="${error_count:-0}"
     echo "${total_lines}" > "${cursor_file}"
     log "推送成功 file=${base} new_lines=${pushed_lines} skipped_bad_rows=${error_count} cursor=${total_lines}"
+    push_succeeded=1
   else
     log "推送失败 file=${base} new_lines=${pushed_lines}（cursor 不前移，下一轮重试；本机文件未受影响）"
   fi
   rm -f "${new_lines_file}" "${sql_file}"
+}
+
+prune_old_samples() {
+  local sql_file psql_output psql_status pruned
+
+  sql_file=$(mktemp)
+  cat > "${sql_file}" <<'SQL'
+\pset tuples_only on
+\pset format unaligned
+WITH deleted AS (
+  DELETE FROM lingxi_monitoring.sample WHERE sampled_at < now() - interval '30 days'
+  RETURNING 1
+)
+SELECT 'LINGXI_MONITORING_PRUNED=' || count(*)::text FROM deleted;
+\pset tuples_only off
+\pset format aligned
+SQL
+
+  psql_status=0
+  psql_output=$(psql "${PG_SAFE_DSN}" -v ON_ERROR_STOP=1 -X -q -f "${sql_file}" 2>&1) || psql_status=$?
+  printf '%s\n' "${psql_output}" >> "${LOG_FILE}"
+
+  if (( psql_status == 0 )); then
+    pruned=$(printf '%s\n' "${psql_output}" \
+      | sed -n 's/^LINGXI_MONITORING_PRUNED=\([0-9]\{1,\}\)$/\1/p' | tail -n1)
+    pruned="${pruned:-0}"
+    log "监控库 sample 收缩完成 pruned=${pruned}"
+  else
+    log "监控库 sample 收缩失败（不影响本轮上推）"
+  fi
+  rm -f "${sql_file}"
 }
 
 shopt -s nullglob
@@ -208,5 +242,9 @@ fi
 for source_file in "${files[@]}"; do
   push_file "${source_file}"
 done
+
+if (( push_succeeded )); then
+  prune_old_samples
+fi
 
 exit 0

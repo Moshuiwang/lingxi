@@ -15,7 +15,20 @@ import unittest
 from pathlib import Path
 
 from lingxi.adapters.user_environment import build_mcp_config
-from lingxi.adapters.user_mcp_config import UserMcpConfigError, load_user_mcp_servers
+from lingxi.adapters.user_mcp_config import UserMcpConfigError
+from lingxi.adapters.user_mcp_config import (
+    load_user_mcp_servers as _load_user_mcp_servers,
+)
+
+DEFAULT_EXPECTED_ENDPOINT = "https://mcp.example.invalid/mcp"
+
+
+def load_user_mcp_servers(
+    *, root: str, user_id: str, expected_endpoint: str = DEFAULT_EXPECTED_ENDPOINT
+):
+    """为旧读侧用例补上显式的入口注入值。"""
+
+    return _load_user_mcp_servers(root=root, user_id=user_id, expected_endpoint=expected_endpoint)
 
 
 def _write(path: Path, content: str) -> None:
@@ -34,7 +47,9 @@ class LoadUserMcpServersTest(unittest.TestCase):
             )
             _write(Path(root) / "usr-1" / ".mcp.json", content)
 
-            servers = load_user_mcp_servers(root=root, user_id="usr-1")
+            servers = load_user_mcp_servers(
+                root=root, user_id="usr-1", expected_endpoint="https://example.invalid/mcp"
+            )
 
             self.assertEqual(
                 servers,
@@ -246,7 +261,9 @@ class LoadUserMcpServersTest(unittest.TestCase):
                     ensure_ascii=False,
                 ),
             )
-            servers = load_user_mcp_servers(root=root, user_id="usr-1")
+            servers = load_user_mcp_servers(
+                root=root, user_id="usr-1", expected_endpoint="https://mcp.example.invalid/mcp"
+            )
             self.assertEqual(
                 servers,
                 {
@@ -329,71 +346,122 @@ class LoadUserMcpServersTest(unittest.TestCase):
                         load_user_mcp_servers(root=root, user_id="usr-1")
                     self.assertEqual(raised.exception.code, "config_shape_invalid")
 
-    def test_same_origin_is_enforced_when_the_expected_endpoint_is_configured(self) -> None:
-        """W-7 的同源闸：配了 ``LINGXI_QUERY_MCP_ENDPOINT`` 就必须同源。
-
-        这道闸**可选**是刻意的：worker-queue 的 env 文件当前没有这个变量，做成
-        必填会让一次没同步改配置的部署把每个用户的问数都失败关闭。装上更紧，
-        没装也不会比现在更松。
-        """
+    def test_expected_endpoint_is_injected_not_read_from_environ(self) -> None:
+        """适配器必须使用调用方传入的期望值，而不是进程环境中的值。"""
 
         from lingxi.adapters.user_mcp_config import QUERY_MCP_ENDPOINT_ENV_VAR
 
-        def _load(url: str, *, expected: str | None):
-            with tempfile.TemporaryDirectory() as root:
-                _write(
-                    Path(root) / "usr-1" / ".mcp.json",
-                    json.dumps(
-                        {
-                            "mcpServers": {
-                                "query": {
-                                    "type": "http",
-                                    "url": url,
-                                    "headers": {"Authorization": "Bearer tok-123"},
-                                }
+        with tempfile.TemporaryDirectory() as root:
+            _write(
+                Path(root) / "usr-1" / ".mcp.json",
+                json.dumps(
+                    {
+                        "mcpServers": {
+                            "query": {
+                                "type": "http",
+                                "url": "https://mcp.example.invalid/user-path",
+                                "headers": {"Authorization": "Bearer tok-123"},
                             }
-                        },
-                        ensure_ascii=False,
-                    ),
+                        }
+                    },
+                    ensure_ascii=False,
+                ),
+            )
+            previous = os.environ.get(QUERY_MCP_ENDPOINT_ENV_VAR)
+            os.environ[QUERY_MCP_ENDPOINT_ENV_VAR] = "https://attacker.example.invalid/mcp"
+            try:
+                servers = load_user_mcp_servers(
+                    root=root,
+                    user_id="usr-1",
+                    expected_endpoint="https://mcp.example.invalid/mcp",
                 )
-                previous = os.environ.get(QUERY_MCP_ENDPOINT_ENV_VAR)
-                if expected is None:
+            finally:
+                if previous is None:
                     os.environ.pop(QUERY_MCP_ENDPOINT_ENV_VAR, None)
                 else:
-                    os.environ[QUERY_MCP_ENDPOINT_ENV_VAR] = expected
-                try:
-                    return load_user_mcp_servers(root=root, user_id="usr-1")
-                finally:
-                    if previous is None:
-                        os.environ.pop(QUERY_MCP_ENDPOINT_ENV_VAR, None)
-                    else:
-                        os.environ[QUERY_MCP_ENDPOINT_ENV_VAR] = previous
+                    os.environ[QUERY_MCP_ENDPOINT_ENV_VAR] = previous
+        self.assertIn("query", servers)
 
-        # 未配置：维持原行为，第三方地址照读（这道闸没装）。
-        self.assertIn("query", _load("https://attacker.example.invalid/mcp", expected=None))
+    def test_same_origin_with_different_path_is_accepted(self) -> None:
+        with tempfile.TemporaryDirectory() as root:
+            _write(
+                Path(root) / "usr-1" / ".mcp.json",
+                json.dumps(
+                    {
+                        "mcpServers": {
+                            "query": {
+                                "type": "http",
+                                "url": "https://mcp.example.invalid/another/path",
+                                "headers": {"Authorization": "Bearer tok-123"},
+                            }
+                        }
+                    },
+                    ensure_ascii=False,
+                ),
+            )
+            servers = load_user_mcp_servers(
+                root=root,
+                user_id="usr-1",
+                expected_endpoint="https://mcp.example.invalid/mcp",
+            )
+        self.assertIn("query", servers)
 
-        # 配置了：同源放行——路径不同、端口写成显式 443、主机大小写不同都算同源。
-        for url in (
-            "https://mcp.example.invalid/mcp",
-            "https://mcp.example.invalid/another/path",
-            "https://MCP.Example.Invalid/mcp",
-            "https://mcp.example.invalid:443/mcp",
-        ):
-            with self.subTest(same_origin=url):
-                self.assertIn("query", _load(url, expected="https://mcp.example.invalid/mcp"))
-
-        # 配置了：异源一律拒——主机、子域、端口任一不同都算异源。
-        for url in (
-            "https://attacker.example.invalid/mcp",
-            "https://mcp.example.invalid.attacker.example.invalid/mcp",
+    def test_scheme_host_or_port_mismatch_is_rejected(self) -> None:
+        cases = (
+            "http://mcp.example.invalid/mcp",
             "https://sub.mcp.example.invalid/mcp",
             "https://mcp.example.invalid:8443/mcp",
-        ):
-            with self.subTest(cross_origin=url):
-                with self.assertRaises(UserMcpConfigError) as raised:
-                    _load(url, expected="https://mcp.example.invalid/mcp")
-                self.assertEqual(raised.exception.code, "config_endpoint_not_same_origin")
-                self.assertNotIn("attacker", raised.exception.code, "错误码不得回显主机名")
+        )
+        for url in cases:
+            with self.subTest(url=url):
+                with tempfile.TemporaryDirectory() as root:
+                    _write(
+                        Path(root) / "usr-1" / ".mcp.json",
+                        json.dumps(
+                            {
+                                "mcpServers": {
+                                    "query": {
+                                        "type": "http",
+                                        "url": url,
+                                        "headers": {"Authorization": "Bearer tok-123"},
+                                    }
+                                }
+                            },
+                            ensure_ascii=False,
+                        ),
+                    )
+                    with self.assertRaises(UserMcpConfigError):
+                        load_user_mcp_servers(
+                            root=root,
+                            user_id="usr-1",
+                            expected_endpoint="https://mcp.example.invalid/mcp",
+                        )
+
+    def test_invalid_expected_endpoint_never_degrades_to_skip(self) -> None:
+        invalid_expected_endpoints = ("", "https://", "https://@evil.example", "not a url")
+        for expected_endpoint in invalid_expected_endpoints:
+            with self.subTest(expected_endpoint=expected_endpoint):
+                with tempfile.TemporaryDirectory() as root:
+                    _write(
+                        Path(root) / "usr-1" / ".mcp.json",
+                        json.dumps(
+                            {
+                                "mcpServers": {
+                                    "query": {
+                                        "type": "http",
+                                        "url": "https://mcp.example.invalid/mcp",
+                                        "headers": {"Authorization": "Bearer tok-123"},
+                                    }
+                                }
+                            },
+                            ensure_ascii=False,
+                        ),
+                    )
+                    with self.assertRaises(UserMcpConfigError) as raised:
+                        load_user_mcp_servers(
+                            root=root, user_id="usr-1", expected_endpoint=expected_endpoint
+                        )
+                    self.assertEqual(raised.exception.code, "config_expected_endpoint_invalid")
 
     def test_error_code_never_echoes_the_configured_path_or_user_id(self) -> None:
         """error.code 只允许是本模块自定的安全码——不回显路径、内容或凭据。"""

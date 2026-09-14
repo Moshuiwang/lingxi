@@ -10,11 +10,15 @@
 
 ### Fixed
 
+- **预发权限发布表新增宿主侧备份、台账、差异、干跑撤回与读回核对守卫**：撤回只认预发 `publish_outbox` 台账中的外部记录标识，写表前备份与显式摘要确认成为升级前后的安全边界（Trace [#770](https://github.com/Moshuiwang/lingxi/issues/770)）。
 - **一次性欢迎卡发送脚本在真实运行时能看见自己的审计记录**：此前「记为说过话」「记为联系不上」这类审计只写进进程内日志、没有任何输出口，真实运行里一行都看不到，只能事后回读数据库；现在脚本运行时把这些记录一并写到标准错误。同批补齐三条只钉住既有行为、不改变任何用户可见结果的用例（文档投递回收判定顺序、「联系不上」标记从库到名单的接线、收件人级拒绝码只认清单成员）（Issue [#751](https://github.com/Moshuiwang/lingxi/issues/751)）。
 - **扩员准备不再把管理员自己的其他在途管理动作误报成「确认已过期」**：在途守卫只看扩员这一类待确认动作；若发起人本人已有别的在途动作占着名额，返回明确的「目标已有在途动作」原因，管理员能自诊断（残留：他类已过期动作要等懒清扫或本人点击才释放名额）（Issue [#708](https://github.com/Moshuiwang/lingxi/issues/708)）。
 
 ### Changed
 
+- **#567 拉取代理进控制包**：每台主机按环境筛选 Release、核对控制包与清单摘要、调用固定部署器并在失败或超时时告警；目标已在位与中断计划均保持幂等接续。
+- **worker-queue 要求入口注入并校验问数 MCP 目标地址**：地址缺失、为空或无效时以 `exit=3` 失败且不接单，同源不同路径仍可用（Issue [#604](https://github.com/Moshuiwang/lingxi/issues/604)）。
+- **监控库原始样本按 30 天窗口收缩**：每轮成功上推后删除 `sampled_at` 早于 30 天的 `sample` 行，并记录收缩行数（Issue [#756](https://github.com/Moshuiwang/lingxi/issues/756)）。
 - **候选镜像包核验工具不再依赖本机镜像存储驱动**：`verify_epic_candidate_bundle.py --import` 改为先从每个 tar 内的 `manifest.json` 读出 config 摘要与清单比对，再逐个导入；在 containerd 快照器存储的机器上也能给出「一致 / 不一致」，摘要对不上或读不到的 tar 不导入（Issue [#765](https://github.com/Moshuiwang/lingxi/issues/765)）。
 - **裁决层的代码审查范围收窄**：只对 `verdict.yml`、`verdict_decision.py` 和 `test_verdict_decision.py` 保留产品负责人审批，其他工作流改动由主干版门禁复跑裁决（Issue [#748](https://github.com/Moshuiwang/lingxi/issues/748)）。
 

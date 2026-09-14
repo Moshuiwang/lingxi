@@ -456,6 +456,8 @@ done
 
 ## 安装与升级
 
+自动化路径见 [deploy/control/引导安装.md（引导安装）](control/引导安装.md) 与 [deploy/拉取代理.md（触发层）](https://github.com/Moshuiwang/lingxi/blob/main/deploy/%E6%8B%89%E5%8F%96%E4%BB%A3%E7%90%86.md)。
+
 > **升级/重部署前置步骤**：容器 stdout 日志不会跨重部署持久（旧容器被替换即丢失，
 > 见 [#343](https://github.com/Moshuiwang/lingxi/issues/343)）。执行下面的 `up -d`
 > 之前，先手动跑一次日志收集脚本把当前容器的最新日志 flush 到宿主机持久目录，
@@ -566,6 +568,8 @@ docker compose exec -T scheduler python -m lingxi.apps.innertest_roster verify \
 任何情况下不要降库。
 
 ## 恢复入口
+
+恢复规则见 [deploy/control/引导安装.md「五、历史恢复包规则」](control/引导安装.md#五历史恢复包规则)。
 
 ```bash
 docker compose --env-file deploy/.env.prod -f deploy/compose.yaml -f deploy/compose.prod.yaml down

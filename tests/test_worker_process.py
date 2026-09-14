@@ -71,7 +71,7 @@ def _make_user_env_root(testcase: unittest.TestCase, *, seed_user_id: str | None
                     "mcpServers": {
                         "query": {
                             "type": "http",
-                            "url": "https://example.invalid/mcp",
+                            "url": "https://mcp.example.invalid/mcp",
                             "headers": {"Authorization": "Bearer test-token"},
                         }
                     }
@@ -106,6 +106,7 @@ class QueueModeSigtermTest(unittest.TestCase):
             "LINGXI_WORKER_READONLY_TOOLS": "mcp__query__noop",
             "LINGXI_WORKER_TRACE_ID": "01J00000000000000000000WRK",
             "LINGXI_WORKER_ID": "worker-sigterm-test",
+            "LINGXI_QUERY_MCP_ENDPOINT": "https://mcp.example.invalid/query",
             "LINGXI_WORKER_POLL_INTERVAL_SECONDS": "0.2",
             "LINGXI_WORKER_HEARTBEAT_INTERVAL_SECONDS": "5",
             "LINGXI_POSTGRES_DSN": DSN,
@@ -315,6 +316,7 @@ class QueueModeSigtermWithInFlightTaskTest(unittest.TestCase):
             "LINGXI_WORKER_READONLY_TOOLS": "mcp__query__noop",
             "LINGXI_WORKER_TRACE_ID": "01J00000000000000000000WR2",
             "LINGXI_WORKER_ID": self.WORKER_ID,
+            "LINGXI_QUERY_MCP_ENDPOINT": "https://mcp.example.invalid/query",
             "LINGXI_WORKER_TARGET_VERSION": "stable",
             "LINGXI_WORKER_POLL_INTERVAL_SECONDS": "0.2",
             "LINGXI_WORKER_STOP_POLL_INTERVAL_SECONDS": "0.2",
@@ -483,6 +485,7 @@ class QueueModeTerminalOutcomeLoggingTest(unittest.TestCase):
             "LINGXI_WORKER_READONLY_TOOLS": "mcp__query__noop",
             "LINGXI_WORKER_TRACE_ID": self.TRACE_ID,
             "LINGXI_WORKER_ID": self.WORKER_ID,
+            "LINGXI_QUERY_MCP_ENDPOINT": "https://mcp.example.invalid/query",
             "LINGXI_WORKER_TARGET_VERSION": "stable",
             "LINGXI_WORKER_POLL_INTERVAL_SECONDS": "0.2",
             "LINGXI_WORKER_HEARTBEAT_INTERVAL_SECONDS": "30",

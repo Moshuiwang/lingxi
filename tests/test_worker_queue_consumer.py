@@ -124,6 +124,7 @@ def worker_config(**overrides: object) -> WorkerConfig:
         "read_only_tools": ("mcp__q__read",),
         "trace_id": "01J00000000000000000000000",
         "turn_timeout_seconds": 1.0,
+        "query_mcp_endpoint": "https://example.invalid/query",
         "worker_id": "worker-test",
         "target_worker_version": "stable",
         "heartbeat_interval_seconds": 0.01,

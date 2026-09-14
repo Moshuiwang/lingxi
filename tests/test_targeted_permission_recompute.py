@@ -24,6 +24,7 @@ from datetime import UTC, datetime
 
 from test_permission_refresh_duty import (
     COMPANY_ID,
+    COMPANY_ID_TWO,
     FUNCTION_LABEL,
     GALAXY_ACCOUNT_ONE,
     METRIC_NAME,
@@ -52,6 +53,7 @@ from lingxi.core.permission.targeted_recompute import (
     SKIP_LOCAL_OVERRIDE_READ_FAILED,
     SKIP_MATCH_FAILED,
     SKIP_METRIC_TRANSLATION_UNAVAILABLE,
+    SKIP_METRIC_TRANSLATION_UNCOVERED,
     SKIP_MISSING_PERSONNEL_ID,
     SKIP_MISSING_ROSTER_SNAPSHOT,
     SKIP_NO_GALAXY_BATCH,
@@ -211,6 +213,17 @@ class RecomputeAndPublishSkipTests(unittest.TestCase):
         self.assertEqual(outcome.reason, SKIP_METRIC_TRANSLATION_UNAVAILABLE)
         self.assertEqual(parts["decisions"].calls, [])
 
+    def test_skips_when_this_users_permission_combination_is_uncovered(self) -> None:
+        recompute, parts = build_recompute(
+            identities=(identity(),),
+            metric_translation_map={COMPANY_ID_TWO: {FUNCTION_LABEL: (METRIC_NAME_TWO,)}},
+        )
+
+        outcome = recompute.recompute_and_publish(user_id=USER_ONE)
+
+        self.assertEqual(outcome.reason, SKIP_METRIC_TRANSLATION_UNCOVERED)
+        self.assertEqual(parts["decisions"].calls, [])
+
     def test_skips_when_the_account_is_not_in_the_active_baseline(self) -> None:
         recompute, _ = build_recompute(identities=())
 
@@ -224,6 +237,14 @@ class RecomputeAndPublishSkipTests(unittest.TestCase):
         outcome = recompute.recompute_and_publish(user_id=USER_ONE)
 
         self.assertEqual(outcome.reason, SKIP_MISSING_PERSONNEL_ID)
+
+    def test_skips_when_the_archive_is_missing_publish_identity_fields(self) -> None:
+        recompute, parts = build_recompute(identities=(identity(email=""),))
+
+        outcome = recompute.recompute_and_publish(user_id=USER_ONE)
+
+        self.assertEqual(outcome.reason, SKIP_ARCHIVED_IDENTITY_INCOMPLETE)
+        self.assertEqual(parts["decisions"].calls, [])
 
     def test_skips_when_matching_fails_and_does_not_touch_the_publish_row(self) -> None:
         recompute, parts = build_recompute(identities=(identity(personnel_id="ou_unknown_person"),))

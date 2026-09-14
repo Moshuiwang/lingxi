@@ -77,6 +77,7 @@ def _env(**overrides: str | None) -> dict[str, str]:
         "LINGXI_WORKER_QUESTION": "帮我写一份上周数据周报",
         "LINGXI_WORKER_READONLY_TOOLS": READ_ONLY_TOOL,
         "LINGXI_WORKER_TRACE_ID": "01J0000000000000000TEST000",
+        "LINGXI_QUERY_MCP_ENDPOINT": "https://mcp.example.invalid/query",
     }
     env.update({key: value for key, value in overrides.items() if value is not None})
     return env

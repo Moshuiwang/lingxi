@@ -27,6 +27,7 @@ from lingxi.core.ids import new_ulid
 from lingxi.core.mcp_naming import QUERY_MCP_SERVER_NAME
 
 ENV_PREFIX = "LINGXI_WORKER_"
+QUERY_MCP_ENDPOINT_ENV_VAR = "LINGXI_QUERY_MCP_ENDPOINT"
 
 # 这是部署配置的默认口径；实际任务值仍从环境变量读取。硬上限是产品为单任务
 # 设下的安全边界，越过它必须在启动期拒绝，不能让一次部署带着不确定的成本口径运行。
@@ -208,6 +209,10 @@ class WorkerConfig:
     # 持有工具名字面量（唯一事实来源是 document_delivery.DELIVER_DOCUMENT_
     # TOOL_NAME）。
     document_delivery_enabled: bool = False
+    # 入口校验后的完整 HTTPS URL；保留路径，适配器只用 scheme + host + port
+    # 做同源判定。正式配置必须经 load_config 注入；空值仅兼容旧的直接构造测试，
+    # 不会由入口放行。
+    query_mcp_endpoint: str = ""
 
     def __post_init__(self) -> None:
         """校验直接构造路径与 loader 路径共用的启动期不变量。"""
@@ -244,11 +249,9 @@ class WorkerConfig:
 
 def _require_worker_env_vars(env: Mapping[str, str], *, require_question: bool) -> None:
     required_names = ("QUESTION", "READONLY_TOOLS") if require_question else ("READONLY_TOOLS",)
-    missing = [name for name in required_names if not _text(env, name)]
+    missing = [f"{ENV_PREFIX}{name}" for name in required_names if not _text(env, name)]
     if missing:
-        raise WorkerConfigError(
-            "缺少必填环境变量：" + "、".join(f"{ENV_PREFIX}{name}" for name in missing)
-        )
+        raise WorkerConfigError(f"缺少必填环境变量：{'、'.join(missing)}")
 
 
 def _validate_prompt_source_exclusivity(
@@ -282,12 +285,16 @@ def _build_worker_config(
     content_capture_enabled: bool,
     content_capture_misconfigured: bool,
 ) -> WorkerConfig:
+    from lingxi.adapters.user_mcp_config import validate_endpoint
+
+    raw_endpoint = env.get(QUERY_MCP_ENDPOINT_ENV_VAR)
     return WorkerConfig(
         question=_text(env, "QUESTION") or "",
         read_only_tools=_read_only_tools(env),
         trace_id=_validated_trace_id(_text(env, "TRACE_ID")),
         max_turns=_max_turns(_text(env, "MAX_TURNS")),
         turn_timeout_seconds=_turn_timeout(_text(env, "TURN_TIMEOUT_SECONDS")),
+        query_mcp_endpoint=validate_endpoint(raw_endpoint, WorkerConfigError),
         drain_grace_seconds=_drain_grace(_text(env, "DRAIN_GRACE_SECONDS")),
         audit_input_fields=_names(env, "AUDIT_INPUT_FIELDS"),
         failure_text_markers=_failure_markers(env),
@@ -359,11 +366,9 @@ def load_config(
 
 
 def _text(env: Mapping[str, str], name: str) -> str | None:
-    value = env.get(f"{ENV_PREFIX}{name}")
-    if value is None:
+    if (value := env.get(f"{ENV_PREFIX}{name}")) is None:
         return None
-    value = value.strip()
-    return value or None
+    return value.strip() or None
 
 
 def _parse_readonly_tool_values(raw: str) -> tuple[str, ...]:
@@ -533,9 +538,8 @@ def declares_production(env: Mapping[str, str]) -> bool:
     这不是"检测"生产（镜像与编排两侧完全相同，检测不出来），是让部署**声明**自己
     是谁，并把这份声明放在入库的 compose 文件里，使它不能被一份抄来的 env 文件覆盖。
     """
-    return (
-        env.get(DEPLOY_ENVIRONMENT_VAR) or ""
-    ).strip().casefold() in PRODUCTION_ENVIRONMENT_VALUES
+    value = env.get(DEPLOY_ENVIRONMENT_VAR) or ""
+    return value.strip().casefold() in PRODUCTION_ENVIRONMENT_VALUES
 
 
 def _document_delivery_enabled(env: Mapping[str, str]) -> bool:

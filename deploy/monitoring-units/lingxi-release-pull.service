@@ -1,0 +1,19 @@
+[Unit]
+Description=Lingxi Release 只出网拉取代理单轮
+After=network-online.target docker.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+# User= 不写在仓库单元里，由本机 drop-in 提供；本服务必须按
+# deploy/control/contract.json 的 runtime.deployment_euid=0 以 root 运行。
+# 缺少 drop-in 时 systemd 默认也是 root；安装前须核对 drop-in 明确写了 User=root。
+WorkingDirectory=/opt/lingxi
+# 这里只传非秘密路径；alert_env_file 由 --config 指向，凭据不进 argv。
+ExecStart=/usr/bin/python3 /opt/lingxi/deploy/release_pull_agent.py --host-contract /opt/lingxi/control/host-contract.json --config /opt/lingxi/control/release-pull-agent.json --state-directory /opt/lingxi/state run
+# 单轮可能包含部署器的 15 分钟观察；3600s 比五分钟 timer 周期长，重叠由代理
+# 状态目录内的非阻塞文件锁拒绝，不能靠缩短超时制造第二个部署器。
+TimeoutStartSec=3600
+
+[Install]
+WantedBy=multi-user.target

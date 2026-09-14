@@ -1,0 +1,11 @@
+[Unit]
+Description=每五分钟检查一次 Lingxi Release 并接续部署
+
+[Timer]
+OnCalendar=*:0/5
+Persistent=true
+AccuracySec=30s
+Unit=lingxi-release-pull.service
+
+[Install]
+WantedBy=timers.target

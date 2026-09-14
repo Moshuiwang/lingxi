@@ -14,6 +14,7 @@ gateway 渲染的句子会与另外两个进程不一致。这类失败不会让
 from __future__ import annotations
 
 import importlib.util
+import re
 import sys
 import tempfile
 import textwrap
@@ -206,6 +207,19 @@ class UnsetVariableIsZeroChangeTest(unittest.TestCase):
         """三个进程要配就一起配：示例文件里三处都得有示范，删掉任一处即变红。"""
         text = (REPOSITORY_ROOT / "deploy" / ".env.example").read_text(encoding="utf-8")
         self.assertGreaterEqual(text.count("LINGXI_CONTENT_OVERRIDE_PATH"), 3)
+
+    def test_worker_queue_env_example_lists_query_mcp_endpoint_as_required(self) -> None:
+        text = (REPOSITORY_ROOT / "deploy" / ".env.example").read_text(encoding="utf-8")
+        match = re.search(
+            r"文件五：deploy/\.env\.stage\.worker-queue.*?(?=\n# ={10,}\n# 文件六)",
+            text,
+            re.DOTALL,
+        )
+        self.assertIsNotNone(match)
+        section = match.group(0)
+        self.assertRegex(section, r"(?m)^LINGXI_QUERY_MCP_ENDPOINT=\S.*$")
+        self.assertNotRegex(section, r"(?m)^#\s*LINGXI_QUERY_MCP_ENDPOINT=")
+        self.assertEqual(CONTRACT.check_worker_queue_env_example(), [])
 
 
 if __name__ == "__main__":
