@@ -85,7 +85,6 @@ def _validate_endpoint(url: str, expected_endpoint: str) -> None:
 
 def _endpoint_parts(value: str, error_code: str) -> Any:
     """把端点解析成同源判定所需的结构；非法期望值绝不降级放行。"""
-
     from urllib.parse import urlsplit
 
     if not isinstance(value, str) or any(character.isspace() for character in value):
@@ -106,6 +105,17 @@ def _endpoint_parts(value: str, error_code: str) -> Any:
     return parts
 
 
+def validate_endpoint(value: Any, error_type: type[ValueError]) -> str:
+    """校验入口传入的问数目标地址，并用调用方的错误类型收口。"""
+    if not isinstance(value, str) or not value.strip():
+        raise error_type(f"{QUERY_MCP_ENDPOINT_ENV_VAR} 缺失")
+    try:
+        _endpoint_parts(value, "config_shape_invalid")
+    except UserMcpConfigError:
+        raise error_type(f"{QUERY_MCP_ENDPOINT_ENV_VAR} 无效") from None
+    return value
+
+
 def _origin(parts: Any) -> tuple[str, str, int | None]:
     """``(scheme, host, port)``——主机名大小写不敏感，端口按 scheme 归一。"""
     port = parts.port
@@ -118,9 +128,7 @@ def _errno_name(error: OSError) -> str:
     return errno_module.errorcode.get(error.errno or 0) or "unknown"
 
 
-def load_user_mcp_servers(
-    *, root: str, user_id: str, expected_endpoint: str
-) -> Mapping[str, Any]:
+def load_user_mcp_servers(root: str, user_id: str, expected_endpoint: str) -> Mapping[str, Any]:
     """读取 ``user_id`` 自己的 ``.mcp.json``，返回其中的 ``mcpServers`` 映射（``server_name -> server_config``，与 ``WorkerConfig.mcp_servers`` 同一形状，可以直接作为 ``mcp_servers=`` 传给 ``build_agent_options``）。
 
     这是本模块**唯一的对外入口**，没有默认值参数、没有回退开关：任何失败都以

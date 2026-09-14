@@ -90,6 +90,8 @@ SELECT 'CREATE ROLE lingxi_monitoring_app LOGIN PASSWORD ' || quote_literal(:'pa
 
 GRANT USAGE ON SCHEMA lingxi_monitoring TO lingxi_monitoring_app;
 GRANT SELECT, INSERT ON ALL TABLES IN SCHEMA lingxi_monitoring TO lingxi_monitoring_app;
+-- 30 天收缩只删 sample 原始样本，不给聚合表新增删除权限；重复执行仍幂等。
+GRANT DELETE ON lingxi_monitoring.sample TO lingxi_monitoring_app;
 GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA lingxi_monitoring TO lingxi_monitoring_app;
 ALTER DEFAULT PRIVILEGES IN SCHEMA lingxi_monitoring GRANT SELECT, INSERT ON TABLES TO lingxi_monitoring_app;
 ALTER DEFAULT PRIVILEGES IN SCHEMA lingxi_monitoring GRANT USAGE, SELECT ON SEQUENCES TO lingxi_monitoring_app;

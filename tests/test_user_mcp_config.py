@@ -15,8 +15,8 @@ import unittest
 from pathlib import Path
 
 from lingxi.adapters.user_environment import build_mcp_config
+from lingxi.adapters.user_mcp_config import UserMcpConfigError
 from lingxi.adapters.user_mcp_config import (
-    UserMcpConfigError,
     load_user_mcp_servers as _load_user_mcp_servers,
 )
 
@@ -28,9 +28,7 @@ def load_user_mcp_servers(
 ):
     """为旧读侧用例补上显式的入口注入值。"""
 
-    return _load_user_mcp_servers(
-        root=root, user_id=user_id, expected_endpoint=expected_endpoint
-    )
+    return _load_user_mcp_servers(root=root, user_id=user_id, expected_endpoint=expected_endpoint)
 
 
 def _write(path: Path, content: str) -> None:

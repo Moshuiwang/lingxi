@@ -54,6 +54,20 @@ else
     bash "${monitoring_dir}/push_to_monitoring.sh"
 fi
 
+# monitoring_schema.sql：收缩所需权限只给原始 sample 表，不扩大 ALL TABLES 权限。
+schema_file="${monitoring_dir}/monitoring_schema.sql"
+if grep -Eq '^[[:space:]]*GRANT DELETE ON lingxi_monitoring\.sample TO lingxi_monitoring_app;' \
+    "${schema_file}" \
+   && grep -Eq '^[[:space:]]*GRANT SELECT, INSERT ON ALL TABLES IN SCHEMA lingxi_monitoring TO lingxi_monitoring_app;' \
+    "${schema_file}" \
+   && ! grep -Eq '^[[:space:]]*GRANT[^;]*DELETE[^;]*ON ALL TABLES IN SCHEMA' "${schema_file}"; then
+  printf 'PASS: monitoring_schema.sql 只给 sample 表 GRANT DELETE，ALL TABLES 未扩大权限\n'
+  pass_count=$((pass_count + 1))
+else
+  printf 'FAIL: monitoring_schema.sql 的 sample DELETE 权限范围不符合预期\n' >&2
+  fail_count=$((fail_count + 1))
+fi
+
 # --- resource_sample.sh：用伪造 docker 走一遍完整采样落盘路径 -----------
 
 work_dir=$(mktemp -d)

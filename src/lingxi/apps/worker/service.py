@@ -23,7 +23,8 @@ from lingxi.adapters.postgres_conversation import (
     TerminalTask,
     is_dependency_unavailable,
 )
-from lingxi.adapters.user_mcp_config import UserMcpConfigError, load_user_mcp_servers
+from lingxi.adapters.user_mcp_config import UserMcpConfigError
+from lingxi.adapters.user_mcp_config import load_user_mcp_servers as load_mcp
 from lingxi.apps.worker.config import WorkerConfig
 from lingxi.apps.worker.content_capture import ContentCaptureRecorder
 from lingxi.apps.worker.housekeeping import QueueHousekeeper
@@ -389,12 +390,7 @@ class WorkerService:
 
     def _load_user_mcp_servers(self, user_id: str) -> Mapping[str, Any]:
         """按任务用户读取配置，并显式注入入口已校验的目标端点。"""
-
-        return load_user_mcp_servers(
-            root=self._config.user_env_root or "",
-            user_id=user_id,
-            expected_endpoint=self._config.query_mcp_endpoint,
-        )
+        return load_mcp(self._config.user_env_root or "", user_id, self._config.query_mcp_endpoint)
 
     def _task_config(
         self,
@@ -659,7 +655,6 @@ class WorkerService:
 
     async def _poll_once(self, stop: asyncio.Event) -> None:
         """跑一轮；无事可做就睡一个轮询间隔。"""
-        del stop
         if not await self.process_once():
             await self._sleep(self._config.poll_interval_seconds)
 

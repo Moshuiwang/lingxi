@@ -27,6 +27,7 @@ from lingxi.core.ids import new_ulid
 from lingxi.core.mcp_naming import QUERY_MCP_SERVER_NAME
 
 ENV_PREFIX = "LINGXI_WORKER_"
+QUERY_MCP_ENDPOINT_ENV_VAR = "LINGXI_QUERY_MCP_ENDPOINT"
 
 # 这是部署配置的默认口径；实际任务值仍从环境变量读取。硬上限是产品为单任务
 # 设下的安全边界，越过它必须在启动期拒绝，不能让一次部署带着不确定的成本口径运行。
@@ -113,10 +114,6 @@ PRODUCTION_ENVIRONMENT_VALUES = ("prod", "production", "生产")
 # ``_innertest_content_capture`` 的主开关：只接受精确值 ``"1"``，错配按启动
 # 即失败处理，不悄悄当作未开启。
 DOCUMENT_DELIVERY_ENABLED_VAR = "DOCUMENT_DELIVERY_ENABLED"
-
-# 问数执行服务的目标地址由 worker 入口读取并校验；逐用户适配器只接收入口注入
-# 的值，不直接读取环境变量。scheduler 侧沿用同名变量，但不在本处改变其语义。
-QUERY_MCP_ENDPOINT_ENV_VAR = "LINGXI_QUERY_MCP_ENDPOINT"
 
 
 class WorkerConfigError(ValueError):
@@ -248,17 +245,13 @@ class WorkerConfig:
             mode_label="output_safety_canary",
             prompt_label="system_prompt",
         )
-        if self.query_mcp_endpoint:
-            _validate_query_mcp_endpoint(self.query_mcp_endpoint)
 
 
 def _require_worker_env_vars(env: Mapping[str, str], *, require_question: bool) -> None:
     required_names = ("QUESTION", "READONLY_TOOLS") if require_question else ("READONLY_TOOLS",)
-    missing = [name for name in required_names if not _text(env, name)]
+    missing = [f"{ENV_PREFIX}{name}" for name in required_names if not _text(env, name)]
     if missing:
-        raise WorkerConfigError(
-            "缺少必填环境变量：" + "、".join(f"{ENV_PREFIX}{name}" for name in missing)
-        )
+        raise WorkerConfigError(f"缺少必填环境变量：{'、'.join(missing)}")
 
 
 def _validate_prompt_source_exclusivity(
@@ -291,15 +284,17 @@ def _build_worker_config(
     system_prompt_file: str | None,
     content_capture_enabled: bool,
     content_capture_misconfigured: bool,
-    query_mcp_endpoint: str,
 ) -> WorkerConfig:
+    from lingxi.adapters.user_mcp_config import validate_endpoint
+
+    raw_endpoint = env.get(QUERY_MCP_ENDPOINT_ENV_VAR)
     return WorkerConfig(
         question=_text(env, "QUESTION") or "",
         read_only_tools=_read_only_tools(env),
         trace_id=_validated_trace_id(_text(env, "TRACE_ID")),
         max_turns=_max_turns(_text(env, "MAX_TURNS")),
         turn_timeout_seconds=_turn_timeout(_text(env, "TURN_TIMEOUT_SECONDS")),
-        query_mcp_endpoint=query_mcp_endpoint,
+        query_mcp_endpoint=validate_endpoint(raw_endpoint, WorkerConfigError),
         drain_grace_seconds=_drain_grace(_text(env, "DRAIN_GRACE_SECONDS")),
         audit_input_fields=_names(env, "AUDIT_INPUT_FIELDS"),
         failure_text_markers=_failure_markers(env),
@@ -354,7 +349,6 @@ def load_config(
     用"：非法 JSON 不会拒绝启动，合法值也不会有一份共享令牌驻留进程内存。
     """
     _require_worker_env_vars(env, require_question=require_question)
-    query_mcp_endpoint = _query_mcp_endpoint(env)
     system_prompt = _text(env, "SYSTEM_PROMPT")
     system_prompt_file = _system_prompt_file(env)
     _validate_prompt_source_exclusivity(
@@ -368,52 +362,13 @@ def load_config(
         system_prompt_file=system_prompt_file,
         content_capture_enabled=content_capture_enabled,
         content_capture_misconfigured=content_capture_misconfigured,
-        query_mcp_endpoint=query_mcp_endpoint,
     )
 
 
 def _text(env: Mapping[str, str], name: str) -> str | None:
-    value = env.get(f"{ENV_PREFIX}{name}")
-    if value is None:
+    if (value := env.get(f"{ENV_PREFIX}{name}")) is None:
         return None
-    value = value.strip()
-    return value or None
-
-
-def _query_mcp_endpoint(env: Mapping[str, str]) -> str:
-    """读取并严格校验问数 MCP 目标地址，失败关闭且不回显地址。"""
-
-    raw = env.get(QUERY_MCP_ENDPOINT_ENV_VAR)
-    if not isinstance(raw, str) or not raw.strip():
-        raise WorkerConfigError(f"{QUERY_MCP_ENDPOINT_ENV_VAR} 缺失")
-    _validate_query_mcp_endpoint(raw)
-    return raw
-
-
-def _validate_query_mcp_endpoint(value: str) -> None:
-    """要求完整 HTTPS URL，拒绝空主机、用户信息、片段、空白和非法端口。"""
-
-    from urllib.parse import urlsplit
-
-    if any(character.isspace() for character in value):
-        raise WorkerConfigError(f"{QUERY_MCP_ENDPOINT_ENV_VAR} 无效：地址含空白")
-    try:
-        parts = urlsplit(value)
-        hostname = parts.hostname
-        username = parts.username
-        password = parts.password
-        port = parts.port
-    except (TypeError, ValueError):
-        raise WorkerConfigError(f"{QUERY_MCP_ENDPOINT_ENV_VAR} 无效：地址解析失败") from None
-    if parts.scheme.casefold() != "https":
-        raise WorkerConfigError(f"{QUERY_MCP_ENDPOINT_ENV_VAR} 无效：地址必须使用 HTTPS")
-    if not hostname:
-        raise WorkerConfigError(f"{QUERY_MCP_ENDPOINT_ENV_VAR} 无效：地址缺少主机名")
-    if username is not None or password is not None:
-        raise WorkerConfigError(f"{QUERY_MCP_ENDPOINT_ENV_VAR} 无效：地址含用户信息")
-    if "#" in value:
-        raise WorkerConfigError(f"{QUERY_MCP_ENDPOINT_ENV_VAR} 无效：地址含片段")
-    del port
+    return value.strip() or None
 
 
 def _parse_readonly_tool_values(raw: str) -> tuple[str, ...]:
@@ -583,9 +538,8 @@ def declares_production(env: Mapping[str, str]) -> bool:
     这不是"检测"生产（镜像与编排两侧完全相同，检测不出来），是让部署**声明**自己
     是谁，并把这份声明放在入库的 compose 文件里，使它不能被一份抄来的 env 文件覆盖。
     """
-    return (
-        env.get(DEPLOY_ENVIRONMENT_VAR) or ""
-    ).strip().casefold() in PRODUCTION_ENVIRONMENT_VALUES
+    value = env.get(DEPLOY_ENVIRONMENT_VAR) or ""
+    return value.strip().casefold() in PRODUCTION_ENVIRONMENT_VALUES
 
 
 def _document_delivery_enabled(env: Mapping[str, str]) -> bool:

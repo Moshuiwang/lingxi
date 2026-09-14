@@ -2463,9 +2463,7 @@ class WorkerCliTest(unittest.TestCase):
         env.pop("LINGXI_QUERY_MCP_ENDPOINT")
         stdout, stderr = io.StringIO(), io.StringIO()
         fake_queue = FakeQueue()
-        with patch(
-            "lingxi.apps.worker.cli.PostgresTaskQueue", return_value=fake_queue
-        ) as factory:
+        with patch("lingxi.apps.worker.cli.PostgresTaskQueue", return_value=fake_queue) as factory:
             code = main(env=env, stdout=stdout, stderr=stderr)
 
         self.assertEqual(code, 3)

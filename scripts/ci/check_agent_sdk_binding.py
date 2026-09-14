@@ -20,6 +20,8 @@ FAKE_ENV = {
     "LINGXI_WORKER_QUESTION": "CI 构造冒烟，不会发给模型",
     "LINGXI_WORKER_READONLY_TOOLS": "mcp__query__list_metrics",
     "LINGXI_WORKER_TRACE_ID": "01J00000000000000000000C10",
+    # worker 入口必填的目标地址只用于构造期校验，不会连接外部服务。
+    "LINGXI_QUERY_MCP_ENDPOINT": "https://ci-smoke.invalid/mcp",
     # 四个"配置了才传"的可选字段也要在真实 dataclass 上构造一次：漏在冒烟外，
     # SDK 改字段名时 CI 全绿、配了对应变量的受控验证一跑就炸（独立复查发现）。
     # 空壳 MCP 定义只构造不连接；command 用 /bin/true 不产生任何副作用。
