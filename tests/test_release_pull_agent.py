@@ -116,10 +116,35 @@ class PullHarness:
             import json, os, sys
             with open(os.environ["CALL_LOG"], "a", encoding="utf-8") as stream:
                 stream.write(json.dumps({"kind":"docker", "argv":sys.argv[1:]}) + "\n")
-            if os.environ.get("DOCKER_MODE", "mismatch") == "match":
-                print(json.dumps([sys.argv[-1]]))
-            else:
-                print("[]")
+            args = sys.argv[1:]
+            mode = os.environ.get("DOCKER_MODE", "mismatch")
+            containers = json.loads(os.environ.get("DOCKER_CONTAINERS_JSON", "{}"))
+            images = json.loads(os.environ.get("DOCKER_IMAGES_JSON", "{}"))
+            if args[:2] == ["ps", "-aq"]:
+                if mode == "daemon":
+                    print("Cannot connect to the Docker daemon", file=sys.stderr)
+                    raise SystemExit(2)
+                if mode in {"match", "records", "stopped", "missing-image"}:
+                    print("\n".join(containers))
+                raise SystemExit(0)
+            if args[:2] == ["image", "inspect"]:
+                image = images.get(args[-1])
+                if mode == "missing-image" or image is None:
+                    print("Error: No such image", file=sys.stderr)
+                    raise SystemExit(1)
+                print(json.dumps(image["RepoDigests"]))
+                raise SystemExit(0)
+            if args and args[0] == "inspect":
+                container = containers.get(args[1])
+                if container is None:
+                    print("Error: No such object", file=sys.stderr)
+                    raise SystemExit(1)
+                print(json.dumps(container["labels"]))
+                print(json.dumps(container["config_image"]))
+                print(json.dumps(container["state"]))
+                print(json.dumps(container["image_id"]))
+                raise SystemExit(0)
+            raise SystemExit(9)
             """,
         )
         self.old_deployer = _exec(
@@ -184,6 +209,17 @@ class PullHarness:
             elif operation == "apply":
                 if os.environ.get("DEPLOY_MODE") == "timeout":
                     time.sleep(4)
+                approval_path = args[args.index("--approval") + 1]
+                approval = json.load(open(approval_path, encoding="utf-8"))
+                approval_sha = hashlib.sha256(canonical(approval)).hexdigest()
+                marker = os.path.join(state_dir, ".fake-approval-sha")
+                if os.path.exists(marker):
+                    if open(marker, encoding="utf-8").read() != approval_sha:
+                        print("approval_changed", file=sys.stderr)
+                        raise SystemExit(1)
+                else:
+                    with open(marker, "w", encoding="utf-8") as stream:
+                        stream.write(approval_sha)
                 print("{}")
             elif operation == "status":
                 print(json.dumps({"status":os.environ.get("DEPLOY_STATUS", "verified")}))
@@ -264,6 +300,8 @@ class PullHarness:
             "INDEX_FILE": str(self.index),
             "INSTALLED_SOURCE": str(self.installed_source),
             "DOCKER_MODE": "mismatch",
+            "DOCKER_CONTAINERS_JSON": "{}",
+            "DOCKER_IMAGES_JSON": "{}",
             "DEPLOY_STATUS": "verified",
             "DEPLOY_MODE": "normal",
         }
@@ -273,6 +311,7 @@ class PullHarness:
         self._make_manifest(self.target_tag, formal=environment == "production", seed="2")
         self.set_releases([self._release(self.target_tag, environment == "stage")])
         self._write_env()
+        self.set_running_containers(self.target_tag)
 
     def _write_env(self):
         self._old_env = os.environ.copy()
@@ -282,6 +321,32 @@ class PullHarness:
         os.environ.clear()
         os.environ.update(self._old_env)
         self.tmp.cleanup()
+
+    def set_running_containers(self, tag: str, running: bool = True):
+        manifest = json.loads((self.manifests / (tag + ".json")).read_text())
+        containers = {}
+        images = {}
+        for service, manifest_service in (
+            ("scheduler", "scheduler"),
+            ("gateway", "gateway"),
+            ("worker-queue", "worker"),
+        ):
+            identifier = "container-" + service
+            image_id = "image-" + service
+            containers[identifier] = {
+                "labels": {
+                    "com.docker.compose.project": self.host["project"],
+                    "com.docker.compose.service": service,
+                },
+                "config_image": manifest["images"][manifest_service],
+                "state": {"Running": running},
+                "image_id": image_id,
+            }
+            images[image_id] = {
+                "RepoDigests": [manifest["images"][manifest_service]],
+            }
+        os.environ["DOCKER_CONTAINERS_JSON"] = json.dumps(containers)
+        os.environ["DOCKER_IMAGES_JSON"] = json.dumps(images)
 
     def _make_manifest(self, tag: str, formal: bool, seed: str) -> dict:
         digest = (seed * 64)[:64]
@@ -491,7 +556,34 @@ class AgentTests(unittest.TestCase):
         self.assertEqual(kinds, {"gh", "manifest", "docker"})
         self.assertNotIn("deployer", kinds)
         self.assertEqual(self.read_state()["last_result"], "already_in_place_external")
-        self.assertEqual(sum(call["kind"] == "docker" for call in self.calls()), 4)
+        self.assertEqual(sum(call["kind"] == "docker" for call in self.calls()), 7)
+
+    def test_pulled_but_not_running_images_are_not_in_place(self):
+        self.harness.state_for_old()
+        self.harness.set_running_containers(self.harness.target_tag, running=False)
+        self.harness.set_env(DOCKER_MODE="stopped", DEPLOY_STATUS="running")
+        code, _ = self.run_agent()
+        self.assertEqual(code, 0)
+        self.assertEqual(self.read_state()["last_result"], "running")
+        self.assertTrue(
+            any(call["kind"] == "deployer" and "apply" in call["argv"] for call in self.calls())
+        )
+
+    def test_missing_image_means_not_installed_not_unknown(self):
+        self.harness.state_for_old()
+        self.harness.set_env(DOCKER_MODE="missing-image", DEPLOY_STATUS="running")
+        code, _ = self.run_agent()
+        self.assertEqual(code, 0)
+        self.assertEqual(self.read_state()["last_result"], "running")
+
+    def test_docker_daemon_unavailable_is_unknown(self):
+        self.harness.state_for_old()
+        self.harness.set_env(DOCKER_MODE="daemon")
+        messages = []
+        code, _ = self.run_agent(sender=lambda message, env, timeout: messages.append(message))
+        self.assertEqual(code, 0)
+        self.assertEqual(self.read_state()["last_result"], "unknown")
+        self.assertEqual(len(messages), 1)
 
     def test_bundle_digest_mismatch_refuses_and_alerts(self):
         self.harness.state_for_old()
@@ -520,8 +612,9 @@ class AgentTests(unittest.TestCase):
             str(self.harness.old_deployer), "\n".join(json.dumps(call) for call in deployer_calls)
         )
 
-    def test_interrupted_plan_is_continued_with_the_same_plan_id(self):
+    def test_interrupted_plan_is_continued_before_in_place_check(self):
         self.harness.state_for_continuation()
+        self.harness.set_env(DOCKER_MODE="match", DEPLOY_STATUS="running")
         calls = []
         code, _ = self.run_agent(sender=lambda message, env, timeout: calls.append(message))
         self.assertEqual(code, 0)
@@ -531,6 +624,100 @@ class AgentTests(unittest.TestCase):
         )
         self.assertFalse(any("plan" in call["argv"] for call in deployer))
         self.assertEqual(self.read_state()["plan_id"], "continuing-plan")
+        self.assertEqual(self.read_state()["deployer_state"], "running")
+        self.assertFalse(any(call["kind"] == "docker" for call in self.calls()))
+
+    def test_resume_reuses_existing_approval_fingerprint(self):
+        self.harness.state_for_old()
+        self.harness.set_env(DEPLOY_STATUS="running")
+        first_code, _ = self.run_agent()
+        self.assertEqual(first_code, 0)
+        approval_path = next(self.harness.state.glob("*.approval.json"))
+        before_bytes = approval_path.read_bytes()
+        before_mtime = approval_path.stat().st_mtime_ns
+        first_state = self.read_state()
+        self.assertEqual(first_state["deployer_state"], "running")
+
+        second_code, output = self.run_agent()
+        self.assertEqual(second_code, 0)
+        self.assertEqual(approval_path.read_bytes(), before_bytes)
+        self.assertEqual(approval_path.stat().st_mtime_ns, before_mtime)
+        self.assertEqual(self.read_state()["approval_sha256"], first_state["approval_sha256"])
+        self.assertIn("approval_reused", output)
+        deployer = [call for call in self.calls() if call["kind"] == "deployer"]
+        self.assertEqual(sum("plan" in call["argv"] for call in deployer), 1)
+        self.assertEqual(sum("apply" in call["argv"] for call in deployer), 2)
+
+    def test_old_release_comes_from_last_verified_plan_or_running_containers(self):
+        self.harness.state_for_old()
+        self.harness.set_env(DEPLOY_STATUS="running")
+        code, _ = self.run_agent()
+        self.assertEqual(code, 0)
+        request = next(self.harness.state.glob("*.request.json"))
+        self.assertEqual(json.loads(request.read_text())["old"]["tag"], self.harness.old_tag)
+
+    def test_old_release_comes_from_running_containers_when_state_is_not_verified(self):
+        previous = self.harness.previous_plan(self.harness.target_tag)
+        state = self.harness.base_state()
+        state.update(
+            {
+                "target_tag": self.harness.target_tag,
+                "deployer_state": "failed",
+                "plan_id": previous["id"],
+            }
+        )
+        self.harness.save_state(state)
+        self.harness.set_releases(
+            [
+                self.harness._release(self.harness.old_tag, False),
+                self.harness._release(self.harness.target_tag, True),
+            ]
+        )
+        self.harness.set_running_containers(self.harness.old_tag)
+        self.harness.set_env(DOCKER_MODE="records", DEPLOY_STATUS="running")
+        code, _ = self.run_agent()
+        self.assertEqual(code, 0)
+        request = next(self.harness.state.glob("*.request.json"))
+        self.assertEqual(json.loads(request.read_text())["old"]["tag"], self.harness.old_tag)
+
+    def test_recovery_target_never_points_at_new(self):
+        self.harness.state_for_old()
+        self.harness.set_env(DEPLOY_STATUS="running")
+        code, _ = self.run_agent()
+        self.assertEqual(code, 0)
+        request = json.loads(next(self.harness.state.glob("*.request.json")).read_text())
+        self.assertEqual(
+            request["recovery"]["target_manifest_sha256"], AGENT.fingerprint(request["old"])
+        )
+        self.assertNotEqual(
+            request["recovery"]["target_manifest_sha256"], AGENT.fingerprint(request["new"])
+        )
+
+    def test_downloads_use_clobber_and_separate_directories(self):
+        self.harness.state_for_old()
+        self.harness.set_env(DEPLOY_STATUS="running")
+        code, _ = self.run_agent()
+        self.assertEqual(code, 0)
+        downloads = [
+            call
+            for call in self.calls()
+            if call["kind"] == "gh" and call["argv"][:2] == ["release", "download"]
+        ]
+        self.assertEqual(len(downloads), 2)
+        self.assertTrue(all("--clobber" in call["argv"] for call in downloads))
+        directories = {call["argv"][call["argv"].index("--dir") + 1] for call in downloads}
+        self.assertEqual(len(directories), 2)
+        self.assertTrue(all(path.endswith(("/new", "/old")) for path in directories))
+
+    def test_alert_env_file_must_be_owned_by_runner(self):
+        runner = os.getuid()
+        self.assertEqual(
+            AGENT._load_alert_credentials(self.harness.alert_env)["LINGXI_ADMIN_GROUP_CHAT_ID"],
+            "oc_synthetic",
+        )
+        with patch.object(AGENT.os, "getuid", return_value=runner + 1):
+            with self.assertRaises(AGENT.AgentError):
+                AGENT._load_alert_credentials(self.harness.alert_env)
 
     def test_approval_binds_plan_fingerprint_and_contract_source(self):
         self.harness.state_for_old()
@@ -651,8 +838,8 @@ class AgentTests(unittest.TestCase):
         self.assertGreaterEqual(int(timeout.split("=", 1)[1]), 3600)
         exec_line = next(line for line in service.splitlines() if line.startswith("ExecStart="))
         self.assertFalse(any("=" in arg for arg in exec_line.split()[1:]))
-        self.assertFalse(any(line.startswith("User=") for line in service.splitlines()))
-        self.assertIn("User=root", service)
+        drop_in = (ROOT / "deploy/monitoring-units/10-local.conf.example").read_text()
+        self.assertRegex(drop_in, r"(?m)^User=<部署用户>$")
 
     def test_control_bundle_files_include_agent_units_doc_and_examples(self):
         spec = importlib.util.spec_from_file_location(
