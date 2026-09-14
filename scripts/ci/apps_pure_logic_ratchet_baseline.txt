@@ -61,13 +61,14 @@
 298	src/lingxi/apps/scheduler/roster_audit.py
 311	src/lingxi/apps/scheduler/stalled_provisioning.py
 290	src/lingxi/apps/trace/__init__.py
-517	src/lingxi/apps/worker/cli.py
-486	src/lingxi/apps/worker/config.py
+509	src/lingxi/apps/worker/cli.py
+475	src/lingxi/apps/worker/config.py
 67	src/lingxi/apps/worker/content_capture.py
 87	src/lingxi/apps/worker/progress_reporting.py
+49	src/lingxi/apps/worker/qa_corpus_capture.py
 293	src/lingxi/apps/worker/report.py
 117	src/lingxi/apps/worker/report_extraction.py
-500	src/lingxi/apps/worker/service.py
+498	src/lingxi/apps/worker/service.py
 31	src/lingxi/apps/worker/service_ports.py
 99	src/lingxi/apps/worker/terminal_outcome.py
 648	src/lingxi/apps/worker/turn.py

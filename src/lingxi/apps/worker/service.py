@@ -29,6 +29,7 @@ from lingxi.apps.worker.config import WorkerConfig
 from lingxi.apps.worker.content_capture import ContentCaptureRecorder
 from lingxi.apps.worker.housekeeping import QueueHousekeeper
 from lingxi.apps.worker.progress_reporting import TurnProgressReporter
+from lingxi.apps.worker.qa_corpus_capture import QaCorpusRecorder
 from lingxi.apps.worker.report_extraction import (
     _cap_log_token,
     _load_task_system_prompt,
@@ -116,6 +117,7 @@ class WorkerService:
             content_capture_writer=sinks.content_capture_writer,
             on_year_grounding_suspect=sinks.on_year_grounding_suspect,
         )
+        self._qa_corpus = QaCorpusRecorder(config=config, writer=sinks.qa_corpus_writer)
         # 收到停机信号后由 ``run()`` 设置：在途任务的监控循环据此把"进程正在停机"与
         # "用户按了停止"同等看待，主动请求执行层中断当前回合。
         self._global_stop: asyncio.Event | None = None
@@ -251,12 +253,7 @@ class WorkerService:
 
     def _emit_heartbeat(self) -> None:
         """戳一次活性；失败只记异常类型，不能因为告警输入失败而让 worker 停止消费。"""
-        if self._heartbeat is None:
-            return
-        try:
-            self._heartbeat()
-        except Exception as error:
-            logger.error("worker 心跳记录失败，任务职责继续运行 error=%s", type(error).__name__)
+        self._run_observer(self._heartbeat, "心跳记录")
 
     def _tick_alerts(self) -> None:
         """推进一次告警状态机的恢复计时与投递重试。
@@ -264,14 +261,17 @@ class WorkerService:
         worker 没有独立的定时职责循环，借用队列消费循环每轮调用一次；频率因此等于轮询
         间隔，比定时进程高，但状态机的去重与阈值判定都基于时间戳而非调用次数，不敏感。
         """
-        if self._on_alert_tick is None:
+        self._run_observer(self._on_alert_tick, "告警状态机推进")
+
+    @staticmethod
+    def _run_observer(callback: Callable[[], None] | None, label: str) -> None:
+        """调用一个可留空的观测出口；失败只记异常类型，任务职责继续运行。"""
+        if callback is None:
             return
         try:
-            self._on_alert_tick()
+            callback()
         except Exception as error:
-            logger.error(
-                "worker 告警状态机推进失败，任务职责继续运行 error=%s", type(error).__name__
-            )
+            logger.error("worker %s失败，任务职责继续运行 error=%s", label, type(error).__name__)
 
     # ------------------------------------------------------------------
     # 一个任务的完整生命周期
@@ -317,17 +317,21 @@ class WorkerService:
         )
 
         outcome = TurnOutcome.from_report(report)
-        self._finish_terminal(
+        decision = self._finish_terminal(
             claimed,
             decide_terminal(outcome, catalog=self._catalog),
             outcome=outcome,
             elapsed_seconds=int(max(0.0, self._monotonic() - started_at)),
             system_prompt_digest=system_prompt_digest,
         )
-        # 采集排在全部终态分支之后：终态（用户结果）优先于旁路观测，即使采集失败也不能
-        # 影响已经写好的终态。失败/超时回合的问题原文与已尝试的工具调用同样有分析价值，
-        # 因此不限于成功回合。
+        # 采集与语料留存都排在全部终态分支之后：终态（用户结果）优先于旁路观测，即使
+        # 旁路失败也不能影响已经写好的终态。失败/超时回合的问题原文与已尝试的工具调用
+        # 同样有分析价值，因此不限于成功回合。语料拿的是收口后的 decision，实收正文
+        # 与投递事件逐字同源。
         self._capture.capture(claimed, executor=executor, question=context.prompt)
+        self._qa_corpus.record(
+            claimed, executor, context.prompt, decision, report, system_prompt_digest
+        )
 
     async def _run_turn(
         self,
@@ -535,8 +539,8 @@ class WorkerService:
         outcome: TurnOutcome | None = None,
         elapsed_seconds: int = 0,
         system_prompt_digest: str | None = None,
-    ) -> None:
-        """写终态事件并把任务转入"等待投递"。
+    ) -> TerminalDecision:
+        """写终态事件并把任务转入"等待投递"，返回实际写入的终态决定。
 
         话题继续占用直到投递解析，因此新建立的会话标识（只在业务成功时非空）随终态事件
         一起持久化，留到确认送达时才写回话题行——同一话题在此期间不会有第二个任务插进来
@@ -581,6 +585,7 @@ class WorkerService:
             document_request=decision.document_request,
             sheet_request=decision.sheet_request,
         )
+        return decision
 
     async def _monitor(
         self,
@@ -641,17 +646,11 @@ class WorkerService:
             # 空闲栈里的连接，不再只靠 atexit。挪去线程池执行，避免同步数据库调用
             # 占住事件循环；清理与调度本身的异常只记日志，不覆盖原始故障。
             try:
-                await asyncio.to_thread(self._close_idle_connections_quietly)
+                await asyncio.to_thread(
+                    self._run_observer, close_idle_connections, "停机清理空闲数据库连接"
+                )
             except Exception as error:
                 logger.error("worker 停机清理调度失败 error=%s", type(error).__name__)
-
-    @staticmethod
-    def _close_idle_connections_quietly() -> None:
-        """停机收尾：关闭空闲数据库连接，失败只记日志。"""
-        try:
-            close_idle_connections()
-        except Exception as error:
-            logger.error("worker 停机清理空闲数据库连接失败 error=%s", type(error).__name__)
 
     async def _poll_once(self, stop: asyncio.Event) -> None:
         """跑一轮；无事可做就睡一个轮询间隔。"""
@@ -702,14 +701,15 @@ def _default_executor_factory(
     就会把它当成真实完成的回合同步写终态——停机预算耗尽后任务本该保持运行中、交给心跳
     超时回收，不该被写成一次可能失真的失败终态。
 
-    采集开关取自装配时的进程配置（按任务覆盖不触碰这一项）；默认关闭时执行器不构造任何
-    收集器，与"默认关闭不产生额外行为"同一条纪律。
+    收集器是机制不是通道：内测采集与语料留存任一通道开启就构造它（开关取自装配时的进程
+    配置，按任务覆盖不触碰）；两者都关时执行器不构造任何收集器，与"默认关闭不产生额外
+    行为"同一条纪律。
     """
     return WorkerTurnExecutor(
         worker_config,
         mark_external_side_effect=marker,
         propagate_cancellation=True,
-        capture_raw_content=worker_config.innertest_content_capture_enabled,
+        capture_raw_content=worker_config.captures_raw_content,
     )
 
 

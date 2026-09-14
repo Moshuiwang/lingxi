@@ -438,6 +438,8 @@ REQUIRED_MODULES = (
     "lingxi.apps.worker.service",
     # service.py 拆分（#592 B-1）：端口协议、巡检、终态审计与内容采集。
     "lingxi.apps.worker.content_capture",
+    # 问答留存语料的旁路记录器，与内容采集记录器并存，由 service.py 模块级 import。
+    "lingxi.apps.worker.qa_corpus_capture",
     "lingxi.apps.worker.progress_reporting",
     "lingxi.apps.worker.housekeeping",
     "lingxi.apps.worker.service_ports",
@@ -1106,6 +1108,11 @@ PROCESS_RUNTIME_IMPORTS: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {
             "lingxi.apps.worker.report",
             "lingxi.apps.worker.turn",
             "lingxi.apps.worker.content_capture",
+            # 问答留存语料：记录器由 service.py 模块级 import，记录模型与落库适配器
+            # 分别由 service_ports.py / cli.py 模块级 import；写入只在开关开启时发生。
+            "lingxi.apps.worker.qa_corpus_capture",
+            "lingxi.core.qa_corpus",
+            "lingxi.adapters.postgres_qa_corpus",
             "lingxi.apps.worker.progress_reporting",
             "lingxi.apps.worker.housekeeping",
             "lingxi.apps.worker.service",
