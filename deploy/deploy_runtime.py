@@ -191,7 +191,20 @@ class Runtime:
                 raise DeployError("public_file_configuration_changed")
 
     def verify_service_inventory(self, plan):
-        """只能停止计划已登记的旧服务，接续只允许旧新两份制品。"""
+        """只能停止计划已登记的旧服务，接续只允许旧新两份制品。
+
+        首次接管：部署器接管之前由人手工用 Compose 启动的旧服务没有任何
+        ``io.lingxi.*`` 标签（``containers`` 读到的 ``config_sha256`` 与
+        ``bundle_sha256`` 同为 ``None``，不是空串或别的值）。这种容器只要镜像
+        摘要等于计划 ``old`` 侧登记的镜像，就视为计划已登记的旧服务而接受；
+        ``new`` 侧永不放行，只缺一枚标签或标签值不等的容器仍按原规则拒绝。
+        这不放松安全边界：旧镜像摘要本身就是计划登记并经批准的旧服务身份，
+        标签核对只是在此之上再钉一次配置与控制包摘要；而部署器自己起过的容器
+        一定带全三枚标签（``channel_compose`` 一起写入，容器创建后不可改），
+        所以「完全无标签」只可能是接管之前的手工启动，不可能是部署器产物。
+        中断在「首个服务更新后」再接续（``changed``）时，剩下的旧容器仍是
+        无标签的，同样按 ``old`` 侧接受。
+        """
         current = self.containers(plan["project"])
         ledger = read_json(self.state_directory / (plan["id"] + ".state.json"))
         changed = "start" in ledger["stages"] or plan["operation"] == "recover"
@@ -202,15 +215,21 @@ class Runtime:
             choices.append(("new", plan["config_sha256"]))
         for name, actual in current.items():
             service = "worker" if name == "worker-queue" else name
+            unlabeled = actual["config_sha256"] is None and actual["bundle_sha256"] is None
             matched = False
             for side, config_sha in choices:
                 release = plan[side]
                 same_image = (
                     actual["image"].split("@")[-1] == release["images"][service].split("@")[-1]
                 )
-                same_config = release["schema"] != 2 or (
-                    actual["config_sha256"] == config_sha
-                    and actual["bundle_sha256"] == control_for(plan, release)["sha256"]
+                takeover = side == "old" and unlabeled
+                same_config = (
+                    takeover
+                    or release["schema"] != 2
+                    or (
+                        actual["config_sha256"] == config_sha
+                        and actual["bundle_sha256"] == control_for(plan, release)["sha256"]
+                    )
                 )
                 matched = matched or (same_image and same_config)
             if not matched:
