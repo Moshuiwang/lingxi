@@ -1629,10 +1629,19 @@ class AgentTests(unittest.TestCase):
 
     def test_alert_dedup_and_recovery_notice(self):
         messages = []
+        outputs = []
         for _ in range(3):
-            code, _ = self.run_agent(sender=lambda message, env, timeout: messages.append(message))
+            code, output = self.run_agent(
+                sender=lambda message, env, timeout: messages.append(message)
+            )
             self.assertEqual(code, 0)
+            outputs.append(output)
         self.assertEqual(len(messages), 1)
+        # 同键第二、三轮被去重：日志不得再记 sent，把「没发」写成「已发」。
+        self.assertIn("阶段=alert 结果码=sent", outputs[0])
+        for output in outputs[1:]:
+            self.assertNotIn("结果码=sent", output)
+            self.assertIn("阶段=alert 结果码=deduplicated", output)
         self.harness.set_releases([self.harness._release(self.harness.target_tag, True)])
         self.harness.set_env(DOCKER_MODE="match")
         code, _ = self.run_agent(sender=lambda message, env, timeout: messages.append(message))

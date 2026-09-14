@@ -16,6 +16,11 @@ import tarfile
 import tempfile
 from pathlib import Path, PurePosixPath
 
+# FILES 只服务于 build()：它是「当前版本」打包时的完整文件清单。核对（verify /
+# verify_install）不再拿它当依据——控制包会跨版本流动：旧工具（已安装的 current）核新包、
+# 新工具核旧包（拉取代理下载旧包接续、部署器 prepare 安装计划里的 old 包、release_manifest
+# resolve 核历史候选）都是正常路径。集合依据改为包自身的 control-index.json，而索引摘要由
+# 发布清单的 index_sha256 在包外钉住，所以放宽的只是「集合来自哪里」，不是任何逐成员检查。
 FILES = (
     "deploy/lingxi_deploy.py",
     "deploy/deploy_state.py",
@@ -46,6 +51,28 @@ FILES = (
 )
 INDEX = "control-index.json"
 ASSET = "lingxi-control.tar"
+# 包内文件只允许落在这三个前缀之下：部署器与其状态 / 运行时模块、compose 与控制目录材料在
+# deploy/，发布清单工具在 scripts/ci/，受限 relay 与安装自检在 scripts/admin/。部署主体、
+# relay 与自检只会从这三处按相对路径读文件；src/、tests/、.github/、etc/ 之类的路径不是任何
+# 调用方会读的位置，出现即视为打包器越界或包被改写。前缀按路径段匹配（deploy2/ 不算）。
+ALLOWED_PREFIXES = ("deploy/", "scripts/ci/", "scripts/admin/")
+# 任何版本的控制包都必须带的文件：v2.4.3（rc.98）那 15 个成员里，部署器（lingxi_deploy /
+# deploy_state / deploy_runtime / control_bundle）、发布清单工具、compose 三份、内测通道契约、
+# relay 与安装自检是被真正读取的；README 与两份 sshd 示例只供人看，不在此列。索引缺任一项即拒，
+# 防止「索引自洽但少了部署器」的包通过核对。此清单只能随真实读取关系变化而增减。
+REQUIRED_FILES = (
+    "deploy/lingxi_deploy.py",
+    "deploy/deploy_state.py",
+    "deploy/deploy_runtime.py",
+    "deploy/control_bundle.py",
+    "scripts/ci/release_manifest.py",
+    "deploy/compose.yaml",
+    "deploy/compose.stage.yaml",
+    "deploy/compose.prod.yaml",
+    "deploy/control/contract.json",
+    "scripts/admin/innertest_relay.py",
+    "scripts/admin/innertest_install_check.py",
+)
 RUNTIME = {
     "python_minimum": "3.11",
     "platform": "linux",
@@ -135,6 +162,42 @@ def build(root: Path, output: Path, commit: str):
     }
 
 
+def allowed_path(name: str) -> bool:
+    """包内文件路径策略：三前缀之下、每段非空且不是 . / ..、不以 / 结尾。"""
+    if not isinstance(name, str) or not name.startswith(ALLOWED_PREFIXES):
+        return False
+    return all(part not in ("", ".", "..") for part in name.split("/"))
+
+
+def index_paths(index: dict) -> set:
+    """从索引取出文件路径集合；索引本身已被清单摘要钉住，这里只核形状、策略与必备文件。"""
+    files = index.get("files") if isinstance(index, dict) else None
+    if not isinstance(files, list) or not all(
+        isinstance(entry, dict) and isinstance(entry.get("path"), str) for entry in files
+    ):
+        raise BundleError("包索引文件条目形状不符")
+    paths = [entry["path"] for entry in files]
+    listed = set(paths)
+    if len(listed) != len(paths) or not all(allowed_path(name) for name in paths):
+        raise BundleError("包索引路径重复或越界")
+    directories = index_directories(listed)
+    if directories & listed:
+        raise BundleError("包索引路径同时作为文件和目录")
+    if not set(REQUIRED_FILES) <= listed:
+        raise BundleError("控制包缺少必备文件")
+    return listed
+
+
+def index_directories(listed: set) -> set:
+    """索引文件集合蕴含的目录集合；安装目录里不允许有其它目录。"""
+    return {
+        str(parent)
+        for name in listed
+        for parent in PurePosixPath(name).parents
+        if str(parent) != "."
+    }
+
+
 def verify(package: Path, expected: dict):
     """完整验证通过前不向目标目录写文件。"""
     raw = package.read_bytes()
@@ -146,7 +209,7 @@ def verify(package: Path, expected: dict):
         for member in archive.getmembers():
             path = PurePosixPath(member.name)
             if (
-                member.name not in (*FILES, INDEX)
+                not (member.name == INDEX or allowed_path(member.name))
                 or path.is_absolute()
                 or ".." in path.parts
                 or member.name in contents
@@ -160,9 +223,7 @@ def verify(package: Path, expected: dict):
                 raise BundleError("控制包路径、类型、权限或重复项不安全")
             contents[member.name] = archive.extractfile(member).read()
             modes[member.name] = member.mode
-    if set(contents) != set((*FILES, INDEX)):
-        raise BundleError("控制包缺少固定文件")
-    if digest(contents[INDEX]) != expected["index_sha256"]:
+    if INDEX not in contents or digest(contents[INDEX]) != expected["index_sha256"]:
         raise BundleError("包索引摘要不符")
     index = json.loads(contents[INDEX])
     if (
@@ -174,8 +235,10 @@ def verify(package: Path, expected: dict):
         or expected["runtime"] != RUNTIME
     ):
         raise BundleError("包索引来源或版本不符")
-    if len(index["files"]) != len(FILES) or {x["path"] for x in index["files"]} != set(FILES):
-        raise BundleError("包索引文件集合不符")
+    # 文件集合以包自身索引为准：tar 多一个索引没列的、或索引多一个 tar 没带的，都拒。
+    listed = index_paths(index)
+    if set(contents) != listed | {INDEX}:
+        raise BundleError("包内文件集合与索引不符")
     for entry in index["files"]:
         name = entry["path"]
         if (
@@ -210,13 +273,10 @@ def verify_install(target: Path, expected: dict):
     ):
         raise BundleError("安装索引已改变")
     index = json.loads(index_path.read_bytes())
+    # 安装目录的文件 / 目录集合同样以目录内（已被清单摘要钉住的）索引为准，多一个、少一个都拒。
+    listed = index_paths(index)
+    directories = index_directories(listed)
     actual = set()
-    directories = {
-        str(parent)
-        for name in FILES
-        for parent in PurePosixPath(name).parents
-        if str(parent) != "."
-    }
     actual_directories = set()
     for path in target.rglob("*"):
         info = path.lstat()
@@ -228,7 +288,7 @@ def verify_install(target: Path, expected: dict):
             actual_directories.add(path.relative_to(target).as_posix())
         else:
             raise BundleError("安装目录文件类型不符")
-    if actual != set((*FILES, INDEX)) or actual_directories != directories:
+    if actual != listed | {INDEX} or actual_directories != directories:
         raise BundleError("安装文件集合不符")
     for entry in index["files"]:
         data, mode = safe_source(target, entry["path"])

@@ -19,11 +19,12 @@ state = importlib.import_module("deploy_state")
 deploy = importlib.import_module("lingxi_deploy")
 
 
-def package(root):
+def package(root, files=None):
     # 本工作树刻意没有另一张卡交付的五份控制包示例；这里只在临时包内补齐
     # 非秘密占位字节，不能把它们伪造回仓库，否则会掩盖两张卡的交付边界。
+    # files 指定包内文件集合（默认当前版本的 FILES），供跨版本用例造子集包 / 超集包。
     contents = {}
-    for name in bundle.FILES:
+    for name in bundle.FILES if files is None else files:
         source = ROOT / name
         contents[name] = (
             source.read_bytes()
