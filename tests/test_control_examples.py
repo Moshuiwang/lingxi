@@ -6,6 +6,7 @@ import importlib.util
 import json
 import re
 import stat
+import subprocess
 import sys
 import unittest
 from pathlib import Path
@@ -98,7 +99,13 @@ class ControlExamplesTests(unittest.TestCase):
     def test_stage_permission_backup_hook_is_safe_placeholder(self) -> None:
         hook = EXAMPLES_ROOT / "hooks" / "stage-permission-table-backup.sh"
         self.assertTrue(hook.is_file())
-        self.assertEqual(stat.S_IMODE(hook.stat().st_mode), 0o755)
+        self.assertTrue(hook.stat().st_mode & (stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH))
+        indexed = subprocess.check_output(
+            ["git", "ls-files", "-s", "--", str(hook.relative_to(REPOSITORY_ROOT))],
+            cwd=REPOSITORY_ROOT,
+            text=True,
+        ).strip()
+        self.assertEqual(indexed.split(maxsplit=1)[0], "100755")
         text = hook.read_text(encoding="utf-8")
         self.assertIn("backup", text)
         self.assertIn("exec", text)

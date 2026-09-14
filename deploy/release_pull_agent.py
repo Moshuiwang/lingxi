@@ -64,6 +64,12 @@ HOST_KEYS = frozenset(
     }
 )
 SERVICES = ("scheduler", "migrate", "gateway", "worker")
+RUNNING_SERVICES = ("scheduler", "gateway", "worker-queue")
+MANIFEST_SERVICE_FOR_CONTAINER = {
+    "scheduler": "scheduler",
+    "gateway": "gateway",
+    "worker-queue": "worker",
+}
 RELEASE_TAG = re.compile(
     r"^v(?P<major>0|[1-9][0-9]*)\.(?P<minor>0|[1-9][0-9]*)\.(?P<patch>0|[1-9][0-9]*)"
     r"(?:-rc\.(?P<rc>[1-9][0-9]*))?$"
@@ -321,6 +327,7 @@ def validate_host(host: object) -> dict:
     if (
         not isinstance(sources, list)
         or not sources
+        or len(sources) != 1
         or any(not isinstance(item, str) or not APPROVAL_SOURCE.fullmatch(item) for item in sources)
         or len(set(sources)) != len(sources)
     ):
@@ -542,47 +549,142 @@ def _resolve_manifest(
     return _validate_manifest(doc, repository, tag)
 
 
-def _inspect_digests(host: dict, manifest: dict, timeout: int) -> dict[str, str]:
-    result = {}
-    for service in SERVICES:
-        reference = manifest["images"][service]
+def _run_inspect_command(argv: list[str], timeout: int) -> str | None:
+    """保留 Docker 的缺失对象语义，避免把未安装误判为守护进程故障。"""
+    try:
+        result = subprocess.run(
+            argv,
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            env=None,
+            close_fds=True,
+        )
+    except (OSError, ValueError, subprocess.TimeoutExpired):
+        raise AgentError("docker_inspect_unavailable") from None
+    if result.returncode == 0:
+        return result.stdout
+    if result.returncode == 1 and "No such" in result.stderr:
+        return None
+    raise AgentError("docker_inspect_unavailable")
+
+
+def _parse_repo_digests(raw: str) -> list[str]:
+    try:
+        values = json.loads(raw)
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        raise AgentError("docker_inspect_unavailable") from None
+    if values is None:
+        return []
+    if isinstance(values, str):
+        values = [values]
+    if not isinstance(values, list):
+        raise AgentError("docker_inspect_unavailable")
+    digests = []
+    for value in values:
+        if not isinstance(value, str) or "@" not in value:
+            continue
+        digest = value.rsplit("@", 1)[1]
+        if IMAGE_DIGEST.fullmatch(digest):
+            digests.append(digest)
+    return digests
+
+
+def _container_digest(host: dict, image_id: object, config_image: object, timeout: int) -> str:
+    if not isinstance(image_id, str) or not image_id:
+        return ""
+    raw = _run_inspect_command(
+        [
+            host["docker"],
+            "image",
+            "inspect",
+            "--format",
+            "{{json .RepoDigests}}",
+            image_id,
+        ],
+        timeout,
+    )
+    if raw is None:
+        return ""
+    digests = _parse_repo_digests(raw)
+    if not digests:
+        return ""
+    if isinstance(config_image, str) and "@" in config_image:
+        configured = config_image.rsplit("@", 1)[1]
+        if configured in digests:
+            return configured
+    return digests[0] if len(set(digests)) == 1 else ""
+
+
+def _inspect_running_digests(host: dict, timeout: int) -> dict[str, str]:
+    """只把三个运行中服务容器的镜像 RepoDigest作为当前事实。"""
+    try:
+        raw = _run_command(
+            [
+                host["docker"],
+                "ps",
+                "-aq",
+                "--filter",
+                f"label=com.docker.compose.project={host['project']}",
+            ],
+            timeout=timeout,
+            env=None,
+        )
+    except AgentError:
+        raise AgentError("docker_inspect_unavailable") from None
+    result = {service: "" for service in RUNNING_SERVICES}
+    seen = set()
+    for identifier in raw.split():
+        inspected = _run_inspect_command(
+            [
+                host["docker"],
+                "inspect",
+                identifier,
+                "--format",
+                "{{json .Config.Labels}}\n{{json .Config.Image}}\n{{json .State}}\n{{json .Image}}",
+            ],
+            timeout,
+        )
+        if inspected is None:
+            continue
+        lines = inspected.splitlines()
+        if len(lines) != 4:
+            raise AgentError("docker_inspect_unavailable")
         try:
-            raw = _run_command(
-                [
-                    host["docker"],
-                    "image",
-                    "inspect",
-                    "--format",
-                    "{{json .RepoDigests}}",
-                    reference,
-                ],
-                timeout=timeout,
-                env=None,
-            )
-        except (AgentError, CommandTimeoutError):
-            raise AgentError("docker_inspect_unavailable") from None
-        try:
-            values = json.loads(raw)
+            labels, config_image, state, image_id = (json.loads(line) for line in lines)
         except (UnicodeDecodeError, json.JSONDecodeError):
             raise AgentError("docker_inspect_unavailable") from None
-        if isinstance(values, str):
-            values = [values]
-        if not isinstance(values, list):
+        if not isinstance(labels, dict) or not isinstance(state, dict):
             raise AgentError("docker_inspect_unavailable")
-        expected = reference.rsplit("@", 1)[1]
-        if not any(
-            isinstance(value, str) and (value == reference or value.rsplit("@", 1)[-1] == expected)
-            for value in values
-        ):
-            result[service] = ""
-        else:
-            result[service] = expected
+        service = labels.get("com.docker.compose.service")
+        if service not in RUNNING_SERVICES:
+            continue
+        if service in seen:
+            raise AgentError("docker_inspect_unavailable")
+        seen.add(service)
+        if type(state.get("Running")) is not bool:
+            raise AgentError("docker_inspect_unavailable")
+        if state["Running"]:
+            result[service] = _container_digest(host, image_id, config_image, timeout)
     return result
 
 
-def _all_digests_match(actual: dict[str, str]) -> bool:
-    """四个镜像必须逐项命中；空值不能被当成已安装。"""
-    return len(actual) == len(SERVICES) and all(actual.get(service) for service in SERVICES)
+def _inspect_digests(host: dict, manifest: dict, timeout: int) -> dict[str, str]:
+    """按运行容器回读镜像摘要；清单只在比较时使用。"""
+    del manifest
+    return _inspect_running_digests(host, timeout)
+
+
+def _all_digests_match(actual: dict[str, str], manifest: dict) -> bool:
+    """三个常驻服务必须逐项命中；拉在本机但未运行不算在位。"""
+    if set(actual) != set(RUNNING_SERVICES):
+        return False
+    return all(
+        actual.get(service)
+        == manifest["images"][MANIFEST_SERVICE_FOR_CONTAINER[service]].rsplit("@", 1)[1]
+        for service in RUNNING_SERVICES
+    )
 
 
 def _bundle_metadata(doc: dict) -> dict:
@@ -662,6 +764,7 @@ def _download_bundle(
             "control-index.json",
             "--dir",
             str(directory),
+            "--clobber",
         ),
         timeout=config["poll_timeout_seconds"],
         env=_gh_env(config),
@@ -1043,12 +1146,58 @@ def _ensure_plan_file(state_directory: Path, plan: dict) -> Path:
     return path
 
 
+def validate_approval(plan: dict, approval: object, now: float | None = None) -> str:
+    """按部署器的完整时间窗核对批准，保留批准时刻的指纹稳定性。"""
+    if now is None:
+        now = time.time()
+    keys = {"schema", "plan_id", "plan_sha256", "operation", "source", "approved_at", "expires_at"}
+    if not isinstance(approval, dict) or set(approval) != keys or approval.get("schema") != 1:
+        raise AgentError("approval_shape")
+    if (
+        approval.get("plan_id") != plan.get("id")
+        or approval.get("plan_sha256") != fingerprint(plan)
+        or approval.get("operation") != plan.get("operation")
+        or approval.get("source") != plan.get("approval_source")
+    ):
+        raise AgentError("approval_mismatch")
+    approved_at = approval.get("approved_at")
+    expires_at = approval.get("expires_at")
+    not_before = plan.get("not_before")
+    plan_expires_at = plan.get("expires_at")
+    if any(
+        type(value) not in (int, float)
+        for value in (not_before, approved_at, now, expires_at, plan_expires_at)
+    ):
+        raise AgentError("approval_expired")
+    if not (not_before <= approved_at <= now <= expires_at <= plan_expires_at):
+        raise AgentError("approval_expired")
+    return fingerprint(approval)
+
+
+def _existing_approval(state_directory: Path, plan: dict) -> tuple[dict, Path] | None:
+    path = state_directory / (plan["id"] + ".approval.json")
+    if not path.exists():
+        return None
+    try:
+        approval = _read_json(path, private=True)
+        validate_approval(plan, approval)
+    except (AgentError, KeyError, TypeError):
+        return None
+    return approval, path
+
+
 def _make_approval(plan: dict, source: str) -> dict:
     if source not in (plan.get("approval_source"),):
         raise AgentError("approval_source_mismatch")
     approved_at = time.time()
     expires_at = plan.get("expires_at")
-    if not isinstance(expires_at, (int, float)) or approved_at > expires_at:
+    not_before = plan.get("not_before")
+    if (
+        type(not_before) not in (int, float)
+        or type(expires_at) not in (int, float)
+        or not_before > approved_at
+        or approved_at > expires_at
+    ):
         raise AgentError("plan_expired")
     approval = {
         "schema": 1,
@@ -1378,7 +1527,7 @@ def _discover_current_release(
     config: dict,
     directory: Path,
 ) -> dict | None:
-    """仅用四个已回读 digest 在已列出的 Release 中找当前版本。"""
+    """仅用三个已回读 digest 在已列出的 Release 中找当前版本。"""
     candidates = []
     for item in releases:
         tag = _release_tag(item)
@@ -1403,8 +1552,8 @@ def _discover_current_release(
         except AgentError:
             continue
         if all(
-            actual.get(service) == manifest["images"][service].rsplit("@", 1)[1]
-            for service in SERVICES
+            actual.get(service) == manifest["images"][manifest_service].rsplit("@", 1)[1]
+            for service, manifest_service in MANIFEST_SERVICE_FOR_CONTAINER.items()
         ):
             return manifest
     return None
@@ -1451,7 +1600,13 @@ def _run_locked(
         release_url=release_url,
         release_run_id=release_audit["release_run_id"],
     )
-    if state.get("deployer_state") == "verified" and state.get("target_tag") == tag:
+    previous = _previous_plan(state, state_directory)
+    continuing = _plan_is_continuable(state, previous or {}, tag)
+    if (
+        not continuing
+        and state.get("deployer_state") == "verified"
+        and state.get("target_tag") == tag
+    ):
         _log("idempotence", "already_in_place", tag=tag, release_url=release_url)
         return _finish(
             state,
@@ -1467,6 +1622,10 @@ def _run_locked(
 
     with tempfile.TemporaryDirectory(prefix=".release-", dir=state_directory) as temporary_name:
         temporary = Path(temporary_name)
+        new_directory = temporary / "new"
+        old_directory = temporary / "old"
+        new_directory.mkdir(mode=0o700)
+        old_directory.mkdir(mode=0o700)
         try:
             configured_manifest = _resolve_manifest(
                 config["release_manifest"],
@@ -1480,7 +1639,11 @@ def _run_locked(
             release_audit["promotion_run_id"] = configured_manifest.get("promotion", {}).get(
                 "run_id"
             )
-            actual = _inspect_digests(host, configured_manifest, config["poll_timeout_seconds"])
+            actual = (
+                None
+                if continuing
+                else _inspect_digests(host, configured_manifest, config["poll_timeout_seconds"])
+            )
         except AgentError:
             _log("idempotence", "unknown", tag=tag, release_url=release_url)
             return _finish(
@@ -1495,7 +1658,7 @@ def _run_locked(
                 deployer_state="unknown",
                 release_record=release_audit,
             )
-        if _all_digests_match(actual):
+        if not continuing and _all_digests_match(actual, configured_manifest):
             _log("idempotence", "already_in_place_external", tag=tag, release_url=release_url)
             return _finish(
                 state,
@@ -1509,36 +1672,28 @@ def _run_locked(
                 deployer_state="verified",
                 release_record=release_audit,
             )
-        previous = _previous_plan(state, state_directory)
-        old_manifest = None
-        if previous is not None and previous.get("new", {}).get("tag") == state.get("target_tag"):
-            old_manifest = previous["new"]
-        if old_manifest is None and state.get("target_tag"):
-            try:
-                old_manifest = _resolve_manifest(
-                    config["release_manifest"],
-                    config,
-                    config["repository"],
-                    state["target_tag"],
-                    host["environment"],
-                    temporary,
-                )
-            except AgentError:
-                old_manifest = None
-        if old_manifest is None:
-            try:
-                old_manifest = _discover_current_release(
-                    releases,
-                    host["environment"],
-                    tag,
-                    actual,
-                    config["release_manifest"],
-                    config,
-                    temporary,
-                )
-            except AgentError:
-                old_manifest = None
-        if old_manifest is None:
+        if continuing:
+            old_manifest = previous.get("old") if isinstance(previous, dict) else None
+        else:
+            old_manifest = None
+            if state.get("deployer_state") == "verified" and isinstance(previous, dict):
+                candidate = previous.get("new")
+                if isinstance(candidate, dict):
+                    old_manifest = candidate
+            if old_manifest is None:
+                try:
+                    old_manifest = _discover_current_release(
+                        releases,
+                        host["environment"],
+                        tag,
+                        actual,
+                        config["release_manifest"],
+                        config,
+                        temporary,
+                    )
+                except AgentError:
+                    old_manifest = None
+        if not isinstance(old_manifest, dict):
             _log("current_release", "unknown", tag=tag, release_url=release_url)
             return _finish(
                 state,
@@ -1559,9 +1714,9 @@ def _run_locked(
                 tag,
                 _bundle_metadata(configured_manifest),
                 state_directory,
-                temporary,
+                new_directory,
             )
-            index_path = temporary / "control-index.json"
+            index_path = new_directory / "control-index.json"
             target = _verify_and_install_bundle(
                 config,
                 host,
@@ -1675,13 +1830,13 @@ def _run_locked(
                         old_manifest["tag"],
                         _bundle_metadata(old_manifest),
                         state_directory,
-                        temporary,
+                        old_directory,
                     )
                     _verify_bundle(
                         config,
                         downloaded_old_package,
                         _bundle_metadata(old_manifest),
-                        temporary / "control-index.json",
+                        old_directory / "control-index.json",
                     )
                     old_package = _copy_stable_package(
                         downloaded_old_package,
@@ -1760,8 +1915,14 @@ def _run_locked(
                 release_record=release_audit,
             )
         try:
-            approval = _make_approval(plan, source)
-            approval_path = _write_approval(state_directory, approval)
+            existing = _existing_approval(state_directory, plan)
+            if existing is None:
+                approval = _make_approval(plan, source)
+                approval_path = _write_approval(state_directory, approval)
+                approval_result = "approval_written"
+            else:
+                approval, approval_path = existing
+                approval_result = "approval_reused"
         except AgentError:
             return _finish(
                 state,
@@ -1783,7 +1944,7 @@ def _run_locked(
             state_directory,
             host=host,
             repository=config["repository"],
-            result="approval_written",
+            result=approval_result,
             tag=tag,
             release_url=release_url,
             plan_id=plan["id"],
@@ -1795,7 +1956,7 @@ def _run_locked(
             approval_source=source,
             release_record=release_audit,
         )
-        _log("approval", "bound", tag=tag, plan_id=plan["id"])
+        _log("approval", approval_result, tag=tag, plan_id=plan["id"])
         try:
             for hook in config["pre_apply_hooks"]:
                 _run_hook(
