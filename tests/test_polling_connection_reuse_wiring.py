@@ -105,6 +105,7 @@ class WorkerQueueModeReuseWiringTests(unittest.TestCase):
                         "LINGXI_WORKER_MODE": "queue",
                         "LINGXI_WORKER_READONLY_TOOLS": "mcp__query__noop",
                         "LINGXI_WORKER_TRACE_ID": "01J00000000000000000000WKR",
+                        "LINGXI_QUERY_MCP_ENDPOINT": "https://mcp.example.invalid/query",
                         "LINGXI_POSTGRES_DSN": "postgresql://user:pass@localhost:5432/does-not-matter",
                         "LINGXI_USER_ENV_ROOT": directory,
                     },

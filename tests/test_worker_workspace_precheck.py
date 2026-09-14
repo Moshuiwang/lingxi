@@ -44,6 +44,7 @@ def _worker_queue_env(**overrides: str) -> dict[str, str]:
         "LINGXI_WORKER_MODE": "queue",
         "LINGXI_WORKER_READONLY_TOOLS": "mcp__query__noop",
         "LINGXI_WORKER_TRACE_ID": "01J00000000000000000000WRK",
+        "LINGXI_QUERY_MCP_ENDPOINT": "https://mcp.example.invalid/query",
         # 队列 worker 的启动预检必须在触达数据库之前就能判定工作目录是否可用；
         # 这个 DSN 语法合法但从不会被真正连接（失败路径在预检处提前返回，
         # 成功路径由下面的 `_run_queue_worker` 打桩接管，两者都不会真的拨号）。

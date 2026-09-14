@@ -47,10 +47,8 @@ _ALLOWED_SERVER_KEYS = frozenset({"type", "url", "headers"})
 #: ``headers`` 只允许这一个键——同样逐字对应写侧的产出形状。
 _ALLOWED_HEADER_KEYS = frozenset({"Authorization"})
 
-#: 端点同源核对的可选环境变量。配置了就强制 ``.mcp.json`` 里的 URL 与它同源
-#: （scheme + host + port 三项全等），没配就不做这一项——刻意做成可选：当前
-#: worker-queue 的 env 文件里没有这个变量，做成必填会让一次没同步改配置的
-#: 部署把每个用户的问数都失败关闭。这是一道装上就更紧、没装也不会更松的闸。
+#: 端点同源核对的环境变量名。入口读取并校验后注入，适配器只接收调用方传入的
+#: 期望值，不直接读取环境变量。
 QUERY_MCP_ENDPOINT_ENV_VAR = "LINGXI_QUERY_MCP_ENDPOINT"
 
 #: ``Authorization`` 必须是 ``Bearer <非空且不含空白的令牌>``。真实令牌是
@@ -68,41 +66,54 @@ class UserMcpConfigError(RuntimeError):
         self.code = code
 
 
-def _validate_endpoint(url: str) -> None:
-    """URL 必须是形状完好的 https 端点；配了 ``QUERY_MCP_ENDPOINT_ENV_VAR`` 时还要同源。
+def _validate_endpoint(url: str, expected_endpoint: str) -> None:
+    """URL 与入口注入的期望端点都必须有效，并且二者必须同源。
 
     单看 ``url.startswith("https://")`` 不够：会放行 userinfo 段藏了真实主机的
     地址（``https://@evil.example``）、空主机名、以及任何指向第三方的合法
     https 地址——而这个 URL 会带着该用户的问数令牌原样交给 Agent 会话发出去，
     改一行 URL 就能把令牌定向送到任意主机。因此这里解析一次 URL 要求 scheme
     恰为 https、有非空主机名，拒绝 userinfo 与 fragment（写侧一个都不会产出），
-    并在配了 ``LINGXI_QUERY_MCP_ENDPOINT`` 时核对同源（scheme+host+port 全等，
-    该项可选，理由见该常量注释）。
+    再核对同源（scheme+host+port 全等）；路径不参与同源判定。
     """
-    from urllib.parse import urlsplit
-
-    try:
-        parts = urlsplit(url)
-    except ValueError:
-        raise UserMcpConfigError("config_shape_invalid") from None
-    if parts.scheme != "https" or not parts.hostname:
-        raise UserMcpConfigError("config_shape_invalid")
-    if parts.username is not None or parts.password is not None or parts.fragment:
-        raise UserMcpConfigError("config_shape_invalid")
-
-    expected = (os.environ.get(QUERY_MCP_ENDPOINT_ENV_VAR) or "").strip()
-    if not expected:
-        return
-    try:
-        reference = urlsplit(expected)
-    except ValueError:
-        # 部署侧配错了这个变量不该把用户的问数一起打死：只是这道可选闸不生效。
-        return
-    if not reference.hostname:
-        return
+    parts = _endpoint_parts(url, "config_shape_invalid")
+    reference = _endpoint_parts(expected_endpoint, "config_expected_endpoint_invalid")
     if _origin(parts) != _origin(reference):
         # 不回显任何一侧的主机名：错误码要能进日志，而 URL 可能带用户可控内容。
         raise UserMcpConfigError("config_endpoint_not_same_origin")
+
+
+def _endpoint_parts(value: str, error_code: str) -> Any:
+    """把端点解析成同源判定所需的结构；非法期望值绝不降级放行。"""
+    from urllib.parse import urlsplit
+
+    if not isinstance(value, str) or any(character.isspace() for character in value):
+        raise UserMcpConfigError(error_code)
+    try:
+        parts = urlsplit(value)
+        hostname = parts.hostname
+        username = parts.username
+        password = parts.password
+        port = parts.port
+    except (TypeError, ValueError):
+        raise UserMcpConfigError(error_code) from None
+    if parts.scheme.casefold() != "https" or not hostname:
+        raise UserMcpConfigError(error_code)
+    if username is not None or password is not None or "#" in value:
+        raise UserMcpConfigError(error_code)
+    del port
+    return parts
+
+
+def validate_endpoint(value: Any, error_type: type[ValueError]) -> str:
+    """校验入口传入的问数目标地址，并用调用方的错误类型收口。"""
+    if not isinstance(value, str) or not value.strip():
+        raise error_type(f"{QUERY_MCP_ENDPOINT_ENV_VAR} 缺失")
+    try:
+        _endpoint_parts(value, "config_shape_invalid")
+    except UserMcpConfigError:
+        raise error_type(f"{QUERY_MCP_ENDPOINT_ENV_VAR} 无效") from None
+    return value
 
 
 def _origin(parts: Any) -> tuple[str, str, int | None]:
@@ -117,7 +128,7 @@ def _errno_name(error: OSError) -> str:
     return errno_module.errorcode.get(error.errno or 0) or "unknown"
 
 
-def load_user_mcp_servers(*, root: str, user_id: str) -> Mapping[str, Any]:
+def load_user_mcp_servers(root: str, user_id: str, expected_endpoint: str) -> Mapping[str, Any]:
     """读取 ``user_id`` 自己的 ``.mcp.json``，返回其中的 ``mcpServers`` 映射（``server_name -> server_config``，与 ``WorkerConfig.mcp_servers`` 同一形状，可以直接作为 ``mcp_servers=`` 传给 ``build_agent_options``）。
 
     这是本模块**唯一的对外入口**，没有默认值参数、没有回退开关：任何失败都以
@@ -141,7 +152,7 @@ def load_user_mcp_servers(*, root: str, user_id: str) -> Mapping[str, Any]:
     finally:
         os.close(root_fd)
 
-    return _parse_mcp_servers(payload)
+    return _parse_mcp_servers(payload, expected_endpoint=expected_endpoint)
 
 
 def _validated_user_id(user_id: str) -> str:
@@ -209,7 +220,7 @@ def _read_config(home_fd: int) -> bytes:
         os.close(fd)
 
 
-def _parse_mcp_servers(payload: bytes) -> Mapping[str, Any]:
+def _parse_mcp_servers(payload: bytes, *, expected_endpoint: str) -> Mapping[str, Any]:
     try:
         text = payload.decode("utf-8")
     except UnicodeDecodeError:
@@ -237,11 +248,11 @@ def _parse_mcp_servers(payload: bytes) -> Mapping[str, Any]:
     ((name, value),) = servers.items()
     if name != QUERY_MCP_SERVER_NAME:
         raise UserMcpConfigError("config_shape_invalid")
-    _validate_server_shape(value)
+    _validate_server_shape(value, expected_endpoint=expected_endpoint)
     return servers
 
 
-def _validate_server_shape(value: Any) -> None:
+def _validate_server_shape(value: Any, *, expected_endpoint: str) -> None:
     """严格校验单个 server 配置恰好是写侧会产出的那一种形状：``{"type": "http", "url": "https://…", "headers": {"Authorization": "Bearer <非空令牌>"}}``，不多一个键、不少一个键。
 
     只检查"是不是 dict"不够：``{"type": "stdio", "command": "…"}`` 这类形状
@@ -257,11 +268,9 @@ def _validate_server_shape(value: Any) -> None:
     if value.get("type") != "http":
         raise UserMcpConfigError("config_shape_invalid")
     url = value.get("url")
-    if not isinstance(url, str) or not url.startswith("https://"):
-        # 明文 Bearer 走 HTTP 等于把令牌发到网络上——与写侧
-        # ``LocalUserEnvironment.__init__`` 对 ``mcp_endpoint`` 的同一条校验。
+    if not isinstance(url, str):
         raise UserMcpConfigError("config_shape_invalid")
-    _validate_endpoint(url)
+    _validate_endpoint(url, expected_endpoint)
     headers = value.get("headers")
     if not isinstance(headers, dict) or set(headers) != _ALLOWED_HEADER_KEYS:
         raise UserMcpConfigError("config_shape_invalid")

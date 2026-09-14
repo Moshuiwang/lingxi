@@ -2024,7 +2024,9 @@ class WorkerQueueEnvExampleTest(unittest.TestCase):
 
     def test_both_present_passes(self) -> None:
         failures = self._with_env_example(
-            "LINGXI_POSTGRES_DSN=postgresql://x\nLINGXI_USER_ENV_ROOT=/var/lib/lingxi/users\n"
+            "LINGXI_POSTGRES_DSN=postgresql://x\n"
+            "LINGXI_USER_ENV_ROOT=/var/lib/lingxi/users\n"
+            "LINGXI_QUERY_MCP_ENDPOINT=https://mcp.example.invalid/query\n"
         )
         self.assertEqual(failures, [])
 

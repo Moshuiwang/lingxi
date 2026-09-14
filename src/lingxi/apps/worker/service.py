@@ -23,7 +23,8 @@ from lingxi.adapters.postgres_conversation import (
     TerminalTask,
     is_dependency_unavailable,
 )
-from lingxi.adapters.user_mcp_config import UserMcpConfigError, load_user_mcp_servers
+from lingxi.adapters.user_mcp_config import UserMcpConfigError
+from lingxi.adapters.user_mcp_config import load_user_mcp_servers as load_mcp
 from lingxi.apps.worker.config import WorkerConfig
 from lingxi.apps.worker.content_capture import ContentCaptureRecorder
 from lingxi.apps.worker.housekeeping import QueueHousekeeper
@@ -353,9 +354,7 @@ class WorkerService:
             # 红线：每个用户的问数必须用他自己的那份 MCP 配置，绝不回退到全进程共用的
             # 那份——回退意味着用一份不属于他的令牌去查数，是越权返回数据。这里**结构性
             # 地没有回退分支**：读取失败在下面单独一支收口成失败报告。
-            user_mcp_servers = load_user_mcp_servers(
-                root=self._config.user_env_root or "", user_id=claimed.user_id
-            )
+            user_mcp_servers = self._load_user_mcp_servers(claimed.user_id)
             task_system_prompt, system_prompt_digest = await self._resolve_system_prompt(claimed)
             task_system_prompt = await self._append_user_memory(claimed, task_system_prompt)
             # ``replace`` 会重跑数据类的后置校验：任务配置携带的是**已解析**的提示词，
@@ -385,8 +384,13 @@ class WorkerService:
                 if not is_dependency_unavailable(error):
                     raise
                 _log_dependency_unavailable("monitor", error)
+
             await progress.drain()
         return report, executor, system_prompt_digest
+
+    def _load_user_mcp_servers(self, user_id: str) -> Mapping[str, Any]:
+        """按任务用户读取配置，并显式注入入口已校验的目标端点。"""
+        return load_mcp(self._config.user_env_root or "", user_id, self._config.query_mcp_endpoint)
 
     def _task_config(
         self,
@@ -651,7 +655,6 @@ class WorkerService:
 
     async def _poll_once(self, stop: asyncio.Event) -> None:
         """跑一轮；无事可做就睡一个轮询间隔。"""
-        del stop
         if not await self.process_once():
             await self._sleep(self._config.poll_interval_seconds)
 
