@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import importlib.util
 import os
+import re
 import subprocess
 import sys
 import textwrap
@@ -1901,13 +1902,22 @@ class RealWorkflowTest(unittest.TestCase):
     def test_permission_impact_ci_requires_external_registration_without_new_privilege(
         self,
     ) -> None:
-        """P2：PR claim 不能独自成为 stage 证据，且当前不偷偷申请新权限。"""
+        """P2：PR claim 不能独自成为 stage 证据，且不偷偷申请新权限。
+
+        `id-token: write` 是唯一被产品负责人明确接受的例外（裁决层 `Epic Verdict` 的
+        OIDC 身份凭证），只允许出现在 `candidate` 作业上、恰好一次；权限影响面那条链
+        仍不得靠它或任何 attest 动作把 PR 自报变成可信证据。
+        """
 
         text = CONTRACT.read(CONTRACT.CI_WORKFLOW)
         self.assertIn("--trusted-provenance", text)
         self.assertIn("permission-impact-provenance.json", text)
         self.assertIn("PR 内的 `.github/permission-impact-counts.json` 只是", text)
-        self.assertNotIn("id-token: write", text)
+        code = CONTRACT.strip_comments(text)
+        self.assertEqual(code.count("id-token: write"), 1)
+        candidate = re.search(r"^  candidate:\n(.*?)(?=^  \w[\w-]*:\n|\Z)", code, re.M | re.S)
+        self.assertIsNotNone(candidate)
+        self.assertIn("id-token: write", candidate.group(1))
         self.assertNotIn("actions/attest-build-provenance", text)
 
 
