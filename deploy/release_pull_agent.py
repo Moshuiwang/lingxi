@@ -1619,12 +1619,17 @@ def _finish(  # noqa: PLR0913
     release_record: dict | None = None,
     deployed_tag: str | None = None,
     verified_digests: dict[str, str] | None = None,
-    remember_target: bool = True,
+    remember_target: bool = False,
 ) -> int:
     """收口一轮：写状态账并按结果码告警。
 
-    ``deployed_tag`` 只会抬高、不会降低状态账的最高已部署版本；降级拒绝时它同时进入
-    去重键和正文。``remember_target=False`` 让被拒目标不覆盖状态账里已在位的目标。
+    状态账的 ``target_tag`` / ``release_url`` 只在本轮写出 ``verified``（部署器 status、
+    外部在位、状态账级在位复核通过）时才推进到目标，即 ``remember_target=True``；任何失败
+    或未知结果都默认不推进，状态账仍指向已在位的目标——否则下一轮会把「目标 == target_tag
+    且 verified」误判成在位，新目标被静默跳过。``deployed_tag`` / ``verified_digests``
+    同样只由 ``verified`` 路径传入：前者只会抬高、不会降低最高已部署版本，降级拒绝时它同时
+    进入去重键和正文。计划 / 批准落盘时 ``_checkpoint`` 已记下的可接续身份（``target_tag`` /
+    ``plan_id`` / ``deployer_state``）不在此列，本函数不会撤销它们。
     """
     next_state = dict(state)
     next_state.update(
@@ -1800,7 +1805,6 @@ def _refuse_downgrade(
         tag=tag,
         release_url=release_url,
         deployed_tag=deployed_tag,
-        remember_target=False,
     )
 
 
@@ -1857,6 +1861,7 @@ def _recheck_verified_target(
             deployer_state="verified",
             deployed_tag=tag,
             verified_digests=expected,
+            remember_target=True,
         )
     _log("idempotence", "external_change_detected", tag=tag, release_url=release_url)
     return _finish(
@@ -1980,6 +1985,7 @@ def _run_locked(
                 release_record=release_audit,
                 deployed_tag=tag,
                 verified_digests=_expected_digests(configured_manifest),
+                remember_target=True,
             )
         if continuing:
             old_manifest = previous.get("old") if isinstance(previous, dict) else None
@@ -2152,7 +2158,6 @@ def _run_locked(
                     stage="installation_receipt",
                     tag=tag,
                     release_url=release_url,
-                    remember_target=False,
                 )
             _log(
                 "installation_receipt",
@@ -2415,6 +2420,7 @@ def _run_locked(
             release_record=release_audit,
             deployed_tag=tag if verified else None,
             verified_digests=_expected_digests(configured_manifest) if verified else None,
+            remember_target=verified,
         )
 
 

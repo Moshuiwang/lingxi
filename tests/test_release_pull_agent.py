@@ -963,6 +963,345 @@ class AgentTests(unittest.TestCase):
         self.assertFalse(any(call["kind"] == "bundle-install" for call in self.calls()))
         self.assertFalse(list(self.harness.state.glob(".release-*")))
 
+    def test_bundle_digest_mismatch_then_retry_is_not_skipped(self):
+        """探针场景：v2.4.3 已验证且摘要已记、容器仍跑 v2.4.3，rc.10 的附件被篡改。
+
+        修复前第一轮把 ``target_tag`` 记成 rc.10 而 ``deployer_state`` / ``verified_digests``
+        仍是 v2.4.3 的，第二轮状态账级幂等就把 rc.10 误判成 ``already_in_place`` 并把最高已
+        部署版本抬到 rc.10：新目标从此被静默跳过，且防降级会拿失真的版本号拒绝真正的目标。
+        """
+        harness = self.harness
+        harness.state_for_verified_target(harness.old_tag)
+        harness.set_running_containers(harness.old_tag)
+        harness.set_env(DOCKER_MODE="records")
+        original = harness.asset.read_bytes()
+        harness.asset.write_bytes(b"tampered package")
+        messages = []
+
+        def sender(message, env, timeout):
+            messages.append(message)
+
+        for round_number in (1, 2):
+            harness.log.unlink(missing_ok=True)
+            code, output = self.run_agent(sender=sender)
+            self.assertEqual(code, 0, round_number)
+            self.assertIn("阶段=bundle 结果码=bundle_digest_mismatch", output)
+            self.assertNotIn("结果码=already_in_place", output)
+            state = self.read_state()
+            self.assertEqual(state["last_result"], "bundle_digest_mismatch")
+            self.assertEqual(state["consecutive_failures"], round_number)
+            # 状态账仍指向已在位的 v2.4.3：目标、部署器状态、最高已部署版本、已验证摘要都不动。
+            self.assertEqual(state["target_tag"], harness.old_tag)
+            self.assertEqual(state["deployer_state"], "verified")
+            self.assertEqual(state["highest_deployed_tag"], harness.old_tag)
+            self.assertEqual(state["verified_digests"], harness.expected_digests(harness.old_tag))
+            self.assertEqual(state["plan_id"], "old-plan")
+            # 每轮都重新下载核对，而不是只读回读容器就收口；篡改包不会走到部署器。
+            self.assertTrue(
+                any(call["kind"] == "gh" and "download" in call["argv"] for call in self.calls())
+            )
+            self.assertFalse(any(call["kind"] == "deployer" for call in self.calls()))
+        self.assertEqual(len(messages), 1)
+        # 附件修好后同一目标正常部署，状态账才推进到 rc.10，并发一条恢复。
+        harness.asset.write_bytes(original)
+        harness.log.unlink()
+        code, output = self.run_agent(sender=sender)
+        self.assertEqual(code, 0)
+        self.assertNotIn("结果码=already_in_place", output)
+        state = self.read_state()
+        self.assertEqual(state["last_result"], "verified")
+        self.assertEqual(state["target_tag"], harness.target_tag)
+        self.assertEqual(state["highest_deployed_tag"], harness.target_tag)
+        self.assertEqual(state["verified_digests"], harness.expected_digests(harness.target_tag))
+        self.assertTrue(
+            any(call["kind"] == "deployer" and "apply" in call["argv"] for call in self.calls())
+        )
+        self.assertEqual(len(messages), 3)
+        self.assertIn("recovered", messages[1])
+        self.assertIn("verified", messages[2])
+
+    def test_failed_or_refused_rounds_never_advance_deployed_state(self):
+        """任何失败、拒绝或未知结果都不把状态账推进到未验证的目标。
+
+        基线：v2.4.3 已验证且摘要已记，容器仍跑 v2.4.3，新目标 rc.10 到来。第一轮按各结果码
+        注入故障：``highest_deployed_tag`` / ``verified_digests`` 必须原样，且状态账绝不会同时
+        声称「目标 == rc.10 且 verified」；计划落盘前的失败连 ``target_tag`` / ``plan_id`` 也不动，
+        计划落盘后的失败只记可接续身份。第二轮排除故障后同一目标必须真正走到 apply 并 ``verified``，
+        而不是被状态账级幂等判成 ``already_in_place``。
+        """
+
+        def both_releases(h: PullHarness) -> list[dict]:
+            return [h._release(h.old_tag, False), h._release(h.target_tag, True)]
+
+        def set_hooks(h: PullHarness, programs: list[str]):
+            config = dict(h.config)
+            config["pre_apply_hooks"] = programs
+            h.config_path = _json(h.config_path, config)
+
+        def start_patch(saved: dict, target: str, **kwargs):
+            saved["patch"] = patch.object(AGENT, target, **kwargs)
+            saved["patch"].start()
+            # 某一例在排除故障前断言失败时，补丁也不能漏到后面的用例；重复 stop 是空操作。
+            self.addCleanup(saved["patch"].stop)
+
+        def hide_plan_and_old_release(h: PullHarness, saved: dict):
+            # 旧计划文件丢失且旧版本不在 Release 列表：运行容器反查不到当前版本。
+            (h.state / "old-plan.plan.json").unlink()
+            h.set_releases([h._release(h.target_tag, True)])
+
+        def hide_target_manifest(h: PullHarness, saved: dict):
+            (h.manifests / (h.target_tag + ".json")).rename(h.manifests / "hidden.json")
+
+        def restore_target_manifest(h: PullHarness, saved: dict):
+            (h.manifests / "hidden.json").rename(h.manifests / (h.target_tag + ".json"))
+
+        def tamper_asset(h: PullHarness, saved: dict):
+            saved["asset"] = h.asset.read_bytes()
+            h.asset.write_bytes(b"tampered package")
+
+        def break_installed_manifest(h: PullHarness, saved: dict):
+            saved["source"] = h.installed_manifest.read_text(encoding="utf-8")
+            _exec(h.installed_manifest, "#!/usr/bin/env python3\nraise SystemExit(1)\n")
+
+        def break_public_config(h: PullHarness, saved: dict):
+            _write(h.public_config, "{not json", 0o644)
+
+        def restore_public_config(h: PullHarness, saved: dict):
+            _json(
+                h.public_config,
+                {"schema": 1, "values": {}, "files": {"scheduler": {}, "worker": {}}},
+                0o644,
+            )
+
+        def unsafe_hook(h: PullHarness, saved: dict):
+            # 临时目录里的钩子程序不是 root 属主：一个都不执行。
+            set_hooks(h, [str(h.hook_fail)])
+
+        def failing_hook(h: PullHarness, saved: dict):
+            set_hooks(h, [str(h.hook_fail)])
+            start_patch(saved, "_hook_program_protected", return_value=True)
+
+        def clear_failing_hook(h: PullHarness, saved: dict):
+            saved["patch"].stop()
+            set_hooks(h, [])
+
+        def apply_timeout(h: PullHarness, saved: dict):
+            config = dict(h.config)
+            config["deploy_timeout_seconds"] = 1
+            h.config_path = _json(h.config_path, config)
+            h.set_env(DEPLOY_MODE="timeout")
+
+        def status_verified_with_new_approval(h: PullHarness, saved: dict):
+            h.set_env(DEPLOY_STATUS="verified")
+            # 假部署器把首次 apply 的批准指纹钉在状态目录；failed 后重新 plan 会换批准。
+            (h.state / ".fake-approval-sha").unlink()
+
+        # (名称, 结果码, 阶段, 计划已落盘, 注入故障, 排除故障)
+        cases = [
+            (
+                "release_list_unavailable",
+                "release_list_unavailable",
+                "release_list",
+                False,
+                lambda h, s: h.set_releases([]),
+                lambda h, s: h.set_releases(both_releases(h)),
+            ),
+            (
+                "downgrade_refused",
+                "downgrade_refused",
+                "version_order",
+                False,
+                lambda h, s: h.set_releases(
+                    [h._release(h.old_tag, False), h._release("v2.4.3-rc.9", True)]
+                ),
+                lambda h, s: h.set_releases(both_releases(h)),
+            ),
+            (
+                "unknown_idempotence_docker_daemon",
+                "unknown",
+                "idempotence",
+                False,
+                lambda h, s: h.set_env(DOCKER_MODE="daemon"),
+                lambda h, s: h.set_env(DOCKER_MODE="records"),
+            ),
+            (
+                "unknown_idempotence_manifest_unresolvable",
+                "unknown",
+                "idempotence",
+                False,
+                hide_target_manifest,
+                restore_target_manifest,
+            ),
+            (
+                "unknown_current_release",
+                "unknown",
+                "current_release",
+                False,
+                hide_plan_and_old_release,
+                lambda h, s: h.set_releases(both_releases(h)),
+            ),
+            (
+                "bundle_digest_mismatch",
+                "bundle_digest_mismatch",
+                "bundle",
+                False,
+                tamper_asset,
+                lambda h, s: h.asset.write_bytes(s["asset"]),
+            ),
+            (
+                "unknown_bundle_download_failed",
+                "unknown",
+                "bundle",
+                False,
+                lambda h, s: h.set_env(ASSET_FILE=str(h.root / "missing.tar")),
+                lambda h, s: h.set_env(ASSET_FILE=str(h.asset)),
+            ),
+            (
+                "unknown_frozen_manifest",
+                "unknown",
+                "frozen_manifest",
+                False,
+                break_installed_manifest,
+                lambda h, s: _exec(h.installed_manifest, s["source"]),
+            ),
+            (
+                "installation_receipt_unusable",
+                "installation_receipt_unusable",
+                "installation_receipt",
+                False,
+                lambda h, s: h.install_receipt(
+                    checks=dict(h.receipt()["checks"], sudo_policy=False)
+                ),
+                lambda h, s: h.install_receipt(),
+            ),
+            (
+                "unknown_plan",
+                "unknown",
+                "plan",
+                False,
+                break_public_config,
+                restore_public_config,
+            ),
+            (
+                "unknown_approval",
+                "unknown",
+                "approval",
+                True,
+                lambda h, s: start_patch(
+                    s, "_make_approval", side_effect=AGENT.AgentError("plan_expired")
+                ),
+                lambda h, s: s["patch"].stop(),
+            ),
+            (
+                "pre_apply_hook_unsafe",
+                "pre_apply_hook_unsafe",
+                "pre_apply_hook",
+                True,
+                unsafe_hook,
+                lambda h, s: set_hooks(h, []),
+            ),
+            (
+                "pre_apply_hook_failed",
+                "pre_apply_hook_failed",
+                "pre_apply_hook",
+                True,
+                failing_hook,
+                clear_failing_hook,
+            ),
+            (
+                "deploy_timeout",
+                "deploy_timeout",
+                "apply",
+                True,
+                apply_timeout,
+                lambda h, s: h.set_env(DEPLOY_MODE="normal"),
+            ),
+            (
+                "failed",
+                "failed",
+                "status",
+                True,
+                lambda h, s: h.set_env(DEPLOY_STATUS="failed"),
+                status_verified_with_new_approval,
+            ),
+            (
+                "unknown_status",
+                "unknown",
+                "status",
+                True,
+                lambda h, s: h.set_env(DEPLOY_STATUS="bogus"),
+                lambda h, s: h.set_env(DEPLOY_STATUS="verified"),
+            ),
+            (
+                "running",
+                "running",
+                "status",
+                True,
+                lambda h, s: h.set_env(DEPLOY_STATUS="running"),
+                lambda h, s: h.set_env(DEPLOY_STATUS="verified"),
+            ),
+        ]
+        for name, result, stage, checkpointed, inject, clear in cases:
+            with self.subTest(case=name):
+                self.harness.close()
+                harness = self.harness = PullHarness()
+                self.addCleanup(harness.close)
+                harness.state_for_verified_target(harness.old_tag)
+                harness.set_running_containers(harness.old_tag)
+                harness.set_releases(both_releases(harness))
+                harness.set_env(DOCKER_MODE="records")
+                messages = []
+                saved: dict = {}
+                inject(harness, saved)
+                code, output = self.run_agent(
+                    sender=lambda message, env, timeout: messages.append(message)
+                )
+                self.assertEqual(code, 0)
+                self.assertIn(f"阶段={stage} 结果码={result}", output)
+                self.assertNotIn("结果码=already_in_place", output)
+                state = self.read_state()
+                self.assertEqual(state["last_result"], result)
+                self.assertEqual(state["highest_deployed_tag"], harness.old_tag)
+                self.assertEqual(
+                    state["verified_digests"], harness.expected_digests(harness.old_tag)
+                )
+                # 核心不变量：没写出 verified 的目标，状态账不会同时说「目标 == 它且 verified」。
+                self.assertFalse(
+                    state["target_tag"] == harness.target_tag
+                    and state["deployer_state"] == "verified"
+                )
+                if checkpointed:
+                    # 计划落盘后只记可接续身份：新目标、新计划、非 verified 的部署器状态。
+                    self.assertEqual(state["target_tag"], harness.target_tag)
+                    self.assertNotEqual(state["plan_id"], "old-plan")
+                    self.assertNotEqual(state["deployer_state"], "verified")
+                else:
+                    self.assertEqual(state["target_tag"], harness.old_tag)
+                    self.assertEqual(state["plan_id"], "old-plan")
+                    self.assertFalse(any(call["kind"] == "deployer" for call in self.calls()))
+                clear(harness, saved)
+                harness.log.unlink(missing_ok=True)
+                code, output = self.run_agent(
+                    sender=lambda message, env, timeout: messages.append(message)
+                )
+                self.assertEqual(code, 0)
+                self.assertNotIn("结果码=already_in_place", output)
+                state = self.read_state()
+                self.assertEqual(state["last_result"], "verified")
+                self.assertEqual(state["target_tag"], harness.target_tag)
+                self.assertEqual(state["deployer_state"], "verified")
+                self.assertEqual(state["highest_deployed_tag"], harness.target_tag)
+                self.assertEqual(
+                    state["verified_digests"], harness.expected_digests(harness.target_tag)
+                )
+                self.assertTrue(
+                    any(
+                        call["kind"] == "deployer" and "apply" in call["argv"]
+                        for call in self.calls()
+                    )
+                )
+                self.assertIn("verified", messages[-1])
+
     def test_uses_the_newly_installed_bundle_scripts(self):
         self.harness.state_for_old()
         messages = []
