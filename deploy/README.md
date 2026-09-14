@@ -407,8 +407,8 @@ manifest 结构、四镜像齐全性（scheduler/migrate/gateway/worker 缺一�
 python3 scripts/ci/verify_epic_candidate_bundle.py /path/to/bundle-dir --import
 ```
 
-这一步会先从每个 tar 内的 `manifest.json` 读出 `Config` 指向的 config 摘要，核对与 manifest
-记录的 `image_digest` 一致，再对四个 tar 逐个 `docker load` 确认导入成功——证明"导入到本机
+这一步对四个 tar **逐个**处理：先从该 tar 内的 `manifest.json` 读出 `Config` 指向的 config 摘要，核对与 manifest
+记录的 `image_digest` 一致，通过后再对它 `docker load` 确认导入成功（前面已通过的 tar 会先被导入，后面某个 tar 判红时工具整体判红、不回滚已导入的本地引用）——证明"导入到本机
 docker 的东西"确实是这次构建产出的那个，不是半截下载或被替换的对象。摘要取自 tar 本身、
 不经过 docker daemon，因此结论不依赖本机存储驱动（overlay2 与 containerd 快照器一样能核出
 「一致 / 不一致」，见 [#765](https://github.com/Moshuiwang/lingxi/issues/765)）；摘要对不上或
