@@ -434,6 +434,7 @@ class AdminCommandRouter:
                         handled=True,
                         content_key="admin.write_action_rejected",
                         content_version=_CONTENT_VERSION,
+                        decision_code=_OVERRIDE_NOT_FOUND_CODE,
                         reply_text=(
                             "未找到匹配的当前生效本地覆盖（标识/公司/指标不匹配，"
                             "或已被撤销，或同一键同时存在补充授权与屏蔽指标两条"
@@ -559,10 +560,10 @@ class AdminCommandRouter:
     ) -> AdminRouteOutcome | None:
         """写命令的三道前置拒绝；都不产生任何待确认操作。
 
-        自我目标防呆放在准备**之前**：这条拒绝不依赖端口是否已装配，不合法的意图不应该
-        先创建一条记录再补救，而是从一开始就不让它进入准备的调用面。端口未装配时安全
-        兜底，不假装已经创建了待确认操作。没有可回复的消息标识就没有地方挂载确认卡片，
-        同样失败关闭。
+        自我目标防呆放在准备**之前**：不合法的意图不该先创建一条记录再补救。端口未装配
+        时安全兜底，不假装已经创建了待确认操作。没有可回复的消息标识就没有地方挂载确认
+        卡片，同样失败关闭——只对声明需要回复上下文的发卡端成立（默认如此）；经持久
+        阶段直发本人的发卡端不需要触发消息，这条拒绝对它不适用。
 
         Returns:
             需要拒绝时的结论；可以继续时返回 ``None``。
@@ -587,7 +588,7 @@ class AdminCommandRouter:
                 action,
                 ctx,
             )
-        if not ctx.message_id:
+        if not ctx.message_id and getattr(self._confirm_cards, "requires_reply_context", True):
             return self._write_action_reply(
                 action_name,
                 "admin.write_action_unavailable",
@@ -606,7 +607,12 @@ class AdminCommandRouter:
         ctx: _Dispatch,
         **fields: object,
     ) -> AdminRouteOutcome:
-        """写命令的统一回复出口：文案、审计动作名与目标字段只有一份。"""
+        """写命令的统一回复出口：文案、审计动作名与目标字段只有一份。
+
+        审计字段里的待确认操作编号与判定码同时放进结论，供不经飞书文本回复的调用面
+        （受限通道的准备工具）取用；文本回复路径对这两个字段视而不见。
+        """
+        pending_action_id = fields.get("pending_action_id")
         return self._record_or_reject(
             action_name,
             AdminRouteOutcome(
@@ -614,6 +620,8 @@ class AdminCommandRouter:
                 content_key=content_key,
                 content_version=_CONTENT_VERSION,
                 reply_text=reply_text,
+                pending_action_id=pending_action_id if isinstance(pending_action_id, str) else None,
+                decision_code=str(fields.get("code") or ""),
             ),
             actor=ctx.entry.feishu_open_id,
             roles=list(ctx.roles),

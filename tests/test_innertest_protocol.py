@@ -9,15 +9,24 @@ from lingxi.core.admin.innertest import (
     envelope,
     validate_arguments,
 )
-from lingxi.core.admin.restricted_tools import CHANNEL_TOOLS, READ_ONLY_TOOL_NAMES
+from lingxi.core.admin.restricted_tools import (
+    CHANNEL_TOOLS,
+    PREPARE_TOOL_NAMES,
+    READ_ONLY_TOOL_NAMES,
+)
 
-SIX_TOOLS = (
+ELEVEN_TOOLS = (
     "list_innertest_members",
     "prepare_innertest_additions",
     "get_innertest_batch",
     "get_user_status",
     "get_user_permission_sources",
     "get_pending_actions",
+    "prepare_suspend_user",
+    "prepare_resume_user",
+    "prepare_grant_position",
+    "prepare_revoke_permission",
+    "prepare_revoke_permission_by_scope",
 )
 VALID_ARGUMENTS = {
     "list_innertest_members": {},
@@ -26,7 +35,27 @@ VALID_ARGUMENTS = {
     "get_user_status": {"identifier": "ou_x"},
     "get_user_permission_sources": {"identifier": "ou_x"},
     "get_pending_actions": {},
+    "prepare_suspend_user": {"identifier": "ou_x"},
+    "prepare_resume_user": {"identifier": "x@example.test"},
+    "prepare_grant_position": {
+        "identifier": "ou_x",
+        "position_name": "A财务",
+        "company_scope": "*",
+        "reason": "特批 一句",
+    },
+    "prepare_revoke_permission": {
+        "override_id": "lpo_01ARZ3NDEKTSV4RRFFQ69G5FAV",
+        "reason": "撤销",
+    },
+    "prepare_revoke_permission_by_scope": {
+        "identifier": "ou_x",
+        "company_id": "1",
+        "metric_name": "vat_rate",
+        "reason": "撤销",
+    },
 }
+#: 通道里永远不该出现的名字：确认、取消、执行都只发生在本人的飞书卡片上。
+FORBIDDEN_NAME_PARTS = ("confirm", "cancel", "execute", "suppress")
 
 
 class Service:
@@ -59,12 +88,15 @@ class ProtocolTests(unittest.TestCase):
         self.assertEqual(result["result"]["protocolVersion"], PROTOCOL_VERSION)
         self.call("notifications/initialized")
 
-    def test_six_tools_and_strict_schema(self):
+    def test_eleven_tools_and_strict_schema(self):
         self.initialize()
         tools = self.call("tools/list")["result"]["tools"]
-        self.assertEqual([tool["name"] for tool in tools], list(SIX_TOOLS))
+        self.assertEqual([tool["name"] for tool in tools], list(ELEVEN_TOOLS))
+        self.assertEqual(len(tools), 11)
         for tool in tools:
             self.assertFalse(tool["inputSchema"]["additionalProperties"])
+            for part in FORBIDDEN_NAME_PARTS:
+                self.assertNotIn(part, tool["name"])
         for extra in ("open_id", "initiated_by", "role", "command", "sql"):
             result = self.call(
                 "tools/call",
@@ -78,7 +110,16 @@ class ProtocolTests(unittest.TestCase):
 
     def test_unknown_tool_name_is_invalid_request(self):
         self.initialize()
-        for name in ("confirm_pending_action", "execute", "run_sql", "", None):
+        for name in (
+            "confirm_pending_action",
+            "cancel_pending_action",
+            "execute_pending_action",
+            "prepare_suppress_metric",
+            "execute",
+            "run_sql",
+            "",
+            None,
+        ):
             result = self.call("tools/call", {"name": name, "arguments": {}})
             self.assertTrue(result["result"]["isError"])
             self.assertEqual(result["result"]["structuredContent"]["code"], "invalid_request")
@@ -124,7 +165,7 @@ class ProtocolTests(unittest.TestCase):
             {"_meta": {"progressToken": 1}},
             {"cursor": "a", "_meta": {}},
         ):
-            self.assertEqual(len(self.call("tools/list", params)["result"]["tools"]), 6)
+            self.assertEqual(len(self.call("tools/list", params)["result"]["tools"]), 11)
         self.assertIn("error", self.call("tools/list", {"filter": "x"}))
 
     def test_twenty_raw_limit_and_xor(self):
@@ -162,6 +203,58 @@ class ProtocolTests(unittest.TestCase):
             with self.assertRaises(InnertestError):
                 validate("get_pending_actions", args)
 
+    def test_prepare_tool_arguments_are_the_command_grammar(self):
+        validate = CHANNEL_TOOLS.validate
+        for name in PREPARE_TOOL_NAMES:
+            validate(name, VALID_ARGUMENTS[name])
+        validate(
+            "prepare_revoke_permission",
+            {"group_id": "lpg_01ARZ3NDEKTSV4RRFFQ69G5FAV", "reason": "x"},
+        )
+        validate(
+            "prepare_revoke_permission",
+            {"group_id": "pac_01ARZ3NDEKTSV4RRFFQ69G5FAV", "reason": "x"},
+        )
+        validate(
+            "prepare_grant_position",
+            {**VALID_ARGUMENTS["prepare_grant_position"], "company_scope": "全部"},
+        )
+        rejected = {
+            "prepare_suspend_user": (
+                {},
+                {"identifier": "ou x"},
+                {"identifier": "ou_x", "open_id": "ou_y"},
+                {"identifier": "x" * 129},
+                {"identifier": "<mailto:x@example.test>"},
+            ),
+            "prepare_resume_user": ({"identifier": ""}, {"identifier": 1}),
+            "prepare_grant_position": (
+                {**VALID_ARGUMENTS["prepare_grant_position"], "reason": " "},
+                {**VALID_ARGUMENTS["prepare_grant_position"], "reason": "长" * 501},
+                {**VALID_ARGUMENTS["prepare_grant_position"], "position_name": "A 财务"},
+                {**VALID_ARGUMENTS["prepare_grant_position"], "company_scope": "1 2"},
+                {**VALID_ARGUMENTS["prepare_grant_position"], "company_scope": "中文公司"},
+                {"identifier": "ou_x", "position_name": "A财务", "company_scope": "*"},
+            ),
+            "prepare_revoke_permission": (
+                {"reason": "x"},
+                {"override_id": "lpo_1", "group_id": "lpg_1", "reason": "x"},
+                {"override_id": "ou_x", "reason": "x"},
+                {"override_id": "lpo_01ARZ3NDEKTSV4RRFFQ69G5FAV", "reason": ""},
+                {"override_id": "lpo_01ARZ3NDEKTSV4RRFFQ69G5FAV"},
+            ),
+            "prepare_revoke_permission_by_scope": (
+                {**VALID_ARGUMENTS["prepare_revoke_permission_by_scope"], "company_id": "中文"},
+                {**VALID_ARGUMENTS["prepare_revoke_permission_by_scope"], "metric_name": "a b"},
+                {**VALID_ARGUMENTS["prepare_revoke_permission_by_scope"], "reason": "长" * 501},
+                {"identifier": "ou_x", "company_id": "1", "reason": "x"},
+            ),
+        }
+        for name, cases in rejected.items():
+            for args in cases:
+                with self.assertRaises(InnertestError, msg=(name, args)):
+                    validate(name, args)
+
     def test_registry_rejects_duplicate_names(self):
         spec = ToolSpec(
             name="get_user_status",
@@ -171,12 +264,13 @@ class ProtocolTests(unittest.TestCase):
         )
         with self.assertRaises(ValueError):
             ToolRegistry([spec, spec])
-        self.assertEqual(CHANNEL_TOOLS.names, SIX_TOOLS)
-        self.assertEqual(READ_ONLY_TOOL_NAMES, SIX_TOOLS[3:])
+        self.assertEqual(CHANNEL_TOOLS.names, ELEVEN_TOOLS)
+        self.assertEqual(READ_ONLY_TOOL_NAMES, ELEVEN_TOOLS[3:6])
+        self.assertEqual(PREPARE_TOOL_NAMES, ELEVEN_TOOLS[6:])
 
     def test_unbound_uid_is_rejected_for_every_tool(self):
         session = InnertestMcpSession(peer_uid=999, service=self.service)
-        for name in SIX_TOOLS:
+        for name in ELEVEN_TOOLS:
             result = session.handle(
                 {
                     "jsonrpc": "2.0",
@@ -199,7 +293,7 @@ class ProtocolTests(unittest.TestCase):
             }
         )
         self.assertEqual(result["error"]["message"], "not_authenticated")
-        for name in SIX_TOOLS:
+        for name in ELEVEN_TOOLS:
             result = session.handle(
                 {
                     "jsonrpc": "2.0",
@@ -216,7 +310,7 @@ class ProtocolTests(unittest.TestCase):
 
     def test_arguments_cannot_supply_identity(self):
         self.initialize()
-        for name in SIX_TOOLS:
+        for name in ELEVEN_TOOLS:
             for extra in ("open_id", "peer_uid", "binding_id", "initiated_by", "role"):
                 result = self.call(
                     "tools/call", {"name": name, "arguments": {**VALID_ARGUMENTS[name], extra: "x"}}
@@ -226,12 +320,12 @@ class ProtocolTests(unittest.TestCase):
 
     def test_registry_revocation_rejects_every_tool_on_the_next_request(self):
         self.initialize()
-        for name in SIX_TOOLS:
+        for name in ELEVEN_TOOLS:
             result = self.call("tools/call", {"name": name, "arguments": VALID_ARGUMENTS[name]})
             self.assertFalse(result["result"]["isError"])
-        self.assertEqual(self.service.calls, 6)
+        self.assertEqual(self.service.calls, 11)
         self.service.enabled = False
-        for name in SIX_TOOLS:
+        for name in ELEVEN_TOOLS:
             result = self.call("tools/call", {"name": name, "arguments": VALID_ARGUMENTS[name]})
             self.assertEqual(result["error"]["message"], "not_authenticated")
-        self.assertEqual(self.service.calls, 6)
+        self.assertEqual(self.service.calls, 11)

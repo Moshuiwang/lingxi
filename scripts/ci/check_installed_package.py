@@ -603,6 +603,12 @@ REQUIRED_MODULES = (
     "lingxi.core.admin.restricted_tools",
     "lingxi.adapters.restricted_admin_queries",
     "lingxi.apps.scheduler.restricted_admin",
+    # 五种写动作的准备工具：转译成命令文本交管理命令路由（adapters），发卡意图经持久
+    # 阶段由 gateway 直发本人（scheduler 侧登记口 + gateway 侧分派发卡器）；三者都由
+    # 装配函数在函数内 import。
+    "lingxi.adapters.restricted_admin_prepare",
+    "lingxi.adapters.followup_confirm_card_sender",
+    "lingxi.adapters.admin_confirmation_card",
     "lingxi.adapters.postgres_admin_followup",
     "lingxi.adapters.postgres_admin_followup_confirmation",
     "lingxi.adapters.postgres_admin_followup_projection",
@@ -704,6 +710,15 @@ PROCESS_RUNTIME_IMPORTS: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {
             "lingxi.apps.scheduler.restricted_admin",
             "lingxi.adapters.restricted_admin_queries",
             "lingxi.core.admin.restricted_tools",
+            # 准备工具把管理命令路由（此前只有 gateway 装配）引进 scheduler 的运行时闭包：
+            # 命令解析、路由与文本渲染三件核心模块，加上持久阶段发卡口。
+            "lingxi.adapters.restricted_admin_prepare",
+            "lingxi.adapters.followup_confirm_card_sender",
+            "lingxi.core.admin.commands",
+            "lingxi.core.admin.followup_render",
+            "lingxi.core.admin.router",
+            "lingxi.core.admin.router_ports",
+            "lingxi.core.admin.router_render",
             "lingxi.core.admin.followup_consumer",
             "lingxi.core.admin.followup_effect",
             "lingxi.core.admin.followup_renewal",
@@ -1270,6 +1285,10 @@ PROCESS_RUNTIME_IMPORTS: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {
             # （`postgres_innertest._audit` 模块级 import 写口与核心模型）。
             "lingxi.adapters.postgres_operation_audit",
             "lingxi.core.admin.operation_audit",
+            # 五种写动作的确认卡由持久阶段分派发出（`apps/gateway/innertest.py` 函数内
+            # import 发卡器）；确认事务写账目终态行时用到核心投影。
+            "lingxi.adapters.admin_confirmation_card",
+            "lingxi.core.admin.restricted_tools",
             "lingxi.adapters.postgres_innertest_confirmation",
             "lingxi.adapters.postgres_innertest_locator",
             "lingxi.adapters.postgres_innertest_roster",

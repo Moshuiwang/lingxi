@@ -85,7 +85,7 @@ class LinuxProtocolTests(unittest.TestCase):
         with self.assertRaisesRegex(InnertestError, "binding_not_protected"):
             load_binding(binding)
 
-    def test_real_sdk_stdio_relay_six_tools(self):
+    def test_real_sdk_stdio_relay_eleven_tools(self):
         relay = self.root / "innertest_relay.py"
         shutil.copy(
             str(Path(__file__).resolve().parents[1] / "scripts/admin/innertest_relay.py"), relay
@@ -116,7 +116,7 @@ class LinuxProtocolTests(unittest.TestCase):
                     hello = await session.initialize()
                     self.assertEqual(hello.protocolVersion, "2025-11-25")
                     tools = await session.list_tools()
-                    self.assertEqual(len(tools.tools), 6)
+                    self.assertEqual(len(tools.tools), 11)
                     result = await session.call_tool(
                         "prepare_innertest_additions",
                         {"request_key": "same", "emails": ["a@example.test"]},
@@ -125,7 +125,7 @@ class LinuxProtocolTests(unittest.TestCase):
                     await asyncio.sleep(30)
                     result = await session.call_tool("get_user_status", {"identifier": "ou_x"})
                     self.assertFalse(result.isError)
-                    self.assertEqual(len((await session.list_tools()).tools), 6)
+                    self.assertEqual(len((await session.list_tools()).tools), 11)
                     self.service.enabled = False
                     with self.assertRaises(Exception):
                         await session.list_tools()
@@ -148,7 +148,7 @@ class LinuxProtocolTests(unittest.TestCase):
         hello, half_packet, listing = [line for line in result.stdout.split("\n") if line]
         self.assertEqual(json.loads(hello)["result"]["protocolVersion"], "2025-11-25")
         self.assertEqual(half_packet, "b''")
-        self.assertEqual(len(json.loads(listing)["result"]["tools"]), 6)
+        self.assertEqual(len(json.loads(listing)["result"]["tools"]), 11)
 
     def test_short_idle_lifetime_closes_idle_connection(self):
         self.listener.drain_until(time.monotonic() + 2)
