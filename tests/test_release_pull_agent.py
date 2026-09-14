@@ -10,6 +10,7 @@ import io
 import json
 import os
 import stat
+import subprocess
 import tempfile
 import textwrap
 import unittest
@@ -23,6 +24,17 @@ AGENT = importlib.util.module_from_spec(spec)
 assert spec.loader is not None
 spec.loader.exec_module(AGENT)
 print(f"loaded release pull agent: {MODULE_PATH}")
+# gh 2.97 `gh release list --help` 列出的全部 JSON 字段；假 gh 据此拒绝其余字段。
+GH_RELEASE_LIST_FIELDS = (
+    "createdAt",
+    "isDraft",
+    "isImmutable",
+    "isLatest",
+    "isPrerelease",
+    "name",
+    "publishedAt",
+    "tagName",
+)
 
 
 def _write(path: Path, value: str | bytes, mode: int = 0o600) -> Path:
@@ -82,7 +94,14 @@ class PullHarness:
             with open(log, "a", encoding="utf-8") as stream:
                 stream.write(json.dumps({"kind":"gh", "argv":sys.argv[1:], "sentinel":os.environ.get("SECRET_SENTINEL", "")}) + "\n")
             if sys.argv[1:3] == ["release", "list"]:
-                print(open(os.environ["RELEASES_FILE"], encoding="utf-8").read())
+                # 复刻 gh 2.97：--json 只接受手册字段，未知字段退出 1；只回请求到的字段。
+                fields = sys.argv[sys.argv.index("--json") + 1].split(",")
+                for field in fields:
+                    if field not in os.environ["GH_RELEASE_LIST_FIELDS"].split(","):
+                        print(f'Unknown JSON field: "{field}"', file=sys.stderr)
+                        raise SystemExit(1)
+                releases = json.load(open(os.environ["RELEASES_FILE"], encoding="utf-8"))
+                print(json.dumps([{k: v for k, v in item.items() if k in fields} for item in releases]))
                 raise SystemExit(0)
             if sys.argv[1:3] == ["release", "download"]:
                 directory = sys.argv[sys.argv.index("--dir") + 1]
@@ -295,6 +314,7 @@ class PullHarness:
         self._env = {
             "CALL_LOG": str(self.log),
             "RELEASES_FILE": str(self.releases),
+            "GH_RELEASE_LIST_FIELDS": ",".join(GH_RELEASE_LIST_FIELDS),
             "MANIFESTS_DIR": str(self.manifests),
             "ASSET_FILE": str(self.asset),
             "INDEX_FILE": str(self.index),
@@ -437,6 +457,27 @@ class PullHarness:
         )
         self.save_state(value)
 
+    def expected_digests(self, tag: str) -> dict:
+        manifest = json.loads((self.manifests / (tag + ".json")).read_text())
+        return AGENT._expected_digests(manifest)
+
+    def state_for_verified_target(self, tag: str | None = None, *, with_digests: bool = True):
+        """状态账已证实 tag 在位：verified 计划的 new 就是 tag，容器摘要按开关记录。"""
+        tag = tag or self.target_tag
+        plan = self.previous_plan(tag)
+        value = self.base_state()
+        value.update(
+            {
+                "target_tag": tag,
+                "deployer_state": "verified",
+                "plan_id": plan["id"],
+                "highest_deployed_tag": tag if with_digests else None,
+                "verified_digests": self.expected_digests(tag) if with_digests else None,
+            }
+        )
+        self.save_state(value)
+        return value
+
     def state_for_continuation(self):
         plan = self.previous_plan(self.target_tag)
         plan["id"] = "continuing-plan"
@@ -539,14 +580,232 @@ class AgentTests(unittest.TestCase):
         self.assertEqual(self.calls(), [])
 
     def test_already_in_place_by_state_account_does_nothing(self):
-        value = self.harness.base_state()
-        value.update({"target_tag": self.harness.target_tag, "deployer_state": "verified"})
-        self.harness.save_state(value)
+        self.harness.state_for_verified_target()
+        self.harness.set_env(DOCKER_MODE="match")
         code, _ = self.run_agent()
         self.assertEqual(code, 0)
+        # 零动作 = 只列 Release 并只读回读容器；不解析清单、不下载、不调部署器。
         kinds = {call["kind"] for call in self.calls()}
-        self.assertEqual(kinds, {"gh"})
+        self.assertEqual(kinds, {"gh", "docker"})
+        self.assertFalse(
+            any(call["kind"] == "gh" and "download" in call["argv"] for call in self.calls())
+        )
         self.assertEqual(self.read_state()["last_result"], "already_in_place")
+
+    def test_release_list_uses_only_valid_gh_json_fields(self):
+        # 假 gh 复刻 gh 2.97 的字段校验；先证明它真的会拒绝 url，本用例才有证明力。
+        probe = subprocess.run(
+            [
+                str(self.harness.gh),
+                "release",
+                "list",
+                "--repo",
+                "Moshuiwang/lingxi",
+                "--limit",
+                "1",
+                "--json",
+                "tagName,url",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=False,
+        )
+        self.assertEqual(probe.returncode, 1)
+        self.assertIn('Unknown JSON field: "url"', probe.stderr)
+        self.harness.log.unlink()
+        self.harness.state_for_verified_target()
+        self.harness.set_env(DOCKER_MODE="match")
+        code, _ = self.run_agent()
+        self.assertEqual(code, 0)
+        state = self.read_state()
+        self.assertEqual(state["last_result"], "already_in_place")
+        listing = [
+            call
+            for call in self.calls()
+            if call["kind"] == "gh" and call["argv"][:2] == ["release", "list"]
+        ]
+        self.assertEqual(len(listing), 1)
+        fields = listing[0]["argv"][listing[0]["argv"].index("--json") + 1].split(",")
+        self.assertTrue(set(fields) <= set(GH_RELEASE_LIST_FIELDS), fields)
+        self.assertNotIn("url", fields)
+        self.assertEqual(
+            state["release_url"],
+            f"https://github.com/Moshuiwang/lingxi/releases/tag/{self.harness.target_tag}",
+        )
+
+    def test_verified_state_still_checks_running_containers_each_round(self):
+        messages = []
+
+        def sender(message, env, timeout):
+            messages.append(message)
+
+        with self.subTest(case="state_without_recorded_digests_resolves_manifest_once"):
+            self.harness.state_for_verified_target(with_digests=False)
+            self.harness.set_env(DOCKER_MODE="match")
+            code, _ = self.run_agent(sender=sender)
+            self.assertEqual(code, 0)
+            state = self.read_state()
+            self.assertEqual(state["last_result"], "already_in_place")
+            self.assertEqual(
+                state["verified_digests"], self.harness.expected_digests(self.harness.target_tag)
+            )
+            self.assertEqual({call["kind"] for call in self.calls()}, {"gh", "manifest", "docker"})
+            self.harness.log.unlink()
+        with self.subTest(case="consistent"):
+            self.harness.state_for_verified_target()
+            self.harness.set_env(DOCKER_MODE="match")
+            code, _ = self.run_agent(sender=sender)
+            self.assertEqual(code, 0)
+            state = self.read_state()
+            self.assertEqual(state["last_result"], "already_in_place")
+            self.assertEqual(state["deployer_state"], "verified")
+            self.assertIsNone(state["external_change_tag"])
+            self.assertEqual({call["kind"] for call in self.calls()}, {"gh", "docker"})
+            self.assertEqual(messages, [])
+        with self.subTest(case="docker_unavailable_keeps_verified_for_next_round"):
+            self.harness.set_env(DOCKER_MODE="daemon")
+            code, _ = self.run_agent(sender=sender)
+            self.assertEqual(code, 0)
+            state = self.read_state()
+            self.assertEqual(state["last_result"], "unknown")
+            self.assertEqual(state["deployer_state"], "verified")
+            self.assertEqual(len(messages), 1)
+            self.harness.set_env(DOCKER_MODE="match")
+            code, _ = self.run_agent(sender=sender)
+            self.assertEqual(code, 0)
+            self.assertEqual(self.read_state()["last_result"], "already_in_place")
+            self.assertEqual(len(messages), 2)
+            self.assertIn("recovered", messages[1])
+            messages.clear()
+        with self.subTest(case="external_change"):
+            # 三个容器被外部换成另一版本的镜像：只告警，不重部署、不沿旧计划接续。
+            self.harness.set_running_containers(self.harness.old_tag)
+            for round_number in (1, 2):
+                code, _ = self.run_agent(sender=sender)
+                self.assertEqual(code, 0, round_number)
+                state = self.read_state()
+                self.assertEqual(state["last_result"], "external_change_detected")
+                self.assertEqual(state["deployer_state"], "unknown")
+                self.assertEqual(state["external_change_tag"], self.harness.target_tag)
+                self.assertEqual(state["target_tag"], self.harness.target_tag)
+                self.assertEqual(state["plan_id"], "old-plan")
+                self.assertEqual(len(messages), 1)
+            self.assertIn("external_change_detected", messages[0])
+            kinds = {call["kind"] for call in self.calls()}
+            self.assertEqual(kinds, {"gh", "docker"})
+            self.assertFalse(list(self.harness.state.glob("*.request.json")))
+        with self.subTest(case="containers_missing"):
+            self.harness.set_running_containers(self.harness.target_tag, running=False)
+            self.harness.set_env(DOCKER_MODE="stopped")
+            code, _ = self.run_agent(sender=sender)
+            self.assertEqual(code, 0)
+            self.assertEqual(self.read_state()["last_result"], "external_change_detected")
+            self.assertEqual(len(messages), 1)
+        with self.subTest(case="recovered"):
+            self.harness.set_running_containers(self.harness.target_tag)
+            self.harness.set_env(DOCKER_MODE="match")
+            code, _ = self.run_agent(sender=sender)
+            self.assertEqual(code, 0)
+            state = self.read_state()
+            self.assertEqual(state["last_result"], "already_in_place")
+            self.assertEqual(state["deployer_state"], "verified")
+            self.assertIsNone(state["external_change_tag"])
+            self.assertEqual(len(messages), 2)
+            self.assertIn("recovered", messages[1])
+        self.assertFalse(any(call["kind"] == "deployer" for call in self.calls()))
+
+    def test_older_target_than_deployed_is_refused_not_deployed(self):
+        key = AGENT.release_version_key
+        self.assertLess(key("v2.5.0-rc.3"), key("v2.5.0"))
+        self.assertLess(key("v2.5.0"), key("v2.5.1"))
+        self.assertLess(key("v2.5.0-rc.9"), key("v2.5.0-rc.10"))
+        self.assertTrue(AGENT.is_downgrade("v2.5.0-rc.3", "v2.5.0"))
+        self.assertTrue(AGENT.is_downgrade("v2.5.0", "v2.5.1"))
+        self.assertFalse(AGENT.is_downgrade("v2.5.0", "v2.5.0"))
+        self.assertFalse(AGENT.is_downgrade("v2.5.1", "v2.5.0"))
+        self.assertFalse(AGENT.is_downgrade("v2.5.0", "v2.5.0-rc.3"))
+        self.assertFalse(AGENT.is_downgrade("v2.5.0", None))
+        messages = []
+
+        def sender(message, env, timeout):
+            messages.append(message)
+
+        older = "v2.5.0-rc.9"
+        self.harness._make_manifest(older, formal=False, seed="4")
+        hidden = dict(self.harness._release(self.harness.target_tag, True), isDraft=True)
+        self.harness.set_releases([self.harness._release(older, True), hidden])
+        self.harness.set_env(DOCKER_MODE="match")
+        with self.subTest(case="state_account_knows_highest"):
+            # 状态账已验证 rc.10；写权限者把 rc.10 改成草稿后选择器只剩 rc.9。
+            self.harness.state_for_verified_target()
+            for round_number in (1, 2):
+                code, _ = self.run_agent(sender=sender)
+                self.assertEqual(code, 0, round_number)
+                state = self.read_state()
+                self.assertEqual(state["last_result"], "downgrade_refused")
+                self.assertEqual(state["target_tag"], self.harness.target_tag)
+                self.assertEqual(state["deployer_state"], "verified")
+                self.assertEqual(state["highest_deployed_tag"], self.harness.target_tag)
+                self.assertEqual(len(messages), 1)
+            self.assertIn("downgrade_refused", messages[0])
+            self.assertIn("最高已部署版本：" + self.harness.target_tag, messages[0])
+            self.assertIn(f"downgrade_refused:{older}:{self.harness.target_tag}", state["alerts"])
+            self.assertEqual({call["kind"] for call in self.calls()}, {"gh"})
+        with self.subTest(case="verified_plan_without_recorded_highest"):
+            # 状态账没记最高版本时，从 verified 计划的 new.tag 反推，同样拒绝。
+            self.harness.log.unlink()
+            self.harness.state_for_verified_target(with_digests=False)
+            code, _ = self.run_agent(sender=sender)
+            self.assertEqual(code, 0)
+            state = self.read_state()
+            self.assertEqual(state["last_result"], "downgrade_refused")
+            self.assertEqual(state["highest_deployed_tag"], self.harness.target_tag)
+            self.assertEqual({call["kind"] for call in self.calls()}, {"gh", "manifest", "docker"})
+        with self.subTest(case="running_formal_release_beats_rc_target"):
+            # 状态账为空、容器运行手工装上的正式版 v2.5.0：反查得到的运行版本也算已部署。
+            self.harness.log.unlink()
+            (self.harness.state / "pull-agent.json").unlink()
+            formal = "v2.5.0"
+            self.harness._make_manifest(formal, formal=True, seed="6")
+            self.harness.set_releases(
+                [self.harness._release(older, True), self.harness._release(formal, False)]
+            )
+            self.harness.set_running_containers(formal)
+            self.harness.set_env(DOCKER_MODE="records")
+            code, _ = self.run_agent(sender=sender)
+            self.assertEqual(code, 0)
+            state = self.read_state()
+            self.assertEqual(state["last_result"], "downgrade_refused")
+            self.assertEqual(state["highest_deployed_tag"], formal)
+            self.assertIn(f"downgrade_refused:{older}:{formal}", state["alerts"])
+            self.assertEqual({call["kind"] for call in self.calls()}, {"gh", "manifest", "docker"})
+        self.assertFalse(list(self.harness.state.glob("*.request.json")))
+        self.assertFalse(
+            any(call["kind"] == "gh" and "download" in call["argv"] for call in self.calls())
+        )
+        with self.subTest(case="same_version_is_not_a_downgrade"):
+            self.harness.log.unlink()
+            self.harness.set_releases([self.harness._release(self.harness.target_tag, True)])
+            self.harness.state_for_verified_target()
+            self.harness.set_running_containers(self.harness.target_tag)
+            self.harness.set_env(DOCKER_MODE="match")
+            code, _ = self.run_agent(sender=sender)
+            self.assertEqual(code, 0)
+            self.assertEqual(self.read_state()["last_result"], "already_in_place")
+        with self.subTest(case="verified_deploy_records_highest_and_digests"):
+            self.harness.log.unlink()
+            self.harness.state_for_old()
+            self.harness.set_env(DOCKER_MODE="mismatch", DEPLOY_STATUS="verified")
+            code, _ = self.run_agent(sender=sender)
+            self.assertEqual(code, 0)
+            state = self.read_state()
+            self.assertEqual(state["last_result"], "verified")
+            self.assertEqual(state["highest_deployed_tag"], self.harness.target_tag)
+            self.assertEqual(
+                state["verified_digests"],
+                self.harness.expected_digests(self.harness.target_tag),
+            )
 
     def test_already_in_place_by_running_digests_does_nothing(self):
         self.harness.set_env(DOCKER_MODE="match")
@@ -830,13 +1089,72 @@ class AgentTests(unittest.TestCase):
         config["pre_apply_hooks"] = [str(self.harness.hook_fail)]
         self.harness.config_path = _json(self.harness.config_path, config)
         messages = []
-        code, _ = self.run_agent(sender=lambda message, env, timeout: messages.append(message))
+        # 临时目录里的钩子过不了属主核对；本用例只看钩子自身失败，属主核对另有用例。
+        with patch.object(AGENT, "_hook_program_protected", return_value=True):
+            code, _ = self.run_agent(sender=lambda message, env, timeout: messages.append(message))
         self.assertEqual(code, 0)
         self.assertEqual(self.read_state()["last_result"], "pre_apply_hook_failed")
         self.assertEqual(len(messages), 1)
+        self.assertTrue(any(call["kind"] == "hook" for call in self.calls()))
         self.assertFalse(
             any(call["kind"] == "deployer" and "apply" in call["argv"] for call in self.calls())
         )
+
+    def test_hook_program_must_be_root_owned_and_unwritable(self):
+        hook = self.harness.hook_fail
+        # 临时目录：程序属主是当前用户，且祖先目录可被其他主体写入，两条都不许。
+        self.assertFalse(AGENT._hook_program_protected(str(hook)))
+        self.harness.state_for_old()
+        config = dict(self.harness.config)
+        config["pre_apply_hooks"] = [str(hook)]
+        self.harness.config_path = _json(self.harness.config_path, config)
+        messages = []
+        code, _ = self.run_agent(sender=lambda message, env, timeout: messages.append(message))
+        self.assertEqual(code, 0)
+        state = self.read_state()
+        self.assertEqual(state["last_result"], "pre_apply_hook_unsafe")
+        self.assertEqual(state["deployer_state"], "planned")
+        self.assertEqual(len(messages), 1)
+        self.assertIn("pre_apply_hook_unsafe", messages[0])
+        self.assertFalse(any(call["kind"] == "hook" for call in self.calls()))
+        self.assertFalse(
+            any(call["kind"] == "deployer" and "apply" in call["argv"] for call in self.calls())
+        )
+        self.assertTrue(list(self.harness.state.glob("*.plan.json")))
+
+        # 打桩 lstat：整条路径 root 属主、0755、非链接才放行；任一环节有缺陷都拒绝。
+        chain = {str(item) for item in (hook, *hook.parents)}
+        real_lstat = os.lstat
+
+        def stub(defect: str | None):
+            def fake_lstat(path, *args, **kwargs):
+                info = real_lstat(path, *args, **kwargs)
+                if str(path) not in chain:
+                    return info
+                kind = stat.S_IFDIR if stat.S_ISDIR(info.st_mode) else stat.S_IFREG
+                mode, uid = kind | 0o755, 0
+                if str(path) == str(hook.parent):
+                    if defect == "symlink":
+                        mode = stat.S_IFLNK | 0o777
+                    elif defect == "group_writable":
+                        mode = kind | 0o775
+                    elif defect == "other_writable":
+                        mode = kind | 0o757
+                    elif defect == "not_root":
+                        uid = os.getuid() + 1
+                return os.stat_result(
+                    (mode, info.st_ino, info.st_dev, info.st_nlink, uid, 0, info.st_size, 0, 0, 0)
+                )
+
+            return fake_lstat
+
+        with patch.object(AGENT.os, "lstat", side_effect=stub(None)):
+            self.assertTrue(AGENT._hook_program_protected(str(hook)))
+        for defect in ("symlink", "group_writable", "other_writable", "not_root"):
+            with self.subTest(defect=defect):
+                with patch.object(AGENT.os, "lstat", side_effect=stub(defect)):
+                    self.assertFalse(AGENT._hook_program_protected(str(hook)))
+        self.assertFalse(AGENT._hook_program_protected(str(hook.parent / "missing-hook.py")))
 
     def test_deploy_timeout_alerts_and_leaves_plan_for_next_run(self):
         self.harness.state_for_old()
