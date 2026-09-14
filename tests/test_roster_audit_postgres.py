@@ -14,7 +14,7 @@ import os
 import unittest
 from datetime import UTC, date, datetime
 
-from postgres_schema import ensure_production_schema, psycopg_available
+from postgres_schema import ensure_production_schema, psycopg_available, reset_production_rows
 
 from lingxi.adapters.postgres import connect
 from lingxi.adapters.postgres_roster_audit import PostgresRosterBaselineReader
@@ -106,9 +106,7 @@ class RosterAuditPostgresTestCase(unittest.TestCase):
         ensure_production_schema(cls._dsn)
 
     def setUp(self) -> None:
-        with connect(self._dsn) as connection, connection.cursor() as cursor:
-            cursor.execute("SET lock_timeout = '5s'")
-            cursor.execute("TRUNCATE app_user CASCADE")
+        reset_production_rows(self._dsn)
 
     # -- 造数与回读 ---------------------------------------------------------
 

@@ -76,12 +76,13 @@ from __future__ import annotations
 
 import argparse
 import csv
+import logging
 import os
 import sys
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, TextIO
 
 from lingxi.config.metric_labels import default_metric_labels
 from lingxi.core.outreach.audience import (
@@ -804,7 +805,27 @@ def _exit_code(results: Sequence[PersonResult], *, alert_error: str | None) -> i
     return 3 if unknown or unrecorded or alert_error is not None else 0
 
 
+def _configure_logging(stream: TextIO | None = None) -> logging.Logger:
+    """把 ``lingxi`` 名下的 INFO 记录（含结构化审计行）接到标准错误。
+
+    审计出口与「说过话 / 联系不上」记录器都经 ``logging`` 写 INFO；本脚本是一个
+    独立进程，没有任何处理器时这些行会被默认丢弃，真实运行就只剩逐人结果、
+    没有审计。只挂在 ``lingxi`` 记录器上、不动根记录器，第三方库的 INFO 不进
+    本脚本输出；先关闭再摘掉旧处理器，同一进程内反复调用不累积。
+    """
+    logger = logging.getLogger("lingxi")
+    logger.setLevel(logging.INFO)
+    for old_handler in logger.handlers:
+        old_handler.close()
+    logger.handlers.clear()
+    handler = logging.StreamHandler(sys.stderr if stream is None else stream)
+    handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(name)s %(message)s"))
+    logger.addHandler(handler)
+    return logger
+
+
 def main(argv: list[str] | None = None) -> int:
+    _configure_logging()
     arguments = _build_parser().parse_args(argv)
     rejection = _reject_conflicting_modes(arguments)
     if rejection is not None:

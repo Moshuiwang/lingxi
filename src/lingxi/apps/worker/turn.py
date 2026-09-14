@@ -28,6 +28,7 @@ from lingxi.adapters.claude_agent_session import (
     is_message_buffer_overflow,
     run_single_turn,
 )
+from lingxi.core.delivery.turn_outcome import MCP_BAD_GATEWAY_FAILURE_CODE
 from lingxi.core.execution.audit import AuditRedactor, ResultRules, TurnAudit, redact_free_text
 from lingxi.core.execution.document_delivery import (
     DELIVER_DOCUMENT_TOOL_NAME,
@@ -57,10 +58,9 @@ _MAX_FAILURE_TEXT = 500
 # 告警——pending（慢连接建连时可能还没到终态）、disabled（主动关闭）、
 # connected 都不触发；判定只在这一层，适配器只转发 SDK 原始 dict。
 _MCP_UNAVAILABLE_STATUSES = frozenset({"failed", "needs-auth"})
-#: 下游指标 MCP 建连失败的稳定取值：只在 query 服务报告 failed/needs-auth
-#: 且错误文本明确带 HTTP 502 时使用；签名形状与其余失败签名一致，低敏、
-#: 可落库、可在 /admin trace 回显。
-MCP_BAD_GATEWAY_FAILURE_CODE = "mcp_bad_gateway"
+#: 下游指标 MCP 建连失败的签名（失败码本身住在 ``core.delivery.turn_outcome``，
+#: 终态判定按它选文案）：只在 query 服务报告 failed/needs-auth 且错误文本明确带
+#: HTTP 502 时使用；形状与其余失败签名一致，低敏、可落库、可在 /admin trace 回显。
 MCP_BAD_GATEWAY_FAILURE_SIGNATURE = "mcp.query.http_502"
 _MCP_BAD_GATEWAY_ERROR = re.compile(
     r"(?:\b502\s+bad\s+gateway\b|\bhttp(?:/\d+(?:\.\d+)?)?\s*[:=]?\s*502\b|"

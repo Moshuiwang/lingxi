@@ -71,13 +71,16 @@ from lingxi.core.permission.publish_row import (
 )
 
 REPOSITORY_ROOT = pathlib.Path(__file__).parents[1]
-#: 本职责的实现现在分两个文件：编排在 ``permission_refresh.py``，本地覆盖这条来源的
-#: 读取与完整性检查在三条链共用的 ``core/permission/decision_chain.py``。下面所有
-#: 「源码里不许出现 X」的否定断言必须同时扫这两份——只扫前一份的话，把实现搬进后一份
-#: 就能让每一条断言变成永远为真的空判定，而它们钉的正是"这条链上不许有通知出口、
-#: 不许有旁路开关、不许自己算版本"这些不变式。
+#: 本职责的实现现在分三个文件：整轮编排与计数在 ``permission_refresh.py``，逐用户
+#: 决策树（匹配 → 聚合 → 翻译 → 合并 → 发布或撤权）在两个入口共用的
+#: ``core/permission/user_decision_tree.py``，本地覆盖这条来源的读取与完整性检查在
+#: 三条链共用的 ``core/permission/decision_chain.py``。下面所有「源码里不许出现 X」
+#: 的否定断言必须同时扫这三份——只扫第一份的话，把实现搬进后两份就能让每一条断言
+#: 变成永远为真的空判定，而它们钉的正是"这条链上不许有通知出口、不许有旁路开关、
+#: 不许自己算版本"这些不变式。
 DUTY_SOURCES = (
     REPOSITORY_ROOT / "src" / "lingxi" / "apps" / "scheduler" / "permission_refresh.py",
+    REPOSITORY_ROOT / "src" / "lingxi" / "core" / "permission" / "user_decision_tree.py",
     REPOSITORY_ROOT / "src" / "lingxi" / "core" / "permission" / "decision_chain.py",
 )
 

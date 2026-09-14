@@ -16,6 +16,12 @@ from lingxi.core.admin.card_dispatch import (
     bounded_management_card_deadline,
     bounded_management_card_ttl_seconds,
 )
+from lingxi.core.admin.management_card_states import (
+    DISPATCH_IDLE,
+    STATE_EFFECTIVE,
+    STATE_INCOMPLETE,
+    STATE_READY,
+)
 
 # 内部缓存保留窗口，不对管理员承诺；用户可见的确认窗口仍由 pending_action 的
 # 产品合同控制。它只避免永久保留消息映射，具体值可随部署配置调整。
@@ -193,8 +199,8 @@ class PostgresManagementCardContextStore:
         card_sequence: int = 2,
         state_version: int = 1,
         context_deadline_at: datetime | None = None,
-        state: str = "ready",
-        dispatch_status: str = "idle",
+        state: str = STATE_READY,
+        dispatch_status: str = DISPATCH_IDLE,
         last_trace_id: str | None = None,
     ) -> None:
         """登记或刷新一张管理卡的持久上下文；重放绝不让已落库的卡倒退。"""
@@ -311,7 +317,7 @@ class PostgresManagementCardContextStore:
     ) -> tuple[list[str], list[object]]:
         """拼出 ``update_state`` 要用的 ``SET`` 片段与对应参数。
 
-        ``state == "effective"``：即时成功不应被当成每日批补齐（迟到的 instant
+        ``state`` 落到已生效时：即时成功不应被当成每日批补齐（迟到的 instant
         outbox 成功不具备每日批资格；只有 :meth:`settle_published_contexts`
         识别到 daily reason 时才重新置为待汇总水位）。任一字段真的改变时：
         状态写入和视觉恢复必须属于同一条单调版本链，``card_sequence`` 与
@@ -329,7 +335,7 @@ class PostgresManagementCardContextStore:
             if value is not None:
                 assignments.append(f"{column} = %s")
                 values.append(value)
-        if state == "effective":
+        if state == STATE_EFFECTIVE:
             assignments.append(
                 "daily_correction_reported_at = CASE"
                 " WHEN daily_correction_pending THEN daily_correction_reported_at"
@@ -529,7 +535,7 @@ class PostgresManagementCardContextStore:
         ):
             cursor.execute(_SETTLE_PUBLISHED_CONTEXTS_SQL)
             rows = cursor.fetchall()
-        return tuple(str(row[0]) for row in rows if row[1] == "incomplete" and bool(row[2]))
+        return tuple(str(row[0]) for row in rows if row[1] == STATE_INCOMPLETE and bool(row[2]))
 
     def unreported_daily_correction_ids(self) -> tuple[str, ...]:
         """待每日汇总补一句、但还没汇报过的消息 ID。"""

@@ -10,7 +10,9 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any
 
-from lingxi.apps.worker.report_extraction import (
+from lingxi.config.content import ContentCatalog, RenderedContent
+from lingxi.core.delivery.ports import TerminalKind
+from lingxi.core.delivery.turn_report import (
     _denied_tool_summary,
     _protocol_breakdown_reasons,
     _report_document_request,
@@ -21,13 +23,14 @@ from lingxi.apps.worker.report_extraction import (
     _tool_result_count,
     _unnamed_failure_code,
 )
-from lingxi.apps.worker.turn import MCP_BAD_GATEWAY_FAILURE_CODE
-from lingxi.config.content import ContentCatalog, RenderedContent
-from lingxi.core.delivery.ports import TerminalKind
 from lingxi.core.task_reference import append_failure_reference
 
 #: 模型把工具调用协议写成正文散文时的失败码。
 MODEL_PROTOCOL_BREAKDOWN_FAILURE_CODE = "model_protocol_breakdown"
+#: 下游指标 MCP 建连失败的稳定取值：只在 query 服务报告 failed/needs-auth
+#: 且错误文本明确带 HTTP 502 时使用（判定在执行层，这里只持有失败码本身）；
+#: 低敏、可落库、可在 /admin trace 回显。
+MCP_BAD_GATEWAY_FAILURE_CODE = "mcp_bad_gateway"
 
 
 def _base_failure_content(catalog: ContentCatalog, code: object) -> tuple[str, RenderedContent]:

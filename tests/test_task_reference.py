@@ -15,9 +15,9 @@ from lingxi.apps import trace
 from lingxi.apps.worker.cli import _log
 from lingxi.apps.worker.service import WorkerService
 from lingxi.apps.worker.service_ports import WorkerObservers
-from lingxi.apps.worker.task_processing import failure_content
 from lingxi.apps.worker.turn import WorkerTurnExecutor
 from lingxi.config.content import ContentCatalog, ContentRenderError, default_content_catalog
+from lingxi.core.delivery.turn_outcome import failure_content
 from lingxi.core.task_reference import (
     FAILURE_REFERENCE_KEYS,
     TaskReference,
