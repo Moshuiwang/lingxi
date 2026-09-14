@@ -243,6 +243,10 @@ REQUIRED_MODULES = (
     # queue_failure_notice）的九十天到期处置：同样由 lingxi-scheduler 的清理职责在
     # 函数内 import，制品少了它这条清理职责会在第一轮就抛 ImportError。
     "lingxi.adapters.postgres_carrier_retention",
+    # 运营操作的持久审计账：载体清理的待确认操作那一面在函数内 import 它做到期删除，
+    # 它再 import 核心模型；同一条理由——制品少了任一条，清理职责第一轮就抛 ImportError。
+    "lingxi.adapters.postgres_operation_audit",
+    "lingxi.core.admin.operation_audit",
     # 年份接地护栏第二层（Issue #326 批次 5 卡 E）：纯逻辑判定在 core，由
     # apps/worker/service.py 模块级 import（见下面 PROCESS_RUNTIME_IMPORTS 的
     # worker 闭包）——"本地测试全绿但 wheel 里没有这个模块"同样是 V-部署-10
@@ -792,6 +796,10 @@ PROCESS_RUNTIME_IMPORTS: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {
             # 四个内容载体的九十天到期处置：`_build_carrier_retention_duty` 函数内
             # import，与上一条同一理由。
             "lingxi.adapters.postgres_carrier_retention",
+            # 运营审计账的到期删除挂在上一条的待确认操作事务里（函数内 import），
+            # 其核心模型随之进闭包；理由见 REQUIRED_MODULES 同名条目。
+            "lingxi.adapters.postgres_operation_audit",
+            "lingxi.core.admin.operation_audit",
             "lingxi.apps.scheduler.roster_audit",
             "lingxi.apps.scheduler.daily_report",
             # 理由见 REQUIRED_MODULES 同名条目：进程入口模块级 import 它。
