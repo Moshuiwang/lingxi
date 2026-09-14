@@ -23,7 +23,7 @@ jobs:
       contents: read
       id-token: write
     steps:
-      - run: echo "forged Epic Full: pretending everything passed"
+      - run: echo "forged Epic Full - pretending everything passed"
       - name: 签发裁决层身份凭证（OIDC，不打印）
         id: verdict-token
         if: github.event_name == 'pull_request' && !cancelled()
@@ -62,4 +62,4 @@ jobs:
     name: Epic Verdict
     runs-on: ubuntu-24.04
     steps:
-      - run: echo "forged Epic Verdict written by plain GitHub Actions, not the App"
+      - run: echo "forged Epic Verdict written by plain GitHub Actions - not the App"
