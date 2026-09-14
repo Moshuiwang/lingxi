@@ -400,14 +400,15 @@ def check_database_timeouts() -> list[str]:
 
 
 def check_worker_queue_env_example() -> list[str]:
-    """`deploy/.env.example` 的 worker-queue 小节必须自带 `LINGXI_POSTGRES_DSN`
-    与 `LINGXI_USER_ENV_ROOT`。
+    """`deploy/.env.example` 的 worker-queue 小节必须自带三个必填示范项：
+    `LINGXI_POSTGRES_DSN`、`LINGXI_USER_ENV_ROOT` 与
+    `LINGXI_QUERY_MCP_ENDPOINT`。
 
     PR #173 复核 P1-2：早期版本让 worker-queue 借用一次性 `worker` job 的
     env 文件，那份文件的示范文本明确写着"这里不放数据库连接串"，worker-queue
     因此照抄部署后拿不到 DSN、以 `restart: unless-stopped` 无限崩溃重启。
     现在两者分文件，这里守住"worker-queue 自己的小节确实示范了 DSN"，防止
-    未来又把这两行拆开时安静地漏掉。
+    未来又把这些必填行拆开时安静地漏掉。
 
     `LINGXI_USER_ENV_ROOT`（Epic D 闸⑥）是同一种失败形状的姊妹项：
     `apps/worker/cli.py` 的队列模式前置检查缺了它同样以 exit=3 拒绝启动，
@@ -440,6 +441,12 @@ def check_worker_queue_env_example() -> list[str]:
             "worker-queue 处理每个任务时都要按 user_id 读这个根目录下的 .mcp.json"
             "（Epic D 闸⑥），启动期读不到会以 exit=3 拒绝启动，配上"
             " restart: unless-stopped 就是无限崩溃重启。"
+        )
+    if not re.search(r"^LINGXI_QUERY_MCP_ENDPOINT=\S.*$", section, re.MULTILINE):
+        failures.append(
+            "deploy/.env.example 的 worker-queue 小节里没有 LINGXI_QUERY_MCP_ENDPOINT 示范值。"
+            "该变量是问数执行服务的必填 MCP 目标地址，缺失、为空或无效时 worker-queue"
+            "启动以 exit=3 失败且不接单；升级镜像前必须先补齐。"
         )
     return failures
 

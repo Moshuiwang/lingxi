@@ -15,6 +15,7 @@
 
 ### Changed
 
+- **worker-queue 要求入口注入并校验问数 MCP 目标地址**：地址缺失、为空或无效时以 `exit=3` 失败且不接单，同源不同路径仍可用（Issue [#604](https://github.com/Moshuiwang/lingxi/issues/604)）。
 - **候选镜像包核验工具不再依赖本机镜像存储驱动**：`verify_epic_candidate_bundle.py --import` 改为先从每个 tar 内的 `manifest.json` 读出 config 摘要与清单比对，再逐个导入；在 containerd 快照器存储的机器上也能给出「一致 / 不一致」，摘要对不上或读不到的 tar 不导入（Issue [#765](https://github.com/Moshuiwang/lingxi/issues/765)）。
 
 ## [2.4.3] - 2026-09-11

@@ -31,6 +31,7 @@ def _env(**overrides: str) -> dict[str, str]:
         "LINGXI_WORKER_QUESTION": "上周活跃用户数是多少？",
         "LINGXI_WORKER_READONLY_TOOLS": _READ_ONLY_TOOL,
         "LINGXI_WORKER_TRACE_ID": "01J0000000000000000TEST000",
+        "LINGXI_QUERY_MCP_ENDPOINT": "https://mcp.example.invalid/query",
     }
     env.update(overrides)
     return env

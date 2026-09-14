@@ -114,6 +114,10 @@ PRODUCTION_ENVIRONMENT_VALUES = ("prod", "production", "生产")
 # 即失败处理，不悄悄当作未开启。
 DOCUMENT_DELIVERY_ENABLED_VAR = "DOCUMENT_DELIVERY_ENABLED"
 
+# 问数执行服务的目标地址由 worker 入口读取并校验；逐用户适配器只接收入口注入
+# 的值，不直接读取环境变量。scheduler 侧沿用同名变量，但不在本处改变其语义。
+QUERY_MCP_ENDPOINT_ENV_VAR = "LINGXI_QUERY_MCP_ENDPOINT"
+
 
 class WorkerConfigError(ValueError):
     """配置不合法。启动即失败，不留到会话建立之后。"""
@@ -208,6 +212,10 @@ class WorkerConfig:
     # 持有工具名字面量（唯一事实来源是 document_delivery.DELIVER_DOCUMENT_
     # TOOL_NAME）。
     document_delivery_enabled: bool = False
+    # 入口校验后的完整 HTTPS URL；保留路径，适配器只用 scheme + host + port
+    # 做同源判定。正式配置必须经 load_config 注入；空值仅兼容旧的直接构造测试，
+    # 不会由入口放行。
+    query_mcp_endpoint: str = ""
 
     def __post_init__(self) -> None:
         """校验直接构造路径与 loader 路径共用的启动期不变量。"""
@@ -240,6 +248,8 @@ class WorkerConfig:
             mode_label="output_safety_canary",
             prompt_label="system_prompt",
         )
+        if self.query_mcp_endpoint:
+            _validate_query_mcp_endpoint(self.query_mcp_endpoint)
 
 
 def _require_worker_env_vars(env: Mapping[str, str], *, require_question: bool) -> None:
@@ -281,6 +291,7 @@ def _build_worker_config(
     system_prompt_file: str | None,
     content_capture_enabled: bool,
     content_capture_misconfigured: bool,
+    query_mcp_endpoint: str,
 ) -> WorkerConfig:
     return WorkerConfig(
         question=_text(env, "QUESTION") or "",
@@ -288,6 +299,7 @@ def _build_worker_config(
         trace_id=_validated_trace_id(_text(env, "TRACE_ID")),
         max_turns=_max_turns(_text(env, "MAX_TURNS")),
         turn_timeout_seconds=_turn_timeout(_text(env, "TURN_TIMEOUT_SECONDS")),
+        query_mcp_endpoint=query_mcp_endpoint,
         drain_grace_seconds=_drain_grace(_text(env, "DRAIN_GRACE_SECONDS")),
         audit_input_fields=_names(env, "AUDIT_INPUT_FIELDS"),
         failure_text_markers=_failure_markers(env),
@@ -342,6 +354,7 @@ def load_config(
     用"：非法 JSON 不会拒绝启动，合法值也不会有一份共享令牌驻留进程内存。
     """
     _require_worker_env_vars(env, require_question=require_question)
+    query_mcp_endpoint = _query_mcp_endpoint(env)
     system_prompt = _text(env, "SYSTEM_PROMPT")
     system_prompt_file = _system_prompt_file(env)
     _validate_prompt_source_exclusivity(
@@ -355,6 +368,7 @@ def load_config(
         system_prompt_file=system_prompt_file,
         content_capture_enabled=content_capture_enabled,
         content_capture_misconfigured=content_capture_misconfigured,
+        query_mcp_endpoint=query_mcp_endpoint,
     )
 
 
@@ -364,6 +378,42 @@ def _text(env: Mapping[str, str], name: str) -> str | None:
         return None
     value = value.strip()
     return value or None
+
+
+def _query_mcp_endpoint(env: Mapping[str, str]) -> str:
+    """读取并严格校验问数 MCP 目标地址，失败关闭且不回显地址。"""
+
+    raw = env.get(QUERY_MCP_ENDPOINT_ENV_VAR)
+    if not isinstance(raw, str) or not raw.strip():
+        raise WorkerConfigError(f"{QUERY_MCP_ENDPOINT_ENV_VAR} 缺失")
+    _validate_query_mcp_endpoint(raw)
+    return raw
+
+
+def _validate_query_mcp_endpoint(value: str) -> None:
+    """要求完整 HTTPS URL，拒绝空主机、用户信息、片段、空白和非法端口。"""
+
+    from urllib.parse import urlsplit
+
+    if any(character.isspace() for character in value):
+        raise WorkerConfigError(f"{QUERY_MCP_ENDPOINT_ENV_VAR} 无效：地址含空白")
+    try:
+        parts = urlsplit(value)
+        hostname = parts.hostname
+        username = parts.username
+        password = parts.password
+        port = parts.port
+    except (TypeError, ValueError):
+        raise WorkerConfigError(f"{QUERY_MCP_ENDPOINT_ENV_VAR} 无效：地址解析失败") from None
+    if parts.scheme.casefold() != "https":
+        raise WorkerConfigError(f"{QUERY_MCP_ENDPOINT_ENV_VAR} 无效：地址必须使用 HTTPS")
+    if not hostname:
+        raise WorkerConfigError(f"{QUERY_MCP_ENDPOINT_ENV_VAR} 无效：地址缺少主机名")
+    if username is not None or password is not None:
+        raise WorkerConfigError(f"{QUERY_MCP_ENDPOINT_ENV_VAR} 无效：地址含用户信息")
+    if "#" in value:
+        raise WorkerConfigError(f"{QUERY_MCP_ENDPOINT_ENV_VAR} 无效：地址含片段")
+    del port
 
 
 def _parse_readonly_tool_values(raw: str) -> tuple[str, ...]:
