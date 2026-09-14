@@ -91,6 +91,7 @@ FAILURE_CODES = frozenset(
         "downgrade_refused",
         "external_change_detected",
         "bundle_digest_mismatch",
+        "installation_receipt_unusable",
         "pre_apply_hook_unsafe",
         "pre_apply_hook_failed",
         "deploy_timeout",
@@ -104,6 +105,7 @@ IMMEDIATE_ALERT_CODES = frozenset(
         "downgrade_refused",
         "external_change_detected",
         "bundle_digest_mismatch",
+        "installation_receipt_unusable",
         "pre_apply_hook_unsafe",
         "pre_apply_hook_failed",
         "deploy_timeout",
@@ -112,6 +114,20 @@ IMMEDIATE_ALERT_CODES = frozenset(
     }
 )
 HEALTHY_CODES = frozenset({"verified", "already_in_place", "already_in_place_external"})
+# 引导安装收据（`<config_root>/deployment-installation.json`）：键集合与六项人工核对项
+# 复制自部署器 `deploy_runtime.Runtime.installation_receipt`，两处必须同形。
+INSTALLATION_RECEIPT_NAME = "deployment-installation.json"
+INSTALLATION_RECEIPT_KEYS = frozenset(
+    {"schema", "environment", "project", "bundle_sha256", "binding_version", "checks"}
+)
+INSTALLATION_RECEIPT_CHECKS = (
+    "sudo_policy",
+    "sshd_policy",
+    "credential_owner",
+    "authorized_peer",
+    "wrong_uid_rejected",
+    "container_peer_rejected",
+)
 ALERT_ENV_KEYS = (
     "LINGXI_FEISHU_APP_ID",
     "LINGXI_FEISHU_APP_SECRET",
@@ -177,8 +193,8 @@ def _check_cli_path(path: Path) -> Path:
     return path
 
 
-def _read_json(path: Path, *, private: bool) -> object:
-    """以不跟随链接的方式读取受控 JSON；错误不回显路径内容。"""
+def _read_json_bytes(path: Path, *, private: bool) -> bytes:
+    """以不跟随链接的方式读取受控 JSON 的原始字节；错误不回显路径内容。"""
     try:
         fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
     except OSError:
@@ -194,14 +210,23 @@ def _read_json(path: Path, *, private: bool) -> object:
             raise AgentError("json_file_permissions")
         with os.fdopen(fd, "rb", closefd=False) as stream:
             raw = stream.read(1024 * 1024 + 1)
-        if len(raw) > 1024 * 1024:
-            raise AgentError("json_file_too_large")
-        try:
-            return json.loads(raw)
-        except (UnicodeDecodeError, json.JSONDecodeError):
-            raise AgentError("json_file_invalid") from None
     finally:
         os.close(fd)
+    if len(raw) > 1024 * 1024:
+        raise AgentError("json_file_too_large")
+    return raw
+
+
+def _parse_json(raw: bytes) -> object:
+    try:
+        return json.loads(raw)
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        raise AgentError("json_file_invalid") from None
+
+
+def _read_json(path: Path, *, private: bool) -> object:
+    """以不跟随链接的方式读取受控 JSON；错误不回显路径内容。"""
+    return _parse_json(_read_json_bytes(path, private=private))
 
 
 def _private_directory(path: Path, *, create: bool = False) -> None:
@@ -244,6 +269,85 @@ def _atomic_write(path: Path, value: object) -> None:
     finally:
         if "temporary" in locals():
             Path(temporary).unlink(missing_ok=True)
+
+
+def _replace_private_file(path: Path, data: bytes) -> None:
+    """在 root 保护的目录里以 0600 原子替换一份私有文件并同步目录。
+
+    与 ``_atomic_write`` 的区别只在目录判定：配置根按引导安装约定是 root 属主、无组 /
+    其他写权限的 0750 目录，不是状态账那种 0700 私有目录。
+    """
+    parent = path.parent
+    try:
+        info = parent.lstat()
+    except OSError:
+        raise AgentError("installation_receipt_write_failed") from None
+    if (
+        stat.S_ISLNK(info.st_mode)
+        or not stat.S_ISDIR(info.st_mode)
+        or info.st_uid != os.geteuid()
+        or info.st_mode & 0o022
+    ):
+        raise AgentError("installation_receipt_write_failed")
+    try:
+        fd, temporary = tempfile.mkstemp(prefix=".pending-", dir=parent)
+        os.fchmod(fd, 0o600)
+        with os.fdopen(fd, "wb") as stream:
+            stream.write(data)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, path)
+        directory_fd = os.open(parent, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
+    except OSError:
+        raise AgentError("installation_receipt_write_failed") from None
+    finally:
+        if "temporary" in locals():
+            Path(temporary).unlink(missing_ok=True)
+
+
+def _usable_installation_receipt(host: dict, receipt: object) -> dict:
+    """引导安装收据只有形状完整、环境与项目相符、六项人工核对全为真时才可沿用。
+
+    六项 ``checks`` 与 ``binding_version`` 由人在引导安装时写定，代理只核对、不改写；
+    不符就拒绝本轮，不替人把「未做」写成已做。
+    """
+    if (
+        not isinstance(receipt, dict)
+        or set(receipt) != INSTALLATION_RECEIPT_KEYS
+        or receipt["schema"] != 1
+        or not isinstance(receipt["bundle_sha256"], str)
+        or not SHA256.fullmatch(receipt["bundle_sha256"])
+        or type(receipt["binding_version"]) is not int
+        or receipt["binding_version"] < 1
+    ):
+        raise AgentError("installation_receipt_shape")
+    if receipt["environment"] != host["environment"] or receipt["project"] != host["project"]:
+        raise AgentError("installation_receipt_environment")
+    if receipt["checks"] != {name: True for name in INSTALLATION_RECEIPT_CHECKS}:
+        raise AgentError("installation_receipt_checks")
+    return receipt
+
+
+def refresh_installation_receipt(host: dict, bundle_sha256: str) -> tuple[dict, bool]:
+    """新控制包装好后把收据的 ``bundle_sha256`` 刷成新包摘要，返回收据与是否改写。
+
+    部署器 apply 前要求收据的 ``bundle_sha256`` 等于目标新版本的控制包摘要；无人值守
+    时只有代理装新包，所以这一个字段由代理随新包刷新。改写前先把旧收据原样备份到
+    同目录 ``deployment-installation.json.prev``，再以 0600 原子替换；其余字段原样保留。
+    """
+    path = Path(host["config_root"]) / INSTALLATION_RECEIPT_NAME
+    raw = _read_json_bytes(path, private=True)
+    receipt = _usable_installation_receipt(host, _parse_json(raw))
+    if receipt["bundle_sha256"] == bundle_sha256:
+        return receipt, False
+    refreshed = dict(receipt, bundle_sha256=bundle_sha256)
+    _replace_private_file(path.with_name(path.name + ".prev"), raw)
+    _replace_private_file(path, canonical(refreshed))
+    return refreshed, True
 
 
 def _base_state(host: dict) -> dict:
@@ -972,7 +1076,7 @@ def _read_public_material(path: Path) -> dict:
 def _host_materials(host: dict, config: dict) -> tuple[dict, dict, dict]:
     """从既有安装收据、binding 和 relay 收集计划所需的非秘密通道事实。"""
     root = Path(host["config_root"])
-    installation = _read_json(root / "deployment-installation.json", private=True)
+    installation = _read_json(root / INSTALLATION_RECEIPT_NAME, private=True)
     binding = _read_public_material(root / "innertest" / "binding.json")
     current = Path(host["relay_root"]) / "current"
     if not current.is_symlink():
@@ -1032,16 +1136,23 @@ def _build_request(
     source: str,
     previous: dict | None,
     deploy_timeout_seconds: int,
+    installation: dict,
 ) -> dict:
+    """组装部署请求；收据指纹与绑定版本一律取自刚刷新的安装收据，不沿用旧计划的值。"""
     if previous is not None:
         resources = dict(previous["resources"])
         channel = dict(previous["channel"])
         recovery = dict(previous["recovery"])
         recovery["target_manifest_sha256"] = fingerprint(old)
         recovery["config_sha256"] = fingerprint(public_config)
+        # 收据每装一个新包就变一次；旧计划里的指纹对应的是上一版的收据。
+        channel["installation_receipt_sha256"] = fingerprint(installation)
+        channel["binding_version"] = installation["binding_version"]
     else:
-        installation, binding, relay = _host_materials(host, public_config)
+        on_disk, binding, relay = _host_materials(host, public_config)
         del binding
+        if on_disk != installation:
+            raise AgentError("deployment_materials_unavailable")
         channel = relay["channel"]
         package_size = sum(path.stat().st_size for path in package_paths.values())
         resources = {
@@ -1508,12 +1619,17 @@ def _finish(  # noqa: PLR0913
     release_record: dict | None = None,
     deployed_tag: str | None = None,
     verified_digests: dict[str, str] | None = None,
-    remember_target: bool = True,
+    remember_target: bool = False,
 ) -> int:
     """收口一轮：写状态账并按结果码告警。
 
-    ``deployed_tag`` 只会抬高、不会降低状态账的最高已部署版本；降级拒绝时它同时进入
-    去重键和正文。``remember_target=False`` 让被拒目标不覆盖状态账里已在位的目标。
+    状态账的 ``target_tag`` / ``release_url`` 只在本轮写出 ``verified``（部署器 status、
+    外部在位、状态账级在位复核通过）时才推进到目标，即 ``remember_target=True``；任何失败
+    或未知结果都默认不推进，状态账仍指向已在位的目标——否则下一轮会把「目标 == target_tag
+    且 verified」误判成在位，新目标被静默跳过。``deployed_tag`` / ``verified_digests``
+    同样只由 ``verified`` 路径传入：前者只会抬高、不会降低最高已部署版本，降级拒绝时它同时
+    进入去重键和正文。计划 / 批准落盘时 ``_checkpoint`` 已记下的可接续身份（``target_tag`` /
+    ``plan_id`` / ``deployer_state``）不在此列，本函数不会撤销它们。
     """
     next_state = dict(state)
     next_state.update(
@@ -1689,7 +1805,6 @@ def _refuse_downgrade(
         tag=tag,
         release_url=release_url,
         deployed_tag=deployed_tag,
-        remember_target=False,
     )
 
 
@@ -1746,6 +1861,7 @@ def _recheck_verified_target(
             deployer_state="verified",
             deployed_tag=tag,
             verified_digests=expected,
+            remember_target=True,
         )
     _log("idempotence", "external_change_detected", tag=tag, release_url=release_url)
     return _finish(
@@ -1869,6 +1985,7 @@ def _run_locked(
                 release_record=release_audit,
                 deployed_tag=tag,
                 verified_digests=_expected_digests(configured_manifest),
+                remember_target=True,
             )
         if continuing:
             old_manifest = previous.get("old") if isinstance(previous, dict) else None
@@ -2017,6 +2134,37 @@ def _run_locked(
             plan = previous
             _log("continuation", "apply_same_plan", tag=tag, plan_id=plan["id"])
         else:
+            # 新包已核对并安装：先把安装收据的 bundle_sha256 刷成新包摘要，再 plan。
+            # 收据缺失、形状不符、六项人工核对不全为真或环境不符都不 plan，状态账
+            # 仍指向已在位的目标，由人按引导安装 runbook 修正收据。
+            try:
+                installation, refreshed = refresh_installation_receipt(
+                    host, configured_manifest["control_bundle"]["sha256"]
+                )
+            except AgentError as error:
+                _log(
+                    "installation_receipt",
+                    "installation_receipt_unusable",
+                    tag=tag,
+                    release_url=release_url,
+                    reason=error.code,
+                )
+                return _finish(
+                    state,
+                    host,
+                    config,
+                    state_directory,
+                    result="installation_receipt_unusable",
+                    stage="installation_receipt",
+                    tag=tag,
+                    release_url=release_url,
+                )
+            _log(
+                "installation_receipt",
+                "refreshed" if refreshed else "unchanged",
+                tag=tag,
+                bundle_sha256=installation["bundle_sha256"],
+            )
             try:
                 old_package = None
                 if (
@@ -2062,6 +2210,7 @@ def _run_locked(
                     host["approval_sources"][0],
                     previous,
                     config["deploy_timeout_seconds"],
+                    installation,
                 )
                 request_path = _write_request(state_directory, request)
                 raw_plan = _invoke_deployer(
@@ -2271,6 +2420,7 @@ def _run_locked(
             release_record=release_audit,
             deployed_tag=tag if verified else None,
             verified_digests=_expected_digests(configured_manifest) if verified else None,
+            remember_target=verified,
         )
 
 
