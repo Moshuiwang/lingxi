@@ -10,7 +10,7 @@ main 持续研发，功能范围齐备时从明确提交创建 `release/X.Y`，�
 
 预发布附件 `release-manifest.json` 的新 schema 2 保存源码、四镜像摘要、迁移头、构建记录和非秘密控制包摘要；`lingxi-control.tar` 在同一候选提交只打包一次，包索引 schema revision 1 精确列出文件、权限、来源和摘要。上传中断可继续，既有不同内容不覆盖。正式版本标签和附件发布后不得改写；有变更建立新候选。
 
-候选与正式版 Release 都带三个附件：`release-manifest.json`、`lingxi-control.tar`、`control-index.json`。第三个是 tar 内嵌索引的逐字节副本，摘要等于清单的 `index_sha256`，由发布脚本从包内读出后上传，供拉取代理在解包前核对；缺任一附件，拉取代理都不会安装该版本。
+候选与正式版 Release 都带三个附件：`release-manifest.json`、`lingxi-control.tar`、`control-index.json`。第三个是 tar 内嵌索引的逐字节副本，摘要等于清单的 `index_sha256`，由发布脚本从包内读出后上传，供拉取代理在解包前核对；缺 tar 或清单不安装；缺 `control-index.json` 附件时（发布流程补传该附件之前发布的版本，Release 不可变、无法补传）以 tar 内嵌索引为准——同一 `index_sha256` 钉住，包摘要、索引摘要与逐文件核对一项不减。
 
 ## 验收后提升
 
