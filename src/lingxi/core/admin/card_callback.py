@@ -53,6 +53,7 @@ from lingxi.core.admin.notification import (
     AdminCardTransport,
     GroupNotifier,
     describe_failed_reason,
+    describe_galaxy_retention,
     permission_scope_ids,
     render_card_payload,
     render_group_notice,
@@ -510,8 +511,11 @@ def _outcome_text(pending: PendingAction) -> str:
         if pending.action_type is PendingActionType.INNERTEST_ADDITIONS:
             return "已加入内测资格，开通结果请逐人查询"
         # 数据库事务已记录，但重算/发布由后台队列异步完成；不能把「已记录」
-        # 误报为「即时生效」。完成后由后台回调把原管理卡刷新为最终状态。
-        return "操作已记录，权限正在下发"
+        # 误报为「即时生效」。完成后由后台回调把原管理卡刷新为最终状态。撤销
+        # 再带一句银河来源回显：撤掉的只是本地行，用户经银河仍持有的项不受影响。
+        retention = describe_galaxy_retention(pending)
+        recorded = "操作已记录，权限正在下发"
+        return f"{recorded}；{retention}" if retention else recorded
     if pending.status is PendingActionStatus.CANCELLED:
         return "已取消"
     if pending.status is PendingActionStatus.EXPIRED:

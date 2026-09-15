@@ -234,6 +234,16 @@ REQUIRED_MODULES = (
     # wheel 里没有这个模块"正是 V-部署-10 要挡的形状。
     "lingxi.core.innertest_content_capture",
     "lingxi.adapters.postgres_content_capture",
+    # 内容留存共用的凭据形状过滤：从内测采集模块搬出的纯函数，内测采集与问答留存语料
+    # 两条通道共用一份判据；由 core.innertest_content_capture 模块级 import。
+    "lingxi.core.content_redaction",
+    # 问答留存语料（合同「数据保留与删除」第三条例外）：记录形状与构造在 core，落库在
+    # adapters，worker 侧记录器按开关装配（见下面 PROCESS_RUNTIME_IMPORTS 的 worker 闭包）。
+    # 同两个模块的读取侧（检索 / 分批导出 / 容量 / 窄读取角色表）只被随 scheduler 镜像
+    # 运行的 `scripts/ops/qa_corpus.py` 在函数内 import，没有进程模块级 import——与
+    # outreach 那条受控运行脚本同一形状，制品少了它们脚本才会发现。
+    "lingxi.core.qa_corpus",
+    "lingxi.adapters.postgres_qa_corpus",
     # 同一张表的**到期删除**侧（对抗审查 2026-09-02 C-7）：由 lingxi-scheduler 的
     # 保留清理职责在函数内 import。刻意与写入侧分成两个模块——写入侧要
     # `ContentCaptureRecord`，那个类会把整个 `core.execution` 拉进 scheduler 的
@@ -243,6 +253,10 @@ REQUIRED_MODULES = (
     # queue_failure_notice）的九十天到期处置：同样由 lingxi-scheduler 的清理职责在
     # 函数内 import，制品少了它这条清理职责会在第一轮就抛 ImportError。
     "lingxi.adapters.postgres_carrier_retention",
+    # 运营操作的持久审计账：载体清理的待确认操作那一面在函数内 import 它做到期删除，
+    # 它再 import 核心模型；同一条理由——制品少了任一条，清理职责第一轮就抛 ImportError。
+    "lingxi.adapters.postgres_operation_audit",
+    "lingxi.core.admin.operation_audit",
     # 年份接地护栏第二层（Issue #326 批次 5 卡 E）：纯逻辑判定在 core，由
     # apps/worker/service.py 模块级 import（见下面 PROCESS_RUNTIME_IMPORTS 的
     # worker 闭包）——"本地测试全绿但 wheel 里没有这个模块"同样是 V-部署-10
@@ -280,6 +294,9 @@ REQUIRED_MODULES = (
     # 顶层 import 它，随它同一条发布理由，见下面 scheduler/gateway 闭包同名注释。
     "lingxi.adapters.postgres_local_permission_import",
     "lingxi.core.permission.merge_sources",
+    # 撤销回执「经银河来源仍持有 K 项」的纯计数：`adapters/admin_registry.py` 模块级
+    # import 它构造银河指标映射，随管理查询口进 scheduler 与 gateway 两个闭包。
+    "lingxi.core.permission.galaxy_retention",
     # 存量用户首聊差集导入的纯逻辑（rc25 S-1，Issue #540）：开通编排、每日/定向重算
     # 与本地覆盖适配器都消费它（见下面 scheduler/gateway 闭包）；开通链的两步编排
     # （翻译一次 + 导入）从 onboarding_runner 拆出（体量棘轮）。
@@ -427,6 +444,8 @@ REQUIRED_MODULES = (
     "lingxi.apps.worker.service",
     # service.py 拆分（#592 B-1）：端口协议、巡检、终态审计与内容采集。
     "lingxi.apps.worker.content_capture",
+    # 问答留存语料的旁路记录器，与内容采集记录器并存，由 service.py 模块级 import。
+    "lingxi.apps.worker.qa_corpus_capture",
     "lingxi.apps.worker.progress_reporting",
     "lingxi.apps.worker.housekeeping",
     "lingxi.apps.worker.service_ports",
@@ -582,6 +601,17 @@ REQUIRED_MODULES = (
     "lingxi.adapters.innertest_socket",
     "lingxi.adapters.innertest_socket_path",
     "lingxi.adapters.innertest_probe",
+    # 受限通道的 Agent 客户端切片：只读三工具的纯逻辑（core）、只读查询适配（adapters）
+    # 与 scheduler 侧装配工厂；`wire_innertest` 函数内 import 工厂，理由同上。
+    "lingxi.core.admin.restricted_tools",
+    "lingxi.adapters.restricted_admin_queries",
+    "lingxi.apps.scheduler.restricted_admin",
+    # 五种写动作的准备工具：转译成命令文本交管理命令路由（adapters），发卡意图经持久
+    # 阶段由 gateway 直发本人（scheduler 侧登记口 + gateway 侧分派发卡器）；三者都由
+    # 装配函数在函数内 import。
+    "lingxi.adapters.restricted_admin_prepare",
+    "lingxi.adapters.followup_confirm_card_sender",
+    "lingxi.adapters.admin_confirmation_card",
     "lingxi.adapters.postgres_admin_followup",
     "lingxi.adapters.postgres_admin_followup_confirmation",
     "lingxi.adapters.postgres_admin_followup_projection",
@@ -680,6 +710,18 @@ PROCESS_RUNTIME_IMPORTS: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {
             "lingxi.adapters.postgres_pending_action_execution",
             "lingxi.apps.innertest",
             "lingxi.apps.scheduler.innertest",
+            "lingxi.apps.scheduler.restricted_admin",
+            "lingxi.adapters.restricted_admin_queries",
+            "lingxi.core.admin.restricted_tools",
+            # 准备工具把管理命令路由（此前只有 gateway 装配）引进 scheduler 的运行时闭包：
+            # 命令解析、路由与文本渲染三件核心模块，加上持久阶段发卡口。
+            "lingxi.adapters.restricted_admin_prepare",
+            "lingxi.adapters.followup_confirm_card_sender",
+            "lingxi.core.admin.commands",
+            "lingxi.core.admin.followup_render",
+            "lingxi.core.admin.router",
+            "lingxi.core.admin.router_ports",
+            "lingxi.core.admin.router_render",
             "lingxi.core.admin.followup_consumer",
             "lingxi.core.admin.followup_effect",
             "lingxi.core.admin.followup_renewal",
@@ -792,6 +834,10 @@ PROCESS_RUNTIME_IMPORTS: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {
             # 四个内容载体的九十天到期处置：`_build_carrier_retention_duty` 函数内
             # import，与上一条同一理由。
             "lingxi.adapters.postgres_carrier_retention",
+            # 运营审计账的到期删除挂在上一条的待确认操作事务里（函数内 import），
+            # 其核心模型随之进闭包；理由见 REQUIRED_MODULES 同名条目。
+            "lingxi.adapters.postgres_operation_audit",
+            "lingxi.core.admin.operation_audit",
             "lingxi.apps.scheduler.roster_audit",
             "lingxi.apps.scheduler.daily_report",
             # 理由见 REQUIRED_MODULES 同名条目：进程入口模块级 import 它。
@@ -831,6 +877,9 @@ PROCESS_RUNTIME_IMPORTS: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {
             "lingxi.adapters.postgres_local_permission",
             "lingxi.adapters.postgres_local_permission_import",
             "lingxi.core.permission.merge_sources",
+            # 撤销回执的银河来源计数：`adapters.admin_registry` 模块级 import（理由见
+            # REQUIRED_MODULES 同名条目）。
+            "lingxi.core.permission.galaxy_retention",
             "lingxi.core.permission.decision_chain",
             # 逐用户权限决策树：`permission_refresh.py` 模块级 import（理由见
             # REQUIRED_MODULES 同名条目）。
@@ -1091,6 +1140,11 @@ PROCESS_RUNTIME_IMPORTS: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {
             "lingxi.apps.worker.report",
             "lingxi.apps.worker.turn",
             "lingxi.apps.worker.content_capture",
+            # 问答留存语料：记录器由 service.py 模块级 import，记录模型与落库适配器
+            # 分别由 service_ports.py / cli.py 模块级 import；写入只在开关开启时发生。
+            "lingxi.apps.worker.qa_corpus_capture",
+            "lingxi.core.qa_corpus",
+            "lingxi.adapters.postgres_qa_corpus",
             "lingxi.apps.worker.progress_reporting",
             "lingxi.apps.worker.housekeeping",
             "lingxi.apps.worker.service",
@@ -1204,6 +1258,8 @@ PROCESS_RUNTIME_IMPORTS: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {
             # apps.worker.service/apps.worker.cli 模块级 import。
             "lingxi.core.innertest_content_capture",
             "lingxi.adapters.postgres_content_capture",
+            # 内容留存共用的凭据形状过滤，由 core.innertest_content_capture 模块级 import。
+            "lingxi.core.content_redaction",
             # 年份接地护栏第二层（Issue #326 批次 5 卡 E）：由 apps/worker/
             # service.py 模块级 import，import 本身不依赖开关；运行时检测仅在
             # 内容采集开启（content_capture_writer 非空）时才会被调用执行。
@@ -1228,6 +1284,14 @@ PROCESS_RUNTIME_IMPORTS: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {
             "lingxi.adapters.innertest_confirmation_card",
             "lingxi.adapters.postgres_identity",
             "lingxi.adapters.postgres_innertest",
+            # 扩员的确认 / 取消 / 拒绝在 gateway 的卡片回调事务里落运营审计账
+            # （`postgres_innertest._audit` 模块级 import 写口与核心模型）。
+            "lingxi.adapters.postgres_operation_audit",
+            "lingxi.core.admin.operation_audit",
+            # 五种写动作的确认卡由持久阶段分派发出（`apps/gateway/innertest.py` 函数内
+            # import 发卡器）；确认事务写账目终态行时用到核心投影。
+            "lingxi.adapters.admin_confirmation_card",
+            "lingxi.core.admin.restricted_tools",
             "lingxi.adapters.postgres_innertest_confirmation",
             "lingxi.adapters.postgres_innertest_locator",
             "lingxi.adapters.postgres_innertest_roster",
@@ -1408,6 +1472,9 @@ PROCESS_RUNTIME_IMPORTS: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {
             "lingxi.adapters.galaxy_import",
             "lingxi.core.permission.account_match",
             "lingxi.core.permission.merge_sources",
+            # 撤销回执的银河来源计数：`adapters.admin_registry` 模块级 import（理由见
+            # REQUIRED_MODULES 同名条目）。
+            "lingxi.core.permission.galaxy_retention",
             # 存量差集导入纯逻辑（rc25 S-1）：随 `adapters.postgres_local_permission`、
             # `core.permission.targeted_recompute` 进入 gateway 闭包。
             "lingxi.core.permission.legacy_diff",

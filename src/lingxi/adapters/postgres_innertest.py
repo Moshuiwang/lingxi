@@ -5,11 +5,50 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 
+from lingxi.adapters.admin_registry import admin_registry_entry_from_row
 from lingxi.adapters.innertest_request import connect
 from lingxi.adapters.postgres_admin_followup import enqueue_followups
+from lingxi.adapters.postgres_operation_audit import record_operation_audit
 from lingxi.core.admin.followup import FollowupSpec
 from lingxi.core.admin.innertest import InnertestError, envelope, normalized_intent, target_digest
+from lingxi.core.admin.operation_audit import (
+    PHASES_REQUIRING_DECIDER,
+    EntryPoint,
+    OperationAuditEntry,
+    OperationPhase,
+)
 from lingxi.core.ids import new_id
+
+#: 扩员在运营审计账上的操作名与目的码；批次号即操作号，各阶段靠它关联。
+OPERATION_INNERTEST_ADDITIONS = "innertest.additions"
+PURPOSE_INNERTEST_ADDITIONS = "innertest_additions"
+
+#: 窄表 ``innertest_audit`` 的动作名到运营审计账阶段的映射：确认卡点击「执行」在账上是
+#: 「已确认」（真正的执行是 scheduler 后台阶段逐人记的），过期与失效都是「已拒绝」。
+_OPERATION_PHASES = {
+    "prepared": OperationPhase.PREPARED,
+    "executed": OperationPhase.CONFIRMED,
+    "cancelled": OperationPhase.CANCELLED,
+    "expired": OperationPhase.REJECTED,
+    "failed": OperationPhase.REJECTED,
+}
+
+
+def admin_roles_snapshot(connection, open_id):
+    """判定时刻的角色快照：在调用方事务内现读登记表，没有 active 条目就是空集。
+
+    审计行记的是「此刻登记表上是什么」，不从「刚才闸门放行了」反推：两者只在角色被
+    收回的那一瞬间不同，而那正是审计最该如实记下的时刻。
+    """
+    with connection.cursor() as cursor:
+        cursor.execute(
+            "SELECT feishu_open_id,label,permission_admin_granted,ops_admin_granted,"
+            "super_admin_granted,entry_status FROM admin_registry "
+            "WHERE feishu_open_id=%s AND entry_status='active'",
+            (open_id,),
+        )
+        row = cursor.fetchone()
+    return frozenset() if row is None else admin_registry_entry_from_row(row).roles
 
 
 @dataclass(frozen=True)
@@ -197,7 +236,15 @@ class PostgresInnertestService:
                     FollowupSpec(subject_key=batch, stage="confirmation_card_send", batch_id=batch),
                 ),
             )
-        self._audit(connection, batch, principal.open_id, trace, "prepared")
+        self._audit(
+            connection,
+            batch,
+            principal.open_id,
+            trace,
+            "prepared",
+            target_count=len(targets),
+            target_digest="sha256:" + target_digest(targets),
+        )
         return self._batch_view(connection, principal, batch)
 
     @staticmethod
@@ -226,8 +273,24 @@ class PostgresInnertestService:
         except UniqueViolation as error:
             raise InnertestError("target_has_pending_action") from error
 
-    def _audit(self, connection, batch, subject, trace, action):
-        """持久审计与状态一起提交；外部审计不可用同样回滚。"""
+    def _audit(
+        self,
+        connection,
+        batch,
+        subject,
+        trace,
+        action,
+        *,
+        entry_point=None,
+        target_count=None,
+        target_digest=None,
+    ):
+        """持久审计与状态一起提交；外部审计不可用同样回滚。
+
+        窄表 ``innertest_audit`` 与运营审计账 ``operation_audit`` 双写：前者是扩员自己的
+        阶段账，后者把扩员与预开通、欢迎卡放到同一张具名身份的账上。外部审计出口或
+        运营审计账写不进去都按「审计不可用」整笔回滚——审计记录保存不了，状态就不改变。
+        """
         with connection.cursor() as cursor:
             cursor.execute(
                 "INSERT INTO innertest_audit(id,batch_id,subject,trace_id,action) "
@@ -236,8 +299,59 @@ class PostgresInnertestService:
             )
         try:
             self.audit.record("innertest." + action, batch_id=batch, trace_id=trace)
+            record_operation_audit(
+                connection,
+                self._operation_entry(
+                    connection,
+                    batch,
+                    subject,
+                    trace,
+                    action,
+                    entry_point=entry_point,
+                    target_count=target_count,
+                    target_digest=target_digest,
+                ),
+            )
         except Exception as error:
             raise InnertestError("audit_unavailable") from error
+
+    @staticmethod
+    def _operation_entry(
+        connection, batch, subject, trace, action, *, entry_point, target_count, target_digest
+    ):
+        """把一次阶段变化翻成运营审计账的一行；发起人与待确认动作从批次记录现读。
+
+        ``subject`` 在准备与拒绝阶段是发起人、在确认与取消阶段是点击者（守卫已保证两者
+        是同一位管理员），因此只有需要确认者的阶段才把它写进 ``decided_by``；入口缺省按
+        阶段推断（准备来自受限通道，其余来自确认卡），准备阶段收口旧批次时由调用方指明。
+        """
+        with connection.cursor() as cursor:
+            cursor.execute(
+                "SELECT initiated_by,pending_action_id FROM innertest_batch WHERE id=%s", (batch,)
+            )
+            initiated_by, pending_action_id = cursor.fetchone()
+        phase = _OPERATION_PHASES[action]
+        if entry_point is None:
+            entry_point = (
+                EntryPoint.RESTRICTED_CHANNEL if action == "prepared" else EntryPoint.FEISHU_CARD
+            )
+        return OperationAuditEntry(
+            operation_id=batch,
+            operation=OPERATION_INNERTEST_ADDITIONS,
+            phase=phase,
+            initiated_by=initiated_by,
+            actor_roles=admin_roles_snapshot(connection, subject),
+            entry_point=entry_point,
+            decided_by=subject if phase in PHASES_REQUIRING_DECIDER else None,
+            purpose=PURPOSE_INNERTEST_ADDITIONS,
+            target_kind="batch",
+            target_count=target_count,
+            target_digest=target_digest,
+            result_code=action if phase is OperationPhase.REJECTED else None,
+            evidence_ref="innertest_batch:" + batch,
+            pending_action_id=pending_action_id,
+            trace_id=trace,
+        )
 
     def get_batch(self, principal, *, batch_id=None, request_key=None):
         """只投影本主体/本环境，查询不执行也不重发。"""
@@ -290,6 +404,13 @@ class PostgresInnertestService:
                 (state, now, row[0]),
             )
             cursor.execute("UPDATE innertest_batch SET status=%s WHERE id=%s", (state, row[5]))
-            self._audit(cursor.connection, row[5], principal.open_id, row[6], state)
+            self._audit(
+                cursor.connection,
+                row[5],
+                principal.open_id,
+                row[6],
+                state,
+                entry_point=EntryPoint.RESTRICTED_CHANNEL,
+            )
             return
         raise InnertestError("stale_confirmation")

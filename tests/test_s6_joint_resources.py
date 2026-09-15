@@ -133,6 +133,7 @@ class JointResourcesTests(unittest.TestCase):
                 innertest_socket_path=path,
                 postgres_dsn=DSN,
                 postgres_timeouts=DEFAULT_POSTGRES_TIMEOUTS,
+                metric_map_path=None,
             )
             probe = Mock()
             probe.list_metrics.return_value = 1

@@ -23,6 +23,8 @@ from pathlib import Path
 from typing import Any
 
 from lingxi.adapters.postgres_local_permission import _apply_position_grant_locked
+from lingxi.core.admin.operation_audit import OperationAuditEntry, OperationPhase
+from lingxi.core.admin.registry import ALL_ADMIN_ROLES
 from lingxi.core.permission.position_override import (
     PREPROVISION_OVERRIDE_REASON,
     PREPROVISION_PENDING_ACTION_REASON,
@@ -422,6 +424,23 @@ class PerPersonFailureIsolationTest(unittest.TestCase):
         self.assertIn("未应用", printed, "汇总必须醒目提示，不靠人肉逐行看")
 
 
+class FakeOperationAudit:
+    """假的运营审计账写口：记下每一条条目；``fail_phases`` 里的阶段一律写失败。"""
+
+    def __init__(self, *, fail_phases: frozenset[OperationPhase] = frozenset()) -> None:
+        self.entries: list[OperationAuditEntry] = []
+        self._fail_phases = fail_phases
+
+    def record(self, entry: OperationAuditEntry) -> str:
+        if entry.phase in self._fail_phases:
+            raise ConnectionError("synthetic ledger outage: password=hunter2")
+        self.entries.append(entry)
+        return f"opa_{len(self.entries)}"
+
+    def phases(self) -> list[str]:
+        return [entry.phase.value for entry in self.entries]
+
+
 class CommandLineWritePolarityTest(unittest.TestCase):
     """写入极性：默认只出清单、零写入；`--apply` 才真正执行。"""
 
@@ -440,6 +459,10 @@ class CommandLineWritePolarityTest(unittest.TestCase):
 
         self._patch(TOOL, "resolve_admin_registry_lookup", lambda dsn: object())
         self._patch(TOOL, "initiated_by_is_registered_admin", lambda lookup, open_id: True)
+        # 运营审计账：假写口记录条目；角色快照按三角色全真给（闸门通过时登记表就是这样）。
+        self.ledger = FakeOperationAudit()
+        self._patch(TOOL, "resolve_operation_audit", lambda dsn: self.ledger)
+        self._patch(TOOL, "actor_roles_snapshot", lambda lookup, open_id: ALL_ADMIN_ROLES)
         # `resolve_start_system` 现在返回 (入口, 收尾) 两个可调用：收尾必须被调用一次
         # ——真实装配里 `build_loop` 已经 start() 了开通执行器的线程池（谁建谁清）。
         self.shutdowns: list[int] = []
@@ -591,6 +614,150 @@ class CommandLineWritePolarityTest(unittest.TestCase):
         with redirect_stdout(out), self.assertRaises(SystemExit):
             TOOL.main(["--help"])
         self.assertIn("lingxi-scheduler", out.getvalue())
+
+
+class OperationAuditHookupTest(CommandLineWritePolarityTest):
+    """`--apply` 接入运营审计账：先「已准备」再执行，逐人各一行，账写不进去的两种结局。
+
+    沿用写入极性用例的全部夹具（假登记表、假装配、假审计账），只加断言，不改既有用例。
+    """
+
+    def test_apply_writes_prepared_before_execution_then_one_executed_row_per_person(
+        self,
+    ) -> None:
+        code, out, _ = self._run([*self._argv(self.ROSTER), "--apply"])
+
+        self.assertEqual(code, 0)
+        self.assertEqual(self.ledger.phases(), ["prepared", "executed", "executed", "executed"])
+        prepared, first, second, summary = self.ledger.entries
+        self.assertEqual(prepared.operation, "preprovision.apply")
+        self.assertEqual(prepared.purpose, "preprovision_roster")
+        self.assertEqual(prepared.target_kind, "roster")
+        self.assertEqual(prepared.target_count, 2)
+        self.assertEqual(prepared.target_digest, TOOL.roster_digest(["a@b.com", "c@d.com"]))
+        self.assertEqual(prepared.initiated_by, "ou_admin")
+        self.assertEqual(prepared.actor_roles, ALL_ADMIN_ROLES)
+        self.assertEqual(prepared.entry_point.value, "ops_script")
+        self.assertEqual(
+            {first.operation_id, second.operation_id, summary.operation_id}, {prepared.operation_id}
+        )
+        self.assertEqual((first.result_code, second.result_code), ("provisioned", "provisioned"))
+        self.assertTrue(first.executor.startswith("scheduler-script:preprovision@"))
+        self.assertTrue(first.executor.endswith(":" + prepared.operation_id))
+        self.assertEqual(first.evidence_ref, "trace:" + first.trace_id)
+        self.assertEqual(
+            {call["trace_id"] for call in self.started}, {first.trace_id, second.trace_id}
+        )
+        self.assertEqual(
+            dict(summary.result_counts),
+            {
+                "provisioned": 2,
+                "skipped": 0,
+                "failed": 0,
+                "grant_not_applied": 0,
+                "audit_unrecorded": 0,
+                "total": 2,
+            },
+        )
+        self.assertEqual(summary.result_code, "completed")
+        self.assertIn(prepared.operation_id, out)
+
+    def test_dry_run_and_the_default_mode_write_nothing_to_the_ledger(self) -> None:
+        for argv in (self._argv(self.ROSTER), [*self._argv(self.ROSTER), "--dry-run"]):
+            with self.subTest(argv=argv[-1]):
+                code, _, _ = self._run(argv)
+                self.assertEqual(code, 0)
+                self.assertEqual(self.ledger.entries, [], "不执行的档位一行审计都不该写")
+
+    def test_an_unwritable_prepared_row_exits_two_with_zero_executions(self) -> None:
+        """否定断言：「已准备」写不进去 ⇒ 退出码 2、开通入口零调用、线程池没起。"""
+
+        self.ledger = FakeOperationAudit(fail_phases=frozenset({OperationPhase.PREPARED}))
+        self._patch(TOOL, "resolve_operation_audit", lambda dsn: self.ledger)
+
+        code, _, err = self._run([*self._argv(self.ROSTER), "--apply"])
+
+        self.assertEqual(code, 2)
+        self.assertEqual(self.started, [], "审计账写不进去时一个人都不能执行")
+        self.assertEqual(self.shutdowns, [], "账在装配之前写，被拒时不该起开通执行器线程池")
+        self.assertIn("运营审计账写不进去", err)
+        self.assertIn("ConnectionError", err)
+        self.assertNotIn("hunter2", err, "异常正文不得进输出")
+
+    def test_a_failed_person_row_keeps_the_result_and_exits_three(self) -> None:
+        """逐人行写失败 ⇒ 结果不丢（清单完整、开通已发生）、退出码 3。"""
+
+        self.ledger = FakeOperationAudit(fail_phases=frozenset({OperationPhase.EXECUTED}))
+        self._patch(TOOL, "resolve_operation_audit", lambda dsn: self.ledger)
+
+        code, out, err = self._run([*self._argv(self.ROSTER), "--apply"])
+
+        self.assertEqual(code, 3)
+        self.assertEqual([call["email"] for call in self.started], ["a@b.com", "c@d.com"])
+        self.assertIn("成功 2、跳过 0、失败 0", out)
+        self.assertEqual(self.ledger.phases(), ["prepared"])
+        self.assertIn("逐人未记 2 人", err)
+        self.assertIn("不要据此重跑", err)
+        self.assertNotIn("hunter2", err)
+
+    def test_an_assembly_failure_leaves_a_not_started_row(self) -> None:
+        def explode(dsn: str) -> Any:
+            raise RuntimeError("synthetic assembly failure secret=hunter2")
+
+        self._patch(TOOL, "resolve_start_system", explode)
+
+        code, _, _ = self._run([*self._argv(self.ROSTER), "--apply"])
+
+        self.assertEqual(code, 2)
+        self.assertEqual(self.ledger.phases(), ["prepared", "executed"])
+        self.assertEqual(self.ledger.entries[1].result_code, "not_started:RuntimeError")
+        self.assertNotIn("hunter2", repr(self.ledger.entries))
+
+    def test_person_rows_carry_the_outcome_class_and_reason_but_never_free_text(self) -> None:
+        """逐人结果码只带固定码形状的原因；异常正文、邮箱都进不了账。"""
+
+        class _Skipped:
+            state = "not_authorized"
+            failure_reason = "employment_read_failed_AccessTokenUnavailableError"
+
+        def start_system(*, email: str, **_: Any) -> Any:
+            if email == "a@b.com":
+                raise RuntimeError(f"炸在 {email} password=hunter2")
+            return _Skipped()
+
+        self._patch(TOOL, "resolve_start_system", lambda dsn: (start_system, lambda: None))
+
+        code, _, _ = self._run([*self._argv(self.ROSTER), "--apply"])
+
+        self.assertEqual(code, 0)
+        _, first, second, summary = self.ledger.entries
+        self.assertEqual(first.result_code, "failed_RuntimeError")
+        self.assertEqual(
+            second.result_code, "skipped:employment_read_failed_AccessTokenUnavailableError"
+        )
+        self.assertEqual(summary.result_code, "partial")
+        self.assertEqual(dict(summary.result_counts)["failed"], 1)
+        dumped = repr(self.ledger.entries)
+        self.assertNotIn("hunter2", dumped)
+        self.assertNotIn("a@b.com", dumped)
+
+
+class ResultCodeShapeTest(unittest.TestCase):
+    def test_a_reason_that_is_not_a_fixed_code_is_dropped_not_recorded(self) -> None:
+        self.assertEqual(
+            TOOL.audit_result_code("skipped", "mcp_sync_timeout"), "skipped:mcp_sync_timeout"
+        )
+        self.assertEqual(TOOL.audit_result_code("skipped", None), "skipped")
+        self.assertEqual(TOOL.audit_result_code("skipped", "token=hunter2 secret"), "skipped")
+        self.assertEqual(TOOL.audit_result_code("skipped", "x" * 80), "skipped")
+
+    def test_the_roster_digest_is_order_and_duplicate_insensitive(self) -> None:
+        self.assertEqual(
+            TOOL.roster_digest(["b@x.com", "a@x.com", "a@x.com"]),
+            TOOL.roster_digest(["a@x.com", "b@x.com"]),
+        )
+        self.assertNotEqual(TOOL.roster_digest(["a@x.com"]), TOOL.roster_digest(["b@x.com"]))
+        self.assertRegex(TOOL.roster_digest(["a@x.com"]), r"^sha256:[0-9a-f]{64}$")
 
 
 class _FakeCursor:

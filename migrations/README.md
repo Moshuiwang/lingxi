@@ -11,7 +11,7 @@
 | 当前事实 | 值 |
 | --- | --- |
 | 基线 revision（链首） | `20260806_baseline` |
-| head revision | `0096_plpgsql_search_path` |
+| head revision | `0098_qa_corpus` |
 | 配置文件 | 仓库根目录 `alembic.ini` |
 | revision 目录 | `migrations/alembic/versions/` |
 | 连接串环境变量 | `LINGXI_MIGRATION_DSN`（缺失即失败，无默认值） |
@@ -846,3 +846,7 @@ OAuth 路径已被 2026-07-28 决策排除；它们此前**不属于生产链**�
 ## `0096_plpgsql_search_path`（函数搜索路径固定与清理函数匿名执行权收回）
 
 [Issue #661](https://github.com/Moshuiwang/lingxi/issues/661)。`public` 下 21 个 PL/pgSQL 函数里 19 个此前没有固定 `search_path`（基线内嵌 4 个、`0054`–`0095` 逐条新增 15 个），触发器函数按调用会话的搜索路径解析未限定的表名，会话能改自己的 `search_path` 就能把 `feishu_delegated_subject` 这类名字指到别的表。本 revision 给 19 个函数逐个 `SET search_path = pg_catalog, pg_temp`：函数体只用 NEW / OLD 与内置函数的 14 个用 `ALTER FUNCTION`，定义原文不动；函数体里有未限定表引用的 5 个（`app_user_reject_delegated_subject`、`credential_reject_app_user_subject`、`feishu_org_sync_run_verify_children`、`app_user_record_real_inbound`、`app_user_adopt_prior_inbound`，共 7 处）用 `CREATE OR REPLACE` 重定义，只给表名加 `public.` 前缀，触发器时机、异常文案、属主、权限全部沿用。另外两件：收回受限清理函数 `public.lingxi_retention_cleanup(timestamptz, integer)` 对 `anon` / `authenticated` 的两条直接 EXECUTE（属主是无登录角色，执行者拿不到 `SET ROLE` 时沿 `0054` 的做法临时授予再按授予方精确收回，前后核对成员关系没有新增），以及撤掉应用创建者 `postgres` 在 `public` 对 FUNCTIONS 默认权限里给这两个角色的 EXECUTE；`service_role`、`lingxi_scheduler` 与属主的权限一律保留。平台角色不存在的库（CI、本机容器）上后两件静默跳过。**不做**：不拆三服务身份、不动平台自己的默认权限、不批量撤权、不消音日志；撤默认权限也不取消内建的 PUBLIC EXECUTE，新建清理类函数仍须显式 `REVOKE … FROM PUBLIC`。降级把 14 个函数 `RESET search_path`、5 个函数按原文重建，并在角色存在的库上按原授予方补回两条直接 EXECUTE 与默认权限两项；不删数据、不依赖表内有没有行。
+
+## `0097_operation_audit`（运营操作的持久审计账）
+
+新表 `operation_audit`：预开通、欢迎卡、内测扩员这类运营操作从此有一张能回答「谁发起、谁确认、谁执行、目的与目标范围、结果、证据指针」的数据库账；此前只有结构化日志，跨进程不可关联。形态是 append-only 事件行——一次操作的各阶段各一行，用 `operation_id` 关联，各进程只 INSERT 不争行锁；表内没有自由文本列，`operation` 是正则 + 长度 CHECK 的开放集合，`phase` / `entry_point` 是封闭集合，confirmed / cancelled 阶段必须有 `decided_by`，executed 阶段必须有 `executor` 与 `result_code`。**不建外键**（`ON DELETE` 动作会以 UPDATE / DELETE 触发行级触发器，与只追加冲突）。两只触发器都在定义语句里固定 `search_path = pg_catalog, pg_temp`：`operation_audit_fix_expiry`（BEFORE INSERT）把 `expires_at` 写死为 `created_at + 2160 小时`，`operation_audit_append_only`（BEFORE UPDATE）一律拒绝。五个索引：按操作号、按时间、到期清理扫描、追溯号与目标用户两个部分索引。它**不是**数据库设计里那张「未建」的分区表 `audit_event`，后者继续未建。到期整行删除接在既有载体清理的待确认操作事务里。降级：表非空即拒绝（应用回退只切镜像不降库）；空表时删表并删两只触发器函数，完整逆转。

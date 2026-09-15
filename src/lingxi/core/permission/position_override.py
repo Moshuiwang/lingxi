@@ -8,7 +8,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping, Sequence
+from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
 
 ALL_COMPANIES_SCOPE = "*"
@@ -140,6 +140,21 @@ class PositionGrantPlan:
     override_reason: str = PREPROVISION_OVERRIDE_REASON
 
 
+def split_missing_pairs(
+    requested: Iterable[tuple[str, str]], existing: Iterable[tuple[str, str]]
+) -> tuple[tuple[tuple[str, str], ...], tuple[tuple[str, str], ...]]:
+    """把一笔补充授权要写的公司×指标对分成「尚未持有」与「已持有」两组。
+
+    本地补充库内部重叠按差集补齐：只登记缺的那几项，已持有的原组保留、不重复登记。
+    两组都按请求顺序去重保序；``existing`` 是该用户当前生效的同方向行。
+    """
+    held = {(str(company), str(metric)) for company, metric in existing}
+    ordered = tuple(dict.fromkeys((str(company), str(metric)) for company, metric in requested))
+    missing = tuple(pair for pair in ordered if pair not in held)
+    reused = tuple(pair for pair in ordered if pair in held)
+    return missing, reused
+
+
 def build_preprovision_grant_plan(expansion: PositionPermissionExpansion) -> PositionGrantPlan:
     """把一次职位范围展开冻结成预开通预授权计划。
 
@@ -165,4 +180,5 @@ __all__ = [
     "PositionPermissionExpansion",
     "build_preprovision_grant_plan",
     "expand_position_scope",
+    "split_missing_pairs",
 ]

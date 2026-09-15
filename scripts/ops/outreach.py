@@ -66,25 +66,40 @@
 新增列**——它是"这一次运行是谁按下的"，属于运行审计，不是那条消息本身的属性。
 dry-run 与 `--list` 不要求它：这两档不发送任何东西。
 
-退出码：`0` 跑完（逐人结果看清单），`2` **什么都没做**（名单、参数、配置或收件人闸门
-不合格），`3` **发出去了但收尾没做干净**（卡片飞书已经收下却没能记成已送达，或者这一批
-攒下的告警没投递出去）。`3` 与 `2` 必须分开：把"已经发出去了"报成"什么都没做"会让人
-原样重跑，而对已经收到卡片的人重跑不是无害的。
+**两条真发路径都记入运营审计账 `operation_audit`**：收件人闸门之后、构造出站口之前先写
+一行「已准备」（写不进去 → 退出码 2、零发送），随后逐人各一行「已执行」（结果码、用户
+标识、指向 `outreach_message` 的去重键——不含邮箱、姓名与正文），最后一行运行汇总；三类
+行共用本次运行号作为操作号，可事后回读。逐人行或汇总写失败**不改任何人的结局**，只让
+退出码变成 3。dry-run 与 `--list` 一行都不写。
+
+退出码：`0` 跑完（逐人结果看清单），`2` **什么都没做**（名单、参数、配置、收件人闸门或
+运营审计账不合格），`3` **发出去了但收尾没做干净**（卡片飞书已经收下却没能记成已送达、
+这一批攒下的告警没投递出去，或逐人结果没能记进运营审计账）。`3` 与 `2` 必须分开：把
+"已经发出去了"报成"什么都没做"会让人原样重跑，而对已经收到卡片的人重跑不是无害的。
 """
 
 from __future__ import annotations
 
 import argparse
 import csv
+import hashlib
 import logging
 import os
+import re
 import sys
 from collections.abc import Callable, Iterable, Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, TextIO
 
 from lingxi.config.metric_labels import default_metric_labels
+from lingxi.core.admin.operation_audit import (
+    EntryPoint,
+    OperationAuditEntry,
+    OperationPhase,
+    executor_label,
+)
+from lingxi.core.admin.registry import AdminRole
 from lingxi.core.outreach.audience import (
     ACTIVE_PROVISIONING_STATE,
     ENABLED_ACCOUNT_STATE,
@@ -116,6 +131,23 @@ SKIP_NOT_ACTIVE_AT_SEND = "not_active_at_send"
 #: 卡片已经送达飞书、却没能记成已送达时的逐人状态。它**不是** failed：算成失败会让
 #: 人原样重跑，而这个人已经收到卡片了。
 STATUS_DELIVERED_NOT_RECORDED = "delivered_not_recorded"
+
+#: 运营审计账上两档各自的操作名、目的码与目标种类；执行者服务名两档共用。
+OPERATION_NAMES = {
+    OutreachPurpose.APPLY: "welcome_card.apply",
+    OutreachPurpose.PRECHECK: "welcome_card.precheck",
+}
+PURPOSE_CODES = {
+    OutreachPurpose.APPLY: "welcome_card_apply",
+    OutreachPurpose.PRECHECK: "welcome_card_precheck",
+}
+TARGET_KINDS = {OutreachPurpose.APPLY: "user", OutreachPurpose.PRECHECK: "admin_self"}
+EXECUTOR_SERVICE = "scheduler-script:outreach"
+
+#: 逐人结果码里细节段允许的形状；账上没有自由文本列，不合形状的细节宁可不记。
+_RESULT_DETAIL = re.compile(r"^[A-Za-z0-9_.-]{1,55}$")
+#: ``detail`` 是平台消息标识而不是结果码的两种状态：消息标识不进账（去重键已足够定位）。
+_DETAIL_IS_MESSAGE_ID = frozenset({"delivered", STATUS_DELIVERED_NOT_RECORDED})
 
 
 class RosterError(ValueError):
@@ -327,39 +359,179 @@ def run_outreach(
     admin_open_id: str | None,
     run_id: str,
     state_at_send: Callable[[str], tuple[str | None, str | None]] | None = None,
+    ledger: OperationLedger | None = None,
 ) -> list[PersonResult]:
     """**唯一的发送点**：预检与正式发送共用这一条路径，只差 ``purpose`` 与收件人。
 
     逐人失败关闭：任何异常只让这一个人计入 ``failed_<异常类型名>``，其余人照常继续。
     异常正文不记录（可能带邮箱、姓名）。给出 ``state_at_send`` 时，正式发送在每个人
-    真发之前重读一次他的状态。
+    真发之前重读一次他的状态。给出 ``ledger`` 时每个人的结局在运营审计账上各留一行；
+    那一行写不进去不改结局、不中断后面的人，只在账上计数——卡片已经发出去了。
     """
     results: list[PersonResult] = []
+
+    def note(recipient: Recipient, result: PersonResult, dedupe_key: str | None) -> None:
+        results.append(result)
+        if ledger is not None:
+            ledger.record_person(
+                result, target_user_id=recipient.facts.user_id, dedupe_key=dedupe_key
+            )
+
     for recipient in recipients:
         if recipient.plan.audience is None:
-            results.append(
-                PersonResult(recipient.plan.email, "skipped", recipient.plan.skip_reason)
+            note(
+                recipient,
+                PersonResult(recipient.plan.email, "skipped", recipient.plan.skip_reason),
+                None,
             )
             continue
+        dedupe_key = None
         try:
             stale = _state_gate(recipient, purpose=purpose, state_at_send=state_at_send)
             if stale is not None:
-                results.append(PersonResult(recipient.plan.email, "skipped", stale))
+                note(recipient, PersonResult(recipient.plan.email, "skipped", stale), None)
                 continue
             target = build_target(
                 recipient, purpose=purpose, admin_open_id=admin_open_id, run_id=run_id
             )
+            dedupe_key = outreach_dedupe_key(
+                content_key=WELCOME_CONTENT_KEY, purpose=purpose, subject=target.subject
+            )
             outcome = dispatcher.deliver(target, purpose=purpose)
         except OutreachRecordingError as error:
-            results.append(
-                PersonResult(recipient.plan.email, STATUS_DELIVERED_NOT_RECORDED, error.message_id)
+            note(
+                recipient,
+                PersonResult(recipient.plan.email, STATUS_DELIVERED_NOT_RECORDED, error.message_id),
+                dedupe_key,
             )
             continue
         except Exception as error:  # noqa: BLE001 - 逐人失败关闭，见方法文档
-            results.append(PersonResult(recipient.plan.email, f"failed_{type(error).__name__}"))
+            note(
+                recipient,
+                PersonResult(recipient.plan.email, f"failed_{type(error).__name__}"),
+                dedupe_key,
+            )
             continue
-        results.append(_classify(recipient.plan.email, outcome))
+        note(recipient, _classify(recipient.plan.email, outcome), dedupe_key)
     return results
+
+
+def roster_digest(emails: Iterable[str]) -> str:
+    """名单目标集合的摘要：去重、排序后的归一邮箱按行连接取 sha256。
+
+    账上只记摘要不记邮箱：它回答「这次发的是不是那份名单」，而不把人员数据搬进账里。
+    """
+    canonical = "\n".join(sorted(set(emails)))
+    return "sha256:" + hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def audit_result_code(result: PersonResult) -> str:
+    """逐人结局在审计账上的结果码：``<状态>[:<细节码>]``。
+
+    细节是平台消息标识（送达、已送达未记账两种状态）时不记——去重键已经能定位那条
+    记录；细节不是固定码形状时也只记状态：账上没有自由文本列，这是它不会藏住凭据的
+    全部依据。
+    """
+    detail = result.detail
+    if (
+        result.status in _DETAIL_IS_MESSAGE_ID
+        or not detail
+        or not _RESULT_DETAIL.match(detail)
+        or len(result.status) + 1 + len(detail) > 64
+    ):
+        return result.status
+    return f"{result.status}:{detail}"
+
+
+@dataclass
+class OperationLedger:
+    """本次真发在运营审计账上的落笔：操作号（即本次运行号）、发起人、判定时刻的角色快照
+    与名单摘要绑在一起，三类行只补各自的结果。
+
+    ``record_prepared`` 写不进去原样抛出——那是发送前的闸；逐人行与汇总只计数不抛，
+    因为它们记的事已经发生，账没记上不能把它报成没发生。``unrecorded`` 是没写成的行数。
+    """
+
+    sink: Any
+    operation_id: str
+    purpose: OutreachPurpose
+    initiated_by: str
+    actor_roles: frozenset[AdminRole]
+    target_count: int
+    target_digest: str
+    unrecorded: int = field(default=0, init=False)
+
+    def _entry(self, phase: OperationPhase, **fields: Any) -> OperationAuditEntry:
+        return OperationAuditEntry(
+            operation_id=self.operation_id,
+            operation=OPERATION_NAMES[self.purpose],
+            phase=phase,
+            initiated_by=self.initiated_by,
+            actor_roles=self.actor_roles,
+            entry_point=EntryPoint.OPS_SCRIPT,
+            purpose=PURPOSE_CODES[self.purpose],
+            target_kind=TARGET_KINDS[self.purpose],
+            **fields,
+        )
+
+    def _executed(self, **fields: Any) -> OperationAuditEntry:
+        return self._entry(
+            OperationPhase.EXECUTED,
+            executor=executor_label(EXECUTOR_SERVICE, run_id=self.operation_id),
+            **fields,
+        )
+
+    def record_prepared(self) -> None:
+        """「已准备」：责任人与收件人闸门都过了、出站口尚未构造；写不进去就一张卡都不发。"""
+        self.sink.record(
+            self._entry(
+                OperationPhase.PREPARED,
+                target_count=self.target_count,
+                target_digest=self.target_digest,
+            )
+        )
+
+    def record_person(
+        self, result: PersonResult, *, target_user_id: str | None, dedupe_key: str | None
+    ) -> None:
+        """逐人一行：结果码按清单状态，证据指向 ``outreach_message`` 的去重键；不带邮箱。"""
+        self._try(
+            lambda: self._executed(
+                result_code=audit_result_code(result),
+                target_user_id=target_user_id or None,
+                evidence_ref=f"outreach_message:{dedupe_key}" if dedupe_key else None,
+            )
+        )
+
+    def record_run(self, results: Sequence[PersonResult]) -> None:
+        """运行汇总一行：送达 / 此前已送达 / 失败 / 跳过 / 待核实 / 已送达未记账 / 未记账。"""
+        counts = {
+            "delivered": sum(1 for item in results if item.status == "delivered"),
+            "already_delivered": sum(1 for item in results if item.status == "already_delivered"),
+            "failed": sum(1 for item in results if item.status.startswith("failed")),
+            "skipped": sum(1 for item in results if item.status == "skipped"),
+            "unknown": sum(1 for item in results if item.status == "unknown"),
+            "delivered_not_recorded": sum(
+                1 for item in results if item.status == STATUS_DELIVERED_NOT_RECORDED
+            ),
+            "audit_unrecorded": self.unrecorded,
+            "total": len(results),
+        }
+        self._try(
+            lambda: self._executed(
+                result_code="completed" if counts["failed"] == 0 else "partial",
+                result_counts=counts,
+                target_count=self.target_count,
+                target_digest=self.target_digest,
+            )
+        )
+
+    def _try(self, build: Callable[[], OperationAuditEntry]) -> None:
+        """构造与落库都在这一层兜住：条目被模型拒绝与账写不进去对调用方是同一件事。"""
+        try:
+            self.sink.record(build())
+        except Exception:  # noqa: BLE001 - 已发生的事不能因为账没记上而改结论，见类文档
+            self.unrecorded += 1
 
 
 def _state_gate(
@@ -491,6 +663,19 @@ def resolve_admin_registry_lookup(dsn: str) -> Any:
     return PostgresAdminRegistryLookup(dsn)
 
 
+def resolve_operation_audit(dsn: str) -> Any:
+    """运营审计账的自开连接写口；单独成函数是给单测一个注入点。"""
+    from lingxi.adapters.postgres_operation_audit import PostgresOperationAudit
+
+    return PostgresOperationAudit(dsn)
+
+
+def actor_roles_snapshot(lookup: Any, open_id: str) -> frozenset[AdminRole]:
+    """审计行里的角色快照：从登记表现读，没有 active 条目就是空集，不从闸门结论反推。"""
+    entry = lookup.active_entry(open_id=open_id)
+    return entry.roles if entry is not None else frozenset()
+
+
 def resolve_state_at_send(dsn: str) -> Callable[[str], tuple[str | None, str | None]]:
     """真发前重读状态的查询口；单独成函数是给单测一个注入点。"""
     from lingxi.adapters.postgres_outreach import PostgresOutreachSubjects
@@ -516,7 +701,8 @@ class _AuditWithInitiator:
 
     ``outreach_message`` **不为此新增列**：发起人是"这一次运行是谁按下的"，属于
     运行审计，不是那条消息本身的属性——把它写进记录表会让同一个人被不同管理员重跑
-    时产生两种真相。审计出口是结构化日志（仓库没有 ``audit_event`` 表）。
+    时产生两种真相。这里的审计出口是结构化日志；本次运行的「已准备 / 逐人已执行 /
+    汇总」另由 :class:`OperationLedger` 落进运营审计账 ``operation_audit``。
     """
 
     def __init__(self, inner: Any, *, initiated_by: str) -> None:
@@ -739,28 +925,50 @@ def _send(
     *,
     initiated_by: str,
 ) -> int:
-    """预检或正式发送。两档共用同一条 :func:`run_outreach`。"""
+    """预检或正式发送。两档共用同一条 :func:`run_outreach`。
+
+    本次运行号同时是运营审计账上的操作号：收件人闸门之后、出站口构造之前先写「已准备」，
+    写不进去就退出码 2、零发送——写操作的审计记录无法可靠保存时，状态不得改变。
+    """
     from lingxi.core.ids import new_id
 
     purpose = OutreachPurpose.PRECHECK if arguments.precheck else OutreachPurpose.APPLY
+    run_id = new_id("prk")
     admin_open_id = resolve_admin_open_id(dsn, arguments.to) if arguments.precheck else None
+    try:
+        ledger = OperationLedger(
+            sink=resolve_operation_audit(dsn),
+            operation_id=run_id,
+            purpose=purpose,
+            initiated_by=initiated_by,
+            actor_roles=actor_roles_snapshot(resolve_admin_registry_lookup(dsn), initiated_by),
+            target_count=len(recipients),
+            target_digest=roster_digest(item.plan.email for item in recipients),
+        )
+        ledger.record_prepared()
+    except Exception as error:  # noqa: BLE001 - 审计账写不进去一律 fail-closed
+        print(f"运营审计账写不进去，未做任何操作：{type(error).__name__}", file=sys.stderr)
+        return 2
     dispatcher, alerting = build_dispatcher(config, dsn, initiated_by=initiated_by)
     results = run_outreach(
         recipients,
         dispatcher=dispatcher,
         purpose=purpose,
         admin_open_id=admin_open_id,
-        run_id=new_id("prk"),
+        run_id=run_id,
         state_at_send=resolve_state_at_send(dsn),
+        ledger=ledger,
     )
     # 谁建谁清：把这一批攒下的告警真的投出去，再让本进程退出。
     alert_error = _flush_alerts(alerting)
     print_results(results, purpose=purpose)
+    ledger.record_run(results)
     print(
-        f"发起人（落进每条审计行的 initiated_by）：{initiated_by}。"
-        "本清单不落库（仓库没有 audit_event 表），请自行保存；记录回查用 --list。"
+        f"发起人（落进每条审计行的 initiated_by）：{initiated_by}；操作号 {run_id}，"
+        "逐人结果已按它记入运营审计账 operation_audit。本清单不落库，请自行保存；"
+        "记录回查用 --list。"
     )
-    return _exit_code(results, alert_error=alert_error)
+    return _exit_code(results, alert_error=alert_error, audit_unrecorded=ledger.unrecorded)
 
 
 def _flush_alerts(alerting: Any) -> str | None:
@@ -776,11 +984,14 @@ def _flush_alerts(alerting: Any) -> str | None:
     return None
 
 
-def _exit_code(results: Sequence[PersonResult], *, alert_error: str | None) -> int:
+def _exit_code(
+    results: Sequence[PersonResult], *, alert_error: str | None, audit_unrecorded: int = 0
+) -> int:
     """收口退出码：``0`` 跑完，``3`` 结果待核实或收尾异常。
 
-    两种收尾不干净都要指名道姓地说清下一步：已送达未记账的人按 ``message_id`` 人工
-    核对，告警没投出去要说明发送本身不受影响。
+    三种收尾不干净都要指名道姓地说清下一步：已送达未记账的人按 ``message_id`` 人工
+    核对，告警没投出去要说明发送本身不受影响，运营审计账没记全要说明清单才是结果、
+    不要据此重跑。
     """
     unrecorded = [item for item in results if item.status == STATUS_DELIVERED_NOT_RECORDED]
     delivered = sum(1 for item in results if item.status == "delivered")
@@ -802,7 +1013,13 @@ def _exit_code(results: Sequence[PersonResult], *, alert_error: str | None) -> i
         print(
             f"{item.email} 的通知结果待核实：先查原记录并核验平台，不要盲目重发。", file=sys.stderr
         )
-    return 3 if unknown or unrecorded or alert_error is not None else 0
+    if audit_unrecorded:
+        print(
+            f"运营审计账有 {audit_unrecorded} 行没写进去：以上清单是完整结果，请留档；"
+            "发送本身不受影响，不要据此重跑。",
+            file=sys.stderr,
+        )
+    return 3 if unknown or unrecorded or alert_error is not None or audit_unrecorded else 0
 
 
 def _configure_logging(stream: TextIO | None = None) -> logging.Logger:

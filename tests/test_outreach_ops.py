@@ -21,6 +21,8 @@ from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
 from typing import Any
 
+from lingxi.core.admin.operation_audit import OperationAuditEntry, OperationPhase
+from lingxi.core.admin.registry import ALL_ADMIN_ROLES
 from lingxi.core.outreach.audience import SubjectFacts
 from lingxi.core.outreach.dispatch import (
     OutreachPurpose,
@@ -645,6 +647,232 @@ class ModeGuardTest(unittest.TestCase):
         """否定断言：`--a` 不得被当成 `--apply`——消息发出去不可撤回。"""
         with self.assertRaises(SystemExit):
             TOOL._build_parser().parse_args(["roster.csv", "--a"])
+
+
+class FakeOperationAudit:
+    """假的运营审计账写口：记下每一条条目；``fail_phases`` 里的阶段一律写失败。"""
+
+    def __init__(self, *, fail_phases: frozenset[OperationPhase] = frozenset()) -> None:
+        self.entries: list[OperationAuditEntry] = []
+        self._fail_phases = fail_phases
+
+    def record(self, entry: OperationAuditEntry) -> str:
+        if entry.phase in self._fail_phases:
+            raise ConnectionError("synthetic ledger outage: password=hunter2")
+        self.entries.append(entry)
+        return f"opa_{len(self.entries)}"
+
+    def phases(self) -> list[str]:
+        return [entry.phase.value for entry in self.entries]
+
+
+class _Dispatcher:
+    @staticmethod
+    def run_once() -> None:
+        return None
+
+
+class _Alerting:
+    dispatcher = _Dispatcher()
+
+
+class OperationAuditHookupTest(unittest.TestCase):
+    """两条真发路径接入运营审计账：先「已准备」再发，逐人各一行，账写不进去的两种结局。
+
+    全部 I/O 装配（名单、配置、登记表、出站口、状态重读、审计账）都用注入点替换；
+    真库那一份见 ``test_operation_hookup_postgres.py``。
+    """
+
+    def setUp(self) -> None:
+        self.ledger = FakeOperationAudit()
+        self.dispatcher = FakeDispatcher()
+        self.built: list[str] = []
+        # 用户标识按真实形态（`usr_` + 标识），审计账的标识列不收带点的化名。
+        self.recipients = _recipients(
+            _facts(user_id="usr_joshua"),
+            _facts(EMAIL_B, user_id="usr_yiming", roster_names=("李四",)),
+        )
+
+        def build_dispatcher(config: Any, dsn: str, *, initiated_by: str) -> Any:
+            self.built.append(initiated_by)
+            return self.dispatcher, _Alerting()
+
+        self._patch("_prepare", lambda arguments, dsn: (object(), self.recipients))
+        self._patch("resolve_admin_registry_lookup", lambda dsn: object())
+        self._patch("initiated_by_is_registered_admin", lambda lookup, open_id: True)
+        self._patch("actor_roles_snapshot", lambda lookup, open_id: ALL_ADMIN_ROLES)
+        self._patch("resolve_operation_audit", lambda dsn: self.ledger)
+        self._patch("resolve_admin_open_id", lambda dsn, requested: ADMIN_OPEN_ID)
+        self._patch("resolve_state_at_send", lambda dsn: None)
+        self._patch("build_dispatcher", build_dispatcher)
+
+    def _patch(self, name: str, value: Any) -> None:
+        original = getattr(TOOL, name)
+        setattr(TOOL, name, value)
+        self.addCleanup(lambda: setattr(TOOL, name, original))
+
+    def _run(self, *extra: str) -> tuple[int, str, str]:
+        out, err = io.StringIO(), io.StringIO()
+        with redirect_stdout(out), redirect_stderr(err):
+            code = TOOL.main(
+                [
+                    "roster.csv",
+                    "--dsn",
+                    "postgresql://example/none",
+                    "--initiated-by",
+                    ADMIN_OPEN_ID,
+                    *extra,
+                ]
+            )
+        return code, out.getvalue(), err.getvalue()
+
+    def test_apply_writes_prepared_before_any_send_then_one_row_per_person(self) -> None:
+        code, out, _ = self._run("--apply")
+
+        self.assertEqual(code, 0)
+        self.assertEqual(self.ledger.phases(), ["prepared", "executed", "executed", "executed"])
+        prepared, first, second, summary = self.ledger.entries
+        self.assertEqual(prepared.operation, "welcome_card.apply")
+        self.assertEqual(prepared.purpose, "welcome_card_apply")
+        self.assertEqual(prepared.target_kind, "user")
+        self.assertEqual(prepared.target_count, 2)
+        self.assertEqual(prepared.target_digest, TOOL.roster_digest([EMAIL_A, EMAIL_B]))
+        self.assertEqual(prepared.initiated_by, ADMIN_OPEN_ID)
+        self.assertEqual(prepared.actor_roles, ALL_ADMIN_ROLES)
+        self.assertTrue(prepared.operation_id.startswith("prk_"), "操作号就是本次运行号")
+        self.assertEqual(
+            {first.operation_id, second.operation_id, summary.operation_id},
+            {prepared.operation_id},
+        )
+        self.assertEqual(
+            {target.subject for target, _ in self.dispatcher.calls},
+            {"usr_joshua", "usr_yiming"},
+        )
+        self.assertEqual((first.result_code, second.result_code), ("delivered", "delivered"))
+        self.assertEqual(first.target_user_id, "usr_joshua")
+        self.assertEqual(
+            first.evidence_ref, f"outreach_message:{WELCOME_CONTENT_KEY}:apply:usr_joshua"
+        )
+        self.assertTrue(first.executor.startswith("scheduler-script:outreach@"))
+        self.assertTrue(first.executor.endswith(":" + prepared.operation_id))
+        self.assertEqual(dict(summary.result_counts)["delivered"], 2)
+        self.assertEqual(dict(summary.result_counts)["total"], 2)
+        self.assertEqual(summary.result_code, "completed")
+        self.assertIn(prepared.operation_id, out)
+
+    def test_precheck_targets_the_admin_and_keys_on_the_run(self) -> None:
+        code, _, _ = self._run("--precheck", "--to", "admin")
+
+        self.assertEqual(code, 0)
+        prepared, first, _, _ = self.ledger.entries
+        self.assertEqual(prepared.operation, "welcome_card.precheck")
+        self.assertEqual(prepared.purpose, "welcome_card_precheck")
+        self.assertEqual(prepared.target_kind, "admin_self")
+        self.assertEqual(
+            first.evidence_ref,
+            f"outreach_message:{WELCOME_CONTENT_KEY}:precheck:{ADMIN_OPEN_ID}:{prepared.operation_id}:usr_joshua",
+        )
+        self.assertEqual(first.target_user_id, "usr_joshua")
+
+    def test_dry_run_and_listing_write_nothing_to_the_ledger(self) -> None:
+        from unittest.mock import patch
+
+        class _Store:
+            def __init__(self, dsn: str) -> None:
+                pass
+
+            @staticmethod
+            def delivered_dedupe_keys(keys: Any) -> frozenset[str]:
+                return frozenset()
+
+        self._patch("_run_listing", lambda dsn, limit: 0)
+        with patch("lingxi.adapters.postgres_outreach.PostgresOutreachStore", _Store):
+            code, _, _ = self._run()
+        self.assertEqual(code, 0)
+        code, _, _ = self._run("--list")
+        self.assertEqual(code, 0)
+        self.assertEqual(self.ledger.entries, [], "不发送的档位一行审计都不该写")
+        self.assertEqual(self.dispatcher.calls, [])
+
+    def test_an_unwritable_prepared_row_exits_two_with_zero_sends(self) -> None:
+        """否定断言：「已准备」写不进去 ⇒ 退出码 2、出站口没构造、一张卡都没发。"""
+
+        self.ledger = FakeOperationAudit(fail_phases=frozenset({OperationPhase.PREPARED}))
+        self._patch("resolve_operation_audit", lambda dsn: self.ledger)
+
+        code, _, err = self._run("--apply")
+
+        self.assertEqual(code, 2)
+        self.assertEqual(self.built, [], "账在出站口构造之前写，被拒时不该装出站口")
+        self.assertEqual(self.dispatcher.calls, [])
+        self.assertIn("运营审计账写不进去", err)
+        self.assertIn("ConnectionError", err)
+        self.assertNotIn("hunter2", err)
+
+    def test_a_failed_person_row_keeps_the_result_and_exits_three(self) -> None:
+        """逐人行写失败 ⇒ 结果不丢（卡片已发出、清单完整）、退出码 3。"""
+
+        self.ledger = FakeOperationAudit(fail_phases=frozenset({OperationPhase.EXECUTED}))
+        self._patch("resolve_operation_audit", lambda dsn: self.ledger)
+
+        code, out, err = self._run("--apply")
+
+        self.assertEqual(code, 3)
+        self.assertEqual(len(self.dispatcher.calls), 2)
+        self.assertIn("送达 2、此前已送达 0、失败 0", out)
+        self.assertEqual(self.ledger.phases(), ["prepared"])
+        self.assertIn("运营审计账有 3 行没写进去", err)
+        self.assertIn("不要据此重跑", err)
+        self.assertNotIn("hunter2", err)
+
+    def test_person_rows_never_carry_exception_text_or_emails(self) -> None:
+        self.dispatcher = FakeDispatcher(
+            errors={"李四": RuntimeError(f"炸在 {EMAIL_B} token=hunter2")}
+        )
+
+        code, _, _ = self._run("--apply")
+
+        self.assertEqual(code, 0)
+        _, first, second, summary = self.ledger.entries
+        self.assertEqual(first.result_code, "delivered")
+        self.assertEqual(second.result_code, "failed_RuntimeError")
+        self.assertEqual(summary.result_code, "partial")
+        dumped = repr(self.ledger.entries)
+        self.assertNotIn("hunter2", dumped)
+        self.assertNotIn(EMAIL_A, dumped)
+        self.assertNotIn(EMAIL_B, dumped)
+        self.assertNotIn("Joshua", dumped)
+
+
+class ResultCodeShapeTest(unittest.TestCase):
+    def test_message_ids_and_free_text_never_enter_the_result_code(self) -> None:
+        self.assertEqual(
+            TOOL.audit_result_code(TOOL.PersonResult(EMAIL_A, "delivered", "om_real_1")),
+            "delivered",
+        )
+        self.assertEqual(
+            TOOL.audit_result_code(
+                TOOL.PersonResult(EMAIL_A, TOOL.STATUS_DELIVERED_NOT_RECORDED, "om_real_1")
+            ),
+            TOOL.STATUS_DELIVERED_NOT_RECORDED,
+        )
+        self.assertEqual(
+            TOOL.audit_result_code(TOOL.PersonResult(EMAIL_A, "skipped", "not_active_at_send")),
+            "skipped:not_active_at_send",
+        )
+        self.assertEqual(
+            TOOL.audit_result_code(TOOL.PersonResult(EMAIL_A, "unknown", "token=hunter2 x")),
+            "unknown",
+        )
+        self.assertEqual(
+            TOOL.audit_result_code(TOOL.PersonResult(EMAIL_A, "failed", None)), "failed"
+        )
+
+    def test_the_roster_digest_is_order_and_duplicate_insensitive(self) -> None:
+        self.assertEqual(
+            TOOL.roster_digest([EMAIL_B, EMAIL_A, EMAIL_A]), TOOL.roster_digest([EMAIL_A, EMAIL_B])
+        )
+        self.assertRegex(TOOL.roster_digest([EMAIL_A]), r"^sha256:[0-9a-f]{64}$")
 
 
 def _call_names(tree: ast.AST) -> list[str]:
