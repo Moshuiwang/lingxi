@@ -13,7 +13,11 @@ WorkingDirectory=/opt/lingxi
 # 自己，子进程（清单工具 / 部署器）不能靠 -B 继承，环境变量兜底。
 Environment=PYTHONDONTWRITEBYTECODE=1
 # 这里只传非秘密路径；alert_env_file 由 --config 指向，凭据不进 argv。
-ExecStart=/usr/bin/python3 -B /opt/lingxi/deploy/release_pull_agent.py --host-contract /opt/lingxi/control/host-contract.json --config /opt/lingxi/control/release-pull-agent.json --state-directory /opt/lingxi/state run
+# 解释器走引导安装建的固定符号链接 /opt/lingxi/bin/python3（目标 = 前提核对定下的
+# <PYTHON_ABSOLUTE_PATH>，3.11 以上），不写死系统 python3——预发默认 python3 是 3.9，
+# 控制包要求 3.11 以上；代理起的子进程（清单工具 / 部署器）沿用同一解释器。
+# 建链与核对见 deploy/监控告警.md「安装」的「Python 注入点」。
+ExecStart=/opt/lingxi/bin/python3 -B /opt/lingxi/deploy/release_pull_agent.py --host-contract /opt/lingxi/control/host-contract.json --config /opt/lingxi/control/release-pull-agent.json --state-directory /opt/lingxi/state run
 # 单轮可能包含部署器的 15 分钟观察；3600s 比五分钟 timer 周期长，重叠由代理
 # 状态目录内的非阻塞文件锁拒绝，不能靠缩短超时制造第二个部署器。
 TimeoutStartSec=3600
