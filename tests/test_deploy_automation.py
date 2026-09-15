@@ -1,8 +1,10 @@
 """部署四操作和控制包以合成输入验证，不触碰真实主机或业务。"""
 
 import errno
+import hashlib
 import importlib
 import io
+import json
 import os
 import subprocess
 import sys
@@ -73,7 +75,7 @@ def archive(path, contents, *, malicious=None):
             stream.addfile(malicious)
 
 
-def fixture(root):
+def fixture(root, *, docker="/usr/bin/docker"):
     pkg, metadata = package(root)
     release = {
         "schema": 2,
@@ -102,7 +104,7 @@ def fixture(root):
         "bundle_root": str(root / "bundles"),
         "relay_root": str(root / "relay"),
         "lock_path": str(root / "host.lock"),
-        "docker": "/usr/bin/docker",
+        "docker": docker,
         "approval_sources": ["https://github.com/Moshuiwang/lingxi/issues/566"],
     }
     config = {"schema": 1, "values": {}, "files": {"scheduler": {}, "worker": {}}}
@@ -160,11 +162,17 @@ def fixture(root):
     return plan, host, config, approval
 
 
+class SyntheticKill(BaseException):
+    """整 cgroup SIGKILL：不是 Exception，部署器来不及把 unknown 写进阶段账。"""
+
+
 class FakeRuntime:
     def __init__(self, host):
         self.host, self.lock_fd = host, None
         self.done, self.calls, self.crash = set(), [], None
         self.heads, self.active_job = ["0091_synthetic"], None
+        # 在该阶段的副作用发生之前被杀：阶段账已写 running、作业没起、库头未变。
+        self.kill_before = None
 
     def preflight(self, plan):
         pass
@@ -182,6 +190,8 @@ class FakeRuntime:
         return stage in self.done
 
     def perform(self, stage, plan):
+        if stage == self.kill_before:
+            raise SyntheticKill(stage)
         self.calls.append(stage)
         self.done.add(stage)
         if stage == "migrate":
@@ -545,6 +555,293 @@ class DeployRecoveryTests(unittest.TestCase):
             broken["recovery"]["historical"][key] = value
             with self.assertRaises(state.DeployError):
                 deploy.validate_plan(broken, self.host, self.config)
+
+
+class MigrationResumeTests(unittest.TestCase):
+    """迁移提交前中断的人工续跑入口：核对不过零写、通过后只删一条记录并留归档与审计。"""
+
+    setUp = DeployTests.setUp
+
+    def _state_raw(self):
+        return state.read_raw(self.store.path(self.plan["id"], "state"))
+
+    def _interrupt_before_migration(self):
+        """复现预发接缝 ④：migrate 记 running 后、作业起来前被杀；下一轮 apply 按设计停住。"""
+        self.runtime.kill_before = "migrate"
+        with self.assertRaises(SyntheticKill):
+            deploy.execute(self.plan, self.approval, self.store, self.runtime)
+        self.runtime.kill_before = None
+        with self.assertRaisesRegex(state.UnknownError, "migration_unknown_no_retry"):
+            deploy.execute(self.plan, self.approval, self.store, self.runtime)
+        record = self.store.state(self.plan)
+        self.assertEqual(record["status"], "unknown")
+        self.assertEqual(record["stages"]["migrate"]["status"], "running")
+        self.assertNotIn("migrate", self.runtime.calls)
+        self.assertEqual(self.runtime.heads, self.plan["current_heads"])
+
+    def _resume(self, acknowledge=None, approval=None):
+        acknowledge = self.store.digest(self.plan) if acknowledge is None else acknowledge
+        return deploy.resume_migration(
+            self.plan, approval or self.approval, self.store, self.runtime, acknowledge
+        )
+
+    def _assert_refused(self, code, **kwargs):
+        before = self._state_raw()
+        with self.assertRaisesRegex(state.DeployError, "^" + code + "$"):
+            self._resume(**kwargs)
+        self.assertEqual(self._state_raw(), before)
+        self.assertFalse((self.store.root / "archive").exists())
+        self.assertNotIn("migrate", self.runtime.calls)
+
+    def test_resume_archives_clears_record_and_next_apply_migrates_exactly_once(self):
+        self._interrupt_before_migration()
+        before = self._state_raw()
+        digest = self.store.digest(self.plan)
+        result = self._resume()
+        archive = Path(result["archive"])
+        self.assertEqual(archive.parent, self.store.root / "archive")
+        self.assertEqual(archive.parent.stat().st_mode & 0o777, 0o700)
+        self.assertEqual(archive.stat().st_mode & 0o777, 0o600)
+        self.assertEqual(archive.read_bytes(), before)
+        self.assertRegex(
+            archive.name, r"^synthetic-deploy\.state\.before-resume-\d{8}T\d{6}Z\.json$"
+        )
+        after = self.store.state(self.plan)
+        self.assertNotIn("migrate", after["stages"])
+        self.assertEqual(after["status"], "unknown")
+        self.assertEqual(after["stages"]["stop"]["status"], "verified")
+        self.assertEqual(len(after["resumes"]), 1)
+        self.assertEqual(
+            set(after["resumes"][0]),
+            {"time", "stage", "archived_state_sha256", "acknowledged_sha256"},
+        )
+        self.assertEqual(after["resumes"][0]["stage"], "migrate")
+        self.assertEqual(after["resumes"][0]["archived_state_sha256"], digest)
+        self.assertEqual(after["resumes"][0]["acknowledged_sha256"], digest)
+        self.assertEqual(result["state_sha256"], self.store.digest(self.plan))
+        self.assertNotEqual(result["state_sha256"], digest)
+        self.assertEqual(
+            result["checked"],
+            {
+                "job": None,
+                "migration_heads": ["0091_synthetic"],
+                "current_heads": ["0091_synthetic"],
+            },
+        )
+        self.assertNotIn("migrate", self.runtime.calls)
+        # 记录已清，再来一次没有可清的记录：拒绝、不再归档。
+        with self.assertRaisesRegex(state.DeployError, "^resume_no_migrate_record$"):
+            self._resume()
+        self.assertEqual(len(list((self.store.root / "archive").iterdir())), 1)
+        # 下一轮 apply 走原逻辑：migrate 无记录 → 正常起迁移作业 → 接续到 verified。
+        deploy.execute(self.plan, self.approval, self.store, self.runtime)
+        final = self.store.state(self.plan)
+        self.assertEqual(final["status"], "verified")
+        self.assertEqual(self.runtime.calls.count("migrate"), 1)
+        self.assertEqual(self.runtime.calls.count("stop"), 1)
+        self.assertEqual(final["stages"]["migrate"]["status"], "verified")
+        self.assertEqual(len(final["resumes"]), 1)
+        with self.assertRaisesRegex(state.DeployError, "^resume_migrate_not_running$"):
+            self._resume()
+
+    def test_resume_refuses_while_a_migration_job_container_exists(self):
+        self._interrupt_before_migration()
+        for job in (
+            {"Running": True, "ExitCode": 0, "id": "j", "image": "i"},
+            {"Running": False, "ExitCode": 0, "id": "j", "image": "i"},
+            {"Running": False, "ExitCode": 1, "id": "j", "image": "i"},
+        ):
+            with self.subTest(job=job):
+                self.runtime.active_job = job
+                self._assert_refused("resume_migration_job_present")
+
+    def test_resume_refuses_when_database_heads_changed(self):
+        self._interrupt_before_migration()
+        for heads in (["0092_synthetic"], ["0090_synthetic"], [], None):
+            with self.subTest(heads=heads):
+                self.runtime.heads = heads
+                self._assert_refused("resume_database_heads_changed")
+
+    def test_resume_refuses_without_running_migrate_record(self):
+        # 没有阶段账：status 也算不出 state_sha256，任何值都对不上。
+        with self.assertRaisesRegex(state.DeployError, "^resume_acknowledge_mismatch$"):
+            self._resume(acknowledge="0" * 64)
+        self.assertFalse(self.store.path(self.plan["id"], "state").exists())
+        # 阶段账存在但没有 migrate 记录（停服务前被杀）。
+        self.runtime.kill_before = "stop"
+        with self.assertRaises(SyntheticKill):
+            deploy.execute(self.plan, self.approval, self.store, self.runtime)
+        self.runtime.kill_before = None
+        self._assert_refused("resume_no_migrate_record")
+        # migrate 已 verified。
+        deploy.execute(self.plan, self.approval, self.store, self.runtime)
+        self.assertEqual(self.store.state(self.plan)["stages"]["migrate"]["status"], "verified")
+        self.runtime.calls.clear()
+        self._assert_refused("resume_migrate_not_running")
+
+    def test_resume_refuses_stale_or_wrong_acknowledge(self):
+        self.runtime.kill_before = "migrate"
+        with self.assertRaises(SyntheticKill):
+            deploy.execute(self.plan, self.approval, self.store, self.runtime)
+        self.runtime.kill_before = None
+        stale = self.store.digest(self.plan)
+        # 下一轮 apply 把 unknown 写进账：旧指纹就是「对着旧状态操作」。
+        with self.assertRaisesRegex(state.UnknownError, "migration_unknown_no_retry"):
+            deploy.execute(self.plan, self.approval, self.store, self.runtime)
+        self.assertNotEqual(stale, self.store.digest(self.plan))
+        self._assert_refused("resume_acknowledge_mismatch", acknowledge=stale)
+        self._assert_refused("resume_acknowledge_mismatch", acknowledge="0" * 64)
+        self._assert_refused("resume_acknowledge_mismatch", acknowledge="")
+        self._assert_refused(
+            "resume_acknowledge_mismatch", acknowledge=self.store.digest(self.plan).upper()
+        )
+
+    def test_resume_refuses_recover_plans_and_mismatched_approval(self):
+        self._interrupt_before_migration()
+        recovery = dict(
+            self.plan,
+            id="synthetic-recovery",
+            operation="recover",
+            recovery_of={"id": self.plan["id"], "plan_sha256": state.fingerprint(self.plan)},
+        )
+        self.store.save_plan(recovery)
+        recovery_approval = dict(
+            self.approval,
+            plan_id=recovery["id"],
+            operation="recover",
+            plan_sha256=state.fingerprint(recovery),
+        )
+        before = self._state_raw()
+        for approval in (recovery_approval, self.approval):
+            with self.subTest(approval=approval["operation"]):
+                with self.assertRaisesRegex(state.DeployError, "^resume_migration_apply_only$"):
+                    deploy.resume_migration(
+                        recovery, approval, self.store, self.runtime, self.store.digest(self.plan)
+                    )
+        self.assertEqual(self._state_raw(), before)
+        for key, value, code in [
+            ("plan_sha256", "a" * 64, "approval_mismatch"),
+            ("operation", "recover", "approval_mismatch"),
+            ("source", "unapproved", "approval_mismatch"),
+            ("expires_at", 1, "approval_expired"),
+            # 形状与窗口都对、但不是部署器已记下的那份批准：本操作只复用原 apply 批准。
+            ("approved_at", self.approval["approved_at"] + 1, "approval_changed"),
+        ]:
+            with self.subTest(key=key):
+                self._assert_refused(code, approval=dict(self.approval, **{key: value}))
+        self.assertFalse((self.store.root / "archive").exists())
+
+    def test_resume_refuses_when_host_marker_points_elsewhere(self):
+        self._interrupt_before_migration()
+        marker = Path(self.host["lock_path"]).with_suffix(".active.json")
+        original = state.read_json(marker)
+        state.atomic_write(marker, dict(original, id="another-plan"))
+        self._assert_refused("resume_host_marker_mismatch")
+        state.atomic_write(marker, dict(original, status="verified"))
+        self._assert_refused("resume_host_marker_mismatch")
+        marker.unlink()
+        self._assert_refused("resume_host_marker_mismatch")
+        state.atomic_write(marker, original)
+        self._resume()
+        self.assertNotIn("migrate", self.store.state(self.plan)["stages"])
+
+
+class MigrationResumeCliTests(unittest.TestCase):
+    """命令行入口：status 打出 state_sha256，resume-migration 拒绝时退出码 1 且 stderr 只带结果码。"""
+
+    _plan_inputs = DeployTests._plan_inputs
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.root = Path(self.tmp.name)
+        # 假 docker：ps 一律空（无容器、无作业），run … current 回读未变的库头；其余零输出。
+        fake = self.root / "fake-docker"
+        fake.write_text('#!/bin/sh\ncase "$1" in run) echo 0091_synthetic;; esac\nexit 0\n')
+        fake.chmod(0o755)
+        self.plan, self.host, self.config, self.approval = fixture(self.root, docker=str(fake))
+        self.store = state.StateStore(self.root / "private")
+        self.store.save_plan(self.plan)
+        self.runtime = FakeRuntime(self.host)
+        self.private = self._plan_inputs()
+        state.atomic_write(self.private / "approval.json", self.approval)
+
+    def _cli(self, *tail):
+        return subprocess.run(
+            [
+                sys.executable,
+                "-B",
+                str(ROOT / "deploy/lingxi_deploy.py"),
+                "--host-contract",
+                str(self.private / "host.json"),
+                "--public-config",
+                str(self.private / "config.json"),
+                "--state-directory",
+                str(self.store.root),
+                *tail,
+            ],
+            capture_output=True,
+            text=True,
+            timeout=120,
+            check=False,
+        )
+
+    def _status(self):
+        result = self._cli("status", self.plan["id"])
+        self.assertEqual(result.returncode, 0, result.stderr)
+        return json.loads(result.stdout)
+
+    def test_status_reports_state_sha256_and_resume_round_trips_through_the_cli(self):
+        self.assertIsNone(self._status()["state_sha256"])
+        self.runtime.kill_before = "migrate"
+        with self.assertRaises(SyntheticKill):
+            deploy.execute(self.plan, self.approval, self.store, self.runtime)
+        self.runtime.kill_before = None
+        with self.assertRaisesRegex(state.UnknownError, "migration_unknown_no_retry"):
+            deploy.execute(self.plan, self.approval, self.store, self.runtime)
+        status = self._status()
+        raw = self.store.path(self.plan["id"], "state").read_bytes()
+        self.assertEqual(status["state_sha256"], hashlib.sha256(raw).hexdigest())
+        self.assertEqual(status["stages"]["migrate"]["status"], "running")
+        self.assertIsNone(status["actual"]["job"])
+        self.assertEqual(status["status"], "unknown")
+        # 指纹不对：退出码 1，stderr 只有结果码，阶段账逐字不变。
+        result = self._cli(
+            "resume-migration",
+            self.plan["id"],
+            "--approval",
+            str(self.private / "approval.json"),
+            "--acknowledge",
+            "0" * 64,
+        )
+        self.assertEqual(result.returncode, 1)
+        self.assertEqual(
+            json.loads(result.stderr), {"status": "failed", "error": "resume_acknowledge_mismatch"}
+        )
+        self.assertEqual(result.stdout, "")
+        self.assertEqual(self.store.path(self.plan["id"], "state").read_bytes(), raw)
+        # 指纹对上：真实 Runtime 用假 docker 回读作业与库头，通过后归档并清记录。
+        result = self._cli(
+            "resume-migration",
+            self.plan["id"],
+            "--approval",
+            str(self.private / "approval.json"),
+            "--acknowledge",
+            status["state_sha256"],
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        output = json.loads(result.stdout)
+        self.assertEqual(output["result"], "已归档并清除未完成的迁移记录")
+        self.assertEqual(output["checked"]["migration_heads"], ["0091_synthetic"])
+        self.assertEqual(Path(output["archive"]).read_bytes(), raw)
+        self.assertNotIn("migrate", output["stages"])
+        after = self._status()
+        self.assertEqual(after["state_sha256"], output["state_sha256"])
+        self.assertNotIn("migrate", after["stages"])
+        self.assertEqual(len(after["resumes"]), 1)
+        deploy.execute(self.plan, self.approval, self.store, self.runtime)
+        self.assertEqual(self.store.state(self.plan)["status"], "verified")
+        self.assertEqual(self.runtime.calls.count("migrate"), 1)
 
 
 class ControlPromotionTests(unittest.TestCase):
