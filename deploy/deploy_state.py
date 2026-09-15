@@ -54,8 +54,8 @@ def private_directory(root: Path, *, create=False):
         raise DeployError("private_directory_permissions")
 
 
-def read_json(path: Path, *, public=False):
-    """私有材料只允许本人读取；非秘密映射可读但不能由他人改写。"""
+def read_raw(path: Path, *, public=False):
+    """私有材料只允许本人读取；非秘密映射可读但不能由他人改写。返回文件原文字节。"""
     fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
     try:
         info = os.fstat(fd)
@@ -69,19 +69,29 @@ def read_json(path: Path, *, public=False):
             data = stream.read(1024 * 1024 + 1)
         if len(data) > 1024 * 1024:
             raise DeployError("private_file_too_large")
-        return json.loads(data)
+        return data
     finally:
         os.close(fd)
 
 
+def read_json(path: Path, *, public=False):
+    """按同一权限口径读取并解析 JSON。"""
+    return json.loads(read_raw(path, public=public))
+
+
 def atomic_write(path: Path, value):
     """同步完整内容后才替换旧账。"""
+    atomic_write_raw(path, canonical(value))
+
+
+def atomic_write_raw(path: Path, data: bytes):
+    """原文字节按同一私有口径落盘：归档时逐字节保留旧账，不重新编码。"""
     private_directory(path.parent)
     fd, name = tempfile.mkstemp(prefix=".pending-", dir=path.parent)
     try:
         os.fchmod(fd, 0o600)
         with os.fdopen(fd, "wb") as stream:
-            stream.write(canonical(value))
+            stream.write(data)
             stream.flush()
             os.fsync(stream.fileno())
         os.replace(name, path)
@@ -170,19 +180,29 @@ class StateStore:
 
     def state(self, plan):
         """状态只属于同一份完整计划。"""
+        return self.load(plan)[1]
+
+    def load(self, plan):
+        """阶段账原文与解析结果一并返回：原文供指纹核对与逐字归档，没有阶段账时原文为 None。"""
         path = self.path(plan["id"], "state")
         if not path.exists():
-            return {
+            return None, {
                 "schema": 1,
                 "plan_sha256": fingerprint(plan),
                 "status": "planned",
                 "stages": {},
                 "approval_sha256": None,
             }
-        result = read_json(path)
+        raw = read_raw(path)
+        result = json.loads(raw)
         if result["plan_sha256"] != fingerprint(plan):
             raise DeployError("state_plan_mismatch")
-        return result
+        return raw, result
+
+    def digest(self, plan):
+        """阶段账文件原文的 sha256，供人工操作前后核对是否仍是同一份账；没有阶段账时为 None。"""
+        raw, _ = self.load(plan)
+        return None if raw is None else hashlib.sha256(raw).hexdigest()
 
     def save(self, plan, state):
         """每个阶段执行前后都同步落盘。"""

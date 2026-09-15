@@ -10,7 +10,7 @@ main 持续研发，功能范围齐备时从明确提交创建 `release/X.Y`，�
 
 预发布附件 `release-manifest.json` 的新 schema 2 保存源码、四镜像摘要、迁移头、构建记录和非秘密控制包摘要；`lingxi-control.tar` 在同一候选提交只打包一次，包索引 schema revision 1 精确列出文件、权限、来源和摘要。上传中断可继续，既有不同内容不覆盖。正式版本标签和附件发布后不得改写；有变更建立新候选。
 
-候选与正式版 Release 都带三个附件：`release-manifest.json`、`lingxi-control.tar`、`control-index.json`。第三个是 tar 内嵌索引的逐字节副本，摘要等于清单的 `index_sha256`，由发布脚本从包内读出后上传，供拉取代理在解包前核对；缺任一附件，拉取代理都不会安装该版本。
+候选与正式版 Release 都带三个附件：`release-manifest.json`、`lingxi-control.tar`、`control-index.json`。第三个是 tar 内嵌索引的逐字节副本，摘要等于清单的 `index_sha256`，由发布脚本从包内读出后上传，供拉取代理在解包前核对；缺 tar 或清单不安装；缺 `control-index.json` 附件时（发布流程补传该附件之前发布的版本，Release 不可变、无法补传）以 tar 内嵌索引为准——同一 `index_sha256` 钉住，包摘要、索引摘要与逐文件核对一项不减。
 
 ## 验收后提升
 
@@ -70,7 +70,7 @@ python3 "$CONTROL_ROOT/deploy/lingxi_deploy.py" \
   --state-directory "$STATE_DIRECTORY" plan --request "$REQUEST" --dry-run
 ```
 
-确认完整差异与窗口后，去掉 `--dry-run` 保存计划；随后将尾部改为 `apply "$PLAN_ID" --approval "$APPROVAL"` 执行。断线后用 `status "$PLAN_ID"` 只读查进度，同一 `apply` 接续。完成后再次 apply 只核对、不重建。恢复需另存 operation=recover 且引用原部署的计划，并使用 `recover "$RECOVERY_PLAN_ID" --approval "$RECOVERY_APPROVAL"`；不能复用 apply 批准。
+确认完整差异与窗口后，去掉 `--dry-run` 保存计划；随后将尾部改为 `apply "$PLAN_ID" --approval "$APPROVAL"` 执行。断线后用 `status "$PLAN_ID"` 只读查进度，同一 `apply` 接续。完成后再次 apply 只核对、不重建。恢复需另存 operation=recover 且引用原部署的计划，并使用 `recover "$RECOVERY_PLAN_ID" --approval "$RECOVERY_APPROVAL"`；不能复用 apply 批准。 唯一不自动接续的中断是「迁移提交前」（阶段账已记 `migrate: running`、作业容器没起、库头未变）：apply 会以 `migration_unknown_no_retry` 停住，人工核对后用 `resume-migration "$PLAN_ID" --approval "$APPROVAL" --acknowledge <status 输出的 state_sha256>` 归档并清掉这一条记录，再由同一 `apply` 接续；步骤与结果码见[拉取代理 §五「迁移提交前中断的人工续跑」](../拉取代理.md#五幂等接续与九处中断)。
 
 新 schema 缺控制包直接拒绝。旧 schema 1 的选择必须显式 `--allow-legacy`，仅作历史核对；历史恢复记录另绑定原部署、原四镜像、发布证据、兼容证明、恢复工具包和入口停用收据；没有新清单的原始标签使用计划内 historical 类型，不捏造维护分支或构建编号，不向历史 Release 补造验收清单。存在新格式阶段或动态名单但无兼容消费者时不能恢复旧版。
 

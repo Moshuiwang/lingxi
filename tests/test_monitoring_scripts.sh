@@ -8,6 +8,9 @@ set -euo pipefail
 script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 repository_root=$(cd -- "${script_dir}/.." && pwd)
 monitoring_dir="${repository_root}/scripts/ops/monitoring"
+# resource_sample.sh 默认走宿主注入点 /opt/lingxi/bin/python3（引导安装建的链接），
+# 测试机没有它：显式指到本机 python3（须 3.11 以上，与脚本自己的版本核对一致）。
+test_python="${LINGXI_PYTHON:-$(command -v python3)}"
 
 pass_count=0
 fail_count=0
@@ -95,7 +98,7 @@ chmod +x "${fake_bin_dir}/docker"
 out_dir="${work_dir}/out"
 mkdir -p "${out_dir}"
 
-if env -i PATH="${fake_bin_dir}:${PATH}" \
+if env -i PATH="${fake_bin_dir}:${PATH}" LINGXI_PYTHON="${test_python}" \
     LINGXI_MONITORING_DIR="${out_dir}" \
     LINGXI_MONITORING_CONTAINERS="present-container missing-container" \
     bash "${monitoring_dir}/resource_sample.sh" >/tmp/lingxi-monitoring-test-stdout.$$ 2>&1; then
@@ -117,6 +120,41 @@ else
   fail_count=$((fail_count + 1))
 fi
 rm -f "/tmp/lingxi-monitoring-test-stdout.$$"
+
+# --- resource_sample.sh：解释器注入点缺失 / 版本不足时拒绝启动（退出码 2）------
+# 2026-09-15 预发实读：PATH 上的 python3 静默换成 3.9，采样每分钟失败 80 分钟无人察觉。
+# 现在解释器只从 LINGXI_PYTHON（默认 /opt/lingxi/bin/python3）取，缺失或低于 3.11
+# 都要在采样之前退出 2 并说明原因，不能落到 PATH 上随便哪个 python3。
+
+expect_exit_code "resource_sample.sh 注入点指向不存在的解释器时拒绝启动" 2 \
+  env -i PATH="${fake_bin_dir}:${PATH}" LINGXI_PYTHON="${work_dir}/no-such-python3" \
+  LINGXI_MONITORING_DIR="${out_dir}" \
+  bash "${monitoring_dir}/resource_sample.sh"
+
+# 伪造一个「3.9」解释器：版本核对（-c 分支）退出 2，--version 报旧版本号。
+cat > "${fake_bin_dir}/python3.9-fake" <<'FAKE_OLD_PYTHON'
+#!/bin/sh
+if [ "$1" = "--version" ]; then
+  echo "Python 3.9.18"
+  exit 0
+fi
+exit 2
+FAKE_OLD_PYTHON
+chmod +x "${fake_bin_dir}/python3.9-fake"
+
+old_python_stderr="${work_dir}/old-python-stderr"
+old_python_exit=0
+env -i PATH="${fake_bin_dir}:${PATH}" LINGXI_PYTHON="${fake_bin_dir}/python3.9-fake" \
+  LINGXI_MONITORING_DIR="${out_dir}" \
+  bash "${monitoring_dir}/resource_sample.sh" >/dev/null 2>"${old_python_stderr}" || old_python_exit=$?
+if [[ "${old_python_exit}" == "2" ]] && grep -q "Python 3.9.18" "${old_python_stderr}"; then
+  printf 'PASS: resource_sample.sh 解释器低于 3.11 时退出 2 并打印实际版本\n'
+  pass_count=$((pass_count + 1))
+else
+  printf 'FAIL: resource_sample.sh 解释器低于 3.11 时未按预期拒绝（退出码 %s）\n' "${old_python_exit}" >&2
+  cat "${old_python_stderr}" >&2
+  fail_count=$((fail_count + 1))
+fi
 
 # --- push_to_monitoring.sh：伪造 psql 走一遍增量上推 + cursor 幂等路径 -----
 

@@ -16,6 +16,13 @@
 #
 # 缺这份 drop-in 时单元会以 root 运行（systemd 默认）——装之前务必先确认它存在，
 # 见 deploy/监控告警.md「安装」的核对步骤。
+#
+# Python 从哪来：**不从这里来**。host-monitor / release-pull 的 ExecStart 与
+# resource-sample 的 Environment=LINGXI_PYTHON 都指向固定符号链接
+# /opt/lingxi/bin/python3，链接目标由引导安装用该机的 <PYTHON_ABSOLUTE_PATH>（3.11 以上）
+# 建好；每台机器只差链接目标，单元与 drop-in 都不写解释器路径。不要在 drop-in 里
+# 用 ExecStart= 覆盖来换解释器——覆盖必须整行重抄，仓库单元每次改 ExecStart 都会
+# 让这份本机副本悄悄落后。建链与核对见 deploy/监控告警.md「安装」的「Python 注入点」。
 
 [Service]
 User=<部署用户>

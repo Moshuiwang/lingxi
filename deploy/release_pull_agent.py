@@ -34,6 +34,9 @@ import urllib.request
 from pathlib import Path, PurePosixPath
 from urllib.parse import urlsplit, urlunsplit
 
+# 代理进程内加载的控制包工具位于只读版本目录，不得写字节码缓存；不依赖启动参数 -B。
+sys.dont_write_bytecode = True
+
 CONFIG_KEYS = frozenset(
     {
         "schema",
@@ -494,11 +497,16 @@ def validate_config(config: object) -> dict:
 
 def _command_argv(path: str | Path, *args: str) -> list[str]:
     path = str(path)
-    return ([path] if os.access(path, os.X_OK) else [sys.executable, path]) + list(args)
+    # 非可执行脚本由代理解释器运行；-B 不让它往只读版本目录写字节码缓存。
+    return ([path] if os.access(path, os.X_OK) else [sys.executable, "-B", path]) + list(args)
 
 
 def _run_command(argv: list[str], *, timeout: int, env: dict[str, str] | None = None) -> str:
     """不使用 shell；失败与超时均只给稳定类别。"""
+    # 子进程（清单工具、部署器、钩子）在只读版本目录里加载源码；解释器参数 -B 不会被
+    # 子进程继承，环境变量兜底禁写字节码缓存。
+    child_env = dict(os.environ if env is None else env)
+    child_env["PYTHONDONTWRITEBYTECODE"] = "1"
     try:
         result = subprocess.run(
             argv,
@@ -506,7 +514,7 @@ def _run_command(argv: list[str], *, timeout: int, env: dict[str, str] | None = 
             capture_output=True,
             text=True,
             timeout=timeout,
-            env=env,
+            env=child_env,
             close_fds=True,
         )
     except subprocess.TimeoutExpired:
@@ -2120,8 +2128,9 @@ def _run_locked(
                 bundle_digest=configured_manifest["control_bundle"]["sha256"],
                 release_record=release_audit,
             )
-        except AgentError:
-            _log("bundle", "unknown", tag=tag, release_url=release_url)
+        except AgentError as error:
+            # reason 只进 journal：状态账与告警仍只带稳定结果码。
+            _log("bundle", "unknown", tag=tag, release_url=release_url, reason=error.code)
             return _finish(
                 state,
                 host,

@@ -35,7 +35,20 @@ else
 fi
 
 command -v docker >/dev/null 2>&1 || { echo "缺少命令：docker" >&2; exit 2; }
-command -v python3 >/dev/null 2>&1 || { echo "缺少命令：python3" >&2; exit 2; }
+
+# ---- 解释器从注入点取，不从 PATH 取 python3 ---------------------------------
+# 预发默认 python3 是 3.9，而 _resource_sample.py 要求 3.11 以上（2026-09-15 预发
+# 实读：每分钟失败 80 分钟无人察觉，因为 PATH 上的 python3 静默换成了旧版本）。
+# 默认指向引导安装用 <PYTHON_ABSOLUTE_PATH> 建的固定符号链接，systemd 单元以
+# Environment=LINGXI_PYTHON= 显式注入同一路径；手工运行或测试可用同名变量指到别处。
+# 版本不足不静默：退出 2 并打印实际版本，让 systemd 的失败状态说清楚原因。
+PYTHON="${LINGXI_PYTHON:-/opt/lingxi/bin/python3}"
+command -v "${PYTHON}" >/dev/null 2>&1 \
+  || { echo "缺少命令：${PYTHON}（LINGXI_PYTHON 未指向可执行的 Python，建链见 deploy/监控告警.md「Python 注入点」）" >&2; exit 2; }
+if ! "${PYTHON}" -c 'import sys; sys.exit(0 if sys.version_info >= (3, 11) else 2)' 2>/dev/null; then
+  echo "Python 版本不足：${PYTHON} 是「$("${PYTHON}" --version 2>&1 || echo '版本读不到')」，要求 3.11 以上" >&2
+  exit 2
+fi
 
 install -d -m 750 "${OUTPUT_DIR}" "${STATE_DIR}"
 
@@ -72,7 +85,7 @@ for mount in "${DISK_MOUNTS[@]}"; do
   disk_mount_args+=(--disk-mount "${mount}")
 done
 
-python3 "${SCRIPT_DIR}/_resource_sample.py" \
+"${PYTHON}" "${SCRIPT_DIR}/_resource_sample.py" \
   --docker-stats-file "${docker_stats_file}" \
   --missing-file "${missing_file}" \
   --output-dir "${OUTPUT_DIR}" \

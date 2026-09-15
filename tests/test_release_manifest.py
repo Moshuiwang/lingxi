@@ -3,9 +3,11 @@
 import copy
 import hashlib
 import importlib
+import importlib.util
 import io
 import os
 import re
+import shutil
 import sys
 import tarfile
 import tempfile
@@ -556,6 +558,40 @@ class ReleaseAttachmentTests(unittest.TestCase):
         self.assertEqual(self.fake.downloads, [(doc["tag"], "lingxi-control.tar")])
         self.assertFalse(self.fake.record("v2.4.0")["draft"])
         self.assertFalse(self.fake.record("v2.4.0")["prerelease"])
+
+
+class ControlBundleVerificationTests(unittest.TestCase):
+    """resolve 在生产版本目录里以 root 核对控制包：源码旁不得留下 __pycache__。"""
+
+    def test_verify_control_bundle_leaves_no_bytecode_cache_beside_sources(self):
+        # 仓库 deploy/ 旁可能早有缓存，改把两份源码按同样相对布局复制到临时目录后按路径加载。
+        with tempfile.TemporaryDirectory() as name:
+            root = Path(name)
+            (root / "scripts/ci").mkdir(parents=True)
+            (root / "deploy").mkdir()
+            shutil.copyfile(
+                ROOT / "scripts/ci/release_manifest.py", root / "scripts/ci/release_manifest.py"
+            )
+            shutil.copyfile(ROOT / "deploy/control_bundle.py", root / "deploy/control_bundle.py")
+            package, metadata, _ = control_package(root)
+            # 先把开关拨回假（模拟不带 -B 启动的解释器），核对函数自己必须把它关上。
+            with (
+                patch.object(sys, "dont_write_bytecode", False),
+                patch.object(sys, "pycache_prefix", None),
+            ):
+                spec = importlib.util.spec_from_file_location(
+                    "release_manifest_bytecode_probe", root / "scripts/ci/release_manifest.py"
+                )
+                module = importlib.util.module_from_spec(spec)
+                spec.loader.exec_module(module)
+                # 探针有效性：开关为假时加载副本本身会留下缓存，说明不是解释器替我们挡住的。
+                self.assertTrue((root / "scripts/ci/__pycache__").is_dir())
+                module.verify_control_bundle(package, metadata)
+                self.assertTrue(sys.dont_write_bytecode)
+                with self.assertRaisesRegex(module.ReleaseError, "控制包内容与固定清单不符"):
+                    module.verify_control_bundle(package, dict(metadata, sha256="0" * 64))
+            self.assertFalse((root / "deploy/__pycache__").exists())
+            self.assertEqual(list((root / "deploy").iterdir()), [root / "deploy/control_bundle.py"])
 
 
 class ReleaseWorkflowTests(unittest.TestCase):
