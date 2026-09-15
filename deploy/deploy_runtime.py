@@ -9,7 +9,9 @@ import shutil
 import socket
 import subprocess
 import sys
+import tempfile
 import time
+from contextlib import contextmanager
 from pathlib import Path
 
 from control_bundle import (
@@ -24,6 +26,68 @@ from control_bundle import (
 from deploy_state import DeployError, UnknownError, atomic_write, fingerprint, read_json
 
 SERVICES = ("scheduler", "gateway", "worker-queue")
+
+# Compose 对双引号值支持的转义；`\$` 在 Compose 里先转成 `$$` 再由插值还原成 `$`，这里不做
+# 插值，直接得到 `$`；其余 `\X` 一律只留 X（与 Compose 的 unescape 规则一致）。
+_ENV_ESCAPES = {"n": "\n", "r": "\r", "t": "\t", "f": "\f", "b": "\b", "v": "\v", "a": "\a"}
+
+
+def normalize_env_file_text(text):
+    r"""把 Compose 口径的 env 文件改写成 docker CLI 能照原义消费的形式。
+
+    三个常驻服务由 ``docker compose`` 起，它读 env 文件会去掉值两端成对的引号并处理转义；
+    部署器回读迁移头与业务探针却直接 ``docker run --env-file``，而 docker CLI 不去引号——
+    同一份 ``LINGXI_POSTGRES_DSN='postgresql://…'`` 在常驻服务里是连接串，到迁移容器里就成了
+    带引号的字符串，2026-09-15 预发实读停在 ``migration_revision_unknown``。本函数按 Compose
+    的 env 文件语义逐行改写，原文件不动：空行与 ``#`` 注释行丢弃；``export `` 前缀去掉；键两侧
+    空白去掉；值两端成对的单引号或双引号去掉，双引号内 ``\n`` / ``\"`` 等转义按 Compose
+    处理、单引号内只还原 ``\'`` 与 ``\"``；无引号值去掉首尾空白与 `` #`` 起的行内注释；
+    没有 ``=`` 的行只留键名（docker 与 Compose 都改从进程环境取值，取不到就不设）。不做变量
+    插值：``$`` 原样交给 docker，与此前直接喂 docker 的行为一致。引号未闭合（含跨行引号值）、
+    闭合引号后还有别的内容、键为空或含空白、值含换行（docker 的 env 文件表达不了）都按
+    ``env_file_malformed`` 拒绝，不猜；规范化后没有任何一行时返回空串，由调用方决定结果码。
+    """
+    lines = []
+    for raw in text.split("\n"):
+        statement = raw.removesuffix("\r").strip()
+        if not statement or statement.startswith("#"):
+            continue
+        statement = re.sub(r"^export\s+", "", statement)
+        key, separator, value = statement.partition("=")
+        key = key.strip()
+        if not key or any(character.isspace() for character in key):
+            raise UnknownError("env_file_malformed")
+        if not separator:
+            lines.append(key)
+            continue
+        value = value.lstrip()
+        if value[:1] in ("'", '"'):
+            value = _unquote_env_value(value)
+        else:
+            value = value.split(" #", 1)[0].rstrip()
+        if "\n" in value:
+            raise UnknownError("env_file_malformed")
+        lines.append(key + "=" + value)
+    return "".join(line + "\n" for line in lines)
+
+
+def _unquote_env_value(value):
+    """按 Compose 规则找到与首引号成对的闭合引号，去掉引号并处理转义。"""
+    quote, escaped = value[0], False
+    for index in range(1, len(value)):
+        character = value[index]
+        if character == quote and not escaped:
+            body, rest = value[1:index], value[index + 1 :]
+            break
+        escaped = character == "\\" and not escaped
+    else:
+        raise UnknownError("env_file_malformed")
+    rest = rest.strip()
+    if rest and not rest.startswith("#"):
+        raise UnknownError("env_file_malformed")
+    if quote == '"':
+        return re.sub(r"\\(.)", lambda match: _ENV_ESCAPES.get(match[1], match[1]), body)
+    return body.replace("\\'", "'").replace('\\"', '"')
 
 
 def control_for(plan, release):
@@ -445,22 +509,56 @@ class Runtime:
             }
         return result
 
+    @contextmanager
+    def normalized_env_file(self, name):
+        """把私有 env 文件按 Compose 口径规范化成 docker CLI 能照原义消费的私有临时副本。
+
+        副本放在状态目录下新建的 ``0700`` 临时目录里、文件 ``0600``、只在本次 ``docker run``
+        期间存在，任何退出路径都整目录删除；原文件逐字不动，路径与内容都不进日志和结果码。
+        选状态目录而不是系统临时目录：它本来就是部署器私有材料所在、按 ``0700`` 核对过，
+        不受系统临时目录清理或服务私有临时目录的影响。原文件读不到记 ``env_file_unreadable``，
+        不是合法 UTF-8 或格式不合 Compose 记 ``env_file_malformed``，规范化后一行都没有记
+        ``env_file_empty``——三者都在 ``docker run`` 之前，什么都还没发生。
+        """
+        if self.state_directory is None:
+            raise DeployError("state_directory_required")
+        try:
+            text = (Path(self.host["config_root"]) / name).read_bytes().decode("utf-8")
+        except OSError:
+            raise UnknownError("env_file_unreadable") from None
+        except UnicodeDecodeError:
+            raise UnknownError("env_file_malformed") from None
+        normalized = normalize_env_file_text(text)
+        if not normalized:
+            raise UnknownError("env_file_empty")
+        directory = Path(tempfile.mkdtemp(prefix=".env-", dir=self.state_directory))
+        try:
+            path = directory / name
+            fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+            with os.fdopen(fd, "w", encoding="utf-8") as stream:
+                os.fchmod(fd, 0o600)
+                stream.write(normalized)
+            yield path
+        finally:
+            shutil.rmtree(directory)
+
     def migration(self, plan):
         """版本回读复用固定迁移镜像的 current，不在宿主解析凭据。"""
         suffix = "prod" if plan["environment"] == "production" else "stage"
         source = plan["new"] if plan["operation"] == "apply" else plan["old"]
-        code, output = self.docker(
-            "run",
-            "--rm",
-            "--read-only",
-            "--network",
-            "host",
-            "--env-file",
-            str(Path(self.host["config_root"]) / f".env.{suffix}.migrate"),
-            source["images"]["migrate"],
-            "current",
-            allowed_failure=True,
-        )
+        with self.normalized_env_file(f".env.{suffix}.migrate") as env_file:
+            code, output = self.docker(
+                "run",
+                "--rm",
+                "--read-only",
+                "--network",
+                "host",
+                "--env-file",
+                str(env_file),
+                source["images"]["migrate"],
+                "current",
+                allowed_failure=True,
+            )
         heads = re.findall(r"^([A-Za-z0-9_]+)(?:\s+\(head\))?\s*$", output, re.M)
         if code or len(heads) != 1:
             raise UnknownError("migration_revision_unknown")
@@ -499,31 +597,32 @@ class Runtime:
             if plan["old"]["schema"] != 2:
                 raise UnknownError("business_probe_unavailable")
             suffix = "prod" if plan["environment"] == "production" else "stage"
-            code, raw = self.docker(
-                "run",
-                "--rm",
-                "--read-only",
-                "--network",
-                "host",
-                "--pids-limit",
-                "64",
-                "--memory",
-                "128m",
-                "--env-file",
-                str(Path(self.host["config_root"]) / f".env.{suffix}.scheduler"),
-                "--env",
-                "LINGXI_INNERTEST_SCOPE=" + self.config["values"]["LINGXI_INNERTEST_SCOPE"],
-                "--env",
-                "LINGXI_INNERTEST_BINDING_ID="
-                + self.config["values"]["LINGXI_INNERTEST_BINDING_ID"],
-                "--entrypoint",
-                "python",
-                plan["old"]["images"]["scheduler"],
-                "-B",
-                "-m",
-                "lingxi.apps.innertest_status",
-                allowed_failure=True,
-            )
+            with self.normalized_env_file(f".env.{suffix}.scheduler") as env_file:
+                code, raw = self.docker(
+                    "run",
+                    "--rm",
+                    "--read-only",
+                    "--network",
+                    "host",
+                    "--pids-limit",
+                    "64",
+                    "--memory",
+                    "128m",
+                    "--env-file",
+                    str(env_file),
+                    "--env",
+                    "LINGXI_INNERTEST_SCOPE=" + self.config["values"]["LINGXI_INNERTEST_SCOPE"],
+                    "--env",
+                    "LINGXI_INNERTEST_BINDING_ID="
+                    + self.config["values"]["LINGXI_INNERTEST_BINDING_ID"],
+                    "--entrypoint",
+                    "python",
+                    plan["old"]["images"]["scheduler"],
+                    "-B",
+                    "-m",
+                    "lingxi.apps.innertest_status",
+                    allowed_failure=True,
+                )
         else:
             code, raw = self.docker(
                 "exec",

@@ -756,10 +756,27 @@ class MigrationResumeCliTests(unittest.TestCase):
         self.addCleanup(self.tmp.cleanup)
         self.root = Path(self.tmp.name)
         # 假 docker：ps 一律空（无容器、无作业），run … current 回读未变的库头；其余零输出。
+        # run 先核对 --env-file 拿到的是去过引号的副本（预发 env 文件的 DSN 带单引号）。
         fake = self.root / "fake-docker"
-        fake.write_text('#!/bin/sh\ncase "$1" in run) echo 0091_synthetic;; esac\nexit 0\n')
+        fake.write_text(
+            "#!/bin/sh\n"
+            '[ "$1" = run ] || exit 0\n'
+            "while [ $# -gt 0 ]; do\n"
+            '  if [ "$1" = --env-file ]; then\n'
+            "    shift\n"
+            "    grep -qx 'LINGXI_POSTGRES_DSN=postgresql://synthetic' \"$1\" || exit 1\n"
+            "  fi\n"
+            "  shift\n"
+            "done\n"
+            "echo 0091_synthetic\n"
+        )
         fake.chmod(0o755)
         self.plan, self.host, self.config, self.approval = fixture(self.root, docker=str(fake))
+        config_root = Path(self.host["config_root"])
+        config_root.mkdir(mode=0o700)
+        (config_root / ".env.stage.migrate").write_text(
+            "LINGXI_POSTGRES_DSN='postgresql://synthetic'\n", encoding="utf-8"
+        )
         self.store = state.StateStore(self.root / "private")
         self.store.save_plan(self.plan)
         self.runtime = FakeRuntime(self.host)
