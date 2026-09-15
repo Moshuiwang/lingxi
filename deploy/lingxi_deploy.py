@@ -9,11 +9,15 @@ import importlib.util
 import json
 import re
 import sys
-import time
-from pathlib import Path
 
-from deploy_runtime import Runtime, control_for
-from deploy_state import (
+# 部署器在只读版本目录里以 root 运行：先关字节码缓存，再加载同目录的运行时模块与清单工具。
+sys.dont_write_bytecode = True
+
+import time  # noqa: E402
+from pathlib import Path  # noqa: E402
+
+from deploy_runtime import Runtime, control_for  # noqa: E402
+from deploy_state import (  # noqa: E402
     DeployError,
     StateStore,
     UnknownError,

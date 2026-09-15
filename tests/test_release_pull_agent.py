@@ -9,8 +9,10 @@ import importlib.util
 import io
 import json
 import os
+import shutil
 import stat
 import subprocess
+import sys
 import tarfile
 import tempfile
 import textwrap
@@ -93,7 +95,7 @@ class PullHarness:
             import json, os, shutil, sys
             log = os.environ.get("CALL_LOG")
             with open(log, "a", encoding="utf-8") as stream:
-                stream.write(json.dumps({"kind":"gh", "argv":sys.argv[1:], "sentinel":os.environ.get("SECRET_SENTINEL", "")}) + "\n")
+                stream.write(json.dumps({"kind":"gh", "argv":sys.argv[1:], "sentinel":os.environ.get("SECRET_SENTINEL", ""), "no_bytecode":os.environ.get("PYTHONDONTWRITEBYTECODE")}) + "\n")
             if sys.argv[1:3] == ["release", "list"]:
                 # 复刻 gh 2.97：--json 只接受手册字段，未知字段退出 1；只回请求到的字段。
                 fields = sys.argv[sys.argv.index("--json") + 1].split(",")
@@ -121,7 +123,7 @@ class PullHarness:
             #!/usr/bin/env python3
             import json, os, sys
             with open(os.environ["CALL_LOG"], "a", encoding="utf-8") as stream:
-                stream.write(json.dumps({"kind":"manifest", "script":os.path.abspath(__file__), "argv":sys.argv[1:]}) + "\n")
+                stream.write(json.dumps({"kind":"manifest", "script":os.path.abspath(__file__), "argv":sys.argv[1:], "no_bytecode":os.environ.get("PYTHONDONTWRITEBYTECODE")}) + "\n")
             tag = sys.argv[sys.argv.index("--tag") + 1]
             source = os.path.join(os.environ["MANIFESTS_DIR"], tag + ".json")
             destination = sys.argv[sys.argv.index("--manifest-output") + 1]
@@ -191,6 +193,9 @@ class PullHarness:
                     stream.write(json.dumps({"kind":"bundle-verify", "package":str(package)}) + "\n")
                 return {}, {"control-index.json": Path(os.environ["INDEX_FILE"]).read_bytes()}
             def install(package, expected, root):
+                if os.environ.get("BUNDLE_INSTALL_MODE") == "refuse":
+                    # 复刻 control_bundle.verify_install 对已装目录里出现可写项（__pycache__）的拒绝。
+                    raise RuntimeError("安装目录存在链接或可写项")
                 target = Path(root) / expected["sha256"]
                 if target.exists():
                     shutil.rmtree(target)
@@ -211,7 +216,7 @@ class PullHarness:
             def canonical(value):
                 return (json.dumps(value, ensure_ascii=False, sort_keys=True, indent=2) + "\n").encode()
             def log(kind, extra=None):
-                value = {"kind":kind, "script":os.path.abspath(__file__), "argv":sys.argv[1:]}
+                value = {"kind":kind, "script":os.path.abspath(__file__), "argv":sys.argv[1:], "no_bytecode":os.environ.get("PYTHONDONTWRITEBYTECODE")}
                 if extra:
                     value.update(extra)
                 with open(os.environ["CALL_LOG"], "a", encoding="utf-8") as stream:
@@ -288,13 +293,22 @@ class PullHarness:
                 raise SystemExit(7)
             """,
         )
+        # 真实清单工具会加载同版本目录里的 deploy/control_bundle.py；假清单工具同样导入一个
+        # 同目录模块，没有禁写字节码缓存时版本目录里就会多出 __pycache__（预发实读的成因）。
+        _write(
+            self.installed_source / "scripts" / "ci" / "manifest_sibling.py",
+            "VALUE = 1\n",
+            0o644,
+        )
         self.installed_manifest = _exec(
             self.installed_source / "scripts" / "ci" / "release_manifest.py",
             r"""
             #!/usr/bin/env python3
             import json, os, sys
+            sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+            import manifest_sibling
             with open(os.environ["CALL_LOG"], "a", encoding="utf-8") as stream:
-                stream.write(json.dumps({"kind":"installed-manifest", "script":os.path.abspath(__file__), "argv":sys.argv[1:]}) + "\n")
+                stream.write(json.dumps({"kind":"installed-manifest", "script":os.path.abspath(__file__), "argv":sys.argv[1:], "no_bytecode":os.environ.get("PYTHONDONTWRITEBYTECODE"), "sibling":manifest_sibling.VALUE}) + "\n")
             tag = sys.argv[sys.argv.index("--tag") + 1]
             with open(os.path.join(os.environ["MANIFESTS_DIR"], tag + ".json"), encoding="utf-8") as source:
                 data = json.load(source)
@@ -371,6 +385,7 @@ class PullHarness:
             "DOCKER_IMAGES_JSON": "{}",
             "DEPLOY_STATUS": "verified",
             "DEPLOY_MODE": "normal",
+            "BUNDLE_INSTALL_MODE": "normal",
         }
         self.old_tag = "v2.4.3"
         self.target_tag = "v2.5.0-rc.10" if environment == "stage" else "v2.5.0"
@@ -2133,6 +2148,168 @@ class AgentTests(unittest.TestCase):
         self.assertFalse(any(call["kind"] == "deployer" for call in self.calls()))
         self.assertEqual(len(messages), 1)
 
+    def test_command_argv_runs_non_executable_scripts_with_bytecode_disabled(self):
+        """版本目录里的清单工具 / 部署器按包内索引装成 0444：由代理解释器带 -B 运行。"""
+        script = _write(self.harness.root / "plain-tool.py", "print('synthetic')\n", 0o644)
+        self.assertEqual(
+            AGENT._command_argv(script, "resolve", "--tag", "v2.5.0"),
+            [sys.executable, "-B", str(script), "resolve", "--tag", "v2.5.0"],
+        )
+        self.assertEqual(
+            AGENT._command_argv(self.harness.gh, "release", "list"),
+            [str(self.harness.gh), "release", "list"],
+        )
+
+    def test_run_command_always_disables_bytecode_cache_for_children(self):
+        """-B 不传子进程：无论 env 是 None 还是显式字典，子进程环境都带 PYTHONDONTWRITEBYTECODE=1。"""
+        captured = []
+
+        def fake_run(argv, **kwargs):
+            captured.append(kwargs)
+            return subprocess.CompletedProcess(argv, 0, stdout="", stderr="")
+
+        with patch.object(AGENT.subprocess, "run", side_effect=fake_run):
+            AGENT._run_command(["/bin/true"], timeout=1, env=None)
+            AGENT._run_command(
+                ["/bin/true"], timeout=1, env={"LINGXI_GH_COMMAND": "/x/gh", "PATH": "/usr/bin"}
+            )
+        inherited, explicit = captured
+        self.assertEqual(inherited["env"]["PYTHONDONTWRITEBYTECODE"], "1")
+        # env=None 仍以进程环境为底：夹具写进 os.environ 的键原样可见。
+        self.assertEqual(inherited["env"]["CALL_LOG"], str(self.harness.log))
+        self.assertEqual(explicit["env"]["PYTHONDONTWRITEBYTECODE"], "1")
+        self.assertEqual(explicit["env"]["LINGXI_GH_COMMAND"], "/x/gh")
+        self.assertEqual(explicit["env"]["PATH"], "/usr/bin")
+        # 显式字典只补这一个键，不把进程环境的其他键夹带进去。
+        self.assertEqual(
+            set(explicit["env"]), {"PYTHONDONTWRITEBYTECODE", "LINGXI_GH_COMMAND", "PATH"}
+        )
+        # 真实子进程：即使本进程环境里没有这个变量，子解释器也已被禁写字节码缓存。
+        with patch.dict(os.environ, clear=False):
+            os.environ.pop("PYTHONDONTWRITEBYTECODE", None)
+            raw = AGENT._run_command(
+                [sys.executable, "-c", "import sys; print(sys.dont_write_bytecode)"],
+                timeout=30,
+                env=None,
+            )
+        self.assertEqual(raw.strip(), "True")
+
+    def test_agent_process_never_writes_bytecode_cache(self):
+        """代理模块顶部的开关不依赖 -B：导入后进程内加载控制包工具不在源码旁留 __pycache__。"""
+        self.assertTrue(sys.dont_write_bytecode)
+        root = self.harness.root / "bytecode-probe"
+        (root / "agent").mkdir(parents=True)
+        (root / "tool").mkdir()
+        agent_copy = root / "agent" / "release_pull_agent.py"
+        tool_copy = root / "tool" / "control_bundle.py"
+        shutil.copyfile(MODULE_PATH, agent_copy)
+        shutil.copyfile(ROOT / "deploy/control_bundle.py", tool_copy)
+        # 先把开关拨回假（模拟不带 -B 启动的解释器），再重新执行代理模块的顶层代码。
+        with (
+            patch.object(sys, "dont_write_bytecode", False),
+            patch.object(sys, "pycache_prefix", None),
+        ):
+            probe_spec = importlib.util.spec_from_file_location(
+                "release_pull_agent_probe", agent_copy
+            )
+            probe = importlib.util.module_from_spec(probe_spec)
+            assert probe_spec.loader is not None
+            probe_spec.loader.exec_module(probe)
+            # 探针有效性：开关为假时加载代理副本本身会留下缓存，说明不是解释器替我们挡住的。
+            self.assertTrue((root / "agent" / "__pycache__").is_dir())
+            self.assertTrue(sys.dont_write_bytecode)
+            module = probe._load_module(tool_copy)
+            self.assertIsNotNone(module)
+            self.assertTrue(callable(module.verify))
+        self.assertFalse((root / "tool" / "__pycache__").exists())
+
+    def test_child_processes_never_write_bytecode_cache_into_bundle(self):
+        """预发实读：清单工具子进程以 root 在版本目录里加载同目录模块，此前留下 __pycache__，
+        下一轮 verify_install 就以「存在可写项」拒绝。装成 0444（生产形态）与可执行两种都不留。"""
+        for executable in (False, True):
+            with self.subTest(executable=executable):
+                self.harness.close()
+                harness = self.harness = PullHarness()
+                self.addCleanup(harness.close)
+                mode = 0o755 if executable else 0o444
+                harness.installed_manifest.chmod(mode)
+                harness.installed_deployer.chmod(mode)
+                harness.state_for_old()
+                with patch.dict(os.environ, clear=False):
+                    os.environ.pop("PYTHONDONTWRITEBYTECODE", None)
+                    code, _ = self.run_agent(sender=lambda message, env, timeout: None)
+                self.assertEqual(code, 0)
+                self.assertEqual(self.read_state()["last_result"], "verified")
+                children = [
+                    call
+                    for call in self.calls()
+                    if call["kind"] in {"gh", "manifest", "installed-manifest", "deployer"}
+                ]
+                self.assertTrue(any(call["kind"] == "installed-manifest" for call in children))
+                self.assertTrue(any(call["kind"] == "deployer" for call in children))
+                self.assertTrue(all(call["no_bytecode"] == "1" for call in children), children)
+                self.assertTrue(
+                    all(
+                        call["sibling"] == 1
+                        for call in children
+                        if call["kind"] == "installed-manifest"
+                    )
+                )
+                self.assertEqual([p for p in harness.bundle_root.rglob("__pycache__")], [])
+                self.assertEqual([p for p in harness.bundle_root.rglob("*.pyc")], [])
+
+    def test_deployer_entry_never_writes_bytecode_cache_without_b_flag(self):
+        """部署器入口自己也关缓存：有人不带 -B 手工在版本目录里跑它，同样不留 __pycache__。"""
+        root = self.harness.root / "deployer-probe"
+        (root / "deploy").mkdir(parents=True)
+        (root / "scripts/ci").mkdir(parents=True)
+        for name in (
+            "deploy/lingxi_deploy.py",
+            "deploy/deploy_runtime.py",
+            "deploy/deploy_state.py",
+            "deploy/control_bundle.py",
+            "scripts/ci/release_manifest.py",
+        ):
+            shutil.copyfile(ROOT / name, root / name)
+        env = {key: value for key, value in os.environ.items() if key != "PYTHONDONTWRITEBYTECODE"}
+        env.pop("PYTHONPYCACHEPREFIX", None)
+        result = subprocess.run(
+            [sys.executable, str(root / "deploy/lingxi_deploy.py"), "--help"],
+            capture_output=True,
+            text=True,
+            timeout=60,
+            env=env,
+            check=False,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(sorted(root.rglob("__pycache__")), [])
+        self.assertEqual(sorted(root.rglob("*.pyc")), [])
+
+    def test_bundle_install_refusal_reason_goes_to_journal_only(self):
+        """控制包入口拒绝安装（如版本目录里多出可写项）：journal 行带 reason，状态账与告警不带。"""
+        harness = self.harness
+        harness.state_for_old()
+        harness.set_env(BUNDLE_INSTALL_MODE="refuse")
+        messages = []
+        code, output = self.run_agent(sender=lambda message, env, timeout: messages.append(message))
+        self.assertEqual(code, 0)
+        lines = [line for line in output.splitlines() if "阶段=bundle 结果码=unknown" in line]
+        self.assertTrue(lines)
+        self.assertTrue(any("reason=control_bundle_install_failed" in line for line in lines))
+        self.assertNotIn(str(harness.bundle_root), output)
+        state = self.read_state()
+        self.assertEqual(state["last_result"], "unknown")
+        self.assertEqual(state["deployer_state"], "unknown")
+        self.assertEqual(state["target_tag"], harness.old_tag)
+        self.assertNotIn(
+            "control_bundle_install_failed", (harness.state / "pull-agent.json").read_text()
+        )
+        self.assertNotIn("reason", (harness.state / "pull-agent.json").read_text())
+        self.assertEqual(len(messages), 1)
+        self.assertIn("unknown", messages[0])
+        self.assertNotIn("control_bundle_install_failed", messages[0])
+        self.assertFalse(any(call["kind"] == "deployer" for call in self.calls()))
+
     def test_systemd_units_shape(self):
         service = (ROOT / "deploy/monitoring-units/lingxi-release-pull.service").read_text()
         timer = (ROOT / "deploy/monitoring-units/lingxi-release-pull.timer").read_text()
@@ -2144,6 +2321,19 @@ class AgentTests(unittest.TestCase):
         self.assertGreaterEqual(int(timeout.split("=", 1)[1]), 3600)
         exec_line = next(line for line in service.splitlines() if line.startswith("ExecStart="))
         self.assertFalse(any("=" in arg for arg in exec_line.split()[1:]))
+        # 代理自己带 -B；子进程靠 [Service] 的环境变量兜底禁写字节码缓存（两头都堵）。
+        self.assertEqual(exec_line.split()[1], "-B")
+        self.assertTrue(exec_line.split()[2].endswith("/deploy/release_pull_agent.py"))
+        sections: dict[str, list[str]] = {}
+        current = ""
+        for line in service.splitlines():
+            if line.startswith("[") and line.endswith("]"):
+                current = line
+                sections[current] = []
+            elif line and not line.startswith("#"):
+                sections.setdefault(current, []).append(line)
+        self.assertIn("Environment=PYTHONDONTWRITEBYTECODE=1", sections["[Service]"])
+        self.assertIn(exec_line, sections["[Service]"])
         # 拉取代理的 drop-in 必须写 User=root（§八），仓库 service 只以注释说明它来自 drop-in。
         self.assertNotRegex(service, r"(?m)^User=")
         user_comments = [
