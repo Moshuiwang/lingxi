@@ -82,6 +82,8 @@ def release_version(tag: str) -> tuple[str, bool]:
 def verify_control_bundle(path: Path, metadata: dict) -> None:
     import importlib.util
 
+    # 本函数在生产版本目录里以 root 运行，源码旁不得留 __pycache__。
+    sys.dont_write_bytecode = True
     source = Path(__file__).resolve().parents[2] / "deploy/control_bundle.py"
     spec = importlib.util.spec_from_file_location("lingxi_fixed_control_bundle", source)
     module = importlib.util.module_from_spec(spec)

@@ -9,11 +9,15 @@ import importlib.util
 import json
 import re
 import sys
-import time
-from pathlib import Path
 
-from deploy_runtime import Runtime, control_for
-from deploy_state import (
+# 部署器在只读版本目录里以 root 运行：先关字节码缓存，再加载同目录的运行时模块与清单工具。
+sys.dont_write_bytecode = True
+
+import time  # noqa: E402
+from pathlib import Path  # noqa: E402
+
+from deploy_runtime import Runtime, control_for  # noqa: E402
+from deploy_state import (  # noqa: E402
     DeployError,
     StateStore,
     UnknownError,
@@ -495,7 +499,10 @@ def main():
         if name != "status":
             p.add_argument("--approval", required=True, type=Path)
     args = parser.parse_args()
-    host, config = read_json(args.host_contract), public_config(read_json(args.public_config))
+    host = read_json(args.host_contract)
+    # public-config 是非秘密映射（root 0644，他人不可写即可），与拉取代理和 runtime 读同类
+    # 文件的口径一致；宿主契约、请求、批准仍按私有材料（0600）读取。
+    config = public_config(read_json(args.public_config, public=True))
     validate_host(host)
     store = StateStore(args.state_directory)
     if args.operation == "plan":

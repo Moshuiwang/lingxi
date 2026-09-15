@@ -3,6 +3,7 @@
 import errno
 import importlib
 import io
+import os
 import subprocess
 import sys
 import tarfile
@@ -284,7 +285,8 @@ class DeployTests(unittest.TestCase):
                 }
             )
 
-    def test_dry_run_cli_creates_no_files_and_no_executor(self):
+    def _plan_inputs(self) -> Path:
+        """把宿主契约、公开配置和计划请求按私有材料形态（0600）写进 0700 目录。"""
         private = self.root / "inputs"
         private.mkdir(mode=0o700)
         request = {
@@ -303,8 +305,10 @@ class DeployTests(unittest.TestCase):
         }
         for name, data in [("host", self.host), ("config", self.config), ("request", request)]:
             state.atomic_write(private / (name + ".json"), data)
-        before = {str(p): p.read_bytes() for p in self.root.rglob("*") if p.is_file()}
-        result = subprocess.run(
+        return private
+
+    def _dry_run_plan(self, private: Path) -> subprocess.CompletedProcess:
+        return subprocess.run(
             [
                 sys.executable,
                 "-B",
@@ -322,12 +326,40 @@ class DeployTests(unittest.TestCase):
             ],
             capture_output=True,
             text=True,
+            timeout=60,
+            check=False,
         )
+
+    def test_dry_run_cli_creates_no_files_and_no_executor(self):
+        private = self._plan_inputs()
+        before = {str(p): p.read_bytes() for p in self.root.rglob("*") if p.is_file()}
+        result = self._dry_run_plan(private)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertFalse((self.root / "not-created").exists())
         self.assertEqual(
             before, {str(p): p.read_bytes() for p in self.root.rglob("*") if p.is_file()}
         )
+
+    def test_public_config_is_read_as_public_file_and_private_inputs_stay_private(self):
+        """预发实读：public-config.json 按非秘密映射装成 root 0644，部署器此前按私有材料要求
+        0600，plan 一步就以 private_file_permissions 停住；宿主契约那一侧仍必须是 0600。"""
+        private = self._plan_inputs()
+        os.chmod(private / "config.json", 0o644)
+        result = self._dry_run_plan(private)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn('"plan_sha256"', result.stdout)
+        self.assertFalse((self.root / "not-created").exists())
+        # 组 / 其他可写的公开配置仍拒：公开只放宽「本人可读」，不放宽「他人不可写」。
+        os.chmod(private / "config.json", 0o664)
+        result = self._dry_run_plan(private)
+        self.assertEqual(result.returncode, 1)
+        self.assertIn('"error": "private_file_permissions"', result.stderr)
+        os.chmod(private / "config.json", 0o644)
+        # 宿主契约是私有材料：0644 必须仍被拒。
+        os.chmod(private / "host.json", 0o644)
+        result = self._dry_run_plan(private)
+        self.assertEqual(result.returncode, 1)
+        self.assertIn('"error": "private_file_permissions"', result.stderr)
 
 
 class BundleTests(unittest.TestCase):
