@@ -5,6 +5,7 @@ import importlib
 import json
 import os
 import socket
+import stat
 import sys
 import tempfile
 import unittest
@@ -233,7 +234,152 @@ class RuntimeTests(unittest.TestCase):
         self.assertEqual(argv[-3:], ["scheduler", "gateway", "worker-queue"])
         self.assertTrue(any(self.plan["new"]["control_bundle"]["sha256"] in x for x in argv))
 
+    # 预发 env 文件历来给 DSN 加单引号；docker CLI 不去引号，Compose 会去。
+    DSN = "postgresql://synthetic:secret@localhost/lingxi?sslmode=require&application_name=x"
+    ENV_TEXT = (
+        "# 合成私有 env 文件\n"
+        "\n"
+        f"LINGXI_POSTGRES_DSN='{DSN}'\n"
+        'export LINGXI_FEISHU_APP_SECRET="s\\"q"\n'
+        "LINGXI_LOG_LEVEL=info # 行内注释\n"
+        "PASSTHRU\n"
+    )
+    NORMALIZED = (
+        f"LINGXI_POSTGRES_DSN={DSN}\n"
+        'LINGXI_FEISHU_APP_SECRET=s"q\n'
+        "LINGXI_LOG_LEVEL=info\n"
+        "PASSTHRU\n"
+    )
+
+    def write_env(self, name, text=ENV_TEXT):
+        """按预发形态写私有 env 文件（目录 0700、文件 0600），返回路径。"""
+        root = Path(self.host["config_root"])
+        root.mkdir(mode=0o700, exist_ok=True)
+        path = root / name
+        path.write_text(text, encoding="utf-8")
+        path.chmod(0o600)
+        return path
+
+    def capturing_docker(self, seen, output):
+        """假 docker：在 docker run 进行中读走 --env-file 副本的路径、内容与权限位。"""
+
+        def docker(*args, **kwargs):
+            path = Path(args[args.index("--env-file") + 1])
+            seen.update(
+                path=path,
+                text=path.read_text(encoding="utf-8"),
+                mode=stat.S_IMODE(path.stat().st_mode),
+                directory_mode=stat.S_IMODE(path.parent.stat().st_mode),
+            )
+            if isinstance(output, Exception):
+                raise output
+            return 0, output
+
+        return docker
+
+    def assert_private_copy_consumed_and_removed(self, seen, original):
+        """副本不是原文件、已按 Compose 口径去引号、0600 放在状态目录下 0700 临时目录，用完即删。"""
+        self.assertNotEqual(seen["path"], original)
+        self.assertEqual(seen["path"].parent.parent, self.root)
+        self.assertTrue(seen["path"].parent.name.startswith(".env-"))
+        self.assertEqual(seen["text"], self.NORMALIZED)
+        self.assertEqual(seen["mode"], 0o600)
+        self.assertEqual(seen["directory_mode"], 0o700)
+        self.assertFalse(seen["path"].exists())
+        self.assertFalse(seen["path"].parent.exists())
+        self.assertEqual(list(self.root.glob(".env-*")), [])
+        self.assertEqual(original.read_text(encoding="utf-8"), self.ENV_TEXT)
+        self.assertEqual(stat.S_IMODE(original.stat().st_mode), 0o600)
+
+    def test_migration_feeds_docker_a_private_unquoted_env_copy_and_removes_it(self):
+        original = self.write_env(".env.stage.migrate")
+        seen = {}
+        with patch.object(
+            self.runtime, "docker", side_effect=self.capturing_docker(seen, "0092_synthetic\n")
+        ) as docker:
+            self.assertEqual(self.runtime.migration(self.plan), ["0092_synthetic"])
+        self.assert_private_copy_consumed_and_removed(seen, original)
+        self.assertEqual(docker.call_args.args[0], "run")
+        self.assertNotIn(str(original), docker.call_args.args)
+        # docker 超时抛出：副本同样不留。
+        seen.clear()
+        timeout = state.UnknownError("command_timeout_reconcile_required")
+        with patch.object(self.runtime, "docker", side_effect=self.capturing_docker(seen, timeout)):
+            with self.assertRaisesRegex(state.UnknownError, "^command_timeout_reconcile_required$"):
+                self.runtime.migration(self.plan)
+        self.assert_private_copy_consumed_and_removed(seen, original)
+
+    def test_business_probe_feeds_docker_the_same_private_env_copy(self):
+        original = self.write_env(".env.stage.scheduler")
+        response = json.dumps(
+            {
+                "ok": True,
+                "schema_revision": 1,
+                "roster": {
+                    "schema_revision": 1,
+                    "compatible": True,
+                    "version": 3,
+                    "mode": "database",
+                    "requires_dynamic_roster": True,
+                },
+                "binding": {
+                    "binding_id": "synthetic-binding",
+                    "version": 1,
+                    "enabled": True,
+                    "authorized": True,
+                },
+                "followups": {
+                    "contract_versions": [1],
+                    "compatible": True,
+                    "inflight": 0,
+                    "recoverable": 0,
+                    "unknown": 0,
+                },
+            }
+        )
+        seen = {}
+        stopped = {"scheduler": {"id": "synthetic", "running": False}}
+        with patch.object(
+            self.runtime, "docker", side_effect=self.capturing_docker(seen, response)
+        ) as docker:
+            result = self.runtime.business_status(self.plan, stopped)
+        self.assertTrue(result["ok"])
+        self.assert_private_copy_consumed_and_removed(seen, original)
+        self.assertEqual(docker.call_args.args[0], "run")
+        self.assertEqual(docker.call_args.args[-1], "lingxi.apps.innertest_status")
+        self.assertNotIn(str(original), docker.call_args.args)
+
+    def test_unreadable_malformed_or_empty_env_file_stops_before_docker_without_leftovers(self):
+        cases = [
+            (None, "env_file_unreadable"),
+            ("# 只有注释\n\n", "env_file_empty"),
+            ("LINGXI_POSTGRES_DSN='未闭合\n", "env_file_malformed"),
+            (b"LINGXI_POSTGRES_DSN=\xff\n", "env_file_malformed"),
+        ]
+        for text, code in cases:
+            with self.subTest(code=code):
+                path = Path(self.host["config_root"]) / ".env.stage.migrate"
+                path.unlink(missing_ok=True)
+                if isinstance(text, bytes):
+                    self.write_env(path.name, "")
+                    path.write_bytes(text)
+                elif text is not None:
+                    self.write_env(path.name, text)
+                with patch.object(self.runtime, "docker") as docker:
+                    with self.assertRaisesRegex(state.UnknownError, "^" + code + "$"):
+                        self.runtime.migration(self.plan)
+                docker.assert_not_called()
+                self.assertEqual(list(self.root.glob(".env-*")), [])
+        # 没接上状态目录就没有私有落点：拒绝而不是退到系统临时目录。
+        self.write_env(".env.stage.migrate")
+        self.runtime.state_directory = None
+        with patch.object(self.runtime, "docker") as docker:
+            with self.assertRaisesRegex(state.DeployError, "^state_directory_required$"):
+                self.runtime.migration(self.plan)
+        docker.assert_not_called()
+
     def test_revision_readback_uses_fixed_native_current_and_rejects_unknown_output(self):
+        self.write_env(".env.stage.migrate")
         with patch.object(
             self.runtime, "docker", return_value=(0, "0092_innertest_membership (head)\n")
         ) as docker:
@@ -458,3 +604,48 @@ class BusinessRecoveryTests(unittest.TestCase):
             with patch.object(runtime, "docker", return_value=(0, json.dumps(response))):
                 with self.assertRaisesRegex(state.DeployError, "cannot_consume"):
                     runtime.business_status(legacy_target, containers)
+
+
+class EnvFileNormalizationTests(unittest.TestCase):
+    """规范化纯函数：对齐 Compose 的 env 文件语义，产物是 docker CLI 能照原义消费的形式。"""
+
+    DSN = "postgresql://synthetic:p%40ss@localhost:5432/lingxi?sslmode=require&application_name=x"
+
+    def normalize(self, text):
+        return runtime_module.normalize_env_file_text(text)
+
+    def test_quotes_comments_blank_lines_export_and_values_with_equals_follow_compose(self):
+        cases = [
+            # 单引号：去引号，内部原样（`\t` 不是转义、`$` 不插值）。
+            (f"A='{self.DSN}'\n", f"A={self.DSN}\n"),
+            ("A='some\\tvalue $X \\'q\\''\n", "A=some\\tvalue $X 'q'\n"),
+            # 双引号：去引号，`\n` / `\t` / `\"` / `\\` / `\$` 按 Compose 处理。
+            (f'A="{self.DSN}"\n', f"A={self.DSN}\n"),
+            ('A="{\\"k\\": \\"v\\"}\\t\\\\ \\$x"\n', 'A={"k": "v"}\t\\ $x\n'),
+            # 无引号：保留原值（含 `=`、`#` 不带前导空格时不是注释），只去首尾空白与 ` #` 注释。
+            (f"A={self.DSN}\n", f"A={self.DSN}\n"),
+            ("A=  v#x  # 注释\r\n", "A=v#x\n"),
+            # 注释行与空行丢弃，`export` 前缀去掉，键两侧空白去掉。
+            ("# 注释\n\n   \n  # 缩进注释\nexport  A = 1\n", "A=1\n"),
+            # 引号值后允许空白或注释；无 `=` 的行只留键名交 docker 从进程环境取。
+            ("A=\"1\"  # 注释\nB='2'#c\n  PASSTHRU  \nC=\n", "A=1\nB=2\nPASSTHRU\nC=\n"),
+            ("", ""),
+            ("# 只有注释\n", ""),
+        ]
+        for text, expected in cases:
+            with self.subTest(text=text):
+                self.assertEqual(self.normalize(text), expected)
+
+    def test_unterminated_quotes_trailing_junk_bad_keys_and_newlines_are_rejected(self):
+        for text in [
+            'A="未闭合\n',
+            "A='未闭合\nB='跨行'\n",
+            'A="x"junk\n',
+            'A="x\\"\n',
+            "A B=1\n",
+            "=1\n",
+            'A="x\\ny"\n',
+        ]:
+            with self.subTest(text=text):
+                with self.assertRaisesRegex(state.UnknownError, "^env_file_malformed$"):
+                    self.normalize(text)

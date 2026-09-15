@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""部署四操作：先固定计划，再按批准执行；恢复必须独立批准。"""
+"""部署四操作：先固定计划，再按批准执行；恢复必须独立批准。另有一个人工续跑入口，只清除一条未完成的迁移记录。"""
 
 from __future__ import annotations
 
@@ -22,10 +22,12 @@ from deploy_state import (  # noqa: E402
     StateStore,
     UnknownError,
     atomic_write,
+    atomic_write_raw,
     canonical,
     check_id,
     fingerprint,
     host_lock,
+    private_directory,
     read_json,
     validate_approval,
 )
@@ -442,6 +444,74 @@ def execute(plan, approval, store, runtime, *, now=None):
         return state
 
 
+def resume_migration(plan, approval, store, runtime, acknowledge, *, now=None):
+    """迁移提交前中断的人工续跑入口：核对事实后只清除一条未完成的迁移记录，不代替 apply 跑迁移。
+
+    只处理一种情形：阶段账写下 ``migrate: running`` 之后、迁移作业容器起来之前部署器被打断，
+    此后 apply 按设计以 ``migration_unknown_no_retry`` 停住。作业容器不带 ``--rm``，有容器
+    （无论在跑还是已退出）就是另一种情形，交 apply 按既有规则判；库头已变同理。批准沿用原
+    apply 的那一份——本操作不换版本、不换迁移头。任一核对不成立就零写、按各自的结果码拒绝。
+    """
+    if plan["operation"] != "apply":
+        raise DeployError("resume_migration_apply_only")
+    approval_sha = validate_approval(plan, approval, now)
+    with host_lock(Path(runtime.host["lock_path"])) as lock_fd:
+        runtime.lock_fd = lock_fd
+        runtime.state_directory = store.root
+        try:
+            raw, state = store.load(plan)
+            archived_sha = None if raw is None else hashlib.sha256(raw).hexdigest()
+            # 指纹不等就是对着旧账操作：status 输出的 state_sha256 必须逐字抄自当前这一份。
+            if archived_sha is None or acknowledge != archived_sha:
+                raise DeployError("resume_acknowledge_mismatch")
+            if state["approval_sha256"] not in (None, approval_sha):
+                raise DeployError("approval_changed")
+            record = state["stages"].get("migrate")
+            if record is None:
+                raise DeployError("resume_no_migrate_record")
+            if record.get("status") != "running":
+                raise DeployError("resume_migrate_not_running")
+            active_path = Path(runtime.host["lock_path"]).with_suffix(".active.json")
+            expected = {"id": plan["id"], "plan_sha256": fingerprint(plan), "status": "running"}
+            if not active_path.exists() or read_json(active_path) != expected:
+                raise DeployError("resume_host_marker_mismatch")
+            # 与 apply 在 migrate 阶段读到的是同一份快照：作业按固定名探测，库头由迁移镜像回读。
+            snapshot = runtime.snapshot(plan)
+            if snapshot["job"] is not None:
+                raise DeployError("resume_migration_job_present")
+            if snapshot["migration_heads"] != plan["current_heads"]:
+                raise DeployError("resume_database_heads_changed")
+            archive_root = store.root / "archive"
+            private_directory(archive_root, create=True)
+            stamp = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
+            archive_path = archive_root / f"{plan['id']}.state.before-resume-{stamp}.json"
+            if archive_path.exists():
+                raise DeployError("resume_archive_exists")
+            atomic_write_raw(archive_path, raw)
+            del state["stages"]["migrate"]
+            state.setdefault("resumes", []).append(
+                {
+                    "time": time.time(),
+                    "stage": "migrate",
+                    "archived_state_sha256": archived_sha,
+                    "acknowledged_sha256": acknowledge,
+                }
+            )
+            store.save(plan, state)
+            return dict(
+                state,
+                archive=str(archive_path),
+                state_sha256=store.digest(plan),
+                checked={
+                    "job": snapshot["job"],
+                    "migration_heads": snapshot["migration_heads"],
+                    "current_heads": plan["current_heads"],
+                },
+            )
+        finally:
+            runtime.lock_fd = None
+
+
 def preview(plan, host, config):
     """差异、窗口和恢复材料在批准前集中展示。"""
     changes = [
@@ -484,7 +554,7 @@ def preview(plan, host, config):
 
 
 def main():
-    """只接受四个明确的操作。"""
+    """只接受四个明确的部署操作，外加一个人工续跑入口。"""
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--host-contract", required=True, type=Path)
     parser.add_argument("--public-config", required=True, type=Path)
@@ -493,11 +563,14 @@ def main():
     p = sub.add_parser("plan")
     p.add_argument("--request", required=True, type=Path)
     p.add_argument("--dry-run", action="store_true")
-    for name in ("apply", "status", "recover"):
+    for name in ("apply", "status", "recover", "resume-migration"):
         p = sub.add_parser(name)
         p.add_argument("plan_id")
         if name != "status":
             p.add_argument("--approval", required=True, type=Path)
+        if name == "resume-migration":
+            # 值取自 status 输出的 state_sha256：证明操作者看的是当前这一份阶段账。
+            p.add_argument("--acknowledge", required=True)
     args = parser.parse_args()
     host = read_json(args.host_contract)
     # public-config 是非秘密映射（root 0644，他人不可写即可），与拉取代理和 runtime 读同类
@@ -524,7 +597,7 @@ def main():
     validate_plan(plan, host, config)
     runtime = Runtime(host, config)
     if args.operation == "status":
-        state = store.state(plan)
+        raw, state = store.load(plan)
         try:
             actual = runtime.snapshot(plan, readonly=True)
             result = dict(state, actual=actual)
@@ -532,6 +605,10 @@ def main():
                 result["status"] = "unknown"
         except Exception:
             result = dict(state, status="unknown", error="actual_state_unavailable")
+        # 阶段账文件原文的 sha256；resume-migration 的 --acknowledge 必须逐字等于它。
+        result["state_sha256"] = None if raw is None else hashlib.sha256(raw).hexdigest()
+    elif args.operation == "resume-migration":
+        result = resume_migration(plan, read_json(args.approval), store, runtime, args.acknowledge)
     else:
         if plan["operation"] != args.operation:
             raise DeployError("independent_recovery_approval_required")
@@ -549,6 +626,10 @@ def main():
         if result["status"] == "verified"
         else "按原计划和有效批准回读接续；恢复须独立批准"
     )
+    if args.operation == "resume-migration":
+        # 阶段账的 status 仍是 unknown（只有真正 apply 才改），结果行单独说明本步做了什么。
+        result["result"] = "已归档并清除未完成的迁移记录"
+        result["required_action"] = "按原计划和同一有效批准执行 apply 接续"
     print(canonical(result).decode(), end="")
 
 

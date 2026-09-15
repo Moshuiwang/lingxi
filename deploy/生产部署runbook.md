@@ -474,6 +474,14 @@ sudo chmod 750 /var/log/lingxi
 stat -c '%n %U:%G %a' /var/log/lingxi /var/log/lingxi/monitoring
 ls -l /etc/lingxi/logrotate.d/lingxi-container-logs
 
+# 1d.（root 级）Python 注入点：host-monitor / release-pull 的 ExecStart 与 resource-sample
+#     的 Environment=LINGXI_PYTHON 都指向这条固定链接，目标 = 引导安装前提核对定下的
+#     <PYTHON_ABSOLUTE_PATH>（3.11 以上；生产系统 python3 是 3.9，见 11.1 第 3 行）。
+#     建链与说明见 deploy/监控告警.md「三、安装」第 0 步；缺链接时采样单元每轮退出码 2
+sudo install -d -o root -g root -m 755 /opt/lingxi/bin
+sudo ln -sfn <PYTHON_ABSOLUTE_PATH> /opt/lingxi/bin/python3
+/opt/lingxi/bin/python3 --version                       # 3.11 以上
+
 # 2. 装单元本体（仓库单元里没有 User=）
 sudo install -m 644 deploy/monitoring-units/*.service \
   deploy/monitoring-units/*.timer /etc/systemd/system/
@@ -491,10 +499,17 @@ sudo systemctl daemon-reload
 sudo systemctl enable --now lingxi-host-monitor.timer lingxi-resource-sample.timer \
   lingxi-db-business-sample.timer lingxi-log-collect.timer lingxi-logrotate.timer
 
-# 5. 回读三项，缺一不可
+# 5. 回读四项，缺一不可（G-2 生产就绪自检同一份清单）
 systemctl list-timers 'lingxi-*'                       # 每个 timer 的 NEXT/LAST 在前进
 systemctl cat lingxi-host-monitor.service | grep '^User='   # 解析成本机部署用户
 ls -la /var/log/lingxi                                  # 收集目录里开始出现容器日志
+/opt/lingxi/bin/python3 --version                       # 3.11 以上（步 1d 的链接）
+systemctl cat lingxi-host-monitor.service lingxi-release-pull.service \
+  lingxi-resource-sample.service lingxi-db-business-sample.service \
+  lingxi-monitoring-push.service | grep -E '^(ExecStart|Environment)='
+#   期望：host-monitor / release-pull 的 ExecStart= 以 /opt/lingxi/bin/python3 开头，
+#   resource-sample 有 Environment=LINGXI_PYTHON=/opt/lingxi/bin/python3，
+#   五个单元没有任何一行指向系统 python3（drop-in 重抄的 ExecStart 同样以该链接开头）
 ```
 
 **装之前先 `systemctl cat <单元>` 与仓库版本逐行比对**：现装的那几份是首发现场手写的，不保证与仓库版本等价；差异逐条确认后再覆盖，不要盲覆盖。

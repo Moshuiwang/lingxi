@@ -70,7 +70,7 @@ python3 "$CONTROL_ROOT/deploy/lingxi_deploy.py" \
   --state-directory "$STATE_DIRECTORY" plan --request "$REQUEST" --dry-run
 ```
 
-确认完整差异与窗口后，去掉 `--dry-run` 保存计划；随后将尾部改为 `apply "$PLAN_ID" --approval "$APPROVAL"` 执行。断线后用 `status "$PLAN_ID"` 只读查进度，同一 `apply` 接续。完成后再次 apply 只核对、不重建。恢复需另存 operation=recover 且引用原部署的计划，并使用 `recover "$RECOVERY_PLAN_ID" --approval "$RECOVERY_APPROVAL"`；不能复用 apply 批准。
+确认完整差异与窗口后，去掉 `--dry-run` 保存计划；随后将尾部改为 `apply "$PLAN_ID" --approval "$APPROVAL"` 执行。断线后用 `status "$PLAN_ID"` 只读查进度，同一 `apply` 接续。完成后再次 apply 只核对、不重建。恢复需另存 operation=recover 且引用原部署的计划，并使用 `recover "$RECOVERY_PLAN_ID" --approval "$RECOVERY_APPROVAL"`；不能复用 apply 批准。 唯一不自动接续的中断是「迁移提交前」（阶段账已记 `migrate: running`、作业容器没起、库头未变）：apply 会以 `migration_unknown_no_retry` 停住，人工核对后用 `resume-migration "$PLAN_ID" --approval "$APPROVAL" --acknowledge <status 输出的 state_sha256>` 归档并清掉这一条记录，再由同一 `apply` 接续；步骤与结果码见[拉取代理 §五「迁移提交前中断的人工续跑」](../拉取代理.md#五幂等接续与九处中断)。
 
 新 schema 缺控制包直接拒绝。旧 schema 1 的选择必须显式 `--allow-legacy`，仅作历史核对；历史恢复记录另绑定原部署、原四镜像、发布证据、兼容证明、恢复工具包和入口停用收据；没有新清单的原始标签使用计划内 historical 类型，不捏造维护分支或构建编号，不向历史 Release 补造验收清单。存在新格式阶段或动态名单但无兼容消费者时不能恢复旧版。
 

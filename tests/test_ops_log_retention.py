@@ -22,6 +22,7 @@ import re
 import shutil
 import stat
 import subprocess
+import sys
 import tempfile
 import time
 import unittest
@@ -138,6 +139,9 @@ class MonitoringSampleRetentionTest(unittest.TestCase):
             ["bash", str(RESOURCE_SCRIPT)],
             env={
                 "PATH": f"{bin_dir}:{os.environ['PATH']}",
+                # 脚本不再从 PATH 取 python3（默认走宿主注入点 /opt/lingxi/bin/python3），
+                # 测试机没有那条链接，显式指到跑测试的这个解释器。
+                "LINGXI_PYTHON": sys.executable,
                 "LINGXI_MONITORING_DIR": str(output_dir),
                 "LINGXI_MONITORING_CONTAINERS": "present-container",
                 "HOME": str(workspace),

@@ -2321,6 +2321,9 @@ class AgentTests(unittest.TestCase):
         self.assertGreaterEqual(int(timeout.split("=", 1)[1]), 3600)
         exec_line = next(line for line in service.splitlines() if line.startswith("ExecStart="))
         self.assertFalse(any("=" in arg for arg in exec_line.split()[1:]))
+        # 解释器只认引导安装建的固定链接（W4 F17）：主机默认 python3 可低于控制包要求的 3.11，
+        # 仓库单元不写死任何一台机器的真实路径。全部宿主侧单元的钉住见 test_monitoring_units_python_pin。
+        self.assertEqual(exec_line.split()[0], "ExecStart=/opt/lingxi/bin/python3")
         # 代理自己带 -B；子进程靠 [Service] 的环境变量兜底禁写字节码缓存（两头都堵）。
         self.assertEqual(exec_line.split()[1], "-B")
         self.assertTrue(exec_line.split()[2].endswith("/deploy/release_pull_agent.py"))

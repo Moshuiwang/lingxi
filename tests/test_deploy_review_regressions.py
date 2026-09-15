@@ -3,6 +3,7 @@
 import io
 import json
 import os
+import shutil
 import tempfile
 import unittest
 from contextlib import redirect_stdout
@@ -91,7 +92,14 @@ class DeploymentReadbackTests(unittest.TestCase):
                 "LINGXI_INNERTEST_BINDING_ID": "synthetic-binding",
             }
         }
-        runtime = runtime_module.Runtime({"config_root": "/synthetic"}, config)
+        # 私有 env 文件按预发形态带引号：探针容器拿到的必须是部署器去过引号的私有副本。
+        root = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, root)
+        (root / "config").mkdir(mode=0o700)
+        env_file = root / "config" / ".env.stage.scheduler"
+        env_file.write_text("LINGXI_POSTGRES_DSN='postgresql://synthetic'\n", encoding="utf-8")
+        runtime = runtime_module.Runtime({"config_root": str(root / "config")}, config)
+        runtime.state_directory = root
         response = {
             "ok": True,
             "schema_revision": 1,
@@ -123,7 +131,14 @@ class DeploymentReadbackTests(unittest.TestCase):
 
         def docker(*args, **kwargs):
             calls.append(args)
-            return (0, json.dumps(response)) if args[0] == "run" else (0, "")
+            if args[0] != "run":
+                return 0, ""
+            copy = Path(args[args.index("--env-file") + 1])
+            self.assertNotEqual(copy, env_file)
+            self.assertEqual(
+                copy.read_text(encoding="utf-8"), "LINGXI_POSTGRES_DSN=postgresql://synthetic\n"
+            )
+            return 0, json.dumps(response)
 
         with (
             patch.object(runtime, "containers", return_value=stopped),
@@ -137,6 +152,8 @@ class DeploymentReadbackTests(unittest.TestCase):
         self.assertIn("synthetic@sha256:old", probe)
         self.assertEqual(probe[-1], "lingxi.apps.innertest_status")
         self.assertNotIn("lingxi.apps.scheduler", probe)
+        self.assertNotIn(str(env_file), probe)
+        self.assertFalse(Path(probe[probe.index("--env-file") + 1]).exists())
         self.assertEqual(
             [args[-1] for args in calls[1:]],
             [stopped[n]["id"] for n in ("gateway", "worker-queue", "scheduler")],
