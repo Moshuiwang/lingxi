@@ -6,7 +6,11 @@
 
 ## [Unreleased]
 
-2.5.0 开发中（Trace [#770](https://github.com/Moshuiwang/lingxi/issues/770)），本节随批次合入逐条追加。
+（暂无）
+
+## [2.5.0] - 2026-09-15
+
+本版是**第一次由拉取代理 + 部署器发到生产的正式版**（Trace [#770](https://github.com/Moshuiwang/lingxi/issues/770)）：`release/2.5` 候选 rc.102 经预发验收后原样提升，生产由 `v2.4.3` 升级、停机约 30 秒、迁移头 `0096` → `0098`，产品负责人一次真实问数通过。用户与管理员得到：① 发布不再靠人在主机上手工操作，门禁的裁决层也不再由被审查的 PR 自己产出（Issue [#748](https://github.com/Moshuiwang/lingxi/issues/748)）；② 预开通、欢迎卡、内测扩员三件运营操作有了具名身份与持久审计账（Issue [#675](https://github.com/Moshuiwang/lingxi/issues/675) / [#788](https://github.com/Moshuiwang/lingxi/issues/788)），管理员可以用自己的 Agent 客户端经受限通道查状态并准备停用 / 恢复 / 补授 / 撤销、确认仍在本人飞书卡片上（Issue [#716](https://github.com/Moshuiwang/lingxi/issues/716)），职位授权重叠时只补缺的项、撤销只撤本笔（Issue [#715](https://github.com/Moshuiwang/lingxi/issues/715)），每次真实问数收口后留存问答语料并可受控读取（Issue [#664](https://github.com/Moshuiwang/lingxi/issues/664)）；③ 队列执行服务必配问数 MCP 地址（Issue [#604](https://github.com/Moshuiwang/lingxi/issues/604)）、预发监控小项（Issue [#756](https://github.com/Moshuiwang/lingxi/issues/756)）、两块纯函数平移（Issue [#658](https://github.com/Moshuiwang/lingxi/issues/658)，行为零变化）与一批真机接缝修法。生产内测名单自本版起改为库内动态名单，新人首聊只能经扩员确认卡准入。迁移 `0097` / `0098` 只加不删，回退不降库。证据等级与已知边界以 [docs/当前能力.md](docs/当前能力.md) 为准。
 
 ### Added
 
