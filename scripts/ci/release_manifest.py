@@ -11,6 +11,7 @@ import os
 import re
 import subprocess
 import sys
+import tarfile
 import tempfile
 import tomllib
 from pathlib import Path
@@ -264,7 +265,39 @@ def load_release(repository: str, tag: str, *, require_completed: bool = True) -
     return release, doc
 
 
+def embedded_index(bundle_path: Path, metadata: dict) -> bytes:
+    """只在内存里读出控制包内嵌的索引成员；摘要必须等于清单钉住的 index_sha256。"""
+    try:
+        with tarfile.open(bundle_path, mode="r:") as archive:
+            member = archive.getmember("control-index.json")
+            data = archive.extractfile(member).read() if member.isfile() else b""
+    except (tarfile.TarError, KeyError):
+        raise ReleaseError("控制包内嵌索引与清单不符") from None
+    if hashlib.sha256(data).hexdigest() != metadata["index_sha256"]:
+        raise ReleaseError("控制包内嵌索引与清单不符")
+    return data
+
+
+def asset_bytes(repo: str, tag: str, name: str) -> bytes:
+    """下载 Release 上已有的同名附件，供中断后核对；不改写任何附件。"""
+    with tempfile.TemporaryDirectory() as directory:
+        command(
+            "gh",
+            "release",
+            "download",
+            tag,
+            "--repo",
+            repo,
+            "--pattern",
+            name,
+            "--dir",
+            directory,
+        )
+        return (Path(directory) / name).read_bytes()
+
+
 def write_release(doc: dict, output: Path, bundle_path: Path | None = None) -> None:
+    index = None
     if doc["schema"] == 2:
         if (
             bundle_path is None
@@ -272,6 +305,7 @@ def write_release(doc: dict, output: Path, bundle_path: Path | None = None) -> N
             != doc["control_bundle"]["sha256"]
         ):
             raise ReleaseError("控制包附件缺失或摘要不符")
+        index = embedded_index(bundle_path, doc["control_bundle"])
         verify_control_bundle(bundle_path, doc["control_bundle"])
     output.write_bytes(canonical(doc))
     repo, tag = doc["repository"], doc["tag"]
@@ -309,54 +343,22 @@ def write_release(doc: dict, output: Path, bundle_path: Path | None = None) -> N
                 "make_latest": "false",
             },
         )
+    # 中断后只接受此前上传的同一份内容，不删除或覆盖任何附件。
+    uploaded = {a.get("name") for a in existing.get("assets", [])}
+    if uploaded:
+        if asset_bytes(repo, tag, "release-manifest.json") != canonical(doc):
+            raise ReleaseError("草稿已有不同清单，拒绝覆盖")
     else:
-        assets = existing.get("assets", [])
-        if assets:
-            # 中断后只接受此前上传的同一份内容，不删除或覆盖任何附件。
-            with tempfile.TemporaryDirectory() as directory:
-                command(
-                    "gh",
-                    "release",
-                    "download",
-                    tag,
-                    "--repo",
-                    repo,
-                    "--pattern",
-                    "release-manifest.json",
-                    "--dir",
-                    directory,
-                )
-                if (Path(directory) / "release-manifest.json").read_bytes() != canonical(doc):
-                    raise ReleaseError("草稿已有不同清单，拒绝覆盖")
-    if not existing.get("assets"):
         command(
             "gh", "release", "upload", tag, str(output) + "#release-manifest.json", "--repo", repo
         )
     if doc["schema"] == 2:
-        bundle_assets = [
-            a for a in existing.get("assets", []) if a.get("name") == "lingxi-control.tar"
-        ]
-        if bundle_assets:
-            with tempfile.TemporaryDirectory() as directory:
-                command(
-                    "gh",
-                    "release",
-                    "download",
-                    tag,
-                    "--repo",
-                    repo,
-                    "--pattern",
-                    "lingxi-control.tar",
-                    "--dir",
-                    directory,
-                )
-                if (
-                    hashlib.sha256(
-                        (Path(directory) / "lingxi-control.tar").read_bytes()
-                    ).hexdigest()
-                    != doc["control_bundle"]["sha256"]
-                ):
-                    raise ReleaseError("已有控制包不同，拒绝覆盖")
+        if "lingxi-control.tar" in uploaded:
+            if (
+                hashlib.sha256(asset_bytes(repo, tag, "lingxi-control.tar")).hexdigest()
+                != doc["control_bundle"]["sha256"]
+            ):
+                raise ReleaseError("已有控制包不同，拒绝覆盖")
         else:
             command(
                 "gh",
@@ -367,6 +369,23 @@ def write_release(doc: dict, output: Path, bundle_path: Path | None = None) -> N
                 "--repo",
                 repo,
             )
+        # 外部索引是拉取代理解包前的核对依据，必须与 tar 内嵌索引逐字节相同。
+        if "control-index.json" in uploaded:
+            if asset_bytes(repo, tag, "control-index.json") != index:
+                raise ReleaseError("已有索引附件不同，拒绝覆盖")
+        else:
+            with tempfile.TemporaryDirectory() as directory:
+                index_path = Path(directory) / "control-index.json"
+                index_path.write_bytes(index)
+                command(
+                    "gh",
+                    "release",
+                    "upload",
+                    tag,
+                    str(index_path) + "#control-index.json",
+                    "--repo",
+                    repo,
+                )
     api(
         f"repos/{repo}/releases/{existing['id']}",
         method="PATCH",

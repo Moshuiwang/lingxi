@@ -1,20 +1,27 @@
 """发布资格与镜像提升的正反用例；网络调用由真实 GitHub 演练另行覆盖。"""
 
 import copy
+import hashlib
 import importlib
+import io
 import os
+import re
 import sys
+import tarfile
 import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import Mock, patch
+from urllib.parse import unquote
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "scripts/ci"))
+sys.path.insert(0, str(ROOT / "deploy"))
 guard = importlib.import_module("check_release_flow")
 release = importlib.import_module("release_manifest")
 proof = importlib.import_module("verify_epic_candidate")
 writer = importlib.import_module("write_epic_candidate")
+bundle = importlib.import_module("control_bundle")
 
 
 def candidate():
@@ -48,6 +55,134 @@ def receipt(doc):
             "evidence_url": "https://github.com/Moshuiwang/lingxi/issues/669#issuecomment-124",
         },
     }
+
+
+def control_package(root, *, index_tail=b""):
+    """造一份能通过控制包核对的最小包；index_tail 只改写 tar 内嵌索引，模拟包内索引被改。"""
+    contents = {name: f"fixture: {name}\n".encode() for name in bundle.REQUIRED_FILES}
+    entries = [
+        {
+            "path": name,
+            "sha256": bundle.digest(data),
+            "mode": 0o444,
+            "size": len(data),
+            "source_commit": "a" * 40,
+        }
+        for name, data in contents.items()
+    ]
+    index = bundle.canonical(
+        {
+            "schema_revision": 1,
+            "source_commit": "a" * 40,
+            "runtime": bundle.RUNTIME,
+            "files": entries,
+        }
+    )
+    contents[bundle.INDEX] = index + index_tail
+    path = root / bundle.ASSET
+    with tarfile.open(path, "w", format=tarfile.USTAR_FORMAT) as archive:
+        for name, data in contents.items():
+            info = tarfile.TarInfo(name)
+            info.size, info.mode, info.mtime = len(data), 0o444, 0
+            archive.addfile(info, io.BytesIO(data))
+    metadata = {
+        "asset": bundle.ASSET,
+        "sha256": bundle.digest(path.read_bytes()),
+        "index_sha256": bundle.digest(index),
+        "schema_revision": 1,
+        "source_commit": "a" * 40,
+        "runtime": bundle.RUNTIME,
+    }
+    return path, metadata, index
+
+
+def candidate_with_bundle(metadata):
+    return dict(
+        candidate(),
+        schema=2,
+        tag="v2.4.0-rc.7",
+        version="2.4.0",
+        branch="release/2.4",
+        control_bundle=metadata,
+    )
+
+
+class FakeGitHub:
+    """内存里的 GitHub：只模拟发布脚本会碰到的 api 路径与 gh release 子命令，记录每次上传。"""
+
+    def __init__(self):
+        self.releases = []
+        self.assets = {}
+        self.tags = {}
+        self.uploads = []
+        self.downloads = []
+
+    def seed(self, doc, assets, *, draft):
+        """预置一份 Release（中断残留的草稿或已发布的候选）；assets 是名称到字节。"""
+        record = {
+            "id": len(self.releases) + 1,
+            "tag_name": doc["tag"],
+            "draft": draft,
+            "prerelease": doc["prerelease"],
+            "assets": [{"name": name} for name in assets],
+        }
+        self.releases.append(record)
+        for name, data in assets.items():
+            self.assets[(doc["tag"], name)] = data
+        self.tags[doc["tag"]] = doc["commit"]
+        return record
+
+    def record(self, tag):
+        return next(r for r in self.releases if r["tag_name"] == tag)
+
+    def api(self, path, *, method="GET", data=None):
+        route = path.split("?", 1)[0]
+        page = int(re.search(r"[?&]page=(\d+)", path).group(1)) if "&page=" in path else 1
+        if method == "GET" and route.endswith("/releases"):
+            return copy.deepcopy(self.releases) if page == 1 else []
+        if method == "GET" and "/git/matching-refs/tags/" in route:
+            tag = unquote(route.rsplit("/", 1)[1])
+            return [{"ref": f"refs/tags/{tag}"}] if tag in self.tags and page == 1 else []
+        if method == "POST" and route.endswith("/git/refs"):
+            self.tags[data["ref"].removeprefix("refs/tags/")] = data["sha"]
+            return {"ref": data["ref"]}
+        if method == "GET" and "/commits/" in route:
+            tag = unquote(route.rsplit("/", 1)[1])
+            return {"sha": self.tags[tag], "commit": {"tree": {"sha": "b" * 40}}}
+        if method == "POST" and route.endswith("/releases"):
+            record = {
+                "id": len(self.releases) + 1,
+                "tag_name": data["tag_name"],
+                "draft": True,
+                "prerelease": data["prerelease"],
+                "assets": [],
+            }
+            self.releases.append(record)
+            return copy.deepcopy(record)
+        if method == "PATCH" and "/releases/" in route:
+            record = next(r for r in self.releases if r["id"] == int(route.rsplit("/", 1)[1]))
+            record.update(data)
+            return copy.deepcopy(record)
+        raise AssertionError(f"未预期的 api 调用：{method} {path}")
+
+    def command(self, *args, input_text=None):
+        if args[:3] == ("gh", "release", "download"):
+            tag, name = args[3], args[args.index("--pattern") + 1]
+            self.downloads.append((tag, name))
+            if (tag, name) not in self.assets:
+                raise release.ReleaseError("gh 执行失败，退出码 1")
+            (Path(args[args.index("--dir") + 1]) / name).write_bytes(self.assets[(tag, name)])
+            return ""
+        if args[:3] == ("gh", "release", "upload"):
+            tag, (source, label) = args[3], args[4].rsplit("#", 1)
+            name = Path(source).name
+            if name != label or (tag, name) in self.assets:
+                raise AssertionError(f"上传附件名与标签不符或重复上传：{args[4]}")
+            self.assets[(tag, name)] = Path(source).read_bytes()
+            self.record(tag)["assets"].append({"name": name})
+            self.uploads.append((tag, name))
+            return ""
+        raise AssertionError(f"未预期的命令：{args}")
 
 
 class ReleaseManifestTests(unittest.TestCase):
@@ -297,6 +432,130 @@ class ReleaseManifestTests(unittest.TestCase):
                 for p in (ROOT / "migrations/alembic/versions").glob("*.py")
             )
         )
+
+
+class ReleaseAttachmentTests(unittest.TestCase):
+    """候选与正式版 Release 都要带三个附件；索引附件与 tar 内嵌索引逐字节相同。"""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.root = Path(self.tmp.name)
+        self.output = self.root / "release-manifest.json"
+        self.fake = FakeGitHub()
+        for name in ("api", "command"):
+            patcher = patch.object(release, name, side_effect=getattr(self.fake, name))
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    def embedded(self, package):
+        with tarfile.open(package, mode="r:") as archive:
+            return archive.extractfile(archive.getmember(bundle.INDEX)).read()
+
+    def test_candidate_release_uploads_manifest_bundle_and_embedded_index(self):
+        package, metadata, index = control_package(self.root)
+        doc = candidate_with_bundle(metadata)
+        release.write_release(doc, self.output, package)
+        tag = doc["tag"]
+        self.assertEqual(
+            self.fake.uploads,
+            [
+                (tag, "release-manifest.json"),
+                (tag, "lingxi-control.tar"),
+                (tag, "control-index.json"),
+            ],
+        )
+        self.assertEqual(self.fake.assets[(tag, "control-index.json")], self.embedded(package))
+        self.assertEqual(self.fake.assets[(tag, "control-index.json")], index)
+        self.assertEqual(
+            hashlib.sha256(self.fake.assets[(tag, "control-index.json")]).hexdigest(),
+            metadata["index_sha256"],
+        )
+        self.assertEqual(self.fake.assets[(tag, "lingxi-control.tar")], package.read_bytes())
+        self.assertFalse(self.fake.record(tag)["draft"])
+
+    def test_resumed_draft_with_same_three_assets_uploads_nothing(self):
+        package, metadata, index = control_package(self.root)
+        doc = candidate_with_bundle(metadata)
+        self.fake.seed(
+            doc,
+            {
+                "release-manifest.json": release.canonical(doc),
+                "lingxi-control.tar": package.read_bytes(),
+                "control-index.json": index,
+            },
+            draft=True,
+        )
+        release.write_release(doc, self.output, package)
+        self.assertEqual(self.fake.uploads, [])
+        self.assertIn((doc["tag"], "control-index.json"), self.fake.downloads)
+        self.assertFalse(self.fake.record(doc["tag"])["draft"])
+
+    def test_resumed_draft_with_different_index_is_refused_and_stays_draft(self):
+        package, metadata, index = control_package(self.root)
+        doc = candidate_with_bundle(metadata)
+        self.fake.seed(
+            doc,
+            {
+                "release-manifest.json": release.canonical(doc),
+                "lingxi-control.tar": package.read_bytes(),
+                "control-index.json": index + b"\n",
+            },
+            draft=True,
+        )
+        with self.assertRaisesRegex(release.ReleaseError, "已有索引附件不同"):
+            release.write_release(doc, self.output, package)
+        self.assertEqual(self.fake.uploads, [])
+        self.assertEqual(self.fake.assets[(doc["tag"], "control-index.json")], index + b"\n")
+        self.assertTrue(self.fake.record(doc["tag"])["draft"])
+
+    def test_embedded_index_mismatching_manifest_is_refused_before_any_upload(self):
+        package, metadata, _ = control_package(self.root, index_tail=b"\n")
+        doc = candidate_with_bundle(metadata)
+        with self.assertRaisesRegex(release.ReleaseError, "内嵌索引与清单不符"):
+            release.write_release(doc, self.output, package)
+        self.assertEqual(self.fake.uploads, [])
+        self.assertEqual(self.fake.releases, [])
+        self.assertFalse(self.output.exists())
+
+    def test_promotion_uploads_embedded_index_without_downloading_candidate_index(self):
+        package, metadata, index = control_package(self.root)
+        doc = candidate_with_bundle(metadata)
+        self.fake.seed(
+            doc,
+            {
+                "release-manifest.json": release.canonical(doc),
+                "lingxi-control.tar": package.read_bytes(),
+            },
+            draft=False,
+        )
+        with (
+            patch.dict(
+                os.environ,
+                {
+                    "GITHUB_REF": "refs/heads/main",
+                    "GITHUB_REF_PROTECTED": "true",
+                    "GITHUB_SHA": "d" * 40,
+                    "GITHUB_RUN_ID": "43",
+                },
+            ),
+            patch.object(release, "load_release", return_value=({}, doc)),
+            patch.object(release, "receipt_for", return_value=receipt(doc)),
+        ):
+            release.promote(doc["repository"], doc["tag"], self.output, True)
+        self.assertEqual(
+            self.fake.uploads,
+            [
+                ("v2.4.0", "release-manifest.json"),
+                ("v2.4.0", "lingxi-control.tar"),
+                ("v2.4.0", "control-index.json"),
+            ],
+        )
+        self.assertEqual(self.fake.assets[("v2.4.0", "control-index.json")], index)
+        self.assertEqual(self.fake.assets[("v2.4.0", "lingxi-control.tar")], package.read_bytes())
+        self.assertEqual(self.fake.downloads, [(doc["tag"], "lingxi-control.tar")])
+        self.assertFalse(self.fake.record("v2.4.0")["draft"])
+        self.assertFalse(self.fake.record("v2.4.0")["prerelease"])
 
 
 class ReleaseWorkflowTests(unittest.TestCase):
