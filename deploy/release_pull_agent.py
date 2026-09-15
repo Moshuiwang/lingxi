@@ -26,6 +26,7 @@ import socket
 import stat
 import subprocess
 import sys
+import tarfile
 import tempfile
 import time
 import urllib.error
@@ -932,14 +933,63 @@ def _download_bundle(
     try:
         if hashlib.sha256(package.read_bytes()).hexdigest() != metadata["sha256"]:
             raise BundleDigestMismatchError()
-        if hashlib.sha256(index.read_bytes()).hexdigest() != metadata["index_sha256"]:
-            raise BundleDigestMismatchError()
     except FileNotFoundError:
         raise BundleDigestMismatchError() from None
+    # 外部索引附件只是 tar 内嵌索引的一份副本，两者都由清单 index_sha256 钉住：附件在场就
+    # 必须与清单摘要相等；不可变 Release 不能事后补附件（已发布的旧版本永远没有它），
+    # 附件缺失时以摘要已核过的 tar 里内嵌的索引为准，写成同名 0600 副本供后续核对。
+    try:
+        index_bytes = index.read_bytes()
+        index_source = "asset"
+    except FileNotFoundError:
+        index_bytes = _embedded_index(package)
+        index_source = "embedded"
+    if hashlib.sha256(index_bytes).hexdigest() != metadata["index_sha256"]:
+        raise BundleDigestMismatchError()
+    if index_source == "embedded":
+        _write_index_copy(index, index_bytes)
+    _log("bundle", "index_verified", tag=tag, index_source=index_source)
     # 先返回临时文件；只有控制包工具完整核对通过后才持久化，篡改包不能留下
     # 看似可接续的稳定副本。
     del state_directory
     return package
+
+
+def _embedded_index(package: Path) -> bytes:
+    """只读出 tar 内嵌的 ``control-index.json`` 成员，不解包其它内容。
+
+    只在包摘要已等于清单 ``sha256`` 之后调用，包字节就是 CI 从固定提交写出的那一份；
+    路径、权限、文件集合等结构核对仍由控制包入口 ``verify`` 负责，这里不重复。
+    """
+    try:
+        with tarfile.open(package, mode="r:") as archive:
+            member = archive.getmember("control-index.json")
+            if not member.isfile() or member.size > 2 * 1024 * 1024:
+                raise BundleDigestMismatchError()
+            stream = archive.extractfile(member)
+            if stream is None:
+                raise BundleDigestMismatchError()
+            with stream:
+                return stream.read()
+    except (tarfile.TarError, KeyError, OSError, ValueError):
+        raise BundleDigestMismatchError() from None
+
+
+def _write_index_copy(index: Path, data: bytes) -> None:
+    """把内嵌索引以 0600 写成外部同名副本；控制包入口随后按同一份文件核对。"""
+    try:
+        fd, temporary = tempfile.mkstemp(prefix=".index-", dir=index.parent)
+        os.fchmod(fd, 0o600)
+        with os.fdopen(fd, "wb") as stream:
+            stream.write(data)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, index)
+    except OSError:
+        raise AgentError("index_write_failed") from None
+    finally:
+        if "temporary" in locals():
+            Path(temporary).unlink(missing_ok=True)
 
 
 def _run_bundle_tool_cli(

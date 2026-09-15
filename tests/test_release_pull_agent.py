@@ -11,6 +11,7 @@ import json
 import os
 import stat
 import subprocess
+import tarfile
 import tempfile
 import textwrap
 import unittest
@@ -106,7 +107,10 @@ class PullHarness:
             if sys.argv[1:3] == ["release", "download"]:
                 directory = sys.argv[sys.argv.index("--dir") + 1]
                 shutil.copyfile(os.environ["ASSET_FILE"], os.path.join(directory, "lingxi-control.tar"))
-                shutil.copyfile(os.environ["INDEX_FILE"], os.path.join(directory, "control-index.json"))
+                # 复刻预发实读：不可变 Release 上没有 control-index.json 附件时，gh 对匹配不到的
+                # 那个 --pattern 仍退出 0，只落下 tar 一个文件。
+                if os.environ.get("INDEX_ASSET_MODE", "present") == "present":
+                    shutil.copyfile(os.environ["INDEX_FILE"], os.path.join(directory, "control-index.json"))
                 raise SystemExit(0)
             raise SystemExit(9)
             """,
@@ -360,6 +364,7 @@ class PullHarness:
             "MANIFESTS_DIR": str(self.manifests),
             "ASSET_FILE": str(self.asset),
             "INDEX_FILE": str(self.index),
+            "INDEX_ASSET_MODE": "present",
             "INSTALLED_SOURCE": str(self.installed_source),
             "DOCKER_MODE": "mismatch",
             "DOCKER_CONTAINERS_JSON": "{}",
@@ -500,6 +505,32 @@ class PullHarness:
             document["promotion"] = {"run_id": int(seed) + 10, "acceptance_sha256": "b" * 64}
         _json(self.manifests / (tag + ".json"), document, 0o644)
         return document
+
+    def use_real_package(self, embedded_index: bytes | None = None, *, index_asset: bool = True):
+        """把附件换成真实 tar（内嵌 ``control-index.json`` 成员），并重算两份清单的摘要。
+
+        清单 ``index_sha256`` 始终按 ``self.index``（外部附件的内容）计算；``embedded_index``
+        默认与之相同，传入不同内容即模拟内嵌索引被篡改。``index_asset=False`` 让假 gh 不再
+        落下外部索引附件，复刻不可变 Release 上没有该附件的已发布版本。
+        """
+        if embedded_index is None:
+            embedded_index = self.index.read_bytes()
+        buffer = io.BytesIO()
+        with tarfile.open(fileobj=buffer, mode="w", format=tarfile.USTAR_FORMAT) as archive:
+            for name, data in (
+                ("deploy/lingxi_deploy.py", b"print('synthetic deployer')\n"),
+                ("control-index.json", embedded_index),
+            ):
+                info = tarfile.TarInfo(name)
+                info.size = len(data)
+                info.mode = 0o444
+                info.mtime = 0
+                archive.addfile(info, io.BytesIO(data))
+        self.asset.write_bytes(buffer.getvalue())
+        formal = self.host["environment"] == "production"
+        self._make_manifest(self.old_tag, formal=formal, seed="1")
+        self._make_manifest(self.target_tag, formal=formal, seed="2")
+        os.environ["INDEX_ASSET_MODE"] = "present" if index_asset else "absent"
 
     def _release(self, tag: str, prerelease: bool) -> dict:
         return {
@@ -993,6 +1024,109 @@ class AgentTests(unittest.TestCase):
         self.assertIn("bundle_digest_mismatch", messages[0])
         self.assertFalse(any(call["kind"] == "bundle-install" for call in self.calls()))
         self.assertFalse(list(self.harness.state.glob(".release-*")))
+
+    def test_missing_index_asset_falls_back_to_embedded_index(self):
+        """预发实读：已发布版本的 Release 上没有 control-index.json 附件（不可变 Release 不能
+        事后补），此前折成 bundle_digest_mismatch；现在以摘要已核的 tar 内嵌索引为准。"""
+        harness = self.harness
+        harness.use_real_package(index_asset=False)
+        harness.state_for_old()
+        messages = []
+        code, output = self.run_agent(sender=lambda message, env, timeout: messages.append(message))
+        self.assertEqual(code, 0)
+        self.assertEqual(self.read_state()["last_result"], "verified")
+        self.assertEqual(self.read_state()["target_tag"], harness.target_tag)
+        # 新目标与回读的旧版本两次下载都走内嵌索引，日志只标来源、不带路径。
+        self.assertEqual(output.count("阶段=bundle 结果码=index_verified"), 2)
+        self.assertEqual(output.count("index_source=embedded"), 2)
+        self.assertNotIn("index_source=asset", output)
+        self.assertNotIn(str(harness.state), output)
+        self.assertNotIn("结果码=bundle_digest_mismatch", output)
+        self.assertTrue(any(call["kind"] == "bundle-install" for call in self.calls()))
+        self.assertNotIn("bundle_digest_mismatch", "\n".join(messages))
+
+    def test_download_bundle_writes_embedded_index_as_private_copy(self):
+        """缺附件时写出的同名副本必须 0600 且逐字节等于内嵌索引，后续核对按同一份文件。"""
+        harness = self.harness
+        harness.use_real_package(index_asset=False)
+        manifest = json.loads((harness.manifests / (harness.target_tag + ".json")).read_text())
+        directory = harness.state / "download"
+        directory.mkdir(mode=0o700)
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            package = AGENT._download_bundle(
+                harness.config,
+                harness.target_tag,
+                manifest["control_bundle"],
+                harness.state,
+                directory,
+            )
+        self.assertEqual(package, directory / "lingxi-control.tar")
+        self.assertIn("阶段=bundle 结果码=index_verified", output.getvalue())
+        self.assertIn("index_source=embedded", output.getvalue())
+        self.assertNotIn(str(directory), output.getvalue())
+        copy = directory / "control-index.json"
+        self.assertEqual(copy.read_bytes(), harness.index.read_bytes())
+        self.assertEqual(stat.S_IMODE(copy.stat().st_mode), 0o600)
+        self.assertEqual(
+            sorted(p.name for p in directory.iterdir()),
+            ["control-index.json", "lingxi-control.tar"],
+        )
+
+    def test_index_asset_identical_to_manifest_is_used_as_is(self):
+        harness = self.harness
+        harness.use_real_package(index_asset=True)
+        harness.state_for_old()
+        code, output = self.run_agent(sender=lambda message, env, timeout: None)
+        self.assertEqual(code, 0)
+        self.assertEqual(self.read_state()["last_result"], "verified")
+        self.assertEqual(output.count("阶段=bundle 结果码=index_verified"), 2)
+        self.assertEqual(output.count("index_source=asset"), 2)
+        self.assertNotIn("index_source=embedded", output)
+
+    def test_index_asset_differing_from_manifest_is_refused_before_bundle_tool(self):
+        harness = self.harness
+        harness.use_real_package(index_asset=True)
+        # 清单已按原索引钉住摘要；附件随后被换成另一份内容。
+        harness.index.write_bytes(b'{"synthetic":true,"tampered":true}\n')
+        harness.state_for_old()
+        messages = []
+        code, output = self.run_agent(sender=lambda message, env, timeout: messages.append(message))
+        self.assertEqual(code, 0)
+        self.assertEqual(self.read_state()["last_result"], "bundle_digest_mismatch")
+        self.assertIn("阶段=bundle 结果码=bundle_digest_mismatch", output)
+        self.assertNotIn("index_source=", output)
+        self.assertEqual(len(messages), 1)
+        self.assertIn("bundle_digest_mismatch", messages[0])
+        # 摘要不符在调用控制包入口之前就拒绝，不靠工具二次发现。
+        self.assertFalse(
+            any(call["kind"] in {"bundle-verify", "bundle-install"} for call in self.calls())
+        )
+
+    def test_missing_index_asset_with_tampered_embedded_index_is_refused(self):
+        harness = self.harness
+        harness.use_real_package(b'{"synthetic":true,"tampered":true}\n', index_asset=False)
+        harness.state_for_old()
+        messages = []
+        code, output = self.run_agent(sender=lambda message, env, timeout: messages.append(message))
+        self.assertEqual(code, 0)
+        self.assertEqual(self.read_state()["last_result"], "bundle_digest_mismatch")
+        self.assertIn("阶段=bundle 结果码=bundle_digest_mismatch", output)
+        self.assertNotIn("index_source=", output)
+        self.assertEqual(len(messages), 1)
+        self.assertFalse(
+            any(call["kind"] in {"bundle-verify", "bundle-install"} for call in self.calls())
+        )
+
+    def test_missing_index_asset_with_non_tar_package_is_refused(self):
+        """附件缺失且包根本不是 tar（或没有内嵌索引成员）：仍是摘要不符，不抛裸异常。"""
+        harness = self.harness
+        harness.set_env(INDEX_ASSET_MODE="absent")
+        harness.state_for_old()
+        code, output = self.run_agent(sender=lambda message, env, timeout: None)
+        self.assertEqual(code, 0)
+        self.assertEqual(self.read_state()["last_result"], "bundle_digest_mismatch")
+        self.assertIn("阶段=bundle 结果码=bundle_digest_mismatch", output)
 
     def test_bundle_digest_mismatch_then_retry_is_not_skipped(self):
         """探针场景：v2.4.3 已验证且摘要已记、容器仍跑 v2.4.3，rc.10 的附件被篡改。
