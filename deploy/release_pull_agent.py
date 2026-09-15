@@ -22,6 +22,7 @@ import importlib.util
 import json
 import os
 import re
+import socket
 import stat
 import subprocess
 import sys
@@ -1579,11 +1580,12 @@ def _send_once(
     active: bool,
     config: dict,
     state_directory: Path,
-) -> None:
+) -> bool:
+    """同键去重：本轮真正发出返回 True，被去重返回 False；状态账形状不变。"""
     alerts = state.setdefault("alerts", {})
     record = alerts.setdefault(key, {})
     if record.get("sent") is True and (not active or record.get("active") is True):
-        return
+        return False
     try:
         send_alert(message, Path(config["alert_env_file"]), config["poll_timeout_seconds"])
     except Exception:
@@ -1599,6 +1601,7 @@ def _send_once(
     )
     if not active:
         record["recovered_at"] = timestamp()
+    return True
 
 
 def _finish(  # noqa: PLR0913
@@ -1717,7 +1720,7 @@ def _finish(  # noqa: PLR0913
             alert_tag = tag or next_state.get("target_tag")
             detail = deployed_tag if result == "downgrade_refused" else None
             key = _alert_key(result, alert_tag, detail)
-            _send_once(
+            delivered = _send_once(
                 next_state,
                 key,
                 _alert_message(host, alert_tag, stage, result, plan_id, detail),
@@ -1725,7 +1728,8 @@ def _finish(  # noqa: PLR0913
                 config=config,
                 state_directory=state_directory,
             )
-            _log("alert", "sent", tag=alert_tag, plan_id=plan_id)
+            # 同键被去重的轮次不再记 sent，否则日志会把「没发」写成「已发」。
+            _log("alert", "sent" if delivered else "deduplicated", tag=alert_tag, plan_id=plan_id)
     except AgentError as error:
         next_state["last_result"] = "alert_delivery_failed"
         next_state["alert_delivery_error"] = error.code
@@ -2443,7 +2447,7 @@ def _run_lock(state_directory: Path):
 
 
 def run_once(host_path: Path, config_path: Path, state_directory: Path) -> int:
-    """执行一轮；配置错误在锁和状态目录创建前拒绝。"""
+    """执行一轮；配置错误与宿主契约主机名不符都在锁和状态目录创建前拒绝。"""
     host_path, config_path, state_directory = (
         _check_cli_path(host_path),
         _check_cli_path(config_path),
@@ -2451,6 +2455,12 @@ def run_once(host_path: Path, config_path: Path, state_directory: Path) -> int:
     )
     host = validate_host(_read_json(host_path, private=True))
     config = validate_config(_read_json(config_path, private=False))
+    actual_hostname = socket.gethostname()
+    if host["host"] != actual_hostname:
+        # 部署器 preflight 按内核主机名比对宿主契约的 host；契约写错时每轮都会在 apply 前
+        # 以 host_mismatch 停住，所以代理在取锁前就退出。状态账尚未成形：不写账、不告警。
+        _log("agent", "host_mismatch", host=host["host"], actual=actual_hostname)
+        return 1
     _private_directory(state_directory, create=True)
     try:
         with _run_lock(state_directory):
