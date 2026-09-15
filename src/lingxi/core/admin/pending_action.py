@@ -14,9 +14,12 @@ cancel 只需要发起人核对 + 时钟），合成一个类需要一个大分�
 
 from __future__ import annotations
 
+import json
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from enum import Enum
+from typing import Any
 
 from lingxi.core.admin.registry import AdminRegistryEntry, AdminRole, is_authorized_admin
 
@@ -192,24 +195,67 @@ _TARGET_STATE_CHANGED_MESSAGE: dict[PendingActionType, str] = {
 }
 
 
+#: 补充授权按差集补齐后「一项都不缺」的拒绝文案：管理员选的整个职位范围都已在
+#: 本地库里，写零行没有意义；带上项数，让他知道拒绝的是「已全部登记」而不是「有一
+#: 项冲突」——部分重叠不再整笔拒绝，而是只登记缺的那几项。
+_GRANT_ALL_HELD_MESSAGE = "所选职位范围的 {count} 项均已登记，无需补授。"
+
+
 def decide_prepare(
-    *, action_type: PendingActionType, current_account_state: str | None
+    *,
+    action_type: PendingActionType,
+    current_account_state: str | None,
+    held_pair_count: int | None = None,
 ) -> PrepareDecision:
     """目标当前状态是否允许发起这个动作。
 
     不检查发起人角色——那一步已经由 ``AdminCommandRouter.route()`` 在解析到这条
     命令之前完成（未通过默认拒绝判定不会走到这里，见 ``core/admin/router.py``）。
+    ``held_pair_count`` 只在补充授权「全部已持有」时由调用方传入，拒绝文案随之带上
+    项数；不传时沿用按动作类型分化的既有文案。
     """
     if current_account_state is None:
         return PrepareDecision(ok=False, code="not_found", message=_NOT_FOUND_MESSAGE[action_type])
     valid_states = VALID_SOURCE_STATES[action_type]
     if current_account_state not in valid_states:
-        return PrepareDecision(
-            ok=False,
-            code="target_state_changed",
-            message=_TARGET_STATE_CHANGED_MESSAGE[action_type],
-        )
+        message = _TARGET_STATE_CHANGED_MESSAGE[action_type]
+        if action_type is PendingActionType.LOCAL_PERMISSION_GRANT and held_pair_count:
+            message = _GRANT_ALL_HELD_MESSAGE.format(count=held_pair_count)
+        return PrepareDecision(ok=False, code="target_state_changed", message=message)
     return PrepareDecision(ok=True)
+
+
+def local_permission_pairs(payload_data: Mapping[str, Any]) -> tuple[tuple[str, str], ...]:
+    """本地权限动作 payload 里的全部公司×指标对。
+
+    职位范围授权与整组撤销带 ``pairs``；单键授权/抑制与历史单行撤销只有
+    ``company_id``/``metric_name``。两种形状统一成一个元组，供差集与回执计数复用。
+    """
+    pairs = payload_data.get("pairs")
+    if isinstance(pairs, (list, tuple)) and pairs:
+        return tuple(
+            (str(pair[0]), str(pair[1]))
+            for pair in pairs
+            if isinstance(pair, (list, tuple)) and len(pair) == 2
+        )
+    company_id, metric_name = payload_data.get("company_id"), payload_data.get("metric_name")
+    if company_id is None or metric_name is None:
+        return ()
+    return ((str(company_id), str(metric_name)),)
+
+
+def narrow_grant_payload(
+    payload: str, *, missing: Iterable[tuple[str, str]], reused_count: int
+) -> str:
+    """把补充授权的 payload 收窄到只写缺的那几项，并记下沿用项数。
+
+    确认执行只按 ``pairs`` 插行，所以差集必须在准备时就落进 payload；
+    ``reused_count`` 供确认卡/终态卡展示「已有 M 项沿用」。其余字段原样保留。
+    """
+    data = json.loads(payload)
+    data["pairs"] = [list(pair) for pair in missing]
+    data["reused_count"] = reused_count
+    return json.dumps(data, ensure_ascii=False)
 
 
 #: 拦截文案里"这是哪一类动作"的中文展示名——不直接展示英文字面量，管理员看

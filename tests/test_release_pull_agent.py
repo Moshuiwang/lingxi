@@ -610,6 +610,10 @@ class AgentTests(unittest.TestCase):
     def setUp(self):
         self.harness = PullHarness()
         self.addCleanup(self.harness.close)
+        # 代理在取锁前要求宿主契约 host 等于内核主机名；夹具契约固定为 synthetic-host。
+        hostname = patch.object(AGENT.socket, "gethostname", return_value=self.harness.host["host"])
+        hostname.start()
+        self.addCleanup(hostname.stop)
 
     def run_agent(self, *, sender=None):
         output = io.StringIO()
@@ -685,6 +689,33 @@ class AgentTests(unittest.TestCase):
         self.assertIn("concurrent_run_refused", output)
         self.assertFalse((self.harness.state / "pull-agent.json").exists())
         self.assertEqual(self.calls(), [])
+
+    def test_host_contract_must_equal_kernel_hostname_before_lock_and_state(self):
+        messages = []
+        with patch.object(AGENT.socket, "gethostname", return_value="synthetic-host-full.internal"):
+            code, output = self.run_agent(
+                sender=lambda message, env, timeout: messages.append(message)
+            )
+        self.assertEqual(code, 1)
+        self.assertIn("阶段=agent 结果码=host_mismatch", output)
+        self.assertIn("host=synthetic-host actual=synthetic-host-full.internal", output)
+        # 状态目录没有任何写入（没有锁文件、没有状态账），不出网、不读 Docker、不告警。
+        self.assertEqual(list(self.harness.state.iterdir()), [])
+        self.assertEqual(self.calls(), [])
+        self.assertEqual(messages, [])
+        # 比对在取锁之前：别的进程持锁时仍报 host_mismatch，而不是 concurrent_run_refused。
+        lock = self.harness.state / ".pull-agent.lock"
+        fd = os.open(lock, os.O_CREAT | os.O_RDWR, 0o600)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            with patch.object(AGENT.socket, "gethostname", return_value="another-host"):
+                code, output = self.run_agent()
+        finally:
+            os.close(fd)
+        self.assertEqual(code, 1)
+        self.assertIn("结果码=host_mismatch", output)
+        self.assertNotIn("concurrent_run_refused", output)
+        self.assertFalse((self.harness.state / "pull-agent.json").exists())
 
     def test_already_in_place_by_state_account_does_nothing(self):
         self.harness.state_for_verified_target()
@@ -1629,10 +1660,19 @@ class AgentTests(unittest.TestCase):
 
     def test_alert_dedup_and_recovery_notice(self):
         messages = []
+        outputs = []
         for _ in range(3):
-            code, _ = self.run_agent(sender=lambda message, env, timeout: messages.append(message))
+            code, output = self.run_agent(
+                sender=lambda message, env, timeout: messages.append(message)
+            )
             self.assertEqual(code, 0)
+            outputs.append(output)
         self.assertEqual(len(messages), 1)
+        # 同键第二、三轮被去重：日志不得再记 sent，把「没发」写成「已发」。
+        self.assertIn("阶段=alert 结果码=sent", outputs[0])
+        for output in outputs[1:]:
+            self.assertNotIn("结果码=sent", output)
+            self.assertIn("阶段=alert 结果码=deduplicated", output)
         self.harness.set_releases([self.harness._release(self.harness.target_tag, True)])
         self.harness.set_env(DOCKER_MODE="match")
         code, _ = self.run_agent(sender=lambda message, env, timeout: messages.append(message))

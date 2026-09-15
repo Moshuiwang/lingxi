@@ -125,6 +125,11 @@ services:
       # 凭据文件必须落在**持久卷**里（断言 V-部署-03 / M2-62-27）。指向容器本地路径
       # 会让每次镜像替换都丢失授权——而这个后果要到下一次轮换才暴露。
       LINGXI_DELEGATED_CREDENTIAL_PATH: /var/lib/lingxi/credentials/delegated_credential.enc
+      # 问答留存语料的受控导出根（Issue #664）：`scripts/ops/qa_corpus.py export` 只把文件
+      # 落在这个目录正下方（目录 0700、文件 0600）。放在凭据卷内，是因为它是 scheduler 唯一
+      # 一个**不挂给 worker / worker-queue / gateway** 的持久卷——模型执行环境看不到；
+      # `scripts/ci/check_deploy_contract.py` 的 check_qa_corpus_export_root 钉住这条边界。
+      LINGXI_QA_CORPUS_EXPORT_ROOT: /var/lib/lingxi/credentials/qa-corpus-exports
       LINGXI_SCHEDULER_INTERVAL_SECONDS: ${LINGXI_SCHEDULER_INTERVAL_SECONDS:-60}
 
     volumes:

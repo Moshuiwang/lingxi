@@ -128,7 +128,12 @@ class _CardDispatchResult(Protocol):
 
 
 class ConfirmCardSender(Protocol):
-    """把已经准备好的待确认操作发到发起管理员本人私聊，作为触发命令那条消息的回复。"""
+    """把已经准备好的待确认操作发到发起管理员本人私聊，作为触发命令那条消息的回复。
+
+    实现可以声明类属性 ``requires_reply_context = False``（默认按 ``True`` 处理）：表示
+    它不依赖触发消息的会话 / 消息标识就能把卡片送到发起人本人——例如经持久阶段由
+    gateway 直发的那条路径；路由据此决定「没有可回复的消息」是否构成拒绝。
+    """
 
     def send(
         self,
@@ -176,6 +181,10 @@ class AdminRouteOutcome:
     content_key: str = ""
     content_version: str = "internal"
     reply_text: str = ""
+    #: 写命令已建出的待确认操作编号；只读命令与未建出操作的分支为 ``None``。
+    pending_action_id: str | None = None
+    #: 写命令被拒绝时的判定码（与审计里的 ``code`` 同值）；其余分支为空串。
+    decision_code: str = ""
 
 
 class AdminRouter(Protocol):

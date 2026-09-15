@@ -17,6 +17,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
+from pathlib import Path
 
 from lingxi.adapters.postgres import DEFAULT_POSTGRES_TIMEOUTS, PostgresTimeouts, connect
 from lingxi.adapters.postgres_admin_followup_projection import fetch_followups
@@ -36,7 +37,19 @@ from lingxi.core.admin.views import (
     LocalPermissionOverrideView,
 )
 from lingxi.core.ids import new_id
+from lingxi.core.permission.galaxy_retention import GalaxyMetricMap, build_galaxy_metric_map
 from lingxi.core.task_reference import parse_reference
+
+#: 银河来源摘要"算不出来"的三个原因码（与 ``core/admin/router_render`` 及
+#: ``core/admin/management_card`` 各自的独立拷贝同值）：命中即「读不到」，与
+#: 「算出来了、结论是没有权限」严格分开——回显层不得把读不到写成 0 项。
+_GALAXY_SOURCE_UNAVAILABLE_REASONS: frozenset[str] = frozenset(
+    {
+        "roster_snapshot_unavailable",
+        "galaxy_snapshot_unavailable",
+        "role_function_map_unavailable",
+    }
+)
 
 
 def admin_registry_entry_from_row(row: tuple) -> AdminRegistryEntry:
@@ -239,6 +252,43 @@ class PostgresAdminQueries:
             )
         except Exception:  # display-only source must fail closed
             return GalaxySourceSummary(granted=False, reason="galaxy_snapshot_unavailable")
+
+    def galaxy_metric_map(
+        self, *, open_id: str, metric_map_path: Path | None
+    ) -> GalaxyMetricMap | None:
+        """该用户银河来源当前翻译出的「公司→指标」映射；读不到返回 ``None``。
+
+        与 :meth:`_galaxy_source_summary` 同一条只读现算路径，再按 ``metric_map_path``
+        （与授权展开用同一份外置映射）翻译成指标名。``None``（任一快照、角色映射或
+        指标映射读不出来、组合未被映射覆盖）与空映射（确认没有银河权限）严格区分，
+        调用方据此把回显写成「暂不可读」还是「0 项」。
+        """
+        with (
+            connect(self._dsn, timeouts=self._timeouts) as connection,
+            connection.cursor() as cursor,
+        ):
+            cursor.execute(
+                "SELECT feishu_user_id FROM app_user WHERE feishu_open_id = %s", (open_id,)
+            )
+            row = cursor.fetchone()
+        summary = self._galaxy_source_summary(feishu_user_id=row[0] if row else None)
+        if summary.reason in _GALAXY_SOURCE_UNAVAILABLE_REASONS:
+            return None
+        if not summary.granted:
+            return GalaxyMetricMap(permissions={}, full_access_wildcard=False)
+        try:
+            from lingxi.adapters.company_function_metric_map_file import (
+                load_company_function_metric_map,
+            )
+
+            return build_galaxy_metric_map(
+                companies=summary.companies,
+                functions=summary.functions,
+                all_companies=summary.all_companies,
+                mapping=load_company_function_metric_map(metric_map_path),
+            )
+        except (OSError, ValueError, KeyError, TypeError):
+            return None
 
     def recent_events(
         self, *, identifier: str | None, window_hours: int, limit: int

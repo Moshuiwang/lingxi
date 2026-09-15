@@ -113,6 +113,11 @@ services:
       # 根 `deploy/.env.prod`，不是仓库中的真实生产文件；`${VAR:?}` 让漏配直接
       # 阻止 compose 渲染，不能退回一个未审计的默认值。
       LINGXI_WORKER_MAX_CONCURRENCY: "${LINGXI_WORKER_MAX_CONCURRENCY:?prod worker concurrency must be 4; see deploy/README.md}"
+      # 问答留存语料通道（产品合同「数据保留与删除」第三条例外，Issue #664）：生产升级后
+      # 每一次真实问数留一行 qa_corpus，不设保留上限。值只在这里声明、且是字面量不是
+      # 插值——compose 的 `environment:` 覆盖 `env_file`，抄 env 文件既开不了也关不了；
+      # 紧急停用改这里再重建 worker-queue。check_qa_corpus_declaration 钉住。
+      LINGXI_QA_CORPUS_RETENTION: "1"
       # 隔离边界（Trace #544 S-2b / 报告 W-1）：Agent SDK 回合的工作目录**必须**
       # 与用户环境根（lingxi-users 卷的挂载点 /var/lib/lingxi/users）互不包含。
       # 这不是洁癖：那个目录下每个用户各有一份 0440 的 .mcp.json，里面是**该用户
