@@ -19,6 +19,7 @@ from typing import Any
 
 from lingxi.config.content import ContentCatalog, default_content_catalog
 from lingxi.config.metric_labels import default_example_metrics
+from lingxi.core.permission.publish_row import lookup_metrics
 
 #: 审计与记录里代表**整张欢迎卡**的内容键。卡片按段落拆成多个文案键（样式可换、
 #: 文案不动），但记录里必须有一个能一眼认出"发的是哪张卡"的键；取它们共同的前缀，
@@ -80,6 +81,7 @@ class WelcomeAudience:
 
     ``metric_labels`` 是指标 ID→中文名，与公司名同一条纪律（见 :meth:`metric_label`）：
     ``metric_names`` 里是 ``sub_recharge_money`` 这类内部标识，**一个字都不许进卡面**。
+    ``company_metrics`` 保留逐公司授权，示例取共有指标，范围展示仍取完整权限。
     """
 
     display_name: str
@@ -89,6 +91,7 @@ class WelcomeAudience:
     company_names: Mapping[str, str]
     metric_labels: Mapping[str, str]
     total_company_count: int
+    company_metrics: Mapping[str, Sequence[str]] | None = None
 
     def __post_init__(self) -> None:
         """失败关闭：范围说不清楚的人不该收到一张说错范围的卡。"""
@@ -206,6 +209,27 @@ def metric_names_text(audience: WelcomeAudience) -> str:
     )
 
 
+def _common_example_metrics(audience: WelcomeAudience) -> tuple[str, ...]:
+    """只选各目标公司共有的指标；目录不全时也须覆盖所有可能的公司覆盖项。"""
+    document = audience.company_metrics
+    if document is None:
+        return ordered_metric_names(audience) if audience.single_company is not None else ()
+    if audience.all_companies:
+        if len(audience.company_names) == audience.total_company_count:
+            scopes = [lookup_metrics(document, key) for key in audience.company_names]
+        else:
+            # 无法列全目标公司时，通配及全部具体覆盖项的交集仍是安全子集。
+            scopes = list(document.values()) if "*" in document else []
+    else:
+        scopes = [lookup_metrics(document, key) for key in audience.company_ids]
+    if not scopes:
+        return ()
+    shared = set(audience.metric_names)
+    for scope in scopes:
+        shared.intersection_update(scope)
+    return tuple(name for name in ordered_metric_names(audience) if name in shared)
+
+
 def example_metrics(audience: WelcomeAudience) -> tuple[str, ...]:
     """三条示例句各用哪个指标：优先列表**按位置**对应三条句子，缺的用展示顺序补位。
 
@@ -213,8 +237,10 @@ def example_metrics(audience: WelcomeAudience) -> tuple[str, ...]:
     环比）是合理的产品选择，由别名表那份列表决定，不由本函数替产品拿主意。
     优先列表里他没有的那一条自动补位——示例只能是他真问得出来的东西。
     """
-    ordered = ordered_metric_names(audience)
-    held = set(audience.metric_names)
+    ordered = _common_example_metrics(audience)
+    if not ordered:
+        return ()
+    held = set(ordered)
     prefer = default_example_metrics()
     picked: list[str] = []
     for index in range(EXAMPLE_COUNT):
@@ -235,6 +261,8 @@ def _example_lines(audience: WelcomeAudience, *, catalog: ContentCatalog) -> tup
     """
     company_word = example_company_word(audience, catalog=catalog)
     picked = example_metrics(audience)
+    if not picked:
+        return ()
     lines: list[str] = []
     for key, metric_id in zip(EXAMPLE_KEYS, picked, strict=True):
         content_key = f"{WELCOME_CONTENT_KEY}.{key}"
@@ -269,7 +297,7 @@ def welcome_lead(audience: WelcomeAudience, *, catalog: ContentCatalog) -> str:
 def welcome_fields(
     audience: WelcomeAudience, *, catalog: ContentCatalog | None = None
 ) -> tuple[tuple[str, str], ...]:
-    """五个「标题｜正文」字段：公司、指标、维度、可以这样开始、遇到问题。
+    """公司、指标、维度、引导和联系字段；无共有指标时省略引导。
 
     字段列表样式把标题放进左列、正文放进右列；markdown 分段样式用
     :data:`FIELD_SEPARATOR` 把两半拼成一行。两种读法共用同一份字。
@@ -288,7 +316,7 @@ def welcome_fields(
         ),
         (source.text(f"{key}.field_metric").text, metric_names_text(audience)),
         (source.text(f"{key}.field_dimension").text, source.text(f"{key}.dimension_body").text),
-        (source.text(f"{key}.examples_heading").text, examples),
+        *(((source.text(f"{key}.examples_heading").text, examples),) if examples else ()),
         (source.text(f"{key}.contact_heading").text, source.text(f"{key}.contact_body").text),
     )
 
@@ -303,7 +331,7 @@ def welcome_sections(
     """
     source = catalog or default_content_catalog()
     key = WELCOME_CONTENT_KEY
-    company, metric, dimension, examples, contact = welcome_fields(audience, catalog=source)
+    company, metric, dimension, *guidance = welcome_fields(audience, catalog=source)
     scope = "\n".join(
         (
             source.text(f"{key}.scope_heading").text,
@@ -316,8 +344,7 @@ def welcome_sections(
         welcome_greeting(audience, catalog=source),
         source.text(f"{key}.intro").text,
         scope,
-        "\n".join(examples),
-        "\n".join(contact),
+        *("\n".join(field) for field in guidance),
         source.text(f"{key}.footnote").text,
     )
 

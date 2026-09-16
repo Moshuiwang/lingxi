@@ -60,6 +60,9 @@ def _audience(
         company_names=company_names if company_names is not None else {"1011": "尼日利亚"},
         metric_labels=METRIC_LABELS if metric_labels is None else metric_labels,
         total_company_count=total_company_count,
+        company_metrics={"*": metric_names}
+        if all_companies
+        else {company: metric_names for company in company_ids},
     )
 
 
@@ -88,14 +91,7 @@ class ExampleScopeRuleTest(unittest.TestCase):
     def test_multi_company_footnote_clarifies_examples_are_not_a_universal_guarantee(
         self,
     ) -> None:
-        """Issue #717⑤：多公司/全部公司范围下，欢迎卡的指标全集经
-        ``core/outreach/audience.py::_parse_scope`` 取得，`lookup_metrics`
-        在 ``company_id=None`` 时对全部键取并集（这是"有没有任何指标"的存在性
-        判定，被原样当成了展示用的指标全集）——三条示例句可能因此选中一条只在
-        其中一家公司成立的指标。真正按公司核对属于另一处装配逻辑，不在本卡
-        范围（只改说法，不改行为）；这里钉住的是补丁本身：脚注必须带一句必要
-        且可理解的澄清，不能让示例读起来像是对每一家公司都成立的保证。
-        """
+        """共有指标示例仍保留数据可用性提示，不承诺任意查询都有结果。"""
         audience = _audience(
             company_ids=("1011", "1012"), company_names={"1011": "尼日利亚", "1012": "肯尼亚"}
         )
@@ -349,6 +345,111 @@ class ContentKeyTest(unittest.TestCase):
         card = render_welcome_card(_audience(), catalog=CATALOG)
         self.assertNotIn("Lingxi", str(card.payload))
         self.assertNotIn("lingxi", str(card.payload))
+
+
+class SharedExampleMetricsTest(unittest.TestCase):
+    """示例必须对所谈及的每家公司成立，完整授权仍用于范围展示。"""
+
+    def plan(self, permissions, *, names=None, total=2):
+        import json
+
+        from lingxi.core.outreach.audience import SubjectFacts, plan_outreach
+
+        facts = SubjectFacts(
+            email="synthetic@example.test",
+            user_id="user",
+            open_id="ou_synthetic",
+            provisioning_state="active",
+            account_state="enabled",
+            permissions=json.dumps(permissions),
+            roster_names=("合成人员",),
+        )
+        plan = plan_outreach(
+            facts,
+            company_names={"1011": "甲公司", "1012": "乙公司"} if names is None else names,
+            metric_labels=METRIC_LABELS,
+            total_company_count=total,
+        )
+        self.assertTrue(plan.sendable, plan.skip_reason)
+        return facts, plan.audience
+
+    def test_single_company_examples_keep_all_of_that_company_metrics(self):
+        from lingxi.core.outreach.welcome_card import example_metrics
+
+        _, audience = self.plan({"1011": list(METRICS)})
+        self.assertEqual(set(example_metrics(audience)), set(METRICS))
+        self.assertIn("甲公司的", welcome_sections(audience)[3])
+
+    def test_shared_metric_is_selected_for_every_multi_company_example(self):
+        from lingxi.core.outreach.welcome_card import example_metrics
+
+        shared, exclusive = METRICS
+        _, audience = self.plan({"1011": [shared, exclusive], "1012": [shared]})
+        self.assertEqual(example_metrics(audience), (shared,) * 3)
+        examples = welcome_sections(audience)[3]
+        self.assertIn("各公司", examples)
+        self.assertNotIn(METRIC_LABELS[exclusive], examples)
+
+    def test_no_intersection_omits_examples_in_every_style(self):
+        first, second = METRICS
+        _, audience = self.plan({"1011": [first], "1012": [second]})
+        for style in WelcomeCardStyle:
+            with self.subTest(style=style):
+                card = render_welcome_card(audience, style=style)
+                self.assertEqual(len(card.fields), 4)
+                self.assertFalse(any(EXAMPLE_BULLET in section for section in card.sections))
+                self.assertNotIn(
+                    CATALOG.text("outreach.welcome.examples_heading").text,
+                    [label for label, _ in card.fields],
+                )
+
+    def test_exclusive_metrics_and_original_authorization_survive_rendering(self):
+        from lingxi.core.permission.publish_row import lookup_metrics, parse_permissions
+
+        shared, exclusive = METRICS
+        permissions = {"1011": [shared, exclusive], "1012": [shared]}
+        facts, audience = self.plan(permissions)
+        original = facts.permissions
+        card = render_welcome_card(audience)
+        self.assertEqual(facts.permissions, original)
+        self.assertEqual(permissions, {"1011": [shared, exclusive], "1012": [shared]})
+        self.assertIn(exclusive, lookup_metrics(parse_permissions(facts.permissions), "1011"))
+        self.assertEqual(set(audience.metric_names), set(METRICS))
+        self.assertIn(METRIC_LABELS[exclusive], card.fields[1][1])
+        self.assertIn("甲公司", card.fields[0][1])
+        self.assertIn("乙公司", card.fields[0][1])
+
+    def test_wildcard_fallback_and_explicit_override_use_actual_companies(self):
+        from lingxi.core.outreach.welcome_card import example_metrics
+
+        shared, exclusive = METRICS
+        _, audience = self.plan({"*": [shared, exclusive], "1011": [shared]})
+        self.assertEqual(example_metrics(audience), (shared,) * 3)
+
+    def test_empty_company_override_prevents_cross_company_examples(self):
+        from lingxi.core.outreach.welcome_card import example_metrics
+
+        _, audience = self.plan({"*": list(METRICS), "1011": []})
+        self.assertEqual(example_metrics(audience), ())
+        self.assertEqual(len(render_welcome_card(audience).fields), 4)
+
+    def test_incomplete_company_catalog_does_not_ignore_an_unresolved_override(self):
+        from lingxi.core.outreach.welcome_card import example_metrics
+
+        _, audience = self.plan(
+            {"*": list(METRICS), "1012": []},
+            names={"1011": "甲公司"},
+            total=2,
+        )
+        self.assertEqual(example_metrics(audience), ())
+
+    def test_multi_company_input_without_per_company_permissions_has_no_examples(self):
+        from dataclasses import replace
+
+        from lingxi.core.outreach.welcome_card import example_metrics
+
+        audience = replace(_audience(company_ids=("1011", "1012")), company_metrics=None)
+        self.assertEqual(example_metrics(audience), ())
 
 
 if __name__ == "__main__":

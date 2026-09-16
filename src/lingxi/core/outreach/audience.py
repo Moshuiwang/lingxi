@@ -191,6 +191,7 @@ def _build_plan(
             company_names=dict(company_names),
             metric_labels=dict(metric_labels),
             total_company_count=total_company_count,
+            company_metrics=parse_permissions(facts.permissions or ""),
         )
     except ValueError:
         return _skip(facts, SKIP_NO_METRICS if not metrics else SKIP_NO_PERMISSIONS, active=True)
