@@ -20,6 +20,9 @@ sys.path.insert(0, str(ROOT / "deploy"))
 bundle = importlib.import_module("control_bundle")
 state = importlib.import_module("deploy_state")
 deploy = importlib.import_module("lingxi_deploy")
+# 与 deploy 在同一时刻取同一份模块对象：别的测试模块会按路径重登记这几个无包名模块，
+# 运行期再 import 会拿到另一份、异常类也就对不上。
+runtime_module = importlib.import_module("deploy_runtime")
 
 
 def package(root, files=None):
@@ -173,9 +176,18 @@ class FakeRuntime:
         self.heads, self.active_job = ["0091_synthetic"], None
         # 在该阶段的副作用发生之前被杀：阶段账已写 running、作业没起、库头未变。
         self.kill_before = None
+        # 在该阶段的副作用发生之后、完成记录写入之前被杀。
+        self.kill_after = None
+        # 在该阶段以明确失败（DeployError）停住：阶段账记 failed，与 unknown 区分。
+        self.fail = None
 
     def preflight(self, plan):
-        pass
+        # 与真实 preflight 同形：返回两侧配置指纹，execute 把它记进阶段账。
+        return {
+            "old_verified_sha256": None,
+            "old_source": "first_takeover",
+            "new_sha256": plan["config_sha256"],
+        }
 
     def check_revocation(self, plan):
         pass
@@ -192,10 +204,14 @@ class FakeRuntime:
     def perform(self, stage, plan):
         if stage == self.kill_before:
             raise SyntheticKill(stage)
+        if stage == self.fail:
+            raise state.DeployError("synthetic_failure")
         self.calls.append(stage)
         self.done.add(stage)
         if stage == "migrate":
             self.heads = plan["new"]["migration_heads"]
+        if stage == self.kill_after:
+            raise SyntheticKill(stage)
         if stage == self.crash:
             raise state.UnknownError("synthetic_interruption")
 
@@ -349,6 +365,15 @@ class DeployTests(unittest.TestCase):
         self.assertEqual(
             before, {str(p): p.read_bytes() for p in self.root.rglob("*") if p.is_file()}
         )
+        # 摘要把两侧配置指纹分开列出：本机没有在途标记，old 侧是首次接管、没有旧值。
+        self.assertEqual(
+            json.loads(result.stdout)["summary"]["configuration"],
+            {
+                "old_verified_sha256": None,
+                "old_source": "first_takeover",
+                "new_sha256": self.plan["config_sha256"],
+            },
+        )
 
     def test_public_config_is_read_as_public_file_and_private_inputs_stay_private(self):
         """预发实读：public-config.json 按非秘密映射装成 root 0644，部署器此前按私有材料要求
@@ -372,27 +397,40 @@ class DeployTests(unittest.TestCase):
         self.assertIn('"error": "private_file_permissions"', result.stderr)
 
 
+RELAY_CONFIGURATION = {
+    "schema_revision": 1,
+    "socket_path": "/synthetic/admin.sock",
+    "relay_uid": 1234,
+    "socket_owner_uid": 10001,
+}
+
+
+def install_root(root, name, mode=0o755):
+    """安装根由 root 预先建立且不可由受限账号写入：权限位显式给定，不交给进程 umask。"""
+    path = root / name
+    path.mkdir()
+    path.chmod(mode)
+    return path
+
+
+def release(target):
+    """只读安装目录在临时目录清理前要放开写权限。"""
+    for path in [target, *target.rglob("*")]:
+        if path.is_dir():
+            path.chmod(0o700)
+
+
 class BundleTests(unittest.TestCase):
     def test_install_is_readonly_exact_and_repeatable_and_relay_is_separate(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             pkg, metadata = package(root)
-            installed = root / "installed"
-            installed.mkdir()
+            installed = install_root(root, "installed")
             target = bundle.install(pkg, metadata, installed)
             self.assertEqual(bundle.install(pkg, metadata, installed), target)
-            relay_root = root / "relay"
-            relay_root.mkdir()
+            relay_root = install_root(root, "relay")
             relay, receipt = bundle.install_relay(
-                installed,
-                metadata,
-                {
-                    "schema_revision": 1,
-                    "socket_path": "/synthetic/admin.sock",
-                    "relay_uid": 1234,
-                    "socket_owner_uid": 10001,
-                },
-                relay_root,
+                installed, metadata, RELAY_CONFIGURATION, relay_root
             )
             self.assertEqual(
                 set(p.name for p in relay.iterdir()),
@@ -402,9 +440,49 @@ class BundleTests(unittest.TestCase):
             self.assertFalse((target / "scripts/admin/innertest-relay.json").exists())
             bundle.activate(installed, metadata)
             self.assertEqual((installed / "current").resolve(), target.resolve())
-            for folder in [target, *target.rglob("*"), relay]:
-                if folder.is_dir():
-                    folder.chmod(0o700)
+            release(target)
+            release(relay)
+
+    def test_install_conclusion_is_the_same_under_umask_0002_and_0022(self):
+        """fixture 自己定安装根的权限位：运行者 shell 的 umask 是 0002 还是 0022，结论都一样。"""
+        original = os.umask(0o022)
+        try:
+            for mask in (0o002, 0o022):
+                os.umask(mask)
+                with self.subTest(umask=f"{mask:04o}"):
+                    self.test_install_is_readonly_exact_and_repeatable_and_relay_is_separate()
+        finally:
+            os.umask(original)
+
+    def test_install_roots_take_explicit_modes_safe_passes_and_writable_is_rejected(self):
+        """安装根与 relay 安装根的权限位是测试输入：显式 0755 通过，显式组 / 其他可写判红且零写入。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            pkg, metadata = package(root)
+            installed = install_root(root, "installed")
+            for mode in (0o775, 0o757, 0o777):
+                installed.chmod(mode)
+                with self.subTest(root="installed", mode=f"{mode:04o}"):
+                    with self.assertRaisesRegex(bundle.BundleError, "^安装根必须预先建立"):
+                        bundle.install(pkg, metadata, installed)
+                    self.assertEqual(list(installed.iterdir()), [])
+            installed.chmod(0o755)
+            target = bundle.install(pkg, metadata, installed)
+            relay_root = install_root(root, "relay")
+            for mode in (0o775, 0o757, 0o777):
+                relay_root.chmod(mode)
+                with self.subTest(root="relay", mode=f"{mode:04o}"):
+                    with self.assertRaisesRegex(bundle.BundleError, "^relay 安装根不安全$"):
+                        bundle.install_relay(installed, metadata, RELAY_CONFIGURATION, relay_root)
+                    self.assertEqual(list(relay_root.iterdir()), [])
+            relay_root.chmod(0o755)
+            relay, receipt = bundle.install_relay(
+                installed, metadata, RELAY_CONFIGURATION, relay_root
+            )
+            self.assertEqual(receipt["bundle_sha256"], metadata["sha256"])
+            self.assertTrue((relay / "installation.json").is_file())
+            release(target)
+            release(relay)
 
     def test_tamper_missing_paths_links_permissions_and_duplicates_rejected(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -555,6 +633,591 @@ class DeployRecoveryTests(unittest.TestCase):
             broken["recovery"]["historical"][key] = value
             with self.assertRaises(state.DeployError):
                 deploy.validate_plan(broken, self.host, self.config)
+
+
+def inventory_runtime(host, config, store, services):
+    """假世界执行各阶段，preflight 换成真实的服务清单核对；容器由用例给定、可中途换（``services``）。"""
+    real = runtime_module.Runtime(host, config)
+    real.state_directory = store.root
+    runtime = FakeRuntime(host)
+    runtime.services = services
+
+    def preflight(plan):
+        with patch.object(real, "containers", return_value=runtime.services):
+            return real.verify_service_inventory(plan)
+
+    runtime.preflight = preflight
+    return runtime
+
+
+def labeled_services(release, config_sha):
+    """部署器自己起过的容器：镜像来自 release，两枚标签是那次部署写下的配置与控制包摘要。"""
+    return {
+        name: {
+            "image": release["images"]["worker" if name == "worker-queue" else name],
+            "config_sha256": config_sha,
+            "bundle_sha256": release["control_bundle"]["sha256"],
+        }
+        for name in runtime_module.SERVICES
+    }
+
+
+class ConfigurationFingerprintTests(unittest.TestCase):
+    """部署链 old / new 配置指纹分离：old 侧只取部署器账里上一次 verified 计划给容器打的标签值，
+    new 侧取本计划的当前 public-config 指纹；假世界跑各阶段，preflight 用真实的服务清单核对。"""
+
+    UNAVAILABLE = "^previous_verified_configuration_unavailable$"
+
+    def setUp(self):
+        DeployTests.setUp(self)
+        self.marker = state.host_marker(self.host["lock_path"], "active")
+        self.x = self.plan["config_sha256"]
+        self.y = state.fingerprint(dict(self.config, values={"LINGXI_WORKER_MAX_CONCURRENCY": "2"}))
+
+    def inventory_runtime(self, services):
+        return inventory_runtime(self.host, self.config, self.store, services)
+
+    def labeled(self, release, config_sha):
+        return labeled_services(release, config_sha)
+
+    def next_plan(self, config_sha):
+        """版本 B 的计划：new 侧换镜像；config_sha256 与代理写进请求的 recovery.config_sha256
+        都是当前 public-config 指纹——后者正是此前被误当成旧容器标签值去核对的那个字段。"""
+        import copy
+
+        plan = copy.deepcopy(self.plan)
+        plan["id"] = "synthetic-next"
+        plan["config_sha256"] = config_sha
+        plan["recovery"]["config_sha256"] = config_sha
+        # fixture 的 old 与 new 是同一个对象：先拆开再改 new 侧。
+        plan["new"] = copy.deepcopy(plan["new"])
+        for service, image in plan["new"]["images"].items():
+            plan["new"]["images"][service] = image.replace("c" * 64, "d" * 64)
+        self.store.save_plan(plan)
+        approval = dict(self.approval, plan_id=plan["id"], plan_sha256=state.fingerprint(plan))
+        return plan, approval
+
+    def verified_marker(self, plan):
+        return {"id": plan["id"], "plan_sha256": state.fingerprint(plan), "status": "verified"}
+
+    def test_changed_public_config_no_longer_blocks_the_next_version(self):
+        """版本 A 部署（配置指纹 X）→ verified → 人工把 public-config 改成 Y → 版本 B 计划
+        （config_sha256 = Y）：preflight 以 X 核 old 侧运行容器、以 Y 描述 new 侧，各阶段照常进入。"""
+        deploy.execute(self.plan, self.approval, self.store, self.runtime)
+        self.assertEqual(state.read_json(self.marker), self.verified_marker(self.plan))
+        plan, approval = self.next_plan(self.y)
+        self.assertNotEqual(plan["recovery"]["config_sha256"], self.x)
+        runtime = self.inventory_runtime(self.labeled(self.plan["new"], self.x))
+        result = deploy.execute(plan, approval, self.store, runtime)
+        self.assertEqual(result["status"], "verified")
+        self.assertEqual(runtime.calls, list(deploy.STAGES))
+        self.assertEqual(
+            result["inventory"],
+            {"old_verified_sha256": self.x, "old_source": self.plan["id"], "new_sha256": self.y},
+        )
+        self.assertEqual(state.read_json(self.marker), self.verified_marker(plan))
+
+    def test_missing_or_altered_previous_plan_fails_closed_before_any_stage(self):
+        """上一次 verified 的计划文件缺失或被改（指纹不再等于标记）：新码零动作，标记与容器都不动，
+        阶段账记 failed 且没有两侧指纹记录。"""
+        deploy.execute(self.plan, self.approval, self.store, self.runtime)
+        plan, approval = self.next_plan(self.y)
+        runtime = self.inventory_runtime(self.labeled(self.plan["new"], self.x))
+        previous_path = self.store.path(self.plan["id"], "plan")
+        for label, action in (
+            ("missing", previous_path.unlink),
+            ("altered", lambda: state.atomic_write(previous_path, dict(self.plan, id=plan["id"]))),
+        ):
+            action()
+            with self.subTest(previous=label):
+                with self.assertRaisesRegex(state.DeployError, self.UNAVAILABLE):
+                    deploy.execute(plan, approval, self.store, runtime)
+                self.assertEqual(runtime.calls, [])
+                record = self.store.state(plan)
+                self.assertEqual(record["status"], "failed")
+                self.assertEqual(record["error"], "previous_verified_configuration_unavailable")
+                self.assertNotIn("inventory", record)
+                self.assertEqual(state.read_json(self.marker), self.verified_marker(self.plan))
+
+    def test_continuation_takes_old_side_from_the_recorded_inventory(self):
+        """B 在 start 阶段中断后接续：标记已指向 B，old 侧只从 B 阶段账记下的 X 取；记录缺失
+        即失败关闭，不重新推算、不回落到当前配置。"""
+        deploy.execute(self.plan, self.approval, self.store, self.runtime)
+        plan, approval = self.next_plan(self.y)
+        old_services = self.labeled(self.plan["new"], self.x)
+        runtime = self.inventory_runtime(old_services)
+        runtime.crash = "start"
+        with self.assertRaises(state.UnknownError):
+            deploy.execute(plan, approval, self.store, runtime)
+        self.assertEqual(state.read_json(self.marker)["status"], "running")
+        expected = {
+            "old_verified_sha256": self.x,
+            "old_source": self.plan["id"],
+            "new_sha256": self.y,
+        }
+        self.assertEqual(self.store.state(plan)["inventory"], expected)
+        # 首个服务已更新：gateway 带 new 侧标签，其余仍是 X 标签的旧容器。
+        runtime.services = dict(
+            old_services,
+            gateway={
+                "image": plan["new"]["images"]["gateway"],
+                "config_sha256": self.y,
+                "bundle_sha256": plan["new"]["control_bundle"]["sha256"],
+            },
+        )
+        runtime.crash = None
+        raw, record = self.store.load(plan)
+        del record["inventory"]
+        self.store.save(plan, record)
+        calls = runtime.calls[:]
+        with self.assertRaisesRegex(state.DeployError, self.UNAVAILABLE):
+            deploy.execute(plan, approval, self.store, runtime)
+        self.assertEqual(runtime.calls, calls)
+        record["inventory"] = expected
+        self.store.save(plan, record)
+        result = deploy.execute(plan, approval, self.store, runtime)
+        self.assertEqual(result["status"], "verified")
+        self.assertEqual(result["inventory"], expected)
+        self.assertEqual(runtime.calls.count("start"), 2)
+
+    def test_recover_checks_old_side_with_the_recovered_plan_fingerprint(self):
+        """recover 的 old 侧 = 被恢复计划 B 的 config_sha256（B 给容器打的标签值 Y）；中断后配置
+        又改成 Z 的 recover 仍按既有 recovery_package_changed 规则拒绝。"""
+        deploy.execute(self.plan, self.approval, self.store, self.runtime)
+        plan, approval = self.next_plan(self.y)
+        runtime = self.inventory_runtime(self.labeled(self.plan["new"], self.x))
+        runtime.crash = "start"
+        with self.assertRaises(state.UnknownError):
+            deploy.execute(plan, approval, self.store, runtime)
+        recovery = dict(
+            plan,
+            id="synthetic-recovery",
+            operation="recover",
+            recovery_of={"id": plan["id"], "plan_sha256": state.fingerprint(plan)},
+            old=plan["new"],
+            new=plan["old"],
+            current_heads=runtime.heads,
+            # 本计划自己的 recovery.config_sha256 不是 old 侧依据：故意写成别的值。
+            recovery=dict(
+                plan["recovery"],
+                target_manifest_sha256=state.fingerprint(plan["old"]),
+                config_sha256="7" * 64,
+            ),
+        )
+        self.store.save_plan(recovery)
+        recovery_approval = dict(
+            approval,
+            plan_id=recovery["id"],
+            operation="recover",
+            plan_sha256=state.fingerprint(recovery),
+        )
+        runtime.services = self.labeled(plan["new"], self.y)
+        runtime.crash = None
+        runtime.done.clear()
+        runtime.calls.clear()
+        result = deploy.execute(recovery, recovery_approval, self.store, runtime)
+        self.assertEqual(result["status"], "verified")
+        self.assertNotIn("migrate", runtime.calls)
+        self.assertEqual(
+            result["inventory"],
+            {"old_verified_sha256": self.y, "old_source": plan["id"], "new_sha256": self.y},
+        )
+        changed = dict(recovery, id="synthetic-recovery-z", config_sha256="3" * 64)
+        self.store.save_plan(changed)
+        changed_approval = dict(
+            recovery_approval, plan_id=changed["id"], plan_sha256=state.fingerprint(changed)
+        )
+        calls = runtime.calls[:]
+        with self.assertRaisesRegex(state.DeployError, "^recovery_package_changed$"):
+            deploy.execute(changed, changed_approval, self.store, runtime)
+        self.assertEqual(runtime.calls, calls)
+
+    def test_preview_lists_old_and_new_fingerprints_and_only_reports_unavailable(self):
+        """plan 摘要把两侧指纹分开列出：首次接管 / 上一次 verified 计划 / 读不到时只如实标
+        unavailable 不裁决（裁决在 apply 的 preflight）。"""
+        first = deploy.preview(self.plan, self.host, self.config, self.store)["configuration"]
+        self.assertEqual(
+            first,
+            {"old_verified_sha256": None, "old_source": "first_takeover", "new_sha256": self.x},
+        )
+        deploy.execute(self.plan, self.approval, self.store, self.runtime)
+        plan, _ = self.next_plan(self.y)
+        self.assertEqual(
+            deploy.preview(plan, self.host, self.config, self.store)["configuration"],
+            {"old_verified_sha256": self.x, "old_source": self.plan["id"], "new_sha256": self.y},
+        )
+        self.store.path(self.plan["id"], "plan").unlink()
+        self.assertEqual(
+            deploy.preview(plan, self.host, self.config, self.store)["configuration"],
+            {"old_verified_sha256": None, "old_source": "unavailable", "new_sha256": self.y},
+        )
+
+
+class KillingStore(state.StateStore):
+    """在阶段账落盘的前一刻或后一刻整进程被杀：``decide(state)`` 返回 before / after / None。"""
+
+    def __init__(self, root, decide):
+        super().__init__(root)
+        self.decide = decide
+
+    def save(self, plan, record):
+        moment = self.decide(record)
+        if moment == "before":
+            raise SyntheticKill("before-save")
+        super().save(plan, record)
+        if moment == "after":
+            raise SyntheticKill("after-save")
+
+
+class FailedMarkerReleaseTests(unittest.TestCase):
+    """只在 prepare 失败的计划，其主机占用由下一计划在锁内按五条件收敛；缺任一条件即
+    unfinished_host_deployment 零动作。收敛不改失败计划状态、不删证据、不写新的 verified。"""
+
+    UNFINISHED = "^unfinished_host_deployment$"
+
+    def setUp(self):
+        DeployTests.setUp(self)
+        self.active = state.host_marker(self.host["lock_path"], "active")
+        self.verified = state.host_marker(self.host["lock_path"], "verified")
+
+    def pointer(self, plan, status="verified"):
+        return {"id": plan["id"], "plan_sha256": state.fingerprint(plan), "status": status}
+
+    def plan_after(self, identifier, config_sha=None):
+        """当前 fixture 计划之后的下一份计划：new 侧换镜像，config 可换。"""
+        import copy
+
+        plan = copy.deepcopy(self.plan)
+        plan["id"] = identifier
+        if config_sha is not None:
+            plan["config_sha256"] = config_sha
+            plan["recovery"]["config_sha256"] = config_sha
+        plan["new"] = copy.deepcopy(plan["new"])
+        for service, image in plan["new"]["images"].items():
+            plan["new"]["images"][service] = image.replace("c" * 64, "d" * 64)
+        self.store.save_plan(plan)
+        approval = dict(self.approval, plan_id=plan["id"], plan_sha256=state.fingerprint(plan))
+        return plan, approval
+
+    def verified_count(self):
+        return sum(
+            1
+            for path in self.store.root.glob("*.state.json")
+            if state.read_json(path).get("status") == "verified"
+        )
+
+    def observing_runtime(self):
+        """假世界执行器；preflight 时抄下在途标记与 verified 账数——收敛在 preflight 之前完成。"""
+        runtime = FakeRuntime(self.host)
+        observed = {}
+        base = runtime.preflight
+
+        def preflight(plan):
+            observed["marker"] = state.read_json(self.active) if self.active.exists() else None
+            observed["verified_count"] = self.verified_count()
+            return base(plan)
+
+        runtime.preflight = preflight
+        return runtime, observed
+
+    def deploy_verified(self):
+        """fixture 计划 P 部署到 verified：在途标记与 host.verified.json 都指向 P。"""
+        deploy.execute(self.plan, self.approval, self.store, self.runtime)
+        self.assertEqual(state.read_json(self.active), self.pointer(self.plan))
+        self.assertEqual(state.read_json(self.verified), self.pointer(self.plan))
+
+    def fail_in_prepare(self, identifier="synthetic-a", config_sha=None):
+        """计划 A 在 prepare 明确失败：阶段账 failed、只有 prepare 意图，在途标记停在 A running。"""
+        plan, approval = self.plan_after(identifier, config_sha)
+        runtime = FakeRuntime(self.host)
+        runtime.fail = "prepare"
+        with self.assertRaisesRegex(state.DeployError, "^synthetic_failure$"):
+            deploy.execute(plan, approval, self.store, runtime)
+        record = self.store.state(plan)
+        self.assertEqual((record["status"], set(record["stages"])), ("failed", {"prepare"}))
+        self.assertEqual(state.read_json(self.active), self.pointer(plan, "running"))
+        return plan, approval
+
+    def assert_refused_without_writes(self, plan, approval, failed):
+        """拒绝 = 零动作：标记、失败计划的账、本计划的账（不存在）都逐字不变。"""
+        marker = self.active.read_bytes()
+        failed_ledger = self.store.path(failed["id"], "state").read_bytes()
+        runtime = FakeRuntime(self.host)
+        with self.assertRaisesRegex(state.DeployError, self.UNFINISHED):
+            deploy.execute(plan, approval, self.store, runtime)
+        self.assertEqual(runtime.calls, [])
+        self.assertEqual(self.active.read_bytes(), marker)
+        self.assertEqual(self.store.path(failed["id"], "state").read_bytes(), failed_ledger)
+        self.assertTrue(self.store.path(failed["id"], "plan").exists())
+        self.assertFalse(self.store.path(plan["id"], "state").exists())
+
+    def test_prepare_only_failure_is_released_and_next_plan_deploys(self):
+        """主路径：P verified → A 在 prepare 失败 → B apply 自动收敛（标记中途恢复为 P，最终指向 B），
+        A 的 status 与文件不动，两处审计齐全。"""
+        self.deploy_verified()
+        failed, _ = self.fail_in_prepare()
+        plan, approval = self.plan_after("synthetic-b")
+        runtime, observed = self.observing_runtime()
+        before = time.time()
+        result = deploy.execute(plan, approval, self.store, runtime)
+        self.assertEqual(result["status"], "verified")
+        self.assertEqual(runtime.calls, list(deploy.STAGES))
+        self.assertEqual(observed["marker"], self.pointer(self.plan))
+        self.assertEqual(state.read_json(self.active), self.pointer(plan))
+        self.assertEqual(state.read_json(self.verified), self.pointer(plan))
+        (entry,) = result["released_markers"]
+        self.assertGreaterEqual(entry.pop("time"), before)
+        self.assertEqual(
+            entry,
+            {
+                "failed_plan_id": failed["id"],
+                "failed_plan_sha256": state.fingerprint(failed),
+                "failed_status": "failed",
+                "failed_stages": ["prepare"],
+                "marker_before": self.pointer(failed, "running"),
+                "restored_pointer": self.pointer(self.plan),
+                "restored_from": "verified_file",
+            },
+        )
+        record = self.store.state(failed)
+        self.assertEqual((record["status"], set(record["stages"])), ("failed", {"prepare"}))
+        self.assertEqual(record["error"], "synthetic_failure")
+        self.assertGreaterEqual(record["released_by"].pop("time"), before)
+        self.assertEqual(record["released_by"], {"plan_id": plan["id"]})
+        self.assertTrue(self.store.path(failed["id"], "plan").exists())
+
+    def test_release_refused_when_stop_intent_was_recorded(self):
+        """A 在 stop 失败：阶段账里有 stop 的意图记录（哪怕容器没动过）→ 不收敛。"""
+        self.deploy_verified()
+        failed, failed_approval = self.plan_after("synthetic-a")
+        runtime = FakeRuntime(self.host)
+        runtime.fail = "stop"
+        with self.assertRaisesRegex(state.DeployError, "^synthetic_failure$"):
+            deploy.execute(failed, failed_approval, self.store, runtime)
+        record = self.store.state(failed)
+        self.assertEqual(record["status"], "failed")
+        self.assertEqual(record["stages"]["stop"]["status"], "running")
+        plan, approval = self.plan_after("synthetic-b")
+        self.assert_refused_without_writes(plan, approval, failed)
+
+    def test_release_refused_when_failed_plan_status_is_unknown(self):
+        """A 在 prepare 以 unknown 停住（不是明确失败）→ 不收敛：unknown 归接续与人工，不归自动清理。"""
+        self.deploy_verified()
+        failed, failed_approval = self.plan_after("synthetic-a")
+        runtime = FakeRuntime(self.host)
+        runtime.crash = "prepare"
+        with self.assertRaises(state.UnknownError):
+            deploy.execute(failed, failed_approval, self.store, runtime)
+        self.assertEqual(self.store.state(failed)["status"], "unknown")
+        plan, approval = self.plan_after("synthetic-b")
+        self.assert_refused_without_writes(plan, approval, failed)
+
+    def test_release_refused_when_marker_does_not_belong_to_the_failed_plan(self):
+        """标记的 id 或 plan_sha256 与失败计划对不上 → 不清别人的占用。"""
+        self.deploy_verified()
+        failed, _ = self.fail_in_prepare()
+        plan, approval = self.plan_after("synthetic-b")
+        for label, marker in (
+            ("sha", dict(self.pointer(failed, "running"), plan_sha256="0" * 64)),
+            ("id", {"id": "someone-else", "plan_sha256": "0" * 64, "status": "running"}),
+        ):
+            state.atomic_write(self.active, marker)
+            with self.subTest(marker=label):
+                self.assert_refused_without_writes(plan, approval, failed)
+
+    def test_release_refused_when_verified_pointer_is_untrustworthy(self):
+        """host.verified.json 指向的计划读不到 / 指纹不符 / 阶段账不是 verified → 不重建、不删标记。"""
+        self.deploy_verified()
+        failed, _ = self.fail_in_prepare()
+        plan, approval = self.plan_after("synthetic-b")
+        untrusted = [
+            ("fingerprint", dict(self.pointer(self.plan), plan_sha256="0" * 64)),
+            ("ledger_not_verified", self.pointer(failed)),
+            ("plan_missing", {"id": "gone", "plan_sha256": "0" * 64, "status": "verified"}),
+        ]
+        for label, pointer in untrusted:
+            state.atomic_write(self.verified, pointer)
+            with self.subTest(pointer=label):
+                self.assert_refused_without_writes(plan, approval, failed)
+                self.assertEqual(state.read_json(self.verified), pointer)
+
+    def test_crash_around_intent_action_and_completion_never_releases(self):
+        """A 在 stop 的六个时点整进程被杀（意图落盘前 / 后、动作前 / 后、完成记录前 / 后）：
+        阶段账都不是 failed，B 一律拒绝且 A 的证据一个不少；A 自己沿同一计划接续能完成。"""
+
+        def intent(record, moment):
+            return moment if record["stages"].get("stop", {}).get("status") == "running" else None
+
+        def completion(record, moment):
+            return moment if record["stages"].get("stop", {}).get("status") == "verified" else None
+
+        # 每个时点：落盘决定、执行器钩子、被杀后账上 stop 记录应有的样子（证明钩子真的打在那一点）。
+        points = {
+            "intent_before": (lambda r: intent(r, "before"), {}, None),
+            "intent_after": (lambda r: intent(r, "after"), {}, "running"),
+            "action_before": (lambda r: None, {"kill_before": "stop"}, "running"),
+            "action_after": (lambda r: None, {"kill_after": "stop"}, "running"),
+            "completion_before": (lambda r: completion(r, "before"), {}, "running"),
+            "completion_after": (lambda r: completion(r, "after"), {}, "verified"),
+        }
+        for label, (decide, hooks, stop_status) in points.items():
+            with self.subTest(point=label), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                self.plan, self.host, self.config, self.approval = fixture(root)
+                self.store = state.StateStore(root / "private")
+                self.store.save_plan(self.plan)
+                self.runtime = FakeRuntime(self.host)
+                self.active = state.host_marker(self.host["lock_path"], "active")
+                self.verified = state.host_marker(self.host["lock_path"], "verified")
+                self.deploy_verified()
+                failed, failed_approval = self.plan_after("synthetic-a")
+                killing = KillingStore(self.store.root, decide)
+                runtime = FakeRuntime(self.host)
+                for name, value in hooks.items():
+                    setattr(runtime, name, value)
+                with self.assertRaises(SyntheticKill):
+                    deploy.execute(failed, failed_approval, killing, runtime)
+                record = self.store.state(failed)
+                self.assertEqual(record["status"], "running")
+                self.assertEqual(record["stages"].get("stop", {}).get("status"), stop_status)
+                plan, approval = self.plan_after("synthetic-b")
+                self.assert_refused_without_writes(plan, approval, failed)
+                runtime.kill_before = runtime.kill_after = None
+                deploy.execute(failed, failed_approval, self.store, runtime)
+                self.assertEqual(self.store.state(failed)["status"], "verified")
+
+    def test_release_is_idempotent_across_crash_and_reentry(self):
+        """收敛写到一半被杀（写标记之前 / 之后）→ 重跑收敛恰一次、审计恰一条；已收敛后同一 B 重入或
+        另一计划 C 开跑都按普通路径走；另一进程持锁时零动作。"""
+        self.deploy_verified()
+        failed, _ = self.fail_in_prepare()
+        plan, approval = self.plan_after("synthetic-b")
+        real_write = deploy.atomic_write
+
+        def killing_write(moment):
+            def write(path, value):
+                restoring = path == self.active and value == self.pointer(self.plan)
+                if restoring and moment == "before":
+                    raise SyntheticKill("before-marker")
+                real_write(path, value)
+                if restoring and moment == "after":
+                    raise SyntheticKill("after-marker")
+
+            return write
+
+        with patch.object(deploy, "atomic_write", killing_write("before")):
+            with self.assertRaises(SyntheticKill):
+                deploy.execute(plan, approval, self.store, FakeRuntime(self.host))
+        self.assertEqual(state.read_json(self.active), self.pointer(failed, "running"))
+        self.assertEqual(len(self.store.state(plan)["released_markers"]), 1)
+        self.assertEqual(self.store.state(failed)["released_by"]["plan_id"], plan["id"])
+        with patch.object(deploy, "atomic_write", killing_write("after")):
+            with self.assertRaises(SyntheticKill):
+                deploy.execute(plan, approval, self.store, FakeRuntime(self.host))
+        self.assertEqual(state.read_json(self.active), self.pointer(self.plan))
+        self.assertEqual(len(self.store.state(plan)["released_markers"]), 1)
+        with state.host_lock(Path(self.host["lock_path"])):
+            with self.assertRaisesRegex(state.DeployError, "^host_deployment_busy$"):
+                deploy.execute(plan, approval, self.store, FakeRuntime(self.host))
+        runtime = FakeRuntime(self.host)
+        result = deploy.execute(plan, approval, self.store, runtime)
+        self.assertEqual(result["status"], "verified")
+        self.assertEqual(len(result["released_markers"]), 1)
+        self.assertEqual(runtime.calls, list(deploy.STAGES))
+        calls = runtime.calls[:]
+        deploy.execute(plan, approval, self.store, runtime)
+        self.assertEqual(runtime.calls, calls)
+        self.assertEqual(len(self.store.state(plan)["released_markers"]), 1)
+        other, other_approval = self.plan_after("synthetic-c")
+        result = deploy.execute(other, other_approval, self.store, FakeRuntime(self.host))
+        self.assertEqual(result["status"], "verified")
+        self.assertNotIn("released_markers", result)
+        self.assertEqual(self.store.state(failed)["released_by"]["plan_id"], plan["id"])
+
+    def test_release_never_creates_a_verified_record(self):
+        """收敛只恢复既有指针：verified 账的数量不变、失败计划仍是 failed、指针逐字等于上一次的。"""
+        self.deploy_verified()
+        failed, _ = self.fail_in_prepare()
+        plan, approval = self.plan_after("synthetic-b")
+        self.assertEqual(self.verified_count(), 1)
+        runtime, observed = self.observing_runtime()
+        deploy.execute(plan, approval, self.store, runtime)
+        self.assertEqual(observed["verified_count"], 1)
+        self.assertEqual(observed["marker"], self.pointer(self.plan))
+        self.assertEqual(self.store.state(failed)["status"], "failed")
+        self.assertEqual(self.verified_count(), 2)
+
+    def test_released_marker_feeds_old_side_from_the_restored_pointer(self):
+        """与 #804 联动：收敛后 B 的 preflight 按恢复指针所指计划 P 的 config_sha256 核旧容器——
+        容器带 P 的指纹 X 通过；带当前指纹 Y（A / B 的目标配置）不通过。"""
+        self.deploy_verified()
+        x = self.plan["config_sha256"]
+        y = state.fingerprint(dict(self.config, values={"LINGXI_WORKER_MAX_CONCURRENCY": "2"}))
+        failed, _ = self.fail_in_prepare(config_sha=y)
+        plan, approval = self.plan_after("synthetic-b", y)
+        runtime = inventory_runtime(
+            self.host, self.config, self.store, labeled_services(self.plan["new"], y)
+        )
+        with self.assertRaisesRegex(state.DeployError, "^unplanned_service_artifact_or_config$"):
+            deploy.execute(plan, approval, self.store, runtime)
+        self.assertEqual(state.read_json(self.active), self.pointer(self.plan))
+        runtime.services = labeled_services(self.plan["new"], x)
+        result = deploy.execute(plan, approval, self.store, runtime)
+        self.assertEqual(result["status"], "verified")
+        self.assertEqual(
+            result["inventory"],
+            {"old_verified_sha256": x, "old_source": self.plan["id"], "new_sha256": y},
+        )
+        self.assertEqual(len(result["released_markers"]), 1)
+
+    def test_pointer_is_rebuilt_from_ledgers_when_verified_file_is_absent(self):
+        """旧版本部署器部署过的主机没有 host.verified.json：从 verified 阶段账里取 verified 时刻最大的
+        一份重建指针；任一份 verified 账与计划文件对不上就不重建。"""
+        self.deploy_verified()
+        later, later_approval = self.plan_after("synthetic-later")
+        deploy.execute(later, later_approval, self.store, FakeRuntime(self.host))
+        self.verified.unlink()
+        failed, _ = self.fail_in_prepare()
+        plan, approval = self.plan_after("synthetic-b")
+        runtime, observed = self.observing_runtime()
+        result = deploy.execute(plan, approval, self.store, runtime)
+        self.assertEqual(observed["marker"], self.pointer(later))
+        (entry,) = result["released_markers"]
+        self.assertEqual(entry["restored_from"], "rebuilt_from_ledger")
+        self.assertEqual(entry["restored_pointer"], self.pointer(later))
+        self.assertEqual(state.read_json(self.verified), self.pointer(plan))
+        # 某份 verified 账的计划文件被挪走：不重建、不删标记。
+        self.verified.unlink()
+        stuck, _ = self.fail_in_prepare("synthetic-a2")
+        self.store.path(self.plan["id"], "plan").unlink()
+        again, again_approval = self.plan_after("synthetic-c")
+        self.assert_refused_without_writes(again, again_approval, stuck)
+
+    def test_equivalent_release_only_for_never_verified_first_takeover(self):
+        """本机从未 verified、A 是在无标记状态下（首次接管）通过 preflight 后在 prepare 失败：
+        删除标记回到「从未由部署器部署过」，审计 restored_pointer 为 null；A 的账没有首次接管
+        记录（例如旧版本部署器写的账）就不解除。"""
+        failed, failed_approval = self.plan_after("synthetic-a")
+        runtime = FakeRuntime(self.host)
+        runtime.fail = "prepare"
+        with self.assertRaisesRegex(state.DeployError, "^synthetic_failure$"):
+            deploy.execute(failed, failed_approval, self.store, runtime)
+        self.assertEqual(self.store.state(failed)["inventory"]["old_source"], "first_takeover")
+        plan, approval = self.plan_after("synthetic-b")
+        raw, record = self.store.load(failed)
+        del record["inventory"]
+        self.store.save(failed, record)
+        self.assert_refused_without_writes(plan, approval, failed)
+        state.atomic_write_raw(self.store.path(failed["id"], "state"), raw)
+        runtime, observed = self.observing_runtime()
+        result = deploy.execute(plan, approval, self.store, runtime)
+        self.assertIsNone(observed["marker"])
+        self.assertEqual(observed["verified_count"], 0)
+        (entry,) = result["released_markers"]
+        self.assertEqual((entry["restored_pointer"], entry["restored_from"]), (None, "none"))
+        self.assertEqual(result["status"], "verified")
+        self.assertEqual(state.read_json(self.active), self.pointer(plan))
+        self.assertEqual(self.store.state(failed)["status"], "failed")
 
 
 class MigrationResumeTests(unittest.TestCase):
@@ -820,6 +1483,15 @@ class MigrationResumeCliTests(unittest.TestCase):
         raw = self.store.path(self.plan["id"], "state").read_bytes()
         self.assertEqual(status["state_sha256"], hashlib.sha256(raw).hexdigest())
         self.assertEqual(status["stages"]["migrate"]["status"], "running")
+        # preflight 通过时记下的两侧配置指纹随阶段账一起读出。
+        self.assertEqual(
+            status["inventory"],
+            {
+                "old_verified_sha256": None,
+                "old_source": "first_takeover",
+                "new_sha256": self.plan["config_sha256"],
+            },
+        )
         self.assertIsNone(status["actual"]["job"])
         self.assertEqual(status["status"], "unknown")
         # 指纹不对：退出码 1，stderr 只有结果码，阶段账逐字不变。

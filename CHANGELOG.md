@@ -6,7 +6,17 @@
 
 ## [Unreleased]
 
-2.5.0 开发中（Trace [#770](https://github.com/Moshuiwang/lingxi/issues/770)），本节随批次合入逐条追加。
+2.5.1 开发中（Trace [#812](https://github.com/Moshuiwang/lingxi/issues/812)）：由拉取代理 + 部署器发布的修复版，装入 [#804](https://github.com/Moshuiwang/lingxi/issues/804) / [#805](https://github.com/Moshuiwang/lingxi/issues/805) / [#807](https://github.com/Moshuiwang/lingxi/issues/807) / [#739](https://github.com/Moshuiwang/lingxi/issues/739) / [#745](https://github.com/Moshuiwang/lingxi/issues/745) 五处改动；本节随批次合入逐条追加。
+
+### Fixed
+
+- **只在准备阶段失败的部署计划不再占着主机，下一次发布自动接上**：此前部署器在 `prepare`（装控制包、拉镜像，不动任何服务）失败后，主机在途标记仍指向这份失败计划，拉取代理不接续失败计划而改建新计划，新计划每轮都以 `unfinished_host_deployment` 被拒、失败计划逐轮堆积，只能人工改 `host.active.json`；现在新计划在主机锁内先取证再收敛——标记确属该失败计划、其阶段账明确是 `failed`、只记过 `prepare` 的意图（阶段意图先于动作落盘，`stop` 及之后哪怕只是「即将进入」也不收敛）、旧执行者不在跑（持锁即证据）、有可信的上一次验证成功指针（新增 `host.verified.json`，没有时从阶段账重建；本机从未验证过则删除标记回到「从未由部署器部署过」）——五条件全有证据才把标记恢复为上一次验证成功的指针并照常部署，缺一条仍零动作。失败计划的状态与文件原地保留并留审计（`released_by` / `released_markers` 固定字段），不产生任何新的验证成功记录；`unknown` / 已进副作用阶段的失败仍走接续或独立批准的恢复，不自动清理（Issue [#805](https://github.com/Moshuiwang/lingxi/issues/805)、Trace [#812](https://github.com/Moshuiwang/lingxi/issues/812)）。
+- **管理员在两次部署之间调整过公开配置后，下一次版本部署不再永久卡住**：此前只要 `public-config.json` 在两次部署之间改过（例如补齐运行文件清单），下一次发布就会在停任何服务之前以 `unplanned_service_artifact_or_config` 停住、每轮重复、失败计划逐轮堆积，唯一出路是把文件改回去——根因是部署器拿「当前配置」的指纹去核对「上一次部署起的旧容器」；现在部署器核对旧服务只用自己账里上一次已验证部署的配置指纹（主机在途标记指向的那份计划，指纹相符才用），新一侧仍用当前配置，配置改动随本次部署落到容器；两侧指纹在 `plan` 摘要（`configuration`）、阶段账与 `status`（`inventory`）里分开列出；上一次的可信旧值取不到时以 `previous_verified_configuration_unavailable` 零动作停住，不拿当前配置冒充、不读容器标签自证；篡改旧容器的配置标签、控制包标签或镜像摘要仍按原规则拒绝。修法随控制包到达，拉取代理不需重装；不提供同版本重应用入口——只改配置不发新版本，改动不会落到容器（Issue [#804](https://github.com/Moshuiwang/lingxi/issues/804)、Trace [#812](https://github.com/Moshuiwang/lingxi/issues/812)）。
+- **同一提交在本机与 CI 上，两条部署测试给出一致的结论**：此前两条部署用例（控制包安装根、公开运行文件）把自己创建的文件与目录的权限位交给运行者 shell 的 umask 决定，`umask 002` 的开发机稳定判红、CI（`umask 022`）稳定判绿，同一提交两边结论相反，只能靠人工排查分辨「环境性」还是「改动引入」；现在测试自己显式建立它要核对的权限位——安全位是测试输入，组 / 其他可写位同样是测试输入——两种 umask 下结论一致，部署器与控制包的权限判据零放宽（Issue [#739](https://github.com/Moshuiwang/lingxi/issues/739)）。
+
+## [2.5.0] - 2026-09-15
+
+本版是**第一次由拉取代理 + 部署器发到生产的正式版**（Trace [#770](https://github.com/Moshuiwang/lingxi/issues/770)）：`release/2.5` 候选 rc.102 经预发验收后原样提升，生产由 `v2.4.3` 升级、停机约 30 秒、迁移头 `0096` → `0098`，产品负责人一次真实问数通过。用户与管理员得到：① 发布不再靠人在主机上手工操作，门禁的裁决层也不再由被审查的 PR 自己产出（Issue [#748](https://github.com/Moshuiwang/lingxi/issues/748)）；② 预开通、欢迎卡、内测扩员三件运营操作有了具名身份与持久审计账（Issue [#675](https://github.com/Moshuiwang/lingxi/issues/675) / [#788](https://github.com/Moshuiwang/lingxi/issues/788)），管理员可以用自己的 Agent 客户端经受限通道查状态并准备停用 / 恢复 / 补授 / 撤销、确认仍在本人飞书卡片上（Issue [#716](https://github.com/Moshuiwang/lingxi/issues/716)），职位授权重叠时只补缺的项、撤销只撤本笔（Issue [#715](https://github.com/Moshuiwang/lingxi/issues/715)），每次真实问数收口后留存问答语料并可受控读取（Issue [#664](https://github.com/Moshuiwang/lingxi/issues/664)）；③ 队列执行服务必配问数 MCP 地址（Issue [#604](https://github.com/Moshuiwang/lingxi/issues/604)）、预发监控小项（Issue [#756](https://github.com/Moshuiwang/lingxi/issues/756)）、两块纯函数平移（Issue [#658](https://github.com/Moshuiwang/lingxi/issues/658)，行为零变化）与一批真机接缝修法。生产内测名单自本版起改为库内动态名单，新人首聊只能经扩员确认卡准入。迁移 `0097` / `0098` 只加不删，回退不降库。证据等级与已知边界以 [docs/当前能力.md](docs/当前能力.md) 为准。
 
 ### Added
 
@@ -21,6 +31,7 @@
 
 ### Fixed
 
+- **受限 relay 账号不再可能被别的公钥来源拿到 shell**：此前受限通道只靠 `authorized_keys` 那一行的 `command=` 钉住强制命令，而云主机的 sshd 常带全局 `AuthorizedKeysCommand`（如 EC2 Instance Connect，预发与生产实读都有），能为该账号临时推送另一把公钥、绕过强制命令拿到 shell；现在 `sshd` 模板与引导安装在该账号的 `Match` 块里关掉其它公钥来源（`AuthorizedKeysCommand none` / `TrustedUserCAKeys none`）并把强制命令钉在 `Match` 块上（`ForceCommand`），公钥从哪来都只能进 relay；预发与生产已按同形加固并复测三路否定（Trace [#770](https://github.com/Moshuiwang/lingxi/issues/770)、Issue [#566](https://github.com/Moshuiwang/lingxi/issues/566)）。
 - **宿主侧监控单元与拉取代理不再依赖主机默认 `python3`**：预发主机默认 `python3` 是 3.9，仓库单元写死系统 `python3`、资源采样脚本从 PATH 取 `python3`，结果资源采样每分钟失败 80 分钟无人察觉、阈值告警候选版起不来；现在 host-monitor / release-pull 的 `ExecStart` 与 resource-sample 注入给采样脚本的解释器统一指向固定符号链接 `/opt/lingxi/bin/python3`，由引导安装用前提核对定下的 `<PYTHON_ABSOLUTE_PATH>`（3.11 以上）建链，两台主机只差链接目标、仓库单元逐字相同、本机 drop-in 不再需要覆盖 `ExecStart`；采样脚本在链接缺失或版本低于 3.11 时退出码 `2` 并打印实际版本，不静默落回 PATH（Trace [#770](https://github.com/Moshuiwang/lingxi/issues/770)、Issue [#756](https://github.com/Moshuiwang/lingxi/issues/756)）。
 - **预发 / 生产 env 文件里的 DSN 带引号时，升级不再在迁移头回读处停住**：三个常驻服务由 Compose 起、读 env 文件会去掉值两端成对的引号，部署器回读迁移头与业务探针却直接 `docker run --env-file`，docker CLI 不去引号，预发 env 文件历来给 DSN 加单引号，迁移容器拿到带引号的连接串、升级停在 `migration_revision_unknown`（此前只能手工改 root 副本去引号）；现在部署器先把 env 文件按 Compose 口径规范化（去成对引号、处理转义、去注释与 `export` 前缀）写成状态目录下用完即删的 `0600` 私有副本再喂给 `docker run`，原文件不动、副本不进日志；文件读不到、不合 Compose 语法或规范化后为空时在 `docker run` 之前以 `env_file_unreadable` / `env_file_malformed` / `env_file_empty` 停住，不猜（Trace [#770](https://github.com/Moshuiwang/lingxi/issues/770)、Issue [#567](https://github.com/Moshuiwang/lingxi/issues/567)）。
 - **候选与正式版 Release 附带控制包索引附件，拉取代理不再因缺附件拒绝该版本**：拉取代理按契约要求 Release 有清单、控制包与外部索引 `control-index.json` 三个附件，此前发布流程只上传前两个，代理核包时会以 `bundle_digest_mismatch` 拒绝该版本、不安装也不 apply，无人值守升级走不到安装；现在候选写入与正式提升都从控制包内读出索引作为第三个附件上传，摘要等于清单的 `index_sha256`；中断重跑时已有相同附件不再上传、已有不同附件拒绝覆盖并保持草稿。此前已发布、没有索引附件的版本不回填（Trace [#770](https://github.com/Moshuiwang/lingxi/issues/770)、Issue [#567](https://github.com/Moshuiwang/lingxi/issues/567)）。

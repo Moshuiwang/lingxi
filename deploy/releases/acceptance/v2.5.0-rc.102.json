@@ -1,0 +1,12 @@
+{
+  "candidate_tag": "v2.5.0-rc.102",
+  "evidence_url": "https://github.com/Moshuiwang/lingxi/issues/770#issuecomment-5677188860",
+  "manifest_sha256": "1bd6e311e4c79896023748896561f167a51021b2986fc68144aa22531eb7d42b",
+  "recovery": {
+    "evidence_url": "https://github.com/Moshuiwang/lingxi/issues/770#issuecomment-5677188860",
+    "instructions": "生产回滚 = 切回上一正式版 v2.4.3 的四镜像，不降级数据库。路径一（部署器，优先）：按 deploy/拉取代理.md §五与 deploy/releases/README.md「固定计划与一次批准」另存 operation=recover、引用本次部署计划的恢复计划并独立批准，执行 lingxi_deploy.py recover（恢复计划 old/new 对调、recovery.target_manifest_sha256 = v2.4.3 清单指纹；部署器在 migrate 阶段只核对库头不降级）；路径二（手工，部署器不可用时）：以部署用户在 /home/bi-ai-deploy/projects/lingxi 用 deploy/.env.prod.before-243-v2.4.3 的四个 *_IMAGE_DIGEST 与 LINGXI_IMAGE_TAG 恢复 deploy/.env.prod，执行 docker compose --env-file deploy/.env.prod -f deploy/compose.yaml -f deploy/compose.prod.yaml -f deploy/compose.innertest.yaml --profile mvp up -d（G-2b 之后旧栈须带内测覆盖文件）。数据库：本候选把迁移头从 0096 前滚到 0098（0097 operation_audit、0098 qa_corpus / qa_corpus_reader 均为新表，表非空即拒绝降级），回滚只切镜像不降库；v2.4.3 镜像跑 0098 库结构只有 CI 合成迁移证据，未在真实环境执行回退演练，如实记录。升级前 pg_dump（产品负责人在点 Release Promotion 前手动执行 prod_pre_apply_pg_dump.py，落 /root/lingxi-backups/）是最后恢复点，恢复动作属显式除外须另请示。",
+    "previous_tag": "v2.4.3"
+  },
+  "result": "passed",
+  "schema": 1
+}
