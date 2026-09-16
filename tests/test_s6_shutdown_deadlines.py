@@ -6,10 +6,11 @@ import signal
 import sys
 import time
 import unittest
-from datetime import UTC, datetime, timedelta
+from uuid import uuid4
 
 import test_admin_followup_postgres as fixture_module
 from postgres_schema import ensure_production_schema, psycopg_available
+from s6_database_shutdown import backend_is_present, recover_after_database_exit
 from s6_shutdown_process import shutdown_process
 
 from lingxi.adapters.postgres import connect
@@ -24,6 +25,8 @@ class ShutdownDeadlineTests(unittest.TestCase):
         ensure_production_schema(DSN)
 
     def test_actual_gateway_and_scheduler_absolute_deadlines(self):
+        from psycopg.conninfo import make_conninfo
+
         for kind, budget in (("gateway", 20), ("scheduler", 120)):
             with self.subTest(kind=kind):
                 fixture = fixture_module.FollowupPostgresTests()
@@ -40,12 +43,16 @@ class ShutdownDeadlineTests(unittest.TestCase):
                     )
                 context = multiprocessing.get_context("spawn")
                 parent, child = context.Pipe()
-                process = context.Process(target=shutdown_process, args=(DSN, kind, child))
+                application_name = "s6-deadline-" + uuid4().hex
+                child_dsn = make_conninfo(DSN, application_name=application_name)
+                process = context.Process(target=shutdown_process, args=(child_dsn, kind, child))
                 try:
                     process.start()
                     self.assertTrue(parent.poll(10))
                     ready = parent.recv()
                     self.assertEqual(ready["state"], "ready")
+                    with connect(DSN, dedicated=True, autocommit=True) as observer:
+                        self.assertTrue(backend_is_present(observer, application_name))
                     started = time.monotonic()
                     os.kill(process.pid, signal.SIGTERM)
                     time.sleep(0.03)
@@ -62,9 +69,7 @@ class ShutdownDeadlineTests(unittest.TestCase):
                     self.assertGreaterEqual(elapsed, budget - 0.5)
                     self.assertLess(elapsed, budget + 4)
                     self.assertFalse(os.path.exists(f"/proc/{process.pid}"))
-                    counts = fixture.store.recover_expired(
-                        now=datetime.now(UTC) + timedelta(seconds=121)
-                    )
+                    counts = recover_after_database_exit(fixture.store, DSN, application_name)
                     self.assertEqual(counts.unknown if kind == "gateway" else counts.recoverable, 1)
                     print(
                         "S6_ACTUAL_DEADLINE",

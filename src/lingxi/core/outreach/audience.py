@@ -55,6 +55,7 @@ class SubjectFacts:
     publish_id: str | None = None
     outbound_unavailable_at: datetime | None = None
     outbound_unavailable_code: str | None = None
+    identity_failure_reason: str | None = None
 
 
 @dataclass(frozen=True)
@@ -116,6 +117,8 @@ def plan_outreach(
     查不到的人都整条跳过**，见 :func:`_build_plan`；``total_company_count`` 是当前
     可用公司总数，只在通配范围下用来把「全部公司」说成一个数字。
     """
+    if facts.identity_failure_reason is not None:
+        return _skip(facts, "email_identity_unresolved", active=False)
     if facts.user_id is None:
         return _skip(facts, SKIP_NOT_FOUND, active=False)
     active = (
@@ -188,6 +191,7 @@ def _build_plan(
             company_names=dict(company_names),
             metric_labels=dict(metric_labels),
             total_company_count=total_company_count,
+            company_metrics=parse_permissions(facts.permissions or ""),
         )
     except ValueError:
         return _skip(facts, SKIP_NO_METRICS if not metrics else SKIP_NO_PERMISSIONS, active=True)

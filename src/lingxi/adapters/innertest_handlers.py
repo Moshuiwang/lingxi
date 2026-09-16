@@ -15,12 +15,14 @@ from lingxi.adapters.postgres_innertest import (
 )
 from lingxi.adapters.postgres_operation_audit import record_operation_audit
 from lingxi.core.admin.followup_consumer import FollowupResult
+from lingxi.core.admin.innertest import InnertestError
 from lingxi.core.admin.operation_audit import (
     EntryPoint,
     OperationAuditEntry,
     OperationPhase,
     executor_label,
 )
+from lingxi.core.identity.preprovision import PreprovisionSkip, PreprovisionTarget
 from lingxi.core.ids import new_id
 
 logger = logging.getLogger(__name__)
@@ -29,9 +31,10 @@ logger = logging.getLogger(__name__)
 class InnertestFollowupHandlers:
     """资格与就绪不是同一个事实，不自动发欢迎卡。"""
 
-    def __init__(self, *, store, runner, probe):
+    def __init__(self, *, store, runner, probe, identity_service=None):
         """Runner 是已装配的 start_system，禁止注入本地补授计划。"""
         self.store, self.runner, self.probe = store, runner, probe
+        self.identity_service = identity_service
 
     def handle(self, item):
         """读取短事务后释放连接，网络期间不持有数据库活动槽。"""
@@ -44,9 +47,21 @@ class InnertestFollowupHandlers:
 
     def _preprovision(self, item, target):
         """未开通的人走系统触发开通；容量与在途两种等待交回消费者重试。"""
+        if target[1] is None:
+            if target[7] != "identity_resolution_pending":
+                return FollowupResult("failed", target[7])
+            pending = self._resolve_identity(item, target)
+            if pending is not None:
+                return pending
+            target = self._target(item)
+            if target is None or target[1] is None:
+                return FollowupResult("failed", "identity_unavailable")
         if target[3] != "active":
             result = self.runner.start_system(
-                email=target[0], trace_id=item.trace_id, initiated_by_open_id=target[2]
+                email=target[0],
+                trace_id=item.trace_id,
+                initiated_by_open_id=target[2],
+                expected_open_id=target[1],
             )
             if getattr(result, "failure_reason", None) in {"capacity_pending", "stopping"}:
                 self.store.retry_followup(
@@ -62,8 +77,38 @@ class InnertestFollowupHandlers:
                 return FollowupResult("retry_wait", "provisioning_pending")
             target = self._target(item)
             if target is None or target[3] != "active":
-                return FollowupResult("failed", "provisioning_failed")
+                return FollowupResult(
+                    "failed", getattr(result, "failure_reason", None) or "provisioning_failed"
+                )
         return FollowupResult()
+
+    def _resolve_identity(self, item, target):
+        """先释放数据库连接再读实时状态，选定结果只允许持久保存一次。"""
+        from lingxi.adapters.innertest_identity import persist_resolved_identity
+
+        located = self.runner.resolve_system_email(email=target[0], trace_id=item.trace_id)
+        if isinstance(located, PreprovisionSkip):
+            return self._refuse_identity(item, located.reason)
+        if not isinstance(located, PreprovisionTarget):
+            return FollowupResult(
+                "retry_wait", getattr(located, "failure_reason", "identity_unavailable")
+            )
+        try:
+            persist_resolved_identity(
+                store=self.store, service=self.identity_service, item=item, target=located
+            )
+        except InnertestError as error:
+            return self._refuse_identity(item, error.code)
+        return None
+
+    def _refuse_identity(self, item, reason):
+        """仅当前领取者可保存拒绝；失去租约时交回消费者，不冒充完成。"""
+        from lingxi.adapters.innertest_identity import persist_identity_refusal
+
+        if reason == "lease_lost":
+            return FollowupResult("retry_wait", reason)
+        persist_identity_refusal(store=self.store, item=item, reason=reason)
+        return FollowupResult("failed", reason)
 
     def _record(self, item, result, *, evidence_ref=None):
         """终态结果各留一行运营审计；写不进去只记日志，阶段结果原样返回。"""
@@ -116,7 +161,7 @@ class InnertestFollowupHandlers:
         with self.store.transaction() as connection, connection.cursor() as cursor:
             cursor.execute(
                 "SELECT i.email,i.open_id,b.initiated_by,u.provisioning_state,u.id,"
-                "u.account_state,u.permission_version FROM innertest_batch_item i "
+                "u.account_state,u.permission_version,i.result_code FROM innertest_batch_item i "
                 "JOIN innertest_batch b ON b.id=i.batch_id LEFT JOIN app_user u "
                 "ON u.feishu_open_id=i.open_id WHERE i.id=%s AND b.id=%s AND b.status='executed'",
                 (item.batch_item_id, item.batch_id),

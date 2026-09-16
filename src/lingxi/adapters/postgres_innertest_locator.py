@@ -1,9 +1,12 @@
 """同一短事务内复用邮箱唯一定位，listener 不另占第二条连接。"""
 
-from datetime import UTC, datetime, timedelta
+from dataclasses import replace
+from datetime import timedelta
 
+from lingxi.adapters.postgres_email_identity import load_email_snapshot
 from lingxi.adapters.postgres_identity import DirectoryLookup
 from lingxi.core.admin.innertest import InnertestError
+from lingxi.core.identity.email_resolver import resolve_email_identity
 from lingxi.core.identity.org_snapshot import DirectoryAvailability, SnapshotMember
 from lingxi.core.identity.preprovision import locate_by_email
 
@@ -50,13 +53,13 @@ class TransactionDirectory:
 
 def locate_transaction_email(email, *, connection):
     """花名册和组织资料只提供定位，绝不替代资格或银河权限。"""
-    with connection.cursor() as cursor:
-        cursor.execute("SELECT id,captured_at FROM roster_snapshot")
-        row = cursor.fetchone()
-        if row is None or row[1] <= datetime.now(UTC) - timedelta(days=90):
-            raise InnertestError("roster_unavailable")
-        cursor.execute(
-            "SELECT personnel_id,email FROM roster_snapshot_row WHERE snapshot_id=%s", (row[0],)
-        )
-        rows = [dict(personnel_id=r[0], email=r[1]) for r in cursor.fetchall()]
-    return locate_by_email(email, roster_rows=rows, directory=TransactionDirectory(connection))
+    snapshot = load_email_snapshot(connection, max_age=timedelta(days=90))
+    if not snapshot.available:
+        raise InnertestError("roster_unavailable")
+    target = locate_by_email(email, snapshot=snapshot, directory=TransactionDirectory(connection))
+    if target.identity is None:
+        identity = resolve_email_identity(email, snapshot=snapshot, employment={})
+        if identity.candidate_count:
+            identity = replace(identity, reason="employment_not_read_in_preparation")
+        target = replace(target, identity=identity)
+    return target

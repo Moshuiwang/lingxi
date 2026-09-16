@@ -272,7 +272,9 @@ class InnertestRealLedgerTest(_RealLedgerCase):
         outer = self
 
         class Runner:
-            def start_system(self, *, email: str, trace_id: str, initiated_by_open_id: str) -> Any:
+            def start_system(
+                self, *, email: str, trace_id: str, initiated_by_open_id: str, expected_open_id=None
+            ) -> Any:
                 outer.user()
                 return Mock(failure_reason=None)
 

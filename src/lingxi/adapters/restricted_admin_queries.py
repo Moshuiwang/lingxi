@@ -23,10 +23,12 @@ from lingxi.core.admin.restricted_tools import (
     trace_result,
     user_status_result,
 )
+from lingxi.core.identity.email_resolver import EmailIdentityUnresolvedError
 from lingxi.core.ids import new_id
 
 RECENT_EVENT_WINDOW_HOURS = 24 * 7
 RECENT_EVENT_LIMIT = 20
+_IDENTITY_UNRESOLVED_MESSAGE = "邮箱身份未能与已有绑定唯一对应，本次未执行；请先核对人员资料。"
 
 _PENDING_COLUMNS = (
     "id, action_type, target_open_id, initiated_by_open_id, status, card_delivered, reason,"
@@ -193,10 +195,19 @@ class RestrictedChannelService:
     def _call_audited(self, target, principal, name, args):
         """每次调用一行审计：成功、业务拒绝与意外异常都留痕，异常不带正文。"""
         trace_id, started = new_id("trc"), time.monotonic()
-        failure = None
+        failure, audit_facts = None, {}
         try:
             result = getattr(target, name)(principal, call_trace_id=trace_id, **args)
             code = result["code"]
+        except EmailIdentityUnresolvedError as error:
+            code = "identity_unresolved"
+            result = envelope(
+                code,
+                trace_id=trace_id,
+                state="rejected",
+                message=_IDENTITY_UNRESOLVED_MESSAGE,
+            )
+            audit_facts = error.check.audit_facts()
         except InnertestError as error:
             result, code = envelope(error.code, trace_id=trace_id, state="rejected"), error.code
         except Exception as error:
@@ -208,6 +219,7 @@ class RestrictedChannelService:
             elapsed_ms=int((time.monotonic() - started) * 1000),
             trace_id=trace_id,
             pending_action_id=(result or {}).get("pending_action_id"),
+            **audit_facts,
         )
         if failure is not None:
             raise InnertestError("query_unavailable") from failure
