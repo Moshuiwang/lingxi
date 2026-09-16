@@ -209,6 +209,7 @@ class AutoOnboardingRunner(OnboardingSteps):
         origin: str = ORIGIN_PREPROVISION,
         initiated_by_open_id: str,
         preprovision_grant: Any | None = None,
+        expected_open_id: str | None = None,
     ) -> OnboardingResult:
         """系统触发的开通入口（预开通，没有入站消息）。
 
@@ -222,7 +223,14 @@ class AutoOnboardingRunner(OnboardingSteps):
             origin=origin,
             initiated_by_open_id=initiated_by_open_id,
             preprovision_grant=preprovision_grant,
+            expected_open_id=expected_open_id,
         )
+
+    def resolve_system_email(self, *, email: str, trace_id: str):
+        """供已授权的后台阶段解析目标，不创建账号或资格。"""
+        from lingxi.core.identity.preprovision import resolve_system_email
+
+        return resolve_system_email(self, email=email, trace_id=trace_id)
 
     def _release(self, open_id: str, event_id: str) -> None:
         with self._lock:
@@ -639,6 +647,8 @@ class AutoOnboardingRunner(OnboardingSteps):
             bindings=self._email_bindings,
             audit=self._audit,
             trace_id=trace_id,
+            personnel_id=request.identity.feishu_user_id,
+            employee_no=request.employee_no,
         )
         if bound_elsewhere is not None:
             return bound_elsewhere
@@ -653,11 +663,12 @@ class AutoOnboardingRunner(OnboardingSteps):
         trace_id: str,
         grant: PreprovisionGrant | None,
     ) -> _Terminal | tuple[str, Any, Any]:
-        """建档、复核、翻译银河，并把存量差集与预授权导入进来。
+        """建档、复核、翻译银河，并处理旧表归属闸与预授权。
 
-        两处导入都挂在**零银河判定之前**：名单里"银河零权限、靠预授权吃饭"的人，先判零
-        权限就会被整批拒绝。银河翻译也算在前面并在失败时立刻关闭——早于令牌签发与用户
-        环境创建，不为一个最终会被拒绝的人签发问数令牌、写一份带凭据的用户环境。
+        旧表归属闸和预授权导入都挂在**零银河判定之前**：名单里"银河零权限、靠预授权
+        吃饭"的人，先判零权限会被整批拒绝。银河翻译也算在前面并在失败时立刻关闭——
+        早于令牌签发与用户环境创建，不为一个最终会被拒绝的人签发问数令牌、写一份带凭据
+        的用户环境。
 
         Returns:
             失败时是终态；成功时是 ``(用户标识, 银河翻译结果, 存量令牌查找结果)``。
@@ -714,14 +725,15 @@ class AutoOnboardingRunner(OnboardingSteps):
         trace_id: str,
         grant: PreprovisionGrant | None,
     ) -> Any:
-        """把存量差集与预开通预授权导进本地覆盖表。
+        """核对旧表行归属，并把预开通预授权导进本地覆盖表。
 
-        正式表只读一次，查找结果同时供令牌采纳复用，因此把它返回给调用方。
+        旧表只读一次；现行规则只允许明确查无旧行继续。保留差集调用的防御分支，避免其它
+        调用方绕过查找闸时静默改变执行次序。
 
         Returns:
             存量令牌的查找结果；没有存量源时是 ``None``。
         """
-        lookup = self._lookup_stock_token(request.email)
+        lookup = self._lookup_stock_token(request)
         if lookup is not None and lookup.state == ADOPTABLE:
             self._import_legacy_permissions(
                 user_id, lookup, aggregate, galaxy_map, open_id=open_id, trace_id=trace_id

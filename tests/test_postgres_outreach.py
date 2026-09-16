@@ -312,7 +312,14 @@ class OutreachSubjectPostgresTest(unittest.TestCase):
                     """INSERT INTO roster_snapshot_row
                          (snapshot_id, row_index, personnel_id, email, name, employee_no, record_id)
                        VALUES ('rss_x', %s, %s, %s, %s, %s, %s)""",
-                    (index, f"per_{index}", EMAIL.upper(), name, f"no_{index}", f"rec_{index}"),
+                    (
+                        index,
+                        "fs_x" if index == 0 else f"per_{index}",
+                        EMAIL.upper(),
+                        name,
+                        f"no_{index}",
+                        f"rec_{index}",
+                    ),
                 )
 
     def test_the_lookup_joins_the_roster_name_with_the_published_scope(self) -> None:
@@ -325,10 +332,31 @@ class OutreachSubjectPostgresTest(unittest.TestCase):
         self.assertEqual(facts.roster_names, ("王晋 (Joshua Wang)",))
         self.assertIn("充值金额", facts.permissions or "")
 
-    def test_two_roster_rows_for_one_email_both_come_back(self) -> None:
-        """不在 SQL 里替产品做判断：同邮箱的全部姓名都返回，由装配层决定发不发。"""
-        self._seed(roster_names=("王晋", "李四"))
-        self.assertEqual(set(self.subjects.facts_for(EMAIL).roster_names), {"王晋", "李四"})
+    def test_multiple_roster_candidates_do_not_send_even_when_names_match(self):
+        self._seed(roster_names=("同名员工", "同名员工"))
+        facts = self.subjects.facts_for(EMAIL)
+        self.assertEqual(facts.identity_failure_reason, "multiple_candidates")
+        self.assertIsNone(facts.user_id)
+        self.assertIsNone(facts.permissions)
+        self.assertFalse(self._plan().sendable)
+
+    def test_changed_personnel_binding_does_not_send_old_permissions_to_new_identity(self):
+        self._seed()
+        self.assertTrue(self._plan().sendable)
+        with connect(self.dsn) as connection, connection.cursor() as cursor:
+            cursor.execute("UPDATE roster_snapshot_row SET personnel_id='new-person'")
+        facts = self.subjects.facts_for(EMAIL)
+        self.assertEqual(facts.identity_failure_reason, "binding_mismatch")
+        self.assertIsNone(facts.permissions)
+        self.assertFalse(self._plan().sendable)
+
+    def test_snapshot_count_mismatch_is_unavailable_not_departed(self):
+        self._seed()
+        with connect(self.dsn) as connection, connection.cursor() as cursor:
+            cursor.execute("UPDATE roster_snapshot SET row_count=2")
+        facts = self.subjects.facts_for(EMAIL)
+        self.assertEqual(facts.identity_failure_reason, "snapshot_unavailable")
+        self.assertFalse(self._plan().sendable)
 
     def test_an_unknown_email_is_an_answer_not_a_failure(self) -> None:
         facts = self.subjects.facts_for("nobody@example.invalid")

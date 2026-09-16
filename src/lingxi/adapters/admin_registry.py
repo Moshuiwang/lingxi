@@ -439,14 +439,18 @@ class PostgresAdminQueries:
             return fetch_trace_task(cursor, trace_id)
 
     def resolve_identifier(self, *, identifier: str) -> str:
-        """把邮箱形态的标识反查成 open_id；查询失败与"零命中/多命中"都原样返回输入。
+        """邮箱只定位可信既有绑定；缺资料或同邮箱多候选时明确拒绝，不挑新人。"""
+        from lingxi.adapters.postgres_email_identity import (
+            load_email_snapshot,
+            record_binding_check,
+        )
+        from lingxi.core.identity.email_resolver import (
+            EmailBindingCheck,
+            EmailIdentityUnresolvedError,
+            check_email_binding,
+        )
+        from lingxi.core.permission.account_match import normalize_email
 
-        判据是"是否含 ``@``"：不是邮箱形态时不发起任何查询，直接原样返回，
-        既是零成本路径，也避免把明显不是邮箱的输入误当邮箱去查。迁移 ``0085``
-        给规范化邮箱加了部分唯一索引后"多命中"在全链迁移库上结构性不可能，
-        但分支仍然保留——它是旧库与索引被删场景下唯一的防线，猜错一条的
-        后果是把管理动作落到另一个人身上。比较是**逐字相等**，不做归一化。
-        """
         if "@" not in identifier:
             return identifier
         with (
@@ -454,14 +458,25 @@ class PostgresAdminQueries:
             connection.cursor() as cursor,
         ):
             cursor.execute(
-                "SELECT feishu_open_id FROM app_user"
-                " WHERE email = %s AND feishu_open_id IS NOT NULL",
-                (identifier,),
+                "SELECT feishu_open_id,feishu_user_id,employee_no FROM app_user"
+                " WHERE lower(btrim(email)) = %s AND feishu_open_id IS NOT NULL",
+                (normalize_email(identifier),),
             )
             rows = cursor.fetchall()
-        if len(rows) == 1:
+            if not rows:
+                return identifier
+            snapshot = load_email_snapshot(connection)
+            if len(rows) != 1:
+                raise EmailIdentityUnresolvedError(
+                    EmailBindingCheck("multiple_bindings", snapshot, None)
+                )
+            check = check_email_binding(
+                identifier, snapshot=snapshot, personnel_id=rows[0][1], employee_no=rows[0][2]
+            )
+            record_binding_check(check, origin="admin")
+            if not check.matched:
+                raise EmailIdentityUnresolvedError(check)
             return rows[0][0]
-        return identifier
 
     def resolve_metric_name(self, *, metric_token: str) -> str:
         """把中文别名反查成真正的指标 ID。

@@ -120,7 +120,7 @@ class InnertestRecoveryTests(InnertestPostgresTests):
         outer = self
 
         class Runner:
-            def start_system(self, *, email, trace_id, initiated_by_open_id):
+            def start_system(self, *, email, trace_id, initiated_by_open_id, expected_open_id=None):
                 number = email.split("@")[0]
                 outer.sql(
                     "INSERT INTO app_user(id,feishu_open_id,feishu_user_id,feishu_union_id,display_name,department,tenant_key,provisioning_state,permission_version) VALUES(%s,%s,%s,%s,'合成','合成','synthetic','active',1)",

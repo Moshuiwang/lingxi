@@ -37,6 +37,7 @@ from lingxi.core.admin.views import (
     GalaxySourceSummary,
     LocalPermissionOverrideView,
 )
+from lingxi.core.identity.email_resolver import EmailIdentityUnresolvedError
 
 METRIC_MAP = {
     "1011": {"财务": ("vat_rate", "exchange_rate"), "后台管理员": ("vat_rate",)},
@@ -447,6 +448,34 @@ class ChannelServiceTests(unittest.TestCase):
         self.assertEqual(self.audit.rows[0][1]["result_code"], "error:RuntimeError")
         self.assertNotIn("connection reset", json.dumps(self.audit.rows[0][1]))
 
+    def test_identity_unresolved_is_an_explicit_audited_rejection(self):
+        check = SimpleNamespace(
+            reason="multiple_candidates",
+            audit_facts=lambda: {
+                "identity_reason": "multiple_candidates",
+                "candidate_count": 2,
+            },
+        )
+
+        def unresolved(**kwargs):
+            raise EmailIdentityUnresolvedError(check)
+
+        self.queries.resolve_identifier = unresolved
+        result = self.service.call(
+            PRINCIPAL, "get_user_status", {"identifier": "target@example.test"}
+        )
+        self.assertEqual(
+            (result["ok"], result["code"], result["state"]),
+            (False, "identity_unresolved", "rejected"),
+        )
+        self.assertEqual(
+            result["message"],
+            "邮箱身份未能与已有绑定唯一对应，本次未执行；请先核对人员资料。",
+        )
+        self.assertTrue(result["trace_id"].startswith("trc_"))
+        self.assertEqual(self.audit.rows[0][1]["result_code"], "identity_unresolved")
+        self.assertEqual(self.audit.rows[0][1]["identity_reason"], "multiple_candidates")
+
 
 #: 每个准备工具 ↔ 私聊命令文本，逐字等价；管理员在私聊里敲这一行会得到同一结论。
 TRANSLATIONS = (
@@ -588,6 +617,7 @@ class CommandTranslationTests(unittest.TestCase):
         for key, code in (
             ("admin.write_action_unavailable", "unavailable"),
             ("admin.write_action_card_send_failed", "card_send_failed"),
+            ("admin.identity_unresolved", "identity_unresolved"),
             ("admin.internal_error", "internal_error"),
             ("admin.unknown", "invalid_request"),
         ):
