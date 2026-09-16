@@ -127,6 +127,10 @@ REQUIRED_MODULES = (
     # `adapters/postgres_stalled_provisioning.py` 都在模块级 import 它，随
     # `onboarding_runner.py` 同一条发布理由。
     "lingxi.core.identity.preprovision",
+    "lingxi.core.identity.email_resolver",
+    "lingxi.core.identity.email_location",
+    "lingxi.adapters.innertest_identity",
+    "lingxi.adapters.postgres_email_identity",
     # 上面那道邮箱闸的只读回读口（`app_user` 规范化邮箱 → user_id）。由
     # `_build_onboarding_duty` 在函数内 import，同 `postgres_onboarding_failure`
     # 一条理由：函数内 import 证明不了它装得上，必须显式登记。
@@ -689,6 +693,10 @@ PROCESS_RUNTIME_IMPORTS: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {
         # 函数内 import 意味着"进程能起来"证明不了"这两个模块装得上"——正是 #29 之后
         # 建立的防漂移机制在这里的缺口：不列进来，extras 那条干净环境的路径永远不会红。
         (
+            "lingxi.adapters.innertest_identity",
+            "lingxi.adapters.postgres_email_identity",
+            "lingxi.core.identity.email_location",
+            "lingxi.core.identity.email_resolver",
             "lingxi.adapters.innertest_runner",
             "lingxi.adapters.innertest_request",
             "lingxi.adapters.innertest_binding",
@@ -1279,6 +1287,9 @@ PROCESS_RUNTIME_IMPORTS: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {
     ),
     "gateway": (
         (
+            "lingxi.adapters.postgres_email_identity",
+            "lingxi.core.identity.email_location",
+            "lingxi.core.identity.email_resolver",
             "lingxi.adapters.innertest_request",
             "lingxi.adapters.feishu_user_card",
             "lingxi.adapters.innertest_confirmation_card",

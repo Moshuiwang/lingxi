@@ -109,13 +109,33 @@ class RestrictedAdminWriteTests(unittest.TestCase):
             "structuredContent"
         ]
 
-    def add_user(self, open_id=TARGET, user_id="usr_target", email="target@example.test"):
+    def add_user(
+        self,
+        open_id=TARGET,
+        user_id="usr_target",
+        email="target@example.test",
+        employee_no="job-1",
+    ):
         self.sql(
             "INSERT INTO app_user(id,feishu_open_id,feishu_user_id,feishu_union_id,display_name,"
-            "department,tenant_key,provisioning_state,permission_version,email) "
-            "VALUES(%s,%s,%s,%s,'化名','部门','tk','active',2,%s)",
-            (user_id, open_id, "fs_" + open_id, "un_" + open_id, email),
+            "department,tenant_key,provisioning_state,permission_version,email,employee_no) "
+            "VALUES(%s,%s,%s,%s,'化名','部门','tk','active',2,%s,%s)",
+            (user_id, open_id, "fs_" + open_id, "un_" + open_id, email, employee_no),
         )
+
+    def add_roster(self, *rows):
+        self.sql(
+            "INSERT INTO roster_snapshot(id,captured_at,row_count,pages_read) "
+            "VALUES('restricted-write-roster',now(),%s,1)",
+            (len(rows),),
+        )
+        for index, (personnel_id, email, employee_no) in enumerate(rows):
+            self.sql(
+                "INSERT INTO roster_snapshot_row("
+                "snapshot_id,row_index,personnel_id,email,name,employee_no,record_id) "
+                "VALUES('restricted-write-roster',%s,%s,%s,'合成员工',%s,%s)",
+                (index, personnel_id, email, employee_no, "record-" + str(index)),
+            )
 
     def counts(self):
         return {
@@ -151,6 +171,7 @@ class RestrictedAdminWriteTests(unittest.TestCase):
         self,
     ):
         self.add_user()
+        self.add_roster(("fs_ou_target", "target@example.test", "job-1"))
         result = self.prepare_suspend("target@example.test")
         self.assertTrue(result["ok"], result)
         pending_id = result["pending_action_id"]
@@ -380,6 +401,7 @@ class RestrictedAdminWriteTests(unittest.TestCase):
     # ------------------------------------------------------------------ 场景 4
     def test_repeat_expiry_and_repeated_click(self):
         self.add_user()
+        self.add_roster(("fs_ou_target", "target@example.test", "job-1"))
         first = self.prepare_suspend()
         second = self.prepare_suspend("target@example.test")
         self.assertEqual(second["pending_action_id"], first["pending_action_id"])
