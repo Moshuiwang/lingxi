@@ -372,27 +372,40 @@ class DeployTests(unittest.TestCase):
         self.assertIn('"error": "private_file_permissions"', result.stderr)
 
 
+RELAY_CONFIGURATION = {
+    "schema_revision": 1,
+    "socket_path": "/synthetic/admin.sock",
+    "relay_uid": 1234,
+    "socket_owner_uid": 10001,
+}
+
+
+def install_root(root, name, mode=0o755):
+    """安装根由 root 预先建立且不可由受限账号写入：权限位显式给定，不交给进程 umask。"""
+    path = root / name
+    path.mkdir()
+    path.chmod(mode)
+    return path
+
+
+def release(target):
+    """只读安装目录在临时目录清理前要放开写权限。"""
+    for path in [target, *target.rglob("*")]:
+        if path.is_dir():
+            path.chmod(0o700)
+
+
 class BundleTests(unittest.TestCase):
     def test_install_is_readonly_exact_and_repeatable_and_relay_is_separate(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             pkg, metadata = package(root)
-            installed = root / "installed"
-            installed.mkdir()
+            installed = install_root(root, "installed")
             target = bundle.install(pkg, metadata, installed)
             self.assertEqual(bundle.install(pkg, metadata, installed), target)
-            relay_root = root / "relay"
-            relay_root.mkdir()
+            relay_root = install_root(root, "relay")
             relay, receipt = bundle.install_relay(
-                installed,
-                metadata,
-                {
-                    "schema_revision": 1,
-                    "socket_path": "/synthetic/admin.sock",
-                    "relay_uid": 1234,
-                    "socket_owner_uid": 10001,
-                },
-                relay_root,
+                installed, metadata, RELAY_CONFIGURATION, relay_root
             )
             self.assertEqual(
                 set(p.name for p in relay.iterdir()),
@@ -402,9 +415,49 @@ class BundleTests(unittest.TestCase):
             self.assertFalse((target / "scripts/admin/innertest-relay.json").exists())
             bundle.activate(installed, metadata)
             self.assertEqual((installed / "current").resolve(), target.resolve())
-            for folder in [target, *target.rglob("*"), relay]:
-                if folder.is_dir():
-                    folder.chmod(0o700)
+            release(target)
+            release(relay)
+
+    def test_install_conclusion_is_the_same_under_umask_0002_and_0022(self):
+        """fixture 自己定安装根的权限位：运行者 shell 的 umask 是 0002 还是 0022，结论都一样。"""
+        original = os.umask(0o022)
+        try:
+            for mask in (0o002, 0o022):
+                os.umask(mask)
+                with self.subTest(umask=f"{mask:04o}"):
+                    self.test_install_is_readonly_exact_and_repeatable_and_relay_is_separate()
+        finally:
+            os.umask(original)
+
+    def test_install_roots_take_explicit_modes_safe_passes_and_writable_is_rejected(self):
+        """安装根与 relay 安装根的权限位是测试输入：显式 0755 通过，显式组 / 其他可写判红且零写入。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            pkg, metadata = package(root)
+            installed = install_root(root, "installed")
+            for mode in (0o775, 0o757, 0o777):
+                installed.chmod(mode)
+                with self.subTest(root="installed", mode=f"{mode:04o}"):
+                    with self.assertRaisesRegex(bundle.BundleError, "^安装根必须预先建立"):
+                        bundle.install(pkg, metadata, installed)
+                    self.assertEqual(list(installed.iterdir()), [])
+            installed.chmod(0o755)
+            target = bundle.install(pkg, metadata, installed)
+            relay_root = install_root(root, "relay")
+            for mode in (0o775, 0o757, 0o777):
+                relay_root.chmod(mode)
+                with self.subTest(root="relay", mode=f"{mode:04o}"):
+                    with self.assertRaisesRegex(bundle.BundleError, "^relay 安装根不安全$"):
+                        bundle.install_relay(installed, metadata, RELAY_CONFIGURATION, relay_root)
+                    self.assertEqual(list(relay_root.iterdir()), [])
+            relay_root.chmod(0o755)
+            relay, receipt = bundle.install_relay(
+                installed, metadata, RELAY_CONFIGURATION, relay_root
+            )
+            self.assertEqual(receipt["bundle_sha256"], metadata["sha256"])
+            self.assertTrue((relay / "installation.json").is_file())
+            release(target)
+            release(relay)
 
     def test_tamper_missing_paths_links_permissions_and_duplicates_rejected(self):
         with tempfile.TemporaryDirectory() as tmp:

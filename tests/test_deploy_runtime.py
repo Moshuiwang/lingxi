@@ -32,20 +32,65 @@ class RuntimeTests(unittest.TestCase):
         self.runtime = runtime_module.Runtime(self.host, self.config)
         self.runtime.state_directory = self.root
 
-    def test_public_file_content_drift_is_rejected_without_reading_private_env(self):
-        directory = self.root / "runtime"
+    def public_runtime_directory(self, name):
+        """公开运行文件按用例声明的权限位建立（目录 0700、文件 0644），不交给进程 umask。"""
+        directory = self.root / name
         directory.mkdir(mode=0o700)
         path = directory / "system_prompt.md"
         path.write_text("合成提示词")
-        (directory / ".env.private").write_text("SECRET_SENTINEL")
+        path.chmod(0o644)
         self.config["values"]["LINGXI_WORKER_RUNTIME_CONFIG_DIR"] = str(directory)
         self.config["files"]["worker"]["system_prompt.md"] = hashlib.sha256(
             path.read_bytes()
         ).hexdigest()
+        return directory, path
+
+    def public_file_drift_round(self, name):
+        directory, path = self.public_runtime_directory(name)
+        (directory / ".env.private").write_text("SECRET_SENTINEL")
         self.runtime.verify_public_files()
         path.write_text("发生改变")
         with self.assertRaisesRegex(state.DeployError, "^public_file_configuration_changed$"):
             self.runtime.verify_public_files()
+
+    def test_public_file_content_drift_is_rejected_without_reading_private_env(self):
+        self.public_file_drift_round("runtime")
+
+    def test_public_file_conclusion_is_the_same_under_umask_0002_and_0022(self):
+        """fixture 自己定公开文件的权限位：运行者 shell 的 umask 是 0002 还是 0022，结论都一样。"""
+        original = os.umask(0o022)
+        try:
+            for mask in (0o002, 0o022):
+                os.umask(mask)
+                with self.subTest(umask=f"{mask:04o}"):
+                    self.public_file_drift_round(f"runtime-umask-{mask:03o}")
+        finally:
+            os.umask(original)
+
+    def test_public_file_modes_are_explicit_inputs_safe_passes_and_writable_is_rejected(self):
+        """公开运行文件及其目录的权限位是测试输入：显式安全位通过，显式组 / 其他可写判红。"""
+        directory, path = self.public_runtime_directory("runtime")
+        for mode in (0o644, 0o444, 0o600):
+            path.chmod(mode)
+            with self.subTest(file_mode=f"{mode:04o}"):
+                self.runtime.verify_public_files()
+        for mode in (0o664, 0o646, 0o666):
+            path.chmod(mode)
+            with self.subTest(file_mode=f"{mode:04o}"):
+                with self.assertRaisesRegex(state.DeployError, "^public_file_permissions_or_size$"):
+                    self.runtime.verify_public_files()
+        path.chmod(0o644)
+        for mode in (0o755, 0o750, 0o700):
+            directory.chmod(mode)
+            with self.subTest(directory_mode=f"{mode:04o}"):
+                self.runtime.verify_public_files()
+        for mode in (0o775, 0o757, 0o777):
+            directory.chmod(mode)
+            with self.subTest(directory_mode=f"{mode:04o}"):
+                with self.assertRaisesRegex(
+                    state.DeployError, "^public_file_directory_permissions$"
+                ):
+                    self.runtime.verify_public_files()
 
     def test_unplanned_service_cannot_be_stopped_and_partial_update_is_bounded(self):
         import copy

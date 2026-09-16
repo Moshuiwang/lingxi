@@ -6,7 +6,11 @@
 
 ## [Unreleased]
 
-（暂无）
+2.5.1 开发中（Trace [#812](https://github.com/Moshuiwang/lingxi/issues/812)）：由拉取代理 + 部署器发布的修复版，装入 [#804](https://github.com/Moshuiwang/lingxi/issues/804) / [#805](https://github.com/Moshuiwang/lingxi/issues/805) / [#807](https://github.com/Moshuiwang/lingxi/issues/807) / [#739](https://github.com/Moshuiwang/lingxi/issues/739) / [#745](https://github.com/Moshuiwang/lingxi/issues/745) 五处改动；本节随批次合入逐条追加。
+
+### Fixed
+
+- **同一提交在本机与 CI 上，两条部署测试给出一致的结论**：此前两条部署用例（控制包安装根、公开运行文件）把自己创建的文件与目录的权限位交给运行者 shell 的 umask 决定，`umask 002` 的开发机稳定判红、CI（`umask 022`）稳定判绿，同一提交两边结论相反，只能靠人工排查分辨「环境性」还是「改动引入」；现在测试自己显式建立它要核对的权限位——安全位是测试输入，组 / 其他可写位同样是测试输入——两种 umask 下结论一致，部署器与控制包的权限判据零放宽（Issue [#739](https://github.com/Moshuiwang/lingxi/issues/739)）。
 
 ## [2.5.0] - 2026-09-15
 
