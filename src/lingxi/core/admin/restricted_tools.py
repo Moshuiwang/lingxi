@@ -67,6 +67,7 @@ _OUTCOME_CODES = {
     "admin.write_action_pending": "ok",
     "admin.write_action_unavailable": "unavailable",
     "admin.write_action_card_send_failed": "card_send_failed",
+    "admin.identity_unresolved": "identity_unresolved",
     "admin.internal_error": "internal_error",
 }
 _REJECTED_KEY = "admin.write_action_rejected"

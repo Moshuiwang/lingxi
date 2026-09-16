@@ -232,7 +232,7 @@ class AdminCommandRouter:
         except EmailIdentityUnresolvedError as error:
             return self._reply(
                 "admin.command.identity_unresolved",
-                "admin.internal_error",
+                "admin.identity_unresolved",
                 "邮箱身份未能与已有绑定唯一对应，本次未执行；请先核对人员资料。",
                 context,
                 **error.check.audit_facts(),

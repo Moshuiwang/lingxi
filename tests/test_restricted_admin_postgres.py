@@ -120,14 +120,34 @@ class RestrictedAdminPostgresTests(unittest.TestCase):
     def tool(self, name, arguments):
         return self.request("tools/call", {"name": name, "arguments": arguments})
 
-    def add_user(self, open_id="ou_target", user_id="usr_target", email="target@example.test"):
+    def add_user(
+        self,
+        open_id="ou_target",
+        user_id="usr_target",
+        email="target@example.test",
+        employee_no="job-1",
+    ):
         self.sql(
             "INSERT INTO app_user(id,feishu_open_id,feishu_user_id,feishu_union_id,display_name,"
-            "department,tenant_key,provisioning_state,permission_version,email) "
+            "department,tenant_key,provisioning_state,permission_version,email,employee_no) "
             "VALUES(%s,%s,%s,%s,'化名','部门','tk',"
-            "'active',2,%s)",
-            (user_id, open_id, "fs_" + open_id, "un_" + open_id, email),
+            "'active',2,%s,%s)",
+            (user_id, open_id, "fs_" + open_id, "un_" + open_id, email, employee_no),
         )
+
+    def add_roster(self, *rows):
+        self.sql(
+            "INSERT INTO roster_snapshot(id,captured_at,row_count,pages_read) "
+            "VALUES('restricted-roster',now(),%s,1)",
+            (len(rows),),
+        )
+        for index, (personnel_id, email, employee_no) in enumerate(rows):
+            self.sql(
+                "INSERT INTO roster_snapshot_row("
+                "snapshot_id,row_index,personnel_id,email,name,employee_no,record_id) "
+                "VALUES('restricted-roster',%s,%s,%s,'合成员工',%s,%s)",
+                (index, personnel_id, email, employee_no, "record-" + str(index)),
+            )
 
     def add_pending(self, *, initiated_by="ou_admin", status="pending", target=None):
         pending_id = new_id("pac")
@@ -161,6 +181,7 @@ class RestrictedAdminPostgresTests(unittest.TestCase):
 
     def test_user_status_by_email_and_trace_with_zero_writes(self):
         self.add_user()
+        self.add_roster(("fs_ou_target", "target@example.test", "job-1"))
         self.sql(
             "INSERT INTO inbound_event(feishu_event_id,received_at,event_type,user_open_id,"
             "handled_as,trace_id) VALUES('evt_1',now(),'im.message.receive_v1','ou_target',"
@@ -168,7 +189,7 @@ class RestrictedAdminPostgresTests(unittest.TestCase):
             (TRACE,),
         )
         before = self.counts()
-        result = self.tool("get_user_status", {"identifier": "target@example.test"})["result"]
+        result = self.tool("get_user_status", {"identifier": " TARGET@example.test "})["result"]
         self.assertFalse(result["isError"])
         body = result["structuredContent"]
         self.assertEqual(body["query"]["resolved_open_id"], "ou_target")
@@ -184,10 +205,10 @@ class RestrictedAdminPostgresTests(unittest.TestCase):
 
     def test_not_found_never_guesses_a_similar_person(self):
         self.add_user()
+        self.add_roster(("fs_ou_target", "target@example.test", "job-1"))
         for arguments in (
             {"identifier": "ou_targe"},
             {"identifier": "targe@example.test"},
-            {"identifier": "TARGET@example.test"},
             {"trace_id": "01ARZ3NDEKTSV4RRFFQ69G5FAX"},
             {"trace_id": "not-a-reference"},
         ):
@@ -198,6 +219,82 @@ class RestrictedAdminPostgresTests(unittest.TestCase):
         self.assertEqual(result["structuredContent"]["code"], "not_found")
         self.assertEqual(
             {row["result_code"] for row in self.audited("get_user_status")}, {"not_found"}
+        )
+
+    def assert_email_identity_refused(self, expected_reason, *, candidate_count, snapshot_version):
+        before = self.counts()
+        bodies = []
+        for name, arguments in (
+            ("get_user_status", {"identifier": "target@example.test"}),
+            ("get_user_permission_sources", {"identifier": "target@example.test"}),
+            ("prepare_suspend_user", {"identifier": "target@example.test"}),
+        ):
+            with self.subTest(name=name):
+                result = self.tool(name, arguments)["result"]
+                self.assertTrue(result["isError"])
+                body = result["structuredContent"]
+                bodies.append(body)
+                self.assertEqual((body["code"], body["state"]), ("identity_unresolved", "rejected"))
+                self.assertEqual(
+                    body["message"],
+                    "邮箱身份未能与已有绑定唯一对应，本次未执行；请先核对人员资料。",
+                )
+                self.assertTrue(body["trace_id"].startswith("trc_"))
+                rendered = str(body)
+                self.assertNotIn("ou_target", rendered)
+                self.assertNotIn("化名", rendered)
+                self.assertNotIn("target@example.test", rendered)
+        self.assertEqual(self.counts(), before)
+        rows = [
+            row
+            for tool in (
+                "get_user_status",
+                "get_user_permission_sources",
+                "prepare_suspend_user",
+            )
+            for row in self.audited(tool)
+        ]
+        self.assertEqual([row["result_code"] for row in rows], ["identity_unresolved"] * 3)
+        for row, body in zip(rows[:2], bodies[:2], strict=True):
+            self.assertEqual(row["trace_id"], body["trace_id"])
+            self.assertEqual(row["identity_reason"], expected_reason)
+            self.assertEqual(row["candidate_count"], candidate_count)
+            self.assertEqual(row["snapshot_version"], snapshot_version)
+            self.assertIsNone(row["active_candidate_count"])
+        router_rows = [
+            call.kwargs
+            for call in self.audit.record.call_args_list
+            if call.args == ("admin.command.identity_unresolved",)
+        ]
+        self.assertEqual(len(router_rows), 1)
+        router_row = router_rows[0]
+        self.assertEqual(router_row["trace_id"], bodies[2]["trace_id"])
+        self.assertEqual(router_row["identity_reason"], expected_reason)
+        self.assertEqual(router_row["candidate_count"], candidate_count)
+        self.assertEqual(router_row["snapshot_version"], snapshot_version)
+        self.assertIsNone(router_row["active_candidate_count"])
+
+    def test_missing_snapshot_refuses_queries_and_prepare_without_writes(self):
+        self.add_user()
+        self.assert_email_identity_refused(
+            "snapshot_unavailable", candidate_count=None, snapshot_version=None
+        )
+
+    def test_multiple_roster_candidates_refuse_queries_and_prepare_without_writes(self):
+        self.add_user()
+        self.add_roster(
+            ("fs_ou_target", "target@example.test", "job-1"),
+            ("fs_other", "TARGET@example.test", "job-2"),
+        )
+        self.assert_email_identity_refused(
+            "multiple_candidates", candidate_count=2, snapshot_version="restricted-roster"
+        )
+
+    def test_changed_binding_refuses_queries_and_prepare_without_writes(self):
+        self.add_user(employee_no="job-1")
+        self.add_roster(("fs_ou_target", "target@example.test", "job-other"))
+        self.assert_email_identity_refused(
+            "binding_mismatch", candidate_count=1, snapshot_version="restricted-roster"
         )
 
     def test_permission_sources_report_unreadable_galaxy_and_local_groups(self):
