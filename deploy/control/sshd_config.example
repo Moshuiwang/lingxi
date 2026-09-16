@@ -1,4 +1,5 @@
 # 由独立安装任务替换占位符并验证生效策略；本模板不创建账号或权限。
+# 三个占位符与 authorized_keys.example 同名同值：账号、Python 绝对路径、冻结 relay 绝对路径。
 Match User <RESTRICTED_RELAY_ACCOUNT>
     AuthenticationMethods publickey
     PasswordAuthentication no
@@ -7,3 +8,9 @@ Match User <RESTRICTED_RELAY_ACCOUNT>
     PermitTTY no
     PermitUserRC no
     X11Forwarding no
+    # 下三行把该账号对「authorized_keys 那一行之外」的公钥来源关掉（F19，外审 2026-09-15）：
+    # authorized_keys 里的 command= 只约束那一行；云主机 sshd 常有全局 AuthorizedKeysCommand
+    # （如 EC2 Instance Connect），能为任意账号临时推送公钥，绕过 forced-command 拿到 shell。
+    AuthorizedKeysCommand none
+    TrustedUserCAKeys none
+    ForceCommand <PYTHON_ABSOLUTE_PATH> -I -S <FROZEN_RELAY_ABSOLUTE_PATH>
