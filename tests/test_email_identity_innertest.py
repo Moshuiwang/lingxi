@@ -132,6 +132,28 @@ class DeferredEmailIdentityTests(unittest.TestCase):
                 self.assertEqual(proxy.resolve_system_email.call_count, 1)
                 proxy.start_system.assert_not_called()
 
+    def test_duplicate_raw_rows_for_one_person_are_refused_by_scheduler(self):
+        self.sql("UPDATE roster_snapshot_row SET personnel_id='person1',employee_no='person1'")
+        item = self.claimed()
+        self.statuses = {"ou_person1": EMPLOYED, "ou_person2": FROZEN}
+        handler, proxy = self.handler()
+
+        result = handler.handle(item)
+
+        self.assertEqual(
+            (result.status, result.result_code),
+            ("failed", "email_identity_active_conflict"),
+        )
+        facts = self.parts["audit"].facts("identity.email_resolved")
+        self.assertEqual((facts["candidate_count"], facts["active_candidate_count"]), (2, 2))
+        self.assertEqual(self.sql("SELECT count(*) FROM innertest_membership"), [(0,)])
+        self.assertEqual(
+            self.sql("SELECT open_id,personnel_id,result_code FROM innertest_batch_item"),
+            [(None, None, "email_identity_active_conflict")],
+        )
+        self.assertEqual(proxy.resolve_system_email.call_count, 1)
+        proxy.start_system.assert_not_called()
+
     def test_lease_lost_before_write_cannot_add_membership(self):
         item = self.claimed()
         handler, proxy = self.handler(
