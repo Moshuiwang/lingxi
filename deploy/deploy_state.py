@@ -13,6 +13,10 @@ import time
 from contextlib import contextmanager
 from pathlib import Path
 
+# 阶段账在 preflight 通过时记下的两侧配置指纹：old 侧是上一次已验证部署给容器打的标签值，
+# new 侧是本计划的当前 public-config 指纹；接续时 old 侧只从这条记录取，不重新推算。
+INVENTORY_KEYS = frozenset({"old_verified_sha256", "old_source", "new_sha256"})
+
 
 class DeployError(RuntimeError):
     """稳定错误码避免泄露外部命令输出。"""
@@ -36,11 +40,21 @@ def fingerprint(value):
     return hashlib.sha256(canonical(value)).hexdigest()
 
 
+def is_sha256(value):
+    """摘要字段只认小写十六进制 64 位；别的形状一律不当作可信值。"""
+    return isinstance(value, str) and re.fullmatch("[0-9a-f]{64}", value) is not None
+
+
 def check_id(value):
     """标识不能改变文件和作业的目标路径。"""
     if not isinstance(value, str) or not re.fullmatch("[a-zA-Z0-9][a-zA-Z0-9_-]{0,63}", value):
         raise DeployError("invalid_identifier")
     return value
+
+
+def host_marker(lock_path, kind):
+    """主机锁同目录的两份指针：``active``（在途 / 已验证的当前占用）与 ``verified``（上一次验证成功）。"""
+    return Path(lock_path).with_suffix(f".{kind}.json")
 
 
 def private_directory(root: Path, *, create=False):
@@ -203,6 +217,57 @@ class StateStore:
         """阶段账文件原文的 sha256，供人工操作前后核对是否仍是同一份账；没有阶段账时为 None。"""
         raw, _ = self.load(plan)
         return None if raw is None else hashlib.sha256(raw).hexdigest()
+
+    def verified_configuration(self, pointer):
+        """按指针读回此前固定的计划，指纹逐字相符才信其 ``config_sha256``。
+
+        指针是部署器自己写下的 ``{"id", "plan_sha256"}``（主机在途标记或 ``recovery_of``）。
+        计划读不到、指纹不符、``config_sha256`` 形状异常都视为可信旧值不可得，失败关闭。
+        """
+        try:
+            previous = self.plan(pointer["id"])
+            usable = fingerprint(previous) == pointer["plan_sha256"] and is_sha256(
+                previous["config_sha256"]
+            )
+        except (OSError, ValueError, KeyError, TypeError, DeployError):
+            usable = False
+        if not usable:
+            raise DeployError("previous_verified_configuration_unavailable")
+        return previous["config_sha256"]
+
+    def old_configuration(self, marker, plan, ledger):
+        """取 old 侧配置指纹：只用部署器自己记下的可信旧值，不取当前配置、不读被核容器的标签。
+
+        返回 ``(指纹或 None, 来源)``。``recover`` 取被恢复计划的 ``config_sha256``；否则看主机
+        在途标记 ``marker``：不存在即首次接管、没有旧值；指向本计划即接续，取本计划阶段账在
+        preflight 通过时记下的 ``inventory``；指向上一次 ``verified`` 计划则取该计划的
+        ``config_sha256``（那次部署给容器打的标签值）。任何一处读不到、指纹不符或形状异常，
+        一律 ``previous_verified_configuration_unavailable`` 失败关闭，不回落到当前配置。
+        """
+        if plan["operation"] == "recover":
+            return self.verified_configuration(plan["recovery_of"]), plan["recovery_of"]["id"]
+        try:
+            active = read_json(marker)
+        except FileNotFoundError:
+            return None, "first_takeover"
+        if not isinstance(active, dict):
+            raise DeployError("previous_verified_configuration_unavailable")
+        if active.get("id") == plan["id"]:
+            record = ledger.get("inventory")
+            if (
+                not isinstance(record, dict)
+                or set(record) != INVENTORY_KEYS
+                or not isinstance(record["old_source"], str)
+                or not (
+                    record["old_verified_sha256"] is None
+                    or is_sha256(record["old_verified_sha256"])
+                )
+            ):
+                raise DeployError("previous_verified_configuration_unavailable")
+            return record["old_verified_sha256"], record["old_source"]
+        if active.get("status") != "verified":
+            raise DeployError("previous_verified_configuration_unavailable")
+        return self.verified_configuration(active), active["id"]
 
     def save(self, plan, state):
         """每个阶段执行前后都同步落盘。"""
