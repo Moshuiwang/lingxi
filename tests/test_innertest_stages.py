@@ -55,7 +55,7 @@ class InnertestStageTests(InnertestPostgresTests):
         outer = self
 
         class Runner:
-            def start_system(self, *, email, trace_id, initiated_by_open_id):
+            def start_system(self, *, email, trace_id, initiated_by_open_id, expected_open_id=None):
                 outer.assertEqual(initiated_by_open_id, "ou_admin")
                 outer.user()
                 return Mock(failure_reason=None)
@@ -333,6 +333,13 @@ class InnertestStageTests(InnertestPostgresTests):
 
         self.user()
         self.sql("UPDATE app_user SET email='person1@example.test'")
+        self.sql(
+            "INSERT INTO roster_snapshot(id,captured_at,row_count,pages_read) VALUES('email-roster',now(),1,1)"
+        )
+        self.sql(
+            "INSERT INTO roster_snapshot_row(snapshot_id,row_index,personnel_id,email,name,employee_no,record_id) "
+            "VALUES('email-roster',0,'fs_person1','person1@example.test','合成','job-1','record-1')"
+        )
         self.sql(
             "UPDATE publish_outbox SET payload=jsonb_build_object('permissions', %s::text)",
             (PERMISSIONS,),

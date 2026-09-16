@@ -16,6 +16,8 @@ from datetime import UTC, datetime
 from typing import Any
 
 from lingxi.core.conversation.ports import OnboardingState
+from lingxi.core.identity.email_location import read_identity_snapshot
+from lingxi.core.identity.email_resolver import email_candidates
 from lingxi.core.identity.first_contact import (
     EmploymentStatus,
     FirstContactOutcome,
@@ -316,7 +318,7 @@ class OnboardingSteps:
 
     # ---- 6. 令牌 + 用户环境 ---------------------------------------------
 
-    def _lookup_stock_token(self, email: str | None) -> StockTokenLookup | None:
+    def _lookup_stock_token(self, request: ProvisioningRequest) -> StockTokenLookup | None:
         """按邮箱查一次存量令牌源；源未装配时返回 ``None``，原样走签新路径。
 
         查在零银河判定**之前**：同一份结果同时供差集导入与令牌采纳复用，正式表只读一次。
@@ -324,11 +326,21 @@ class OnboardingSteps:
         if self._stock_tokens is None:
             return None
         try:
-            return self._stock_tokens.lookup(email)
+            lookup = self._stock_tokens.lookup(request.email)
         except Exception as error:
             raise OnboardingChainError(
                 f"stock_token_lookup_failed_{type(error).__name__}"
             ) from error
+        if lookup.state in (ADOPTABLE, DECRYPT_FAILED):
+            candidates = email_candidates(request.email, read_identity_snapshot(self._roster))
+            if (
+                candidates is None
+                or len(candidates) != 1
+                or candidates[0].get("personnel_id") != request.identity.feishu_user_id
+                or candidates[0].get("employee_no") != request.employee_no
+            ):
+                raise OnboardingChainError("stock_token_identity_unresolved")
+        return lookup
 
     def _import_legacy_permissions(
         self,

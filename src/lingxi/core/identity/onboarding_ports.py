@@ -13,6 +13,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import Any, Protocol
 
+from lingxi.core.identity.email_resolver import EmailIdentitySnapshot
 from lingxi.core.identity.first_contact import EmploymentStatus
 from lingxi.core.identity.provisioning import UserProvisioningStatus
 from lingxi.core.permission.legacy_diff import LegacyImportPlan, LegacyImportReport
@@ -52,6 +53,10 @@ class RosterSource(Protocol):
         """返回花名册快照全部行；没有快照返回 ``None``。"""
         ...
 
+    def identity_snapshot(self) -> EmailIdentitySnapshot:
+        """邮箱解析必须回读同一完整快照的原始行、版本与采集时间。"""
+        ...
+
 
 class GalaxySource(Protocol):
     """银河当前有效批次；``None`` 表示没有有效批次。"""
@@ -73,6 +78,8 @@ class EmailBinding:
 
     user_id: str
     feishu_open_id: str | None
+    personnel_id: str | None = None
+    employee_no: str | None = None
 
 
 class EmailBindingSource(Protocol):

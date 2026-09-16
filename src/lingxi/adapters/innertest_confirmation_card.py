@@ -96,12 +96,16 @@ class InnertestConfirmationCard:
                 return None
             cursor.execute(
                 "SELECT email,personnel_id FROM innertest_batch_item "
-                "WHERE batch_id=%s AND result_code='new' ORDER BY email",
+                "WHERE batch_id=%s AND result_code IN ('new','identity_resolution_pending') ORDER BY email",
                 (item.batch_id,),
             )
             people = cursor.fetchall()
-        body = f"加入内测资格，不授业务权限；开通结果逐人查询。\n实际新增 {len(people)} 人：\n"
-        body += "\n".join(f"{email}（{personnel}）" for email, personnel in people)
+        body = f"加入内测资格，不授业务权限；资格与开通结果逐人查询。\n本批 {len(people)} 项：\n"
+        body += "\n".join(
+            f"{email}（{personnel or '待执行阶段解析'}）" for email, personnel in people
+        )
+        if any(personnel is None for _, personnel in people):
+            body += "\n待解析项仅在执行时确认唯一在职身份后加入资格；未知或冲突不加入。"
         body += "\n请本人在10分钟内确认；取消不新增资格。"
         buttons = tuple(
             ConfirmCardButton(

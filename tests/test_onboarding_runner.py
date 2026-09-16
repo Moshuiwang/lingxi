@@ -195,6 +195,13 @@ class FakeRoster:
     def rows(self) -> Sequence[Mapping[str, Any]] | None:
         return self._rows
 
+    def identity_snapshot(self):
+        from lingxi.core.identity.email_resolver import EmailIdentitySnapshot
+
+        return EmailIdentitySnapshot(
+            self._rows, "synthetic-roster", datetime(2026, 8, 18, tzinfo=UTC)
+        )
+
 
 class FakeGalaxySnapshot:
     user_rows = GALAXY_USER_ROWS
@@ -2993,26 +3000,28 @@ class SystemTriggerTests(unittest.TestCase):
         parts, result = run_system_once(email="nobody@example.com")
 
         self.assertIs(result.state, OnboardingState.NOT_AUTHORIZED)
-        self.assertEqual(result.failure_reason, "email_not_in_roster")
+        self.assertEqual(result.failure_reason, "email_identity_not_found")
         self.assertEqual(result.messages, (), "预开通失败没有任何用户可见出口")
         self.assertEqual(parts["provisioning"].requests, [])
         self.assertEqual(parts["directory"].calls, [])
 
-    def test_an_email_matching_several_people_is_skipped_without_touching_anything(self) -> None:
-        """裁定 6 在入口上的落点：定位不唯一时链一步都不跑。判据本身的用例在
-        ``tests/test_preprovision.py``；这里钉住"跳过真的没有副作用"。"""
+    def test_a_candidate_without_directory_status_keeps_identity_unresolved(self) -> None:
+        """另一候选缺组织资料时，不能因已知候选在职就给它开通。"""
 
         rows = ROSTER_ROWS + ({**ROSTER_ROWS[0], "personnel_id": "fu_2"},)
         parts, result = run_system_once(roster=FakeRoster(rows))
 
-        self.assertEqual(result.failure_reason, "email_multiple_personnel")
+        self.assertIs(result.state, OnboardingState.INTERNAL_ERROR)
+        self.assertEqual(result.failure_reason, "email_identity_unavailable")
+        self.assertIsNone(parts["audit"].facts("identity.email_resolved")["active_candidate_count"])
         self.assertEqual(parts["provisioning"].requests, [])
         self.assertEqual(parts["tokens"].calls, [])
         self.assertEqual(parts["decisions"].reasons, [])
 
     def test_an_unreadable_roster_is_not_the_same_as_an_unknown_email(self) -> None:
         parts, result = run_system_once(roster=FakeRoster(rows=None))
-        self.assertEqual(result.failure_reason, "roster_unavailable")
+        self.assertIs(result.state, OnboardingState.INTERNAL_ERROR)
+        self.assertEqual(result.failure_reason, "email_identity_unavailable")
 
     def test_an_unknown_origin_is_refused_instead_of_silently_running(self) -> None:
         """收下一个不认识的来源再继续跑，等于让调用方把一条链变成"不静默但也没有

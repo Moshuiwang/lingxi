@@ -209,6 +209,7 @@ class AutoOnboardingRunner(OnboardingSteps):
         origin: str = ORIGIN_PREPROVISION,
         initiated_by_open_id: str,
         preprovision_grant: Any | None = None,
+        expected_open_id: str | None = None,
     ) -> OnboardingResult:
         """系统触发的开通入口（预开通，没有入站消息）。
 
@@ -222,7 +223,14 @@ class AutoOnboardingRunner(OnboardingSteps):
             origin=origin,
             initiated_by_open_id=initiated_by_open_id,
             preprovision_grant=preprovision_grant,
+            expected_open_id=expected_open_id,
         )
+
+    def resolve_system_email(self, *, email: str, trace_id: str):
+        """供已授权的后台阶段解析目标，不创建账号或资格。"""
+        from lingxi.core.identity.preprovision import resolve_system_email
+
+        return resolve_system_email(self, email=email, trace_id=trace_id)
 
     def _release(self, open_id: str, event_id: str) -> None:
         with self._lock:
@@ -639,6 +647,8 @@ class AutoOnboardingRunner(OnboardingSteps):
             bindings=self._email_bindings,
             audit=self._audit,
             trace_id=trace_id,
+            personnel_id=request.identity.feishu_user_id,
+            employee_no=request.employee_no,
         )
         if bound_elsewhere is not None:
             return bound_elsewhere
@@ -721,7 +731,7 @@ class AutoOnboardingRunner(OnboardingSteps):
         Returns:
             存量令牌的查找结果；没有存量源时是 ``None``。
         """
-        lookup = self._lookup_stock_token(request.email)
+        lookup = self._lookup_stock_token(request)
         if lookup is not None and lookup.state == ADOPTABLE:
             self._import_legacy_permissions(
                 user_id, lookup, aggregate, galaxy_map, open_id=open_id, trace_id=trace_id

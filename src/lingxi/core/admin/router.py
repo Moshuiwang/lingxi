@@ -54,6 +54,7 @@ from lingxi.core.admin.views import (
     AdminUserStatusView,
     LocalPermissionOverrideView,
 )
+from lingxi.core.identity.email_resolver import EmailIdentityUnresolvedError
 
 logger = logging.getLogger(__name__)
 
@@ -228,6 +229,14 @@ class AdminCommandRouter:
         )
         try:
             return self._dispatch(parse_admin_command(text), text, context)
+        except EmailIdentityUnresolvedError as error:
+            return self._reply(
+                "admin.command.identity_unresolved",
+                "admin.internal_error",
+                "邮箱身份未能与已有绑定唯一对应，本次未执行；请先核对人员资料。",
+                context,
+                **error.check.audit_facts(),
+            )
         except Exception as error:
             return self._record_or_reject(
                 "admin.command.internal_error",

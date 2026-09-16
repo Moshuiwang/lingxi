@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime
 from enum import Enum
 from typing import Any
@@ -44,6 +44,16 @@ class EmailIdentityResolution:
     active_candidate_count: int | None
     selected: Mapping[str, Any] | None = None
 
+    def check_binding(self, *, personnel_id=None, employee_no=None):
+        """有可信旧主键时只能核对，不允许解析结果自动替换它。"""
+        if self.selected is not None and not identity_binding_matches(
+            self.selected, personnel_id, employee_no
+        ):
+            return replace(
+                self, state=EmailIdentityState.UNAVAILABLE, reason="binding_mismatch", selected=None
+            )
+        return self
+
     def audit_facts(self) -> dict[str, Any]:
         """审计只带来源、计数和所选主键，不复制姓名或邮箱。"""
         return {
@@ -77,6 +87,70 @@ def email_candidates(
     )
 
 
+def identity_binding_matches(row, personnel_id, employee_no):
+    """共同的可信主键核对；缺省绑定不新增匹配条件。"""
+    return (personnel_id is None or row.get("personnel_id") == personnel_id) and (
+        employee_no is None or row.get("employee_no") == employee_no
+    )
+
+
+@dataclass(frozen=True)
+class EmailBindingCheck:
+    """既有绑定的只读核对结果；不声称实时在职，也不选择新的身份。"""
+
+    reason: str
+    snapshot: EmailIdentitySnapshot
+    candidate_count: int | None
+    row: Mapping[str, Any] | None = None
+
+    @property
+    def matched(self):
+        """只能使用原绑定，不能据此创建或转移身份。"""
+        return self.row is not None
+
+    def audit_facts(self):
+        """在职数保持未知，避免把绑定核对伪装成实时在职解析。"""
+        facts = EmailIdentityResolution(
+            EmailIdentityState.UNAVAILABLE,
+            self.reason,
+            self.snapshot.version,
+            self.snapshot.captured_at,
+            self.candidate_count,
+            None,
+        ).audit_facts()
+        facts["identity_state"] = "existing_binding_verified" if self.matched else "unavailable"
+        facts["bound_personnel_id"] = self.row.get("personnel_id") if self.row is not None else None
+        return facts
+
+
+class EmailIdentityUnresolvedError(ValueError):
+    """管理员入口明确拒绝身份未决；异常正文不含任何人员资料。"""
+
+    def __init__(self, check):
+        """保留最小审计事实供入口回执，不携带查询正文。"""
+        self.check = check
+        super().__init__(check.reason)
+
+
+def check_email_binding(email, *, snapshot, personnel_id, employee_no=None):
+    """无实时状态的入口只接受一个原始候选且与既有可信绑定一致。"""
+    candidates = email_candidates(email, snapshot)
+    if candidates is None:
+        return EmailBindingCheck("snapshot_unavailable", snapshot, None)
+    if len(candidates) != 1:
+        return EmailBindingCheck(
+            "email_not_found" if not candidates else "multiple_candidates",
+            snapshot,
+            len(candidates),
+        )
+    row = candidates[0]
+    if not personnel_id or not row.get("personnel_id"):
+        return EmailBindingCheck("binding_unknown", snapshot, 1)
+    if not identity_binding_matches(row, personnel_id, employee_no):
+        return EmailBindingCheck("binding_mismatch", snapshot, 1)
+    return EmailBindingCheck("existing_binding_verified", snapshot, 1, row)
+
+
 def resolve_email_identity(
     email: str,
     *,
@@ -92,11 +166,6 @@ def resolve_email_identity(
     """
     candidates = email_candidates(email, snapshot)
     state, reason, active, selected = _select(candidates, employment)
-    if selected is not None and (
-        (bound_personnel_id is not None and selected.get("personnel_id") != bound_personnel_id)
-        or (bound_employee_no is not None and selected.get("employee_no") != bound_employee_no)
-    ):
-        state, reason, selected = EmailIdentityState.UNAVAILABLE, "binding_mismatch", None
     return EmailIdentityResolution(
         state,
         reason,
@@ -105,7 +174,7 @@ def resolve_email_identity(
         None if candidates is None else len(candidates),
         active,
         selected,
-    )
+    ).check_binding(personnel_id=bound_personnel_id, employee_no=bound_employee_no)
 
 
 def _select(candidates, employment):

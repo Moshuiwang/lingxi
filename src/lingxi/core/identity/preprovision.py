@@ -9,22 +9,30 @@
 兜底靠 ``INNER JOIN inbound_event``，系统触发两者皆无——:func:`deliver_silently`
 按送达处理，兜底查询改用 ``LEFT JOIN LATERAL`` 并以 ``provisioning_started_at`` 为租约起点。
 
-邮箱命中多个人员 ID 时一律跳过、不猜：认错人会让错的那一行永久占住这个邮箱
-（不可自愈、无改绑动作），宁可跳过交人工处理。
+邮箱准备阶段不持实时凭据；多候选留待 scheduler 回读后解析，未知或冲突不自动选人。
 """
 
 from __future__ import annotations
 
-from collections.abc import Iterable, Mapping, Sequence
-from dataclasses import dataclass
+from collections.abc import Iterable
+from dataclasses import dataclass, replace
 from datetime import datetime
 from typing import Any, Protocol
 
 from lingxi.core.conversation.ports import OnboardingResult, OnboardingState
+from lingxi.core.identity.email_location import locate_current_email, read_identity_snapshot
+from lingxi.core.identity.email_resolver import (
+    EmailIdentityResolution,
+    EmailIdentitySnapshot,
+    EmailIdentityState,
+    email_candidates,
+    resolve_email_identity,
+)
 from lingxi.core.identity.onboarding_terminal import (
     KEY_COMPLETED,
     OnboardingChainError,
     _internal,
+    _not_authorized,
 )
 from lingxi.core.identity.org_snapshot import DirectoryAvailability, SnapshotMember
 from lingxi.core.permission.account_match import normalize_email
@@ -121,11 +129,12 @@ SKIP_ROSTER_UNAVAILABLE = "roster_unavailable"
 
 @dataclass(frozen=True)
 class PreprovisionTarget:
-    """一个可以进开通链的名单条目：邮箱已经唯一定位到一名飞书成员。"""
+    """准备时唯一的组织成员，或执行时经实时在职解析的成员；不代表已授权。"""
 
     email: str
     personnel_id: str
     member: SnapshotMember
+    identity: EmailIdentityResolution | None = None
 
     @property
     def open_id(self) -> str:
@@ -135,21 +144,22 @@ class PreprovisionTarget:
 
 @dataclass(frozen=True)
 class PreprovisionSkip:
-    """一个被**失败关闭**跳过的名单条目。``reason`` 取上面六个原因码之一。"""
+    """被拒绝或尚未能确定身份的名单条目，保留原因和可得的解析事实。"""
 
     email: str
     reason: str
+    identity: EmailIdentityResolution | None = None
 
     def as_result(self) -> OnboardingResult:
-        """跳过也要有一个可被脚本消费的结论。
+        """确定性拒绝与资料不可用分别返回，系统触发不产生私聊消息。"""
+        state = OnboardingState.NOT_AUTHORIZED
+        if self.identity is not None and self.identity.state is EmailIdentityState.UNAVAILABLE:
+            state = OnboardingState.INTERNAL_ERROR
+        return OnboardingResult(state=state, failure_reason=self.reason)
 
-        状态用 ``NOT_AUTHORIZED``：这一类失败的意思是"我们无法唯一地认定这个邮箱是
-        谁"，因此**不能**给他开通——与"这个人没有可用银河权限"同属确定性业务失败，
-        不是本侧故障（走 ``INTERNAL_ERROR`` 会触发管理群告警，而名单写错一个邮箱不是
-        需要半夜叫人的事）。``messages`` 恒为空：预开通失败**没有任何用户可见出口**，
-        逐人原因只报告给产品负责人（脚本清单）。
-        """
-        return OnboardingResult(state=OnboardingState.NOT_AUTHORIZED, failure_reason=self.reason)
+
+class PreprovisionDeferred(PreprovisionSkip):
+    """管理员确认的是待执行解析的邮箱，尚未选择人员、写入资格或开通。"""
 
 
 class DirectoryByUserId(Protocol):
@@ -168,37 +178,29 @@ class DirectoryByUserId(Protocol):
 def locate_by_email(
     email: str,
     *,
-    roster_rows: Sequence[Mapping[str, Any]],
+    snapshot: EmailIdentitySnapshot,
     directory: DirectoryByUserId,
 ) -> PreprovisionTarget | PreprovisionSkip:
-    """邮箱 → 花名册 ``personnel_id`` → 组织快照成员。**任一环节非唯一即跳过。**
-
-    这一类失败是**预开通独有**的：正式首聊路径从 ``open_id`` 出发，天然唯一，根本
-    走不到这里。跳过的硬规则与它的不可自愈后果见模块文档最后一节。
-
-    ``roster_rows`` 是花名册快照的全量行（``RosterSource.rows()`` 本来就返回全部行，
-    不需要新查询）；邮箱按 ``account_match.normalize_email`` 的同一口径归一，避免
-    "名单里大写、花名册里小写"这种纯格式差异被当成查无此人。
-    """
+    """准备阶段只定位候选；多行保留待执行解析，绝不假设候选在职。"""
     needle = normalize_email(email)
     if not needle:
         return PreprovisionSkip(email=email, reason=SKIP_EMAIL_BLANK)
-    personnel_ids = sorted(
-        {
-            str(row.get("personnel_id", "") or "").strip()
-            for row in roster_rows
-            if normalize_email(row.get("email")) == needle
-            and str(row.get("personnel_id", "") or "").strip()
-        }
-    )
-    if not personnel_ids:
+    candidates = email_candidates(email, snapshot)
+    if candidates is None:
+        return PreprovisionSkip(email=email, reason=SKIP_ROSTER_UNAVAILABLE)
+    if not candidates:
         return PreprovisionSkip(email=email, reason=SKIP_EMAIL_NOT_IN_ROSTER)
-    if len(personnel_ids) > 1:
-        # 一律跳过、不猜：认错人会让错的那一行永久占住这个邮箱（部分唯一索引下
-        # 不可自愈），真人首聊反而会被拒。
-        return PreprovisionSkip(email=email, reason=SKIP_EMAIL_MULTIPLE_PERSONNEL)
-
-    lookup = directory.lookup_by_user_id(personnel_ids[0])
+    if len(candidates) > 1:
+        result = resolve_email_identity(email, snapshot=snapshot, employment={})
+        return PreprovisionDeferred(
+            email,
+            "identity_resolution_pending",
+            replace(result, reason="execution_resolution_pending"),
+        )
+    personnel = str(candidates[0].get("personnel_id") or "").strip()
+    if not personnel:
+        return PreprovisionSkip(email=email, reason="identity_field_unknown")
+    lookup = directory.lookup_by_user_id(personnel)
     if getattr(lookup, "availability", None) is not DirectoryAvailability.AVAILABLE:
         # 组织资料不可用 / 已过九十天上限时"查不到"不是事实，只是我们暂时看不见——
         # 与 ``AutoOnboardingRunner._locate`` 同一条纪律，不当成"这个人不存在"。
@@ -208,13 +210,13 @@ def locate_by_email(
         return PreprovisionSkip(email=email, reason=SKIP_PERSONNEL_NOT_IN_DIRECTORY)
     if len(members) > 1:
         return PreprovisionSkip(email=email, reason=SKIP_DIRECTORY_MULTIPLE_MEMBERS)
-    return PreprovisionTarget(email=email, personnel_id=personnel_ids[0], member=members[0])
+    return PreprovisionTarget(email=email, personnel_id=personnel, member=members[0])
 
 
 def plan_preprovision(
     emails: Iterable[str],
     *,
-    roster_rows: Sequence[Mapping[str, Any]],
+    snapshot: EmailIdentitySnapshot,
     directory: DirectoryByUserId,
 ) -> tuple[tuple[PreprovisionTarget, ...], tuple[PreprovisionSkip, ...]]:
     """把一份名单逐条定位成「可执行」与「跳过」两张清单，**保持名单顺序**。
@@ -235,7 +237,7 @@ def plan_preprovision(
             continue
         if normalized:
             seen.add(normalized)
-        located = locate_by_email(raw, roster_rows=roster_rows, directory=directory)
+        located = locate_by_email(raw, snapshot=snapshot, directory=directory)
         if isinstance(located, PreprovisionTarget):
             targets.append(located)
         else:
@@ -333,6 +335,9 @@ class _SystemOnboardingHost(Protocol):
 
     _roster: Any
     _directory: Any
+    _employment: Any
+    _audit: Any
+    _email_bindings: Any
     _lock: Any
     _running: dict[str, str]
 
@@ -348,6 +353,46 @@ class _SystemOnboardingHost(Protocol):
 
     def _release(self, open_id: str, event_id: str) -> None: ...
 
+    def _report_terminal(self, terminal, *, event_id: str, trace_id: str) -> None: ...
+
+
+def resolve_system_email(runner: _SystemOnboardingHost, *, email: str, trace_id: str):
+    """唯一实时在职成员才可进入系统开通；来源及失败判据一并写审计。"""
+    located = locate_current_email(
+        email,
+        snapshot=read_identity_snapshot(runner._roster),
+        directory=runner._directory,
+        employment=runner._employment,
+    )
+    result = located.resolution
+    if result.selected is not None:
+        result = _check_existing_keys(runner, email, located)
+    runner._audit.record("identity.email_resolved", trace_id=trace_id, **result.audit_facts())
+    if result.selected is None:
+        return PreprovisionSkip(email, "email_identity_" + result.state.value, result)
+    return PreprovisionTarget(email, located.member.user_id, located.member, result)
+
+
+def _check_existing_keys(runner, email, located):
+    """同一飞书主体也不能借邮箱重选覆盖已经保存的人员或工号。"""
+    result = located.resolution
+    try:
+        bindings = runner._email_bindings.bindings_for_email(normalize_email(email))
+    except Exception:
+        return replace(
+            result,
+            state=EmailIdentityState.UNAVAILABLE,
+            reason="binding_unavailable",
+            selected=None,
+        )
+    for binding in bindings:
+        if binding.feishu_open_id != located.member.open_id:
+            continue  # 不同主体仍由开通链既有邮箱闸拒绝并登记故障。
+        result = result.check_binding(
+            personnel_id=binding.personnel_id, employee_no=binding.employee_no
+        )
+    return result
+
 
 def run_system_onboarding(
     runner: _SystemOnboardingHost,
@@ -357,6 +402,7 @@ def run_system_onboarding(
     origin: str = ORIGIN_PREPROVISION,
     initiated_by_open_id: str,
     preprovision_grant: Any | None = None,
+    expected_open_id: str | None = None,
 ) -> OnboardingResult:
     """系统触发一次开通，**同步返回终态**。形状与三处差异见模块文档「入口的三处形状」。
 
@@ -372,12 +418,19 @@ def run_system_onboarding(
         raise ValueError("系统触发目前只有预开通这一个来源")
     if not str(initiated_by_open_id or "").strip():
         raise ValueError("预开通必须带上责任人 open_id：审计里不接受占位身份")
-    rows = runner._roster.rows()
-    if rows is None:
-        return PreprovisionSkip(email=email, reason=SKIP_ROSTER_UNAVAILABLE).as_result()
-    located = locate_by_email(email, roster_rows=rows, directory=runner._directory)
+    located = resolve_system_email(runner, email=email, trace_id=trace_id)
     if isinstance(located, PreprovisionSkip):
-        return located.as_result()
+        return _report_system_rejection(runner, located.as_result(), trace_id)
+    if expected_open_id is not None and located.open_id != expected_open_id:
+        runner._audit.record("identity.email_binding_mismatch", trace_id=trace_id)
+        return _report_system_rejection(
+            runner,
+            OnboardingResult(
+                state=OnboardingState.INTERNAL_ERROR,
+                failure_reason="email_identity_binding_mismatch",
+            ),
+            trace_id,
+        )
 
     event_id = system_event_id(trace_id)
     grant = (
@@ -400,6 +453,17 @@ def run_system_onboarding(
         # 停机信号落在链中途：``_execute`` 已经如实记了审计、什么也没收口。
         terminal = _internal("aborted_while_stopping")
     return terminal.as_result(trace_id=trace_id)
+
+
+def _report_system_rejection(runner, result, trace_id):
+    """提前解析失败也写入既有终态与排障记录；系统触发仍不私聊用户。"""
+    terminal = (
+        _internal(result.failure_reason)
+        if result.state is OnboardingState.INTERNAL_ERROR
+        else _not_authorized(result.failure_reason)
+    )
+    runner._report_terminal(terminal, event_id=system_event_id(trace_id), trace_id=trace_id)
+    return result
 
 
 __all__ = [

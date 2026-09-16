@@ -26,6 +26,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
+from lingxi.adapters.postgres_email_identity import RosterRows
 from lingxi.adapters.postgres_local_permission import (
     PostgresLocalPermissionOverrideStore,
     local_override_reader,
@@ -329,24 +330,6 @@ def join_onboarding_executors(duties: Sequence[Any]) -> None:
 # ----------------------------------------------------------------------
 # 小适配器
 # ----------------------------------------------------------------------
-
-
-class RosterRows:
-    """把花名册持久快照折成"当前全部行或 ``None``"。
-
-    **不加新鲜度判据**：每日重算要求快照是"今天的"，因为它是一次全量重算；而一次首聊
-    开通如果因为快照晚了两小时就告诉用户"没有可用的银河权限"，那是一句错话。快照的新鲜度
-    由花名册审计职责保证，这里只区分"有"和"根本没有"。
-    """
-
-    def __init__(self, store: Any) -> None:
-        """包住一个花名册持久快照读取口。"""
-        self._store = store
-
-    def rows(self) -> Sequence[Mapping[str, Any]] | None:
-        """当前全部花名册行，没有快照时返回 ``None``。"""
-        snapshot = self._store.load()
-        return None if snapshot is None else snapshot.rows
 
 
 class CatalogNotifier:

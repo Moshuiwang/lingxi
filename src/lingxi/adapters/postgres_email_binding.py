@@ -44,7 +44,7 @@ class PostgresEmailBindingSource:
         ):
             cursor.execute(
                 """
-                SELECT id, feishu_open_id
+                SELECT id, feishu_open_id, feishu_user_id, employee_no
                   FROM app_user
                  WHERE email IS NOT NULL
                    AND btrim(email) <> ''
@@ -53,4 +53,4 @@ class PostgresEmailBindingSource:
                 (email,),
             )
             rows = cursor.fetchall()
-        return tuple(EmailBinding(str(row[0]), row[1]) for row in rows)
+        return tuple(EmailBinding(str(row[0]), row[1], row[2], row[3]) for row in rows)

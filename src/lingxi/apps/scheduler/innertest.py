@@ -54,21 +54,15 @@ def _build_followup_consumer(config, *, loop, duties, audit):
     from lingxi.adapters.innertest_handlers import InnertestFollowupHandlers
     from lingxi.adapters.innertest_runner import SharedOnboardingRunner
     from lingxi.adapters.postgres_admin_followup import PostgresFollowupStore
+    from lingxi.apps.innertest import build_innertest_service
 
-    owners = [d for d in duties if hasattr(d, "onboarding_runner")]
-    runners = [d.onboarding_runner for d in owners]
-    if len(runners) != 1:
-        raise ValueError("内测后台开通入口未就绪")
     store = PostgresFollowupStore(
         str(config.postgres_dsn), timeouts=config.postgres_timeouts, db_slots=loop.followup_db_slots
     )
     handlers = InnertestFollowupHandlers(
         store=store,
-        runner=SharedOnboardingRunner(
-            runner=runners[0],
-            executor=owners[0].onboarding_executor,
-            should_stop=lambda: loop.stopping,
-        ),
+        identity_service=build_innertest_service(config, audit),
+        runner=SharedOnboardingRunner.from_duties(duties, should_stop=lambda: loop.stopping),
         probe=_build_probe(
             config, db_slots=loop.followup_db_slots, should_stop=lambda: loop.stopping
         ),

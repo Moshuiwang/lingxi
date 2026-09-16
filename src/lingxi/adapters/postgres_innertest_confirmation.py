@@ -10,6 +10,7 @@ from lingxi.adapters.postgres_pending_action import ConfirmOutcome
 from lingxi.core.admin.followup import FollowupSpec
 from lingxi.core.admin.innertest import InnertestError, target_digest
 from lingxi.core.admin.pending_action import ConfirmDecision, ConfirmResultKind, PendingActionStatus
+from lingxi.core.identity.preprovision import PreprovisionDeferred
 
 #: 落明确终态的拒绝分支。过期与目标漂移是既有的两条；授权已变化补进来是因为
 #: 它同样是「这批不可能再被批准」的确定结果——留在 ``pending`` 会让卡片按钮
@@ -117,7 +118,7 @@ class InnertestPendingActions:
                 )
         decision = ConfirmDecision(
             kind=ConfirmResultKind.EXECUTE,
-            message="已取消。" if cancel else "已加入内测资格，开通结果请逐人查询。",
+            message="已取消。" if cancel else "已确认执行，内测资格与开通结果请逐人查询。",
             terminal_status=PendingActionStatus(state),
         )
         return ConfirmOutcome(decision=decision, pending=updated)
@@ -191,15 +192,23 @@ class InnertestPendingActions:
     def _confirm_items(self, connection, cursor, batch, action):
         """新增每人两阶段，未建档 user_id 保持 NULL；无提交后内存队列。"""
         cursor.execute(
-            "SELECT id,email,open_id,personnel_id FROM innertest_batch_item "
-            "WHERE batch_id=%s AND result_code='new' ORDER BY id FOR UPDATE",
+            "SELECT id,email,open_id,personnel_id,result_code FROM innertest_batch_item "
+            "WHERE batch_id=%s AND result_code IN ('new','identity_resolution_pending') ORDER BY id FOR UPDATE",
             (batch[0],),
         )
         items = cursor.fetchall()
         if not items:
             raise InnertestError("stale_confirmation")
-        for item_id, email, open_id, personnel in items:
+        for item_id, email, open_id, personnel, code in items:
             target = self.service.locator(email, connection=connection)
+            if code == "identity_resolution_pending":
+                if not isinstance(target, PreprovisionDeferred):
+                    raise InnertestError("stale_confirmation")
+                ref = self._enqueue_person(connection, action, batch, item_id, None)
+                cursor.execute(
+                    "UPDATE innertest_batch_item SET followup_id=%s WHERE id=%s", (ref.id, item_id)
+                )
+                continue
             if (
                 getattr(target, "open_id", None) != open_id
                 or getattr(target, "personnel_id", None) != personnel

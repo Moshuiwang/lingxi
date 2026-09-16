@@ -44,7 +44,7 @@ class SyntheticRunner:
         self.system_calls = []
         self.normal_calls = []
 
-    def start_system(self, *, email, trace_id, initiated_by_open_id):
+    def start_system(self, *, email, trace_id, initiated_by_open_id, expected_open_id=None):
         del trace_id, initiated_by_open_id
         number = email.split("@")[0]
         self.system_calls.append((number, threading.current_thread().name))
