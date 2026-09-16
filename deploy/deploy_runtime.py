@@ -23,7 +23,14 @@ from control_bundle import (
     sync_directory,
     verify_install,
 )
-from deploy_state import DeployError, UnknownError, atomic_write, fingerprint, read_json
+from deploy_state import (
+    DeployError,
+    StateStore,
+    UnknownError,
+    atomic_write,
+    fingerprint,
+    read_json,
+)
 
 SERVICES = ("scheduler", "gateway", "worker-queue")
 
@@ -209,13 +216,14 @@ class Runtime:
                 raise DeployError("installation_directory_unavailable")
         self.check_revocation(plan)
         self.installation_receipt(plan)
-        self.verify_service_inventory(plan)
+        inventory = self.verify_service_inventory(plan)
         self.verify_public_files()
         if plan["operation"] == "recover":
             original = read_json(self.state_directory / (plan["recovery_of"]["id"] + ".plan.json"))
             job = self.job(original)
             if job and job["Running"]:
                 raise UnknownError("original_migration_still_running")
+        return inventory
 
     def verify_public_files(self):
         """只核对明确非秘密运行文件，禁止扫描或读取私有 env 文件。"""
@@ -255,37 +263,36 @@ class Runtime:
                 raise DeployError("public_file_configuration_changed")
 
     def verify_service_inventory(self, plan):
-        """只能停止计划已登记的旧服务，接续只允许旧新两份制品。
+        """只能停止计划已登记的旧服务，接续只允许旧新两份制品；返回两侧配置指纹供阶段账记录。
 
-        首次接管：部署器接管之前由人手工用 Compose 启动的旧服务没有任何
-        ``io.lingxi.*`` 标签（``containers`` 读到的 ``config_sha256`` 与
-        ``bundle_sha256`` 同为 ``None``，不是空串或别的值）。这种容器只要镜像
-        摘要等于计划 ``old`` 侧登记的镜像，就视为计划已登记的旧服务而接受；
-        ``new`` 侧永不放行，只缺一枚标签或标签值不等的容器仍按原规则拒绝。
-        这不放松安全边界：旧镜像摘要本身就是计划登记并经批准的旧服务身份，
-        标签核对只是在此之上再钉一次配置与控制包摘要；而部署器自己起过的容器
-        一定带全三枚标签（``channel_compose`` 一起写入，容器创建后不可改），
-        所以「完全无标签」只可能是接管之前的手工启动，不可能是部署器产物。
-        中断在「首个服务更新后」再接续（``changed``）时，剩下的旧容器仍是
-        无标签的，同样按 ``old`` 侧接受。
-        豁免只在本机首次由部署器接管时生效：``lingxi_deploy.execute`` 在 preflight
-        通过后才写 ``lock_path`` 同目录的 ``host.active.json``，本机从未由部署器
-        部署过时它不存在；同一首次计划中断后接续时它记着本计划的 ``id``。它记着
-        其它计划（本机已由部署器部署过）或形状异常时，无标签容器不再享受豁免，
-        按原规则拒绝——部署过之后再出现的无标签容器不可能是「接管前的旧服务」。
+        ``old`` 侧配置指纹由状态账 ``old_configuration`` 给出——上一次 ``verified`` 部署给容器
+        打的标签值；``new`` 侧取本计划的 ``config_sha256``（当前 ``public-config``）。两个时间
+        语义的值各归各侧：不拿当前配置去核旧容器，也不读被核容器的标签当依据；旧值不可得时
+        失败关闭，不冒充。
+        首次接管：部署器接管之前由人手工用 Compose 启动的旧服务没有任何 ``io.lingxi.*``
+        标签（``containers`` 读到的 ``config_sha256`` 与 ``bundle_sha256`` 同为 ``None``，
+        不是空串或别的值）。这种容器只要镜像摘要等于计划 ``old`` 侧登记的镜像，就视为计划
+        已登记的旧服务而接受；``new`` 侧永不放行，只缺一枚标签或标签值不等的容器仍按原规则
+        拒绝。这不放松安全边界：旧镜像摘要本身就是计划登记并经批准的旧服务身份，标签核对只是
+        在此之上再钉一次配置与控制包摘要；而部署器自己起过的容器一定带全三枚标签
+        （``channel_compose`` 一起写入，容器创建后不可改），所以「完全无标签」只可能是接管
+        之前的手工启动，不可能是部署器产物。中断在「首个服务更新后」再接续（``changed``）时，
+        剩下的旧容器仍是无标签的，同样按 ``old`` 侧接受。
+        豁免只在 ``old_configuration`` 判为首次接管时生效：``host.active.json`` 不存在（本机
+        从未由部署器部署过），或同一首次计划中断后接续（阶段账记着 ``first_takeover``）。
+        本机已由部署器部署过之后再出现的无标签容器不可能是「接管前的旧服务」，按原规则拒绝。
         """
-        current = self.containers(plan["project"])
         ledger = read_json(self.state_directory / (plan["id"] + ".state.json"))
+        marker = Path(self.host["lock_path"]).with_suffix(".active.json")
+        old_sha, old_source = StateStore(self.state_directory).old_configuration(
+            marker, plan, ledger
+        )
+        first_takeover = old_source == "first_takeover"
+        current = self.containers(plan["project"])
         changed = "start" in ledger["stages"] or plan["operation"] == "recover"
-        try:
-            active = read_json(Path(self.host["lock_path"]).with_suffix(".active.json"))
-        except FileNotFoundError:
-            first_takeover = True
-        else:
-            first_takeover = isinstance(active, dict) and active.get("id") == plan["id"]
         if not changed and set(current) != set(SERVICES):
             raise DeployError("service_inventory_changed")
-        choices = [("old", plan["recovery"]["config_sha256"])]
+        choices = [("old", old_sha)]
         if changed:
             choices.append(("new", plan["config_sha256"]))
         for name, actual in current.items():
@@ -302,13 +309,19 @@ class Runtime:
                     takeover
                     or release["schema"] != 2
                     or (
-                        actual["config_sha256"] == config_sha
+                        config_sha is not None
+                        and actual["config_sha256"] == config_sha
                         and actual["bundle_sha256"] == control_for(plan, release)["sha256"]
                     )
                 )
                 matched = matched or (same_image and same_config)
             if not matched:
                 raise DeployError("unplanned_service_artifact_or_config")
+        return {
+            "old_verified_sha256": old_sha,
+            "old_source": old_source,
+            "new_sha256": plan["config_sha256"],
+        }
 
     def check_revocation(self, plan):
         """已明确撤销的资格在执行与观察期间也不能继续使用。"""

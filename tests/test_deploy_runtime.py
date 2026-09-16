@@ -31,6 +31,7 @@ class RuntimeTests(unittest.TestCase):
         }
         self.runtime = runtime_module.Runtime(self.host, self.config)
         self.runtime.state_directory = self.root
+        self.marker = Path(self.host["lock_path"]).with_suffix(".active.json")
 
     def public_runtime_directory(self, name):
         """公开运行文件按用例声明的权限位建立（目录 0700、文件 0644），不交给进程 umask。"""
@@ -92,28 +93,55 @@ class RuntimeTests(unittest.TestCase):
                 ):
                     self.runtime.verify_public_files()
 
-    def test_unplanned_service_cannot_be_stopped_and_partial_update_is_bounded(self):
+    def previous_verified(self, config_sha, identifier="earlier-deploy"):
+        """上一次 verified 的计划文件与指向它的主机在途标记：部署器自己写下的两份 0600 私有材料。"""
         import copy
 
-        current = {
+        previous = copy.deepcopy(self.plan)
+        previous["id"] = identifier
+        previous["config_sha256"] = config_sha
+        state.atomic_write(self.root / (identifier + ".plan.json"), previous)
+        state.atomic_write(
+            self.marker,
+            {"id": identifier, "plan_sha256": state.fingerprint(previous), "status": "verified"},
+        )
+        return previous
+
+    @staticmethod
+    def labeled_services(release, config_sha):
+        """部署器自己起过的容器：镜像来自 release，两枚标签是那次部署写下的配置与控制包摘要。"""
+        return {
             name: {
-                "image": self.plan["old"]["images"]["worker" if name == "worker-queue" else name],
-                "config_sha256": self.plan["recovery"]["config_sha256"],
-                "bundle_sha256": self.plan["old"]["control_bundle"]["sha256"],
+                "image": release["images"]["worker" if name == "worker-queue" else name],
+                "config_sha256": config_sha,
+                "bundle_sha256": release["control_bundle"]["sha256"],
             }
             for name in runtime_module.SERVICES
         }
+
+    def test_unplanned_service_cannot_be_stopped_and_partial_update_is_bounded(self):
+        import copy
+
+        previous = self.previous_verified(self.plan["config_sha256"])
+        current = self.labeled_services(self.plan["old"], previous["config_sha256"])
         ledger = self.root / (self.plan["id"] + ".state.json")
         state.atomic_write(ledger, {"stages": {}})
         with patch.object(self.runtime, "containers", return_value=current):
-            self.runtime.verify_service_inventory(self.plan)
+            inventory = self.runtime.verify_service_inventory(self.plan)
             self.plan["new"] = copy.deepcopy(self.plan["new"])
             image = self.plan["new"]["images"]["worker"].replace("c" * 64, "d" * 64)
             self.plan["new"]["images"]["worker"] = image
             current["worker-queue"]["image"] = image
             with self.assertRaisesRegex(state.DeployError, "unplanned_service"):
                 self.runtime.verify_service_inventory(self.plan)
-            state.atomic_write(ledger, {"stages": {"start": {"status": "running"}}})
+            # 首个服务更新后接续：标记已指向本计划，old 侧只从 preflight 记下的账取。
+            state.atomic_write(
+                ledger, {"stages": {"start": {"status": "running"}}, "inventory": inventory}
+            )
+            state.atomic_write(
+                self.marker,
+                {"id": self.plan["id"], "plan_sha256": "0" * 64, "status": "running"},
+            )
             self.runtime.verify_service_inventory(self.plan)
             current["gateway"]["image"] = current["gateway"]["image"].replace("c" * 64, "e" * 64)
             with self.assertRaisesRegex(state.DeployError, "unplanned_service"):
@@ -143,22 +171,32 @@ class RuntimeTests(unittest.TestCase):
             for name in runtime_module.SERVICES
         }
 
+    @staticmethod
+    def first_takeover_record(plan):
+        """首次接管的计划在 preflight 通过时记进阶段账的两侧指纹：old 侧没有旧值。"""
+        return {
+            "old_verified_sha256": None,
+            "old_source": "first_takeover",
+            "new_sha256": plan["config_sha256"],
+        }
+
     def test_first_takeover_accepts_only_fully_unlabeled_old_image_services(self):
         plan = self.takeover_plan()
-        old_config = plan["recovery"]["config_sha256"]
         old_bundle = plan["old"]["control_bundle"]["sha256"]
         state.atomic_write(self.root / (plan["id"] + ".state.json"), {"stages": {}})
         current = self.unlabeled_services(plan["old"])
         with patch.object(self.runtime, "containers", return_value=current):
-            # a. 三个无标签旧镜像容器：首次接管通过。
-            self.runtime.verify_service_inventory(plan)
+            # a. 三个无标签旧镜像容器：首次接管通过，返回的两侧指纹记着「没有旧值」。
+            self.assertEqual(
+                self.runtime.verify_service_inventory(plan), self.first_takeover_record(plan)
+            )
             # b. 无标签但镜像已是 new：不是「接管前的旧服务」，拒。
             current["gateway"]["image"] = plan["new"]["images"]["gateway"]
             with self.assertRaisesRegex(state.DeployError, "^unplanned_service"):
                 self.runtime.verify_service_inventory(plan)
             current["gateway"]["image"] = plan["old"]["images"]["gateway"]
-            # c. 只缺一枚标签（config 正确、bundle 缺）：不算全缺，拒；反过来也拒。
-            current["gateway"]["config_sha256"] = old_config
+            # c. 只缺一枚标签（config 有值、bundle 缺）：不算全缺，拒；反过来也拒。
+            current["gateway"]["config_sha256"] = plan["config_sha256"]
             with self.assertRaisesRegex(state.DeployError, "^unplanned_service"):
                 self.runtime.verify_service_inventory(plan)
             current["gateway"]["config_sha256"], current["gateway"]["bundle_sha256"] = (
@@ -171,22 +209,31 @@ class RuntimeTests(unittest.TestCase):
             current["gateway"]["config_sha256"], current["gateway"]["bundle_sha256"] = "", ""
             with self.assertRaisesRegex(state.DeployError, "^unplanned_service"):
                 self.runtime.verify_service_inventory(plan)
-            # d. 标签齐但值不等：拒。
+            # d. 标签齐：首次接管没有可信旧值，带标签的容器不可能是「接管前的旧服务」——
+            # 值是别的指纹拒，值恰等于当前配置也拒（当前配置不是历史值）。
             current["gateway"]["config_sha256"], current["gateway"]["bundle_sha256"] = (
                 "0" * 64,
                 old_bundle,
             )
             with self.assertRaisesRegex(state.DeployError, "^unplanned_service"):
                 self.runtime.verify_service_inventory(plan)
-            # 标签齐且相等：原规则照常通过。
-            current["gateway"]["config_sha256"] = old_config
-            self.runtime.verify_service_inventory(plan)
+            current["gateway"]["config_sha256"] = plan["config_sha256"]
+            with self.assertRaisesRegex(state.DeployError, "^unplanned_service"):
+                self.runtime.verify_service_inventory(plan)
 
     def test_first_takeover_continuation_keeps_exception_on_old_side_only(self):
         plan = self.takeover_plan()
-        # e. 中断在「首个服务更新后」：start 已在账，剩下的旧容器仍无标签。
+        # e. 中断在「首个服务更新后」：start 已在账，标记已指向本计划，剩下的旧容器仍无标签。
         state.atomic_write(
-            self.root / (plan["id"] + ".state.json"), {"stages": {"start": {"status": "running"}}}
+            self.root / (plan["id"] + ".state.json"),
+            {
+                "stages": {"start": {"status": "running"}},
+                "inventory": self.first_takeover_record(plan),
+            },
+        )
+        state.atomic_write(
+            self.marker,
+            {"id": plan["id"], "plan_sha256": state.fingerprint(plan), "status": "running"},
         )
         current = self.unlabeled_services(plan["old"])
         with patch.object(self.runtime, "containers", return_value=current):
@@ -210,39 +257,158 @@ class RuntimeTests(unittest.TestCase):
 
     def test_first_takeover_exemption_only_before_host_has_been_deployed(self):
         plan = self.takeover_plan()
-        state.atomic_write(self.root / (plan["id"] + ".state.json"), {"stages": {}})
-        active = Path(self.host["lock_path"]).with_suffix(".active.json")
+        ledger = self.root / (plan["id"] + ".state.json")
+        state.atomic_write(ledger, {"stages": {}})
         current = self.unlabeled_services(plan["old"])
+        unavailable = "^previous_verified_configuration_unavailable$"
         with patch.object(self.runtime, "containers", return_value=current):
             # a. 没有 host.active.json：本机从未由部署器部署过，首次接管通过。
-            self.assertFalse(active.exists())
+            self.assertFalse(self.marker.exists())
             self.runtime.verify_service_inventory(plan)
             # b. 标记指向另一个已 verified 的计划：本机已由部署器部署过，无标签容器按原规则拒。
+            previous = self.previous_verified("1" * 64)
+            with self.assertRaisesRegex(state.DeployError, "^unplanned_service"):
+                self.runtime.verify_service_inventory(plan)
+            # 形状异常（没有 id / 不是对象）：取不到可信旧值，失败关闭，不退回首次接管豁免。
+            state.atomic_write(self.marker, {"status": "verified"})
+            with self.assertRaisesRegex(state.DeployError, unavailable):
+                self.runtime.verify_service_inventory(plan)
+            state.atomic_write(self.marker, [plan["id"]])
+            with self.assertRaisesRegex(state.DeployError, unavailable):
+                self.runtime.verify_service_inventory(plan)
+            # c. 标记指向同一计划（running）且阶段账记着首次接管：同一首次计划中断后接续，仍放行。
             state.atomic_write(
-                active, {"id": "earlier-deploy", "plan_sha256": "0" * 64, "status": "verified"}
+                ledger, {"stages": {}, "inventory": self.first_takeover_record(plan)}
             )
-            with self.assertRaisesRegex(state.DeployError, "^unplanned_service"):
-                self.runtime.verify_service_inventory(plan)
-            # 形状异常（没有 id / 不是对象）视为非首次：拒。
-            state.atomic_write(active, {"status": "verified"})
-            with self.assertRaisesRegex(state.DeployError, "^unplanned_service"):
-                self.runtime.verify_service_inventory(plan)
-            state.atomic_write(active, [plan["id"]])
-            with self.assertRaisesRegex(state.DeployError, "^unplanned_service"):
-                self.runtime.verify_service_inventory(plan)
-            # c. 标记指向同一计划（running）：同一首次计划中断后接续，仍放行。
             state.atomic_write(
-                active, {"id": plan["id"], "plan_sha256": "0" * 64, "status": "running"}
+                self.marker, {"id": plan["id"], "plan_sha256": "0" * 64, "status": "running"}
             )
             self.runtime.verify_service_inventory(plan)
-            # 收窄只影响无标签容器：带全标签的旧容器在标记指向别的计划时照常通过。
+            # 收窄只影响无标签容器：标记指向别的计划时，带全标签的旧容器只要标签值等于
+            # 那次 verified 部署记下的配置指纹就照常通过。
             state.atomic_write(
-                active, {"id": "earlier-deploy", "plan_sha256": "0" * 64, "status": "verified"}
+                self.marker,
+                {
+                    "id": previous["id"],
+                    "plan_sha256": state.fingerprint(previous),
+                    "status": "verified",
+                },
             )
             for service in current.values():
-                service["config_sha256"] = plan["recovery"]["config_sha256"]
+                service["config_sha256"] = previous["config_sha256"]
                 service["bundle_sha256"] = plan["old"]["control_bundle"]["sha256"]
             self.runtime.verify_service_inventory(plan)
+
+    def changed_configuration_plan(self):
+        """版本 A 已 verified（配置指纹 X）后人工把 public-config 改成 Y：版本 B 计划的
+        config_sha256 是 Y，代理把 Y 同样写进 recovery.config_sha256，运行容器仍带 X 标签。"""
+        plan = self.takeover_plan()
+        x, y = plan["config_sha256"], "2" * 64
+        previous = self.previous_verified(x)
+        plan["config_sha256"] = y
+        plan["recovery"]["config_sha256"] = y
+        state.atomic_write(self.root / (plan["id"] + ".state.json"), {"stages": {}})
+        return plan, previous, x, y
+
+    def test_next_version_checks_old_side_with_previous_verified_fingerprint_not_current(self):
+        plan, previous, x, y = self.changed_configuration_plan()
+        current = self.labeled_services(plan["old"], x)
+        with patch.object(self.runtime, "containers", return_value=current):
+            self.assertEqual(
+                self.runtime.verify_service_inventory(plan),
+                {"old_verified_sha256": x, "old_source": previous["id"], "new_sha256": y},
+            )
+
+    def test_tampered_old_container_label_bundle_or_image_is_still_rejected(self):
+        plan, _, x, y = self.changed_configuration_plan()
+        tampered = plan["old"]["images"]["gateway"].replace("c" * 64, "e" * 64)
+        cases = [
+            ("config_sha256", "0" * 64),
+            # 标签值恰是当前配置 Y：当前配置不是历史值，同样不是上一次部署的产物。
+            ("config_sha256", y),
+            ("bundle_sha256", "0" * 64),
+            ("image", tampered),
+        ]
+        for field, value in cases:
+            current = self.labeled_services(plan["old"], x)
+            current["gateway"][field] = value
+            with self.subTest(field=field, value=value[:8]):
+                with patch.object(self.runtime, "containers", return_value=current):
+                    with self.assertRaisesRegex(
+                        state.DeployError, "^unplanned_service_artifact_or_config$"
+                    ):
+                        self.runtime.verify_service_inventory(plan)
+
+    def test_unavailable_previous_verified_fingerprint_fails_closed_without_fallback(self):
+        """标记指向的计划缺失 / 指纹不符 / 标记未 verified / 接续时阶段账缺记录：一律新码失败
+        关闭。容器标签刻意等于当前配置——任何回落到当前配置或读标签自证的实现都会放行。"""
+        plan = self.takeover_plan()
+        x = plan["config_sha256"]
+        ledger = self.root / (plan["id"] + ".state.json")
+        state.atomic_write(ledger, {"stages": {}})
+        previous = self.previous_verified(x)
+        previous_path = self.root / (previous["id"] + ".plan.json")
+        current = self.labeled_services(plan["old"], x)
+        unavailable = "^previous_verified_configuration_unavailable$"
+        with patch.object(self.runtime, "containers", return_value=current):
+            self.runtime.verify_service_inventory(plan)
+            previous_path.unlink()
+            with self.assertRaisesRegex(state.DeployError, unavailable):
+                self.runtime.verify_service_inventory(plan)
+            state.atomic_write(previous_path, dict(previous, config_sha256="0" * 64))
+            with self.assertRaisesRegex(state.DeployError, unavailable):
+                self.runtime.verify_service_inventory(plan)
+            state.atomic_write(previous_path, previous)
+            state.atomic_write(
+                self.marker,
+                {
+                    "id": previous["id"],
+                    "plan_sha256": state.fingerprint(previous),
+                    "status": "running",
+                },
+            )
+            with self.assertRaisesRegex(state.DeployError, unavailable):
+                self.runtime.verify_service_inventory(plan)
+            state.atomic_write(
+                self.marker,
+                {"id": plan["id"], "plan_sha256": state.fingerprint(plan), "status": "running"},
+            )
+            with self.assertRaisesRegex(state.DeployError, unavailable):
+                self.runtime.verify_service_inventory(plan)
+
+    def test_recover_checks_old_side_with_the_recovered_plan_fingerprint(self):
+        import copy
+
+        original = self.takeover_plan()
+        x = original["config_sha256"]
+        original_path = self.root / (original["id"] + ".plan.json")
+        state.atomic_write(original_path, original)
+        state.atomic_write(
+            self.marker,
+            {"id": original["id"], "plan_sha256": state.fingerprint(original), "status": "running"},
+        )
+        recovery = copy.deepcopy(original)
+        recovery.update(
+            id="synthetic-recovery",
+            operation="recover",
+            recovery_of={"id": original["id"], "plan_sha256": state.fingerprint(original)},
+            old=original["new"],
+            new=original["old"],
+        )
+        # 本计划自己的 recovery.config_sha256 不是 old 侧依据：故意写成别的值。
+        recovery["recovery"]["config_sha256"] = "7" * 64
+        state.atomic_write(self.root / (recovery["id"] + ".state.json"), {"stages": {}})
+        current = self.labeled_services(original["new"], x)
+        with patch.object(self.runtime, "containers", return_value=current):
+            self.assertEqual(
+                self.runtime.verify_service_inventory(recovery),
+                {"old_verified_sha256": x, "old_source": original["id"], "new_sha256": x},
+            )
+            original_path.unlink()
+            with self.assertRaisesRegex(
+                state.DeployError, "^previous_verified_configuration_unavailable$"
+            ):
+                self.runtime.verify_service_inventory(recovery)
 
     def test_missing_business_modules_report_unavailable_without_starting_services(self):
         with patch.object(self.runtime, "docker", return_value=(1, "")) as docker:

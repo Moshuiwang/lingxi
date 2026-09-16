@@ -361,7 +361,9 @@ def execute(plan, approval, store, runtime, *, now=None):
         state["status"] = "running"
         store.save(plan, state)
         try:
-            runtime.preflight(plan)
+            # 两侧配置指纹先落阶段账再写在途标记：标记一旦指向本计划，接续只从这条记录取旧值。
+            state["inventory"] = runtime.preflight(plan)
+            store.save(plan, state)
             atomic_write(
                 active_path,
                 {"id": plan["id"], "plan_sha256": fingerprint(plan), "status": "running"},
@@ -512,7 +514,24 @@ def resume_migration(plan, approval, store, runtime, acknowledge, *, now=None):
             runtime.lock_fd = None
 
 
-def preview(plan, host, config):
+def configuration_summary(plan, host, store):
+    """批准前把两侧配置指纹分开列出：old 取部署器账里上一次 verified 的值，new 取本计划。
+
+    只展示不裁决：旧值此刻取不到记 ``unavailable``，apply 时由 preflight 失败关闭。
+    """
+    marker = Path(host["lock_path"]).with_suffix(".active.json")
+    try:
+        old_sha, old_source = store.old_configuration(marker, plan, store.state(plan))
+    except (DeployError, OSError):
+        old_sha, old_source = None, "unavailable"
+    return {
+        "old_verified_sha256": old_sha,
+        "old_source": old_source,
+        "new_sha256": plan["config_sha256"],
+    }
+
+
+def preview(plan, host, config, store):
     """差异、窗口和恢复材料在批准前集中展示。"""
     changes = [
         {
@@ -537,6 +556,7 @@ def preview(plan, host, config):
             )
         },
         "public_configuration": config,
+        "configuration": configuration_summary(plan, host, store),
         "deployment_id": plan["id"],
         "environment": plan["environment"],
         "image_changes": changes,
@@ -587,7 +607,7 @@ def main():
                 {
                     "plan": plan,
                     "plan_sha256": fingerprint(plan),
-                    "summary": preview(plan, host, config),
+                    "summary": preview(plan, host, config, store),
                 }
             ).decode(),
             end="",

@@ -20,6 +20,9 @@ sys.path.insert(0, str(ROOT / "deploy"))
 bundle = importlib.import_module("control_bundle")
 state = importlib.import_module("deploy_state")
 deploy = importlib.import_module("lingxi_deploy")
+# 与 deploy 在同一时刻取同一份模块对象：别的测试模块会按路径重登记这几个无包名模块，
+# 运行期再 import 会拿到另一份、异常类也就对不上。
+runtime_module = importlib.import_module("deploy_runtime")
 
 
 def package(root, files=None):
@@ -175,7 +178,12 @@ class FakeRuntime:
         self.kill_before = None
 
     def preflight(self, plan):
-        pass
+        # 与真实 preflight 同形：返回两侧配置指纹，execute 把它记进阶段账。
+        return {
+            "old_verified_sha256": None,
+            "old_source": "first_takeover",
+            "new_sha256": plan["config_sha256"],
+        }
 
     def check_revocation(self, plan):
         pass
@@ -348,6 +356,15 @@ class DeployTests(unittest.TestCase):
         self.assertFalse((self.root / "not-created").exists())
         self.assertEqual(
             before, {str(p): p.read_bytes() for p in self.root.rglob("*") if p.is_file()}
+        )
+        # 摘要把两侧配置指纹分开列出：本机没有在途标记，old 侧是首次接管、没有旧值。
+        self.assertEqual(
+            json.loads(result.stdout)["summary"]["configuration"],
+            {
+                "old_verified_sha256": None,
+                "old_source": "first_takeover",
+                "new_sha256": self.plan["config_sha256"],
+            },
         )
 
     def test_public_config_is_read_as_public_file_and_private_inputs_stay_private(self):
@@ -608,6 +625,216 @@ class DeployRecoveryTests(unittest.TestCase):
             broken["recovery"]["historical"][key] = value
             with self.assertRaises(state.DeployError):
                 deploy.validate_plan(broken, self.host, self.config)
+
+
+class ConfigurationFingerprintTests(unittest.TestCase):
+    """部署链 old / new 配置指纹分离：old 侧只取部署器账里上一次 verified 计划给容器打的标签值，
+    new 侧取本计划的当前 public-config 指纹；假世界跑各阶段，preflight 用真实的服务清单核对。"""
+
+    UNAVAILABLE = "^previous_verified_configuration_unavailable$"
+
+    def setUp(self):
+        DeployTests.setUp(self)
+        self.marker = Path(self.host["lock_path"]).with_suffix(".active.json")
+        self.x = self.plan["config_sha256"]
+        self.y = state.fingerprint(dict(self.config, values={"LINGXI_WORKER_MAX_CONCURRENCY": "2"}))
+
+    def inventory_runtime(self, services):
+        """假世界执行各阶段，preflight 换成真实的服务清单核对；容器由用例给定、可中途换。"""
+        real = runtime_module.Runtime(self.host, self.config)
+        real.state_directory = self.store.root
+        runtime = FakeRuntime(self.host)
+        runtime.services = services
+
+        def preflight(plan):
+            with patch.object(real, "containers", return_value=runtime.services):
+                return real.verify_service_inventory(plan)
+
+        runtime.preflight = preflight
+        return runtime
+
+    def labeled(self, release, config_sha):
+        """部署器自己起过的容器：镜像来自 release，两枚标签是那次部署写下的配置与控制包摘要。"""
+        return {
+            name: {
+                "image": release["images"]["worker" if name == "worker-queue" else name],
+                "config_sha256": config_sha,
+                "bundle_sha256": release["control_bundle"]["sha256"],
+            }
+            for name in runtime_module.SERVICES
+        }
+
+    def next_plan(self, config_sha):
+        """版本 B 的计划：new 侧换镜像；config_sha256 与代理写进请求的 recovery.config_sha256
+        都是当前 public-config 指纹——后者正是此前被误当成旧容器标签值去核对的那个字段。"""
+        import copy
+
+        plan = copy.deepcopy(self.plan)
+        plan["id"] = "synthetic-next"
+        plan["config_sha256"] = config_sha
+        plan["recovery"]["config_sha256"] = config_sha
+        # fixture 的 old 与 new 是同一个对象：先拆开再改 new 侧。
+        plan["new"] = copy.deepcopy(plan["new"])
+        for service, image in plan["new"]["images"].items():
+            plan["new"]["images"][service] = image.replace("c" * 64, "d" * 64)
+        self.store.save_plan(plan)
+        approval = dict(self.approval, plan_id=plan["id"], plan_sha256=state.fingerprint(plan))
+        return plan, approval
+
+    def verified_marker(self, plan):
+        return {"id": plan["id"], "plan_sha256": state.fingerprint(plan), "status": "verified"}
+
+    def test_changed_public_config_no_longer_blocks_the_next_version(self):
+        """版本 A 部署（配置指纹 X）→ verified → 人工把 public-config 改成 Y → 版本 B 计划
+        （config_sha256 = Y）：preflight 以 X 核 old 侧运行容器、以 Y 描述 new 侧，各阶段照常进入。"""
+        deploy.execute(self.plan, self.approval, self.store, self.runtime)
+        self.assertEqual(state.read_json(self.marker), self.verified_marker(self.plan))
+        plan, approval = self.next_plan(self.y)
+        self.assertNotEqual(plan["recovery"]["config_sha256"], self.x)
+        runtime = self.inventory_runtime(self.labeled(self.plan["new"], self.x))
+        result = deploy.execute(plan, approval, self.store, runtime)
+        self.assertEqual(result["status"], "verified")
+        self.assertEqual(runtime.calls, list(deploy.STAGES))
+        self.assertEqual(
+            result["inventory"],
+            {"old_verified_sha256": self.x, "old_source": self.plan["id"], "new_sha256": self.y},
+        )
+        self.assertEqual(state.read_json(self.marker), self.verified_marker(plan))
+
+    def test_missing_or_altered_previous_plan_fails_closed_before_any_stage(self):
+        """上一次 verified 的计划文件缺失或被改（指纹不再等于标记）：新码零动作，标记与容器都不动，
+        阶段账记 failed 且没有两侧指纹记录。"""
+        deploy.execute(self.plan, self.approval, self.store, self.runtime)
+        plan, approval = self.next_plan(self.y)
+        runtime = self.inventory_runtime(self.labeled(self.plan["new"], self.x))
+        previous_path = self.store.path(self.plan["id"], "plan")
+        for label, action in (
+            ("missing", previous_path.unlink),
+            ("altered", lambda: state.atomic_write(previous_path, dict(self.plan, id=plan["id"]))),
+        ):
+            action()
+            with self.subTest(previous=label):
+                with self.assertRaisesRegex(state.DeployError, self.UNAVAILABLE):
+                    deploy.execute(plan, approval, self.store, runtime)
+                self.assertEqual(runtime.calls, [])
+                record = self.store.state(plan)
+                self.assertEqual(record["status"], "failed")
+                self.assertEqual(record["error"], "previous_verified_configuration_unavailable")
+                self.assertNotIn("inventory", record)
+                self.assertEqual(state.read_json(self.marker), self.verified_marker(self.plan))
+
+    def test_continuation_takes_old_side_from_the_recorded_inventory(self):
+        """B 在 start 阶段中断后接续：标记已指向 B，old 侧只从 B 阶段账记下的 X 取；记录缺失
+        即失败关闭，不重新推算、不回落到当前配置。"""
+        deploy.execute(self.plan, self.approval, self.store, self.runtime)
+        plan, approval = self.next_plan(self.y)
+        old_services = self.labeled(self.plan["new"], self.x)
+        runtime = self.inventory_runtime(old_services)
+        runtime.crash = "start"
+        with self.assertRaises(state.UnknownError):
+            deploy.execute(plan, approval, self.store, runtime)
+        self.assertEqual(state.read_json(self.marker)["status"], "running")
+        expected = {
+            "old_verified_sha256": self.x,
+            "old_source": self.plan["id"],
+            "new_sha256": self.y,
+        }
+        self.assertEqual(self.store.state(plan)["inventory"], expected)
+        # 首个服务已更新：gateway 带 new 侧标签，其余仍是 X 标签的旧容器。
+        runtime.services = dict(
+            old_services,
+            gateway={
+                "image": plan["new"]["images"]["gateway"],
+                "config_sha256": self.y,
+                "bundle_sha256": plan["new"]["control_bundle"]["sha256"],
+            },
+        )
+        runtime.crash = None
+        raw, record = self.store.load(plan)
+        del record["inventory"]
+        self.store.save(plan, record)
+        calls = runtime.calls[:]
+        with self.assertRaisesRegex(state.DeployError, self.UNAVAILABLE):
+            deploy.execute(plan, approval, self.store, runtime)
+        self.assertEqual(runtime.calls, calls)
+        record["inventory"] = expected
+        self.store.save(plan, record)
+        result = deploy.execute(plan, approval, self.store, runtime)
+        self.assertEqual(result["status"], "verified")
+        self.assertEqual(result["inventory"], expected)
+        self.assertEqual(runtime.calls.count("start"), 2)
+
+    def test_recover_checks_old_side_with_the_recovered_plan_fingerprint(self):
+        """recover 的 old 侧 = 被恢复计划 B 的 config_sha256（B 给容器打的标签值 Y）；中断后配置
+        又改成 Z 的 recover 仍按既有 recovery_package_changed 规则拒绝。"""
+        deploy.execute(self.plan, self.approval, self.store, self.runtime)
+        plan, approval = self.next_plan(self.y)
+        runtime = self.inventory_runtime(self.labeled(self.plan["new"], self.x))
+        runtime.crash = "start"
+        with self.assertRaises(state.UnknownError):
+            deploy.execute(plan, approval, self.store, runtime)
+        recovery = dict(
+            plan,
+            id="synthetic-recovery",
+            operation="recover",
+            recovery_of={"id": plan["id"], "plan_sha256": state.fingerprint(plan)},
+            old=plan["new"],
+            new=plan["old"],
+            current_heads=runtime.heads,
+            # 本计划自己的 recovery.config_sha256 不是 old 侧依据：故意写成别的值。
+            recovery=dict(
+                plan["recovery"],
+                target_manifest_sha256=state.fingerprint(plan["old"]),
+                config_sha256="7" * 64,
+            ),
+        )
+        self.store.save_plan(recovery)
+        recovery_approval = dict(
+            approval,
+            plan_id=recovery["id"],
+            operation="recover",
+            plan_sha256=state.fingerprint(recovery),
+        )
+        runtime.services = self.labeled(plan["new"], self.y)
+        runtime.crash = None
+        runtime.done.clear()
+        runtime.calls.clear()
+        result = deploy.execute(recovery, recovery_approval, self.store, runtime)
+        self.assertEqual(result["status"], "verified")
+        self.assertNotIn("migrate", runtime.calls)
+        self.assertEqual(
+            result["inventory"],
+            {"old_verified_sha256": self.y, "old_source": plan["id"], "new_sha256": self.y},
+        )
+        changed = dict(recovery, id="synthetic-recovery-z", config_sha256="3" * 64)
+        self.store.save_plan(changed)
+        changed_approval = dict(
+            recovery_approval, plan_id=changed["id"], plan_sha256=state.fingerprint(changed)
+        )
+        calls = runtime.calls[:]
+        with self.assertRaisesRegex(state.DeployError, "^recovery_package_changed$"):
+            deploy.execute(changed, changed_approval, self.store, runtime)
+        self.assertEqual(runtime.calls, calls)
+
+    def test_preview_lists_old_and_new_fingerprints_and_only_reports_unavailable(self):
+        """plan 摘要把两侧指纹分开列出：首次接管 / 上一次 verified 计划 / 读不到时只如实标
+        unavailable 不裁决（裁决在 apply 的 preflight）。"""
+        first = deploy.preview(self.plan, self.host, self.config, self.store)["configuration"]
+        self.assertEqual(
+            first,
+            {"old_verified_sha256": None, "old_source": "first_takeover", "new_sha256": self.x},
+        )
+        deploy.execute(self.plan, self.approval, self.store, self.runtime)
+        plan, _ = self.next_plan(self.y)
+        self.assertEqual(
+            deploy.preview(plan, self.host, self.config, self.store)["configuration"],
+            {"old_verified_sha256": self.x, "old_source": self.plan["id"], "new_sha256": self.y},
+        )
+        self.store.path(self.plan["id"], "plan").unlink()
+        self.assertEqual(
+            deploy.preview(plan, self.host, self.config, self.store)["configuration"],
+            {"old_verified_sha256": None, "old_source": "unavailable", "new_sha256": self.y},
+        )
 
 
 class MigrationResumeTests(unittest.TestCase):
@@ -873,6 +1100,15 @@ class MigrationResumeCliTests(unittest.TestCase):
         raw = self.store.path(self.plan["id"], "state").read_bytes()
         self.assertEqual(status["state_sha256"], hashlib.sha256(raw).hexdigest())
         self.assertEqual(status["stages"]["migrate"]["status"], "running")
+        # preflight 通过时记下的两侧配置指纹随阶段账一起读出。
+        self.assertEqual(
+            status["inventory"],
+            {
+                "old_verified_sha256": None,
+                "old_source": "first_takeover",
+                "new_sha256": self.plan["config_sha256"],
+            },
+        )
         self.assertIsNone(status["actual"]["job"])
         self.assertEqual(status["status"], "unknown")
         # 指纹不对：退出码 1，stderr 只有结果码，阶段账逐字不变。
