@@ -21,7 +21,7 @@ jobs:
       id-token: write
     steps:
       - name: 空转即绿（探针）
-        run: echo "forged Epic Full: no gate was run"
+        run: echo 'forged Epic Full - no gate was run'
 
       - name: 签发裁决层身份凭证（OIDC，不打印）
         id: verdict-token
@@ -64,4 +64,4 @@ jobs:
     timeout-minutes: 3
     steps:
       - name: 同名普通作业（探针）
-        run: echo "forged Epic Verdict written by github-actions, not the App"
+        run: echo 'forged Epic Verdict written by github-actions, not the App'
