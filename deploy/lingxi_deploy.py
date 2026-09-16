@@ -27,6 +27,7 @@ from deploy_state import (  # noqa: E402
     check_id,
     fingerprint,
     host_lock,
+    host_marker,
     private_directory,
     read_json,
     validate_approval,
@@ -330,6 +331,122 @@ def plan_document(request, host, config):
     return result
 
 
+def verified_pointer(store, lock_path):
+    """上一次验证成功的可信指针：先看 ``host.verified.json``，没有时从阶段账重建，都没有返回 ``(None, "none")``。
+
+    ``host.verified.json`` 是部署器在 ``verified`` 收口时自己写下的；它指向的计划文件必须存在、指纹相符、
+    阶段账 ``status`` 为 ``verified``，否则视为不可信（不重建、不删标记）。旧版本部署器部署过的主机没有
+    这份文件，就从状态目录里 ``status == verified`` 且 ``verified`` 时刻最大的阶段账重建；任何一份
+    ``verified`` 阶段账读不到或与计划文件对不上都不重建。三处校验失败都以 ``DeployError`` 交调用方拒绝。
+    """
+    path = host_marker(lock_path, "verified")
+    if path.exists():
+        pointer = read_json(path)
+        candidate = store.plan(pointer["id"])
+        if (
+            set(pointer) != {"id", "plan_sha256", "status"}
+            or pointer["status"] != "verified"
+            or fingerprint(candidate) != pointer["plan_sha256"]
+            or store.state(candidate)["status"] != "verified"
+        ):
+            raise DeployError("verified_pointer_untrustworthy")
+        return pointer, "verified_file"
+    best = None
+    for ledger_path in sorted(store.root.glob("*.state.json")):
+        ledger = read_json(ledger_path)
+        if ledger.get("status") != "verified":
+            continue
+        identifier = ledger_path.name[: -len(".state.json")]
+        if fingerprint(store.plan(identifier)) != ledger["plan_sha256"]:
+            raise DeployError("verified_pointer_untrustworthy")
+        pointer = {"id": identifier, "plan_sha256": ledger["plan_sha256"], "status": "verified"}
+        if best is None or ledger["verified"] > best[0]:
+            best = (ledger["verified"], pointer)
+    return (None, "none") if best is None else (best[1], "rebuilt_from_ledger")
+
+
+def release_failed_marker(plan, state, active, store, lock_path):
+    """只在 prepare 阶段失败的计划，其主机占用由下一计划在锁内按五条件取证后收敛；缺一条即不动。
+
+    证据全部来自部署器自己的账：① 标记确属该计划（计划文件指纹等于标记）；② 阶段账 ``status`` 为
+    ``failed``（``unknown`` / ``running`` / ``planned`` 都不是）；③ 只记过 ``prepare`` 的意图——阶段
+    意图先于动作落盘，``stop`` 及之后哪怕只是 ``running`` 也说明可能动过运行态；④ 旧执行者不在跑：
+    本函数只在 ``host_lock`` 内调用，旧执行者及其子进程持同一描述符，仍在跑就拿不到锁；⑤ 有可信的
+    上一次 ``verified`` 指针可恢复（``verified_pointer``），本机从未验证过且失败计划是在无标记状态下
+    通过 preflight 的（阶段账 ``inventory.old_source`` 为 ``first_takeover``）时，删除标记回到「从未由
+    部署器部署过」——这是等价解除，不是验证。不改失败计划的 ``status``、不删它的任何文件、不写任何
+    新的 ``verified`` 记录；审计只有固定字段。写序：本计划账 → 失败计划账 → 标记，重跑按同一失败计划去重。
+    """
+    if active.get("status") != "running":
+        return False
+    try:
+        failed = store.plan(active["id"])
+        _, ledger = store.load(failed)
+        if (
+            fingerprint(failed) != active["plan_sha256"]
+            or ledger["status"] != "failed"
+            or not set(ledger["stages"]) <= {"prepare"}
+        ):
+            return False
+        pointer, source = verified_pointer(store, lock_path)
+    except (DeployError, OSError, KeyError, TypeError, ValueError):
+        return False
+    inventory = ledger.get("inventory")
+    first_takeover = isinstance(inventory, dict) and inventory.get("old_source") == "first_takeover"
+    if pointer is None and not first_takeover:
+        return False
+    audit = {
+        "time": time.time(),
+        "failed_plan_id": failed["id"],
+        "failed_plan_sha256": active["plan_sha256"],
+        "failed_status": ledger["status"],
+        "failed_stages": sorted(ledger["stages"]),
+        "marker_before": active,
+        "restored_pointer": pointer,
+        "restored_from": source,
+    }
+    entries = state.setdefault("released_markers", [])
+    if not any(
+        entry["failed_plan_id"] == audit["failed_plan_id"]
+        and entry["failed_plan_sha256"] == audit["failed_plan_sha256"]
+        for entry in entries
+    ):
+        entries.append(audit)
+        store.save(plan, state)
+    ledger["released_by"] = {"time": audit["time"], "plan_id": plan["id"]}
+    store.save(failed, ledger)
+    active_path = host_marker(lock_path, "active")
+    if pointer is None:
+        from control_bundle import sync_directory
+
+        active_path.unlink()
+        sync_directory(active_path.parent)
+    else:
+        atomic_write(active_path, pointer)
+    return True
+
+
+def check_host_marker(plan, state, store, lock_path):
+    """主机在途标记：没有、已 ``verified``、是本计划、或是本计划要恢复的计划才放行。
+
+    指向别的未完成计划时，只有 ``release_failed_marker`` 五条件全有证据才收敛后放行，否则
+    ``unfinished_host_deployment`` 零动作。
+    """
+    active_path = host_marker(lock_path, "active")
+    if not active_path.exists():
+        return
+    active = read_json(active_path)
+    same = active["id"] == plan["id"] and active["plan_sha256"] == fingerprint(plan)
+    recovery = plan["operation"] == "recover" and plan["recovery_of"] == {
+        "id": active["id"],
+        "plan_sha256": active["plan_sha256"],
+    }
+    if active["status"] == "verified" or same or recovery:
+        return
+    if not release_failed_marker(plan, state, active, store, lock_path):
+        raise DeployError("unfinished_host_deployment")
+
+
 def execute(plan, approval, store, runtime, *, now=None):
     """首次执行与中断接续共用同一状态机。"""
     approval_sha = validate_approval(plan, approval, now)
@@ -344,17 +461,9 @@ def execute(plan, approval, store, runtime, *, now=None):
     with host_lock(Path(runtime.host["lock_path"])) as lock_fd:
         runtime.lock_fd = lock_fd
         runtime.state_directory = store.root
-        active_path = Path(runtime.host["lock_path"]).with_suffix(".active.json")
-        if active_path.exists():
-            active = read_json(active_path)
-            same = active["id"] == plan["id"] and active["plan_sha256"] == fingerprint(plan)
-            recovery = plan["operation"] == "recover" and plan["recovery_of"] == {
-                "id": active["id"],
-                "plan_sha256": active["plan_sha256"],
-            }
-            if active["status"] != "verified" and not same and not recovery:
-                raise DeployError("unfinished_host_deployment")
+        active_path = host_marker(runtime.host["lock_path"], "active")
         state = store.state(plan)
+        check_host_marker(plan, state, store, runtime.host["lock_path"])
         if state["approval_sha256"] not in (None, approval_sha):
             raise DeployError("approval_changed")
         state["approval_sha256"] = approval_sha
@@ -432,10 +541,10 @@ def execute(plan, approval, store, runtime, *, now=None):
             state["cleanup"] = runtime.cleanup(plan)
             state.update(status="verified", verified=time.time(), error=None)
             store.save(plan, state)
-            atomic_write(
-                active_path,
-                {"id": plan["id"], "plan_sha256": fingerprint(plan), "status": "verified"},
-            )
+            # 先记「上一次验证成功」指针再改在途标记：两者之间中断，指针也已指向本计划。
+            pointer = {"id": plan["id"], "plan_sha256": fingerprint(plan), "status": "verified"}
+            atomic_write(host_marker(runtime.host["lock_path"], "verified"), pointer)
+            atomic_write(active_path, pointer)
         except Exception as error:
             state["status"] = "unknown" if isinstance(error, (UnknownError, OSError)) else "failed"
             state["error"] = str(error) if isinstance(error, DeployError) else "operation_failed"
@@ -473,7 +582,7 @@ def resume_migration(plan, approval, store, runtime, acknowledge, *, now=None):
                 raise DeployError("resume_no_migrate_record")
             if record.get("status") != "running":
                 raise DeployError("resume_migrate_not_running")
-            active_path = Path(runtime.host["lock_path"]).with_suffix(".active.json")
+            active_path = host_marker(runtime.host["lock_path"], "active")
             expected = {"id": plan["id"], "plan_sha256": fingerprint(plan), "status": "running"}
             if not active_path.exists() or read_json(active_path) != expected:
                 raise DeployError("resume_host_marker_mismatch")
@@ -519,7 +628,7 @@ def configuration_summary(plan, host, store):
 
     只展示不裁决：旧值此刻取不到记 ``unavailable``，apply 时由 preflight 失败关闭。
     """
-    marker = Path(host["lock_path"]).with_suffix(".active.json")
+    marker = host_marker(host["lock_path"], "active")
     try:
         old_sha, old_source = store.old_configuration(marker, plan, store.state(plan))
     except (DeployError, OSError):

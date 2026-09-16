@@ -29,6 +29,7 @@ from deploy_state import (
     UnknownError,
     atomic_write,
     fingerprint,
+    host_marker,
     read_json,
 )
 
@@ -283,9 +284,8 @@ class Runtime:
         本机已由部署器部署过之后再出现的无标签容器不可能是「接管前的旧服务」，按原规则拒绝。
         """
         ledger = read_json(self.state_directory / (plan["id"] + ".state.json"))
-        marker = Path(self.host["lock_path"]).with_suffix(".active.json")
         old_sha, old_source = StateStore(self.state_directory).old_configuration(
-            marker, plan, ledger
+            host_marker(self.host["lock_path"], "active"), plan, ledger
         )
         first_takeover = old_source == "first_takeover"
         current = self.containers(plan["project"])

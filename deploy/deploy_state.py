@@ -52,6 +52,11 @@ def check_id(value):
     return value
 
 
+def host_marker(lock_path, kind):
+    """主机锁同目录的两份指针：``active``（在途 / 已验证的当前占用）与 ``verified``（上一次验证成功）。"""
+    return Path(lock_path).with_suffix(f".{kind}.json")
+
+
 def private_directory(root: Path, *, create=False):
     """部署账限制为当前部署主体可访问。"""
     if create:
