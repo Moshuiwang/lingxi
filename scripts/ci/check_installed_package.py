@@ -127,6 +127,7 @@ REQUIRED_MODULES = (
     # `adapters/postgres_stalled_provisioning.py` 都在模块级 import 它，随
     # `onboarding_runner.py` 同一条发布理由。
     "lingxi.core.identity.preprovision",
+    "lingxi.core.identity.email_resolver",
     # 上面那道邮箱闸的只读回读口（`app_user` 规范化邮箱 → user_id）。由
     # `_build_onboarding_duty` 在函数内 import，同 `postgres_onboarding_failure`
     # 一条理由：函数内 import 证明不了它装得上，必须显式登记。
