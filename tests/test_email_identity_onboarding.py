@@ -149,6 +149,31 @@ class EmailIdentityOnboardingTests(unittest.TestCase):
         self.assertEqual(parts["legacy_importer"].calls, [])
         self.assert_no_grant(parts)
 
+    def test_a_current_unique_person_still_cannot_claim_an_unattributed_old_row(self):
+        """旧人员已不在快照也不能让当前唯一候选继承同邮箱旧令牌或权限。"""
+
+        stock = FakeStockTokens(
+            StockTokenLookup(
+                ADOPTABLE, secret="synthetic-old-secret", permissions='{"88":["旧表指标"]}'
+            )
+        )
+        for entry in ("first_chat", "preprovision"):
+            with self.subTest(entry=entry):
+                runner, parts = build_runner(roster=FakeRoster(ROSTER_ROWS), stock_tokens=stock)
+                if entry == "first_chat":
+                    runner.start(event_id="trusted-event", open_id=OPEN_ID, trace_id="trusted-test")
+                    reason = parts["audit"].facts("onboarding.result")["failure_reason"]
+                else:
+                    result = runner.start_system(
+                        email=ROSTER_ROWS[0]["email"],
+                        trace_id="preprovision-test",
+                        initiated_by_open_id=INITIATED_BY,
+                    )
+                    reason = result.failure_reason
+                self.assertEqual(reason, "stock_token_identity_unresolved")
+                self.assertEqual(parts["legacy_importer"].calls, [])
+                self.assert_no_grant(parts)
+
     def test_trusted_primary_key_path_does_not_select_another_email_identity(self):
         runner, parts = build_runner(roster=FakeRoster(ROWS))
         runner.start(event_id="trusted-event", open_id=OPEN_ID, trace_id="trusted-test")

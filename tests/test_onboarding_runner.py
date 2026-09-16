@@ -1617,12 +1617,7 @@ class InternalFaultTests(unittest.TestCase):
 
 
 class StockTokenAdoptionTests(unittest.TestCase):
-    """`V-开通-24`：存量令牌 adopt-or-issue（Issue #281 改道，2026-08-25 裁定）。
-
-    rc25 S-1 起可采纳的查找结果必须带 ``permissions`` 原文（存量差集导入的输入）；这里
-    统一给空对象 ``{}``（旧行没有任何权限 → 没有可导入的内容），差集导入本身的断言见
-    ``LegacyPermissionImportTests``。
-    """
+    """`V-开通-24`：旧正式表行没有独立历史归属证据时关闭自动迁入。"""
 
     EMAIL = "Xiaoming@Example.com"  # 与 ROSTER_ROWS[0]["email"] 同源，见模块顶部 fixture。
 
@@ -1642,79 +1637,57 @@ class StockTokenAdoptionTests(unittest.TestCase):
         self.assertEqual(parts["tokens"].adopt_calls, [])
         self.assertEqual(parts["audit"].facts("onboarding.stock_token_absent")["state"], NO_ROW)
 
-    def test_no_cipher_falls_back_to_issuing_a_new_token(self) -> None:
-        stock = FakeStockTokens(StockTokenLookup(state=NO_CIPHER, status="pending"))
-        parts, _ = run_once(stock_tokens=stock)
-        self.assertEqual(parts["tokens"].calls, [USER_ID])
-        self.assertEqual(parts["tokens"].adopt_calls, [])
-        self.assertEqual(parts["audit"].facts("onboarding.stock_token_absent")["state"], NO_CIPHER)
+    def test_any_existing_row_without_historical_identity_proof_is_refused(self) -> None:
+        for lookup in (
+            StockTokenLookup(
+                state=NO_CIPHER, status="pending", permissions='{"88":["仍在旧行的权限"]}'
+            ),
+            StockTokenLookup(state=DECRYPT_FAILED, status="approved"),
+            StockTokenLookup(
+                state=ADOPTABLE,
+                secret="stock-plaintext-secret",
+                status="approved",
+                permissions='{"88":["旧表指标"]}',
+            ),
+        ):
+            with self.subTest(state=lookup.state):
+                parts, _ = run_once(stock_tokens=FakeStockTokens(lookup))
+                result = parts["audit"].facts("onboarding.result")
+                self.assertEqual(result["state"], "internal_error")
+                self.assertEqual(result["failure_reason"], "stock_token_identity_unresolved")
+                self.assertEqual(parts["notifier"].terminal()[1], KEY_INTERNAL_ERROR)
+                self.assertEqual(parts["legacy_importer"].calls, [])
+                self.assertEqual(parts["tokens"].calls, [])
+                self.assertEqual(parts["tokens"].adopt_calls, [])
+                self.assertEqual(parts["environment"].calls, [])
+                self.assertEqual(parts["decisions"].rows, [])
 
-    def test_adoptable_secret_is_adopted_instead_of_issuing_a_new_one(self) -> None:
-        secret = "stock-plaintext-secret"
-        stock = FakeStockTokens(
-            StockTokenLookup(state=ADOPTABLE, secret=secret, status="approved", permissions="{}")
-        )
-        parts, _ = run_once(stock_tokens=stock)
-        self.assertEqual(parts["tokens"].calls, [], "有可用存量密文时不该再签新")
-        self.assertEqual(parts["tokens"].adopt_calls, [(USER_ID, secret)])
-        self.assertEqual(
-            parts["environment"].tokens, [secret], "落进用户环境的必须是采纳的那份明文"
-        )
-        self.assertEqual(
-            parts["audit"].facts("onboarding.stock_token_adopted")["status_approved"], True
-        )
-
-    def test_adopting_an_existing_row_is_audited_distinctly_from_a_fresh_adoption(self) -> None:
-        """幂等：库里已经有这个用户的令牌行时，审计动作名必须与"首次采纳"可分辨。"""
-
-        secret = "stock-plaintext-secret"
-        stock = FakeStockTokens(StockTokenLookup(state=ADOPTABLE, secret=secret, permissions="{}"))
-        parts, _ = run_once(stock_tokens=stock, tokens=FakeTokens(adopt_created=False))
-        self.assertEqual(parts["tokens"].adopt_calls, [(USER_ID, secret)])
-        self.assertIn("onboarding.stock_token_existing_kept", parts["audit"].actions())
-        self.assertNotIn("onboarding.stock_token_adopted", parts["audit"].actions())
-
-    def test_decrypt_failure_is_a_loud_failure_never_a_fallback_to_issuing_new(self) -> None:
-        """否定断言（#281 改道裁定）：解密失败必须响亮失败（`LX-ONBOARD-001`），
-        **绝不**退回签新——签新会让用户环境令牌与正式表令牌错位，造成真实 MCP 认证
-        静默失败。"""
-
-        stock = FakeStockTokens(StockTokenLookup(state=DECRYPT_FAILED, status="approved"))
-        parts, result = run_once(stock_tokens=stock)
-        self.assertEqual(parts["audit"].facts("onboarding.result")["state"], "internal_error")
-        self.assertEqual(
-            parts["audit"].facts("onboarding.result")["failure_reason"],
-            "stock_token_decrypt_failed",
-        )
-        self.assertEqual(parts["notifier"].terminal()[1], KEY_INTERNAL_ERROR)
-        self.assertEqual(parts["tokens"].calls, [], "解密失败绝不能回退签新")
-        self.assertEqual(parts["tokens"].adopt_calls, [])
-        self.assertEqual(parts["environment"].calls, [], "没有可用令牌，环境不该被创建")
-        self.assertEqual(parts["decisions"].rows, [], "没有可用令牌，权限不该被发布")
-        self.assertIn("onboarding.stock_token_decrypt_failed", parts["audit"].actions())
-
-    def test_non_approved_status_is_annotated_but_does_not_block_adoption(self) -> None:
-        """权限面由银河同步权威决定，不由本步裁量——非 approved 只审计标注，仍然采纳。"""
-
-        secret = "stock-plaintext-secret"
-        stock = FakeStockTokens(
-            StockTokenLookup(state=ADOPTABLE, secret=secret, status="pending", permissions="{}")
-        )
-        parts, _ = run_once(stock_tokens=stock)
-        self.assertEqual(parts["tokens"].adopt_calls, [(USER_ID, secret)], "非 approved 不阻止采纳")
-        self.assertEqual(
-            parts["audit"].facts("onboarding.stock_token_adopted")["status_approved"], False
-        )
-
-    def test_blank_status_counts_as_approved(self) -> None:
-        secret = "stock-plaintext-secret"
-        stock = FakeStockTokens(
-            StockTokenLookup(state=ADOPTABLE, secret=secret, status="", permissions="{}")
-        )
-        parts, _ = run_once(stock_tokens=stock)
-        self.assertEqual(
-            parts["audit"].facts("onboarding.stock_token_adopted")["status_approved"], True
-        )
+    def test_an_already_active_user_finishes_before_reading_the_old_table(self) -> None:
+        for entry in ("first_chat", "preprovision"):
+            with self.subTest(entry=entry):
+                stock = FakeStockTokens(
+                    StockTokenLookup(
+                        state=ADOPTABLE, secret="unused", permissions='{"88":["旧权限"]}'
+                    )
+                )
+                runner, parts = build_runner(
+                    stock_tokens=stock,
+                    users=FakeUsers(UserProvisioningStatus("enabled", STATE_ACTIVE, 9)),
+                )
+                if entry == "first_chat":
+                    runner.start(event_id="active-event", open_id=OPEN_ID, trace_id="active-test")
+                    state = parts["audit"].facts("onboarding.result")["state"]
+                else:
+                    result = runner.start_system(
+                        email=ROSTER_ROWS[0]["email"],
+                        trace_id="active-preprovision-test",
+                        initiated_by_open_id=INITIATED_BY,
+                    )
+                    state = result.state.value
+                self.assertEqual(state, "completed")
+                self.assertEqual(stock.calls, [])
+                self.assertEqual(parts["tokens"].calls, [])
+                self.assertEqual(parts["tokens"].adopt_calls, [])
 
     def test_source_lookup_failure_is_an_internal_fault_not_a_business_rejection(self) -> None:
         stock = FakeStockTokens(RuntimeError("源端不可用"))
@@ -1735,15 +1708,7 @@ class StockTokenAdoptionTests(unittest.TestCase):
 
 
 class LegacyPermissionImportTests(unittest.TestCase):
-    """存量用户首聊差集导入（rc25 S-1，Issue #540，`V-权限-17`）：正式表已有其行且密文可采纳
-    时，把「旧行权限 − 银河当前翻译」经导入口落成本地授权，挂在零银河判定**之前**；形状
-    不受支持 / 原文解析失败 / 导入口失败一律 fail-closed（外部表零写入）。
-
-    变异锚点：① 把 `_run` 里 `_import_legacy_permissions` 调用挪到
-    `_reject_zero_galaxy_without_local_grant` 之后 →
-    ``test_a_zero_galaxy_legacy_user_is_admitted_by_the_imported_rows`` 变红；② 让
-    `_import_legacy_permissions` 吞掉导入口异常 →
-    ``test_importer_failure_fails_closed_with_zero_external_writes`` 变红。"""
+    """`V-权限-17`：无历史归属证据的旧权限不再自动导入。"""
 
     EMAIL = "Xiaoming@Example.com"
 
@@ -1754,167 +1719,46 @@ class LegacyPermissionImportTests(unittest.TestCase):
             )
         )
 
-    def test_specific_row_imports_only_the_difference(self) -> None:
-        """银河翻译给 88:销售分析；旧行多一个指标与一家映射外公司 → 只导这两对，无组。"""
-
-        importer = FakeLegacyImporter()
-        stock = self._adoptable('{"88":["销售分析","旧表指标"],"40":["旧表指标"]}')
-        parts, result = run_once(stock_tokens=stock, legacy_importer=importer)
-
-        self.assertIs(result.state, OnboardingState.STARTED)
-        self.assertEqual(parts["audit"].facts("onboarding.result")["state"], "completed")
-        self.assertEqual(len(importer.calls), 1)
-        call = importer.calls[0]
-        self.assertEqual(call["user_id"], USER_ID)
-        self.assertEqual(call["target_open_id"], OPEN_ID)
-        self.assertEqual(call["plan"].pairs, (("40", "旧表指标"), ("88", "旧表指标")))
-        self.assertEqual(call["plan"].all_scope_metrics, ())
-        facts = parts["audit"].facts("onboarding.legacy_permission_import")
-        self.assertEqual(facts["shape"], "specific")
-        self.assertEqual(facts["imported"], 2)
-        self.assertEqual(facts["unmapped_companies_kept"], 1)
-        self.assertEqual(facts["group_created"], False)
-        self.assertEqual(
-            (facts["group_skipped_revoked"], facts["revoked_skipped"]),
-            (False, 0),
-            "撤销跳过标志进审计",
-        )
-
-    def test_full_wildcard_row_becomes_one_all_scope_group(self) -> None:
-        importer = FakeLegacyImporter()
-        parts, result = run_once(
-            stock_tokens=self._adoptable('{"*":["*"]}'), legacy_importer=importer
-        )
-
-        self.assertEqual(parts["audit"].facts("onboarding.result")["state"], "completed")
-        plan = importer.calls[0]["plan"]
-        self.assertEqual(plan.shape, "full_wildcard")
-        self.assertEqual(plan.all_scope_metrics, ("销售分析",), "指标数 = 映射并集")
-        self.assertEqual(plan.pairs, ())
-        self.assertEqual(
-            parts["audit"].facts("onboarding.legacy_permission_import")["group_created"], True
-        )
-
-    def test_an_identical_row_imports_nothing_and_is_audited_as_skipped(self) -> None:
-        importer = FakeLegacyImporter()
-        parts, _ = run_once(
-            stock_tokens=self._adoptable('{"88":["销售分析"]}'), legacy_importer=importer
-        )
-
-        self.assertEqual(importer.calls, [], "差集为空时不调用导入口")
-        facts = parts["audit"].facts("onboarding.legacy_permission_import_skipped")
-        self.assertEqual(facts["reasons"], ["nothing_to_import"])
-        self.assertEqual(parts["audit"].facts("onboarding.result")["state"], "completed")
-
-    def test_a_zero_galaxy_legacy_user_is_admitted_by_the_imported_rows(self) -> None:
-        """变异锚点①：导入必须先于零银河判定，导入行经本地覆盖读回后放行。"""
-
-        importer = FakeLegacyImporter()
-        overrides = FakeLocalOverrides()
-
-        def import_plan(**kwargs: Any) -> Any:
-            report = FakeLegacyImporter.import_plan(importer, **kwargs)
-            # 模拟落库后本地覆盖表可读回这些行。
-            overrides._entries[USER_ID] = tuple(
-                _override_entry(company_id=company, metric_name=metric)
-                for company, metric in kwargs["plan"].pairs
-            )
-            return report
-
-        importer.import_plan = import_plan  # type: ignore[method-assign]
-        parts, result = run_once(
-            role_function_map={},
-            stock_tokens=self._adoptable('{"88":["旧表指标"]}'),
-            legacy_importer=importer,
-            local_overrides=overrides,
-        )
-
-        self.assertIs(result.state, OnboardingState.STARTED)
-        self.assertEqual(parts["audit"].facts("onboarding.result")["state"], "completed")
-        self.assertEqual(parts["decisions"].rows[0].permissions, '{"88":["旧表指标"]}')
-        self.assertEqual(parts["tokens"].adopt_calls, [(USER_ID, "stock-secret")])
-
-    def test_unsupported_wildcard_shape_fails_closed(self) -> None:
-        importer = FakeLegacyImporter()
-        parts, _ = run_once(stock_tokens=self._adoptable('{"88":["*"]}'), legacy_importer=importer)
-
-        facts = parts["audit"].facts("onboarding.result")
-        self.assertEqual(facts["state"], "internal_error")
-        self.assertEqual(facts["failure_reason"], "legacy_wildcard_shape_unsupported")
-        self.assertEqual(parts["notifier"].terminal()[1], KEY_INTERNAL_ERROR)
-        self.assertEqual(importer.calls, [])
-        self.assertEqual(parts["decisions"].rows, [], "外部表零写入")
-        self.assertEqual(parts["environment"].calls, [])
-        self.assertEqual(parts["tokens"].adopt_calls, [], "fail-closed 早于令牌采纳")
-
-    def test_a_blank_permissions_cell_imports_nothing(self) -> None:
-        """独立审核 P2-2：空白单元格没有任何会被发布覆盖的内容，按 ``{}`` 处理而不是
-        永久 fail-closed。"""
-
-        importer = FakeLegacyImporter()
-        parts, _ = run_once(stock_tokens=self._adoptable("   "), legacy_importer=importer)
-        self.assertEqual(importer.calls, [])
-        self.assertEqual(
-            parts["audit"].facts("onboarding.legacy_permission_import_skipped")["reasons"],
-            ["nothing_to_import"],
-        )
-        self.assertEqual(parts["audit"].facts("onboarding.result")["state"], "completed")
-
-    def test_unparseable_permissions_text_fails_closed(self) -> None:
-        for text in ("not json", "[]", '{"88":[" "]}'):
+    def test_old_permissions_of_every_shape_are_refused_before_import(self) -> None:
+        for text in (
+            '{"88":["销售分析","旧表指标"],"40":["旧表指标"]}',
+            '{"*":["*"]}',
+            "   ",
+            "not json",
+        ):
             with self.subTest(text=text):
                 importer = FakeLegacyImporter()
                 parts, _ = run_once(stock_tokens=self._adoptable(text), legacy_importer=importer)
                 facts = parts["audit"].facts("onboarding.result")
-                self.assertEqual(facts["state"], "internal_error")
-                self.assertEqual(facts["failure_reason"], "legacy_permissions_unparseable")
+                self.assertEqual(facts["failure_reason"], "stock_token_identity_unresolved")
                 self.assertEqual(importer.calls, [])
+                self.assertEqual(parts["tokens"].adopt_calls, [])
+                self.assertEqual(parts["environment"].calls, [])
                 self.assertEqual(parts["decisions"].rows, [])
 
-    def test_importer_failure_fails_closed_with_zero_external_writes(self) -> None:
-        """变异锚点②。"""
-
-        importer = FakeLegacyImporter(RuntimeError("落库失败"))
-        parts, _ = run_once(
-            stock_tokens=self._adoptable('{"88":["旧表指标"]}'), legacy_importer=importer
-        )
-
-        facts = parts["audit"].facts("onboarding.result")
-        self.assertEqual(facts["state"], "internal_error")
-        self.assertEqual(facts["failure_reason"], "legacy_permission_import_failed_RuntimeError")
-        self.assertEqual(parts["decisions"].rows, [])
-        self.assertEqual(parts["environment"].calls, [])
-        self.assertEqual(
-            parts["audit"].facts("onboarding.legacy_permission_import_failed")["reason"],
-            "legacy_permission_import_failed_RuntimeError",
-        )
-
-    def test_true_full_access_galaxy_skips_the_import(self) -> None:
+    def test_old_permissions_cannot_admit_a_zero_galaxy_user(self) -> None:
         importer = FakeLegacyImporter()
         parts, _ = run_once(
-            galaxy=FakeGalaxy(AdminRoleGalaxySnapshot()),
-            metric_translation_map={"*": {"后台管理员": ("全部指标",)}},
-            role_function_map={ADMIN_FULL_ACCESS_FUNCTION: ADMIN_FULL_ACCESS_FUNCTION},
-            stock_tokens=self._adoptable('{"*":["*"]}'),
+            role_function_map={},
+            stock_tokens=self._adoptable('{"88":["旧表指标"]}'),
+            legacy_importer=importer,
+        )
+        self.assertEqual(
+            parts["audit"].facts("onboarding.result")["failure_reason"],
+            "stock_token_identity_unresolved",
+        )
+        self.assertEqual(importer.calls, [])
+        self.assertEqual(parts["decisions"].rows, [])
+
+    def test_new_user_without_an_old_row_never_calls_the_importer(self) -> None:
+        importer = FakeLegacyImporter()
+        parts, _ = run_once(
+            stock_tokens=FakeStockTokens(StockTokenLookup(state=NO_ROW)),
             legacy_importer=importer,
         )
         self.assertEqual(importer.calls, [])
-        self.assertEqual(
-            parts["audit"].facts("onboarding.legacy_permission_import_skipped")["reasons"],
-            ["wildcard_galaxy_current"],
-        )
-
-    def test_issue_path_never_calls_the_importer(self) -> None:
-        importer = FakeLegacyImporter()
-        for lookup in (
-            StockTokenLookup(state=NO_ROW),
-            StockTokenLookup(state=NO_CIPHER, status="pending"),
-        ):
-            with self.subTest(state=lookup.state):
-                parts, _ = run_once(stock_tokens=FakeStockTokens(lookup), legacy_importer=importer)
-                self.assertEqual(importer.calls, [])
-                self.assertNotIn("onboarding.legacy_permission_import", parts["audit"].actions())
-                self.assertEqual(parts["tokens"].calls, [USER_ID])
+        self.assertNotIn("onboarding.legacy_permission_import", parts["audit"].actions())
+        self.assertEqual(parts["tokens"].calls, [USER_ID])
 
     def test_the_raw_permissions_text_never_reaches_the_audit_trail(self) -> None:
         importer = FakeLegacyImporter()
@@ -1926,7 +1770,7 @@ class LegacyPermissionImportTests(unittest.TestCase):
         self.assertNotIn("独一无二的旧表指标", rendered)
         self.assertNotIn(self.EMAIL, rendered)
 
-    def test_translation_failure_happens_before_any_import_or_token(self) -> None:
+    def test_translation_failure_still_happens_before_reading_the_old_row(self) -> None:
         importer = FakeLegacyImporter()
         parts, _ = run_once(
             metric_translation_map={"88": {"别的职能": ("x",)}},

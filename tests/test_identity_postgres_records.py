@@ -2627,6 +2627,76 @@ class AppUserEmailBindingTest(IdentityPostgresTestCase):
         self.assertEqual(self.scalar("SELECT count(*) FROM publish_outbox"), 0)
         self.assertNotEqual(OPEN_ID, "ou_someone_else")
 
+    def _runner_with_unattributed_old_row(self):
+        from test_onboarding_runner import (
+            ADOPTABLE,
+            ROSTER_ROWS,
+            FakeRoster,
+            FakeStockTokens,
+            StockTokenLookup,
+            build_runner,
+        )
+
+        from lingxi.adapters.postgres_email_binding import PostgresEmailBindingSource
+        from lingxi.adapters.postgres_identity import PostgresAppUserStore
+        from lingxi.adapters.postgres_permission_publish import PostgresPermissionPublishStore
+
+        return build_runner(
+            provisioning=PostgresAppUserStore(self._dsn),
+            users=PostgresAppUserStore(self._dsn),
+            email_bindings=PostgresEmailBindingSource(self._dsn),
+            decisions=PostgresPermissionPublishStore(self._dsn),
+            roster=FakeRoster(ROSTER_ROWS),
+            stock_tokens=FakeStockTokens(
+                StockTokenLookup(
+                    ADOPTABLE,
+                    secret="unattributed-old-secret",
+                    permissions='{"88":["旧表指标"]}',
+                )
+            ),
+        )
+
+    def _assert_unattributed_retry_left_only_the_identity_row(self, parts) -> None:
+        """第一次失败留下的真实建档行不能在第二次请求里反过来自证旧行归属。"""
+
+        self.assertEqual(self.scalar("SELECT count(*) FROM app_user"), 1)
+        self.assertEqual(self.scalar("SELECT count(*) FROM mcp_access_token"), 0)
+        self.assertEqual(self.scalar("SELECT count(*) FROM local_permission_override"), 0)
+        self.assertEqual(self.scalar("SELECT count(*) FROM publish_outbox"), 0)
+        self.assertEqual(parts["tokens"].calls, [])
+        self.assertEqual(parts["tokens"].adopt_calls, [])
+        self.assertEqual(parts["environment"].calls, [])
+        self.assertEqual(parts["legacy_importer"].calls, [])
+
+    def test_first_chat_retries_cannot_use_the_first_failure_as_old_row_proof(self) -> None:
+        from test_onboarding_runner import OPEN_ID
+
+        runner, parts = self._runner_with_unattributed_old_row()
+        for attempt in (1, 2, 3):
+            runner.start(
+                event_id=f"unattributed-{attempt}",
+                open_id=OPEN_ID,
+                trace_id=f"unattributed-first-chat-{attempt}",
+            )
+            self.assertEqual(
+                parts["audit"].facts("onboarding.result")["failure_reason"],
+                "stock_token_identity_unresolved",
+            )
+        self._assert_unattributed_retry_left_only_the_identity_row(parts)
+
+    def test_preprovision_retries_cannot_use_the_first_failure_as_old_row_proof(self) -> None:
+        from test_onboarding_runner import INITIATED_BY, ROSTER_ROWS
+
+        runner, parts = self._runner_with_unattributed_old_row()
+        for attempt in (1, 2, 3):
+            result = runner.start_system(
+                email=ROSTER_ROWS[0]["email"],
+                trace_id=f"unattributed-preprovision-{attempt}",
+                initiated_by_open_id=INITIATED_BY,
+            )
+            self.assertEqual(result.failure_reason, "stock_token_identity_unresolved")
+        self._assert_unattributed_retry_left_only_the_identity_row(parts)
+
 
 if __name__ == "__main__":
     unittest.main()

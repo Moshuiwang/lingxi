@@ -16,8 +16,6 @@ from datetime import UTC, datetime
 from typing import Any
 
 from lingxi.core.conversation.ports import OnboardingState
-from lingxi.core.identity.email_location import read_identity_snapshot
-from lingxi.core.identity.email_resolver import email_candidates
 from lingxi.core.identity.first_contact import (
     EmploymentStatus,
     FirstContactOutcome,
@@ -50,7 +48,12 @@ from lingxi.core.identity.onboarding_terminal import (
 )
 from lingxi.core.identity.org_snapshot import DirectoryAvailability, SnapshotMember
 from lingxi.core.identity.provisioning import ProvisioningRejection, ProvisioningRequest
-from lingxi.core.identity.stock_token_source import ADOPTABLE, DECRYPT_FAILED, StockTokenLookup
+from lingxi.core.identity.stock_token_source import (
+    ADOPTABLE,
+    DECRYPT_FAILED,
+    NO_ROW,
+    StockTokenLookup,
+)
 from lingxi.core.permission.account_match import MATCHED, match_galaxy_account
 from lingxi.core.permission.decision_chain import (
     LocalOverrideDecisionSource,
@@ -319,9 +322,11 @@ class OnboardingSteps:
     # ---- 6. 令牌 + 用户环境 ---------------------------------------------
 
     def _lookup_stock_token(self, request: ProvisioningRequest) -> StockTokenLookup | None:
-        """按邮箱查一次存量令牌源；源未装配时返回 ``None``，原样走签新路径。
+        """按邮箱查一次旧正式表；源未装配时返回 ``None``，原样走签新路径。
 
-        查在零银河判定**之前**：同一份结果同时供差集导入与令牌采纳复用，正式表只读一次。
+        旧表行只有邮箱、令牌和权限，没有能证明历史人员归属的人员标识。当前花名册唯一
+        匹配只能证明本次请求；建档行也可能由上一次失败留下，不能在重试时反过来证明旧行
+        属于这个人。因此只接受明确查无旧行的结果，其余三态都沿既有管理员校正路径关闭。
         """
         if self._stock_tokens is None:
             return None
@@ -331,15 +336,8 @@ class OnboardingSteps:
             raise OnboardingChainError(
                 f"stock_token_lookup_failed_{type(error).__name__}"
             ) from error
-        if lookup.state in (ADOPTABLE, DECRYPT_FAILED):
-            candidates = email_candidates(request.email, read_identity_snapshot(self._roster))
-            if (
-                candidates is None
-                or len(candidates) != 1
-                or candidates[0].get("personnel_id") != request.identity.feishu_user_id
-                or candidates[0].get("employee_no") != request.employee_no
-            ):
-                raise OnboardingChainError("stock_token_identity_unresolved")
+        if lookup.state != NO_ROW:
+            raise OnboardingChainError("stock_token_identity_unresolved")
         return lookup
 
     def _import_legacy_permissions(
@@ -370,9 +368,8 @@ class OnboardingSteps:
     def _issue_token(self, user_id: str, lookup: StockTokenLookup | None) -> Any:
         """签发或采纳这个人的问数访问令牌。
 
-        没有存量源、没有存量行、或有行但没有密文，都签一把新的；有行含密文则原样采纳。
-        **解密失败必须响亮失败、绝不退回签新**——签新会让用户环境里的令牌与正式表错位，
-        表现为真实的认证失败。
+        现行开通链只会把未装配旧表源或明确查无旧行送到这里并签新。旧行分支保留原有
+        防御性处理，但上游身份归属闸不会让它们成为自动迁入入口。
         """
         if lookup is not None:
             if lookup.state == ADOPTABLE:
