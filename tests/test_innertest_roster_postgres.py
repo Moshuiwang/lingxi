@@ -173,12 +173,14 @@ class RosterImportPostgresTests(_RosterImportPostgresBase):
         self.assertEqual(ctx.exception.detail, (("missing@x.test", "email_not_in_roster"),))
         self.assertEqual(self.sql("SELECT count(*) FROM innertest_roster_version")[0][0], 0)
 
-    def test_plan_rejects_email_mapped_to_multiple_personnel_without_writing(self):
+    def test_bootstrap_plan_rejects_identity_pending_without_writing(self):
         self.seed_directory([("p1", "dup@x.test", "ou_p1"), ("p2", "dup@x.test", "ou_p2")])
         with self.assertRaises(RosterImportRejectedError) as ctx:
             self.plan(["dup@x.test"])
         self.assertEqual(ctx.exception.code, "email_resolution_failed")
-        self.assertEqual(ctx.exception.detail, (("dup@x.test", "email_multiple_personnel"),))
+        self.assertEqual(ctx.exception.detail, (("dup@x.test", "identity_resolution_pending"),))
+        self.assertEqual(self.sql("SELECT count(*) FROM innertest_roster_version")[0][0], 0)
+        self.assertEqual(self.sql("SELECT count(*) FROM innertest_admin_binding")[0][0], 0)
         self.assertEqual(self.sql("SELECT count(*) FROM innertest_membership")[0][0], 0)
 
     def test_apply_rejects_repeat_after_scope_already_database(self):

@@ -47,11 +47,11 @@
 275	src/lingxi/apps/scheduler/credential_rotation.py
 569	src/lingxi/apps/scheduler/daily_report.py
 233	src/lingxi/apps/scheduler/daily_report_sections.py
-89	src/lingxi/apps/scheduler/innertest.py
+83	src/lingxi/apps/scheduler/innertest.py
 434	src/lingxi/apps/scheduler/late_readiness_recovery.py
 43	src/lingxi/apps/scheduler/lifecycle.py
 106	src/lingxi/apps/scheduler/loop.py
-588	src/lingxi/apps/scheduler/onboarding.py
+583	src/lingxi/apps/scheduler/onboarding.py
 331	src/lingxi/apps/scheduler/org_snapshot_sync.py
 436	src/lingxi/apps/scheduler/permission_publish.py
 86	src/lingxi/apps/scheduler/permission_readiness_assembly.py

@@ -66,13 +66,11 @@ SELECT recipient_open_id, purpose, content_key, content_version, card_style,
  LIMIT %s
 """
 
-#: 定位链的一次读齐：邮箱在 app_user 上已有唯一索引（迁移 ``0085``），因此这里
-#: 不需要"多命中就跳过"的第二道判定；花名册那一侧才可能一个邮箱多行，由
-#: ``core/outreach/audience`` 按姓名是否唯一决定发不发。
+#: 已发布权限只属于原有用户。取得绑定后还须核对完整花名册；姓名相同不能证明同一人。
 _SUBJECT_SQL = """
 SELECT u.id, u.feishu_open_id, u.provisioning_state, u.account_state,
        p.payload ->> 'permissions', u.permission_version, p.id,
-       u.outbound_unavailable_at, u.outbound_unavailable_code
+       u.outbound_unavailable_at, u.outbound_unavailable_code,u.feishu_user_id,u.employee_no
   FROM app_user u
   LEFT JOIN LATERAL (
        SELECT o.id, o.payload FROM publish_outbox o
@@ -81,10 +79,7 @@ SELECT u.id, u.feishu_open_id, u.provisioning_state, u.account_state,
         ORDER BY o.created_at DESC, o.id DESC LIMIT 1
   ) p ON true
  WHERE lower(btrim(u.email)) = %s
- LIMIT 1
 """
-
-_ROSTER_NAMES_SQL = "SELECT DISTINCT name FROM roster_snapshot_row WHERE lower(btrim(email)) = %s"
 
 
 @dataclass(frozen=True)
@@ -252,6 +247,12 @@ class PostgresOutreachSubjects:
         的口径一致；查不到不抛异常——"这个人不在库里"是一条清单上要显示的结论，
         不是一次故障。
         """
+        from lingxi.adapters.postgres_email_identity import (
+            load_email_snapshot,
+            record_binding_check,
+        )
+        from lingxi.core.identity.email_resolver import check_email_binding
+
         normalized = (email or "").strip().lower()
         if not normalized:
             raise ValueError("邮箱不能为空")
@@ -260,12 +261,22 @@ class PostgresOutreachSubjects:
             connection.cursor() as cursor,
         ):
             cursor.execute(_SUBJECT_SQL, (normalized,))
-            user_row = cursor.fetchone()
-            cursor.execute(_ROSTER_NAMES_SQL, (normalized,))
-            name_rows = cursor.fetchall()
-        names = tuple(str(row[0]) for row in name_rows if row[0])
-        if user_row is None:
-            return SubjectFacts(email=normalized, roster_names=names)
+            users = cursor.fetchall()
+            if not users:
+                return SubjectFacts(email=normalized)
+            if len(users) != 1:
+                return SubjectFacts(email=normalized, identity_failure_reason="multiple_bindings")
+            user_row = users[0]
+            check = check_email_binding(
+                normalized,
+                snapshot=load_email_snapshot(connection),
+                personnel_id=user_row[9],
+                employee_no=user_row[10],
+            )
+            record_binding_check(check, origin="outreach")
+        if not check.matched:
+            return SubjectFacts(email=normalized, identity_failure_reason=check.reason)
+        names = (str(check.row.get("name") or ""),)
         return SubjectFacts(
             email=normalized,
             user_id=str(user_row[0]),

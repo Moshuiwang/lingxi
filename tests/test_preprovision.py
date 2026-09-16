@@ -11,9 +11,11 @@ from __future__ import annotations
 
 import unittest
 from collections.abc import Mapping, Sequence
+from datetime import UTC, datetime
 from typing import Any
 
 from lingxi.core.conversation.ports import OnboardingState
+from lingxi.core.identity.email_resolver import EmailIdentitySnapshot
 from lingxi.core.identity.onboarding_terminal import KEY_COMPLETED, KEY_SYNCING
 from lingxi.core.identity.org_snapshot import DirectoryAvailability, SnapshotMember
 from lingxi.core.identity.preprovision import (
@@ -26,6 +28,7 @@ from lingxi.core.identity.preprovision import (
     SKIP_EMAIL_MULTIPLE_PERSONNEL,
     SKIP_EMAIL_NOT_IN_ROSTER,
     SKIP_PERSONNEL_NOT_IN_DIRECTORY,
+    PreprovisionDeferred,
     PreprovisionSkip,
     PreprovisionTarget,
     deliver_silently,
@@ -58,6 +61,10 @@ def roster_row(*, personnel_id: str, email: str) -> Mapping[str, Any]:
         "employee_no": f"E{personnel_id}",
         "record_id": f"rec_{personnel_id}",
     }
+
+
+def snapshot(rows):
+    return EmailIdentitySnapshot(tuple(rows), "synthetic", datetime(2026, 9, 16, tzinfo=UTC))
 
 
 class FakeDirectory:
@@ -100,7 +107,9 @@ class LocateByEmailTests(unittest.TestCase):
     """邮箱 → 花名册 ``personnel_id`` → 组织快照成员。**任一环节非唯一即跳过。**"""
 
     def test_a_unique_email_locates_the_member(self) -> None:
-        located = locate_by_email("Xiaoming@Example.com", roster_rows=ROSTER, directory=DIRECTORY)
+        located = locate_by_email(
+            "Xiaoming@Example.com", snapshot=snapshot(ROSTER), directory=DIRECTORY
+        )
         assert isinstance(located, PreprovisionTarget)
         self.assertEqual(located.personnel_id, "u_ming")
         self.assertEqual(located.open_id, "ou_ming")
@@ -111,48 +120,49 @@ class LocateByEmailTests(unittest.TestCase):
         同源。"""
 
         located = locate_by_email(
-            "  XIAOMING@EXAMPLE.COM ", roster_rows=ROSTER, directory=DIRECTORY
+            "  XIAOMING@EXAMPLE.COM ", snapshot=snapshot(ROSTER), directory=DIRECTORY
         )
         self.assertIsInstance(located, PreprovisionTarget)
 
-    def test_an_email_matching_several_personnel_ids_is_always_skipped(self) -> None:
-        """**产品负责人 2026-09-02 裁定 6（硬规则）。** 认错人在迁移 ``0085`` 的部分
-        唯一索引之后**不可自愈**：错的那一行会永久占住这个邮箱，真正的那个人首聊时
-        被「同邮箱已绑定他人」拒绝，而仓库里没有改绑动作。因此哪怕只有一个人员 ID
-        在组织快照里，也一律跳过、不猜。"""
-
+    def test_multiple_raw_candidates_wait_for_execution_without_directory_reads(self):
         directory = FakeDirectory({"u_dup_a": (member(user_id="u_dup_a", open_id="ou_a"),)})
-        located = locate_by_email("shared@example.com", roster_rows=ROSTER, directory=directory)
-
-        self.assertEqual(
-            located,
-            PreprovisionSkip(email="shared@example.com", reason=SKIP_EMAIL_MULTIPLE_PERSONNEL),
+        located = locate_by_email(
+            "shared@example.com", snapshot=snapshot(ROSTER), directory=directory
         )
-        self.assertEqual(directory.calls, [], "判断多命中不该再去读组织快照")
+        self.assertIsInstance(located, PreprovisionDeferred)
+        self.assertEqual(located.reason, "identity_resolution_pending")
+        self.assertEqual(located.identity.candidate_count, 2)
+        self.assertIsNone(located.identity.active_candidate_count)
+        self.assertIsNone(located.identity.selected)
+        self.assertEqual(directory.calls, [])
 
-    def test_the_same_personnel_id_on_several_roster_rows_is_not_a_conflict(self) -> None:
-        """同一个人在花名册里有两行（离职再入职是既有事实）不是"两个人"：判据是
-        去重后的**人员 ID 集合**，不是行数。"""
-
+    def test_same_personnel_repeated_rows_also_wait_without_deduplication(self):
         rows = ROSTER + (roster_row(personnel_id="u_ming", email="xiaoming@example.com"),)
-        located = locate_by_email("xiaoming@example.com", roster_rows=rows, directory=DIRECTORY)
-        self.assertIsInstance(located, PreprovisionTarget)
+        located = locate_by_email(
+            "xiaoming@example.com", snapshot=snapshot(rows), directory=DIRECTORY
+        )
+        self.assertIsInstance(located, PreprovisionDeferred)
+        self.assertEqual(located.identity.candidate_count, 2)
 
     def test_an_email_absent_from_the_roster_is_skipped(self) -> None:
-        located = locate_by_email("nobody@example.com", roster_rows=ROSTER, directory=DIRECTORY)
+        located = locate_by_email(
+            "nobody@example.com", snapshot=snapshot(ROSTER), directory=DIRECTORY
+        )
         self.assertEqual(
             located, PreprovisionSkip(email="nobody@example.com", reason=SKIP_EMAIL_NOT_IN_ROSTER)
         )
 
     def test_a_blank_email_is_skipped_with_its_own_reason(self) -> None:
-        located = locate_by_email("   ", roster_rows=ROSTER, directory=DIRECTORY)
+        located = locate_by_email("   ", snapshot=snapshot(ROSTER), directory=DIRECTORY)
         self.assertEqual(located, PreprovisionSkip(email="   ", reason=SKIP_EMAIL_BLANK))
 
     def test_a_personnel_id_outside_the_directory_snapshot_is_skipped(self) -> None:
         """组织快照只覆盖花名册人员的一部分（实测 59.9%）。"不在快照里"既可能是
         离职、也可能只是那个租户没共享给本应用——两种都不是"可以开通"。"""
 
-        located = locate_by_email("hong@example.com", roster_rows=ROSTER, directory=FakeDirectory())
+        located = locate_by_email(
+            "hong@example.com", snapshot=snapshot(ROSTER), directory=FakeDirectory()
+        )
         self.assertEqual(
             located,
             PreprovisionSkip(email="hong@example.com", reason=SKIP_PERSONNEL_NOT_IN_DIRECTORY),
@@ -163,7 +173,9 @@ class LocateByEmailTests(unittest.TestCase):
         按 #34 方案 C 留给管理员侧审计）。多条候选时不许自己挑一条。"""
 
         directory = FakeDirectory({"u_ming": (member(), member(open_id="ou_ming_2"))})
-        located = locate_by_email("xiaoming@example.com", roster_rows=ROSTER, directory=directory)
+        located = locate_by_email(
+            "xiaoming@example.com", snapshot=snapshot(ROSTER), directory=directory
+        )
         self.assertEqual(
             located,
             PreprovisionSkip(email="xiaoming@example.com", reason=SKIP_DIRECTORY_MULTIPLE_MEMBERS),
@@ -174,7 +186,9 @@ class LocateByEmailTests(unittest.TestCase):
         ``AutoOnboardingRunner._locate`` 同一条纪律，原因码必须分得开。"""
 
         directory = FakeDirectory({"u_ming": (member(),)}, availability=DirectoryAvailability.STALE)
-        located = locate_by_email("xiaoming@example.com", roster_rows=ROSTER, directory=directory)
+        located = locate_by_email(
+            "xiaoming@example.com", snapshot=snapshot(ROSTER), directory=directory
+        )
         self.assertEqual(
             located,
             PreprovisionSkip(email="xiaoming@example.com", reason=SKIP_DIRECTORY_UNAVAILABLE),
@@ -187,11 +201,11 @@ class PlanPreprovisionTests(unittest.TestCase):
     def test_one_bad_row_does_not_take_down_the_rest_of_the_list(self) -> None:
         targets, skips = plan_preprovision(
             ["xiaoming@example.com", "shared@example.com", "hong@example.com"],
-            roster_rows=ROSTER,
+            snapshot=snapshot(ROSTER),
             directory=DIRECTORY,
         )
         self.assertEqual([target.open_id for target in targets], ["ou_ming", "ou_hong"])
-        self.assertEqual([skip.reason for skip in skips], [SKIP_EMAIL_MULTIPLE_PERSONNEL])
+        self.assertEqual([skip.reason for skip in skips], ["identity_resolution_pending"])
 
     def test_a_repeated_email_is_processed_once(self) -> None:
         """名单里同一个邮箱写了两遍是笔误，不是两个人；对同一个人跑两次开通链
@@ -199,7 +213,7 @@ class PlanPreprovisionTests(unittest.TestCase):
 
         targets, skips = plan_preprovision(
             ["xiaoming@example.com", " Xiaoming@example.com "],
-            roster_rows=ROSTER,
+            snapshot=snapshot(ROSTER),
             directory=DIRECTORY,
         )
         self.assertEqual(len(targets), 1)
@@ -207,7 +221,9 @@ class PlanPreprovisionTests(unittest.TestCase):
 
     def test_the_list_order_is_preserved(self) -> None:
         targets, _ = plan_preprovision(
-            ["hong@example.com", "xiaoming@example.com"], roster_rows=ROSTER, directory=DIRECTORY
+            ["hong@example.com", "xiaoming@example.com"],
+            snapshot=snapshot(ROSTER),
+            directory=DIRECTORY,
         )
         self.assertEqual(
             [target.email for target in targets], ["hong@example.com", "xiaoming@example.com"]

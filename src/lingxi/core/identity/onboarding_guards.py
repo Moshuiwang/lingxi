@@ -20,6 +20,7 @@ import logging
 from collections.abc import Callable
 from typing import Any
 
+from lingxi.core.identity.email_resolver import identity_binding_matches
 from lingxi.core.identity.onboarding_ports import EmailBindingSource, _AuditSink
 from lingxi.core.identity.onboarding_terminal import _internal, _not_authorized, _Terminal
 from lingxi.core.permission.account_match import normalize_email
@@ -46,6 +47,8 @@ def reject_email_bound_to_another_person(
     bindings: EmailBindingSource,
     audit: _AuditSink,
     trace_id: str,
+    personnel_id: str | None = None,
+    employee_no: str | None = None,
 ) -> _Terminal | None:
     """**同一个邮箱已经绑给另一个人时失败关闭**。
 
@@ -60,16 +63,20 @@ def reject_email_bound_to_another_person(
     normalized = normalize_email(email)
     if not normalized:
         return None
+    bindings_found = bindings.bindings_for_email(normalized)
     conflicting = tuple(
         sorted(
             {
                 binding.user_id
-                for binding in bindings.bindings_for_email(normalized)
+                for binding in bindings_found
                 if (binding.feishu_open_id or "") != open_id
             }
         )
     )
     if not conflicting:
+        if _bound_keys_changed(bindings_found, personnel_id, employee_no):
+            audit.record("onboarding.identity_binding_mismatch", trace_id=trace_id)
+            return _internal("identity_binding_mismatch")
         return None
     # 审计只带冲突方的 ``user_id``：**不带邮箱、也不带 open_id**（两者都是身份资料
     # 值，与本文件其余审计同一条纪律）。需要还原是哪个邮箱时按这些 ``user_id``
@@ -83,6 +90,19 @@ def reject_email_bound_to_another_person(
         "同一邮箱已绑定其它用户，开通失败关闭 trace=%s conflicting=%d", trace_id, len(conflicting)
     )
     return _internal(EMAIL_ALREADY_BOUND)
+
+
+def _bound_keys_changed(bindings, personnel_id, employee_no):
+    """可信主体的开通重试只核对已有键，不随邮箱重选刷新历史归属。"""
+    row = {"personnel_id": personnel_id, "employee_no": employee_no}
+    return any(
+        not identity_binding_matches(
+            row,
+            binding.personnel_id if personnel_id is not None else None,
+            binding.employee_no if employee_no is not None else None,
+        )
+        for binding in bindings
+    )
 
 
 def reject_zero_galaxy_without_local_grant(

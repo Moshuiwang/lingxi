@@ -923,18 +923,21 @@ class TraceLookupTests(AdminRegistryPostgresTestCase):
 
 
 class ResolveIdentifierTests(AdminRegistryPostgresTestCase):
-    """``PostgresAdminQueries.resolve_identifier``（#439 A 档）：邮箱 → open_id
-    真库反查。零命中/多命中都必须 fail-open（原样返回输入），不猜测。
+    """邮箱只能核对已有绑定；同名、多候选、缺快照均不能选择另一个主体。"""
 
-    迁移 ``0085``（rc25 S-2a）之后，``app_user`` 的**规范化邮箱**已经唯一，
-    "多命中"在一个跑过全链迁移的库上结构性不可能；下面那条多命中用例因此显式
-    把索引摘掉再造这个形状——它守的是**防御分支本身还在**，适用于 0085 之前建成
-    的库、以及任何有人把索引删掉的场合。删掉那条分支而只依赖索引，等于把一道
-    只在特定库上成立的保证当成代码不变式。
-    """
+    def roster(self, person="fs_ou_target"):
+        self.execute(
+            "INSERT INTO roster_snapshot(id,captured_at,row_count,pages_read) VALUES('email-roster',now(),1,1)"
+        )
+        self.execute(
+            "INSERT INTO roster_snapshot_row(snapshot_id,row_index,personnel_id,email,name,employee_no,record_id) "
+            "VALUES('email-roster',0,%s,'someone@example.com','合成员工','job-1','record-1')",
+            (person,),
+        )
 
     def test_unique_email_match_resolves_to_open_id(self) -> None:
         self.add_user(open_id="ou_target", email="someone@example.com")
+        self.roster()
         queries = PostgresAdminQueries(self._dsn)
 
         self.assertEqual(queries.resolve_identifier(identifier="someone@example.com"), "ou_target")
@@ -967,10 +970,24 @@ class ResolveIdentifierTests(AdminRegistryPostgresTestCase):
         self.add_user(user_id="usr_b", open_id="ou_b", email="dup@example.com")
         queries = PostgresAdminQueries(self._dsn)
 
-        resolved = queries.resolve_identifier(identifier="dup@example.com")
+        from lingxi.core.identity.email_resolver import EmailIdentityUnresolvedError
 
-        self.assertEqual(resolved, "dup@example.com")
-        self.assertNotIn(resolved, ("ou_a", "ou_b"))
+        with self.assertRaises(EmailIdentityUnresolvedError) as raised:
+            queries.resolve_identifier(identifier="dup@example.com")
+        self.assertEqual(raised.exception.check.reason, "multiple_bindings")
+
+    def test_missing_snapshot_and_changed_binding_explicitly_refuse_email_resolution(self):
+        from lingxi.core.identity.email_resolver import EmailIdentityUnresolvedError
+
+        self.add_user(open_id="ou_target", email="someone@example.com")
+        queries = PostgresAdminQueries(self._dsn)
+        with self.assertRaises(EmailIdentityUnresolvedError) as raised:
+            queries.resolve_identifier(identifier="someone@example.com")
+        self.assertEqual(raised.exception.check.reason, "snapshot_unavailable")
+        self.roster(person="new-person")
+        with self.assertRaises(EmailIdentityUnresolvedError) as raised:
+            queries.resolve_identifier(identifier="someone@example.com")
+        self.assertEqual(raised.exception.check.reason, "binding_mismatch")
 
     def test_non_email_identifier_is_returned_verbatim_without_querying(self) -> None:
         queries = PostgresAdminQueries(self._dsn)

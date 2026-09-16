@@ -165,18 +165,23 @@ class PostgresInnertestService:
                     if old[1] != digest:
                         raise InnertestError("idempotency_conflict")
                     return self._batch_view(connection, principal, old[0])
-                targets = self._resolve(cursor, values)
+                targets, identities = self._resolve(cursor, values)
                 return self._insert_batch(
-                    connection, cursor, principal, request_key, digest, version, targets
+                    connection, cursor, principal, request_key, digest, version, targets, identities
                 )
 
     def _resolve(self, cursor, values):
         """保留每个规范化邮箱的结果，不能由管理员挑非唯一候选。"""
-        from lingxi.core.identity.preprovision import PreprovisionSkip
+        from lingxi.core.identity.preprovision import PreprovisionDeferred, PreprovisionSkip
 
-        targets, seen = [], set()
+        targets, seen, identities = [], set(), {}
         for email in values:
             target = self.locator(email, connection=cursor.connection)
+            if target.identity is not None:
+                identities[email] = target.identity
+            if isinstance(target, PreprovisionDeferred):
+                targets.append((email, None, None, "identity_resolution_pending"))
+                continue
             if isinstance(target, PreprovisionSkip):
                 code = "identity_not_unique" if "multiple" in target.reason else "identity_missing"
                 targets.append((email, None, None, code))
@@ -193,12 +198,14 @@ class PostgresInnertestService:
             seen.add(open_id)
         if sum(len(str(v)) for row in targets for v in row) > 12000:
             raise InnertestError("card_too_large")
-        return targets
+        return targets, identities
 
-    def _insert_batch(self, connection, cursor, principal, key, digest, version, targets):
+    def _insert_batch(
+        self, connection, cursor, principal, key, digest, version, targets, identities
+    ):
         """批次、动作、发卡意图与审计共享事务。"""
         batch, action, trace = new_id("ibt"), new_id("pac"), new_id("trc")
-        has_new = any(t[3] == "new" for t in targets)
+        has_new = any(t[3] in {"new", "identity_resolution_pending"} for t in targets)
         if has_new:
             self._pending_guard(cursor, principal, version)
             self._insert_pending_action(cursor, action, principal, version)
@@ -221,12 +228,7 @@ class PostgresInnertestService:
                 trace,
             ),
         )
-        for email, open_id, personnel, code in targets:
-            cursor.execute(
-                "INSERT INTO innertest_batch_item(id,batch_id,email,open_id,personnel_id,"
-                "result_code) VALUES(%s,%s,%s,%s,%s,%s)",
-                (new_id("ibi"), batch, email, open_id, personnel, code),
-            )
+        self._insert_items(cursor, batch, trace, targets, identities)
         if has_new:
             enqueue_followups(
                 connection,
@@ -246,6 +248,27 @@ class PostgresInnertestService:
             target_digest="sha256:" + target_digest(targets),
         )
         return self._batch_view(connection, principal, batch)
+
+    def _insert_items(self, cursor, batch, trace, targets, identities):
+        """准备阶段的原始来源跟随批次项记录，不用未知在职数冒充零在职。"""
+        for email, open_id, personnel, code in targets:
+            item_id = new_id("ibi")
+            cursor.execute(
+                "INSERT INTO innertest_batch_item(id,batch_id,email,open_id,personnel_id,"
+                "result_code) VALUES(%s,%s,%s,%s,%s,%s)",
+                (item_id, batch, email, open_id, personnel, code),
+            )
+            if email in identities:
+                try:
+                    self.audit.record(
+                        "innertest.identity_prepared",
+                        batch_id=batch,
+                        batch_item_id=item_id,
+                        trace_id=trace,
+                        **identities[email].audit_facts(),
+                    )
+                except Exception as error:
+                    raise InnertestError("audit_unavailable") from error
 
     @staticmethod
     def _insert_pending_action(cursor, action, principal, version):
