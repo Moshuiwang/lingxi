@@ -68,21 +68,41 @@ def locate_by_open_id(open_id: object, members: Sequence[SnapshotMember]) -> Loc
 
 @dataclass(frozen=True)
 class EmploymentStatus:
-    """飞书成员详情 ``status`` 的判定投影。**只在一次判定中存在，绝不落库。**"""
+    """飞书成员详情 ``status`` 的判定投影。**只在一次判定中存在，绝不落库。**
+
+    ``absent_from_directory`` 不是飞书字段：它表示组织快照可用且新鲜时该人员 ID
+    已不在快照里（已移出租户），是明确非在职而不是未知；只能经 :meth:`absent`
+    构造，``from_feishu`` 永远不会产生它。
+    """
 
     is_activated: bool
     is_exited: bool
     is_frozen: bool
     is_resigned: bool
     is_unjoin: bool
+    absent_from_directory: bool = False
 
     _FLAGS = ("is_activated", "is_exited", "is_frozen", "is_resigned", "is_unjoin")
 
     @property
     def employed(self) -> bool:
-        """综合五个标志位判定是否在职。"""
-        return self.is_activated and not (
-            self.is_exited or self.is_frozen or self.is_resigned or self.is_unjoin
+        """综合五个标志位判定是否在职；不在组织快照的人员一律不在职。"""
+        return (
+            not self.absent_from_directory
+            and self.is_activated
+            and not (self.is_exited or self.is_frozen or self.is_resigned or self.is_unjoin)
+        )
+
+    @classmethod
+    def absent(cls) -> EmploymentStatus:
+        """不在可用且新鲜的组织快照里的人员：明确非在职，可被审计与实时读到的离职区分。"""
+        return cls(
+            is_activated=False,
+            is_exited=True,
+            is_frozen=False,
+            is_resigned=False,
+            is_unjoin=False,
+            absent_from_directory=True,
         )
 
     @classmethod

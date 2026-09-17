@@ -8,6 +8,7 @@ from lingxi.core.identity.email_resolver import (
     email_candidates,
     resolve_email_identity,
 )
+from lingxi.core.identity.first_contact import EmploymentStatus
 from lingxi.core.identity.org_snapshot import DirectoryAvailability, SnapshotMember
 
 
@@ -20,7 +21,12 @@ class LocatedEmailIdentity:
 
 
 def locate_current_email(email, *, snapshot, directory, employment):
-    """逐候选回读实时在职；读取失败保留未知，不能被当成离职后排除。"""
+    """逐候选回读实时在职；读取失败保留未知，不能被当成离职后排除。
+
+    只有组织快照可用且新鲜、且该人员 ID 精确对应零个成员，才判为明确非在职：
+    快照不可用或过期、成员多于一个、任何异常都保持未知——它们不是"这个人不在"，
+    只是我们暂时看不见，折成离职会让另一候选被误认为唯一在职。
+    """
     candidates = email_candidates(email, snapshot)
     members, statuses = {}, {}
     for row in candidates or ():
@@ -31,7 +37,12 @@ def locate_current_email(email, *, snapshot, directory, employment):
         try:
             lookup = directory.lookup_by_user_id(personnel)
             values = tuple(lookup.members)
-            if lookup.availability is not DirectoryAvailability.AVAILABLE or len(values) != 1:
+            if lookup.availability is not DirectoryAvailability.AVAILABLE:
+                continue
+            if len(values) == 0:
+                statuses[personnel] = EmploymentStatus.absent()
+                continue
+            if len(values) != 1:
                 continue
             member = values[0]
             if member.user_id != personnel or not member.tenant_key or not member.open_id:

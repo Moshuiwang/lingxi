@@ -110,6 +110,36 @@ class DeferredEmailIdentityTests(unittest.TestCase):
         self.assertEqual(self.sql("SELECT version FROM innertest_roster_version"), version)
         self.assertEqual(self.sql("SELECT count(*) FROM innertest_membership"), [(1,)])
 
+    def test_candidate_deleted_from_the_directory_is_absent_and_the_other_is_chosen(self):
+        """旧人员 ID 已从组织快照删除：真实定位口回答"可用且零成员"，执行阶段选中仍在快照的人。"""
+
+        item = self.claimed()
+        self.sql("DELETE FROM feishu_org_member_snapshot WHERE user_id='person1'")
+        # 不在快照的候选没有主体可回读：刻意不给 ou_person1 任何状态，读到即失败。
+        self.statuses = {"ou_person2": EMPLOYED}
+        handler, proxy = self.handler()
+        with self.assertRaisesRegex(RuntimeError, "synthetic interruption"):
+            handler.handle(item)
+        self.assertEqual(
+            self.sql("SELECT open_id,email FROM innertest_membership"),
+            [("ou_person2", "person1@example.test")],
+        )
+        self.assertEqual(
+            self.sql("SELECT open_id,personnel_id,result_code FROM innertest_batch_item"),
+            [("ou_person2", "person2", "added")],
+        )
+        facts = self.parts["audit"].facts("identity.email_resolved")
+        self.assertEqual(
+            (
+                facts["candidate_count"],
+                facts["active_candidate_count"],
+                facts["absent_candidate_count"],
+            ),
+            (2, 1, 1),
+        )
+        self.assertEqual(facts["selected_personnel_id"], "person2")
+        self.assertEqual(proxy.resolve_system_email.call_count, 1)
+
     def test_two_active_or_unknown_candidates_never_write_membership(self):
         for second in (EMPLOYED, None):
             with self.subTest(second=second):
