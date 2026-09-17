@@ -19,6 +19,8 @@ from test_onboarding_runner import (
 
 from lingxi.core.conversation.ports import OnboardingState
 from lingxi.core.identity.onboarding_ports import EmailBinding
+from lingxi.core.identity.org_snapshot import DirectoryAvailability
+from lingxi.core.identity.preprovision import PreprovisionTarget
 from lingxi.core.identity.stock_token_source import ADOPTABLE, StockTokenLookup
 
 OLD = replace(MEMBER, member_key="old-member", user_id="old-person", open_id="old-open")
@@ -68,14 +70,24 @@ class EmailIdentityOnboardingTests(unittest.TestCase):
         self.assertEqual(parts["decisions"].calls[0]["user_id"], refresh.USER_ONE)
         self.assertEqual(parts["decisions"].calls[0]["row"].token_cipher, refresh.TOKEN_CIPHER)
 
-    def execute(self, *, old=FROZEN, rows=ROWS, expected=None, **options):
-        employment = Employment(old)
-        runner, parts = build_runner(
-            directory=FakeDirectory(members=(OLD, MEMBER)),
+    def build(
+        self,
+        *,
+        old=FROZEN,
+        rows=ROWS,
+        members=(OLD, MEMBER),
+        availability=DirectoryAvailability.AVAILABLE,
+        **options,
+    ):
+        return build_runner(
+            directory=FakeDirectory(availability=availability, members=members),
             roster=FakeRoster(rows),
-            employment=employment,
+            employment=Employment(old),
             **options,
         )
+
+    def execute(self, *, expected=None, **options):
+        runner, parts = self.build(**options)
         result = runner.start_system(
             email=ROSTER_ROWS[0]["email"],
             trace_id="email-test",
@@ -99,6 +111,60 @@ class EmailIdentityOnboardingTests(unittest.TestCase):
         self.assertEqual((facts["candidate_count"], facts["active_candidate_count"]), (2, 1))
         self.assertEqual(facts["selected_personnel_id"], MEMBER.user_id)
         self.assertEqual(facts["snapshot_version"], "synthetic-roster")
+
+    def test_old_personnel_absent_from_a_fresh_directory_opens_the_active_member(self):
+        """旧人员 ID 已不在可用且新鲜的组织快照：明确非在职，不再让整条邮箱永远未决。"""
+
+        parts, result = self.execute(members=(MEMBER,))
+        self.assertIs(result.state, OnboardingState.COMPLETED)
+        self.assertEqual(parts["provisioning"].requests[0].identity.feishu_open_id, OPEN_ID)
+        self.assertEqual(set(parts["directory"].user_id_calls), {OLD.user_id, MEMBER.user_id})
+        # 不在快照的候选没有可回读的主体：旧账号的实时状态一次都不会被读。
+        self.assertEqual({oid for _, oid in parts["employment"].calls}, {OPEN_ID})
+        facts = parts["audit"].facts("identity.email_resolved")
+        self.assertEqual(
+            (
+                facts["candidate_count"],
+                facts["active_candidate_count"],
+                facts["absent_candidate_count"],
+            ),
+            (2, 1, 1),
+        )
+        self.assertEqual(facts["selected_personnel_id"], MEMBER.user_id)
+
+    def test_execution_stage_resolution_selects_the_member_still_in_the_directory(self):
+        """扩员执行阶段与预开通共用同一解析入口：(不在快照, 在职) 也走到选中主体。"""
+
+        runner, parts = self.build(members=(MEMBER,))
+        target = runner.resolve_system_email(email=ROSTER_ROWS[0]["email"], trace_id="expand-test")
+        self.assertIsInstance(target, PreprovisionTarget)
+        self.assertIs(target.member, MEMBER)
+        self.assertEqual(target.identity.absent_candidate_count, 1)
+        facts = parts["audit"].facts("identity.email_resolved")
+        self.assertEqual(facts["identity_state"], "unique_active")
+
+    def test_zero_members_from_a_stale_or_unavailable_directory_stays_undecided(self):
+        """快照过期或不可用时"查不到"不是事实：两位候选都保持未知，不许折成离职。"""
+
+        for availability in (DirectoryAvailability.STALE, DirectoryAvailability.UNAVAILABLE):
+            with self.subTest(availability=availability.value):
+                parts, result = self.execute(members=(MEMBER,), availability=availability)
+                self.assertIs(result.state, OnboardingState.INTERNAL_ERROR)
+                self.assertEqual(result.failure_reason, "email_identity_unavailable")
+                facts = parts["audit"].facts("identity.email_resolved")
+                self.assertEqual(facts["identity_reason"], "employment_unknown")
+                self.assertIsNone(facts["absent_candidate_count"])
+                self.assertEqual(parts["provisioning"].requests, [])
+                self.assert_no_grant(parts)
+
+    def test_a_lone_candidate_absent_from_a_fresh_directory_is_refused_not_errored(self):
+        parts, result = self.execute(rows=ROSTER_ROWS, members=())
+        self.assertIs(result.state, OnboardingState.NOT_AUTHORIZED)
+        self.assertEqual(result.failure_reason, "email_identity_inactive")
+        facts = parts["audit"].facts("identity.email_resolved")
+        self.assertEqual(facts["absent_candidate_count"], 1)
+        self.assertEqual(parts["provisioning"].requests, [])
+        self.assert_no_grant(parts)
 
     def test_two_active_never_opens_either_member(self):
         parts, result = self.execute(old=EMPLOYED)
