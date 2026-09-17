@@ -1,0 +1,12 @@
+{
+  "candidate_tag": "v2.5.1-rc.106",
+  "evidence_url": "https://github.com/Moshuiwang/lingxi/issues/812#issuecomment-5710789683",
+  "manifest_sha256": "40f62f65c72f68d29028530f37869c310084df229a48c1a1e9d19cfe19ad2d58",
+  "recovery": {
+    "evidence_url": "https://github.com/Moshuiwang/lingxi/issues/812#issuecomment-5710789683",
+    "instructions": "生产回滚 = 切回上一正式版 v2.5.0 的四镜像，不降级数据库；任何回滚动作属显式除外，须产品负责人单独请示与亲跑。路径一（部署器，优先）：按 deploy/拉取代理.md §五与 deploy/releases/README.md「固定计划与一次批准」另存 operation=recover、引用本次 v2.5.1 部署计划的恢复计划并独立批准，以 /opt/lingxi/bin/python3 -B <控制包内 lingxi_deploy.py> recover 执行（恢复计划 old/new 对调，recovery.target_manifest_sha256 = v2.5.0 正式版 Release 附件 release-manifest.json 的 sha256 3978038bc99427d07d076c53d438fc7562fd307b99bf70db785798ec9db6c237；部署器在 migrate 阶段只核对库头不降级）。路径二（手工，部署器不可用时）：用 v2.5.0 正式版清单的四镜像 digest（gateway 48877b06d5b0…、migrate 17eb4dd9142f…、scheduler 46c1512155fa…、worker 6dcc09587e3c…，完整值见 Release v2.5.0 附件 release-manifest.json）按部署器为 v2.5.0 计划渲染保存的 compose 与公开配置重起三服务。数据库：本候选迁移头仍为 0098_qa_corpus（与 v2.5.0 相同，migrate 阶段无作业），回滚没有库结构回退项；提升前产品负责人手动执行的 pg_dump（prod_pre_apply_pg_dump.py，落 /root/lingxi-backups/）是最后恢复点，恢复动作属显式除外须另请示。",
+    "previous_tag": "v2.5.0"
+  },
+  "result": "passed",
+  "schema": 1
+}
