@@ -3,13 +3,21 @@
 
 ## 必须在 `lingxi-scheduler` 容器内运行（硬约束，不是建议）
 
-    docker exec -i lingxi-scheduler-1 \\
-        env PYTHONPATH=/app/src python3 -B /app/scripts/ops/preprovision.py \\
-        /path/to/roster.csv --initiated-by ou_xxx
+镜像不带 `scripts/`（`.dockerignore` 排除），脚本本身经标准输入喂给容器内的 python；
+容器根文件系统只读、`/tmp` 是 16 MiB 的内存临时目录，名单同样经标准输入写进去，
+**不能 `docker cp`**；`lingxi` 包已装进镜像的 site-packages，**不需要 `PYTHONPATH`**：
+
+    # 1. 名单写进容器的内存临时目录（只有本用户可读）
+    docker exec -i lingxi-scheduler-1 sh -c 'umask 077; cat > /tmp/roster.csv' < roster.csv
+    # 2. 先出清单（默认零写入），逐行核对
+    docker exec -i lingxi-scheduler-1 python3 -B - /tmp/roster.csv --initiated-by ou_xxx \\
+        < scripts/ops/preprovision.py
+    # 3. 核对无误后真正执行：同上一条，末尾加 --apply
 
 本脚本按 `SchedulerConfig.from_env()` + `build_loop(...)` **原样重建一遍 scheduler
-启动时那条装配**（见 :func:`resolve_start_system`），因此它要的东西与常驻 scheduler
-一字不差。逐项列清单，不只给结论：
+启动时那条装配**（见 :func:`resolve_start_system`；唯一刻意跳过的是受限管理入口，
+理由见该函数第 3 条），因此它要的东西与常驻 scheduler 一字不差。逐项列清单，不只给
+结论：
 
 | 需要什么 | 谁提供 | 不在容器内跑会怎样 |
 | --- | --- | --- |
@@ -122,6 +130,9 @@ wang.wu@example.com,A国家总经理,1011、1012
   挂点）：名单本身带了新权限的人不该被判成零权限而整批拒绝。
 - `origin` 只接受 `"preprovision"`，`initiated_by_open_id` 不接受空白——两条都是链侧
   的失败关闭判据，本脚本在 CLI 闸就先挡一次，不把明知会被拒的输入送进去。
+- **内测名单闸对本脚本同样生效**：数据库模式（`LINGXI_INNERTEST_SCOPE` 已配置）下，
+  链只对已在内测名单的人执行，名单外的人按 `innertest_roster_rejected` 逐人失败关闭、
+  零写入——闸挂在链的公共段最前面，系统触发与首聊触发过的是同一道。
 """
 
 from __future__ import annotations
@@ -722,6 +733,13 @@ def resolve_start_system(dsn: str) -> tuple[Callable[..., Any], Callable[[], Non
     2. **不 ``run_forever()``、不装信号处理。** 只需要编排这一个句柄；其余职责
        （凭据轮换、清理、重算、发布、快照同步……）**一次都不会 tick**，因为从头到尾
        没有人调用 ``loop.run_once()``。
+    3. **传 ``register_innertest_entry=False``，不注册受限管理入口。** 常驻 scheduler
+       已经持有内测管理 socket 及其文件锁（``LINGXI_INNERTEST_SCOPE`` 已配置时），
+       同容器内的第二个进程再去建监听器会以 ``socket_in_use`` 失败关闭——这道
+       「谁持锁谁负责」的边界必须原样保留，本脚本要做的是**不去抢**，而不是绕过
+       锁。跳过的整段（监听器、后台阶段消费者、租约保活）全是后台组件，本脚本一次
+       都不 tick 它们，与第 2 条同一个道理；跳过它不影响 ``_build_onboarding_duty``
+       装配的内测名单闸——名单闸挡在开通链最前面、系统触发同样过闸，本脚本照过。
 
     ``build_loop`` 唯一有副作用的一步是 ``_build_onboarding_duty`` 里的
     ``executor.start()``（开通执行器的线程池）。返回的收尾函数按 ``main()`` 的
@@ -746,7 +764,7 @@ def resolve_start_system(dsn: str) -> tuple[Callable[..., Any], Callable[[], Non
             "管理员闸与开通链会落在两个库上，拒绝运行"
         )
     alerting_duty = build_alerting_duty(config, audit=StructuredLogAuditSink())
-    loop = build_loop(config, alerting_duty=alerting_duty)
+    loop = build_loop(config, alerting_duty=alerting_duty, register_innertest_entry=False)
 
     runners = [
         runner
@@ -776,11 +794,16 @@ def resolve_start_system(dsn: str) -> tuple[Callable[..., Any], Callable[[], Non
 
 _CLI_DESCRIPTION = (
     "管理员预开通：按名单在用户首聊之前完成开通与预授权（Issue #541）。"
-    " 【硬约束】本脚本必须在 lingxi-scheduler 容器内运行"
-    "（docker exec -i lingxi-scheduler-1 env PYTHONPATH=/app/src python3 -B ...）："
+    " 【硬约束】本脚本必须在 lingxi-scheduler 容器内运行；镜像不带 scripts/，"
+    "脚本与名单都经标准输入送进容器，不 docker cp、不需要 PYTHONPATH："
+    "先 docker exec -i lingxi-scheduler-1 sh -c 'umask 077; cat > /tmp/roster.csv'"
+    " < roster.csv 写入名单，再 docker exec -i lingxi-scheduler-1 python3 -B -"
+    " /tmp/roster.csv --initiated-by ou_xxx [--apply] < scripts/ops/preprovision.py。"
     "签发/采纳问数令牌的 MCP 主密钥、用户环境卷、在职状态实时回读所用的专用授权主体"
-    "令牌（全系统只允许一个消费者）都只有该进程持有；在宿主机另起进程会与正式入口"
-    "抢占同一条外部通道。"
+    "令牌（全系统只允许一个消费者）都只有该容器持有；在宿主机另起进程会与正式入口"
+    "抢占同一条外部通道。数据库模式（LINGXI_INNERTEST_SCOPE 已配置）下内测名单闸"
+    "对本脚本同样生效：只对已在内测名单的人执行，名单外的人按 innertest_roster_rejected"
+    " 逐人失败关闭、零写入。"
 )
 
 
