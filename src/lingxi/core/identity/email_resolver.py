@@ -43,6 +43,7 @@ class EmailIdentityResolution:
     candidate_count: int | None
     active_candidate_count: int | None
     selected: Mapping[str, Any] | None = None
+    absent_candidate_count: int | None = None
 
     def check_binding(self, *, personnel_id=None, employee_no=None):
         """有可信旧主键时只能核对，不允许解析结果自动替换它。"""
@@ -65,6 +66,7 @@ class EmailIdentityResolution:
             ),
             "candidate_count": self.candidate_count,
             "active_candidate_count": self.active_candidate_count,
+            "absent_candidate_count": self.absent_candidate_count,
             "selected_personnel_id": self.selected.get("personnel_id") if self.selected else None,
         }
 
@@ -174,7 +176,18 @@ def resolve_email_identity(
         None if candidates is None else len(candidates),
         active,
         selected,
+        absent_candidate_count=None if active is None else _count_absent(candidates, employment),
     ).check_binding(personnel_id=bound_personnel_id, employee_no=bound_employee_no)
+
+
+def _count_absent(candidates, employment):
+    """只在候选状态全部已知时计数：有几条候选是因不在组织快照而判非在职的。"""
+    statuses = (employment.get(str(row.get("personnel_id") or "").strip()) for row in candidates)
+    return sum(
+        1
+        for status in statuses
+        if isinstance(status, EmploymentStatus) and status.absent_from_directory
+    )
 
 
 def _select(candidates, employment):
