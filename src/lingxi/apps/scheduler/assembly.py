@@ -7,6 +7,10 @@
 它）；告警职责注册在**最后**，汇总本轮观察到的信号，排在被观察者后面才看
 得到这一轮的事实。完整理由随每一段装配代码就近写在 `build_loop` 各拆分
 函数的注释里。
+
+受限管理入口同一时刻只能由一个进程持有；同容器内借 `build_loop` 重建装配的受控脚本用
+``register_innertest_entry=False`` 退出这一段。它是参数不是环境变量：环境变量被常驻
+scheduler 读到会静默关掉正式入口，参数只有调用方代码能传，误配传不进常驻进程。
 """
 
 from __future__ import annotations
@@ -189,15 +193,15 @@ def build_loop(
     audit: AuditSink | None = None,
     alerting_duty: AlertingDuty | None = None,
     heartbeat: Callable[[], None] | None = None,
+    register_innertest_entry: bool = True,
 ) -> SchedulerLoop:
     """装配进程的全部定时职责；顺序理由见模块文档字符串。
 
-    ``roster_access_token``/``permission_table_access_token`` 默认不是
-    ``None``——这里会建出真实的进程内令牌供给（前者复用凭据轮换职责派生的
-    短期令牌，后者用应用身份换取 tenant_access_token，零新增凭据材料）；
-    ``None`` 只是"用默认这条"，不是"没有供给"，两条供给各自的详细理由随
-    其装配点写在对应函数的注释里。调用方（主要是测试）传自定义实现即可
-    替换默认供给。
+    ``roster_access_token``/``permission_table_access_token`` 传 ``None`` 只是"用默认
+    这条"（真实的进程内令牌供给，理由随各自装配点的注释），不是"没有供给"；调用方
+    （主要是测试）传自定义实现即可替换。``register_innertest_entry=False`` 只给同容器
+    内的受控脚本传：整段跳过受限管理入口的注册，其余装配一字不动；它是显式参数而
+    不是环境变量，理由见模块文档字符串末段。
     """
     stop = SignalStopEvent()
     sink = audit if audit is not None else StructuredLogAuditSink()
@@ -233,9 +237,12 @@ def build_loop(
         stop=stop,
         heartbeat=heartbeat,
     )
-    from lingxi.apps.scheduler.innertest import wire_innertest
+    if register_innertest_entry:
+        from lingxi.apps.scheduler.innertest import wire_innertest
 
-    wire_innertest(config, loop=loop, duties=duties, audit=sink)
+        wire_innertest(config, loop=loop, duties=duties, audit=sink)
+    else:
+        logger.info("按调用方要求不注册受限管理入口：不建监听器、后台阶段消费者与租约保活")
     return loop
 
 
@@ -591,13 +598,5 @@ def _wire_late_and_stalled_recovery(
     不需要 ``if ... is not None`` 判断。
     """
     duties.append(_build_late_readiness_recovery_duty(config, stop=stop, audit=audit))
-    duties.append(
-        _build_stalled_provisioning_duty(
-            config,
-            stop=stop,
-            audit=audit,
-            alert=(
-                alerting_duty.onboarding_stalled_callback() if alerting_duty is not None else None
-            ),
-        )
-    )
+    alert = alerting_duty.onboarding_stalled_callback() if alerting_duty is not None else None
+    duties.append(_build_stalled_provisioning_duty(config, stop=stop, audit=audit, alert=alert))
