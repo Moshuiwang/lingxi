@@ -4,9 +4,9 @@
 
 条目按发布批次维护，不逐 PR 记录；每条引用对应 Issue 便于追溯。当前能力的完整事实、证据层级与已知边界以 [docs/当前能力.md](docs/当前能力.md) 为准，本文件不重复其细节。
 
-## [Unreleased]
+## [2.5.1] - 2026-09-17
 
-2.5.1 开发中（Trace [#812](https://github.com/Moshuiwang/lingxi/issues/812)）：由拉取代理 + 部署器发布的修复版，装入 [#804](https://github.com/Moshuiwang/lingxi/issues/804) / [#805](https://github.com/Moshuiwang/lingxi/issues/805) / [#807](https://github.com/Moshuiwang/lingxi/issues/807) / [#739](https://github.com/Moshuiwang/lingxi/issues/739) / [#745](https://github.com/Moshuiwang/lingxi/issues/745) 五处改动；本节随批次合入逐条追加。
+本版由**拉取代理 + 部署器**从 `release/2.5` 候选 rc.106 原样提升发到生产（Trace [#812](https://github.com/Moshuiwang/lingxi/issues/812)）：正式版 07:58Z 发布 → 生产代理自动拾取 → 三服务 08:01Z 重建（用户可见停机不到 1 分钟）→ 15 分钟观察 `verified`，迁移头 `0098` 不变、回退不降库，产品负责人一次真实问数通过。镜像里装下列五处修复与一处运维脚本修复；同批收口四张不进镜像的单：[#748](https://github.com/Moshuiwang/lingxi/issues/748) 裁决层剩余验收（同名伪造 PR 被拒、不改裁决核心的工作流 PR 免批合并、规则集应急恢复路径演练）、[#735](https://github.com/Moshuiwang/lingxi/issues/735)「申请使用」核实（= 飞书应用可用范围申请，不是业务授权来源）、[#742](https://github.com/Moshuiwang/lingxi/issues/742) 偶发失败复现量测（N = 24 未复现，测试侧修法随本版）、[#756](https://github.com/Moshuiwang/lingxi/issues/756) 峰值样本与恢复证据。生产 [#807](https://github.com/Moshuiwang/lingxi/issues/807) 受影响的 4 人：3 位返聘者按新规则解析为唯一在职并入组，旧正式表里属于旧身份的 3 行由管理员归档后开通完成、就绪核验通过；第 4 人（同一人员 ID 多行）按规则仍拒绝，花名册去重后再扩员。证据等级与已知边界以 [docs/当前能力.md](docs/当前能力.md) 为准。
 
 ### Fixed
 
