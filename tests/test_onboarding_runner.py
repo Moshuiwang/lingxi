@@ -2850,10 +2850,21 @@ class SystemTriggerTests(unittest.TestCase):
         self.assertEqual(parts["directory"].calls, [])
 
     def test_a_candidate_without_directory_status_keeps_identity_unresolved(self) -> None:
-        """另一候选缺组织资料时，不能因已知候选在职就给它开通。"""
+        """另一候选的组织资料不可判定（同一人员 ID 对应多个成员）时，不能因已知候选在职就给它开通。
+
+        「可用且新鲜的快照里精确零成员」是另一回事——那是明确非在职，见
+        ``tests/test_email_identity_onboarding.py``。"""
+
+        from dataclasses import replace
 
         rows = ROSTER_ROWS + ({**ROSTER_ROWS[0], "personnel_id": "fu_2"},)
-        parts, result = run_system_once(roster=FakeRoster(rows))
+        twins = tuple(
+            replace(MEMBER, member_key=f"mk_{open_id}", user_id="fu_2", open_id=open_id)
+            for open_id in ("ou_2a", "ou_2b")
+        )
+        parts, result = run_system_once(
+            roster=FakeRoster(rows), directory=FakeDirectory(members=(MEMBER, *twins))
+        )
 
         self.assertIs(result.state, OnboardingState.INTERNAL_ERROR)
         self.assertEqual(result.failure_reason, "email_identity_unavailable")
