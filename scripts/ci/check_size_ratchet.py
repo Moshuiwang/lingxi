@@ -156,11 +156,14 @@ def evaluate(baseline: dict[str, int], current: dict[str, int]) -> list[str]:
             # 2048 改成 2348），本检查看到的是"记录 == 实测"，会判绿——精确相等
             # 提供的价值是"任何净增都必须在同一次改动里对基线文件留下一处可审阅
             # 的文本 diff"，不是"净增在算法上不可能通过"。真正堵住这类绕过需要
-            # 对照上一个可信基线（例如与合并基比对），但本仓当前跑
-            # `verify_repository.sh` 的 CI job（`ci.yml` 的 `gate`、
-            # `story.yml` 的 `fast`）都是浅克隆、不带 `fetch-depth: 0`，
-            # 没有可用的历史或 `origin/main` 引用可比——2026-08-19 复查后
-            # 确认加不了，如实登记为已知边界（代码框架「文件体量棘轮」一节）。
+            # 对照上一个可信基线（例如与合并基比对）。跑 `verify_repository.sh`
+            # 的 CI job 现状：`ci.yml` 的 `gate` 自 `c34b6989`（2026-09-01）起
+            # `fetch-depth: 0`；`story.yml` 的 `fast` 仍是浅克隆，且同样跑
+            # `verify_repository.sh`；`gate` 在 `workflow_dispatch` /
+            # `workflow_call` 形态下没有 PR base sha；当前没有任何一步把 base ref
+            # 传进 `verify_repository.sh`。此处早先记录的克隆深度事实已过期，
+            # 结论按 #592 D-24 不变（只登记不改），仍如实登记为已知边界
+            # （代码框架「文件体量棘轮」一节）。
             failures.append(
                 f"{path}：棘轮基线记录 {recorded} 行，与实测 {actual} 行不一致。"
                 "基线必须与实际行数精确相等，不允许留有余量。运行 "
