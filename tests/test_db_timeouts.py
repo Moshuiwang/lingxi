@@ -5,6 +5,7 @@ from __future__ import annotations
 import importlib.util
 import sys
 import tempfile
+import textwrap
 import types
 import unittest
 from pathlib import Path
@@ -163,6 +164,17 @@ class DbTimeoutGateTest(unittest.TestCase):
         self.assertEqual(CHECK.check_runtime_connections(CHECK.CONTROLLED_SCRIPTS_ROOT), [])
         self.assertEqual(CHECK.check_migration_connection(), [])
 
+    def test_repository_connection_borrow_scope_passes_and_is_not_vacuous(self) -> None:
+        """全仓默认复用调用点一处不改即全绿；计数为正，证明扫描确实识别到了工厂调用。"""
+
+        runtime = CHECK.scan_connection_borrow_scope()
+        scripts = CHECK.scan_connection_borrow_scope(CHECK.CONTROLLED_SCRIPTS_ROOT)
+        self.assertEqual(runtime.failures, [])
+        self.assertEqual(scripts.failures, [])
+        self.assertGreater(runtime.reused_calls, 0)
+        self.assertGreater(runtime.dedicated_calls + scripts.dedicated_calls, 0)
+        self.assertEqual(runtime.exempted_calls + scripts.exempted_calls, 0)
+
     def test_a_bare_psycopg_connection_is_rejected(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             source = Path(directory) / "lingxi"
@@ -281,6 +293,221 @@ class DbTimeoutGateTest(unittest.TestCase):
             failures = CHECK.check_runtime_connections(source)
 
         self.assertEqual(failures, [])
+
+
+FACTORY_IMPORT = "from lingxi.adapters.postgres import connect\n"
+
+
+def _borrow_scope(code: str, **kwargs) -> tuple[list[str], int, int]:
+    """把一份样本写成临时包里的适配器文件，跑借用围栏，返回 (判红清单, 默认复用数, 独占数)。"""
+
+    with tempfile.TemporaryDirectory() as directory:
+        source = Path(directory) / "lingxi"
+        (source / "adapters").mkdir(parents=True)
+        (source / "adapters" / "postgres.py").write_text("# 工厂占位\n", encoding="utf-8")
+        (source / "adapters" / "sample.py").write_text(textwrap.dedent(code), encoding="utf-8")
+        scan = CHECK.scan_connection_borrow_scope(source, **kwargs)
+    return scan.failures, scan.reused_calls, scan.dedicated_calls
+
+
+class ConnectionBorrowScopeGateTest(unittest.TestCase):
+    """连接借用围栏的正反例：默认复用路径的 ``connect()`` 与其游标不得逃出 ``with`` 块。
+
+    变异实测：把 ``_scan_borrow_scope_file`` 里 ``if id(node) in context_ids`` 改成恒真，
+    下面四条违规样本里「裸 connect() 赋值后使用」必红；把 ``_escapes_inside`` /
+    ``_uses_after`` 改成直接 ``return []``，其余三条必红。
+    """
+
+    # ---- 四种违规样本，各判红一次
+
+    def test_a_bare_connect_assigned_and_used_is_red(self) -> None:
+        failures, reused, _ = _borrow_scope(
+            FACTORY_IMPORT
+            + "def f(dsn):\n    c = connect(dsn)\n    c.execute('SELECT 1')\n    c.close()\n"
+        )
+        self.assertEqual(reused, 1)
+        self.assertEqual(len(failures), 1)
+        self.assertIn("sample.py:3 默认复用路径的 connect() 没有写在 with 语句", failures[0])
+
+    def test_connect_again_after_close_inside_the_with_block_is_red(self) -> None:
+        failures, _, _ = _borrow_scope(
+            FACTORY_IMPORT
+            + "def f(dsn):\n"
+            + "    with connect(dsn) as c:\n"
+            + "        c.execute('SELECT 1')\n"
+            + "        c.close()\n"
+            + "        with connect(dsn) as d:\n"
+            + "            d.execute('SELECT 2')\n"
+        )
+        self.assertEqual(len(failures), 1)
+        self.assertIn(
+            "sample.py:6 with 块内已 close() 归还的连接，同一块内又取 connect()", failures[0]
+        )
+
+    def test_a_cursor_stored_on_self_is_red(self) -> None:
+        for expression in ("c.cursor()", "c.execute('SELECT 1')", "c"):
+            with self.subTest(expression=expression):
+                failures, _, _ = _borrow_scope(
+                    FACTORY_IMPORT
+                    + "class Store:\n"
+                    + "    def f(self, dsn):\n"
+                    + "        with connect(dsn) as c:\n"
+                    + f"            self.kept = {expression}\n"
+                )
+                self.assertEqual(len(failures), 1)
+                self.assertIn("sample.py:5 连接或游标存进了属性 / 容器", failures[0])
+
+    def test_a_cursor_escaping_the_with_block_and_executing_is_red(self) -> None:
+        failures, _, _ = _borrow_scope(
+            FACTORY_IMPORT
+            + "def f(dsn):\n"
+            + "    with connect(dsn) as c:\n"
+            + "        cur = c.cursor()\n"
+            + "    cur.execute('SELECT 1')\n"
+            + "    return cur.fetchone()\n"
+        )
+        self.assertEqual(
+            [failure.split(" ", 1)[0] for failure in failures],
+            ["lingxi/adapters/sample.py:5", "lingxi/adapters/sample.py:6"],
+        )
+        self.assertTrue(all("名字 cur 指向的连接或游标仍在使用" in failure for failure in failures))
+
+    # ---- 同类逃逸：归还后再用连接、随 return 逃出、global / nonlocal
+
+    def test_using_the_connection_after_the_with_block_is_red(self) -> None:
+        failures, _, _ = _borrow_scope(
+            FACTORY_IMPORT
+            + "def f(dsn):\n"
+            + "    with connect(dsn) as c:\n"
+            + "        c.execute('SELECT 1')\n"
+            + "    c.commit()\n"
+        )
+        self.assertEqual(len(failures), 1)
+        self.assertIn("sample.py:5 with 块已退出，名字 c 指向的连接或游标仍在使用", failures[0])
+
+    def test_returning_a_cursor_from_inside_the_with_block_is_red(self) -> None:
+        failures, _, _ = _borrow_scope(
+            FACTORY_IMPORT
+            + "def f(dsn):\n    with connect(dsn) as c:\n        return c.execute('SELECT 1')\n"
+        )
+        self.assertEqual(len(failures), 1)
+        self.assertIn("sample.py:4 连接或游标随 return 逃出 with 块", failures[0])
+
+    def test_a_cursor_assigned_to_a_global_or_nonlocal_name_is_red(self) -> None:
+        failures, _, _ = _borrow_scope(
+            FACTORY_IMPORT
+            + "KEPT = None\n"
+            + "def f(dsn):\n"
+            + "    global KEPT\n"
+            + "    with connect(dsn) as c:\n"
+            + "        KEPT = c.cursor()\n"
+        )
+        self.assertEqual(len(failures), 1)
+        self.assertIn("sample.py:6 游标或连接赋给了 with 块外的名字", failures[0])
+
+    # ---- 正例，各判绿
+
+    def test_the_standard_with_block_is_green(self) -> None:
+        failures, reused, dedicated = _borrow_scope(
+            FACTORY_IMPORT
+            + "def f(dsn):\n"
+            + "    with connect(dsn) as connection:\n"
+            + "        with connection.cursor() as cursor:\n"
+            + "            cursor.execute('SELECT 1')\n"
+            + "            rows = cursor.fetchall()\n"
+            + "        first = connection.execute('SELECT 2').fetchone()\n"
+            + "    with connect(dsn) as connection:\n"
+            + "        connection.execute('SELECT 3')\n"
+            + "    return rows, first\n"
+        )
+        self.assertEqual(failures, [])
+        self.assertEqual((reused, dedicated), (2, 0))
+
+    def test_dedicated_connections_are_outside_the_fence(self) -> None:
+        for arguments in ("dedicated=True", "autocommit=True, dedicated=True"):
+            with self.subTest(arguments=arguments):
+                failures, reused, dedicated = _borrow_scope(
+                    FACTORY_IMPORT
+                    + "class Holder:\n"
+                    + "    def open(self, dsn):\n"
+                    + f"        self._connection = connect(dsn, {arguments})\n"
+                )
+                self.assertEqual(failures, [])
+                self.assertEqual((reused, dedicated), (0, 1))
+
+    def test_closing_inside_the_with_block_without_another_connect_is_green(self) -> None:
+        failures, _, _ = _borrow_scope(
+            FACTORY_IMPORT
+            + "def f(dsn):\n"
+            + "    with connect(dsn) as c:\n"
+            + "        c.execute('SELECT 1')\n"
+            + "        c.close()\n"
+        )
+        self.assertEqual(failures, [])
+
+    def test_all_import_aliases_are_recognised_green_in_with_and_red_outside(self) -> None:
+        """别名 import 是威胁模型第一条：三种形态下 with 内判绿、赋值即判红，一条都不能漏。"""
+
+        forms = (
+            ("from lingxi.adapters.postgres import connect as open_db\n", "open_db"),
+            ("import lingxi.adapters.postgres as pg\n", "pg.connect"),
+            ("from lingxi.adapters import postgres\n", "postgres.connect"),
+            ("import lingxi.adapters.postgres\n", "lingxi.adapters.postgres.connect"),
+            ("from .postgres import connect\n", "connect"),
+            ("from lingxi.adapters import postgres\n", "getattr(postgres, 'connect')"),
+        )
+        for header, call in forms:
+            with self.subTest(call=call):
+                green, reused, _ = _borrow_scope(
+                    header
+                    + f"def f(dsn):\n    with {call}(dsn) as c:\n        c.execute('SELECT 1')\n"
+                )
+                self.assertEqual(green, [])
+                self.assertEqual(reused, 1)
+                red, _, _ = _borrow_scope(header + f"def f(dsn):\n    c = {call}(dsn)\n")
+                self.assertEqual(len(red), 1)
+                self.assertIn("sample.py:3 默认复用路径的 connect()", red[0])
+
+    def test_kwargs_unpacking_or_dynamic_dedicated_cannot_bypass_the_fence(self) -> None:
+        """``**kwargs`` 与 ``dedicated=<变量>`` 静态判不出走哪条路，按默认复用路径要求。"""
+
+        for call in ("connect(dsn, **options)", "connect(dsn, dedicated=flag)"):
+            with self.subTest(call=call):
+                failures, reused, dedicated = _borrow_scope(
+                    FACTORY_IMPORT + f"def f(dsn, options, flag):\n    c = {call}\n"
+                )
+                self.assertEqual((reused, dedicated), (1, 0))
+                self.assertEqual(len(failures), 1)
+
+    def test_a_wrapper_around_the_factory_is_not_mistaken_for_it(self) -> None:
+        failures, reused, _ = _borrow_scope(
+            "from lingxi.adapters.innertest_request import connect\n"
+            "def f(dsn):\n    c = connect(dsn)\n"
+        )
+        self.assertEqual((failures, reused), ([], 0))
+
+    # ---- 豁免清单：只读常量、精确到行、运行期塞不进去
+
+    def test_the_exemption_list_is_empty_read_only_and_line_exact(self) -> None:
+        self.assertEqual(dict(CHECK.BORROW_SCOPE_EXEMPTIONS), {})
+        with self.assertRaises(TypeError):
+            CHECK.BORROW_SCOPE_EXEMPTIONS[("lingxi/adapters/sample.py", 3)] = "运行期塞进来的豁免"
+
+        code = FACTORY_IMPORT + "def f(dsn):\n    c = connect(dsn)\n    d = connect(dsn)\n"
+        explicit = types.MappingProxyType({("lingxi/adapters/sample.py", 3): "试验用"})
+        failures, _, _ = _borrow_scope(code, exemptions=explicit)
+        self.assertEqual(len(failures), 1, "豁免只放行登记的那一行，相邻一行照红")
+        self.assertIn("sample.py:4", failures[0])
+
+    def test_rebinding_the_module_level_list_at_runtime_does_not_reach_the_scan(self) -> None:
+        """`__main__` 里重绑常量也没用：扫描函数用的是定义时绑定的默认值。"""
+
+        code = FACTORY_IMPORT + "def f(dsn):\n    c = connect(dsn)\n"
+        with mock.patch.object(
+            CHECK, "BORROW_SCOPE_EXEMPTIONS", {("lingxi/adapters/sample.py", 3): "运行期重绑"}
+        ):
+            failures, _, _ = _borrow_scope(code)
+        self.assertEqual(len(failures), 1)
 
 
 class MigrationTimeoutConfigTest(unittest.TestCase):
