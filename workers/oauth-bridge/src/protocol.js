@@ -81,5 +81,5 @@ export function callbackPage({ delivered, state }) {
     };
     socket.onerror = () => { status.textContent = '正在查询组织信息，请稍候或返回飞书重新开始。'; };
   </script>` : "";
-  return `<!doctype html><html lang="zh-CN"><meta charset="utf-8"><meta name="referrer" content="no-referrer"><title>灵犀开通</title><body><p id="status">${message}</p><section id="debug-section" hidden><p><strong>仅供 Bot-Test 调试：请勿保存、转发或截图其中的身份资料。</strong></p><pre id="debug"></pre></section><section id="debug-details-section" hidden><h2>资料可得性报告</h2><pre id="debug-details"></pre></section><script>history.replaceState(null, '', location.pathname)</script>${bridgeScript}</body></html>`;
+  return `<!doctype html><html lang="zh-CN"><meta charset="utf-8"><meta name="referrer" content="no-referrer"><title>BI Plus 开通</title><body><p id="status">${message}</p><section id="debug-section" hidden><p><strong>仅供 Bot-Test 调试：请勿保存、转发或截图其中的身份资料。</strong></p><pre id="debug"></pre></section><section id="debug-details-section" hidden><h2>资料可得性报告</h2><pre id="debug-details"></pre></section><script>history.replaceState(null, '', location.pathname)</script>${bridgeScript}</body></html>`;
 }

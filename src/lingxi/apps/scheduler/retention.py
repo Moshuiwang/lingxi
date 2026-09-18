@@ -1,7 +1,9 @@
 """到期数据清理职责：保留清理、空闲会话清理、权限链到期处置、内测采集到期删除。
 
 几个职责同组的理由——共用「每轮只处理一批、不循环到清空」的纪律与幂等前提——
-见各类自己的文档字符串与包的 ``__init__.py`` 模块文档。
+见各类自己的文档字符串与包的 ``__init__.py`` 模块文档。「一批」= 各清理适配器自己的
+行级上限：每条清理语句带 ``LIMIT``，一轮最多处理这么多行，不是「本轮可见的全部积压」；
+超出的部分留给下一轮，单轮工作量因此有不随积压增长的上界。
 """
 
 from __future__ import annotations
@@ -103,14 +105,14 @@ class IdleConversationSweepDuty:
     def run_once(self) -> int | None:
         """已经在停止中就一批都不领。
 
-        返回 ``None`` 表示本轮未执行，否则返回本轮清除了已送达正文的会话数
-        （供日志/断言，不承载业务语义）。
+        返回 ``None`` 表示本轮未执行，否则返回本轮清空了已送达正文的事件行数
+        （供日志/断言，不承载业务语义；日志与返回值都不含行内容）。
         """
         if self._stop.is_set():
             return None
         cleared = self._queue.sweep_idle_conversations(idle_after=self._idle_after)
         if cleared:
-            logger.info("空闲会话清理：本轮清除 %s 个会话的已送达投递正文", cleared)
+            logger.info("空闲会话清理：本轮清空 %s 条已送达投递正文", cleared)
         return cleared
 
 

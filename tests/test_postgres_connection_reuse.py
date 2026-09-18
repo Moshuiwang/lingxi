@@ -8,6 +8,10 @@
 变异对照（#593 完成标准 3）：把 ``reset_for_reuse`` 里的 ``rollback()`` 删掉，
 ``test_an_exception_inside_with_rolls_back_before_the_connection_is_reused`` 必红——
 上一位借用者未提交的临时表会被下一位在同一会话里看见。
+
+已知边界的记录（#834）：归还后的旧引用与旧游标会随下一次借出恢复操作能力，
+``test_known_boundary_stale_handles_recover_once_the_object_is_lent_again`` 把六条时序
+按当前行为钉住，#835 修复时改为反向断言；围栏见 ``scripts/ci/check_db_timeouts.py``。
 """
 
 from __future__ import annotations
@@ -193,6 +197,13 @@ class ConnectionReuseTests(unittest.TestCase):
             second.close()
 
     def test_close_inside_with_block_is_safe(self) -> None:
+        """安全前提：``close()`` 与 ``with`` 退出之间不得再插一次 ``connect()``。
+
+        ``close()`` 归还后 ``with`` 自身的 ``__exit__`` 看到 ``closed`` 为真就直接返回，所以这里
+        安全；一旦中间再取一次 ``connect()``，同一对象被再次借出、标志置回假，``__exit__`` 就会
+        替新借用者提交并归还——那条时序钉在下面的记录性用例里。
+        """
+
         with connect(DSN) as connection:
             _backend_pid(connection)
             connection.close()
@@ -200,6 +211,99 @@ class ConnectionReuseTests(unittest.TestCase):
         with connect(DSN) as again:
             with connect(DSN) as other:
                 self.assertNotEqual(_backend_pid(again), _backend_pid(other))
+
+    def test_known_boundary_stale_handles_recover_once_the_object_is_lent_again(self) -> None:
+        """记录性用例：钉住「归还后的旧引用与旧游标随下一次借出恢复操作能力」的当前行为。
+
+        已知边界（#834 围栏只堵调用侧误用面，不修）：句柄失效只由共享标志 ``_lingxi_idle``
+        维护，下一次借出把它置回假，五处防护同时解除。六条时序按 Issue #834 逐条钉住；
+        #835（每次借用返回独立句柄并包装游标）完成时把这里的断言逐条改为反向断言。
+        """
+
+        with connect(DSN, dedicated=True) as setup:
+            setup.execute("DROP TABLE IF EXISTS reuse_boundary_probe")
+            setup.execute("CREATE TABLE reuse_boundary_probe (x int)")
+            setup.commit()
+        observer = connect(DSN, dedicated=True, autocommit=True)
+        self.addCleanup(observer.close)
+        self.addCleanup(lambda: observer.execute("DROP TABLE IF EXISTS reuse_boundary_probe"))
+
+        def committed_rows(marker: int) -> int:
+            return observer.execute(
+                "SELECT count(*) FROM reuse_boundary_probe WHERE x = %s", (marker,)
+            ).fetchone()[0]
+
+        with self.subTest(timeline=1, desc="归还后再借出拿到同一个对象，旧引用 closed 由真变回假"):
+            stale = connect(DSN)
+            pid = _backend_pid(stale)
+            stale.close()
+            self.assertTrue(stale.closed)
+            fresh = connect(DSN)
+            self.assertIs(fresh, stale)
+            self.assertFalse(stale.closed, "旧引用随下一次借出重新变为可用")
+            self.assertEqual(_backend_pid(fresh), pid)
+            fresh.close()
+
+        with self.subTest(timeline=2, desc="旧引用 commit() 提交新借用者尚未提交的事务"):
+            stale = connect(DSN)
+            stale.close()
+            fresh = connect(DSN)
+            fresh.execute("INSERT INTO reuse_boundary_probe VALUES (2)")
+            self.assertEqual(committed_rows(2), 0)
+            stale.commit()
+            self.assertEqual(committed_rows(2), 1, "新借用者未提交的行被旧引用提交了")
+            fresh.close()
+
+        with self.subTest(
+            timeline=3, desc="旧引用 rollback() 丢掉新借用者的写入，新借用者 commit() 不报错"
+        ):
+            stale = connect(DSN)
+            stale.close()
+            fresh = connect(DSN)
+            fresh.execute("INSERT INTO reuse_boundary_probe VALUES (3)")
+            stale.rollback()
+            fresh.commit()
+            self.assertEqual(committed_rows(3), 0, "写入被旧引用回滚，提交静默变成空操作")
+            fresh.close()
+
+        with self.subTest(timeline=4, desc="迟到 close() 强行归还在用连接并回滚在途写入"):
+            stale = connect(DSN)
+            stale.close()
+            fresh = connect(DSN)
+            pid = _backend_pid(fresh)
+            fresh.execute("INSERT INTO reuse_boundary_probe VALUES (4)")
+            stale.close()
+            self.assertTrue(fresh.closed, "在用连接被旧引用强行归还")
+            self.assertEqual(idle_connection_count(), 1)
+            with connect(DSN) as third:
+                self.assertEqual(_backend_pid(third), pid, "下一位借用者拿到同一条物理连接")
+            self.assertEqual(committed_rows(4), 0, "在途写入随强行归还被回滚")
+
+        with self.subTest(
+            timeline=5, desc="with 块内提前 close() 后再 connect()，__exit__ 成为迟到操作者"
+        ):
+            with connect(DSN) as first:
+                first.close()
+                second = connect(DSN)
+                self.assertIs(second, first)
+                second.execute("INSERT INTO reuse_boundary_probe VALUES (5)")
+                self.assertEqual(committed_rows(5), 0)
+            self.assertEqual(committed_rows(5), 1, "外层 with 退出替第二次借用提交了事务")
+            self.assertTrue(second.closed, "并把它归还")
+            self.assertEqual(idle_connection_count(), 1)
+
+        with self.subTest(
+            timeline=6, desc="归还前取得的游标在连接空闲期间仍能写库，并被下一位借用者提交"
+        ):
+            first = connect(DSN)
+            cursor = first.cursor()
+            first.close()
+            self.assertTrue(first.closed)
+            cursor.execute("INSERT INTO reuse_boundary_probe VALUES (6)")
+            self.assertEqual(committed_rows(6), 0)
+            with connect(DSN) as second:
+                self.assertIs(second, first)
+            self.assertEqual(committed_rows(6), 1, "旧游标的写入被下一位借用者的 with 退出提交")
 
     def test_a_returned_connection_cannot_be_used_again(self) -> None:
         connection = connect(DSN)
