@@ -1,17 +1,17 @@
 """PostgreSQL 连接的仓库级唯一入口。
 
-正式代码不能在各个适配器里分别决定连接、语句和锁等待的边界。三项超时写进 libpq
-启动参数，连接建立后的第一条业务语句已经受约束。本模块只依赖标准库；``psycopg``
-在真正建连的函数内延迟导入，保持没有数据库驱动的纯逻辑测试仍能导入正式包。
+三项超时（连接、语句、锁等待）写进 libpq 启动参数，第一条业务语句起就受约束，各适配器不再各自决定
+边界。本模块只依赖标准库；``psycopg`` 在真正建连的函数内延迟导入，没有驱动的纯逻辑测试仍能导入正式包。
 
-``connect()`` 默认返回本进程内可复用的连接：``close()`` 不真正断开，而是把仍然
-健康的连接放回按 (DSN, 超时配置) 分组的空闲栈，供下一次同 DSN、同超时配置的
-``connect()`` 直接取用；连接已断、回滚失败或空闲栈已满时才真正关闭。借用者看到
-的合同与驱动一致，区别只在物理连接未必真的断开；取用前的健康检查、归还前的
-会话属性复位见 ``_IdleConnectionPool`` 与 ``_ReusableConnectionMixin``。
-``dedicated=True``（或任何额外 psycopg 关键字参数）取得驱动原生连接，不进空闲栈，
-``close()`` 立即真正关闭——``LISTEN`` 适配器与常驻轮询的独占连接用这条路径；
-进程退出时 ``atexit`` 清空空闲栈，不给数据库连接池留悬挂会话。
+``connect()`` 默认返回本进程内可复用的连接：``close()`` 不真正断开，而是把仍然健康的连接
+放回按 (DSN, 超时配置) 分组的空闲栈，供下一次同键的 ``connect()`` 取用，连接已断、回滚失败
+或栈已满才真正关闭（健康检查与会话属性复位见 ``_IdleConnectionPool``、``_ReusableConnectionMixin``）；
+``dedicated=True`` 或任何额外 psycopg 关键字参数取得驱动原生连接，不进空闲栈、``close()``
+立即真正关闭（``LISTEN`` 适配器与常驻轮询用它）；进程退出时 ``atexit`` 清空空闲栈，不留悬挂会话。
+借用者看到的合同与驱动一致，区别只在物理连接未必真的断开——这句尚未完全兑现：句柄失效只由
+共享标志 ``_lingxi_idle`` 维护，连接再次借出后旧引用与旧游标恢复操作能力，「归还后不得再用、
+``with`` 块内 ``close()`` 后不得再取 ``connect()``、游标不得逃出 ``with`` 块」因此是调用方义务，
+由 ``scripts/ci/check_db_timeouts.py`` 守；围栏堵不住的三件事与修复方向见 ``_ReusableConnectionMixin``。
 """
 
 from __future__ import annotations
@@ -158,13 +158,13 @@ _PoolKey = tuple[str, PostgresTimeouts]
 class _IdleConnectionPool:
     """按 (DSN, 超时配置) 分组的空闲连接栈；只保管此刻没人在用的连接。
 
-    在用的连接不在这里登记：``connect()`` 取走即离开栈，``close()`` 归还才回来。
-    因此同一线程里嵌套的两个 ``with connect()`` 拿到的是两条不同的物理连接，
-    不会出现内层退出把外层事务一并提交的情况。
+    在用的连接不在这里登记：``connect()`` 取走即离开栈，``close()`` 归还才回来。因此同一线程里
+    嵌套的两个 ``with connect()`` 拿到的是两条不同的物理连接，内层退出不会把外层事务一并提交。
 
-    不变量：一个连接对象在栈里最多出现一次。由连接自己的 ``_lingxi_idle`` 标志
-    维护——压栈时置真、弹栈时置假，都在锁内完成；``close()`` 看到标志已真就直接
-    返回，所以重复 ``close()`` 不会把同一对象压栈两次、让两位借用者共用一条连接。
+    不变量：一个连接对象在栈里最多出现一次，由连接自己的 ``_lingxi_idle`` 标志在锁内维护（压栈置真、
+    弹栈置假），``close()`` 见标志已真就直接返回，重复 ``close()`` 不会让两位借用者共用一条连接。尚未
+    完全兑现：标志只认「此刻是否在栈里」、不认「是谁在用」——对象再次借出后，旧引用迟到的 ``close()``
+    会把在用连接强行归还并回滚在途写入，下一位借用者拿到同一条物理连接；「归还后不得再用」是调用方义务。
     """
 
     def __init__(self) -> None:
@@ -275,17 +275,21 @@ _reusable_connection_type: type | None = None
 class _ReusableConnectionMixin:
     """``close()`` 改为归还进程内空闲栈的连接。
 
-    与 ``psycopg.Connection`` 组合成 ``ReusableConnection``（见
-    :func:`_build_reusable_connection_type`）。借用者看到的合同与驱动一致：
-    ``with`` 退出由驱动 ``commit()``/``rollback()`` 再 ``close()``；之后
-    ``closed`` 为真、重复 ``close()`` 空操作、再用报"连接已关闭"，区别只在物理
-    连接没断、等下一位借用者。模块顶层不能 import 第三方 SDK，本类需要引用驱动
-    异常/状态枚举的方法各自延迟导入；``super()`` 在拼接出的 ``ReusableConnection``
-    MRO 上解析到 ``psycopg.Connection``，行为与直接继承一致。
+    与 ``psycopg.Connection`` 组合成 ``ReusableConnection``（见 :func:`_build_reusable_connection_type`）。
+    借用者看到的合同与驱动一致：``with`` 退出由驱动 ``commit()``/``rollback()`` 再 ``close()``，之后
+    ``closed`` 为真、重复 ``close()`` 空操作、再用报"连接已关闭"，区别只在物理连接没断、等下一位
+    借用者——尚未完全兑现：句柄失效只由共享标志 ``_lingxi_idle`` 维护（见其说明），再次借出后旧引用
+    与旧游标恢复操作能力。围栏堵不住的三件事：``with`` 块内提前 ``close()`` 后再取 ``connect()``
+    （``__exit__`` 成为迟到操作者，AST 只拦得住部分写法）、归还前取得的游标（``Cursor.connection``
+    回指原始连接）、旧 ``pgconn``。修复方向：每次借用返回独立句柄并包装游标；围栏不是修复。
     """
 
     _lingxi_pool_key: _PoolKey | None = None
-    #: 为真表示对象此刻躺在空闲栈里（或正被池回收）：借用者手里的引用已经失效。
+    #: 为真表示对象此刻躺在空闲栈里（或正被池回收）：借用者手里的引用已经失效。尚未完全兑现：
+    #: 这是全体借用者共享的一个标志，``closed`` / ``close()`` / ``cursor()`` / ``commit()`` /
+    #: ``rollback()`` 五处防护都只读它，下一次借出把它置回假、五处防护同时解除，旧引用与旧游标
+    #: 恢复操作能力；归还前取得的游标不经过任何一处防护。「归还后不得再用、``with`` 块内 ``close()``
+    #: 后不得再取 ``connect()``、游标不得逃出 ``with`` 块」由 ``scripts/ci/check_db_timeouts.py`` 守。
     _lingxi_idle: bool = False
 
     @property
@@ -387,7 +391,11 @@ class _ReusableConnectionMixin:
 
 
 def _build_reusable_connection_type() -> type:
-    """延迟构造 psycopg ``Connection`` 子类：模块顶层不能 import 驱动。"""
+    """延迟构造 psycopg ``Connection`` 子类：模块顶层不能 import 驱动。
+
+    混入类里引用驱动异常/状态枚举的方法也各自延迟导入；``super()`` 沿拼接出的 MRO 解析到
+    ``psycopg.Connection``，行为与直接继承一致。
+    """
     global _reusable_connection_type
     if _reusable_connection_type is not None:
         return _reusable_connection_type
