@@ -6,6 +6,7 @@ import importlib.util
 import sys
 import tempfile
 import textwrap
+import threading
 import types
 import unittest
 from pathlib import Path
@@ -310,12 +311,38 @@ def _borrow_scope(code: str, **kwargs) -> tuple[list[str], int, int]:
     return scan.failures, scan.reused_calls, scan.dedicated_calls
 
 
+def _borrow_scope_within(seconds: float, code: str) -> tuple[list[str], int, int]:
+    """在独立线程里跑围栏：到时未结束即判失败（门禁挂死也要有确定的红），异常原样抛出。"""
+
+    outcome: list[object] = []
+
+    def run() -> None:
+        try:
+            outcome.append(_borrow_scope(code))
+        except Exception as error:
+            outcome.append(error)
+
+    worker = threading.Thread(target=run, daemon=True)
+    worker.start()
+    worker.join(seconds)
+    if worker.is_alive():
+        raise AssertionError(f"围栏扫描 {seconds} 秒内没有结束（别名收集挂死）")
+    result = outcome[0]
+    if isinstance(result, Exception):
+        raise result
+    assert isinstance(result, tuple)
+    return result
+
+
 class ConnectionBorrowScopeGateTest(unittest.TestCase):
     """连接借用围栏的正反例：默认复用路径的 ``connect()`` 与其游标不得逃出 ``with`` 块。
 
     变异实测：把 ``_scan_borrow_scope_file`` 里 ``if id(node) in context_ids`` 改成恒真，
     下面四条违规样本里「裸 connect() 赋值后使用」必红；把 ``_escapes_inside`` /
-    ``_uses_after`` 改成直接 ``return []``，其余三条必红。
+    ``_uses_after`` 改成直接 ``return []``，其余三条必红。把 ``_bind`` 改回无条件覆盖，
+    别名振荡用例抛错（再去掉轮数上界则超时）、跨作用域覆盖用例变绿；把
+    ``_non_name_with_targets`` 改成 ``return []``、``_carries_handle`` 改成只认名字与游标
+    表达式，``as`` 目标用例与容器字面量用例各自变绿。
     """
 
     # ---- 四种违规样本，各判红一次
@@ -485,6 +512,128 @@ class ConnectionBorrowScopeGateTest(unittest.TestCase):
             "def f(dsn):\n    c = connect(dsn)\n"
         )
         self.assertEqual((failures, reused), ([], 0))
+
+    # ---- 别名收集只升不降：振荡片段 2 秒内结束、跨作用域覆盖不漏判、不收敛就响亮失败
+
+    def test_a_name_rebound_between_two_factory_members_settles_fast_and_is_red(self) -> None:
+        """同一个名字先后赋给工厂的两个成员曾让别名收集每轮互相覆盖、门禁挂死；现在绑定
+        只升不降，顺序、反序、if / else 三种写法都必须 2 秒内结束，且曾绑到 connect 的名字
+        按工厂审查（宁可多判）。"""
+
+        header = "from lingxi.adapters import postgres as pg\n"
+        samples = {
+            "顺序": "alias = pg.connect\nalias = pg.PostgresTimeouts\n",
+            "反序": "alias = pg.PostgresTimeouts\nalias = pg.connect\n",
+            "if / else": "if pg:\n    alias = pg.connect\nelse:\n    alias = pg.PostgresTimeouts\n",
+        }
+        for label, body in samples.items():
+            with self.subTest(sample=label):
+                code = header + body + "def f(dsn):\n    c = alias(dsn)\n"
+                call_line = code.count("\n")
+                failures, reused, _ = _borrow_scope_within(2.0, code)
+                self.assertEqual(reused, 1)
+                self.assertEqual(len(failures), 1)
+                self.assertIn(f"sample.py:{call_line} 默认复用路径的 connect()", failures[0])
+
+    def test_a_non_factory_import_in_another_scope_does_not_unbind_the_factory_alias(
+        self,
+    ) -> None:
+        """``open_db`` 在一个作用域绑到工厂后，另一个作用域 ``from elsewhere import connect
+        as open_db`` 不得把它覆盖成非工厂——不论先后，两处 ``open_db(...)`` 都按默认复用
+        路径审查（宁可多判）。"""
+
+        factory_first = (
+            "from lingxi.adapters.postgres import connect as open_db\n"
+            "def a(dsn):\n    c = open_db(dsn)\n"
+            "def b():\n    from elsewhere import connect as open_db\n    return open_db('x')\n"
+        )
+        factory_last = (
+            "from elsewhere import connect as open_db\n"
+            "def a(dsn):\n    c = open_db(dsn)\n"
+            "def b():\n    from lingxi.adapters.postgres import connect as open_db\n"
+            "    return open_db('x')\n"
+        )
+        for label, code in (("工厂在前", factory_first), ("工厂在后", factory_last)):
+            with self.subTest(order=label):
+                failures, reused, _ = _borrow_scope(code)
+                self.assertEqual(reused, 2)
+                self.assertEqual(
+                    [failure.split(" ", 1)[0] for failure in failures],
+                    ["lingxi/adapters/sample.py:3", "lingxi/adapters/sample.py:6"],
+                )
+                self.assertTrue(all("默认复用路径的 connect()" in f for f in failures))
+
+    def test_alias_collection_that_never_settles_fails_loudly(self) -> None:
+        """轮数上界是兜底：把登记函数换回「无条件覆盖、每次都算改动」，扫描必须抛错，
+        而不是静默返回或挂死。"""
+
+        def overwrite(bindings: dict[str, str], name: str, canonical: str) -> bool:
+            bindings[name] = canonical
+            return True
+
+        with mock.patch.object(CHECK, "_bind", overwrite):
+            with self.assertRaisesRegex(RuntimeError, "别名收集没有收敛"):
+                _borrow_scope_within(2.0, FACTORY_IMPORT + "alias = connect\n")
+
+    # ---- ``as`` 目标与容器字面量
+
+    def test_binding_the_connection_to_anything_but_a_name_is_red(self) -> None:
+        """``as self.connection`` / ``as store["c"]`` 让句柄一落地就在块外可达，判红；
+        ``as c`` 与不写 ``as`` 照旧判绿。"""
+
+        for target, expected in (("self.connection", 1), ("store['c']", 1), ("c", 0), ("", 0)):
+            with self.subTest(target=target or "无 as"):
+                clause = f" as {target}" if target else ""
+                failures, reused, _ = _borrow_scope(
+                    FACTORY_IMPORT
+                    + "class Store:\n"
+                    + "    def f(self, dsn, store):\n"
+                    + f"        with connect(dsn){clause}:\n"
+                    + "            pass\n"
+                )
+                self.assertEqual(reused, 1)
+                self.assertEqual(len(failures), expected)
+                if expected:
+                    self.assertIn("sample.py:4 连接绑定到属性 / 下标 / 解包目标", failures[0])
+
+    def test_a_container_literal_carrying_the_connection_or_cursor_escapes_too(self) -> None:
+        """装进 Dict / List / Tuple / Set 字面量（含嵌套）再 return 或存进属性，与直接逃出
+        同判；不含句柄的容器照旧判绿。"""
+
+        for expression in (
+            "{'connection': c, 'cursor': c.cursor()}",
+            "[c.execute('SELECT 1')]",
+            "(rows, c)",
+            "{c}",
+            "{'pair': (rows, [c.cursor()])}",
+        ):
+            with self.subTest(expression=expression):
+                failures, _, _ = _borrow_scope(
+                    FACTORY_IMPORT
+                    + "def f(dsn):\n"
+                    + "    with connect(dsn) as c:\n"
+                    + "        rows = c.execute('SELECT 1').fetchall()\n"
+                    + f"        return {expression}\n"
+                )
+                self.assertEqual(len(failures), 1)
+                self.assertIn("sample.py:5 连接或游标随 return 逃出 with 块", failures[0])
+        failures, _, _ = _borrow_scope(
+            FACTORY_IMPORT
+            + "class Store:\n"
+            + "    def f(self, dsn):\n"
+            + "        with connect(dsn) as c:\n"
+            + "            self.kept = [c]\n"
+        )
+        self.assertEqual(len(failures), 1)
+        self.assertIn("sample.py:5 连接或游标存进了属性 / 容器", failures[0])
+        failures, _, _ = _borrow_scope(
+            FACTORY_IMPORT
+            + "def f(dsn):\n"
+            + "    with connect(dsn) as c:\n"
+            + "        rows = c.execute('SELECT 1').fetchall()\n"
+            + "    return {'rows': rows}\n"
+        )
+        self.assertEqual(failures, [])
 
     # ---- 豁免清单：只读常量、精确到行、运行期塞不进去
 
