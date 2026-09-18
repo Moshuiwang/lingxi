@@ -290,8 +290,8 @@ class _Transaction:
         的事务**里，不建连接不提交不回滚（清理须与账号/权限决定同一事务）；没
         有独立事务的调用方改用 ``_queue_outbox._OutboxMixin`` 同名方法。**硬
         失效**触发，不等两小时空闲阈值。加锁顺序固定**先锁全部 conversation
-        （按 id 升序）、再逐个清 tde**，与 ``/new``、空闲到点扫描同一顺序，避免
-        交叉持锁死锁（并发回归见
+        （按 id 升序）、再逐会话按事件 id 升序清 tde**，与 ``/new``、空闲到点扫描
+        （按 (会话 id, 事件 id) 升序）同一锁序，避免交叉持锁死锁（并发回归见
         ``test_purge_and_new_command_never_deadlock_across_twenty_rounds``）。
         """
         # 一次性锁定该用户名下全部会话（按 id 升序），同时把 agent_session_id 现值
@@ -330,23 +330,30 @@ class _Transaction:
     def clear_delivered_content_for_conversation(self, *, conversation_id: str) -> int:
         """把已确认送达（``platform_received``）但仍随会话保留的投递正文清空。
 
-        只清 ``content``：``event_type``/``sequence``/``terminal_kind``/
-        ``error_kind`` 等低敏事实按状态合同保留最长九十天，供审计与到期
-        清理链复用；只有正文本身在会话边界触发时被清除（数据库设计「问数结果
-        投递事件与会话保留 Outbox」）。只匹配 ``platform_received_at IS NOT NULL``
-        的行——送达前的正文走独立的二十四小时到期路径
-        （``PostgresTaskQueue.expire_undelivered_terminals``），不受这个方法影响。
-        返回值是本次清空的事件行数，只用于日志/断言，不承载业务语义。
+        只清 ``content``：``event_type``/``sequence``/``terminal_kind``/``error_kind``
+        等低敏事实按状态合同保留最长九十天，供审计与到期清理链复用；只有正文本身在
+        会话边界触发时被清除（数据库设计「问数结果投递事件与会话保留 Outbox」）。只
+        匹配 ``platform_received_at IS NOT NULL`` 的行——送达前的正文走独立的二十四
+        小时到期路径（``expire_undelivered_terminals``），不受本方法影响。CTE 先按
+        事件 id 升序逐行锁定再清空，与空闲到点扫描（按 (会话 id, 事件 id) 升序）在同
+        一会话内锁序一致，并发不交叉持锁。返回值只是本次清空的行数，不承载业务语义。
         """
         cursor = self._execute(
             """
+            WITH target AS (
+                SELECT e.id
+                  FROM task_delivery_event AS e
+                  JOIN task AS t ON e.task_id = t.id
+                 WHERE t.conversation_id = %s
+                   AND e.platform_received_at IS NOT NULL
+                   AND e.content IS NOT NULL
+                 ORDER BY e.id
+                 FOR UPDATE OF e
+            )
             UPDATE task_delivery_event AS e
                SET content = NULL
-              FROM task AS t
-             WHERE e.task_id = t.id
-               AND t.conversation_id = %s
-               AND e.platform_received_at IS NOT NULL
-               AND e.content IS NOT NULL
+              FROM target
+             WHERE e.id = target.id
             """,
             (conversation_id,),
         )

@@ -139,10 +139,11 @@ _EXPIRE_CLEAR_CONTENT_SQL = (
     "UPDATE task_delivery_event SET content = NULL WHERE task_id = %s AND content IS NOT NULL"
 )
 
-# 候选谓词只描述「会话空闲到点、事件已送达且仍持有正文」，行级上限按事件 id 升序
-# 截取。候选在 CTE 里按这个顺序逐行锁定，不用 SKIP LOCKED：被占住的行让本轮按
+# 候选谓词只描述「会话空闲到点、事件已送达且仍持有正文」，行级上限按 (会话 id, 事件 id)
+# 升序截取。候选在 CTE 里按这个顺序逐行锁定，不用 SKIP LOCKED：被占住的行让本轮按
 # 锁等待超时失败回滚、下一轮重来，而不是悄悄永久跳过；外层 UPDATE 只碰已经锁到
-# 手的行，行锁顺序因此固定为事件 id 升序，不随执行计划漂移。
+# 手的行，行锁顺序因此固定为 (会话 id, 事件 id) 升序，与 /new、按用户清理（先锁
+# 会话、再逐会话按事件 id 升序清）同一锁序，不随执行计划漂移。
 _CLEAR_STALE_DELIVERED_CONTENT_SQL = """
 WITH target AS (
     SELECT e.id
@@ -155,7 +156,7 @@ WITH target AS (
        AND c.last_task_ended_at <= now() - %s::interval
        AND e.platform_received_at IS NOT NULL
        AND e.content IS NOT NULL
-     ORDER BY e.id
+     ORDER BY c.id, e.id
      LIMIT %s
      FOR UPDATE OF e
 )
@@ -801,7 +802,8 @@ class _OutboxMixin:
         """会话空闲满两小时由 scheduler 周期调用，返回本轮清空正文的事件行数。
 
         分两条独立查询、同一事务同一连接，候选集不同：清正文只挑已到点、仍持有
-        未清正文的投递事件，单轮最多 ``_CLEANUP_ROW_LIMIT`` 行、积压由下一轮继续
+        未清正文的投递事件，单轮最多 ``_CLEANUP_ROW_LIMIT`` 行、积压由下一轮继续、
+        按 (会话 id, 事件 id) 升序锁行，与 ``/new``、按用户清理同一锁序
         （见 :meth:`_clear_stale_delivered_content`）；Agent 会话物理清理排队与
         是否有投递正文无关（见 :meth:`_queue_idle_session_cleanups`）。返回值只是
         行数，不含任何行内容。天然幂等：重复调用不产生第二次副作用。
@@ -817,11 +819,11 @@ class _OutboxMixin:
     def _clear_stale_delivered_content(cursor: Any, *, idle_after: timedelta) -> int:
         """清空已到两小时空闲、已送达且仍持有正文的投递事件；返回本轮清空的行数。
 
-        一条语句、单轮最多 ``_CLEANUP_ROW_LIMIT`` 行，按事件 id 升序锁定并清空，
-        积压由下一轮继续：单轮工作量不再随一个会话攒下的正文行数增长，一处行锁
-        冲突也只作废这一条语句。**不**把 ``conversation.agent_session_id`` 置空
-        ——是否 ``resume`` 仍然只由领取任务时的时间戳比较决定（`V-会话-04`），
-        本方法只负责让正文不再继续占着数据库。
+        一条语句、单轮最多 ``_CLEANUP_ROW_LIMIT`` 行，按 (会话 id, 事件 id) 升序锁定
+        并清空，与 ``/new``、按用户清理同一锁序；积压由下一轮继续：单轮工作量不再随
+        一个会话攒下的正文行数增长，一处行锁冲突也只作废这一条语句。**不**把
+        ``conversation.agent_session_id`` 置空——是否 ``resume`` 仍然只由领取任务时
+        的时间戳比较决定（`V-会话-04`），本方法只负责让正文不再继续占着数据库。
         """
         cursor.execute(_CLEAR_STALE_DELIVERED_CONTENT_SQL, (idle_after, _CLEANUP_ROW_LIMIT))
         return cursor.rowcount

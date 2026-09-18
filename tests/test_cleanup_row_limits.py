@@ -3,7 +3,8 @@
 空闲会话正文清理（``sweep_idle_conversations``）、二十四小时到期收敛
 （``expire_undelivered_terminals``）与心跳超时回收（``reclaim_stale``）各为一条带
 ``LIMIT`` 的语句：单轮最多处理 500 行候选、积压由下一轮继续、未处理行逐字不变、
-一处行锁冲突只作废这一条语句、日志与返回值不含行内容。
+一处行锁冲突只作废这一条语句、日志与返回值不含行内容。空闲清理的候选窗口按
+(会话 id, 事件 id) 升序锁行，与 ``/new``、按用户清理同一锁序，交叉布局下并发零死锁。
 
 判定值全部由测试实跑写出：隔离真库里的表内容与被测方法的返回值；前置状态
 （多少会话、多少行、谁占着锁）由用例自己构造。大批量行用 ``generate_series``
@@ -14,6 +15,7 @@ from __future__ import annotations
 
 import logging
 import os
+import threading
 import time
 import unittest
 from datetime import timedelta
@@ -21,7 +23,7 @@ from datetime import timedelta
 from postgres_schema import ensure_production_schema, psycopg_available, reset_production_rows
 
 from lingxi.adapters.postgres import DEFAULT_POSTGRES_TIMEOUTS, connect
-from lingxi.adapters.postgres_conversation import PostgresTaskQueue
+from lingxi.adapters.postgres_conversation import PostgresTaskQueue, _Transaction
 from lingxi.adapters.postgres_conversation._queue_outbox import _CLEANUP_ROW_LIMIT
 from lingxi.apps.scheduler.retention import IDLE_CONVERSATION_SWEEP_AFTER, IdleConversationSweepDuty
 
@@ -85,13 +87,16 @@ class CleanupRowLimitTestCase(unittest.TestCase):
         events: int,
         idle_for: str = "3 hours",
         delivered: bool = True,
+        event_prefix: str | None = None,
     ) -> list[str]:
         """一个已空闲 ``idle_for`` 的会话、一个已结束任务、``events`` 条 terminal 行。
 
-        事件 id 形如 ``tde-<会话>-<六位序号>``，因此「按事件 id 升序」在用例里是可以
-        手算的；返回本会话全部事件 id（升序）。``delivered=False`` 造的是送达前的
-        正文——它走独立的二十四小时到期路径，空闲清理不得碰它。
+        事件 id 默认形如 ``tde-<会话>-<六位序号>``，因此「按 (会话 id, 事件 id) 升序」
+        在用例里是可以手算的；``event_prefix`` 可以换掉前缀，造出会话 id 与事件 id
+        顺序相反的布局。返回本会话全部事件 id（升序）。``delivered=False`` 造的是
+        送达前的正文——它走独立的二十四小时到期路径，空闲清理不得碰它。
         """
+        prefix = event_prefix if event_prefix is not None else f"tde-{conversation_id}-"
         self.execute(
             """INSERT INTO conversation
                (id, user_id, feishu_chat_id, feishu_thread_id, running_task_id, last_task_ended_at)
@@ -115,9 +120,13 @@ class CleanupRowLimitTestCase(unittest.TestCase):
                 SELECT %s || lpad(g::text, 6, '0'), %s, g, 'terminal', 'success',
                        %s || g, 'worker-1', %s || g, {received_sql}
                   FROM generate_series(1, %s) AS g""",
-            (f"tde-{conversation_id}-", task_id, CONTENT_MARKER, f"{task_id}:", events),
+            (prefix, task_id, CONTENT_MARKER, f"{task_id}:", events),
         )
-        return [f"tde-{conversation_id}-{sequence:06d}" for sequence in range(1, events + 1)]
+        # 批量 generate_series 插入中途若被自动分析取到 reltuples=0 的快照，规划器会把
+        # 外层 UPDATE 排成非参数化 Nested Loop（6 万行实测 14 秒、撞 3 秒语句超时）——
+        # 这是测试造数方式引起的假红，不是产品缺陷；造数后显式分析让统计与行数一致。
+        self.execute("ANALYZE task_delivery_event")
+        return [f"{prefix}{sequence:06d}" for sequence in range(1, events + 1)]
 
     def cleared_ids(self) -> list[str]:
         return [
@@ -146,8 +155,9 @@ class IdleSweepRowLimitTests(CleanupRowLimitTestCase):
     def test_one_round_clears_at_most_the_limit_and_exactly_the_first_rows_by_event_id(
         self,
     ) -> None:
-        """上限生效：1 个会话 3000 行 + 200 个会话各 10 行，单轮只清按事件 id 排序的前
-        500 行——上限是行级的，会在一个会话中间切开，不是「清完整个会话」。"""
+        """上限生效：1 个会话 3000 行 + 200 个会话各 10 行，单轮只清按 (会话 id, 事件 id)
+        升序的前 500 行——上限是行级的，会在一个会话中间切开，不是「清完整个会话」。
+        这份数据的事件 id 内嵌会话 id，两级排序与单按事件 id 排序给出同一批行。"""
 
         candidates: list[str] = []
         for index in range(201):
@@ -268,6 +278,152 @@ class IdleSweepRowLimitTests(CleanupRowLimitTestCase):
             self.assertNotIn(CONTENT_MARKER, record.getMessage())
             self.assertNotIn("tde-cnv-1", record.getMessage())
         self.assertEqual(IDLE_CONVERSATION_SWEEP_AFTER, IDLE)
+
+
+class _PauseBetweenConversations(_Transaction):
+    """测试专用：按用户清理清完前一个会话、正要清 ``pause_before`` 这个会话时暂停，
+    等外部放行——用来确定性地让空闲扫描在这个空档进场并在数据库层排队，不依赖
+    线程调度运气。暂停点在两条逐会话语句之间，此时本事务已持有前一个会话全部
+    投递事件的行锁。"""
+
+    def __init__(
+        self,
+        connection,
+        *,
+        pause_before: str,
+        ready_event: threading.Event,
+        go_event: threading.Event,
+    ) -> None:
+        super().__init__(connection)
+        self._pause_before = pause_before
+        self._ready_event = ready_event
+        self._go_event = go_event
+
+    def clear_delivered_content_for_conversation(self, *, conversation_id: str) -> int:
+        if conversation_id == self._pause_before:
+            self._ready_event.set()
+            self._go_event.wait(timeout=15)
+        return super().clear_delivered_content_for_conversation(conversation_id=conversation_id)
+
+
+class IdleSweepLockOrderTests(CleanupRowLimitTestCase):
+    """路径一的锁序：候选窗口按 (会话 id, 事件 id) 升序锁行，与 ``/new``、按用户清理
+    （先锁全部会话、再逐会话按事件 id 升序清）同一锁序。
+
+    交叉布局：会话 id 低的 ``cnv-1`` 反而持有事件 id 高的行（``tde-2-*``），``cnv-2``
+    持有 ``tde-1-*``；两会话各 300 行，单轮 500 行的窗口横跨两者。「按事件 id 单独
+    升序」在这份数据上会先锁走 ``cnv-2`` 的行、再等 ``cnv-1`` 的行，与逐会话清理
+    的顺序相反——两条路径并发时互持对方下一步需要的锁，被数据库判定为死锁。
+    """
+
+    ROWS_PER_CONVERSATION = 300
+    ROUNDS = 10
+
+    def seed_crossed_layout(self) -> tuple[list[str], list[str]]:
+        """返回 (cnv-1 的事件 id, cnv-2 的事件 id)，各自升序。"""
+
+        low_conversation = self.seed_conversation(
+            "cnv-1", events=self.ROWS_PER_CONVERSATION, event_prefix="tde-2-"
+        )
+        high_conversation = self.seed_conversation(
+            "cnv-2", events=self.ROWS_PER_CONVERSATION, event_prefix="tde-1-"
+        )
+        return low_conversation, high_conversation
+
+    def test_the_window_is_ordered_by_conversation_then_event_id_not_by_event_id_alone(
+        self,
+    ) -> None:
+        """单轮 500 行 = cnv-1 全部 300 行 + cnv-2 按事件 id 升序的前 200 行；单按事件 id
+        升序会得到 cnv-2 全部 300 行 + cnv-1 的前 200 行，两者在这份数据上可区分。"""
+
+        low_conversation, high_conversation = self.seed_crossed_layout()
+        expected = sorted(low_conversation + high_conversation[:200])
+        by_event_id_alone = sorted(low_conversation + high_conversation)[:_CLEANUP_ROW_LIMIT]
+        self.assertNotEqual(expected, by_event_id_alone, "布局必须能区分两种排序")
+
+        cleared = self.queue.sweep_idle_conversations(idle_after=IDLE)
+
+        self.assertEqual(cleared, _CLEANUP_ROW_LIMIT)
+        self.assertEqual(self.cleared_ids(), expected)
+        self.assertEqual(self.rows_with_content(), 2 * self.ROWS_PER_CONVERSATION - cleared)
+
+    def _wait_until_blocked_on_a_lock(self, pid: int, *, timeout: float) -> bool:
+        """轮询 ``pg_stat_activity``，直到该后端在数据库层等锁（或超时）。"""
+
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            waiting = self.scalar(
+                "SELECT wait_event_type = 'Lock' FROM pg_stat_activity WHERE pid = %s", (pid,)
+            )
+            if waiting:
+                return True
+            time.sleep(0.02)
+        return False
+
+    def _run_one_round(self) -> tuple[BaseException | None, BaseException | None]:
+        """一轮：按用户清理锁两个会话并清完 cnv-1 后暂停；空闲扫描进场、在数据库层排队；
+        放行后按用户清理继续清 cnv-2。两边都回滚，数据留给下一轮。返回两边的异常。"""
+
+        conn_a = connect(self._dsn)
+        conn_b = connect(self._dsn)
+        a_ready = threading.Event()
+        a_go = threading.Event()
+        errors: dict[str, BaseException | None] = {"a": None, "b": None}
+
+        def run_user_purge() -> None:
+            try:
+                _PauseBetweenConversations(
+                    conn_a, pause_before="cnv-2", ready_event=a_ready, go_event=a_go
+                ).clear_delivered_content_for_user(user_id="usr-1", reason="user_cleared")
+            except BaseException as error:  # noqa: BLE001 - 收集到主线程再断言
+                errors["a"] = error
+            finally:
+                a_ready.set()
+                conn_a.rollback()
+                conn_a.close()
+
+        def run_sweep() -> None:
+            try:
+                PostgresTaskQueue._clear_stale_delivered_content(conn_b.cursor(), idle_after=IDLE)
+            except BaseException as error:  # noqa: BLE001 - 收集到主线程再断言
+                errors["b"] = error
+            finally:
+                conn_b.rollback()
+                conn_b.close()
+
+        sweep_pid = conn_b.execute("SELECT pg_backend_pid()").fetchone()[0]
+        thread_a = threading.Thread(target=run_user_purge)
+        thread_b = threading.Thread(target=run_sweep)
+
+        thread_a.start()
+        self.assertTrue(a_ready.wait(timeout=5), "按用户清理 5 秒内未到达暂停点")
+        thread_b.start()
+        self.assertTrue(
+            self._wait_until_blocked_on_a_lock(sweep_pid, timeout=5),
+            "空闲扫描 5 秒内没有在数据库层等到按用户清理持有的行锁",
+        )
+        a_go.set()
+
+        thread_a.join(timeout=15)
+        thread_b.join(timeout=15)
+        self.assertFalse(thread_a.is_alive(), "按用户清理线程 15 秒内未结束")
+        self.assertFalse(thread_b.is_alive(), "空闲扫描线程 15 秒内未结束")
+        return errors["a"], errors["b"]
+
+    def test_sweep_and_user_purge_never_deadlock_across_ten_rounds(self) -> None:
+        """交叉布局下两条路径并发 10 轮：零死锁（40P01）、零锁等待超时，数据每轮原样保留。"""
+
+        self.seed_crossed_layout()
+        for round_index in range(self.ROUNDS):
+            with self.subTest(round=round_index):
+                a_error, b_error = self._run_one_round()
+                self.assertIsNone(
+                    a_error, f"round {round_index}: 按用户清理出现未预期异常：{a_error!r}"
+                )
+                self.assertIsNone(
+                    b_error, f"round {round_index}: 空闲扫描出现未预期异常：{b_error!r}"
+                )
+                self.assertEqual(self.rows_with_content(), 2 * self.ROWS_PER_CONVERSATION)
 
 
 class WorkerSideRowLimitTests(CleanupRowLimitTestCase):
