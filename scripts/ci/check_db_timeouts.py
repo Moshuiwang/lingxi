@@ -12,7 +12,8 @@
 ``connect()``。识别工厂时覆盖 ``from … import connect``、``import … as x; x.connect``、
 ``from … import connect as y``、``from lingxi.adapters import postgres``、相对 import、
 ``getattr(模块, "connect")`` 与文件内的别名赋值；``dedicated=True`` 字面量或任何额外的
-字面量关键字参数在工厂里就走驱动原生连接，不进空闲栈，不受本围栏约束。
+字面量关键字参数在工厂里就走驱动原生连接，不进空闲栈，不受本围栏约束；``**kwargs`` 展开
+或 ``dedicated=<变量>`` 静态判不出走哪条路，一律按默认复用路径要求。
 
 围栏的已知边界（如实登记，不构成绕过许可）：只看语法位置，连接 / 游标作为实参传给
 别的函数、被 ``yield`` 交给消费者、被解包赋值（``a, b = …``）、经嵌套函数闭包捕获，
