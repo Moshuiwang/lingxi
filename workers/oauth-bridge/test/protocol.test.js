@@ -24,6 +24,14 @@ test("callback page removes the authorization query from browser history", () =>
   assert.match(callbackPage({ delivered: false, state }), /重新点击/);
 });
 
+test("callback page shows the public product name and never an internal codename", () => {
+  for (const delivered of [true, false]) {
+    const page = callbackPage({ delivered, state });
+    assert.match(page, /<title>BI Plus 开通<\/title>/);
+    assert.doesNotMatch(page, /灵犀|lingxi/i);
+  }
+});
+
 test("callback page may open its same-origin result notification channel", () => {
   assert.match(callbackResponse(true, state).headers.get("Content-Security-Policy"), /connect-src 'self'/);
 });
