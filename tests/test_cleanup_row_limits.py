@@ -314,6 +314,10 @@ class IdleSweepLockOrderTests(CleanupRowLimitTestCase):
     持有 ``tde-1-*``；两会话各 300 行，单轮 500 行的窗口横跨两者。「按事件 id 单独
     升序」在这份数据上会先锁走 ``cnv-2`` 的行、再等 ``cnv-1`` 的行，与逐会话清理
     的顺序相反——两条路径并发时互持对方下一步需要的锁，被数据库判定为死锁。
+
+    多任务布局：一个会话 300 个任务、各一行已送达正文，任务序与事件 id 序相反。
+    单会话清理若按任务驱动的访问顺序平铺更新（而不是按事件 id 升序锁定），会以事件
+    id 降序拿锁，与空闲扫描的升序相反——两条单语句路径在中间相遇即死锁。
     """
 
     ROWS_PER_CONVERSATION = 300
@@ -347,15 +351,50 @@ class IdleSweepLockOrderTests(CleanupRowLimitTestCase):
         self.assertEqual(self.cleared_ids(), expected)
         self.assertEqual(self.rows_with_content(), 2 * self.ROWS_PER_CONVERSATION - cleared)
 
-    def _wait_until_blocked_on_a_lock(self, pid: int, *, timeout: float) -> bool:
-        """轮询 ``pg_stat_activity``，直到该后端在数据库层等锁（或超时）。"""
+    def seed_multitask_conversation(self, conversation_id: str, *, tasks: int) -> list[str]:
+        """一个已空闲会话下 ``tasks`` 个已结束任务、各一行已送达正文；第 k 个任务的事件 id
+        是 ``tde-<tasks+1-k>``，任务序与事件 id 序相反。返回全部事件 id（升序）。"""
+
+        self.execute(
+            """INSERT INTO conversation
+               (id, user_id, feishu_chat_id, feishu_thread_id, running_task_id, last_task_ended_at)
+               VALUES (%s, 'usr-1', %s, %s, NULL, now() - interval '3 hours')""",
+            (conversation_id, f"chat-{conversation_id}", f"topic-{conversation_id}"),
+        )
+        self.execute(
+            """INSERT INTO task
+               (id, conversation_id, user_id, inbound_event_id, prompt, status,
+                target_worker_version, worker_id, heartbeat_at, attempts, content_expires_at)
+               SELECT 'tsk-' || lpad(g::text, 6, '0'), %s, 'usr-1', 'event-' || g, '问题',
+                      'succeeded', 'stable', 'worker-1', now(), 1, now()
+                 FROM generate_series(1, %s) AS g""",
+            (conversation_id, tasks),
+        )
+        self.execute(
+            """INSERT INTO task_delivery_event
+               (id, task_id, sequence, event_type, terminal_kind, content, worker_id,
+                idempotency_key, platform_received_at)
+               SELECT 'tde-' || lpad((%s + 1 - g)::text, 6, '0'), 'tsk-' || lpad(g::text, 6, '0'),
+                      1, 'terminal', 'success', %s || g, 'worker-1',
+                      'tsk-' || lpad(g::text, 6, '0') || ':1', now()
+                 FROM generate_series(1, %s) AS g""",
+            (tasks, CONTENT_MARKER, tasks),
+        )
+        self.execute("ANALYZE task_delivery_event")
+        self.execute("ANALYZE task")
+        return [f"tde-{index:06d}" for index in range(1, tasks + 1)]
+
+    def _wait_until_blocked_on_a_lock(self, *pids: int, timeout: float) -> bool:
+        """轮询 ``pg_stat_activity``，直到这些后端全部在数据库层等锁（或超时）。"""
 
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
             waiting = self.scalar(
-                "SELECT wait_event_type = 'Lock' FROM pg_stat_activity WHERE pid = %s", (pid,)
+                "SELECT count(*) FROM pg_stat_activity"
+                " WHERE pid = ANY(%s) AND wait_event_type = 'Lock'",
+                (list(pids),),
             )
-            if waiting:
+            if waiting == len(pids):
                 return True
             time.sleep(0.02)
         return False
@@ -424,6 +463,76 @@ class IdleSweepLockOrderTests(CleanupRowLimitTestCase):
                     b_error, f"round {round_index}: 空闲扫描出现未预期异常：{b_error!r}"
                 )
                 self.assertEqual(self.rows_with_content(), 2 * self.ROWS_PER_CONVERSATION)
+
+    def _run_one_new_command_round(
+        self, *, middle_event_id: str
+    ) -> tuple[BaseException | None, BaseException | None]:
+        """一轮：第三方先占住中间那一行；``/new`` 与空闲扫描同时进场，各自锁到中间行前
+        停下并在数据库层排队；确认两边都在等锁后放开中间行。锁序一致时先到者拿完
+        剩余行、后到者接着走；锁序相反时两边各持对方下一步需要的行，放开即死锁。
+        两边都回滚，数据留给下一轮。返回两边的异常。"""
+
+        holder = self._psycopg.connect(self._dsn)
+        holder.execute(
+            "SELECT id FROM task_delivery_event WHERE id = %s FOR UPDATE", (middle_event_id,)
+        )
+        conn_a = connect(self._dsn)
+        conn_b = connect(self._dsn)
+        errors: dict[str, BaseException | None] = {"a": None, "b": None}
+
+        def run_new_command() -> None:
+            try:
+                _Transaction(conn_a).clear_agent_session(conversation_id="cnv-1")
+            except BaseException as error:  # noqa: BLE001 - 收集到主线程再断言
+                errors["a"] = error
+            finally:
+                conn_a.rollback()
+                conn_a.close()
+
+        def run_sweep() -> None:
+            try:
+                PostgresTaskQueue._clear_stale_delivered_content(conn_b.cursor(), idle_after=IDLE)
+            except BaseException as error:  # noqa: BLE001 - 收集到主线程再断言
+                errors["b"] = error
+            finally:
+                conn_b.rollback()
+                conn_b.close()
+
+        new_command_pid = conn_a.execute("SELECT pg_backend_pid()").fetchone()[0]
+        sweep_pid = conn_b.execute("SELECT pg_backend_pid()").fetchone()[0]
+        thread_a = threading.Thread(target=run_new_command)
+        thread_b = threading.Thread(target=run_sweep)
+
+        thread_a.start()
+        thread_b.start()
+        both_blocked = self._wait_until_blocked_on_a_lock(new_command_pid, sweep_pid, timeout=5)
+        holder.rollback()
+        holder.close()
+        thread_a.join(timeout=15)
+        thread_b.join(timeout=15)
+        self.assertTrue(both_blocked, "/new 与空闲扫描 5 秒内没有都在数据库层等到中间行的锁")
+        self.assertFalse(thread_a.is_alive(), "/new 线程 15 秒内未结束")
+        self.assertFalse(thread_b.is_alive(), "空闲扫描线程 15 秒内未结束")
+        return errors["a"], errors["b"]
+
+    def test_sweep_and_new_command_never_deadlock_when_task_order_opposes_event_order(
+        self,
+    ) -> None:
+        """多任务布局下 ``/new`` 与空闲扫描并发 8 轮：零死锁（40P01）、零锁等待超时，
+        数据每轮原样保留。"""
+
+        event_ids = self.seed_multitask_conversation("cnv-1", tasks=self.ROWS_PER_CONVERSATION)
+        middle_event_id = event_ids[len(event_ids) // 2]
+        for round_index in range(8):
+            with self.subTest(round=round_index):
+                a_error, b_error = self._run_one_new_command_round(middle_event_id=middle_event_id)
+                self.assertIsNone(
+                    a_error, f"round {round_index}: /new 路径出现未预期异常：{a_error!r}"
+                )
+                self.assertIsNone(
+                    b_error, f"round {round_index}: 空闲扫描出现未预期异常：{b_error!r}"
+                )
+                self.assertEqual(self.rows_with_content(), self.ROWS_PER_CONVERSATION)
 
 
 class WorkerSideRowLimitTests(CleanupRowLimitTestCase):
