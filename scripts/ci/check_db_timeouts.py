@@ -7,19 +7,23 @@
 
 连接借用围栏（``check_connection_borrow_scope``）守的是工厂默认复用路径的调用方义务：
 ``connect()`` 归还后旧引用会随下一次借出恢复操作能力，所以默认复用路径的 ``connect()``
-必须写在 ``with`` 语句的上下文表达式位置，块内取得的连接与游标不得存进属性 / 容器 /
-块外名字、不得随 return 逃出、不得在块退出后继续使用，块内 ``close()`` 之后不得再取
-``connect()``。识别工厂时覆盖 ``from … import connect``、``import … as x; x.connect``、
-``from … import connect as y``、``from lingxi.adapters import postgres``、相对 import、
-``getattr(模块, "connect")`` 与文件内的别名赋值；``dedicated=True`` 字面量或任何额外的
-字面量关键字参数在工厂里就走驱动原生连接，不进空闲栈，不受本围栏约束；``**kwargs`` 展开
-或 ``dedicated=<变量>`` 静态判不出走哪条路，一律按默认复用路径要求。
+必须写在 ``with`` 语句的上下文表达式位置、``as`` 后只能是一个名字，块内取得的连接与游标
+不得存进属性 / 容器 / 块外名字、不得随 return 逃出（直接或装进容器字面量都算）、不得在块
+退出后继续使用，块内 ``close()`` 之后不得再取 ``connect()``。识别工厂时覆盖
+``from … import connect``、``import … as x; x.connect``、``from … import connect as y``、
+``from lingxi.adapters import postgres``、相对 import、``getattr(模块, "connect")`` 与文件内
+的别名赋值，名字在任一作用域绑过工厂就按工厂审查、不被非工厂绑定覆盖；``dedicated=True``
+字面量或任何额外关键字参数在工厂里就走驱动原生连接，不进空闲栈，不受本围栏约束；
+``**kwargs`` 展开或 ``dedicated=<变量>`` 静态判不出走哪条路，一律按默认复用路径要求。
 
 围栏的已知边界（如实登记，不构成绕过许可）：只看语法位置，连接 / 游标作为实参传给
 别的函数、被 ``yield`` 交给消费者、被解包赋值（``a, b = …``）、经嵌套函数闭包捕获，
 以及 ``close()`` 藏在辅助函数里再取 ``connect()``、``getattr`` 的属性名不是字面量、
-``importlib`` 等动态取名、经别的模块转导出的 ``connect``（只认从工厂模块直接 import 的
-名字），都判不出；名字追踪不分先后、以文件 / 块为单位，宁可多判。
+``importlib.import_module(…).connect`` 等动态取名、经别的模块转导出的 ``connect``（只认从
+工厂模块直接 import 的名字）、把工厂当默认参数值再调用（``def f(dsn, factory=connect)``）、
+块外自赋值（``cur = cur``）后再用（算重新绑定、不再追）、先装进容器再经名字转手
+（``pair = (c, cur)`` 后 ``return pair``；只认 return / 逃逸赋值处的容器字面量），都判不出；
+名字追踪不分先后、以文件 / 块为单位，宁可多判。
 围栏不是修复：归还前取得的游标（``Cursor.connection`` 回指原始连接）、旧 ``pgconn``、
 以及块内提前 ``close()`` 后再取 ``connect()`` 的间接写法，围栏堵不住。
 """
@@ -226,46 +230,78 @@ def _resolve_import_from(node: ast.ImportFrom, module_name: str, is_package: boo
     return joined or None
 
 
+def _binding_rank(canonical: str) -> int:
+    """绑定优先级：工厂 ``connect`` 本身 > 工厂模块、其它成员或父包 > 与工厂无关。"""
+    if canonical == FACTORY_CONNECT:
+        return 2
+    return 1 if _reaches_factory(canonical) else 0
+
+
+def _bind(bindings: dict[str, str], name: str, canonical: str) -> bool:
+    """只升不降地登记一个绑定，返回是否改动。
+
+    名字一旦在任何作用域绑到工厂，就不被后来的非工厂 import / 赋值覆盖；绑到 ``connect``
+    之后也不再改成工厂的别的成员。别名收集因此每轮只能新增或升级，轮数有上界，宁可多判。
+    """
+    current = bindings.get(name)
+    if current is not None and _binding_rank(canonical) <= _binding_rank(current):
+        return False
+    bindings[name] = canonical
+    return True
+
+
+def _alias_assignments(tree: ast.Module) -> list[tuple[str, ast.AST]]:
+    """全文件里「单个名字 = 表达式」形态的赋值（含带注解的）；别名传递只看这一种。"""
+    pairs: list[tuple[str, ast.AST]] = []
+    for node in ast.walk(tree):
+        if not isinstance(node, (ast.Assign, ast.AnnAssign)) or node.value is None:
+            continue
+        targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+        if len(targets) == 1 and isinstance(targets[0], ast.Name):
+            pairs.append((targets[0].id, node.value))
+    return pairs
+
+
 def _collect_bindings(tree: ast.Module, module_name: str, is_package: bool) -> dict[str, str]:
     """本文件里每个本地名字对应的绝对点分名（import 与别名赋值，全文件、不分作用域）。
 
     不分作用域是有意的：一个名字只要在文件任何位置绑定到工厂，所有同名调用都按工厂
-    调用审查——宁可多判、不给别名留缝。
+    调用审查——宁可多判、不给别名留缝。绑定只升不降（``_bind``），别名传递取到不动点；
+    轮数超过理论上界只可能是门禁自身缺陷，直接抛错，不静默、不挂死。
     """
     bindings: dict[str, str] = {}
     for node in ast.walk(tree):
         if isinstance(node, ast.Import):
             for item in node.names:
                 if item.asname:
-                    bindings[item.asname] = item.name
+                    _bind(bindings, item.asname, item.name)
                 else:
                     top = item.name.split(".", 1)[0]
-                    bindings[top] = top
+                    _bind(bindings, top, top)
         elif isinstance(node, ast.ImportFrom):
             base = _resolve_import_from(node, module_name, is_package)
             if base is None:
                 continue
             for item in node.names:
                 if item.name != "*":
-                    bindings[item.asname or item.name] = f"{base}.{item.name}"
-    changed = True
-    while changed:
+                    _bind(bindings, item.asname or item.name, f"{base}.{item.name}")
+    aliases = _alias_assignments(tree)
+    # 每个目标名最多升级两次（非工厂 → 工厂成员 → connect），每个有效轮次至少升级一次。
+    for _ in range(2 * len(aliases) + 1):
         changed = False
-        for node in ast.walk(tree):
-            if not isinstance(node, (ast.Assign, ast.AnnAssign)) or node.value is None:
-                continue
-            targets = node.targets if isinstance(node, ast.Assign) else [node.target]
-            if len(targets) != 1 or not isinstance(targets[0], ast.Name):
-                continue
-            canonical = _dotted(node.value, bindings)
+        for name, value in aliases:
+            canonical = _dotted(value, bindings)
             if canonical is None or not (
                 canonical == FACTORY_MODULE or canonical.startswith(f"{FACTORY_MODULE}.")
             ):
                 continue
-            if bindings.get(targets[0].id) != canonical:
-                bindings[targets[0].id] = canonical
+            if _bind(bindings, name, canonical):
                 changed = True
-    return bindings
+        if not changed:
+            return bindings
+    raise RuntimeError(
+        f"{module_name}：连接借用围栏的别名收集没有收敛，这是门禁自身缺陷，请修门禁而不是绕过"
+    )
 
 
 def _dotted(node: ast.AST, bindings: Mapping[str, str]) -> str | None:
@@ -307,7 +343,7 @@ def _is_factory_call(node: ast.AST, bindings: Mapping[str, str]) -> bool:
 def _classify_factory_call(node: ast.Call) -> str:
     """按工厂运行期会走的路径分类：``reused`` / ``dedicated`` / ``unknown``。
 
-    ``dedicated=True`` 字面量与任何额外的字面量关键字参数在工厂里都走驱动原生连接
+    ``dedicated=True`` 字面量与任何额外关键字参数在工厂里都走驱动原生连接
     （不进空闲栈）；``**kwargs`` 展开或 ``dedicated=<非字面量>`` 静态判不出，记为
     ``unknown``，围栏按最严的默认复用路径对待。
     """
@@ -360,6 +396,22 @@ def _handle_names(node: ast.AST, connections: set[str], cursors: set[str]) -> bo
     return isinstance(node, ast.Name) and (node.id in connections or node.id in cursors)
 
 
+def _carries_handle(node: ast.AST, connections: set[str], cursors: set[str]) -> bool:
+    """连接名 / 游标表达式本身，或把它们装进 Dict / List / Tuple / Set 字面量（逐层递归）。"""
+    if _is_cursor_expr(node, connections, cursors) or _handle_names(node, connections, cursors):
+        return True
+    if isinstance(node, ast.Dict):
+        elements: list[ast.AST | None] = [*node.keys, *node.values]
+    elif isinstance(node, (ast.List, ast.Tuple, ast.Set)):
+        elements = list(node.elts)
+    else:
+        return False
+    return any(
+        element is not None and _carries_handle(element, connections, cursors)
+        for element in elements
+    )
+
+
 def _assignment_pairs(node: ast.AST) -> list[tuple[ast.AST, ast.AST]]:
     if isinstance(node, ast.Assign):
         return [(target, node.value) for target in node.targets]
@@ -370,17 +422,36 @@ def _assignment_pairs(node: ast.AST) -> list[tuple[ast.AST, ast.AST]]:
     return []
 
 
+def _is_reused_factory_call(node: ast.AST, bindings: Mapping[str, str]) -> bool:
+    """工厂调用且没有显式独占：按默认复用路径受围栏约束。"""
+    return _is_factory_call(node, bindings) and _classify_factory_call(node) != "dedicated"
+
+
 def _borrow_with_items(with_node: ast.With, bindings: Mapping[str, str]) -> set[str]:
     """``with`` 各项里默认复用路径的工厂调用绑定的连接名。"""
-    connections: set[str] = set()
-    for item in with_node.items:
-        if (
-            _is_factory_call(item.context_expr, bindings)
-            and _classify_factory_call(item.context_expr) != "dedicated"
-        ):
-            if isinstance(item.optional_vars, ast.Name):
-                connections.add(item.optional_vars.id)
-    return connections
+    return {
+        item.optional_vars.id
+        for item in with_node.items
+        if _is_reused_factory_call(item.context_expr, bindings)
+        and isinstance(item.optional_vars, ast.Name)
+    }
+
+
+def _non_name_with_targets(
+    with_node: ast.With, bindings: Mapping[str, str], relative: str
+) -> list[str]:
+    """默认复用路径的工厂调用 ``as`` 到属性 / 下标 / 解包目标：句柄一落地就在块外可达。
+
+    ``as`` 缺省没有句柄可逃逸，不在此列。
+    """
+    return [
+        f"{relative}:{item.context_expr.lineno} 连接绑定到属性 / 下标 / 解包目标，无法保证"
+        "不逃出 with 块：as 后只能是一个名字"
+        for item in with_node.items
+        if item.optional_vars is not None
+        and not isinstance(item.optional_vars, ast.Name)
+        and _is_reused_factory_call(item.context_expr, bindings)
+    ]
 
 
 def _tracked_names_in(with_node: ast.With, seed: set[str]) -> tuple[set[str], set[str]]:
@@ -438,10 +509,7 @@ def _escapes_inside(
     close_lines: list[int] = []
     for node in ast.walk(with_node):
         for target, value in _assignment_pairs(node):
-            leaks = _is_cursor_expr(value, connections, cursors) or _handle_names(
-                value, connections, cursors
-            )
-            if not leaks:
+            if not _carries_handle(value, connections, cursors):
                 continue
             if isinstance(target, (ast.Attribute, ast.Subscript)):
                 failures.append(
@@ -454,9 +522,7 @@ def _escapes_inside(
                     "（global / nonlocal / 模块级），逃出 with 块"
                 )
         if isinstance(node, ast.Return) and node.value is not None:
-            if _is_cursor_expr(node.value, connections, cursors) or _handle_names(
-                node.value, connections, cursors
-            ):
+            if _carries_handle(node.value, connections, cursors):
                 failures.append(f"{relative}:{node.lineno} 连接或游标随 return 逃出 with 块")
         if (
             isinstance(node, ast.Call)
@@ -469,11 +535,7 @@ def _escapes_inside(
     if close_lines:
         first_close = min(close_lines)
         for node in ast.walk(with_node):
-            if (
-                _is_factory_call(node, bindings)
-                and _classify_factory_call(node) != "dedicated"
-                and node.lineno > first_close
-            ):
+            if _is_reused_factory_call(node, bindings) and node.lineno > first_close:
                 failures.append(
                     f"{relative}:{node.lineno} with 块内已 close() 归还的连接，同一块内又取"
                     " connect()：同一对象会被再次借出，外层 with 退出成为迟到操作者"
@@ -552,11 +614,11 @@ def _scan_borrow_scope_file(
         for with_node in _walk_scope(scope):
             if not isinstance(with_node, ast.With):
                 continue
-            if not _borrow_with_items(with_node, bindings):
+            failures.extend(_non_name_with_targets(with_node, bindings, relative))
+            seed = _borrow_with_items(with_node, bindings)
+            if not seed:
                 continue
-            connections, cursors = _tracked_names_in(
-                with_node, _borrow_with_items(with_node, bindings)
-            )
+            connections, cursors = _tracked_names_in(with_node, seed)
             failures.extend(
                 _escapes_inside(scope, with_node, connections, cursors, bindings, relative=relative)
             )
