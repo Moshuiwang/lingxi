@@ -122,6 +122,10 @@ class CleanupRowLimitTestCase(unittest.TestCase):
                   FROM generate_series(1, %s) AS g""",
             (prefix, task_id, CONTENT_MARKER, f"{task_id}:", events),
         )
+        # 批量 generate_series 插入中途若被自动分析取到 reltuples=0 的快照，规划器会把
+        # 外层 UPDATE 排成非参数化 Nested Loop（6 万行实测 14 秒、撞 3 秒语句超时）——
+        # 这是测试造数方式引起的假红，不是产品缺陷；造数后显式分析让统计与行数一致。
+        self.execute("ANALYZE task_delivery_event")
         return [f"{prefix}{sequence:06d}" for sequence in range(1, events + 1)]
 
     def cleared_ids(self) -> list[str]:
