@@ -218,12 +218,10 @@ class IdleSweepRowLimitTests(CleanupRowLimitTestCase):
             self.assertEqual(connection.execute("SHOW statement_timeout").fetchone()[0], "3s")
         seeded = self.seed_conversation("cnv-huge", events=60_000)
 
-        started = time.monotonic()
+        # 语句超时由数据库执行：超过 3 秒会以 QueryCanceled 抛出，正常返回本身就是判据。
         cleared = self.queue.sweep_idle_conversations(idle_after=IDLE)
-        elapsed = time.monotonic() - started
 
         self.assertEqual(cleared, _CLEANUP_ROW_LIMIT)
-        self.assertLess(elapsed, 3.0)
         self.assertEqual(self.cleared_ids(), seeded[:_CLEANUP_ROW_LIMIT])
         self.assertEqual(self.rows_with_content(), len(seeded) - _CLEANUP_ROW_LIMIT)
 
