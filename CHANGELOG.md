@@ -6,7 +6,21 @@
 
 ## [Unreleased]
 
-2.5.1 开发中（Trace [#812](https://github.com/Moshuiwang/lingxi/issues/812)）：由拉取代理 + 部署器发布的修复版，装入 [#804](https://github.com/Moshuiwang/lingxi/issues/804) / [#805](https://github.com/Moshuiwang/lingxi/issues/805) / [#807](https://github.com/Moshuiwang/lingxi/issues/807) / [#739](https://github.com/Moshuiwang/lingxi/issues/739) / [#745](https://github.com/Moshuiwang/lingxi/issues/745) 五处改动；本节随批次合入逐条追加。
+2.5.2 开发中（Trace [#843](https://github.com/Moshuiwang/lingxi/issues/843)）：由拉取代理 + 部署器发布的补丁版，装入 [#784](https://github.com/Moshuiwang/lingxi/issues/784) / [#834](https://github.com/Moshuiwang/lingxi/issues/834) / [#836](https://github.com/Moshuiwang/lingxi/issues/836) / [#837](https://github.com/Moshuiwang/lingxi/issues/837) 四处改动；本节随批次合入逐条追加。
+
+### Changed
+
+- **助手在飞书里的自称与授权页标题统一为「BI Plus」**：系统提示词首行改为「你是 BI Plus，面向公司内部员工的只读数据问答助手。」并写入自称规则（自称与对外名称只用 BI Plus，不使用任何内部代号）；提示词文件与公开配置登记随同一预发 / 生产窗口由脚本更新、回读核对。仓库侧只改 Bot-Test 授权页的标题字符串一处，该 Cloudflare Worker 本次不重新部署、Cloudflare 侧仍显示旧标题直到下次受控验收部署（Issue [#784](https://github.com/Moshuiwang/lingxi/issues/784)）。
+- **三条清理路径每轮最多处理 500 行，积压由下一轮继续**：空闲会话正文清理（两小时空闲到点清除已送达的安全结果正文）从「一轮清完全部积压、逐会话无上限」改为一条带行级上限的语句，一个会话攒下数万条待清正文时每轮仍然前进，不再整轮被 3 秒语句超时取消、正文再也回收不掉；一处行锁冲突只作废本轮这一条语句，被锁行不被跳过、下一轮重来；日志与返回值只有行数。队列执行服务侧的二十四小时到期收敛与心跳超时回收候选集加同型上限。用户可见行为不变：两小时空闲清正文的时机与范围、九十天保留承诺、二十四小时到期语义都不动（Issue [#837](https://github.com/Moshuiwang/lingxi/issues/837)）。
+
+### Fixed
+
+- **门禁新增「数据库连接与游标不得逃出 `with` 块」判据**：对全仓既有调用点退出码 0、一处不改；裸 `connect()` 赋值后使用、`with` 内关闭后再建连、游标赋给实例属性、游标逃出 `with` 再执行四种违规样本各判红并由测试钉住；连接工厂模块说明改为与实现一致（目标合同句保留并注明尚未完全兑现）。零运行时改动（Issue [#834](https://github.com/Moshuiwang/lingxi/issues/834)）。
+- **棘轮门禁三处过期表述勘误**：文件体量棘轮「基线登记的路径找不到时判红、须 `--refresh` 清除」写回正文、CI 浅克隆注释与实际工作流一致、纯逻辑基线头部改为如实登记「不再迁移」；门禁判定与全部基线数值零变化（Issue [#836](https://github.com/Moshuiwang/lingxi/issues/836)）。
+
+## [2.5.1] - 2026-09-17
+
+本版由**拉取代理 + 部署器**从 `release/2.5` 候选 rc.106 原样提升发到生产（Trace [#812](https://github.com/Moshuiwang/lingxi/issues/812)）：正式版 07:58Z 发布 → 生产代理自动拾取 → 三服务 08:01Z 重建（用户可见停机不到 1 分钟）→ 15 分钟观察 `verified`，迁移头 `0098` 不变、回退不降库，产品负责人一次真实问数通过。镜像里装下列五处修复与一处运维脚本修复；同批收口四张不进镜像的单：[#748](https://github.com/Moshuiwang/lingxi/issues/748) 裁决层剩余验收（同名伪造 PR 被拒、不改裁决核心的工作流 PR 免批合并、规则集应急恢复路径演练）、[#735](https://github.com/Moshuiwang/lingxi/issues/735)「申请使用」核实（= 飞书应用可用范围申请，不是业务授权来源）、[#742](https://github.com/Moshuiwang/lingxi/issues/742) 偶发失败复现量测（N = 24 未复现，测试侧修法随本版）、[#756](https://github.com/Moshuiwang/lingxi/issues/756) 峰值样本与恢复证据。生产 [#807](https://github.com/Moshuiwang/lingxi/issues/807) 受影响的 4 人：3 位返聘者按新规则解析为唯一在职并入组，旧正式表里属于旧身份的 3 行由管理员归档后开通完成、就绪核验通过；第 4 人（同一人员 ID 多行）按规则仍拒绝，花名册去重后再扩员。证据等级与已知边界以 [docs/当前能力.md](docs/当前能力.md) 为准。
 
 ### Fixed
 
