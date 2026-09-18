@@ -21,8 +21,9 @@
 以及 ``close()`` 藏在辅助函数里再取 ``connect()``、``getattr`` 的属性名不是字面量、
 ``importlib.import_module(…).connect`` 等动态取名、经别的模块转导出的 ``connect``（只认从
 工厂模块直接 import 的名字）、把工厂当默认参数值再调用（``def f(dsn, factory=connect)``）、
-块外自赋值（``cur = cur``）后再用（算重新绑定、不再追），都判不出；名字追踪不分先后、
-以文件 / 块为单位，宁可多判。
+块外自赋值（``cur = cur``）后再用（算重新绑定、不再追）、先装进容器再经名字转手
+（``pair = (c, cur)`` 后 ``return pair``；只认 return / 逃逸赋值处的容器字面量），都判不出；
+名字追踪不分先后、以文件 / 块为单位，宁可多判。
 围栏不是修复：归还前取得的游标（``Cursor.connection`` 回指原始连接）、旧 ``pgconn``、
 以及块内提前 ``close()`` 后再取 ``connect()`` 的间接写法，围栏堵不住。
 """
