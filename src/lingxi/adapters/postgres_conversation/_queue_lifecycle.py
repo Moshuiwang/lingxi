@@ -24,6 +24,7 @@ from lingxi.core.delivery.ports import DeliveryEventType, TerminalKind
 from lingxi.core.task_reference import append_failure_reference, task_reference, valid_trace_id
 
 from ._dataclasses import ClaimedTask, TaskContext, TerminalTask
+from ._queue_outbox import _CLEANUP_ROW_LIMIT
 
 # 三条"系统代为收口"路径共用的哨兵 worker_id：这些任务从未被一个仍然存活
 # 的 worker 正常执行完，没有真实持有者可以填进
@@ -73,6 +74,7 @@ SELECT id, conversation_id, attempts, side_effect_state
  WHERE status = 'running'
    AND heartbeat_at < now() - %s::interval
  ORDER BY heartbeat_at, id
+ LIMIT %s
  FOR UPDATE SKIP LOCKED
 """
 
@@ -313,7 +315,8 @@ class _TaskLifecycleMixin:
         同样**不碰 ``target_worker_version``**：任务被回收重排后，用户仍然进入他当初
         被分到的那个版本（`V-灰度-01` 的回收路径）。安全重试的 ``UPDATE`` 必须就地
         内联在本方法体内、不提到模块常量：外部结构性核对按本方法源码确认 SET 子句
-        没有写 ``target_worker_version``，挪走会让核对失明。
+        没有写 ``target_worker_version``，挪走会让核对失明。单轮最多处理
+        ``_CLEANUP_ROW_LIMIT`` 行候选，积压下一轮继续。
         """
         if isinstance(max_auto_retries, bool) or max_auto_retries < 0:
             raise ValueError("max_auto_retries 必须是非负整数")
@@ -323,7 +326,7 @@ class _TaskLifecycleMixin:
         with connect(self._dsn, timeouts=self._timeouts) as connection:
             with connection.transaction():
                 cursor = connection.cursor()
-                cursor.execute(_RECLAIM_STALE_CANDIDATES_SQL, (older_than,))
+                cursor.execute(_RECLAIM_STALE_CANDIDATES_SQL, (older_than, _CLEANUP_ROW_LIMIT))
                 for task_id, conversation_id, attempts, side_effect_state in cursor.fetchall():
                     safe_retry = side_effect_state == "none" and attempts <= max_auto_retries
                     if safe_retry:
