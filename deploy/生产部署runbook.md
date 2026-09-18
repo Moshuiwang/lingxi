@@ -544,9 +544,9 @@ systemctl cat lingxi-host-monitor.service lingxi-release-pull.service \
 
 `compose.prod.yaml` 把宿主目录 `/opt/lingxi/runtime-config` 只读挂进 scheduler 与 worker 容器，但**正文里没有任何一步负责创建它或往里放东西**——docker 会自动建一个空目录，挂载成功但内容为空。首发的处置：
 
-- **`system_prompt.md` 必须从 stage 传入**（首发 sha256 前缀 `84741170e3c2…`，与 stage 逐字节一致），并设 `LINGXI_WORKER_SYSTEM_PROMPT_FILE` 指向容器内路径。**没有安全的「留空」选项**：提示词按 2026-08-23 裁定不进代码、不进镜像，镜像里没有可回落的随包版本，文件缺失时 worker **静默降级为无提示词执行**——服务全 `healthy`、观察期全绿、digest 全对、用户也能问出答案，但每次问数的质量与 stage 上验证过的完全不是一回事。该变量与 `LINGXI_WORKER_SYSTEM_PROMPT`、`LINGXI_WORKER_OUTPUT_SAFETY_CANARY` **互斥，同时配置启动即失败**，从 stage 复制 env 时须确认另两个没被一起抄过来。
+- **`system_prompt.md` 必须从 stage 传入**（首发 sha256 前缀 `84741170e3c2…`；**2.5.2 起 `95195ca5fa49…`**，#784 自称 BI Plus 版；与 stage 逐字节一致），并设 `LINGXI_WORKER_SYSTEM_PROMPT_FILE` 指向容器内路径。**没有安全的「留空」选项**：提示词按 2026-08-23 裁定不进代码、不进镜像，镜像里没有可回落的随包版本，文件缺失时 worker **静默降级为无提示词执行**——服务全 `healthy`、观察期全绿、digest 全对、用户也能问出答案，但每次问数的质量与 stage 上验证过的完全不是一回事。该变量与 `LINGXI_WORKER_SYSTEM_PROMPT`、`LINGXI_WORKER_OUTPUT_SAFETY_CANARY` **互斥，同时配置启动即失败**，从 stage 复制 env 时须确认另两个没被一起抄过来。
 - **`LINGXI_COMPANY_FUNCTION_METRIC_MAP_PATH` 刻意不设**：外置映射文件与随包默认经结构化逐键比对为 **354 键零差异**，留空即用随包默认，等价且少一个需要长期同步的带外文件。反过来，若照「非敏感配置抄自 stage」的做法把这个路径变量抄进 prod 而文件不在，会按既定语义**响亮失败**（权限发布整轮拒绝，一条发布意图都不排），首批用户全部开不通。**将来真要启用外置文件时的两条硬前提**（Trace #544 S-2c）：① 这个变量自 rc25 起 `scheduler` 与 `gateway` **两侧同读**，要配就两份 env 一起配、值相同，要么两边都不配——只配一边会让管理动作按一份映射发布、次日每日重算按另一份翻回来，每次翻转都是用户可见的真实权限变化；② **先补 `gateway` 服务的 `runtime-config` 只读挂载再配变量**——`compose.prod.yaml` 目前只给 `scheduler` 挂了它，gateway 配了却读不到时三处管理动作全部失败关闭（安全但不可用）。详见 [`deploy/验收前部署配置清单.md`「闸① 外置路径」](验收前部署配置清单.md)。
-- **验收判据（首发已执行）**：首批用户第一次问数之后，读该轮 worker 终态审计的 `system_prompt_digest`，必须与 stage 同值、且降级计数为 0。该字段是**提示词文件 strip 之后 sha256 的前 12 位**（首发实测 `2272bd4d40ae`），不是文件本身的 sha256，核对时别拿错值。
+- **验收判据（首发已执行）**：首批用户第一次问数之后，读该轮 worker 终态审计的 `system_prompt_digest`，必须与 stage 同值、且降级计数为 0。该字段是**提示词文件 strip 之后 sha256 的前 12 位**（首发实测 `2272bd4d40ae`；**2.5.2 起 `ee39a24ea28d`**），不是文件本身的 sha256，核对时别拿错值。
 - 同一份 env 里，内测轮的**内容级采集**两个变量在生产禁止配置，且 CI 守卫读不到未入库的生产 env 文件——这条只能靠部署纪律兑现：从 stage 的 worker-queue env 生成 prod 版本时必须**显式剔除**这两项（它们恰恰只存在于 stage 那一份里）。
 
 ### 11.3 判据与命令形态

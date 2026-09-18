@@ -4,9 +4,9 @@
 
 条目按发布批次维护，不逐 PR 记录；每条引用对应 Issue 便于追溯。当前能力的完整事实、证据层级与已知边界以 [docs/当前能力.md](docs/当前能力.md) 为准，本文件不重复其细节。
 
-## [Unreleased]
+## [2.5.2] - 2026-09-18
 
-2.5.2 开发中（Trace [#843](https://github.com/Moshuiwang/lingxi/issues/843)）：由拉取代理 + 部署器发布的补丁版，装入 [#784](https://github.com/Moshuiwang/lingxi/issues/784) / [#834](https://github.com/Moshuiwang/lingxi/issues/834) / [#836](https://github.com/Moshuiwang/lingxi/issues/836) / [#837](https://github.com/Moshuiwang/lingxi/issues/837) 四处改动；本节随批次合入逐条追加。
+补丁版（Trace [#843](https://github.com/Moshuiwang/lingxi/issues/843)）：候选 `v2.5.2-rc.107` 经预发验收后由 Release Promotion 发布为正式版，生产由拉取代理 + 部署器无人值守升级（停机数十秒），产品负责人一次真实问数通过（L5）；装入 [#784](https://github.com/Moshuiwang/lingxi/issues/784) / [#834](https://github.com/Moshuiwang/lingxi/issues/834) / [#836](https://github.com/Moshuiwang/lingxi/issues/836) / [#837](https://github.com/Moshuiwang/lingxi/issues/837) 四处改动。
 
 ### Changed
 
