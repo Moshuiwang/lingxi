@@ -39,7 +39,7 @@ sys.dont_write_bytecode = True
 
 # 代理程序自身的版本标记：自替换只在包内代理的标记严格大于在位标记时进行（单调，防降级）。
 # 标记按下面的正则从源码文本读出，不导入、不执行候选文件；代理行为有改动时同步加一。
-AGENT_VERSION = 1
+AGENT_VERSION = 2
 AGENT_VERSION_PATTERN = re.compile(r"^AGENT_VERSION = ([0-9]+)$", re.MULTILINE)
 AGENT_BUNDLE_PATH = "deploy/release_pull_agent.py"
 AGENT_FILE_LIMIT = 2 * 1024 * 1024
@@ -62,7 +62,19 @@ CONFIG_KEYS = frozenset(
 )
 # 可选配置键缺省即启用：预发 / 生产既有配置文件不含它们也必须通过校验，否则新代理首轮
 # 就会以 config_shape 拒绝启动。
-OPTIONAL_CONFIG_KEYS = frozenset({"agent_self_update"})
+OPTIONAL_CONFIG_KEYS = frozenset({"agent_self_update", "pat_metadata_file"})
+# 机器身份入口用的个人访问令牌（PAT）没有运行时接口可查到期日：到期日由引导安装写在
+# 令牌文件旁的元数据里，代理只读元数据、不读令牌文件。进入到期前窗口起每日提醒一次。
+PAT_METADATA_FILE_NAME = "gh.env.meta"
+PAT_EXPIRY_WARNING_DAYS = 14
+PAT_EXPIRES_ON = re.compile(r"^[0-9]{4}-[0-9]{2}-[0-9]{2}$")
+PAT_ALERT_KEY_PREFIXES = (
+    "pat_expiring:",
+    "pat_expired:",
+    "pat_expiry_unknown:",
+    "pat_expiry_recovered:",
+)
+PAT_ALERTING_STATUSES = frozenset({"expiring", "expired", "unknown"})
 HOST_KEYS = frozenset(
     {
         "schema",
@@ -185,6 +197,15 @@ class AgentSelfUpdateError(AgentError):
         super().__init__(code)
 
 
+class PatMetadataError(AgentError):
+    """令牌元数据读不到或不合格：只带固定原因码，不带路径、文件内容与令牌。"""
+
+    def __init__(self, reason: str):
+        """原因码限于受控 JSON 读取的四个码与 schema / token_kind / expires_on 三个字段码。"""
+        self.reason = reason
+        super().__init__("pat_expiry_unknown")
+
+
 def canonical(value: object) -> bytes:
     """与部署状态账相同的稳定 JSON 编码。"""
     return (json.dumps(value, ensure_ascii=False, sort_keys=True, indent=2) + "\n").encode()
@@ -198,6 +219,11 @@ def fingerprint(value: object) -> str:
 def timestamp() -> str:
     """输出不含本机路径和凭据的 UTC 时刻。"""
     return dt.datetime.now(dt.UTC).isoformat(timespec="seconds").replace("+00:00", "Z")
+
+
+def _today() -> dt.date:
+    """令牌到期判定用的 UTC 日期；单独成函数是为了让用例注入「今天」。"""
+    return dt.datetime.now(dt.UTC).date()
 
 
 def _safe_path(value: object) -> bool:
@@ -517,12 +543,22 @@ def validate_config(config: object) -> dict:
         raise AgentError("config_notify_shape")
     if type(_self_update_enabled(config)) is not bool:
         raise AgentError("config_shape")
+    if "pat_metadata_file" in config and not _safe_path(config["pat_metadata_file"]):
+        raise AgentError("config_shape")
     return config
 
 
 def _self_update_enabled(config: dict) -> object:
     """自替换开关缺省开启；键不在场就是 True。"""
     return config.get("agent_self_update", True)
+
+
+def _pat_metadata_path(config: dict) -> Path:
+    """令牌元数据缺省与机器身份入口同目录；键 pat_metadata_file 在场时以它为准。"""
+    configured = config.get("pat_metadata_file")
+    if configured is not None:
+        return Path(configured)
+    return Path(config["gh_command"]).parent / PAT_METADATA_FILE_NAME
 
 
 def _command_argv(path: str | Path, *args: str) -> list[str]:
@@ -2183,10 +2219,168 @@ def _self_update_agent(
         _alert_self_update(state, host, config, state_directory, tag, result)
 
 
+def _read_pat_expiry(path: Path) -> dt.date:
+    """读令牌元数据里的到期日；任何不合格都只抛固定原因码，不带路径与文件内容。"""
+    try:
+        document = _read_json(path, private=True)
+    except AgentError as error:
+        raise PatMetadataError(error.code) from None
+    if not isinstance(document, dict) or document.get("schema") != 1:
+        raise PatMetadataError("schema")
+    if document.get("token_kind") != "github_pat":
+        raise PatMetadataError("token_kind")
+    expires_on = document.get("expires_on")
+    if not isinstance(expires_on, str) or not PAT_EXPIRES_ON.fullmatch(expires_on):
+        raise PatMetadataError("expires_on")
+    try:
+        return dt.date.fromisoformat(expires_on)
+    except ValueError:
+        raise PatMetadataError("expires_on") from None
+
+
+def _pat_observation(
+    status: str,
+    *,
+    expires_on: str | None = None,
+    days_left: int | None = None,
+    reason: str | None = None,
+) -> dict:
+    return {
+        "status": status,
+        "expires_on": expires_on,
+        "days_left": days_left,
+        "reason": reason,
+        "today": _today().isoformat(),
+    }
+
+
+def _observe_pat_expiry(config: dict) -> dict:
+    """四态判定：ok / expiring（到期前窗内）/ expired / unknown（元数据不可用或不合格）。"""
+    try:
+        expires_on = _read_pat_expiry(_pat_metadata_path(config))
+    except PatMetadataError as error:
+        return _pat_observation("unknown", reason=error.reason)
+    days_left = (expires_on - _today()).days
+    if days_left <= 0:
+        status = "expired"
+    elif days_left <= PAT_EXPIRY_WARNING_DAYS:
+        status = "expiring"
+    else:
+        status = "ok"
+    return _pat_observation(status, expires_on=expires_on.isoformat(), days_left=days_left)
+
+
+def _pat_alert_key(observation: dict, previous_status: object) -> str | None:
+    """窗内按天去重、未知按原因码去重、恢复按新到期日去重；ok 且上一轮也无事则不发。"""
+    status = observation["status"]
+    if status in ("expiring", "expired"):
+        return f"pat_{status}:{observation['expires_on']}:{observation['today']}"
+    if status == "unknown":
+        return f"pat_expiry_unknown:{observation['reason']}"
+    if previous_status in PAT_ALERTING_STATUSES:
+        return f"pat_expiry_recovered:{observation['expires_on']}"
+    return None
+
+
+def _prune_pat_alerts(alerts: dict, keep: str | None) -> None:
+    """只留本轮要用的那一条去重记录：过期的按天记录、已离开的未知原因和旧到期日都弹掉。
+
+    不弹掉的后果有两种：同一原因码的下一次未知事件被永久去重再也不告警；窗内每天一条
+    记录随到期后的天数无限增长。所有判定只看上一轮状态与本轮键，不依赖历史记录。
+    """
+    for key in list(alerts):
+        if key != keep and isinstance(key, str) and key.startswith(PAT_ALERT_KEY_PREFIXES):
+            alerts.pop(key)
+
+
+def _pat_alert_message(host: dict, observation: dict, code: str) -> str:
+    """PAT 类正文：主机、环境、阶段、结果码、到期日、剩余天数；不含令牌、路径与文件内容。"""
+    days_left = observation["days_left"]
+    fields = [
+        ("主机", host["host"]),
+        ("环境", host["environment"]),
+        ("阶段", "pat_expiry"),
+        ("结果码", code),
+        ("到期日", observation["expires_on"] or "未知"),
+        ("剩余天数", "未知" if days_left is None else str(days_left)),
+    ]
+    if observation["reason"] is not None:
+        fields.append(("原因", observation["reason"]))
+    if code == "pat_expired":
+        fields.append(("说明", "个人访问令牌已到期，发布列表将拿不到"))
+    return "\n".join(f"{key}：{value}" for key, value in fields)
+
+
+def _notify_pat_expiry(
+    state: dict, host: dict, config: dict, state_directory: Path, observation: dict
+) -> None:
+    """按状态迁移发告警或恢复通知，并推进状态账的 pat_expiry；投递失败则本轮不推进。
+
+    不推进是为了让下一轮按同一迁移重试（去重记录 ``sent=False`` 不算已发）。真正发出后立刻
+    落账：本轮稍后若走异常路径，``run_once`` 会从文件重新装账，不落账就会同日再发一条。
+    """
+    previous = state.get("pat_expiry")
+    previous_status = previous.get("status") if isinstance(previous, dict) else None
+    alerts = state.setdefault("alerts", {})
+    key = _pat_alert_key(observation, previous_status)
+    _prune_pat_alerts(alerts, key)
+    delivered = False
+    if key is not None:
+        try:
+            delivered = _send_once(
+                state,
+                key,
+                _pat_alert_message(host, observation, key.split(":", 1)[0]),
+                active=False,
+                config=config,
+                state_directory=state_directory,
+            )
+        except AgentError:
+            _log("alert", "alert_delivery_failed", key=key)
+            return
+        _log("alert", "sent" if delivered else "deduplicated", key=key)
+    state["pat_expiry"] = {
+        "status": observation["status"],
+        "expires_on": observation["expires_on"],
+        "checked_at": timestamp(),
+    }
+    if delivered:
+        with contextlib.suppress(AgentError):
+            _atomic_write(state_directory / "pull-agent.json", state)
+
+
+def _check_pat_expiry(state: dict, host: dict, config: dict, state_directory: Path) -> None:
+    """每轮核对一次个人访问令牌到期日；任何结局都不改变本轮返回码与部署结论。
+
+    到期后 ``gh release list`` 拿不到列表仍走既有 ``release_list_unavailable`` 路径，本函数
+    只负责提前提醒与到期提示。PAT 类去重记录一律 ``active=False``：``_finish`` 只对
+    ``active=True`` 的记录在健康轮发恢复，否则任何一轮幂等在位都会把「即将到期」误报成已恢复。
+    """
+    try:
+        observation = _observe_pat_expiry(config)
+    except Exception:
+        observation = _pat_observation("unknown", reason="unexpected")
+    _log(
+        "pat_expiry",
+        observation["status"],
+        expires_on=observation["expires_on"],
+        days_left=observation["days_left"],
+        reason=observation["reason"],
+    )
+    try:
+        _notify_pat_expiry(state, host, config, state_directory, observation)
+    except Exception:
+        fallback = _pat_observation("unknown", reason="unexpected")
+        _log("pat_expiry", "unknown", reason="unexpected")
+        with contextlib.suppress(Exception):
+            _notify_pat_expiry(state, host, config, state_directory, fallback)
+
+
 def _run_locked(
     host_path: Path, config_path: Path, state_directory: Path, host: dict, config: dict
 ) -> int:
     state = _load_state(state_directory / "pull-agent.json", host)
+    _check_pat_expiry(state, host, config, state_directory)
     try:
         releases = _list_releases(config)
         selected = select_release(releases, host["environment"])
