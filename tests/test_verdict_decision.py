@@ -1152,11 +1152,12 @@ class CiWorkflowTestRefTest(unittest.TestCase):
         checkouts = re.findall(
             r"uses: actions/checkout@[0-9a-f]{40}[^\n]*\n((?:        [^\n]*\n)*)", self.code
         )
-        self.assertEqual(len(checkouts), 8)
+        # 第 9 个检出 = `audit` 作业（#839）。
+        self.assertEqual(len(checkouts), 9)
         for block in checkouts:
             self.assertIn("ref: ${{ inputs.test_ref || '' }}", block)
             self.assertIn("persist-credentials: false", block)
-        self.assertEqual(self.code.count("ref: ${{ inputs.test_ref || '' }}"), 8)
+        self.assertEqual(self.code.count("ref: ${{ inputs.test_ref || '' }}"), 9)
 
     def test_concurrency_group_keeps_pr_number_first_then_test_ref(self):
         block = _top_level_block(self.code, "concurrency")

@@ -1,0 +1,86 @@
+name: Dependency Audit
+
+# Issue #839：每周对 main 做一次依赖漏洞扫描——新公布的漏洞不必等到下一个 PR 才被发现。
+# schedule 事件只在默认分支（main）上运行；workflow_dispatch 供手动补跑。
+# 步骤与 ci.yml 的 audit 作业相同、判定走同一个 scripts/ci/pip_audit_check.py：判定逻辑只有
+# 一处，步骤重复可以接受。失败通知走 GitHub 对定时工作流失败的默认通知，不另建通道；
+# 结论同样写进作业摘要。不引入锁文件、不改镜像、不修依赖。
+on:
+  schedule:
+    # 每周日 20:43 UTC = 每周一 04:43 北京时间；避开整点，GitHub 在整点排队最拥挤。
+    - cron: '43 20 * * 0'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: dependency-audit-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  audit:
+    name: Dependency Audit / audit (${{ matrix.group }})
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    strategy:
+      # 各组互相独立，一组红了也要看到其余组的结论。
+      fail-fast: false
+      matrix:
+        # 与 ci.yml 里 extras / audit 两个矩阵同一列表；新增 extra 时三处同步，
+        # tests/test_pip_audit_check.py 钉住三处一致。
+        group: [scheduler, reauthorize, worker, gateway, migrate]
+
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: 配置 Python 运行时
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: '3.12'
+
+      - name: 在干净虚拟环境里只装这一个 extra 并导出解析后的依赖集合
+        env:
+          GROUP: ${{ matrix.group }}
+          VENV: ${{ runner.temp }}/venv
+        run: |
+          python3 -m venv "${VENV}"
+          "${VENV}/bin/python" -m pip install ".[${GROUP}]"
+          "${VENV}/bin/python" -m pip freeze --exclude lingxi > "${RUNNER_TEMP}/resolved-${GROUP}.txt"
+          echo "--- 扫描对象：解析后的依赖集合 ---"
+          cat "${RUNNER_TEMP}/resolved-${GROUP}.txt"
+
+      # 扫描器装在自己的虚拟环境里：装进被审环境会把它自己的依赖混进扫描对象。
+      # 钉精确版本（与 ci.yml 的 audit 作业同一个版本，测试钉住两处一致）；装不上就让本步失败。
+      - name: 安装钉版扫描器（独立环境）
+        env:
+          TOOL: ${{ runner.temp }}/audit-tool
+        run: |
+          python3 -m venv "${TOOL}"
+          "${TOOL}/bin/python" -m pip install 'pip-audit==2.10.1'
+          "${TOOL}/bin/pip-audit" --version
+
+      # pip-audit 发现漏洞时退出 1，运行错误也退出 1；这里不据此下结论，只把结果文件交给判定
+      # 脚本——文件缺失或不完整由脚本判「未知」失败。
+      - name: 扫描解析后的依赖集合（OSV）
+        env:
+          GROUP: ${{ matrix.group }}
+          TOOL: ${{ runner.temp }}/audit-tool
+        run: |
+          "${TOOL}/bin/pip-audit" \
+            --requirement "${RUNNER_TEMP}/resolved-${GROUP}.txt" --no-deps --disable-pip --strict \
+            --vulnerability-service osv --format json --progress-spinner off \
+            --output "${RUNNER_TEMP}/audit-${GROUP}.json" \
+            || echo "pip-audit 退出码 $?（1 = 发现漏洞或运行错误；结论由下一步的判定脚本给出）"
+
+      - name: 判定严重度与豁免（高 / 严重未豁免判红，取不到判未知）
+        env:
+          GROUP: ${{ matrix.group }}
+        run: |
+          python3 scripts/ci/pip_audit_check.py \
+            --audit-json "${RUNNER_TEMP}/audit-${GROUP}.json" \
+            --allowlist scripts/ci/pip_audit_allowlist.txt \
+            --label "${GROUP}"

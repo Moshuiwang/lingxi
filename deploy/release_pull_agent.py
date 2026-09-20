@@ -37,6 +37,13 @@ from urllib.parse import urlsplit, urlunsplit
 # 代理进程内加载的控制包工具位于只读版本目录，不得写字节码缓存；不依赖启动参数 -B。
 sys.dont_write_bytecode = True
 
+# 代理程序自身的版本标记：自替换只在包内代理的标记严格大于在位标记时进行（单调，防降级）。
+# 标记按下面的正则从源码文本读出，不导入、不执行候选文件；代理行为有改动时同步加一。
+AGENT_VERSION = 1
+AGENT_VERSION_PATTERN = re.compile(r"^AGENT_VERSION = ([0-9]+)$", re.MULTILINE)
+AGENT_BUNDLE_PATH = "deploy/release_pull_agent.py"
+AGENT_FILE_LIMIT = 2 * 1024 * 1024
+
 CONFIG_KEYS = frozenset(
     {
         "schema",
@@ -53,6 +60,9 @@ CONFIG_KEYS = frozenset(
         "notify_on_success",
     }
 )
+# 可选配置键缺省即启用：预发 / 生产既有配置文件不含它们也必须通过校验，否则新代理首轮
+# 就会以 config_shape 拒绝启动。
+OPTIONAL_CONFIG_KEYS = frozenset({"agent_self_update"})
 HOST_KEYS = frozenset(
     {
         "schema",
@@ -164,6 +174,15 @@ class CommandTimeoutError(AgentError):
     def __init__(self):
         """固定为命令超时结果码。"""
         super().__init__("command_timeout")
+
+
+class AgentSelfUpdateError(AgentError):
+    """代理自替换被拒绝或失败：结果码进状态账与告警，原因只进日志。"""
+
+    def __init__(self, code: str, reason: str):
+        """保存稳定结果码与不含路径原文的原因码。"""
+        self.reason = reason
+        super().__init__(code)
 
 
 def canonical(value: object) -> bytes:
@@ -462,8 +481,12 @@ def validate_host(host: object) -> dict:
 
 
 def validate_config(config: object) -> dict:
-    """非秘密代理配置必须精确命中固定字段集合。"""
-    if not isinstance(config, dict) or set(config) != CONFIG_KEYS or config["schema"] != 1:
+    """非秘密代理配置必须含全部必需字段，多出的键只能是已登记的可选键。"""
+    if (
+        not isinstance(config, dict)
+        or not CONFIG_KEYS <= set(config) <= CONFIG_KEYS | OPTIONAL_CONFIG_KEYS
+        or config["schema"] != 1
+    ):
         raise AgentError("config_shape")
     if not isinstance(config["repository"], str) or not REPOSITORY.fullmatch(config["repository"]):
         raise AgentError("config_repository")
@@ -492,7 +515,14 @@ def validate_config(config: object) -> dict:
         raise AgentError("config_timeout_exceeds_service_bound")
     if type(config["notify_on_success"]) is not bool:
         raise AgentError("config_notify_shape")
+    if type(_self_update_enabled(config)) is not bool:
+        raise AgentError("config_shape")
     return config
+
+
+def _self_update_enabled(config: dict) -> object:
+    """自替换开关缺省开启；键不在场就是 True。"""
+    return config.get("agent_self_update", True)
 
 
 def _command_argv(path: str | Path, *args: str) -> list[str]:
@@ -1939,6 +1969,220 @@ def _recheck_verified_target(
     )
 
 
+def _agent_program_path() -> Path:
+    """在位代理就是本进程实际运行的这份文件；不写死主机路径，两台主机的 ExecStart 可不同。"""
+    return Path(__file__).absolute()
+
+
+def _read_regular_file(path: Path, limit: int = AGENT_FILE_LIMIT) -> bytes:
+    """以不跟随链接的方式读一份普通文件的全部字节，超过上限即拒绝；错误不带路径原文。"""
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+    except OSError:
+        raise AgentError("file_unavailable") from None
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            raise AgentError("file_not_regular")
+        with os.fdopen(fd, "rb", closefd=False) as stream:
+            raw = stream.read(limit + 1)
+    finally:
+        os.close(fd)
+    if len(raw) > limit:
+        raise AgentError("file_too_large")
+    return raw
+
+
+def parse_agent_version(data: bytes) -> int:
+    """从代理源码文本读版本标记；没有标记或不是整数行视为 0，不导入、不执行。"""
+    match = AGENT_VERSION_PATTERN.search(data.decode("utf-8", errors="replace"))
+    return int(match.group(1)) if match else 0
+
+
+def read_agent_version(path: Path) -> int:
+    """按文件路径只读文本解析版本标记；读不到同样视为 0。"""
+    try:
+        return parse_agent_version(_read_regular_file(path))
+    except AgentError:
+        return 0
+
+
+def _trusted_agent_candidate(target: Path, metadata: dict) -> tuple[bytes, str]:
+    """候选只认已核对版本目录里、与清单钉住的索引条目摘要相等的那份代理文件。
+
+    信任链与部署器同一条：版本目录内 ``control-index.json`` 的摘要必须等于发布清单的
+    ``index_sha256``，候选文件摘要必须等于索引里 ``deploy/release_pull_agent.py`` 条目；
+    任一环不成立就拒绝，不另设签名或公钥。
+    """
+    rejected = "agent_self_update_rejected"
+    try:
+        index_data = _read_regular_file(target / "control-index.json")
+    except AgentError:
+        raise AgentSelfUpdateError(rejected, "index_unavailable") from None
+    if hashlib.sha256(index_data).hexdigest() != metadata.get("index_sha256"):
+        raise AgentSelfUpdateError(rejected, "index_digest_mismatch")
+    try:
+        entries = json.loads(index_data)["files"]
+        expected = next(item for item in entries if item.get("path") == AGENT_BUNDLE_PATH)["sha256"]
+    except (ValueError, TypeError, KeyError, AttributeError, StopIteration):
+        raise AgentSelfUpdateError(rejected, "index_entry_missing") from None
+    if not isinstance(expected, str) or not SHA256.fullmatch(expected):
+        raise AgentSelfUpdateError(rejected, "index_entry_missing")
+    try:
+        data = _read_regular_file(target / AGENT_BUNDLE_PATH)
+    except AgentError:
+        raise AgentSelfUpdateError(rejected, "candidate_unavailable") from None
+    if hashlib.sha256(data).hexdigest() != expected:
+        raise AgentSelfUpdateError(rejected, "candidate_digest_mismatch")
+    return data, expected
+
+
+def _in_place_agent_bytes(in_place: Path) -> bytes:
+    """在位代理须是运行者自有的普通文件，所在目录不得由组 / 其他主体写入；符号链接不替换。"""
+    rejected = "agent_self_update_rejected"
+    try:
+        info = in_place.lstat()
+        parent = in_place.parent.lstat()
+    except OSError:
+        raise AgentSelfUpdateError(rejected, "in_place_unavailable") from None
+    if stat.S_ISLNK(info.st_mode):
+        raise AgentSelfUpdateError(rejected, "in_place_symlink")
+    if not stat.S_ISREG(info.st_mode) or info.st_uid != os.geteuid():
+        raise AgentSelfUpdateError(rejected, "in_place_permissions")
+    if (
+        stat.S_ISLNK(parent.st_mode)
+        or not stat.S_ISDIR(parent.st_mode)
+        or parent.st_uid != os.geteuid()
+        or parent.st_mode & 0o022
+    ):
+        raise AgentSelfUpdateError(rejected, "in_place_directory_permissions")
+    try:
+        return _read_regular_file(in_place)
+    except AgentError as error:
+        raise AgentSelfUpdateError(rejected, error.code) from None
+
+
+def _write_sibling(path: Path, data: bytes, mode: int, prefix: str) -> None:
+    """同目录临时文件写满、落盘后 ``os.replace`` 到目标路径并同步目录。"""
+    fd, temporary = tempfile.mkstemp(prefix=prefix, dir=path.parent)
+    try:
+        with os.fdopen(fd, "wb") as stream:
+            os.fchmod(stream.fileno(), mode)
+            stream.write(data)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, path)
+        directory_fd = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
+    finally:
+        Path(temporary).unlink(missing_ok=True)
+
+
+def _restore_agent_backup(backup: Path, in_place: Path) -> None:
+    """尽力把旧副本换回在位路径；换不回也不再抛，本轮部署结论不受影响。"""
+    with contextlib.suppress(OSError):
+        if backup.is_file():
+            os.replace(backup, in_place)
+
+
+def _replace_agent_file(in_place: Path, old_data: bytes, new_data: bytes, new_sha: str) -> None:
+    """先在同目录留旧代理的 ``.bak-<旧摘要前 8 位>`` 副本，再把新文件原子换入在位路径。
+
+    ExecStart 路径上始终是旧的或新的完整文件，没有「文件不存在」的窗口；旧副本只保留
+    最近一份。换入后回读摘要不等于候选即把副本换回、按失败上报。
+    """
+    failed = "agent_self_update_failed"
+    backup = in_place.with_name(in_place.name + ".bak-" + hashlib.sha256(old_data).hexdigest()[:8])
+    try:
+        mode = stat.S_IMODE(in_place.lstat().st_mode)
+        # 更早的旧副本与上次硬崩溃可能留下的本函数临时文件一起清掉，目录里只留最近一份副本。
+        for pattern in (in_place.name + ".bak-*", ".agent-backup-*", ".agent-new-*"):
+            for stale in in_place.parent.glob(pattern):
+                stale.unlink()
+        _write_sibling(backup, old_data, mode, ".agent-backup-")
+        _write_sibling(in_place, new_data, mode, ".agent-new-")
+    except OSError:
+        _restore_agent_backup(backup, in_place)
+        raise AgentSelfUpdateError(failed, "write_failed") from None
+    try:
+        verified = hashlib.sha256(_read_regular_file(in_place)).hexdigest() == new_sha
+    except AgentError:
+        verified = False
+    if not verified:
+        _restore_agent_backup(backup, in_place)
+        raise AgentSelfUpdateError(failed, "readback_mismatch")
+
+
+def _self_update_once(in_place: Path, target: Path, metadata: dict) -> tuple[str, dict]:
+    """判定并执行一次自替换，返回结果码与只含摘要 / 标记的审计字段。"""
+    candidate_data, candidate_sha = _trusted_agent_candidate(target, metadata)
+    in_place_data = _in_place_agent_bytes(in_place)
+    in_place_sha = hashlib.sha256(in_place_data).hexdigest()
+    fields = {"in_place_sha256": in_place_sha, "candidate_sha256": candidate_sha}
+    if in_place_sha == candidate_sha:
+        return "agent_self_update_unchanged", fields
+    in_place_version = parse_agent_version(in_place_data)
+    candidate_version = parse_agent_version(candidate_data)
+    fields.update({"in_place_version": in_place_version, "candidate_version": candidate_version})
+    if candidate_version <= in_place_version:
+        return "agent_self_update_skipped_not_newer", fields
+    _replace_agent_file(in_place, in_place_data, candidate_data, candidate_sha)
+    fields["next_round_by"] = candidate_version
+    return "agent_self_update_replaced", fields
+
+
+def _alert_self_update(
+    state: dict, host: dict, config: dict, state_directory: Path, tag: str, result: str
+) -> None:
+    """拒绝与失败各只告警一次（去重键 = 结果码 + tag）；投递失败只记日志，下一轮重试。"""
+    try:
+        delivered = _send_once(
+            state,
+            _alert_key(result, tag),
+            _alert_message(host, tag, "agent_self_update", result, None),
+            active=False,
+            config=config,
+            state_directory=state_directory,
+        )
+    except AgentError:
+        _log("alert", "alert_delivery_failed", tag=tag)
+        return
+    _log("alert", "sent" if delivered else "deduplicated", tag=tag)
+    if delivered:
+        with contextlib.suppress(AgentError):
+            _atomic_write(state_directory / "pull-agent.json", state)
+
+
+def _self_update_agent(
+    state: dict,
+    host: dict,
+    config: dict,
+    state_directory: Path,
+    target: Path,
+    metadata: dict,
+    tag: str,
+) -> None:
+    """用本轮已核对版本目录里的代理替换在位代理；任何结局都不改变本轮的部署结论。
+
+    本轮进程继续跑旧代码（不重新执行自身），新代理从下一轮起运行；替换成功只留审计，
+    被拒与失败各告警一次，摘要相同或候选标记不高于在位都静默。
+    """
+    if _self_update_enabled(config) is not True:
+        _log("agent_self_update", "agent_self_update_disabled", tag=tag)
+        return
+    try:
+        result, fields = _self_update_once(_agent_program_path(), target, metadata)
+    except AgentSelfUpdateError as error:
+        result, fields = error.code, {"reason": error.reason}
+    except Exception:
+        result, fields = "agent_self_update_failed", {"reason": "unexpected"}
+    _log("agent_self_update", result, tag=tag, **fields)
+    if result in ("agent_self_update_rejected", "agent_self_update_failed"):
+        _alert_self_update(state, host, config, state_directory, tag, result)
+
+
 def _run_locked(
     host_path: Path, config_path: Path, state_directory: Path, host: dict, config: dict
 ) -> int:
@@ -2143,6 +2387,11 @@ def _run_locked(
                 deployer_state="unknown",
                 release_record=release_audit,
             )
+        # 新包已核对并安装：先让代理自己随包升级（本轮仍以旧代码跑完），再进部署链；
+        # 自替换的任何结局都不改变本轮部署结论。
+        _self_update_agent(
+            state, host, config, state_directory, target, _bundle_metadata(configured_manifest), tag
+        )
         del target
         release_audit["run_id"] = configured_manifest.get("run_id")
         release_audit["promotion_run_id"] = configured_manifest.get("promotion", {}).get("run_id")
@@ -2523,7 +2772,8 @@ def run_once(host_path: Path, config_path: Path, state_directory: Path) -> int:
     _private_directory(state_directory, create=True)
     try:
         with _run_lock(state_directory):
-            _log("lock", "acquired", host=host["host"])
+            # 每轮首行带自身版本标记：自替换后下一轮由谁在跑，看这一行即可。
+            _log("lock", "acquired", host=host["host"], agent_version=AGENT_VERSION)
             try:
                 return _run_locked(host_path, config_path, state_directory, host, config)
             except AgentError as error:
