@@ -2391,6 +2391,8 @@ class AgentTests(unittest.TestCase):
         old_sha = harness.in_place_sha256()
         stale = harness.in_place_agent.with_name("release_pull_agent.py.bak-deadbeef")
         stale.write_bytes(b"stale backup\n")
+        leftover = harness.in_place_agent.with_name(".agent-new-leftover")
+        leftover.write_bytes(b"half written by a crashed round\n")
         newer = harness.agent_with_version(AGENT.AGENT_VERSION + 1)
         self.assertEqual(AGENT.parse_agent_version(newer), AGENT.AGENT_VERSION + 1)
         new_sha = harness.install_bundle_agent(newer)
@@ -2413,6 +2415,7 @@ class AgentTests(unittest.TestCase):
         self.assertEqual(harness.backups(), [backup])
         self.assertEqual(backup.read_bytes(), harness.agent_source)
         self.assertFalse(stale.exists())
+        self.assertFalse(leftover.exists())
         self.assertEqual(
             self.in_place_directory_names(), sorted([backup.name, "release_pull_agent.py"])
         )

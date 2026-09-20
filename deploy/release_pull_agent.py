@@ -2097,8 +2097,10 @@ def _replace_agent_file(in_place: Path, old_data: bytes, new_data: bytes, new_sh
     backup = in_place.with_name(in_place.name + ".bak-" + hashlib.sha256(old_data).hexdigest()[:8])
     try:
         mode = stat.S_IMODE(in_place.lstat().st_mode)
-        for stale in in_place.parent.glob(in_place.name + ".bak-*"):
-            stale.unlink()
+        # 更早的旧副本与上次硬崩溃可能留下的本函数临时文件一起清掉，目录里只留最近一份副本。
+        for pattern in (in_place.name + ".bak-*", ".agent-backup-*", ".agent-new-*"):
+            for stale in in_place.parent.glob(pattern):
+                stale.unlink()
         _write_sibling(backup, old_data, mode, ".agent-backup-")
         _write_sibling(in_place, new_data, mode, ".agent-new-")
     except OSError:
