@@ -235,11 +235,11 @@ if ! preflight_out=$(remote_bash "${preflight_script}" "${remote_workdir}" "${sh
 fi
 declare -A pre=()
 parse_kv pre "${preflight_out}"
+remote_tmp="${pre[TMP]:-}"
 for key in WORKDIR HAS_SHA BASIS TIME_BIN TIMEOUT_BIN TMP; do
   [[ -n "${pre[${key}]+set}" ]] || fail "${EXIT_UNAVAILABLE}" "远端预检输出里没有 ${key}，视为连接不完整。"
 done
 remote_workdir="${pre[WORKDIR]}"
-remote_tmp="${pre[TMP]}"
 if [[ -n "${timeout_seconds}" && "${pre[TIMEOUT_BIN]}" != "1" ]]; then
   fail "${EXIT_CONFIG}" "配置了 LINGXI_REMOTE_TIMEOUT_SECONDS，但远端没有 timeout 命令。"
 fi
@@ -389,7 +389,9 @@ fi
 remote_exit="${res[EXIT_CODE]:-}"
 if [[ ! "${remote_exit}" =~ ^[0-9]+$ ]]; then
   remote_exit=""
-  note_failure "${EXIT_UNAVAILABLE}" "远端 check.sh 没有写出退出码：命令被中断（SSH 返回 ${ssh_rc}）"
+  if [[ "${collect_ok}" -eq 1 ]]; then
+    note_failure "${EXIT_UNAVAILABLE}" "远端 check.sh 没有写出退出码：命令被中断（SSH 返回 ${ssh_rc}）"
+  fi
 elif [[ "${remote_exit}" -ne 0 ]]; then
   if [[ "${remote_exit}" -eq 124 && -n "${timeout_seconds}" ]]; then
     reasons+=("远端 check.sh 超过 ${timeout_seconds} 秒被终止（退出码 124）")
@@ -399,7 +401,8 @@ elif [[ "${remote_exit}" -ne 0 ]]; then
   verdict_code="${remote_exit}"
 fi
 
-ran_line=$(grep -E -o 'Ran [0-9]+ tests? in [0-9.]+s' "${log_path}" 2>/dev/null | tail -n 1 || true)
+# 日志里可能有多条 Ran N（主套件之外还有定向小套件），取 N 最大的一条 = 主套件。
+ran_line=$(grep -E -o 'Ran [0-9]+ tests? in [0-9.]+s' "${log_path}" 2>/dev/null | sort -t ' ' -k2,2n | tail -n 1 || true)
 ran_count="未知"
 if [[ -n "${ran_line}" ]]; then
   ran_count=$(printf '%s' "${ran_line}" | grep -E -o '[0-9]+' | head -n 1)

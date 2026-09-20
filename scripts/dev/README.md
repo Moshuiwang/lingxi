@@ -41,11 +41,11 @@
 | Python | 与 `ci.yml` 现读一致的版本化二进制（当前 `python3.12`）+ `venv` 模块带 `pip` | `check.sh` 建 venv 时优先找版本化二进制，版本不符响亮失败 |
 | git | 支持 `git -C`、`git bundle`、按 SHA `fetch` | 传输与 `checkout --detach` |
 | bash | 5.x 在 PATH 上（登录 shell 可以是任何 POSIX shell） | 远端步骤以 `bash -c` 执行，`check.sh` 自身也要 bash 4.3+ |
-| `/usr/bin/time` | GNU time（`time` 包） | 取 `Maximum resident set size` 作内存峰值；缺了脚本仍能跑，峰值记「未知」 |
+| `/usr/bin/time` | GNU time（`time` 包） | 取 `Maximum resident set size` 作内存峰值——它是 `check.sh` 进程树里**单个进程**的最大常驻集（通常是跑单测的 python），不是整机内存增量；缺了脚本仍能跑，峰值记「未知」 |
 | `timeout` | coreutils | 只有配置了 `LINGXI_REMOTE_TIMEOUT_SECONDS` 才需要 |
 | SSH 接入 | 本机那条 `LINGXI_REMOTE_SSH` 命令能**免交互**连上（公钥或 Tailscale SSH），登录用户即上面装好 Docker 的用户 | 脚本每次运行要连同一主机五六次，任何一次要口令就等于挂死 |
 | 仓库检出 | `git clone <仓库> <目录>` 一次，之后保持工作树干净 | 脚本每次 `checkout --detach` 到目标提交，脏了拒绝 |
-| 资源 | 磁盘：venv 数百 MB + `postgres:16-alpine` 镜像；内存：`full` 单进程峰值实测约 850 MB | 低于 2 GiB 内存的主机请配 swap |
+| 资源 | 磁盘：venv 数百 MB + `postgres:16-alpine` 镜像；内存：2 GiB 主机实测可跑（单进程峰值约 170 MB，整机用量增长约 300 MB） | 低于 2 GiB 内存的主机请配 swap |
 
 **换主机**：只改配置，不改代码——在新主机做完上表 → `git clone` 一个检出 → 再写一份 `.dev-check/remote-b.env`（只有 `LINGXI_REMOTE_SSH` 与 `LINGXI_REMOTE_WORKDIR` 不同）→ `LINGXI_REMOTE_ENV_FILE=.dev-check/remote-b.env scripts/dev/remote_check.sh <sha>`。同一台机器上多份检出（例如给两条批次分别留一个）也是同样的办法。「配置不写死」的证明方式：换主机全程只新增一份配置文件，仓库 `git diff` 为空；脚本里唯一的主机字样是用法说明里的占位 `gate-host`。
 
