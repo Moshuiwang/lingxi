@@ -391,6 +391,17 @@ class PullHarness:
         self.target_tag = "v2.5.0-rc.10" if environment == "stage" else "v2.5.0"
         self._make_manifest(self.old_tag, formal=environment == "production", seed="1")
         self._make_manifest(self.target_tag, formal=environment == "production", seed="2")
+        # 在位代理是被测源码的一份独立副本：自替换只许改这份副本，绝不能碰源码树；
+        # 包内候选默认与它逐字节相同，所以既有用例每轮只多一行 agent_self_update_unchanged。
+        self.agent_source = MODULE_PATH.read_bytes()
+        self.in_place_agent = self.root / "agent-in-place" / "release_pull_agent.py"
+        _write(self.in_place_agent, self.agent_source, 0o644)
+        self.in_place_agent.parent.chmod(0o755)
+        self._program_path = patch.object(
+            AGENT, "_agent_program_path", return_value=self.in_place_agent
+        )
+        self._program_path.start()
+        self.install_bundle_agent(self.agent_source)
         self.set_releases([self._release(self.target_tag, environment == "stage")])
         self._write_env()
         self.set_running_containers(self.target_tag)
@@ -398,6 +409,58 @@ class PullHarness:
     def _write_env(self):
         self._old_env = os.environ.copy()
         os.environ.update(self._env)
+
+    def agent_with_version(self, version: int) -> bytes:
+        """把被测源码的版本标记行换成 ``version``；找不到标记行即断言失败，不静默退化。"""
+        current = f"\nAGENT_VERSION = {AGENT.AGENT_VERSION}\n".encode()
+        assert current in self.agent_source
+        return self.agent_source.replace(current, f"\nAGENT_VERSION = {version}\n".encode(), 1)
+
+    def install_bundle_agent(self, data: bytes, *, indexed_sha256: str | None = None) -> str:
+        """把一份代理写进假控制包：版本目录源、目录内索引与外部索引附件，并重算两份清单。
+
+        ``indexed_sha256`` 默认为文件真实摘要；传入别的值即模拟索引条目与文件不符。
+        """
+        sha = hashlib.sha256(data).hexdigest()
+        candidate = self.installed_source / "deploy" / "release_pull_agent.py"
+        candidate.unlink(missing_ok=True)
+        _write(candidate, data, 0o444)
+        index = {
+            "schema_revision": 1,
+            "source_commit": "1" * 40,
+            "runtime": {"python_minimum": "3.11", "platform": "linux"},
+            "files": [
+                {
+                    "path": "deploy/release_pull_agent.py",
+                    "sha256": indexed_sha256 or sha,
+                    "mode": 0o444,
+                    "size": len(data),
+                    "source_commit": "1" * 40,
+                }
+            ],
+        }
+        self.install_bundle_index(AGENT.canonical(index))
+        return sha
+
+    def install_bundle_index(self, index_bytes: bytes) -> None:
+        """外部索引附件与版本目录内索引写成同一份内容，并重算两份清单的 ``index_sha256``。"""
+        self.index.write_bytes(index_bytes)
+        installed_index = self.installed_source / "control-index.json"
+        installed_index.unlink(missing_ok=True)
+        _write(installed_index, index_bytes, 0o444)
+        formal = self.host["environment"] == "production"
+        self._make_manifest(self.old_tag, formal=formal, seed="1")
+        self._make_manifest(self.target_tag, formal=formal, seed="2")
+
+    def in_place_sha256(self) -> str:
+        return hashlib.sha256(self.in_place_agent.read_bytes()).hexdigest()
+
+    def backups(self) -> list[Path]:
+        return sorted(self.in_place_agent.parent.glob("release_pull_agent.py.bak-*"))
+
+    def write_config(self, **overrides):
+        self.config.update(overrides)
+        _json(self.config_path, self.config)
 
     def receipt(self, bundle_sha256: str | None = None, **overrides) -> dict:
         """引导安装时人工写定的收据；六项核对全真，bundle_sha256 默认是引导安装的包摘要。"""
@@ -455,6 +518,7 @@ class PullHarness:
         (self.relay_root / "current").symlink_to(relay_directory.name)
 
     def close(self):
+        self._program_path.stop()
         os.environ.clear()
         os.environ.update(self._old_env)
         self.tmp.cleanup()
@@ -2309,6 +2373,457 @@ class AgentTests(unittest.TestCase):
         self.assertIn("unknown", messages[0])
         self.assertNotIn("control_bundle_install_failed", messages[0])
         self.assertFalse(any(call["kind"] == "deployer" for call in self.calls()))
+
+    # ---- 代理自替换 ----
+
+    def self_update_lines(self, output: str) -> list[str]:
+        return [line for line in output.splitlines() if "阶段=agent_self_update" in line]
+
+    def self_update_alerts(self, messages: list[str]) -> list[str]:
+        return [message for message in messages if "agent_self_update" in message]
+
+    def in_place_directory_names(self) -> list[str]:
+        return sorted(p.name for p in self.harness.in_place_agent.parent.iterdir())
+
+    def test_agent_replaces_itself_from_verified_bundle_and_keeps_deploy_result(self):
+        """包内代理摘要不同且标记更高：原子替换、留 .bak、审计带新标记，本轮部署结果不变。"""
+        harness = self.harness
+        old_sha = harness.in_place_sha256()
+        stale = harness.in_place_agent.with_name("release_pull_agent.py.bak-deadbeef")
+        stale.write_bytes(b"stale backup\n")
+        leftover = harness.in_place_agent.with_name(".agent-new-leftover")
+        leftover.write_bytes(b"half written by a crashed round\n")
+        newer = harness.agent_with_version(AGENT.AGENT_VERSION + 1)
+        self.assertEqual(AGENT.parse_agent_version(newer), AGENT.AGENT_VERSION + 1)
+        new_sha = harness.install_bundle_agent(newer)
+        self.assertNotEqual(new_sha, old_sha)
+        # 状态账与旧计划在候选就位之后写：旧计划里冻着旧版本清单，包索引换了它也得一起重算。
+        harness.state_for_old()
+        messages = []
+        code, output = self.run_agent(sender=lambda message, env, timeout: messages.append(message))
+        self.assertEqual(code, 0)
+        state = self.read_state()
+        self.assertEqual(state["last_result"], "verified")
+        self.assertEqual(state["target_tag"], harness.target_tag)
+        self.assertTrue(
+            any(call["kind"] == "deployer" and "apply" in call["argv"] for call in self.calls())
+        )
+        # 在位文件已是包内代理，权限位沿用旧文件；旧文件留成 .bak-<旧摘要前 8 位>，更早的副本删掉。
+        self.assertEqual(harness.in_place_sha256(), new_sha)
+        self.assertEqual(stat.S_IMODE(harness.in_place_agent.stat().st_mode), 0o644)
+        backup = harness.in_place_agent.with_name(f"release_pull_agent.py.bak-{old_sha[:8]}")
+        self.assertEqual(harness.backups(), [backup])
+        self.assertEqual(backup.read_bytes(), harness.agent_source)
+        self.assertFalse(stale.exists())
+        self.assertFalse(leftover.exists())
+        self.assertEqual(
+            self.in_place_directory_names(), sorted([backup.name, "release_pull_agent.py"])
+        )
+        lines = self.self_update_lines(output)
+        self.assertEqual(len(lines), 1, output)
+        self.assertIn("结果码=agent_self_update_replaced", lines[0])
+        self.assertIn(f"next_round_by={AGENT.AGENT_VERSION + 1}", lines[0])
+        self.assertIn(f"candidate_sha256={new_sha}", lines[0])
+        self.assertIn(f"in_place_sha256={old_sha}", lines[0])
+        # 成功不告警：本轮只有 notify_on_success 的成功通知；进程内仍是旧代码。
+        self.assertEqual(len(messages), 1)
+        self.assertIn("verified", messages[0])
+        self.assertEqual(self.self_update_alerts(messages), [])
+        self.assertEqual(AGENT.parse_agent_version(harness.agent_source), AGENT.AGENT_VERSION)
+        # 每轮首行带运行中代理的版本标记，下一轮由谁在跑一眼可见。
+        self.assertIn(
+            f"阶段=lock 结果码=acquired host=synthetic-host agent_version={AGENT.AGENT_VERSION}",
+            output,
+        )
+
+    def test_candidate_off_the_digest_chain_is_rejected_and_alerted_once(self):
+        """候选文件摘要不等于索引条目：不替换、rejected 审计、告警恰一次，同 tag 第二轮去重。"""
+        harness = self.harness
+        harness.write_config(notify_on_success=False)
+        harness.set_env(DEPLOY_STATUS="running")
+        old_sha = harness.in_place_sha256()
+        harness.install_bundle_agent(
+            harness.agent_with_version(AGENT.AGENT_VERSION + 1), indexed_sha256="f" * 64
+        )
+        harness.state_for_old()
+        messages = []
+        outputs = []
+        for _ in range(2):
+            code, output = self.run_agent(
+                sender=lambda message, env, timeout: messages.append(message)
+            )
+            self.assertEqual(code, 0)
+            outputs.append(output)
+            self.assertEqual(self.read_state()["last_result"], "running")
+            self.assertEqual(harness.in_place_sha256(), old_sha)
+            self.assertEqual(harness.backups(), [])
+            lines = self.self_update_lines(output)
+            self.assertEqual(len(lines), 1, output)
+            self.assertIn("结果码=agent_self_update_rejected", lines[0])
+            self.assertIn("reason=candidate_digest_mismatch", lines[0])
+        self.assertEqual(len(messages), 1)
+        self.assertIn("agent_self_update_rejected", messages[0])
+        self.assertIn("阶段：agent_self_update", messages[0])
+        self.assertIn("阶段=alert 结果码=sent", outputs[0])
+        self.assertIn("阶段=alert 结果码=deduplicated", outputs[1])
+        self.assertNotIn("结果码=sent", outputs[1])
+        record = self.read_state()["alerts"][f"agent_self_update_rejected:{harness.target_tag}"]
+        self.assertTrue(record["sent"])
+        self.assertFalse(record["active"])
+
+    def test_index_off_the_manifest_chain_or_missing_entry_is_rejected(self):
+        """索引摘要不等于清单 index_sha256、或索引里没有代理条目：同样拒绝，不替换。"""
+        harness = self.harness
+        harness.write_config(notify_on_success=False)
+        old_sha = harness.in_place_sha256()
+        for reason in ("index_digest_mismatch", "index_entry_missing"):
+            with self.subTest(reason=reason):
+                harness.install_bundle_agent(harness.agent_with_version(AGENT.AGENT_VERSION + 1))
+                if reason == "index_digest_mismatch":
+                    # 只换版本目录内那份索引：外部附件与清单仍一致，包本身照常通过核对。
+                    installed_index = harness.installed_source / "control-index.json"
+                    installed_index.unlink()
+                    _write(installed_index, AGENT.canonical({"files": [], "x": True}), 0o444)
+                else:
+                    # 清单钉住的索引本身就没有代理条目。
+                    harness.install_bundle_index(
+                        AGENT.canonical({"schema_revision": 1, "files": []})
+                    )
+                harness.state_for_old()
+                messages = []
+                code, output = self.run_agent(
+                    sender=lambda message, env, timeout: messages.append(message)
+                )
+                self.assertEqual(code, 0)
+                self.assertEqual(self.read_state()["last_result"], "verified")
+                self.assertEqual(harness.in_place_sha256(), old_sha)
+                lines = self.self_update_lines(output)
+                self.assertEqual(len(lines), 1, output)
+                self.assertIn("结果码=agent_self_update_rejected", lines[0])
+                self.assertIn(f"reason={reason}", lines[0])
+                self.assertEqual(len(self.self_update_alerts(messages)), 1)
+
+    def test_half_written_replacement_leaves_old_agent_intact(self):
+        """换入时崩溃：在位文件逐字节仍是旧文件、无临时文件残留、failed 审计 + 告警一次，部署结果不变。"""
+        harness = self.harness
+        harness.write_config(notify_on_success=False)
+        new_sha = harness.install_bundle_agent(harness.agent_with_version(AGENT.AGENT_VERSION + 1))
+        harness.state_for_old()
+        real_replace = os.replace
+
+        def crash_on_new_file(src, dst, *args, **kwargs):
+            if Path(src).name.startswith(".agent-new-"):
+                raise OSError(5, "injected crash")
+            return real_replace(src, dst, *args, **kwargs)
+
+        messages = []
+        with patch.object(AGENT.os, "replace", side_effect=crash_on_new_file):
+            code, output = self.run_agent(
+                sender=lambda message, env, timeout: messages.append(message)
+            )
+        self.assertEqual(code, 0)
+        self.assertEqual(self.read_state()["last_result"], "verified")
+        self.assertEqual(harness.in_place_agent.read_bytes(), harness.agent_source)
+        self.assertNotEqual(harness.in_place_sha256(), new_sha)
+        self.assertEqual(self.in_place_directory_names(), ["release_pull_agent.py"])
+        lines = self.self_update_lines(output)
+        self.assertEqual(len(lines), 1, output)
+        self.assertIn("结果码=agent_self_update_failed", lines[0])
+        self.assertIn("reason=write_failed", lines[0])
+        self.assertEqual(len(messages), 1)
+        self.assertIn("agent_self_update_failed", messages[0])
+
+    def test_crash_while_writing_backup_leaves_old_agent_and_no_backup(self):
+        """写旧副本那一步崩溃（先副本、后换入）：在位文件仍是旧文件、目录里没有 .bak-* 也没有临时残留，
+        failed 审计 + 告警一次，部署结果不变。"""
+        harness = self.harness
+        harness.write_config(notify_on_success=False)
+        new_sha = harness.install_bundle_agent(harness.agent_with_version(AGENT.AGENT_VERSION + 1))
+        harness.state_for_old()
+        real_replace = os.replace
+
+        def crash_on_backup(src, dst, *args, **kwargs):
+            if Path(src).name.startswith(".agent-backup-"):
+                raise OSError(5, "injected crash")
+            return real_replace(src, dst, *args, **kwargs)
+
+        messages = []
+        with patch.object(AGENT.os, "replace", side_effect=crash_on_backup):
+            code, output = self.run_agent(
+                sender=lambda message, env, timeout: messages.append(message)
+            )
+        self.assertEqual(code, 0)
+        self.assertEqual(self.read_state()["last_result"], "verified")
+        self.assertEqual(harness.in_place_agent.read_bytes(), harness.agent_source)
+        self.assertNotEqual(harness.in_place_sha256(), new_sha)
+        self.assertEqual(harness.backups(), [])
+        self.assertEqual(self.in_place_directory_names(), ["release_pull_agent.py"])
+        lines = self.self_update_lines(output)
+        self.assertEqual(len(lines), 1, output)
+        self.assertIn("结果码=agent_self_update_failed", lines[0])
+        self.assertIn("reason=write_failed", lines[0])
+        self.assertEqual(len(messages), 1)
+        self.assertIn("agent_self_update_failed", messages[0])
+
+    def test_group_or_other_writable_in_place_directory_is_rejected(self):
+        """在位目录可由组 / 其他主体写入：rejected（reason=in_place_directory_permissions）、不替换、告警一次。"""
+        harness = self.harness
+        harness.write_config(notify_on_success=False)
+        harness.set_env(DEPLOY_STATUS="running")
+        old_sha = harness.in_place_sha256()
+        harness.install_bundle_agent(harness.agent_with_version(AGENT.AGENT_VERSION + 1))
+        harness.state_for_old()
+        directory = harness.in_place_agent.parent
+        self.addCleanup(directory.chmod, 0o755)
+        for mode in (0o775, 0o707):
+            with self.subTest(mode=oct(mode)):
+                directory.chmod(mode)
+                messages = []
+                code, output = self.run_agent(
+                    sender=lambda message, env, timeout: messages.append(message)
+                )
+                self.assertEqual(code, 0)
+                self.assertEqual(self.read_state()["last_result"], "running")
+                self.assertEqual(harness.in_place_sha256(), old_sha)
+                self.assertEqual(harness.backups(), [])
+                self.assertEqual(self.in_place_directory_names(), ["release_pull_agent.py"])
+                lines = self.self_update_lines(output)
+                self.assertEqual(len(lines), 1, output)
+                self.assertIn("结果码=agent_self_update_rejected", lines[0])
+                self.assertIn("reason=in_place_directory_permissions", lines[0])
+                # 同 tag 去重：第一种权限位那一轮发出，第二种权限位那一轮被去重。
+                self.assertEqual(len(messages), 1 if mode == 0o775 else 0, messages)
+                if mode == 0o775:
+                    self.assertIn("agent_self_update_rejected", messages[0])
+        # 权限位修回后同一轮次即替换：目录判定是唯一阻碍。
+        directory.chmod(0o755)
+        code, output = self.run_agent(sender=lambda message, env, timeout: None)
+        self.assertEqual(code, 0)
+        self.assertNotEqual(harness.in_place_sha256(), old_sha)
+        self.assertIn("结果码=agent_self_update_replaced", output)
+
+    def test_readback_mismatch_after_replace_restores_old_agent(self):
+        """换入「成功」但回读摘要不等于候选（写坏）：把旧副本换回，按 failed 上报、告警一次。"""
+        harness = self.harness
+        harness.write_config(notify_on_success=False)
+        harness.install_bundle_agent(harness.agent_with_version(AGENT.AGENT_VERSION + 1))
+        harness.state_for_old()
+        real_replace = os.replace
+
+        def torn_write(src, dst, *args, **kwargs):
+            if Path(src).name.startswith(".agent-new-"):
+                Path(src).unlink()
+                Path(dst).write_bytes(b"torn write\n")
+                return None
+            return real_replace(src, dst, *args, **kwargs)
+
+        messages = []
+        with patch.object(AGENT.os, "replace", side_effect=torn_write):
+            code, output = self.run_agent(
+                sender=lambda message, env, timeout: messages.append(message)
+            )
+        self.assertEqual(code, 0)
+        self.assertEqual(self.read_state()["last_result"], "verified")
+        self.assertEqual(harness.in_place_agent.read_bytes(), harness.agent_source)
+        self.assertEqual(self.in_place_directory_names(), ["release_pull_agent.py"])
+        lines = self.self_update_lines(output)
+        self.assertEqual(len(lines), 1, output)
+        self.assertIn("结果码=agent_self_update_failed", lines[0])
+        self.assertIn("reason=readback_mismatch", lines[0])
+        self.assertEqual(len(messages), 1)
+        self.assertIn("agent_self_update_failed", messages[0])
+
+    def test_candidate_not_newer_than_in_place_is_skipped_without_alert(self):
+        """摘要不同但标记不高于在位（相同 / 更低）：不替换、不告警，只审计 skipped_not_newer。"""
+        harness = self.harness
+        old_sha = harness.in_place_sha256()
+        cases = {
+            "same_marker": harness.agent_source + b"\n# trailing change without marker bump\n",
+            "lower_marker": harness.agent_with_version(AGENT.AGENT_VERSION - 1),
+        }
+        for name, candidate in cases.items():
+            with self.subTest(name=name):
+                new_sha = harness.install_bundle_agent(candidate)
+                self.assertNotEqual(new_sha, old_sha)
+                harness.state_for_old()
+                messages = []
+                code, output = self.run_agent(
+                    sender=lambda message, env, timeout: messages.append(message)
+                )
+                self.assertEqual(code, 0)
+                self.assertEqual(self.read_state()["last_result"], "verified")
+                self.assertEqual(harness.in_place_sha256(), old_sha)
+                self.assertEqual(harness.backups(), [])
+                lines = self.self_update_lines(output)
+                self.assertEqual(len(lines), 1, output)
+                self.assertIn("结果码=agent_self_update_skipped_not_newer", lines[0])
+                self.assertIn(f"in_place_version={AGENT.AGENT_VERSION}", lines[0])
+                self.assertEqual(self.self_update_alerts(messages), [])
+
+    def test_identical_candidate_is_silent_and_disabled_switch_skips_everything(self):
+        """摘要相同只记 unchanged；开关关闭时整段跳过、只记 disabled——两者都不告警、不写文件。"""
+        harness = self.harness
+        old_sha = harness.in_place_sha256()
+        harness.state_for_old()
+        messages = []
+        code, output = self.run_agent(sender=lambda message, env, timeout: messages.append(message))
+        self.assertEqual(code, 0)
+        lines = self.self_update_lines(output)
+        self.assertEqual(len(lines), 1, output)
+        self.assertIn("结果码=agent_self_update_unchanged", lines[0])
+        self.assertEqual(self.self_update_alerts(messages), [])
+        # 关闭开关后换成更高标记的候选：仍不替换。
+        harness.write_config(agent_self_update=False)
+        harness.install_bundle_agent(harness.agent_with_version(AGENT.AGENT_VERSION + 1))
+        harness.state_for_old()
+        code, output = self.run_agent(sender=lambda message, env, timeout: messages.append(message))
+        self.assertEqual(code, 0)
+        self.assertEqual(self.read_state()["last_result"], "verified")
+        self.assertEqual(harness.in_place_sha256(), old_sha)
+        self.assertEqual(harness.backups(), [])
+        lines = self.self_update_lines(output)
+        self.assertEqual(len(lines), 1, output)
+        self.assertIn("结果码=agent_self_update_disabled", lines[0])
+        self.assertEqual(self.self_update_alerts(messages), [])
+
+    def test_self_update_switch_is_optional_and_must_be_bool(self):
+        """旧配置（不含新键）必须仍通过校验；键在场时只接受布尔值，其它值以 config_shape 拒绝。"""
+        base = dict(self.harness.config)
+        self.assertNotIn("agent_self_update", base)
+        self.assertIs(AGENT.validate_config(base), base)
+        for value in (True, False):
+            with self.subTest(value=value):
+                config = dict(base, agent_self_update=value)
+                self.assertIs(AGENT.validate_config(config), config)
+        for value in ("yes", 1, 0, None, [True]):
+            with self.subTest(value=value):
+                with self.assertRaises(AGENT.AgentError) as caught:
+                    AGENT.validate_config(dict(base, agent_self_update=value))
+                self.assertEqual(caught.exception.code, "config_shape")
+        # 必需键一个都不能少，未登记的额外键仍拒绝。
+        with self.assertRaises(AGENT.AgentError):
+            AGENT.validate_config(dict(base, agent_self_updatee=True))
+
+    def test_self_update_audit_and_alerts_never_leak_secrets_or_host_paths(self):
+        """rejected / failed 两种告警正文与审计行不含凭据哨兵，也不含在位目录以内的任何主机路径。"""
+        harness = self.harness
+        harness.write_config(notify_on_success=False)
+        newer = harness.agent_with_version(AGENT.AGENT_VERSION + 1)
+        real_replace = os.replace
+
+        def crash_on_new_file(src, dst, *args, **kwargs):
+            if Path(src).name.startswith(".agent-new-"):
+                raise OSError(5, "injected crash")
+            return real_replace(src, dst, *args, **kwargs)
+
+        for result in ("agent_self_update_rejected", "agent_self_update_failed"):
+            with self.subTest(result=result):
+                if result == "agent_self_update_rejected":
+                    harness.install_bundle_agent(newer, indexed_sha256="f" * 64)
+                    context = contextlib.nullcontext()
+                else:
+                    harness.install_bundle_agent(newer)
+                    context = patch.object(AGENT.os, "replace", side_effect=crash_on_new_file)
+                harness.state_for_old()
+                messages = []
+                with (
+                    patch.dict(os.environ, {"SECRET_SENTINEL": harness.sentinel}, clear=False),
+                    context,
+                ):
+                    code, output = self.run_agent(
+                        sender=lambda message, env, timeout: messages.append(message)
+                    )
+                self.assertEqual(code, 0)
+                self.assertEqual(len(messages), 1)
+                self.assertIn(result, messages[0])
+                joined = output + "\n" + "\n".join(messages)
+                self.assertNotIn(harness.sentinel, joined)
+                self.assertNotIn(str(harness.root), joined)
+                self.assertNotIn(str(harness.in_place_agent.parent), joined)
+                self.assertNotIn(harness.sentinel, (harness.state / "pull-agent.json").read_text())
+                self.assertEqual(harness.in_place_agent.read_bytes(), harness.agent_source)
+
+    def test_symlinked_in_place_agent_is_never_replaced(self):
+        """在位路径是符号链接：不替换、rejected 审计（reason=in_place_symlink）、告警一次，目标文件不动。"""
+        harness = self.harness
+        harness.write_config(notify_on_success=False)
+        real = harness.in_place_agent.with_name("real_agent.py")
+        real.write_bytes(harness.agent_source)
+        harness.in_place_agent.unlink()
+        harness.in_place_agent.symlink_to(real.name)
+        harness.install_bundle_agent(harness.agent_with_version(AGENT.AGENT_VERSION + 1))
+        harness.state_for_old()
+        messages = []
+        code, output = self.run_agent(sender=lambda message, env, timeout: messages.append(message))
+        self.assertEqual(code, 0)
+        self.assertEqual(self.read_state()["last_result"], "verified")
+        self.assertTrue(harness.in_place_agent.is_symlink())
+        self.assertEqual(real.read_bytes(), harness.agent_source)
+        self.assertEqual(harness.backups(), [])
+        lines = self.self_update_lines(output)
+        self.assertEqual(len(lines), 1, output)
+        self.assertIn("结果码=agent_self_update_rejected", lines[0])
+        self.assertIn("reason=in_place_symlink", lines[0])
+        self.assertEqual(len(messages), 1)
+        self.assertIn("agent_self_update_rejected", messages[0])
+
+    def test_self_update_alert_delivery_failure_does_not_change_round_result(self):
+        """自替换告警投递失败：只记日志、本轮结论不变，去重记录不写成已发，下一轮重试。"""
+        harness = self.harness
+        harness.write_config(notify_on_success=False)
+        harness.set_env(DEPLOY_STATUS="running")
+        harness.install_bundle_agent(
+            harness.agent_with_version(AGENT.AGENT_VERSION + 1), indexed_sha256="f" * 64
+        )
+        harness.state_for_old()
+        attempts = []
+
+        def flaky(message, env, timeout):
+            attempts.append(message)
+            if len(attempts) == 1:
+                raise RuntimeError("network failure")
+
+        code, output = self.run_agent(sender=flaky)
+        self.assertEqual(code, 0)
+        self.assertEqual(self.read_state()["last_result"], "running")
+        self.assertIn("阶段=alert 结果码=alert_delivery_failed", output)
+        key = f"agent_self_update_rejected:{harness.target_tag}"
+        self.assertFalse(self.read_state()["alerts"][key]["sent"])
+        code, output = self.run_agent(sender=flaky)
+        self.assertEqual(code, 0)
+        self.assertEqual(len(attempts), 2)
+        self.assertIn("阶段=alert 结果码=sent", output)
+        self.assertTrue(self.read_state()["alerts"][key]["sent"])
+
+    def test_agent_version_marker_is_read_from_source_text_only(self):
+        """版本标记只按整行正则从文本读出：没有标记、读不到都视为 0，不导入也不执行文件。"""
+        harness = self.harness
+        self.assertEqual(AGENT.parse_agent_version(b"x = 1\nAGENT_VERSION = 7\n"), 7)
+        self.assertEqual(
+            AGENT.parse_agent_version(b"X_AGENT_VERSION = 9\nAGENT_VERSION = 3  # x\n"), 0
+        )
+        self.assertEqual(AGENT.parse_agent_version(b"import os; os.system('x')\n"), 0)
+        self.assertEqual(AGENT.parse_agent_version(MODULE_PATH.read_bytes()), AGENT.AGENT_VERSION)
+        self.assertGreaterEqual(AGENT.AGENT_VERSION, 1)
+        probe = harness.root / "probe.py"
+        probe.write_bytes(b"raise SystemExit(99)\n")
+        self.assertEqual(AGENT.read_agent_version(probe), 0)
+        self.assertEqual(AGENT.read_agent_version(harness.root / "missing.py"), 0)
+        self.assertEqual(AGENT.read_agent_version(harness.in_place_agent), AGENT.AGENT_VERSION)
+        # 在位代理没有标记（今天预发 / 生产在跑的那种）时视为 0：带标记的候选可以替换它。
+        harness.state_for_old()
+        without_marker = harness.agent_source.replace(
+            f"\nAGENT_VERSION = {AGENT.AGENT_VERSION}\n".encode(), b"\n", 1
+        )
+        self.assertEqual(AGENT.parse_agent_version(without_marker), 0)
+        harness.in_place_agent.write_bytes(without_marker)
+        code, output = self.run_agent(sender=lambda message, env, timeout: None)
+        self.assertEqual(code, 0)
+        self.assertEqual(harness.in_place_agent.read_bytes(), harness.agent_source)
+        lines = self.self_update_lines(output)
+        self.assertEqual(len(lines), 1, output)
+        self.assertIn("结果码=agent_self_update_replaced", lines[0])
+        self.assertIn("in_place_version=0", lines[0])
 
     def test_systemd_units_shape(self):
         service = (ROOT / "deploy/monitoring-units/lingxi-release-pull.service").read_text()

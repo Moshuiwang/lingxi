@@ -6,7 +6,18 @@
 
 ## [Unreleased]
 
-2.5.2 开发中（Trace [#843](https://github.com/Moshuiwang/lingxi/issues/843)）：由拉取代理 + 部署器发布的补丁版，装入 [#784](https://github.com/Moshuiwang/lingxi/issues/784) / [#834](https://github.com/Moshuiwang/lingxi/issues/834) / [#836](https://github.com/Moshuiwang/lingxi/issues/836) / [#837](https://github.com/Moshuiwang/lingxi/issues/837) 四处改动；本节随批次合入逐条追加。
+补丁版候选（Trace [#859](https://github.com/Moshuiwang/lingxi/issues/859) 发布1，目标 `v2.5.3`，不含数据库迁移）：主机侧拉取代理与告警、CI 依赖漏洞扫描四处改动。
+
+### Added
+
+- **拉取代理随控制包自升级，代理侧修法不再需要人工重装**：代理每轮装好新控制包后，用包内已核对的 `deploy/release_pull_agent.py`（版本目录内索引摘要等于发布清单、文件摘要等于索引条目——与部署器同一条摘要链，不另设签名）替换自身实际运行的那份文件：只在候选摘要不同且版本标记严格高于在位时替换（只升不降），同目录先留旧文件 `.bak-<旧摘要前 8 位>` 副本再原子换入、换入后回读摘要核对，本轮继续以旧代码跑完、下一轮由新代理运行并在每轮首行日志标出运行中的版本标记；候选不在摘要链上或换入失败各告警一次（同键去重），都不影响本轮部署结论；可选配置键 `agent_self_update=false` 可关闭，既有配置文件不必改动。管理员在引导安装时只装一次代理程序文件，此后不再重装（Issue [#815](https://github.com/Moshuiwang/lingxi/issues/815)）。
+- **拉取代理停摆有人被通知**：宿主健康巡检新增对拉取代理 systemd 单元的检查项，单元起不来、退出或长时间没有新一轮留痕时向管理群告警，与现有告警同一去重口径（Issue [#838](https://github.com/Moshuiwang/lingxi/issues/838)）。
+- **只读 PAT 到期前 14 天起每天提醒一次**：拉取代理读到机器身份 PAT 的到期日进入 14 天窗口后，每天在管理群发一条提醒（与现有告警同一去重口径），到期后仍按现状 `unknown` + 告警；正文不含 PAT 值（Issue [#856](https://github.com/Moshuiwang/lingxi/issues/856)）。
+- **CI 多一道依赖漏洞扫描**：对实际解析出来的依赖集合查已公布的漏洞，高危判红、其余只告警；扫描判红需修依赖时另建工作项，不在本版内修（Issue [#839](https://github.com/Moshuiwang/lingxi/issues/839)）。
+
+## [2.5.2] - 2026-09-18
+
+补丁版（Trace [#843](https://github.com/Moshuiwang/lingxi/issues/843)）：候选 `v2.5.2-rc.107` 经预发验收后由 Release Promotion 发布为正式版，生产由拉取代理 + 部署器无人值守升级（停机数十秒），产品负责人一次真实问数通过（L5）；装入 [#784](https://github.com/Moshuiwang/lingxi/issues/784) / [#834](https://github.com/Moshuiwang/lingxi/issues/834) / [#836](https://github.com/Moshuiwang/lingxi/issues/836) / [#837](https://github.com/Moshuiwang/lingxi/issues/837) 四处改动。
 
 ### Changed
 

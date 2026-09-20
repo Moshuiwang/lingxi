@@ -97,6 +97,20 @@ cron 调用间隔（1-2 分钟）与单轮最坏耗时（三个容器 × `docker
 这三项检查只读取本机数据（`/proc`、`shutil.disk_usage`、采样文件 mtime），不
 依赖 `scripts/ops/monitoring/` 里任何脚本正在运行——即使采样管线整体挂了，
 "采样文件停更"这条判据本身依然能独立算出来并告警,这正是它存在的意义。
+
+# 拉取代理单元检查（默认开启，``--disable-release-pull-check`` 关闭）
+
+拉取代理（`lingxi-release-pull.timer` 每五分钟触发一次 `.service`）是无人值守升级
+的唯一入口，它自己停摆时没有任何进程会替它出声。本检查挂在阈值副线上（同一份
+`--threshold-state-file` 去重记忆、同一套告警 / 恢复语义），只读任何用户都能查的
+systemd 属性（`systemctl show`），**不读代理状态账**：代理以 root 运行，状态账在
+root 0700 目录里，本脚本按部署用户运行读不到。三个判据各自独立去重：timer 不是
+`active`；最近一次留痕（timer 上一次触发与 service 上一次结束二者取新）距今超过
+`--release-pull-stale-minutes`（默认 15 分钟 = 三个轮询周期）；上一轮 `Result`
+不是 `success` 且退出码非零。判的是**触发**过期而不是完成过期：单轮可长达一小时
+（含部署观察），service 仍在运行时不判过期、也不判上一轮失败。任何一步读不到
+（`systemctl` 不存在 / 非零退出 / 属性缺失或解析不了）都以「未知」形态告警一次
+并同样去重，不得静默当作正常。本检查不改变容器主线的退出码语义。
 """
 
 from __future__ import annotations
@@ -107,6 +121,7 @@ import fcntl
 import json
 import logging
 import os
+import re
 import shutil
 import socket
 import subprocess
@@ -145,6 +160,12 @@ DEFAULT_DISK_THRESHOLD_PERCENT = 85.0
 DEFAULT_LOAD_MULTIPLIER = 2.0
 DEFAULT_LOAD_CONSECUTIVE = 3
 DEFAULT_STALENESS_THRESHOLD_MINUTES = 10.0
+
+#: 拉取代理单元检查：单元基名（派生 `.timer` / `.service`）与留痕过期阈值。15 分钟
+#: 是 timer 五分钟周期的三倍——一次错过可能只是 AccuracySec 抖动，连续三个周期没有
+#: 任何留痕才算停摆。
+DEFAULT_RELEASE_PULL_UNIT = "lingxi-release-pull"
+DEFAULT_RELEASE_PULL_STALE_MINUTES = 15.0
 
 REQUIRED_ENV_KEYS: tuple[str, ...] = (
     "LINGXI_FEISHU_APP_ID",
@@ -356,16 +377,174 @@ def classify_threshold(
     return ACTION_NONE, ThresholdState(alerting=False, consecutive=0)
 
 
-def render_threshold_message(action: str, *, label: str, detail: str, host: str, now: str) -> str:
+def render_threshold_message(
+    action: str, *, label: str, detail: str, host: str, now: str, category: str = "资源监控"
+) -> str:
     """渲染阈值告警/恢复的纯文本消息，保持"简短警报一句话"原则（issue #410 目标
     形态）：一个判据名 + 一句话细节，不像容器告警那样需要从取值域里查文案。
+
+    `category` 只决定首行的分类词：资源三项沿用「资源监控」，拉取代理单元检查用
+    「宿主监控」——它判的是宿主上一个 systemd 单元活不活，不是资源水位。
     """
 
     if action == ACTION_ALERT:
-        return f"[BI Plus 资源监控] 告警\n{label}：{detail}\n主机：{host}\n时间：{now}"
+        return f"[BI Plus {category}] 告警\n{label}：{detail}\n主机：{host}\n时间：{now}"
     if action == ACTION_RECOVERY:
-        return f"[BI Plus 资源监控] 恢复\n{label}：已恢复正常\n主机：{host}\n时间：{now}"
+        return f"[BI Plus {category}] 恢复\n{label}：已恢复正常\n主机：{host}\n时间：{now}"
     raise ValueError("仅 alert / recovery 两种动作需要渲染文本")
+
+
+# ---------------------------------------------------------------------------
+# 拉取代理单元检查的纯逻辑：从 systemd 属性提炼观察值、按三个判据 + 未知形态产出
+# 阈值检查项。全部不做进程调用，可以在没有 systemd 的机器上直接单测。
+# ---------------------------------------------------------------------------
+
+RELEASE_PULL_TIMER_INACTIVE = "release_pull_timer_inactive"
+RELEASE_PULL_TRIGGER_STALE = "release_pull_trigger_stale"
+RELEASE_PULL_LAST_RUN_FAILED = "release_pull_last_run_failed"
+RELEASE_PULL_UNKNOWN = "release_pull_unknown"
+
+_RELEASE_PULL_LABEL: Mapping[str, str] = {
+    RELEASE_PULL_TIMER_INACTIVE: "拉取代理定时器未激活",
+    RELEASE_PULL_TRIGGER_STALE: "拉取代理留痕过期",
+    RELEASE_PULL_LAST_RUN_FAILED: "拉取代理上一轮失败",
+    RELEASE_PULL_UNKNOWN: "拉取代理状态未知",
+}
+
+#: 拉取代理四个键的消息分类词；其余阈值键沿用渲染函数的默认值。
+_THRESHOLD_CATEGORY: Mapping[str, str] = dict.fromkeys(_RELEASE_PULL_LABEL, "宿主监控")
+
+#: oneshot 服务执行中是 `activating`；其余几个是保守起见一并视为"仍在跑"的状态。
+_SERVICE_RUNNING_STATES = frozenset({"activating", "active", "reloading", "deactivating"})
+
+#: `systemctl show` 在 `TZ=UTC` 下打印的时间戳形如 `Sun 2026-09-20 06:40:04 UTC`；
+#: 星期缩写允许缺省，秒后允许小数。
+_SYSTEMD_TIMESTAMP = re.compile(
+    r"^(?:[A-Za-z]{3}\s+)?(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})(?:\.\d+)?\s+UTC$"
+)
+_TIMER_PROPERTIES = ("ActiveState", "LoadState", "LastTriggerUSec")
+_SERVICE_PROPERTIES = ("ActiveState", "Result", "ExecMainStatus", "ExecMainExitTimestamp")
+
+
+@dataclass(frozen=True)
+class ReleasePullObservation:
+    """判定拉取代理单元所需的最小事实集合，全部来自任何用户可读的 systemd 属性。"""
+
+    unit: str
+    timer_active_state: str
+    timer_load_state: str
+    last_trigger: datetime | None
+    service_active_state: str
+    service_result: str
+    service_exit_status: int
+    service_exit_at: datetime | None
+
+
+def parse_systemd_timestamp(value: str | None) -> datetime | None:
+    """把 `systemctl show`（`TZ=UTC`）的时间戳文本转成带时区的 datetime。
+
+    空串、`n/a`、`0` 与属性整行缺失（systemd 对未设置的时间戳就是这么打印的）都
+    返回 ``None`` 表示"尚无此事件"；非空却对不上格式的文本抛 ``ValueError``，交由
+    调用方按「未知」形态处理，不猜测。
+    """
+
+    text = (value or "").strip()
+    if text in ("", "n/a", "0"):
+        return None
+    match = _SYSTEMD_TIMESTAMP.match(text)
+    if match is None:
+        raise ValueError("systemd_timestamp_unparseable")
+    return datetime.strptime(match.group(1), "%Y-%m-%d %H:%M:%S").replace(tzinfo=UTC)
+
+
+def _format_utc(moment: datetime | None) -> str:
+    if moment is None:
+        return "n/a"
+    return moment.astimezone(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def release_pull_trace_at(observation: ReleasePullObservation) -> datetime | None:
+    """最近一次留痕时刻 = timer 上一次触发与 service 上一次结束二者取新。
+
+    只看触发时刻会在一轮长部署刚结束、下一个五分钟刻度还没到的窗口里把"刚跑完"
+    误判成"过期"；把 service 结束时刻并进来，这个窗口就消失了。
+    """
+
+    candidates = [t for t in (observation.last_trigger, observation.service_exit_at) if t]
+    return max(candidates) if candidates else None
+
+
+def describe_release_pull(
+    observation: ReleasePullObservation, *, now: datetime, stale_minutes: float
+) -> str:
+    """告警正文里的一句话事实：单元名、两个单元的状态、上一次触发（UTC）、上一轮结果、
+    留痕年龄与阈值。只含 systemd 属性取值，不含路径、命令与日志原文。
+    """
+
+    timer_state = observation.timer_active_state
+    if observation.timer_load_state not in ("", "loaded"):
+        timer_state = f"{timer_state}（{observation.timer_load_state}）"
+    trace_at = release_pull_trace_at(observation)
+    age = "n/a" if trace_at is None else f"{(now - trace_at).total_seconds() / 60:.1f} 分钟前"
+    return (
+        f"单元 {observation.unit}：timer={timer_state}，service={observation.service_active_state}，"
+        f"上一次触发 {_format_utc(observation.last_trigger)}，"
+        f"上一轮 {observation.service_result}/{observation.service_exit_status}，"
+        f"留痕 {age}（阈值 {stale_minutes:.0f} 分钟）"
+    )
+
+
+def judge_release_pull(
+    observation: ReleasePullObservation, *, now: datetime, stale_minutes: float
+) -> list[tuple[str, str, bool, str, int]]:
+    """三个判据各自独立成阈值检查项 `(key, label, breached, detail, consecutive_required)`。
+
+    - timer 不是 `active` → 定时器未激活；此时不再判留痕过期（停摆的根因已经报过，
+      不为同一件事再发第二条）。
+    - service 正在运行 → 留痕按未过期处理（一轮已经开始就是最新留痕，先前的过期
+      告警随之恢复）；上一轮失败这一轮不出结论（运行中 systemd 会把 `Result` /
+      退出码重置为成功，要等它跑完）。
+    - 从未触发也从未结束（两个时间戳都没有）按过期处理。
+    """
+
+    detail = describe_release_pull(observation, now=now, stale_minutes=stale_minutes)
+    timer_active = observation.timer_active_state == "active"
+    running = observation.service_active_state in _SERVICE_RUNNING_STATES
+    checks = [
+        (
+            RELEASE_PULL_TIMER_INACTIVE,
+            _RELEASE_PULL_LABEL[RELEASE_PULL_TIMER_INACTIVE],
+            not timer_active,
+            detail,
+            1,
+        )
+    ]
+    if timer_active:
+        trace_at = release_pull_trace_at(observation)
+        stale = not running and (
+            trace_at is None or (now - trace_at) > timedelta(minutes=stale_minutes)
+        )
+        checks.append(
+            (
+                RELEASE_PULL_TRIGGER_STALE,
+                _RELEASE_PULL_LABEL[RELEASE_PULL_TRIGGER_STALE],
+                stale,
+                detail,
+                1,
+            )
+        )
+    if not running:
+        failed = observation.service_result != "success" and observation.service_exit_status != 0
+        checks.append(
+            (
+                RELEASE_PULL_LAST_RUN_FAILED,
+                _RELEASE_PULL_LABEL[RELEASE_PULL_LAST_RUN_FAILED],
+                failed,
+                detail,
+                1,
+            )
+        )
+    return checks
 
 
 # ---------------------------------------------------------------------------
@@ -615,6 +794,89 @@ def read_sample_age_seconds(
     return now.timestamp() - max(mtimes)
 
 
+def _systemctl_show(
+    unit: str, properties: Sequence[str], *, systemctl_bin: str, timeout_seconds: float
+) -> dict[str, str]:
+    """`systemctl show --all -p … <unit>` 读成 `{属性: 文本}`。
+
+    `show` 对已停止、甚至不存在（`LoadState=not-found`）的单元都以 0 退出并照常打印
+    属性，非零退出只剩"问不到 systemd 本身"这一种含义——与 `is-active` 不同，后者
+    对非 active 单元本来就非零退出，无法当作读取失败的信号。`--all` 让未设置的时间
+    戳属性也打印出来（值为空），否则旧版 systemd 会整行省略。子进程固定 `TZ=UTC`，
+    时间戳文本才有确定的时区可解析。错误信息只带类别，不带可执行文件路径。
+    """
+
+    argv = [systemctl_bin, "--no-pager", "show", "--all", "--property", ",".join(properties), unit]
+    env = {**os.environ, "TZ": "UTC", "LC_ALL": "C"}
+    try:
+        proc = subprocess.run(
+            argv, capture_output=True, text=True, timeout=timeout_seconds, check=False, env=env
+        )
+    except FileNotFoundError as error:
+        raise HostMonitorError("systemctl_not_found") from error
+    except subprocess.TimeoutExpired as error:
+        raise HostMonitorError("systemctl_timeout") from error
+    if proc.returncode != 0:
+        raise HostMonitorError(f"systemctl_exit_{proc.returncode}")
+    result: dict[str, str] = {}
+    for line in proc.stdout.splitlines():
+        key, separator, value = line.partition("=")
+        if separator:
+            result[key.strip()] = value.strip()
+    return result
+
+
+def _required_property(properties: Mapping[str, str], name: str) -> str:
+    value = properties.get(name, "")
+    if not value:
+        raise HostMonitorError(f"property_missing:{name}")
+    return value
+
+
+def _timestamp_property(properties: Mapping[str, str], name: str) -> datetime | None:
+    try:
+        return parse_systemd_timestamp(properties.get(name))
+    except ValueError as error:
+        raise HostMonitorError(f"property_unparseable:{name}") from error
+
+
+def read_release_pull_observation(
+    unit: str, *, systemctl_bin: str = "systemctl", timeout_seconds: float = DEFAULT_TIMEOUT_SECONDS
+) -> ReleasePullObservation:
+    """两次 `systemctl show`（timer 与 service）拼成一份观察值；任何一步读不到都抛
+    `HostMonitorError`，由调用方以「未知」形态告警，绝不把读不到当成正常。
+    """
+
+    base = unit.removesuffix(".timer").removesuffix(".service")
+    timer = _systemctl_show(
+        f"{base}.timer",
+        _TIMER_PROPERTIES,
+        systemctl_bin=systemctl_bin,
+        timeout_seconds=timeout_seconds,
+    )
+    service = _systemctl_show(
+        f"{base}.service",
+        _SERVICE_PROPERTIES,
+        systemctl_bin=systemctl_bin,
+        timeout_seconds=timeout_seconds,
+    )
+    exit_status_text = _required_property(service, "ExecMainStatus")
+    try:
+        exit_status = int(exit_status_text)
+    except ValueError as error:
+        raise HostMonitorError("property_unparseable:ExecMainStatus") from error
+    return ReleasePullObservation(
+        unit=base,
+        timer_active_state=_required_property(timer, "ActiveState"),
+        timer_load_state=timer.get("LoadState", ""),
+        last_trigger=_timestamp_property(timer, "LastTriggerUSec"),
+        service_active_state=_required_property(service, "ActiveState"),
+        service_result=_required_property(service, "Result"),
+        service_exit_status=exit_status,
+        service_exit_at=_timestamp_property(service, "ExecMainExitTimestamp"),
+    )
+
+
 def _feishu_tenant_access_token(
     base_url: str, app_id: str, app_secret: str, *, timeout_seconds: float
 ) -> str:
@@ -817,6 +1079,26 @@ def build_arg_parser() -> argparse.ArgumentParser:
         default=DEFAULT_STALENESS_THRESHOLD_MINUTES,
         help="resource/db_business 采样文件超过多少分钟没有新样本视为停更",
     )
+    parser.add_argument(
+        "--disable-release-pull-check",
+        action="store_true",
+        help="关闭拉取代理单元检查（默认开启：timer 非 active / 留痕过期 / 上一轮失败 / 读不到"
+        "以未知形态告警，去重状态与阈值检查共用 --threshold-state-file）",
+    )
+    parser.add_argument(
+        "--release-pull-unit",
+        default=DEFAULT_RELEASE_PULL_UNIT,
+        help=f"拉取代理单元基名，派生 .timer / .service，默认 {DEFAULT_RELEASE_PULL_UNIT}",
+    )
+    parser.add_argument(
+        "--release-pull-stale-minutes",
+        type=float,
+        default=DEFAULT_RELEASE_PULL_STALE_MINUTES,
+        help="拉取代理最近一次留痕（timer 触发 / service 结束取新）超过多少分钟视为过期",
+    )
+    parser.add_argument(
+        "--systemctl-bin", default="systemctl", help="systemctl 可执行文件名或路径（测试注入用）"
+    )
     return parser
 
 
@@ -921,27 +1203,129 @@ def run(argv: Sequence[str] | None = None) -> int:
                 logger.error("状态文件写入失败，下一轮可能重复告警 error=%s", error)
                 fatal = True
 
-        if args.enable_resource_thresholds:
+        if args.enable_resource_thresholds or not args.disable_release_pull_check:
             _run_threshold_checks(args, credentials, host=host, logger=logger)
 
         return 2 if fatal else 0
 
 
+def _collect_release_pull_checks(
+    args: argparse.Namespace, logger: logging.Logger
+) -> list[tuple[str, str, bool, str, int]]:
+    """拉取代理单元检查项。读取失败不是"跳过"：以 `release_pull_unknown` 这一键
+    告警一次（同样去重、恢复后一条恢复通知），三个正常判据这一轮不出结论、状态
+    原样保留。读取成功时未知键以未触发形态参与，才能在恢复后发出恢复通知。
+    """
+
+    unit = args.release_pull_unit
+    unknown_label = _RELEASE_PULL_LABEL[RELEASE_PULL_UNKNOWN]
+    try:
+        observation = read_release_pull_observation(
+            unit, systemctl_bin=args.systemctl_bin, timeout_seconds=args.timeout_seconds
+        )
+    except HostMonitorError as error:
+        logger.warning("拉取代理单元状态读取失败，按未知形态告警 unit=%s error=%s", unit, error)
+        detail = f"单元 {unit}：读不到 systemd 属性（{error}）"
+        return [(RELEASE_PULL_UNKNOWN, unknown_label, True, detail, 1)]
+    checks: list[tuple[str, str, bool, str, int]] = [
+        (RELEASE_PULL_UNKNOWN, unknown_label, False, "", 1)
+    ]
+    checks.extend(
+        judge_release_pull(
+            observation, now=datetime.now(UTC), stale_minutes=args.release_pull_stale_minutes
+        )
+    )
+    return checks
+
+
 def _run_threshold_checks(
     args: argparse.Namespace, credentials: Mapping[str, str], *, host: str, logger: logging.Logger
 ) -> None:
-    """磁盘用量/系统负载/采样文件停更三项检查（S-RC20-410）。独立于容器检查的
-    去重状态与退出码——这三项目前设计为"尽力而为的补充信号"，采集失败（例如
-    挂载点不存在）只记警告并跳过那一项，不把整个 host_health_alert 调用判成
-    脚本自身故障（`fatal`/退出码 2 仍然只由容器检查那条主线决定）。
+    """阈值副线：磁盘用量/系统负载/采样文件停更三项（S-RC20-410）与拉取代理单元
+    检查共用一份去重状态文件与同一套发送/落盘流程。独立于容器检查的去重状态与
+    退出码——采集失败（例如挂载点不存在）只记警告并跳过那一项，不把整个
+    host_health_alert 调用判成脚本自身故障（`fatal`/退出码 2 仍然只由容器检查那条
+    主线决定）；拉取代理读取失败则按「未知」形态告警，见 `_collect_release_pull_checks`。
     """
 
     threshold_state_path = Path(args.threshold_state_file)
     threshold_states = load_threshold_state(threshold_state_path)
 
-    checks: list[
-        tuple[str, str, bool, str, int]
-    ] = []  # (key, label, breached, detail, consecutive_required)
+    checks: list[tuple[str, str, bool, str, int]] = []
+    if args.enable_resource_thresholds:
+        checks.extend(_collect_resource_checks(args, logger))
+    if not args.disable_release_pull_check:
+        checks.extend(_collect_release_pull_checks(args, logger))
+
+    threshold_changed = False
+    for key, label, breached, detail, consecutive_required in checks:
+        prior = threshold_states.get(key, ThresholdState())
+        action, next_state = classify_threshold(
+            breached, prior, consecutive_required=consecutive_required
+        )
+
+        if action == ACTION_NONE:
+            if not args.dry_run and next_state != prior:
+                threshold_states[key] = next_state
+                threshold_changed = True
+            continue
+
+        text = render_threshold_message(
+            action,
+            label=label,
+            detail=detail,
+            host=host,
+            now=_now_iso(),
+            category=_THRESHOLD_CATEGORY.get(key, "资源监控"),
+        )
+
+        if args.dry_run:
+            logger.info("dry-run，未真实发送 threshold=%s action=%s detail=%s", key, action, detail)
+            continue
+
+        try:
+            feishu_send_text(
+                base_url=args.base_url,
+                chat_id=credentials["chat_id"],
+                app_id=credentials["app_id"],
+                app_secret=credentials["app_secret"],
+                text=text,
+                timeout_seconds=args.timeout_seconds,
+            )
+        except Exception as error:  # noqa: BLE001 - 与容器告警发送路径同一条纪律
+            # 发送失败：保留旧的 `alerting` 记忆（下一轮达标时会重新尝试发送），
+            # 但连续计数本身是纯观测事实，不因为通知没发出去而回退到 0。
+            threshold_states[key] = ThresholdState(
+                alerting=prior.alerting, consecutive=next_state.consecutive
+            )
+            threshold_changed = True
+            logger.error(
+                "阈值告警发送失败，告警记忆未推进，下一轮达标会重试 threshold=%s action=%s error=%s",
+                key,
+                action,
+                error,
+            )
+            continue
+
+        threshold_states[key] = next_state
+        threshold_changed = True
+        logger.info("阈值告警已发送 threshold=%s action=%s detail=%s", key, action, detail)
+
+    if threshold_changed and not args.dry_run:
+        try:
+            save_threshold_state(threshold_state_path, threshold_states)
+        except HostMonitorError as error:
+            logger.error("阈值状态文件写入失败，下一轮可能重复告警 error=%s", error)
+
+
+def _collect_resource_checks(
+    args: argparse.Namespace, logger: logging.Logger
+) -> list[tuple[str, str, bool, str, int]]:
+    """磁盘用量/系统负载/采样文件停更三项的采集与判据，产出
+    `(key, label, breached, detail, consecutive_required)` 供阈值副线统一去重发送。
+    """
+
+    checks: list[tuple[str, str, bool, str, int]] = []
 
     try:
         disk_percent = read_disk_usage_percent(args.disk_mount)
@@ -989,60 +1373,7 @@ def _run_threshold_checks(
             detail = f"最近一次样本 {age_minutes:.1f} 分钟前（阈值 {threshold_minutes:.0f} 分钟）"
         checks.append((key, label, breached, detail, 1))
 
-    threshold_changed = False
-    for key, label, breached, detail, consecutive_required in checks:
-        prior = threshold_states.get(key, ThresholdState())
-        action, next_state = classify_threshold(
-            breached, prior, consecutive_required=consecutive_required
-        )
-
-        if action == ACTION_NONE:
-            if not args.dry_run and next_state != prior:
-                threshold_states[key] = next_state
-                threshold_changed = True
-            continue
-
-        text = render_threshold_message(
-            action, label=label, detail=detail, host=host, now=_now_iso()
-        )
-
-        if args.dry_run:
-            logger.info("dry-run，未真实发送 threshold=%s action=%s detail=%s", key, action, detail)
-            continue
-
-        try:
-            feishu_send_text(
-                base_url=args.base_url,
-                chat_id=credentials["chat_id"],
-                app_id=credentials["app_id"],
-                app_secret=credentials["app_secret"],
-                text=text,
-                timeout_seconds=args.timeout_seconds,
-            )
-        except Exception as error:  # noqa: BLE001 - 与容器告警发送路径同一条纪律
-            # 发送失败：保留旧的 `alerting` 记忆（下一轮达标时会重新尝试发送），
-            # 但连续计数本身是纯观测事实，不因为通知没发出去而回退到 0。
-            threshold_states[key] = ThresholdState(
-                alerting=prior.alerting, consecutive=next_state.consecutive
-            )
-            threshold_changed = True
-            logger.error(
-                "阈值告警发送失败，告警记忆未推进，下一轮达标会重试 threshold=%s action=%s error=%s",
-                key,
-                action,
-                error,
-            )
-            continue
-
-        threshold_states[key] = next_state
-        threshold_changed = True
-        logger.info("阈值告警已发送 threshold=%s action=%s detail=%s", key, action, detail)
-
-    if threshold_changed and not args.dry_run:
-        try:
-            save_threshold_state(threshold_state_path, threshold_states)
-        except HostMonitorError as error:
-            logger.error("阈值状态文件写入失败，下一轮可能重复告警 error=%s", error)
+    return checks
 
 
 def main() -> int:  # pragma: no cover - 由 __main__ 调用，逻辑全部委托给 run()
