@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import contextlib
+import datetime as dt
 import fcntl
 import hashlib
 import importlib.util
@@ -402,9 +403,28 @@ class PullHarness:
         )
         self._program_path.start()
         self.install_bundle_agent(self.agent_source)
+        # 令牌元数据缺省与 gh 包装脚本同目录；夹具默认远未到期，既有用例每轮只多一行 ok 审计。
+        self.pat_metadata = self.bin / "gh.env.meta"
+        self.write_pat_metadata("2099-01-01")
         self.set_releases([self._release(self.target_tag, environment == "stage")])
         self._write_env()
         self.set_running_containers(self.target_tag)
+
+    def write_pat_metadata(
+        self, expires_on: object, *, path: Path | None = None, mode: int = 0o600, **overrides
+    ) -> Path:
+        """按宿主脚本钉死的格式写 gh.env.meta；``overrides`` 用来制造 schema / token_kind 错。"""
+        if isinstance(expires_on, dt.date):
+            expires_on = expires_on.isoformat()
+        document = {
+            "schema": 1,
+            "token_kind": "github_pat",
+            "expires_on": expires_on,
+            "written_at": "2026-09-20T00:00:00Z",
+            "source": "s29_p1_host_install",
+        }
+        document.update(overrides)
+        return _json(path or self.pat_metadata, document, mode)
 
     def _write_env(self):
         self._old_env = os.environ.copy()
@@ -2824,6 +2844,360 @@ class AgentTests(unittest.TestCase):
         self.assertEqual(len(lines), 1, output)
         self.assertIn("结果码=agent_self_update_replaced", lines[0])
         self.assertIn("in_place_version=0", lines[0])
+
+    # ---- 个人访问令牌（PAT）到期告警 ----
+
+    def pat_lines(self, output: str) -> list[str]:
+        return [line for line in output.splitlines() if "阶段=pat_expiry" in line]
+
+    def pat_alerts(self, messages: list[str]) -> list[str]:
+        return [message for message in messages if "阶段：pat_expiry" in message]
+
+    def pat_alert_keys(self) -> list[str]:
+        return sorted(key for key in self.read_state()["alerts"] if key.startswith("pat_"))
+
+    def idle_in_place(self):
+        """最快的健康轮：状态账已证实目标在位、容器摘要相符，每轮只列 Release 并回读容器。"""
+        self.harness.state_for_verified_target()
+        self.harness.set_env(DOCKER_MODE="match")
+        self.harness.write_config(notify_on_success=False)
+
+    def run_on(self, day: dt.date, messages: list[str], *, sender=None) -> str:
+        with patch.object(AGENT, "_today", return_value=day):
+            code, output = self.run_agent(
+                sender=sender or (lambda message, env, timeout: messages.append(message))
+            )
+        self.assertEqual(code, 0, output)
+        return output
+
+    def test_pat_far_from_expiry_is_silent_and_audited_ok(self):
+        """距到期 30 天：零告警，审计一行 ok 带剩余天数，状态账记下四态之一与到期日。"""
+        self.idle_in_place()
+        today = dt.date(2026, 11, 1)
+        expires_on = today + dt.timedelta(days=30)
+        self.harness.write_pat_metadata(expires_on)
+        messages: list[str] = []
+        output = self.run_on(today, messages)
+        self.assertEqual(messages, [])
+        lines = self.pat_lines(output)
+        self.assertEqual(len(lines), 1, output)
+        self.assertIn(f"结果码=ok expires_on={expires_on.isoformat()} days_left=30", lines[0])
+        self.assertNotIn("阶段=alert", output)
+        state = self.read_state()
+        self.assertEqual(state["last_result"], "already_in_place")
+        self.assertEqual(state["pat_expiry"]["status"], "ok")
+        self.assertEqual(state["pat_expiry"]["expires_on"], expires_on.isoformat())
+        self.assertTrue(state["pat_expiry"]["checked_at"].endswith("Z"))
+        self.assertEqual(self.pat_alert_keys(), [])
+
+    def test_pat_within_window_alerts_once_per_day(self):
+        """距到期 10 天：首轮告警一次（正文含到期日与剩余天数），同日第二轮去重，次日再一条。"""
+        self.idle_in_place()
+        day_one = dt.date(2026, 12, 3)
+        expires_on = day_one + dt.timedelta(days=10)
+        self.harness.write_pat_metadata(expires_on)
+        messages: list[str] = []
+        first = self.run_on(day_one, messages)
+        self.assertEqual(len(messages), 1)
+        self.assertIn("结果码：pat_expiring", messages[0])
+        self.assertIn(f"到期日：{expires_on.isoformat()}", messages[0])
+        self.assertIn("剩余天数：10", messages[0])
+        self.assertIn("阶段：pat_expiry", messages[0])
+        self.assertIn("结果码=expiring", self.pat_lines(first)[0])
+        self.assertIn(f"阶段=alert 结果码=sent key=pat_expiring:{expires_on}", first)
+        second = self.run_on(day_one, messages)
+        self.assertEqual(len(messages), 1)
+        self.assertNotIn("结果码=sent", second)
+        self.assertIn("阶段=alert 结果码=deduplicated", second)
+        day_two = day_one + dt.timedelta(days=1)
+        third = self.run_on(day_two, messages)
+        self.assertEqual(len(messages), 2)
+        self.assertIn("剩余天数：9", messages[1])
+        self.assertIn(f"结果码=sent key=pat_expiring:{expires_on}:{day_two}", third)
+        # 状态账只留当天那一条按天记录，前一天的记录弹掉，不随天数增长。
+        self.assertEqual(self.pat_alert_keys(), [f"pat_expiring:{expires_on}:{day_two}"])
+        self.assertEqual(self.read_state()["pat_expiry"]["status"], "expiring")
+        self.assertEqual(self.read_state()["last_result"], "already_in_place")
+
+    def test_pat_expired_alerts_daily_and_release_list_failure_path_is_unchanged(self):
+        """已到期：每日一条 expired，既有 release_list_unavailable 连续三轮告警一次照旧，两者并存。"""
+        self.idle_in_place()
+        self.harness.set_releases([])
+        day_one = dt.date(2026, 12, 14)
+        expires_on = day_one - dt.timedelta(days=1)
+        self.harness.write_pat_metadata(expires_on)
+        messages: list[str] = []
+        self.run_on(day_one, messages)
+        self.assertEqual(len(messages), 1)
+        self.assertIn("结果码：pat_expired", messages[0])
+        self.assertIn("剩余天数：-1", messages[0])
+        self.assertIn("已到期，发布列表将拿不到", messages[0])
+        self.assertEqual(self.read_state()["last_result"], "release_list_unavailable")
+        self.assertEqual(self.read_state()["consecutive_failures"], 1)
+        self.run_on(day_one, messages)
+        self.assertEqual(len(messages), 1)
+        output = self.run_on(day_one + dt.timedelta(days=1), messages)
+        # 第二天：一条新的 expired，加上第三轮连续失败触发的一条 release_list_unavailable。
+        self.assertEqual(len(messages), 3)
+        self.assertEqual(len(self.pat_alerts(messages)), 2)
+        others = [message for message in messages if message not in self.pat_alerts(messages)]
+        self.assertEqual(len(others), 1)
+        self.assertIn("结果码：release_list_unavailable", others[0])
+        self.assertIn("结果码=expired", self.pat_lines(output)[0])
+        self.assertEqual(self.read_state()["consecutive_failures"], 3)
+        self.assertEqual(self.read_state()["pat_expiry"]["status"], "expired")
+        active = [
+            key
+            for key, record in self.read_state()["alerts"].items()
+            if key.startswith("release_list_unavailable:") and record["active"] is True
+        ]
+        self.assertEqual(len(active), 1, self.read_state()["alerts"])
+
+    def test_pat_renewal_sends_one_recovery_then_silence(self):
+        """窗内告警发过后换新到 60 天后：恰一条 pat_expiry_recovered，之后静默，旧到期日记录弹掉。"""
+        self.idle_in_place()
+        today = dt.date(2026, 12, 3)
+        old_expiry = today + dt.timedelta(days=10)
+        new_expiry = today + dt.timedelta(days=60)
+        self.harness.write_pat_metadata(old_expiry)
+        messages: list[str] = []
+        self.run_on(today, messages)
+        self.assertEqual(len(messages), 1)
+        self.harness.write_pat_metadata(new_expiry)
+        output = self.run_on(today, messages)
+        self.assertEqual(len(messages), 2)
+        self.assertIn("结果码：pat_expiry_recovered", messages[1])
+        self.assertIn(f"到期日：{new_expiry.isoformat()}", messages[1])
+        self.assertIn("剩余天数：60", messages[1])
+        self.assertIn(f"结果码=sent key=pat_expiry_recovered:{new_expiry}", output)
+        self.assertEqual(self.pat_alert_keys(), [f"pat_expiry_recovered:{new_expiry}"])
+        for _ in range(2):
+            output = self.run_on(today, messages)
+            self.assertEqual(len(messages), 2)
+            self.assertNotIn("阶段=alert", output)
+        self.assertEqual(self.read_state()["pat_expiry"]["status"], "ok")
+        self.assertEqual(self.pat_alert_keys(), [])
+        # 窗外换新（ok → ok、到期日变化）不发任何通知。
+        self.harness.write_pat_metadata(today + dt.timedelta(days=90))
+        output = self.run_on(today, messages)
+        self.assertEqual(len(messages), 2)
+        self.assertNotIn("阶段=alert", output)
+
+    def test_pat_metadata_unknown_alerts_once_per_reason_and_realerts_after_recovery(self):
+        """元数据不可用的每种原因各告警一次并同键去重；补上后发恢复，再缺时仍告警一次。"""
+        self.idle_in_place()
+        today = dt.date(2026, 11, 1)
+        valid = today + dt.timedelta(days=30)
+        harness = self.harness
+        cases = [
+            ("json_file_unavailable", lambda: harness.pat_metadata.unlink()),
+            ("json_file_permissions", lambda: harness.write_pat_metadata(valid, mode=0o644)),
+            ("json_file_invalid", lambda: _write(harness.pat_metadata, "{", 0o600)),
+            ("schema", lambda: harness.write_pat_metadata(valid, schema=2)),
+            ("token_kind", lambda: harness.write_pat_metadata(valid, token_kind="ssh_key")),
+            ("expires_on", lambda: harness.write_pat_metadata("2026/12/13")),
+            ("expires_on", lambda: harness.write_pat_metadata(None)),
+        ]
+        messages: list[str] = []
+        sent = 0
+        for reason, inject in cases:
+            with self.subTest(reason=reason):
+                inject()
+                if messages and f"原因：{reason}" in messages[-1]:
+                    # 同一原因码连着出现时是同键去重，先换回可用元数据再制造。
+                    harness.write_pat_metadata(valid)
+                    self.run_on(today, messages)
+                    sent += 1
+                    inject()
+                output = self.run_on(today, messages)
+                sent += 1
+                self.assertEqual(len(messages), sent, messages)
+                self.assertIn("结果码：pat_expiry_unknown", messages[-1])
+                self.assertIn("到期日：未知", messages[-1])
+                self.assertIn("剩余天数：未知", messages[-1])
+                self.assertIn(f"原因：{reason}", messages[-1])
+                self.assertIn(f"结果码=unknown reason={reason}", self.pat_lines(output)[0])
+                self.assertNotIn("days_left=", self.pat_lines(output)[0])
+                output = self.run_on(today, messages)
+                self.assertEqual(len(messages), sent)
+                self.assertIn("阶段=alert 结果码=deduplicated", output)
+                self.assertEqual(self.pat_alert_keys(), [f"pat_expiry_unknown:{reason}"])
+                self.assertEqual(self.read_state()["pat_expiry"]["status"], "unknown")
+                self.assertIsNone(self.read_state()["pat_expiry"]["expires_on"])
+        # 缺文件 → 补上 → 再缺：恢复一条；未知记录已弹掉，第二次缺失仍告警一次。
+        harness.pat_metadata.unlink()
+        self.run_on(today, messages)
+        harness.write_pat_metadata(valid)
+        output = self.run_on(today, messages)
+        self.assertIn("结果码：pat_expiry_recovered", messages[-1])
+        self.assertIn(f"key=pat_expiry_recovered:{valid}", output)
+        self.assertEqual(self.pat_alert_keys(), [f"pat_expiry_recovered:{valid}"])
+        before = len(messages)
+        harness.pat_metadata.unlink()
+        output = self.run_on(today, messages)
+        self.assertEqual(len(messages), before + 1)
+        self.assertIn("原因：json_file_unavailable", messages[-1])
+        self.assertIn("结果码=sent key=pat_expiry_unknown:json_file_unavailable", output)
+        # 未知 → 窗内：窗内告警本身就是通知，不另发恢复。
+        harness.write_pat_metadata(today + dt.timedelta(days=3))
+        output = self.run_on(today, messages)
+        self.assertEqual(len(messages), before + 2)
+        self.assertIn("结果码：pat_expiring", messages[-1])
+        self.assertNotIn("recovered", output + "\n".join(messages[before:]))
+
+    def test_pat_metadata_path_defaults_next_to_gh_command_and_key_is_optional(self):
+        """旧配置无 pat_metadata_file 照常通过且缺省读 gh_command 同目录；相对路径拒绝；绝对路径按其读。"""
+        harness = self.harness
+        base = dict(harness.config)
+        self.assertNotIn("pat_metadata_file", base)
+        self.assertIs(AGENT.validate_config(base), base)
+        self.assertEqual(
+            AGENT._pat_metadata_path(base), Path(base["gh_command"]).parent / "gh.env.meta"
+        )
+        self.assertEqual(harness.pat_metadata, Path(base["gh_command"]).parent / "gh.env.meta")
+        for value in ("relative/gh.env.meta", "/opt/../etc/gh.env.meta", "", 1, None, True):
+            with self.subTest(value=value):
+                with self.assertRaises(AGENT.AgentError) as caught:
+                    AGENT.validate_config(dict(base, pat_metadata_file=value))
+                self.assertEqual(caught.exception.code, "config_shape")
+        elsewhere = harness.root / "elsewhere" / "token.meta"
+        config = dict(base, pat_metadata_file=str(elsewhere))
+        self.assertIs(AGENT.validate_config(config), config)
+        self.assertEqual(AGENT._pat_metadata_path(config), elsewhere)
+        # 指向别处时按该路径读：把缺省位置的文件删掉，只有真的读了别处才会得到 expiring。
+        self.idle_in_place()
+        today = dt.date(2026, 12, 3)
+        harness.pat_metadata.unlink()
+        harness.write_pat_metadata(today + dt.timedelta(days=5), path=elsewhere)
+        harness.write_config(pat_metadata_file=str(elsewhere))
+        messages: list[str] = []
+        output = self.run_on(today, messages)
+        self.assertEqual(len(messages), 1)
+        self.assertIn("结果码：pat_expiring", messages[0])
+        self.assertIn("剩余天数：5", messages[0])
+        self.assertIn("结果码=expiring", self.pat_lines(output)[0])
+
+    def test_pat_window_alert_is_not_recovered_by_healthy_rounds(self):
+        """窗内告警之后的幂等在位轮不得发出任何 recovered：PAT 记录 active=False，_finish 不碰它。"""
+        self.idle_in_place()
+        today = dt.date(2026, 12, 3)
+        expires_on = today + dt.timedelta(days=7)
+        self.harness.write_pat_metadata(expires_on)
+        messages: list[str] = []
+        outputs = [self.run_on(today, messages) for _ in range(3)]
+        self.assertEqual(len(messages), 1)
+        record = self.read_state()["alerts"][f"pat_expiring:{expires_on}:{today}"]
+        self.assertIs(record["active"], False)
+        self.assertIs(record["sent"], True)
+        for output in outputs:
+            self.assertEqual(self.read_state()["last_result"], "already_in_place")
+            self.assertNotIn("recovered", output)
+        self.assertNotIn("recovered", "\n".join(messages))
+        # 同一轮里真正的故障恢复照常：既有 active=True 记录仍由健康轮发一条 recovered，PAT 记录不动。
+        state = self.read_state()
+        state["alerts"]["failed:v0.0.1"] = {"sent": True, "active": True}
+        self.harness.save_state(state)
+        output = self.run_on(today, messages)
+        self.assertEqual(len(messages), 2)
+        self.assertIn("结果码：recovered", messages[1])
+        self.assertNotIn("pat_expiry", messages[1])
+        self.assertIn("阶段=alert 结果码=deduplicated key=pat_expiring", output)
+        self.assertIs(self.read_state()["alerts"]["failed:v0.0.1"]["active"], False)
+
+    def test_pat_alerts_and_audit_never_leak_token_or_paths(self):
+        """gh.env 里的令牌哨兵与含哨兵的元数据目录名：告警正文、审计输出与状态账零命中。"""
+        harness = self.harness
+        self.idle_in_place()
+        _write(harness.bin / "gh.env", f"GH_TOKEN={harness.sentinel}\n", 0o600)
+        secret_directory = harness.root / f"pat-{harness.sentinel}"
+        secret_directory.mkdir(mode=0o700)
+        metadata = secret_directory / "gh.env.meta"
+        harness.pat_metadata.unlink()
+        harness.write_config(pat_metadata_file=str(metadata))
+        today = dt.date(2026, 12, 3)
+        outputs: list[str] = []
+        messages: list[str] = []
+        harness.write_pat_metadata(today + dt.timedelta(days=3), path=metadata)
+        outputs.append(self.run_on(today, messages))
+        harness.write_pat_metadata(today + dt.timedelta(days=3), path=metadata, mode=0o644)
+        outputs.append(self.run_on(today, messages))
+        metadata.unlink()
+        outputs.append(self.run_on(today, messages))
+        _write(metadata, harness.sentinel + " not json", 0o600)
+        outputs.append(self.run_on(today, messages))
+        self.assertEqual(len(messages), 4, messages)
+        self.assertEqual(
+            [message.splitlines()[3] for message in messages],
+            ["结果码：pat_expiring"] + ["结果码：pat_expiry_unknown"] * 3,
+        )
+        self.assertEqual(
+            [message.splitlines()[6] for message in messages[1:]],
+            [
+                "原因：json_file_permissions",
+                "原因：json_file_unavailable",
+                "原因：json_file_invalid",
+            ],
+        )
+        joined = "\n".join(outputs) + "\n" + "\n".join(messages)
+        state_text = (harness.state / "pull-agent.json").read_text()
+        for text in (joined, state_text):
+            self.assertNotIn(harness.sentinel, text)
+            self.assertNotIn(secret_directory.name, text)
+            self.assertNotIn(str(harness.root), text)
+            self.assertNotIn("gh.env", text)
+
+    def test_pat_check_never_changes_round_result(self):
+        """判定崩溃、投递失败、本轮稍后崩溃：返回码与部署结论不变，去重记录先落账不重发。"""
+        harness = self.harness
+        self.idle_in_place()
+        today = dt.date(2026, 12, 3)
+        expires_on = today + dt.timedelta(days=2)
+        harness.write_pat_metadata(expires_on)
+        messages: list[str] = []
+        # 判定本身抛出未预期异常：审计 unknown reason=unexpected，告警一次，本轮照常在位。
+        with patch.object(AGENT, "_observe_pat_expiry", side_effect=RuntimeError("boom")):
+            output = self.run_on(today, messages)
+        self.assertIn("阶段=pat_expiry 结果码=unknown reason=unexpected", output)
+        self.assertEqual(len(messages), 1)
+        self.assertIn("原因：unexpected", messages[0])
+        self.assertEqual(self.read_state()["last_result"], "already_in_place")
+        # 投递失败：不抛出、返回码不变、记录不写成已发、状态账不推进；下一轮重试成功。
+        attempts: list[str] = []
+
+        def flaky(message, env, timeout):
+            attempts.append(message)
+            if len(attempts) == 1:
+                raise RuntimeError("network failure")
+
+        output = self.run_on(today, messages, sender=flaky)
+        self.assertIn(
+            f"阶段=alert 结果码=alert_delivery_failed key=pat_expiring:{expires_on}", output
+        )
+        self.assertEqual(self.read_state()["last_result"], "already_in_place")
+        self.assertIs(
+            self.read_state()["alerts"][f"pat_expiring:{expires_on}:{today}"]["sent"], False
+        )
+        self.assertEqual(self.read_state()["pat_expiry"]["status"], "unknown")
+        output = self.run_on(today, messages, sender=flaky)
+        self.assertEqual(len(attempts), 2)
+        self.assertIn(f"阶段=alert 结果码=sent key=pat_expiring:{expires_on}:{today}", output)
+        self.assertEqual(self.read_state()["pat_expiry"]["status"], "expiring")
+        # 告警发出后本轮稍后崩溃：run_once 从文件重新装账收口 unknown，同日下一轮仍是去重。
+        harness.write_pat_metadata(today + dt.timedelta(days=1))
+        with (
+            patch.object(AGENT, "_today", return_value=today),
+            patch.object(AGENT, "_list_releases", side_effect=RuntimeError("boom")),
+        ):
+            code, output = self.run_agent(
+                sender=lambda message, env, timeout: messages.append(message)
+            )
+        self.assertEqual(code, 0)
+        self.assertEqual(self.read_state()["last_result"], "unknown")
+        self.assertIn("结果码=sent key=pat_expiring:", output)
+        before = len(self.pat_alerts(messages))
+        output = self.run_on(today, messages)
+        self.assertEqual(len(self.pat_alerts(messages)), before)
+        self.assertIn("阶段=alert 结果码=deduplicated key=pat_expiring:", output)
 
     def test_systemd_units_shape(self):
         service = (ROOT / "deploy/monitoring-units/lingxi-release-pull.service").read_text()
