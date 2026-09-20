@@ -431,8 +431,22 @@ class WorkflowShapeTests(unittest.TestCase):
 
 
 class AllowlistFileTests(unittest.TestCase):
-    def test_repository_allowlist_parses_and_starts_empty(self) -> None:
-        self.assertEqual(pac.parse_allowlist(ALLOWLIST), [])
+    def test_repository_allowlist_holds_exactly_the_ruled_cryptography_exemptions(self) -> None:
+        # 产品负责人 2026-09-20 裁定 A（#859 评论 5748497593）：cryptography 45.0.7 的 4 条 HIGH
+        # 豁免到 2026-10-20；MODERATE / LOW 只告警、不入清单。多一条或换日期都要回到裁定处说明。
+        entries = pac.parse_allowlist(ALLOWLIST)
+        self.assertEqual(
+            {entry.vuln_id for entry in entries},
+            {
+                "GHSA-r6ph-v2qm-q3c2",
+                "GHSA-537c-gmf6-5ccf",
+                "GHSA-jwv3-5hgf-82ww",
+                "GHSA-g6cj-pr64-35w5",
+            },
+        )
+        self.assertEqual({entry.expires.isoformat() for entry in entries}, {"2026-10-20"})
+        for entry in entries:
+            self.assertIn("5748497593", entry.reason)
         self.assertTrue(ALLOWLIST.read_text(encoding="utf-8").startswith("#"))
 
 
