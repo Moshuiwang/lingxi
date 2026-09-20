@@ -32,7 +32,7 @@ container="${LINGXI_POSTGRES_CONTAINER}"
 # 两个一次性库。名字里带 scratch，任何人在容器里看到它们都知道可以直接删。
 sql_database='lingxi_migrate_scratch_sql'
 alembic_database='lingxi_migrate_scratch_alembic'
-# 往返检查用的参考库：每退一步就用它建一个「空库直达该版本」的对照。
+# 往返检查用的参考库：空库从基线起逐版正滚到 head，每到一版留一份 dump 作对照。
 reference_database='lingxi_migrate_scratch_ref'
 workspace=$(mktemp -d)
 
@@ -223,11 +223,15 @@ printf 'head 上重跑 upgrade：通过（结构不变）\n'
 # 静态检查只看得出 `downgrade()` 不是空函数，看不出它做的事对不对——
 # `if False: op.drop_table(...)` 一样能过形状检查，而真库从不执行 downgrade，
 # 于是「基线之上每条 revision 可真往返」这句承诺一直没有任何机器在守（内审 / 外审
-# 共同指出）。这里在真库上走一遍：先一路 downgrade 回基线，每退一步都与
-# 「空库直接 upgrade 到那一版」逐字节比对；再一路 upgrade 回 head，每进一步都与
-# 下行时同一版本记下的 dump 逐字节比对。
+# 共同指出）。这里在真库上走一遍：先在参考库上从空库起逐版正滚到 head，每到一版
+# 记一份归一化 dump（这就是「空库直达那一版」的对照，一次线性正滚全部备齐）；再一路
+# downgrade 回基线，每退一步都与对照逐字节比对；最后一路 upgrade 回 head，每进一步
+# 都与下行时同一版本记下的 dump 逐字节比对。
 #
-# 当前链上只有基线，下面两个循环都是空的、零成本；#54 的第一条 revision 落地即生效。
+# 对照只正滚一次、不逐步重建：每退一步都新建空库再 upgrade 到那一版，迁移执行次数
+# 随 revision 数平方增长（N 条约 N²/2 次），链只增不减，门禁会随历史无限变慢。
+#
+# 链上只有基线时下面的循环都是空的、零成本。
 round_trip_pairs=$(python3 - <<'PY'
 from alembic.config import Config
 from alembic.script import ScriptDirectory
@@ -251,18 +255,29 @@ PY
 if [[ -z "${round_trip_pairs}" ]]; then
   printf '逐条 revision 往返：本次无对象（链上只有基线，基线按设计不可 downgrade）\n'
 else
-  # 下行：head → base，逐步 downgrade 并与空库直达同一版本的结果比对。
+  # 对照：参考库从空库起逐版正滚到 head，每到一版记一份 dump。基线那版也记：
+  # 下行的最后一步（第一条 revision 退回基线）要与它比对。
+  drop_database "${reference_database}"
+  psql_do postgres -c "CREATE DATABASE ${reference_database};"
+  reference_dsn=$(scratch_dsn "${reference_database}")
+  LINGXI_MIGRATION_DSN="${reference_dsn}" python3 -m alembic upgrade "${baseline_revision}"
+  normalized_dump "${reference_database}" > "${workspace}/fresh_${baseline_revision}.sql"
+  tac <<< "${round_trip_pairs}" | while read -r revision _parent; do
+    LINGXI_MIGRATION_DSN="${reference_dsn}" python3 -m alembic upgrade "${revision}"
+    normalized_dump "${reference_database}" > "${workspace}/fresh_${revision}.sql"
+  done || exit 1
+  # 逐版正滚与一次性 upgrade head 是同一条链的两种走法，到 head 必须相同；不同就是
+  # 对照本身不可信，先于任何 downgrade 判定报出来，免得错怪某条 revision 的 downgrade。
+  if ! diff -u "${workspace}/head.sql" "${workspace}/fresh_${head_revision}.sql"; then
+    printf '\n逐版 upgrade 到 head 的结构与一次性 upgrade head 不一致（上面是 diff）。\n' >&2
+    exit 1
+  fi
+
+  # 下行：head → base，逐步 downgrade 并与正滚时记下的同一版本对照比对。
   while read -r revision parent; do
     normalized_dump "${alembic_database}" > "${workspace}/at_${revision}.sql"
     LINGXI_MIGRATION_DSN="${alembic_dsn}" python3 -m alembic downgrade "${parent}"
     normalized_dump "${alembic_database}" > "${workspace}/down_to_${parent}.sql"
-
-    drop_database "${reference_database}"
-    psql_do postgres -c "CREATE DATABASE ${reference_database};"
-    reference_dsn=$(scratch_dsn "${reference_database}")
-    LINGXI_MIGRATION_DSN="${reference_dsn}" python3 -m alembic upgrade "${parent}"
-    normalized_dump "${reference_database}" > "${workspace}/fresh_${parent}.sql"
-
     if ! diff -u "${workspace}/fresh_${parent}.sql" "${workspace}/down_to_${parent}.sql"; then
       printf '\nrevision %s 的 downgrade 没有真正回到 %s（上面是 diff）。\n' "${revision}" "${parent}" >&2
       printf 'downgrade 必须真正逆转 upgrade，否则回滚只是把版本号改小了。\n' >&2
