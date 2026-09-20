@@ -2533,6 +2533,75 @@ class AgentTests(unittest.TestCase):
         self.assertEqual(len(messages), 1)
         self.assertIn("agent_self_update_failed", messages[0])
 
+    def test_crash_while_writing_backup_leaves_old_agent_and_no_backup(self):
+        """写旧副本那一步崩溃（先副本、后换入）：在位文件仍是旧文件、目录里没有 .bak-* 也没有临时残留，
+        failed 审计 + 告警一次，部署结果不变。"""
+        harness = self.harness
+        harness.write_config(notify_on_success=False)
+        new_sha = harness.install_bundle_agent(harness.agent_with_version(AGENT.AGENT_VERSION + 1))
+        harness.state_for_old()
+        real_replace = os.replace
+
+        def crash_on_backup(src, dst, *args, **kwargs):
+            if Path(src).name.startswith(".agent-backup-"):
+                raise OSError(5, "injected crash")
+            return real_replace(src, dst, *args, **kwargs)
+
+        messages = []
+        with patch.object(AGENT.os, "replace", side_effect=crash_on_backup):
+            code, output = self.run_agent(
+                sender=lambda message, env, timeout: messages.append(message)
+            )
+        self.assertEqual(code, 0)
+        self.assertEqual(self.read_state()["last_result"], "verified")
+        self.assertEqual(harness.in_place_agent.read_bytes(), harness.agent_source)
+        self.assertNotEqual(harness.in_place_sha256(), new_sha)
+        self.assertEqual(harness.backups(), [])
+        self.assertEqual(self.in_place_directory_names(), ["release_pull_agent.py"])
+        lines = self.self_update_lines(output)
+        self.assertEqual(len(lines), 1, output)
+        self.assertIn("结果码=agent_self_update_failed", lines[0])
+        self.assertIn("reason=write_failed", lines[0])
+        self.assertEqual(len(messages), 1)
+        self.assertIn("agent_self_update_failed", messages[0])
+
+    def test_group_or_other_writable_in_place_directory_is_rejected(self):
+        """在位目录可由组 / 其他主体写入：rejected（reason=in_place_directory_permissions）、不替换、告警一次。"""
+        harness = self.harness
+        harness.write_config(notify_on_success=False)
+        harness.set_env(DEPLOY_STATUS="running")
+        old_sha = harness.in_place_sha256()
+        harness.install_bundle_agent(harness.agent_with_version(AGENT.AGENT_VERSION + 1))
+        harness.state_for_old()
+        directory = harness.in_place_agent.parent
+        self.addCleanup(directory.chmod, 0o755)
+        for mode in (0o775, 0o707):
+            with self.subTest(mode=oct(mode)):
+                directory.chmod(mode)
+                messages = []
+                code, output = self.run_agent(
+                    sender=lambda message, env, timeout: messages.append(message)
+                )
+                self.assertEqual(code, 0)
+                self.assertEqual(self.read_state()["last_result"], "running")
+                self.assertEqual(harness.in_place_sha256(), old_sha)
+                self.assertEqual(harness.backups(), [])
+                self.assertEqual(self.in_place_directory_names(), ["release_pull_agent.py"])
+                lines = self.self_update_lines(output)
+                self.assertEqual(len(lines), 1, output)
+                self.assertIn("结果码=agent_self_update_rejected", lines[0])
+                self.assertIn("reason=in_place_directory_permissions", lines[0])
+                # 同 tag 去重：第一种权限位那一轮发出，第二种权限位那一轮被去重。
+                self.assertEqual(len(messages), 1 if mode == 0o775 else 0, messages)
+                if mode == 0o775:
+                    self.assertIn("agent_self_update_rejected", messages[0])
+        # 权限位修回后同一轮次即替换：目录判定是唯一阻碍。
+        directory.chmod(0o755)
+        code, output = self.run_agent(sender=lambda message, env, timeout: None)
+        self.assertEqual(code, 0)
+        self.assertNotEqual(harness.in_place_sha256(), old_sha)
+        self.assertIn("结果码=agent_self_update_replaced", output)
+
     def test_readback_mismatch_after_replace_restores_old_agent(self):
         """换入「成功」但回读摘要不等于候选（写坏）：把旧副本换回，按 failed 上报、告警一次。"""
         harness = self.harness
