@@ -466,6 +466,9 @@ class RunIntegrationTests(unittest.TestCase):
             str(self.lock_path),
             "--docker-bin",
             str(self.docker_bin),
+            # 本类只关心容器主线：关掉默认开启的拉取代理单元检查，不让本机 systemd
+            # 的真实状态（本机没有这个单元）混进 `sender.call_count`。
+            "--disable-release-pull-check",
         ]
         if extra_argv:
             argv.extend(extra_argv)
@@ -759,6 +762,8 @@ class RunThresholdIntegrationTests(unittest.TestCase):
             str(self.monitoring_dir),
             "--load-consecutive",
             "2",
+            # 同上：本类只关心资源三项，拉取代理单元检查另有专门的测试类。
+            "--disable-release-pull-check",
         ]
         if extra_argv:
             argv.extend(extra_argv)
@@ -778,6 +783,7 @@ class RunThresholdIntegrationTests(unittest.TestCase):
             str(self.lock_path),
             "--docker-bin",
             str(self.docker_bin),
+            "--disable-release-pull-check",
         ]
         with mock.patch.object(host_health_alert, "feishu_send_text") as sender:
             exit_code = host_health_alert.run(argv)
@@ -886,6 +892,446 @@ class RunThresholdIntegrationTests(unittest.TestCase):
             self._run(["--dry-run"])
         sender.assert_not_called()
         self.assertFalse(self.threshold_state_path.exists())
+
+
+def _systemd_stamp(moment: datetime) -> str:
+    """`systemctl show` 在 `TZ=UTC` 下打印的时间戳文本，例如 `Sun 2026-09-20 06:40:04 UTC`。"""
+    return moment.astimezone(UTC).strftime("%a %Y-%m-%d %H:%M:%S UTC")
+
+
+class ParseSystemdTimestampTests(unittest.TestCase):
+    def test_pretty_utc_timestamp_parses_to_aware_datetime(self) -> None:
+        parsed = host_health_alert.parse_systemd_timestamp("Sun 2026-09-20 06:40:04 UTC")
+        self.assertEqual(parsed, datetime(2026, 9, 20, 6, 40, 4, tzinfo=UTC))
+
+    def test_weekday_is_optional_and_fraction_is_tolerated(self) -> None:
+        parsed = host_health_alert.parse_systemd_timestamp("2026-09-20 06:40:04.123456 UTC")
+        self.assertEqual(parsed, datetime(2026, 9, 20, 6, 40, 4, tzinfo=UTC))
+
+    def test_unset_values_return_none(self) -> None:
+        for value in ("", "n/a", "0", None, "  "):
+            with self.subTest(value=value):
+                self.assertIsNone(host_health_alert.parse_systemd_timestamp(value))
+
+    def test_garbage_or_non_utc_zone_raises(self) -> None:
+        for value in ("yesterday", "Sun 2026-09-20 14:40:04 CST", "1758350404"):
+            with self.subTest(value=value):
+                with self.assertRaises(ValueError):
+                    host_health_alert.parse_systemd_timestamp(value)
+
+
+class JudgeReleasePullTests(unittest.TestCase):
+    """`judge_release_pull` 三个判据的纯逻辑边界；本卡的变异验红目标之一。"""
+
+    NOW = datetime(2026, 9, 20, 7, 0, 0, tzinfo=UTC)
+
+    def _observation(self, **overrides) -> host_health_alert.ReleasePullObservation:
+        fields = {
+            "unit": "lingxi-release-pull",
+            "timer_active_state": "active",
+            "timer_load_state": "loaded",
+            "last_trigger": self.NOW - timedelta(minutes=5),
+            "service_active_state": "inactive",
+            "service_result": "success",
+            "service_exit_status": 0,
+            "service_exit_at": self.NOW - timedelta(minutes=4),
+        }
+        fields.update(overrides)
+        return host_health_alert.ReleasePullObservation(**fields)
+
+    def _judge(self, observation, *, stale_minutes: float = 15.0) -> dict[str, bool]:
+        checks = host_health_alert.judge_release_pull(
+            observation, now=self.NOW, stale_minutes=stale_minutes
+        )
+        return {key: breached for key, _label, breached, _detail, _required in checks}
+
+    def test_healthy_observation_breaches_nothing(self) -> None:
+        breaches = self._judge(self._observation())
+        self.assertEqual(
+            breaches,
+            {
+                host_health_alert.RELEASE_PULL_TIMER_INACTIVE: False,
+                host_health_alert.RELEASE_PULL_TRIGGER_STALE: False,
+                host_health_alert.RELEASE_PULL_LAST_RUN_FAILED: False,
+            },
+        )
+
+    def test_timer_not_active_breaches_and_staleness_is_not_judged(self) -> None:
+        for state in ("inactive", "failed", "activating", "deactivating"):
+            with self.subTest(state=state):
+                breaches = self._judge(self._observation(timer_active_state=state))
+                self.assertTrue(breaches[host_health_alert.RELEASE_PULL_TIMER_INACTIVE])
+                self.assertNotIn(host_health_alert.RELEASE_PULL_TRIGGER_STALE, breaches)
+
+    def test_staleness_boundary_is_strictly_greater_than_threshold(self) -> None:
+        at_threshold = self._observation(
+            last_trigger=self.NOW - timedelta(minutes=15),
+            service_exit_at=self.NOW - timedelta(minutes=15),
+        )
+        self.assertFalse(self._judge(at_threshold)[host_health_alert.RELEASE_PULL_TRIGGER_STALE])
+        past_threshold = self._observation(
+            last_trigger=self.NOW - timedelta(minutes=15, seconds=1),
+            service_exit_at=self.NOW - timedelta(minutes=15, seconds=1),
+        )
+        self.assertTrue(self._judge(past_threshold)[host_health_alert.RELEASE_PULL_TRIGGER_STALE])
+
+    def test_recent_service_exit_rescues_an_old_trigger(self) -> None:
+        # 一轮 40 分钟的长部署刚刚结束、下一个五分钟刻度还没到：触发时刻已旧，但
+        # service 刚结束就是最新留痕，不算过期。
+        observation = self._observation(
+            last_trigger=self.NOW - timedelta(minutes=40),
+            service_exit_at=self.NOW - timedelta(minutes=2),
+        )
+        self.assertFalse(self._judge(observation)[host_health_alert.RELEASE_PULL_TRIGGER_STALE])
+
+    def test_running_service_is_neither_stale_nor_failed(self) -> None:
+        observation = self._observation(
+            last_trigger=self.NOW - timedelta(minutes=40),
+            service_active_state="activating",
+            service_exit_at=None,
+        )
+        breaches = self._judge(observation)
+        self.assertFalse(breaches[host_health_alert.RELEASE_PULL_TRIGGER_STALE])
+        self.assertNotIn(host_health_alert.RELEASE_PULL_LAST_RUN_FAILED, breaches)
+
+    def test_never_triggered_and_never_finished_is_stale(self) -> None:
+        observation = self._observation(last_trigger=None, service_exit_at=None)
+        self.assertTrue(self._judge(observation)[host_health_alert.RELEASE_PULL_TRIGGER_STALE])
+
+    def test_failure_requires_non_success_result_and_non_zero_exit_status(self) -> None:
+        cases = {
+            ("exit-code", 1): True,
+            ("timeout", 15): True,
+            ("exit-code", 0): False,
+            ("success", 1): False,
+            ("success", 0): False,
+        }
+        for (result, status), expected in cases.items():
+            with self.subTest(result=result, status=status):
+                observation = self._observation(service_result=result, service_exit_status=status)
+                self.assertEqual(
+                    self._judge(observation)[host_health_alert.RELEASE_PULL_LAST_RUN_FAILED],
+                    expected,
+                )
+
+    def test_detail_names_unit_states_trigger_result_and_threshold(self) -> None:
+        observation = self._observation(
+            timer_active_state="inactive",
+            timer_load_state="not-found",
+            service_result="exit-code",
+            service_exit_status=1,
+        )
+        detail = host_health_alert.describe_release_pull(
+            observation, now=self.NOW, stale_minutes=15.0
+        )
+        self.assertIn("单元 lingxi-release-pull", detail)
+        self.assertIn("timer=inactive（not-found）", detail)
+        self.assertIn("service=inactive", detail)
+        self.assertIn("上一次触发 2026-09-20T06:55:00Z", detail)
+        self.assertIn("上一轮 exit-code/1", detail)
+        self.assertIn("阈值 15 分钟", detail)
+
+    def test_release_pull_messages_use_host_monitor_category(self) -> None:
+        text = host_health_alert.render_threshold_message(
+            host_health_alert.ACTION_ALERT,
+            label="拉取代理定时器未激活",
+            detail="x",
+            host="h",
+            now="t",
+            category=host_health_alert._THRESHOLD_CATEGORY[
+                host_health_alert.RELEASE_PULL_TIMER_INACTIVE
+            ],
+        )
+        self.assertTrue(text.startswith("[BI Plus 宿主监控] 告警\n"))
+        # 资源三项不传分类词，首行保持既有文案。
+        legacy = host_health_alert.render_threshold_message(
+            host_health_alert.ACTION_ALERT, label="磁盘用量", detail="x", host="h", now="t"
+        )
+        self.assertTrue(legacy.startswith("[BI Plus 资源监控] 告警\n"))
+
+
+class RunReleasePullIntegrationTests(unittest.TestCase):
+    """`run()` 端到端：`systemctl` 用可执行桩注入固定属性输出，验证拉取代理单元检查
+    默认开启、三态告警 / 去重 / 恢复、未知形态、逃生口与脱敏否定在真正的调用路径
+    上成立。容器主线用"运行中、无 healthcheck"的伪造 docker 保持安静。
+    """
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.tmp_path = Path(self._tmp.name)
+
+        self.env_path = self.tmp_path / "env"
+        self.env_path.write_text(
+            "LINGXI_FEISHU_APP_ID=a\nLINGXI_FEISHU_APP_SECRET=b\nLINGXI_ADMIN_GROUP_CHAT_ID=oc_x\n",
+            encoding="utf-8",
+        )
+        os.chmod(self.env_path, 0o600)
+
+        self.docker_bin = self.tmp_path / "fake-docker"
+        self.docker_bin.write_text(
+            "#!/bin/sh\necho '{\"Running\": true}'\nexit 0\n", encoding="utf-8"
+        )
+        os.chmod(self.docker_bin, 0o755)
+
+        # 伪造的 `systemctl`：按最后一个参数（单元名）的后缀吐出对应属性文件，退出码
+        # 也由文件控制；每次调用追加一行到 calls.log，供「逃生口关闭时不得调用」断言。
+        self.timer_props = self.tmp_path / "timer.props"
+        self.timer_rc = self.tmp_path / "timer.rc"
+        self.service_props = self.tmp_path / "service.props"
+        self.service_rc = self.tmp_path / "service.rc"
+        self.calls_log = self.tmp_path / "calls.log"
+        self.systemctl_bin = self.tmp_path / "fake-systemctl"
+        self.systemctl_bin.write_text(
+            "#!/bin/sh\n"
+            f'echo "$*" >> "{self.calls_log}"\n'
+            'for last in "$@"; do :; done\n'
+            'case "$last" in\n'
+            f'  *.timer) cat "{self.timer_props}"; echo "stderr /opt/SENTINEL_STDERR" >&2; '
+            f'exit "$(cat "{self.timer_rc}")" ;;\n'
+            f'  *.service) cat "{self.service_props}"; exit "$(cat "{self.service_rc}")" ;;\n'
+            "esac\n"
+            "exit 2\n",
+            encoding="utf-8",
+        )
+        os.chmod(self.systemctl_bin, 0o755)
+        self.now = datetime.now(UTC)
+        self._set_timer()
+        self._set_service()
+
+        self.state_path = self.tmp_path / "state.json"
+        self.threshold_state_path = self.tmp_path / "threshold-state.json"
+        self.log_path = self.tmp_path / "log.txt"
+        self.lock_path = self.tmp_path / "lock"
+
+    def _set_timer(
+        self,
+        *,
+        active_state: str = "active",
+        load_state: str = "loaded",
+        last_trigger: datetime | None | str = "default",
+        rc: int = 0,
+        extra_lines: tuple[str, ...] = (),
+        omit: tuple[str, ...] = (),
+    ) -> None:
+        if last_trigger == "default":
+            last_trigger = self.now - timedelta(minutes=5)
+        lines = {
+            "ActiveState": active_state,
+            "LoadState": load_state,
+            "LastTriggerUSec": _systemd_stamp(last_trigger) if last_trigger else "",
+        }
+        body = [f"{k}={v}" for k, v in lines.items() if k not in omit] + list(extra_lines)
+        self.timer_props.write_text("\n".join(body) + "\n", encoding="utf-8")
+        self.timer_rc.write_text(f"{rc}\n", encoding="utf-8")
+
+    def _set_service(
+        self,
+        *,
+        active_state: str = "inactive",
+        result: str = "success",
+        exit_status: int = 0,
+        exit_at: datetime | None | str = "default",
+        rc: int = 0,
+        extra_lines: tuple[str, ...] = (),
+    ) -> None:
+        if exit_at == "default":
+            exit_at = self.now - timedelta(minutes=4)
+        lines = {
+            "ActiveState": active_state,
+            "Result": result,
+            "ExecMainStatus": str(exit_status),
+            "ExecMainExitTimestamp": _systemd_stamp(exit_at) if exit_at else "",
+        }
+        body = [f"{k}={v}" for k, v in lines.items()] + list(extra_lines)
+        self.service_props.write_text("\n".join(body) + "\n", encoding="utf-8")
+        self.service_rc.write_text(f"{rc}\n", encoding="utf-8")
+
+    def _run(self, extra_argv: list[str] | None = None) -> int:
+        argv = [
+            "--env-file",
+            str(self.env_path),
+            "--containers",
+            "unused-container",
+            "--state-file",
+            str(self.state_path),
+            "--log-file",
+            str(self.log_path),
+            "--lock-file",
+            str(self.lock_path),
+            "--docker-bin",
+            str(self.docker_bin),
+            "--threshold-state-file",
+            str(self.threshold_state_path),
+            "--systemctl-bin",
+            str(self.systemctl_bin),
+        ]
+        if extra_argv:
+            argv.extend(extra_argv)
+        return host_health_alert.run(argv)
+
+    def _round(self, extra_argv: list[str] | None = None) -> list[str]:
+        with mock.patch.object(host_health_alert, "feishu_send_text") as sender:
+            exit_code = self._run(extra_argv)
+        self.assertEqual(exit_code, 0)
+        return [call.kwargs["text"] for call in sender.call_args_list]
+
+    def _alerting_keys(self) -> set[str]:
+        state = host_health_alert.load_threshold_state(self.threshold_state_path)
+        return {key for key, value in state.items() if value.alerting}
+
+    def test_healthy_unit_yields_zero_alerts_and_no_state_file(self) -> None:
+        self.assertEqual(self._round(), [])
+        self.assertFalse(self.threshold_state_path.exists())
+        # 默认开启：桩确实被问过 timer 与 service 各一次。
+        calls = self.calls_log.read_text(encoding="utf-8").splitlines()
+        self.assertEqual(len(calls), 2)
+        self.assertTrue(any("lingxi-release-pull.timer" in c for c in calls))
+        self.assertTrue(any("lingxi-release-pull.service" in c for c in calls))
+        self.assertTrue(all("--all" in c and "show" in c for c in calls))
+
+    def test_timer_inactive_alerts_once_dedupes_then_recovers_once(self) -> None:
+        self._set_timer(active_state="inactive")
+        texts = self._round()
+        self.assertEqual(len(texts), 1)
+        self.assertTrue(texts[0].startswith("[BI Plus 宿主监控] 告警\n"))
+        self.assertIn("拉取代理定时器未激活", texts[0])
+        self.assertIn("单元 lingxi-release-pull", texts[0])
+        self.assertIn("timer=inactive", texts[0])
+        self.assertIn("上一次触发 ", texts[0])
+        self.assertIn("上一轮 success/0", texts[0])
+        self.assertEqual(self._alerting_keys(), {host_health_alert.RELEASE_PULL_TIMER_INACTIVE})
+
+        # 同一状态第二轮：去重，不再发。
+        self.assertEqual(self._round(), [])
+
+        # 恢复：一条恢复通知，随后静默。
+        self._set_timer(active_state="active")
+        texts = self._round()
+        self.assertEqual(len(texts), 1)
+        self.assertTrue(texts[0].startswith("[BI Plus 宿主监控] 恢复\n"))
+        self.assertIn("拉取代理定时器未激活：已恢复正常", texts[0])
+        self.assertEqual(self._round(), [])
+        self.assertEqual(self._alerting_keys(), set())
+
+    def test_stale_trigger_alerts_once(self) -> None:
+        self._set_timer(last_trigger=self.now - timedelta(minutes=20))
+        self._set_service(exit_at=self.now - timedelta(minutes=20))
+        texts = self._round()
+        self.assertEqual(len(texts), 1)
+        self.assertIn("拉取代理留痕过期", texts[0])
+        self.assertIn("阈值 15 分钟", texts[0])
+        self.assertEqual(self._round(), [])
+        self.assertEqual(self._alerting_keys(), {host_health_alert.RELEASE_PULL_TRIGGER_STALE})
+
+    def test_stale_threshold_is_configurable(self) -> None:
+        self._set_timer(last_trigger=self.now - timedelta(minutes=20))
+        self._set_service(exit_at=self.now - timedelta(minutes=20))
+        self.assertEqual(self._round(["--release-pull-stale-minutes", "30"]), [])
+
+    def test_running_deployment_is_not_stale(self) -> None:
+        # 触发 4 分钟前、service 正在运行：零告警。
+        self._set_timer(last_trigger=self.now - timedelta(minutes=4))
+        self._set_service(active_state="activating", exit_at=None)
+        self.assertEqual(self._round(), [])
+        # 一轮长部署跑了 40 分钟仍在运行：触发时刻早已超过阈值，但不算过期。
+        self._set_timer(last_trigger=self.now - timedelta(minutes=40))
+        self.assertEqual(self._round(), [])
+        self.assertFalse(self.threshold_state_path.exists())
+
+    def test_last_run_failure_alerts_once_then_recovers_after_a_good_run(self) -> None:
+        self._set_service(result="exit-code", exit_status=1)
+        texts = self._round()
+        self.assertEqual(len(texts), 1)
+        self.assertIn("拉取代理上一轮失败", texts[0])
+        self.assertIn("上一轮 exit-code/1", texts[0])
+        self.assertEqual(self._round(), [])
+        self._set_service(result="success", exit_status=0)
+        texts = self._round()
+        self.assertEqual(len(texts), 1)
+        self.assertIn("拉取代理上一轮失败：已恢复正常", texts[0])
+
+    def test_systemctl_failure_alerts_unknown_once_dedupes_then_recovers(self) -> None:
+        self._set_timer(rc=1)
+        texts = self._round()
+        self.assertEqual(len(texts), 1)
+        self.assertIn("拉取代理状态未知", texts[0])
+        self.assertIn("systemctl_exit_1", texts[0])
+        self.assertEqual(self._alerting_keys(), {host_health_alert.RELEASE_PULL_UNKNOWN})
+        self.assertEqual(self._round(), [])
+        self._set_timer(rc=0)
+        texts = self._round()
+        self.assertEqual(len(texts), 1)
+        self.assertIn("拉取代理状态未知：已恢复正常", texts[0])
+        self.assertEqual(self._alerting_keys(), set())
+
+    def test_missing_property_alerts_unknown(self) -> None:
+        self._set_timer(omit=("ActiveState",))
+        texts = self._round()
+        self.assertEqual(len(texts), 1)
+        self.assertIn("拉取代理状态未知", texts[0])
+        self.assertIn("property_missing:ActiveState", texts[0])
+
+    def test_unparseable_timestamp_alerts_unknown(self) -> None:
+        self._set_timer(extra_lines=("LastTriggerUSec=yesterday",), omit=("LastTriggerUSec",))
+        texts = self._round()
+        self.assertEqual(len(texts), 1)
+        self.assertIn("property_unparseable:LastTriggerUSec", texts[0])
+
+    def test_missing_systemctl_binary_alerts_unknown_without_exit_code_two(self) -> None:
+        self._set_timer(active_state="inactive")
+        with mock.patch.object(host_health_alert, "feishu_send_text") as sender:
+            exit_code = self._run(["--systemctl-bin", str(self.tmp_path / "no-such-systemctl")])
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(sender.call_count, 1)
+        text = sender.call_args.kwargs["text"]
+        self.assertIn("拉取代理状态未知", text)
+        self.assertIn("systemctl_not_found", text)
+        self.assertNotIn("no-such-systemctl", text)
+
+    def test_disable_flag_skips_check_and_never_invokes_systemctl(self) -> None:
+        self._set_timer(active_state="inactive")
+        self._set_service(result="exit-code", exit_status=1)
+        self.assertEqual(self._round(["--disable-release-pull-check"]), [])
+        self.assertFalse(self.calls_log.exists())
+        self.assertFalse(self.threshold_state_path.exists())
+
+    def test_dry_run_does_not_send_or_persist(self) -> None:
+        self._set_timer(active_state="inactive")
+        self.assertEqual(self._round(["--dry-run"]), [])
+        self.assertFalse(self.threshold_state_path.exists())
+        self.assertIn("release_pull_timer_inactive", self.log_path.read_text(encoding="utf-8"))
+
+    def test_alert_text_never_leaks_paths_tokens_or_command_lines(self) -> None:
+        # 桩输出里塞满哨兵：ExecStart 命令原文、环境里的令牌、路径；进程环境也塞一个。
+        leaky_lines = (
+            "ExecStart={ path=/opt/SENTINEL_PATH/release_pull_agent.py ; argv[]=/opt/lingxi/bin/"
+            "python3 -B /opt/SENTINEL_PATH/release_pull_agent.py --host-contract /opt/SENTINEL_PATH/"
+            "host-contract.json --env-file /opt/SENTINEL_PATH/gh.env run }",
+            "Environment=GH_TOKEN=SENTINEL_TOKEN_9f3a LINGXI_X=SENTINEL_ENV_VALUE",
+        )
+        self._set_timer(active_state="inactive", extra_lines=leaky_lines)
+        self._set_service(result="exit-code", exit_status=1, extra_lines=leaky_lines)
+        with mock.patch.dict(os.environ, {"LINGXI_LEAKY": "SENTINEL_PROCESS_ENV"}):
+            texts = self._round()
+            self._set_timer(rc=1, extra_lines=leaky_lines)
+            texts.extend(self._round())
+        # 三条告警都发了：定时器未激活、上一轮失败、然后读取失败转未知。
+        self.assertEqual(len(texts), 3)
+        forbidden = (
+            "SENTINEL",
+            "/opt/",
+            "--env-file",
+            "--host-contract",
+            "argv[]",
+            "GH_TOKEN",
+            str(self.tmp_path),
+            str(self.systemctl_bin),
+        )
+        for text in texts:
+            for needle in forbidden:
+                with self.subTest(needle=needle, text=text):
+                    self.assertNotIn(needle, text)
 
 
 if __name__ == "__main__":
