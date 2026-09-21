@@ -5,7 +5,7 @@
 ## 一、前提与已裁定
 
 - **D-4**：动机 = 停付 Supabase 订阅 + 数据自主；本地 PostgreSQL 大版本 17（不借迁库升级）。**D-5**：RPO 24 小时、RTO 4 小时（工作时段）、异机副本落 `biai-stage`、不做 PITR。**D-6**：切换 = 30 分钟停写 + 观察 7 天；观察期 Supabase 只停写不退役、可回切；迁移方式 = 停写窗口内 `pg_dump` / `pg_restore`（27 MB 以分钟计）。
-- 进入生产切换前必须齐：rc.C 验收记录 PR 已合；预发按本文完整演练四项全过（切换、备份、副本恢复、回退切回）；生产余盘 ≥ 10 GB；Supabase 付费档自动备份最近一份的时间已实读；脚本 sha 两端相等；来源库两项 idle 超时与 locale 现值已回读并钉进 `s30.env`。
+- 进入生产切换前必须齐：rc.C 验收记录 PR 已合；预发按本文完整演练四项全过（切换、备份、副本恢复、回退切回）；生产余盘 ≥ 10 GB；Supabase 付费档自动备份最近一份的时间已实读；脚本 sha 两端相等；来源库参数与 locale 现值已由产品负责人只读回读（Issue #859 评论 5753938437）并钉进 compose 缺省与 `s30.env`（idle 两项 0 / 0、`statement_timeout` 120 s、`TimeZone` UTC、ICU locale `en-US`），`install-pg` 按 `preflight` 实读自动派生 initdb 参数、不手填。
 - **属主与权限必须原样保留**：迁移 `0054` 的九十天清理函数是 `SECURITY DEFINER`、属主无登录角色 `lingxi_retention_owner`，内容表的删除触发器按 `current_user` 放行。`pg_restore --no-owner` 会把属主改成 `postgres`，迁完后每一轮保留清理都被触发器拒绝——因此脚本先按来源事实预建占位角色，`restore` 不带 `--no-owner` / `--no-privileges`，`verify` 逐对象比属主与 ACL。
 
 ## 二、角色与通路
@@ -46,8 +46,8 @@
 
 ## 五、`verify` 零差异的判据与预期差异
 
-- **判红项**（任一不等即退出非 0、打印逐项差异）：`encoding` / `datcollate` / `datctype`；`alembic_version`；`public` 对象计数（表 / 索引 / 序列 / 视图 / 函数 / 非内部触发器）；逐表精确行数；序列 `last_value`；逐表触发器名；`pg_trgm` 版本与 schema（`extensions`）；`lingxi_retention_cleanup` 属主 = `lingxi_retention_owner` 且 `prosecdef = true`；`public` 下全部表 / 序列 / 视图 / 函数与 schema 本身的属主逐个相等；同一集合的 ACL 逐对象相等。
-- **预期差异（只列不判红）**：来源的平台扩展（`supabase_vault` / `pg_stat_statements` / `pgcrypto` / `uuid-ossp` 等）不在目标——应用只依赖 `pg_trgm`；来源的平台角色（`supabase_*` / `authenticator` 等）不比对，只比 `public` 对象引用到的角色，它们已在 `install-pg` 按来源清单占位（`NOLOGIN`、无成员、无属性）。
+- **判红项**（任一不等即退出非 0、打印逐项差异）：`encoding` / `datcollate` / `datctype` / `datlocprovider` / `datlocale` 五项；角色级 `postgres` 的 `search_path`（来源 `"$user", public, extensions`，`install-pg` 镜像同一条）；`alembic_version`；`public` 对象计数（表 / 索引 / 序列 / 视图 / 函数 / 非内部触发器）；逐表精确行数；序列 `last_value`；逐表触发器名；`pg_trgm` 版本与 schema（`extensions`）；`lingxi_retention_cleanup` 属主 = `lingxi_retention_owner` 且 `prosecdef = true`；`public` 下全部表 / 序列 / 视图 / 函数与 schema 本身的属主逐个相等；同一集合的 ACL 逐对象相等。
+- **预期差异（只列不判红）**：`datcollversion`（来源 153.121，本地 `postgres:17` 实测 153.128——同 ICU 73 系，恢复后索引在本地重建，脚本只把两值记进 `verify.json`）；来源的平台扩展（`supabase_vault` / `pg_stat_statements` / `pgcrypto` / `uuid-ossp` 等）不在目标——应用只依赖 `pg_trgm`；来源的平台角色（`supabase_*` / `authenticator` 等）不比对，只比 `public` 对象引用到的角色，它们已在 `install-pg` 按来源清单占位（`NOLOGIN`、无成员、无属性）。
 - 比对基准是 `dump` 时（已停写）写下的来源快照，不是 `preflight`，也不是任何人工抄写的常量：迁移链头在研发机实得 `public` 表 46，与早先只读盘点表上的 85 不一致，`verify` 只认实时读数。
 
 ## 六、回退
@@ -66,6 +66,8 @@
 - 容器网络无 TLS：`switch-dsn` 把连接串里的 `sslmode=require` 改为 `sslmode=disable`，其余参数原样保留。
 - 数据库与三个应用容器同机同盘：共同故障域，靠每日备份 + 异机副本兜底（D-5）。
 - 应用栈的 `docker compose down` 会因本地库容器仍挂在 `lingxi_default` 网络上而删网失败（部署器从不 `down`，只 `stop` + `up -d`，不受影响）；本地库自己的 `compose down` 不删外部网络、可正常执行，日常停库只 `docker stop lingxi-db`，升级镜像走「改摘要 → `up -d`」。
-- 占位角色只为保住属主与 ACL 结构：来源平台角色若在 `public` 对象的 ACL 里出现（`anon` / `authenticated` / `service_role`），目标上会以同名 `NOLOGIN` 空角色存在，无任何成员与属性。
+- 占位角色只为保住属主与 ACL 结构：来源平台角色若在 `public` 对象的 ACL 里出现（`anon` / `authenticated` / `service_role`），目标上会以同名 `NOLOGIN` 空角色存在，无任何成员与属性；平台角色自己的设置（`statement_timeout` / `app.settings.*` 等）不照搬。
+- `wal_level` 本地取 `replica`（来源 `logical` 是托管方 realtime 所需）：可复核断言 = `replication slot|pg_logical|logical decoding|pgoutput|wal2json|CREATE PUBLICATION|CREATE SUBSCRIPTION|pg_create_logical` 在 `src/` `migrations/` `scripts/` `deploy/` 命中 0，`LISTEN` / `NOTIFY` 在任何 `wal_level` 都工作；D-5 不做逻辑复制。
+- 角色级 `search_path`：来源给 `postgres` 设了 `"$user", public, extensions`，应用与迁移零处裸引用 `extensions` 下的对象（0098 DDL 用限定名），功能上不依赖；为「与迁移前一致」零差异且未来迁移行为相同，`install-pg` 镜像同一条 `ALTER ROLE postgres SET search_path`，`verify` 比对。
 - `public` 处置用 TOC 过滤（跳过 dump 里的 `CREATE SCHEMA public` 条目、保留其 ACL 条目；来源属主不同时补一句 `ALTER SCHEMA public OWNER TO`）：先删再由 dump 重建的做法实测会丢掉 initdb 给 `public` 的缺省 ACL（PUBLIC 的 USAGE），`verify` 判红。
 - `dump` 与 `verify` 的行数快照来自停写后的两次只读连接；停写窗口外跑 `verify` 必然有差异，不是故障。
