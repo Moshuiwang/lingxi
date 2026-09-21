@@ -48,6 +48,10 @@
 #     现场（隔离容器、网络、dump 文件）原样保留供取证，失败信息会指出如何手动
 #     核对与之后如何清理（见下方“失败后如何处理”）。这是有意的：先取证、
 #     再销毁，不为了让脚本看起来"跑完"而在失败时静默擦掉现场。
+#   - **副本文件模式**（设 `LINGXI_DRILL_SOURCE_DUMP`）对源库零接触：不读任何 DSN、
+#     不 `pg_isready`、不 `pg_dump`、不回读行数，源库事实只来自副本旁的 `.sha256`
+#     与 `.counts.json` 两个随附文件；副本文件本身只读使用，脚本不改它的权限、
+#     收尾也不删它（它不是本脚本的产物，是备份闭环的证据）。
 #   - **源库 DSN 只从环境变量读，本脚本不接受、也不解析任何命令行参数**；DSN
 #     本身不打印、不落日志——唯一例外是源库操作失败时，会把捕获到的错误文本
 #     经 `mask()` 脱敏后打到 stderr 供排障，覆盖 URI 形态（`user:pass@`，含
@@ -60,6 +64,10 @@
 #     执行验证。
 #   - `postgres:17`、指定的 scheduler 镜像与 migrate 镜像已经在本机，或本机能
 #     `docker pull` 到（脚本不会静默重试拉取失败；缺镜像直接失败）。
+#   - 副本文件模式还需要宿主机有 `python3`（只用标准库解析行数清单）与
+#     `sha256sum`；副本、`<副本>.sha256`、`<副本>.counts.json` 三个文件放在一起。
+#     恢复前按清单预建 `extensions` schema 与其中的扩展（公共表的索引按名引用
+#     扩展成员，`pg_restore -n public` 不会自己带上扩展）。
 #   - 磁盘要有余量：dump 与隔离实例的数据量级与源库相当，加上三个镜像的本地
 #     层；执行前后各 `df -h` 一次自行核对，不由脚本代为判断磁盘是否够用。
 #   - **源库在整个演练窗口内应当基本静默**（见上方「破坏半径」行数回读一条）：
@@ -74,7 +82,7 @@
 # codex gpt-5.6-sol 2026-09-11 指出的真实缺口）：
 #   docker rm -f -v "${LINGXI_DRILL_DB_CONTAINER:-lingxi-drill-db}"
 #   docker network rm "${LINGXI_DRILL_NETWORK:-lingxi-drill-net}"
-#   rm -f <脚本打印的 dump/日志临时文件路径>
+#   rm -f <脚本打印的 dump/日志临时文件路径>   # 副本文件模式只删恢复日志：副本不是临时文件，不删
 #   docker volume ls --filter "label=com.docker.compose.project" # 仅供比对，本脚本不用 compose
 # `docker rm -v` 会清掉该容器挂的**全部**匿名卷（不止一个也一样，Docker 语义是
 # 按容器一次性回收，不是逐卷计数）；`step_isolate_and_restore` 探测到多于一个
@@ -94,6 +102,18 @@
 #                                     包裹单引号、协议是 `postgresql+psycopg://`
 #                                     ——脚本会自动去引号并把协议改写成
 #                                     `postgresql://`，调用方不需要手工改 env。
+#   LINGXI_DRILL_SOURCE_DUMP          副本文件模式：直接从这个 `pg_dump -Fc` 副本恢复，
+#                                     不连源库（上面两个 DSN 变量都不需要、有也不读）。
+#                                     恢复前先核 `<副本>.sha256`（按值比对，不依赖旁
+#                                     文件里记的文件名）与 `<副本>.counts.json`
+#                                     （schema=1）；恢复后表集合、逐表行数与
+#                                     alembic head 都与清单比对，差异逐行打印后失败。
+#                                     与 LINGXI_DRILL_DUMP_PATH 互斥。
+#   LINGXI_DRILL_SKIP_MIGRATE         `1` 时跳过 alembic upgrade head，只与副本文件
+#                                     模式同用；此时两个镜像引用可不给、合成样本注入
+#                                     强制为 0。缺省 `0`，只接受 0 / 1。**仅供没有
+#                                     lingxi 镜像的主机验证恢复与比对链路，正式演练
+#                                     不得设。**
 #   LINGXI_DRILL_NETWORK              隔离网络名，默认 lingxi-drill-net
 #   LINGXI_DRILL_DB_CONTAINER         隔离数据库容器名，默认 lingxi-drill-db
 #   LINGXI_DRILL_POSTGRES_IMAGE       隔离数据库镜像与源库只读工具镜像共用同一个
@@ -142,13 +162,36 @@
 #   LINGXI_DRILL_SCHEDULER_IMAGE=ghcr.io/moshuiwang/lingxi-scheduler:<tag> \
 #   LINGXI_DRILL_MIGRATE_IMAGE=ghcr.io/moshuiwang/lingxi-migrate:<tag> \
 #     scripts/ops/backup_restore_drill.sh
+# 副本文件模式（备份闭环演练：从备份脚本写出的副本恢复到独立实例、与随附清单零
+# 差异；有镜像的主机照常迁移、注入合成样本、补跑清理并核对）：
+#   LINGXI_DRILL_SOURCE_DUMP=<副本路径>.dump \
+#   LINGXI_DRILL_INJECT_SYNTHETIC=1 \
+#   LINGXI_DRILL_SCHEDULER_IMAGE=ghcr.io/moshuiwang/lingxi-scheduler:<tag> \
+#   LINGXI_DRILL_MIGRATE_IMAGE=ghcr.io/moshuiwang/lingxi-migrate:<tag> \
+#     scripts/ops/backup_restore_drill.sh
+# 没有 lingxi 镜像的主机只验恢复与比对链路（正式演练不得这样跑）：
+#   LINGXI_DRILL_SOURCE_DUMP=<副本路径>.dump LINGXI_DRILL_SKIP_MIGRATE=1 \
+#     scripts/ops/backup_restore_drill.sh
 set -euo pipefail
 
 DRILL_NETWORK="${LINGXI_DRILL_NETWORK:-lingxi-drill-net}"
 DRILL_DB_CONTAINER="${LINGXI_DRILL_DB_CONTAINER:-lingxi-drill-db}"
 DRILL_POSTGRES_IMAGE="${LINGXI_DRILL_POSTGRES_IMAGE:-postgres:17}"
-DRILL_SCHEDULER_IMAGE="${LINGXI_DRILL_SCHEDULER_IMAGE:?必须指定用于执行真实保留清理代码路径的 scheduler 镜像引用，例如 ghcr.io/moshuiwang/lingxi-scheduler:<tag>}"
-DRILL_MIGRATE_IMAGE="${LINGXI_DRILL_MIGRATE_IMAGE:?必须指定用于执行 alembic upgrade head 的 migrate 镜像引用，例如 ghcr.io/moshuiwang/lingxi-migrate:<tag>}"
+SOURCE_DUMP="${LINGXI_DRILL_SOURCE_DUMP:-}"
+SKIP_MIGRATE="${LINGXI_DRILL_SKIP_MIGRATE:-0}"
+if [[ "${SKIP_MIGRATE}" != "0" && "${SKIP_MIGRATE}" != "1" ]]; then
+  echo "配置错误：LINGXI_DRILL_SKIP_MIGRATE 只接受 0 或 1，收到「${SKIP_MIGRATE}」" >&2
+  exit 1
+fi
+# 跳过迁移（只允许与副本文件模式同用，见预检）时两个镜像引用不再是硬前提；其余
+# 情况维持「必须显式指定」的既有纪律。
+if [[ "${SKIP_MIGRATE}" == "1" ]]; then
+  DRILL_SCHEDULER_IMAGE="${LINGXI_DRILL_SCHEDULER_IMAGE:-}"
+  DRILL_MIGRATE_IMAGE="${LINGXI_DRILL_MIGRATE_IMAGE:-}"
+else
+  DRILL_SCHEDULER_IMAGE="${LINGXI_DRILL_SCHEDULER_IMAGE:?必须指定用于执行真实保留清理代码路径的 scheduler 镜像引用，例如 ghcr.io/moshuiwang/lingxi-scheduler:<tag>}"
+  DRILL_MIGRATE_IMAGE="${LINGXI_DRILL_MIGRATE_IMAGE:?必须指定用于执行 alembic upgrade head 的 migrate 镜像引用，例如 ghcr.io/moshuiwang/lingxi-migrate:<tag>}"
+fi
 INJECT_SYNTHETIC="${LINGXI_DRILL_INJECT_SYNTHETIC:-1}"
 DUMP_PATH="${LINGXI_DRILL_DUMP_PATH:-}"
 
@@ -224,7 +267,27 @@ step_preflight() {
     echo "配置错误：LINGXI_DRILL_INJECT_SYNTHETIC 只接受 0 或 1，收到「${INJECT_SYNTHETIC}」——不是这两个字面值时不当成 0 处理，避免笔误静默跳过保留语义核对" >&2
     exit 1
   fi
-  SOURCE_DSN=$(resolve_source_dsn)
+  if [[ "${SKIP_MIGRATE}" == "1" ]]; then
+    if [[ -z "${SOURCE_DUMP}" ]]; then
+      echo "配置错误：LINGXI_DRILL_SKIP_MIGRATE=1 只允许与 LINGXI_DRILL_SOURCE_DUMP 同用（没有 lingxi 镜像的主机验证恢复与比对链路）；全模式不接受" >&2
+      exit 1
+    fi
+    if [[ "${INJECT_SYNTHETIC}" == "1" ]]; then
+      log "跳过迁移时不注入合成样本、不补跑保留清理（两者都要 lingxi 镜像）：LINGXI_DRILL_INJECT_SYNTHETIC 强制按 0 处理"
+      INJECT_SYNTHETIC=0
+    fi
+  fi
+  if [[ -n "${SOURCE_DUMP}" ]]; then
+    # 副本文件模式：源库事实只来自副本与随附清单，不解析、不读取任何 DSN。
+    if [[ -n "${DUMP_PATH}" ]]; then
+      echo "配置错误：LINGXI_DRILL_SOURCE_DUMP 与 LINGXI_DRILL_DUMP_PATH 只能设一个——副本文件模式直接从给定副本恢复，不再写新的 dump" >&2
+      exit 1
+    fi
+    require_cmd python3
+    require_cmd sha256sum
+  else
+    SOURCE_DSN=$(resolve_source_dsn)
+  fi
   # 命名碰撞断言（独立审查 P2-12 的登记延续）：DRILL_DB_CONTAINER 与
   # DRILL_NETWORK 是脚本同时创建、同时存在的两个不同类型对象，同名会让不显式
   # 声明对象类型的排查命令（`docker inspect <名字>`）产生歧义。纯字符串比较，
@@ -245,12 +308,98 @@ step_preflight() {
     echo "残留网络 ${DRILL_NETWORK}，请先 docker network rm 再重跑" >&2
     exit 1
   fi
-  if [[ -z "${DUMP_PATH}" ]]; then
-    DUMP_PATH=$(mktemp /tmp/lingxi-drill-dump-XXXXXX.dump)
+  if [[ -n "${SOURCE_DUMP}" ]]; then
+    # 副本文件不是本脚本的产物：只读使用，不改它的权限。
+    DUMP_PATH="${SOURCE_DUMP}"
+  else
+    if [[ -z "${DUMP_PATH}" ]]; then
+      DUMP_PATH=$(mktemp /tmp/lingxi-drill-dump-XXXXXX.dump)
+    fi
+    chmod 600 "${DUMP_PATH}"
   fi
-  chmod 600 "${DUMP_PATH}"
   RESTORE_LOG=$(mktemp /tmp/lingxi-drill-restore-XXXXXX.log)
-  log "dump 文件：${DUMP_PATH}（0600，pg_dump -Fc 自定义格式）；恢复日志：${RESTORE_LOG}"
+  if [[ -n "${SOURCE_DUMP}" ]]; then
+    log "副本文件：${DUMP_PATH}（只读使用，不改权限、不删除）；恢复日志：${RESTORE_LOG}"
+  else
+    log "dump 文件：${DUMP_PATH}（0600，pg_dump -Fc 自定义格式）；恢复日志：${RESTORE_LOG}"
+  fi
+}
+
+# 行数清单读取（副本文件模式）：python3 只用标准库 json，不用 3.9 之后的语法——宿主
+# 机的系统解释器可能只有 3.9。清单形状由备份脚本定义，这里只核 schema=1 与所需三键的
+# 类型；输出行格式固定（tables → `public.<表>|<行数>` 每行一张、extensions →
+# `<名>@<版本>` 每行一个、alembic_head → 一行），供 shell 侧逐行比对。
+manifest_read() {
+  python3 - "$1" "$2" <<'PY'
+import json
+import sys
+
+path, key = sys.argv[1], sys.argv[2]
+try:
+    with open(path, encoding="utf-8") as fh:
+        data = json.load(fh)
+except ValueError:
+    sys.exit("行数清单不是合法 JSON：" + path)
+schema = data.get("schema") if isinstance(data, dict) else None
+if isinstance(schema, bool) or schema != 1:
+    sys.exit("行数清单 schema 不是 1（只认备份脚本当前写出的形状）：" + path)
+tables, head, extensions = data.get("tables"), data.get("alembic_head"), data.get("extensions")
+if not isinstance(tables, dict) or not isinstance(head, str) or not head:
+    sys.exit("行数清单缺 tables 或 alembic_head：" + path)
+if not isinstance(extensions, list):
+    sys.exit("行数清单缺 extensions：" + path)
+if key == "tables":
+    for name in sorted(tables):
+        print("%s|%s" % (name, tables[name]))
+elif key == "extensions":
+    for item in extensions:
+        print(item)
+elif key == "alembic_head":
+    print(head)
+else:
+    sys.exit("未知的清单键：" + key)
+PY
+}
+
+# 副本文件模式：源库事实只来自副本旁的两个随附文件——`<副本>.sha256`（备份脚本写出
+# 的校验和，第一个字段是 64 位十六进制）与 `<副本>.counts.json`（行数清单）。校验和按
+# 值比对而不是 `sha256sum -c`：旁文件里记的文件名可能是备份目录里的相对名或绝对路径，
+# 副本被传到别的主机、别的目录后按名核对会假红，按值核对不会。
+step_verify_source_dump() {
+  log "== 副本文件模式：核对副本与随附清单（不连源库）=="
+  local sidecar="${SOURCE_DUMP}.sha256" manifest="${SOURCE_DUMP}.counts.json"
+  if [[ ! -f "${SOURCE_DUMP}" ]]; then
+    echo "副本文件不存在：${SOURCE_DUMP}" >&2
+    exit 1
+  fi
+  if [[ ! -f "${sidecar}" ]]; then
+    echo "缺少校验和文件：${sidecar}" >&2
+    exit 1
+  fi
+  local expected actual
+  expected=$(awk 'NR == 1 { print $1 }' "${sidecar}")
+  if [[ ! "${expected}" =~ ^[0-9a-f]{64}$ ]]; then
+    echo "校验和文件第一个字段不是 64 位十六进制：${sidecar}" >&2
+    exit 1
+  fi
+  actual=$(sha256sum "${SOURCE_DUMP}" | awk '{ print $1 }')
+  if [[ "${expected}" != "${actual}" ]]; then
+    echo "核对失败：副本校验和与随附记录不一致，副本可能损坏或不完整，停止：" >&2
+    echo "--- 随附记录 ---" >&2
+    echo "${expected}" >&2
+    echo "--- 实测 ---" >&2
+    echo "${actual}" >&2
+    exit 1
+  fi
+  log "校验和一致：${actual}"
+  if [[ ! -f "${manifest}" ]]; then
+    echo "缺少行数清单：${manifest}" >&2
+    exit 1
+  fi
+  MANIFEST_TABLES=$(manifest_read "${manifest}" tables)
+  MANIFEST_ALEMBIC_HEAD=$(manifest_read "${manifest}" alembic_head)
+  MANIFEST_EXTENSIONS=$(manifest_read "${manifest}" extensions)
+  log "行数清单可用：schema=1，$(printf '%s\n' "${MANIFEST_TABLES}" | grep -c .) 张表，alembic_head=${MANIFEST_ALEMBIC_HEAD}，扩展：$(printf '%s\n' "${MANIFEST_EXTENSIONS}" | tr '\n' ' ')"
 }
 
 step_precheck_source() {
@@ -354,6 +503,15 @@ step_isolate_and_restore() {
     \$\$;
   " >/dev/null
 
+  # 副本文件模式的第二处前置：`pg_restore -n public` 只恢复 public 下的对象，dump 里
+  # 的 `extensions` schema 与 CREATE EXTENSION 条目会被跳过，而 public 下的索引定义按
+  # 名引用 `extensions.gin_trgm_ops` 这类扩展成员——不预建就在建索引那一步失败退出
+  # （本机对链头源库的 dump 实测撞到）。全模式今天没有这一步，源库装了扩展时同样
+  # 会撞；那不在本次改动范围，只登记不顺手改。
+  if [[ -n "${SOURCE_DUMP}" ]]; then
+    step_precreate_extensions
+  fi
+
   # --exit-on-error：pg_restore 默认遇错继续跑完、只在汇总里报警告，退出码仍可能
   # 是 0；本文件全程靠 `set -e` 判定成败，没有这个开关会让恢复过程中的错误被
   # `set -e` 漏掉（同「其余步骤靠 psql -v ON_ERROR_STOP=1 保证失败即停」的一贯
@@ -400,6 +558,35 @@ step_isolate_and_restore() {
     \$\$;
   " >/dev/null
   log "属主与授权修复完成：lingxi_retention_cleanup（若存在）已改回属主 lingxi_retention_owner 并补回其读写两张受限表所需的 GRANT"
+}
+
+# 按清单 `extensions` 键预建扩展：schema 固定为 `extensions`（迁移链安装扩展的约定，
+# 也是托管方的默认位置）；名字只允许小写标识符形状（要拼进 SQL，不信任清单里的
+# 任意文本）；版本不钉——以隔离实例镜像自带的版本为准并打印出来，版本漂移是
+# 镜像选型问题、不是恢复失败。`plpgsql` 每个库自带、装在 pg_catalog，跳过。
+step_precreate_extensions() {
+  log "== 副本文件模式：按清单预建扩展（schema extensions，不钉版本）=="
+  local entry name
+  while IFS= read -r entry; do
+    [[ -z "${entry}" ]] && continue
+    name="${entry%%@*}"
+    if [[ ! "${name}" =~ ^[a-z_][a-z0-9_]*$ ]]; then
+      echo "清单里的扩展名不是小写标识符形状，拒绝拼进 SQL：${entry}" >&2
+      exit 1
+    fi
+    if [[ "${name}" == "plpgsql" ]]; then
+      continue
+    fi
+    docker exec "${DRILL_DB_CONTAINER}" psql -U "${DRILL_DB_USER}" -d "${DRILL_DB_NAME}" -v ON_ERROR_STOP=1 \
+      -c "CREATE SCHEMA IF NOT EXISTS extensions; CREATE EXTENSION IF NOT EXISTS ${name} WITH SCHEMA extensions;" >/dev/null
+  done <<<"${MANIFEST_EXTENSIONS}"
+  log "扩展就绪：$(docker exec "${DRILL_DB_CONTAINER}" psql -At -U "${DRILL_DB_USER}" -d "${DRILL_DB_NAME}" \
+    -c "SELECT coalesce(string_agg(extname || '@' || extversion || ' schema=' || n.nspname, ' ' ORDER BY extname), '（无）') FROM pg_extension e JOIN pg_namespace n ON n.oid = e.extnamespace WHERE extname <> 'plpgsql'")"
+}
+
+step_skip_migrate() {
+  log "== 迁移：跳过 =="
+  log "!!! 跳过 ALEMBIC UPGRADE HEAD：仅供没有 lingxi 镜像的主机做结构验证，正式演练不得设 LINGXI_DRILL_SKIP_MIGRATE=1 !!!"
 }
 
 step_migrate() {
@@ -455,6 +642,32 @@ step_verify_row_counts() {
     exit 1
   fi
   log "行数回读通过：$(printf '%s\n' "${target_counts}" | grep -c .) 张表逐表一致"
+}
+
+# 副本文件模式的行数回读：不连源库，与副本随附清单比对。表集合与逐表行数都要相等
+# （清单没有而恢复后有、或反过来，都算差异）；alembic_version 也要与清单 alembic_head
+# 相等。两边都经 LC_ALL=C 排序后逐行 diff，差异逐行打印后失败。
+step_verify_manifest_counts() {
+  log "== 行数回读：恢复（且迁移）之后与副本随附清单逐表一致、alembic head 一致 =="
+  local expected actual head
+  expected=$(printf '%s\n' "${MANIFEST_TABLES}" | LC_ALL=C sort)
+  actual=$(docker exec "${DRILL_DB_CONTAINER}" psql -A -t -F '|' -U "${DRILL_DB_USER}" -d "${DRILL_DB_NAME}" \
+    -c "$(row_counts_sql)" | sed 's/^/public./' | LC_ALL=C sort)
+  if [[ "${expected}" != "${actual}" ]]; then
+    echo "核对失败：恢复后的 public 表集合或逐表行数与副本随附清单不一致（< 清单，> 恢复后）：" >&2
+    diff <(printf '%s\n' "${expected}") <(printf '%s\n' "${actual}") >&2 || true
+    echo "两种已知原因：① 副本与清单不是同一次备份写出的（核对清单 dumped_at 与备份状态文件）；" >&2
+    echo "② 迁移把恢复出的实例推进到了比清单更新的链头，新增了清单没有的表——这不代表恢复出错，" >&2
+    echo "   代表副本落后于所用镜像的迁移链；用与副本同一链头的镜像重跑。" >&2
+    exit 1
+  fi
+  head=$(docker exec "${DRILL_DB_CONTAINER}" psql -At -U "${DRILL_DB_USER}" -d "${DRILL_DB_NAME}" \
+    -c "SELECT version_num FROM alembic_version")
+  if [[ "${head}" != "${MANIFEST_ALEMBIC_HEAD}" ]]; then
+    echo "核对失败：恢复后的 alembic_version（${head}）与清单 alembic_head（${MANIFEST_ALEMBIC_HEAD}）不一致" >&2
+    exit 1
+  fi
+  log "行数回读通过：$(printf '%s\n' "${actual}" | grep -c .) 张表逐表与清单一致；alembic head ${head} 一致"
 }
 
 # 真实（非本脚本合成）行的主键快照：按「安全边际未到期」（expires_at 比清理
@@ -725,8 +938,13 @@ step_destroy() {
   log "== 销毁隔离实例与临时产物 =="
   docker rm -f -v "${DRILL_DB_CONTAINER}" >/dev/null
   docker network rm "${DRILL_NETWORK}" >/dev/null
-  rm -f "${DUMP_PATH}" "${RESTORE_LOG}"
-  log "已删除容器 ${DRILL_DB_CONTAINER}（含其匿名数据卷 ${DRILL_VOLUME}）、网络 ${DRILL_NETWORK}、dump 与恢复日志临时文件"
+  if [[ -n "${SOURCE_DUMP}" ]]; then
+    rm -f "${RESTORE_LOG}"
+    log "已删除容器 ${DRILL_DB_CONTAINER}（含其匿名数据卷 ${DRILL_VOLUME}）、网络 ${DRILL_NETWORK}、恢复日志临时文件；副本文件 ${SOURCE_DUMP} 与随附清单原样保留（不是本脚本产物）"
+  else
+    rm -f "${DUMP_PATH}" "${RESTORE_LOG}"
+    log "已删除容器 ${DRILL_DB_CONTAINER}（含其匿名数据卷 ${DRILL_VOLUME}）、网络 ${DRILL_NETWORK}、dump 与恢复日志临时文件"
+  fi
   log "-- 残留盘点 --"
   docker ps -a --filter "name=${DRILL_DB_CONTAINER}"
   docker network ls --filter "name=${DRILL_NETWORK}"
@@ -739,11 +957,23 @@ step_destroy() {
 }
 
 step_preflight
-step_precheck_source
-step_backup
+if [[ -n "${SOURCE_DUMP}" ]]; then
+  step_verify_source_dump
+else
+  step_precheck_source
+  step_backup
+fi
 step_isolate_and_restore
-step_migrate
-step_verify_row_counts
+if [[ "${SKIP_MIGRATE}" == "1" ]]; then
+  step_skip_migrate
+else
+  step_migrate
+fi
+if [[ -n "${SOURCE_DUMP}" ]]; then
+  step_verify_manifest_counts
+else
+  step_verify_row_counts
+fi
 if [[ "${INJECT_SYNTHETIC}" == "1" ]]; then
   step_inject_synthetic
   step_run_real_cleanup
