@@ -6,7 +6,7 @@
 
 ## [Unreleased]
 
-2.6.0 迁库版（Trace [#859](https://github.com/Moshuiwang/lingxi/issues/859) 发布2）：生产数据库从 Supabase 迁到生产主机本地 PostgreSQL 17，装入 [#809](https://github.com/Moshuiwang/lingxi/issues/809) / [#835](https://github.com/Moshuiwang/lingxi/issues/835) 两处改动；本节随批次合入逐条追加。
+2.6.0 迁库版（Trace [#859](https://github.com/Moshuiwang/lingxi/issues/859) 发布2）：生产数据库从 Supabase 迁到生产主机本地 PostgreSQL 17，装入 [#809](https://github.com/Moshuiwang/lingxi/issues/809) / [#835](https://github.com/Moshuiwang/lingxi/issues/835) 两处改动。**切换当日有一个不超过 30 分钟的停写窗口**：窗口内问数与卡片投递暂停，窗口结束后自动恢复，窗口前已提交的请求不丢失；本节随批次合入逐条追加。
 
 ### Changed
 

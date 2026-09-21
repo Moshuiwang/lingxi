@@ -2,8 +2,10 @@
 #
 # 用法（独立于应用编排，不叠进 deploy/compose.yaml；值全部来自 --env-file 指向的文件）：
 #
-#   docker compose --env-file /opt/lingxi/db/compose.env -f /opt/lingxi/db/compose.db.yaml up -d
-#   docker compose --env-file /opt/lingxi/db/compose.env -f /opt/lingxi/db/compose.db.yaml config
+#   docker compose --env-file /etc/lingxi/db/compose.env -f /opt/lingxi/db/compose.db.yaml up -d
+#   docker compose --env-file /etc/lingxi/db/compose.env -f /opt/lingxi/db/compose.db.yaml config
+#
+# （路径是切换脚本 `install-pg` 的缺省：配置文件在 /etc/lingxi/db/，compose 副本在 /opt/lingxi/db/。）
 #
 # 与应用编排分开成第二个 compose 项目，是因为生命周期不同：拉取代理每次发布对应用栈
 # 只做 `docker stop` + `compose up -d`、从不 `compose down`，数据库不跟着发布重建；
@@ -12,7 +14,8 @@
 # **接入方式：加入应用栈已存在的网络，不改应用 compose。** 应用编排没有显式 networks，
 # compose 给它建的默认网络名为 `<项目名>_default`（项目名 `lingxi` → `lingxi_default`，
 # 生产实读同名）。应用容器以主机名 `lingxi-db` 连本实例（连接串主机段写 `lingxi-db`）；
-# 宿主侧 psql / 备份脚本 / 监控采样只经回环端口，本实例不向外网发布任何端口。
+# 宿主 psql 与业务采样经回环端口 127.0.0.1:5432；每日备份与巡检的本地库检查项经 `docker exec`
+# 走容器内工具链；本实例不向外网发布任何端口。
 #
 # **配置全部走环境变量，一处不写死**：必填两项（凭据文件、数据目录）缺失即渲染失败；
 # 其余带缺省。缺省值来自两处：来源库实读值（Issue #859 评论 5753938437：idle 两项 / statement_timeout /
