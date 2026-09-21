@@ -1,0 +1,109 @@
+# Lingxi 本地数据库编排：生产 / 预发主机上的 PostgreSQL 17 单实例（Issue #809）。
+#
+# 用法（独立于应用编排，不叠进 deploy/compose.yaml；值全部来自 --env-file 指向的文件）：
+#
+#   docker compose --env-file /opt/lingxi/db/compose.env -f /opt/lingxi/db/compose.db.yaml up -d
+#   docker compose --env-file /opt/lingxi/db/compose.env -f /opt/lingxi/db/compose.db.yaml config
+#
+# 与应用编排分开成第二个 compose 项目，是因为生命周期不同：拉取代理每次发布对应用栈
+# 只做 `docker stop` + `compose up -d`、从不 `compose down`，数据库不跟着发布重建；
+# 本文件的实例由切换脚本（`install-pg`）与运维手工起停，升级镜像也单独走。
+#
+# **接入方式：加入应用栈已存在的网络，不改应用 compose。** 应用编排没有显式 networks，
+# compose 给它建的默认网络名为 `<项目名>_default`（项目名 `lingxi` → `lingxi_default`，
+# 生产实读同名）。应用容器以主机名 `lingxi-db` 连本实例（连接串主机段写 `lingxi-db`）；
+# 宿主侧 psql / 备份脚本 / 监控采样只经回环端口，本实例不向外网发布任何端口。
+#
+# **配置全部走环境变量，一处不写死**：必填两项（凭据文件、数据目录）缺失即渲染失败；
+# 其余带缺省。缺省值按生产主机规格（2 vCPU / 3.8 GB、三服务合计限额约 3 GB）取保守值，
+# 推导与调参依据见 deploy/监控告警.md「十、本地数据库」。
+#
+# 本文件没有 `build:` 键：只拉钉住摘要的官方镜像，不在生产现场构建。
+
+name: lingxi-db
+
+services:
+  db:
+    # 镜像钉摘要（postgres:17 = 17.11，2026-09-20 `docker pull postgres:17` 实读）。升级：
+    # 在研发机 `docker pull postgres:17` 取新摘要 → 改本行 → 预发先滚一遍 → 生产
+    # `compose up -d`；同一大版本内换小版本不需要 initdb，数据目录原样沿用。
+    image: postgres:17@sha256:f4c66b820c6f974249089d3d16d86a3698eae11e8746eb6644b2271031e91232
+    # 容器名固定，应用连接串与备份脚本都按名字找它；本机演练用另一个名字与真实实例并存。
+    container_name: ${LINGXI_DB_CONTAINER_NAME:-lingxi-db}
+    restart: unless-stopped
+    # 60s：checkpoint + 断开连接的正常关库时间；超过即 SIGKILL，下次启动走崩溃恢复
+    # （数据不丢，只是慢）。备份脚本另有自己的超时，不依赖本值。
+    stop_grace_period: 60s
+    # 口令只放 --env-file 之外的第二份文件（root 0600，内容只有一行 POSTGRES_PASSWORD=）：
+    # compose.env 里是路径与参数，不含凭据；`docker compose config` 输出会展开 env_file
+    # 的内容，回读时注意不要把渲染结果贴进任何留痕。
+    env_file:
+      - ${LINGXI_DB_ENV_FILE:?LINGXI_DB_ENV_FILE is required}
+    environment:
+      # 库名与角色沿用来源库（应用今天就以 `postgres` 连 `postgres` 库，连接串只改主机段）。
+      # 已知边界：本地实例上 `postgres` 是超级用户，应用因此以超级用户身份连库；收紧为
+      # 专用低权角色另立工作项，不在迁库版内做。
+      POSTGRES_DB: postgres
+      POSTGRES_USER: postgres
+      # 只在首次 initdb 生效（数据目录已有内容时整段忽略）。locale 须与来源库
+      # `datcollate` / `datctype` 一致，否则切换脚本 `verify` 的库级比对判红；
+      # 来源现值待 S-3-0 回读后钉值（待回填），此处为占位缺省。
+      POSTGRES_INITDB_ARGS: ${LINGXI_DB_INITDB_ARGS:---encoding=UTF8 --locale=en_US.utf8 --data-checksums}
+    # 服务端参数经命令行传入而不是挂 postgresql.conf：值在版本控制里可见、可 diff，
+    # 改参数 = 改 compose.env 后 `up -d`（容器重建，数据目录不动）。
+    command:
+      - postgres
+      - -c
+      - shared_buffers=${LINGXI_DB_SHARED_BUFFERS:-128MB}
+      - -c
+      - max_connections=${LINGXI_DB_MAX_CONNECTIONS:-100}
+      - -c
+      - work_mem=${LINGXI_DB_WORK_MEM:-8MB}
+      - -c
+      - maintenance_work_mem=${LINGXI_DB_MAINTENANCE_WORK_MEM:-64MB}
+      # 两项 idle 超时：来源库现值待 S-3-0 回读后钉值（待回填）；占位缺省 = 事务内空闲
+      # 5 分钟即断、会话空闲不断（毫秒）。
+      - -c
+      - idle_in_transaction_session_timeout=${LINGXI_DB_IDLE_IN_TRANSACTION_TIMEOUT:-300000}
+      - -c
+      - idle_session_timeout=${LINGXI_DB_IDLE_SESSION_TIMEOUT:-0}
+      # 慢语句记入容器日志（毫秒），与应用侧 3s 语句超时同量级。
+      - -c
+      - log_min_duration_statement=${LINGXI_DB_LOG_MIN_DURATION:-3000}
+    # 数据目录用宿主目录绑定挂载而不是具名卷：备份、迁移与磁盘核对都要按路径找它，
+    # 且 `compose down -v` 不会误删数据。目录由切换脚本 `install-pg` 建（root 0700）。
+    volumes:
+      - ${LINGXI_DB_DATA_DIR:?LINGXI_DB_DATA_DIR is required}:/var/lib/postgresql/data
+    # 只在回环发布：宿主侧 psql / pg_dump 容器（--network host）/ 监控采样走这里；
+    # 应用容器走 compose 网络的 5432，不经过宿主端口。
+    ports:
+      - "127.0.0.1:${LINGXI_DB_HOST_PORT:-5432}:5432"
+    networks:
+      - app
+    # PostgreSQL 的并行查询与动态共享内存用 /dev/shm；docker 缺省 64m 会让并行工作进程
+    # 报 "could not resize shared memory segment"。
+    shm_size: ${LINGXI_DB_SHM_SIZE:-256m}
+    deploy:
+      resources:
+        limits:
+          cpus: "${LINGXI_DB_CPU_LIMIT:-1.0}"
+          memory: ${LINGXI_DB_MEMORY_LIMIT:-768M}
+    # 探 TCP 而不是 unix socket：官方镜像首次 initdb 期间会起一个只听 socket 的临时
+    # 服务跑初始化脚本，探 socket 会在那一段误报 healthy；应用与备份都走 TCP。
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "postgres", "-d", "postgres", "-h", "127.0.0.1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+networks:
+  # 应用栈的既有网络（external：本文件不建也不删它）。名字按项目名推导，见文件头。
+  app:
+    external: true
+    name: ${LINGXI_DB_APP_NETWORK:-lingxi_default}

@@ -1,0 +1,13 @@
+[Unit]
+Description=每日触发一次 Lingxi 本地数据库备份（UTC 18:30 = 北京 02:30 低峰，Issue #809）
+
+[Timer]
+# RPO 24 小时（D-5）：每日一次；落在业务低峰。Persistent 让停机错过的那一轮开机补跑；
+# 随机延迟最多 5 分钟，避开与整点的其它定时任务对齐。
+OnCalendar=*-*-* 18:30:00 UTC
+RandomizedDelaySec=300
+Persistent=true
+AccuracySec=1m
+
+[Install]
+WantedBy=timers.target
