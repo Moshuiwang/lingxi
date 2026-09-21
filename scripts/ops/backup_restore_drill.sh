@@ -22,9 +22,10 @@
 # `postgres:17`，其内建客户端天然是同版本，`docker exec` 到它身上不受此限制。
 #
 # **破坏半径（先读这一段再执行）**：
-#   - 对源库**只有**三次只读连接：`pg_isready` 预检、`pg_dump -Fc` 备份、
-#     恢复并迁移之后的一次逐表行数回读（`step_verify_row_counts`，只读
-#     `count(*)`）；本脚本不建立任何写连接，不 stop/restart 任何服务，不重启
+#   - 对源库**只有**四次只读连接：`pg_isready` 预检、`pg_dump -Fc` 备份、恢复前
+#     只读读源库扩展清单（`pg_extension` 里除 `plpgsql` 外的扩展名 / schema /
+#     版本，用于在隔离实例预建）、恢复并迁移之后的一次逐表行数回读
+#     （`step_verify_row_counts`，只读 `count(*)`）；本脚本不建立任何写连接，不 stop/restart 任何服务，不重启
 #     任何容器，不触碰源库所在主机（此前版本头注释漏记了行数回读这一次，
 #     外审 codex gpt-5.6-sol 2026-09-11 指出）。
 #   - **行数回读假设演练窗口内源库静默（无并发写入）**：`pg_dump` 与行数回读
@@ -66,8 +67,12 @@
 #     `docker pull` 到（脚本不会静默重试拉取失败；缺镜像直接失败）。
 #   - 副本文件模式还需要宿主机有 `python3`（只用标准库解析行数清单）与
 #     `sha256sum`；副本、`<副本>.sha256`、`<副本>.counts.json` 三个文件放在一起。
-#     恢复前按清单预建 `extensions` schema 与其中的扩展（公共表的索引按名引用
-#     扩展成员，`pg_restore -n public` 不会自己带上扩展）。
+#   - 两种模式恢复前都先在隔离实例预建扩展（`pg_restore -n public` 只带 public 下
+#     的对象，而 public 表的索引按名引用 `extensions.gin_trgm_ops` 这类扩展成员）：
+#     全模式按源库 `pg_extension` 实际的扩展名 / schema，副本模式按清单 `extensions`
+#     键（schema 固定 `extensions`）。隔离实例镜像不提供的扩展跳过并打印（托管方
+#     自带的平台扩展不属于 public 对象的依赖）；若 public 对象真依赖它，恢复会在
+#     该对象处失败退出，不会静默。
 #   - 磁盘要有余量：dump 与隔离实例的数据量级与源库相当，加上三个镜像的本地
 #     层；执行前后各 `df -h` 一次自行核对，不由脚本代为判断磁盘是否够用。
 #   - **源库在整个演练窗口内应当基本静默**（见上方「破坏半径」行数回读一条）：
@@ -328,7 +333,8 @@ step_preflight() {
 # 行数清单读取（副本文件模式）：python3 只用标准库 json，不用 3.9 之后的语法——宿主
 # 机的系统解释器可能只有 3.9。清单形状由备份脚本定义，这里只核 schema=1 与所需三键的
 # 类型；输出行格式固定（tables → `public.<表>|<行数>` 每行一张、extensions →
-# `<名>@<版本>` 每行一个、alembic_head → 一行），供 shell 侧逐行比对。
+# `<名>|extensions|<版本>` 每行一个（清单只记名字与版本，schema 按迁移链安装扩展
+# 的约定固定为 `extensions`）、alembic_head → 一行），供 shell 侧逐行比对与预建。
 manifest_read() {
   python3 - "$1" "$2" <<'PY'
 import json
@@ -353,7 +359,8 @@ if key == "tables":
         print("%s|%s" % (name, tables[name]))
 elif key == "extensions":
     for item in extensions:
-        print(item)
+        name, _, version = str(item).partition("@")
+        print("%s|extensions|%s" % (name, version))
 elif key == "alembic_head":
     print(head)
 else:
@@ -398,8 +405,8 @@ step_verify_source_dump() {
   fi
   MANIFEST_TABLES=$(manifest_read "${manifest}" tables)
   MANIFEST_ALEMBIC_HEAD=$(manifest_read "${manifest}" alembic_head)
-  MANIFEST_EXTENSIONS=$(manifest_read "${manifest}" extensions)
-  log "行数清单可用：schema=1，$(printf '%s\n' "${MANIFEST_TABLES}" | grep -c .) 张表，alembic_head=${MANIFEST_ALEMBIC_HEAD}，扩展：$(printf '%s\n' "${MANIFEST_EXTENSIONS}" | tr '\n' ' ')"
+  SOURCE_EXTENSIONS=$(manifest_read "${manifest}" extensions)
+  log "行数清单可用：schema=1，$(printf '%s\n' "${MANIFEST_TABLES}" | grep -c .) 张表，alembic_head=${MANIFEST_ALEMBIC_HEAD}，扩展：$(printf '%s\n' "${SOURCE_EXTENSIONS}" | tr '\n' ' ')"
 }
 
 step_precheck_source() {
@@ -414,7 +421,7 @@ step_precheck_source() {
 }
 
 step_backup() {
-  log "== 备份（对源库唯一的写前接触：一次只读 pg_dump -Fc）=="
+  log "== 备份（对源库的一次只读 pg_dump -Fc）=="
   local dump_stderr
   dump_stderr=$(mktemp /tmp/lingxi-drill-dump-stderr-XXXXXX.log)
   if ! run_source_tool pg_dump -Fc > "${DUMP_PATH}" 2>"${dump_stderr}"; then
@@ -425,6 +432,30 @@ step_backup() {
   fi
   rm -f "${dump_stderr}"
   log "备份写入 ${DUMP_PATH}（$(du -h "${DUMP_PATH}" | cut -f1)）"
+}
+
+# 源库扩展清单：除 `plpgsql` 外每个已装扩展一行 `<名>|<schema>|<版本>`，与副本模式
+# 清单读出来的行同一形状，供同一个预建函数使用。只读系统目录，不碰业务表。
+extension_list_sql() {
+  cat <<'SQL'
+SELECT e.extname || '|' || n.nspname || '|' || e.extversion
+FROM pg_catalog.pg_extension e
+JOIN pg_catalog.pg_namespace n ON n.oid = e.extnamespace
+WHERE e.extname <> 'plpgsql'
+ORDER BY e.extname;
+SQL
+}
+
+step_read_source_extensions() {
+  log "== 恢复前只读读源库扩展清单（pg_extension，经 postgres:17 一次性容器）=="
+  local output
+  if ! output=$(run_source_tool psql -At -c "$(extension_list_sql)" 2>&1); then
+    printf '%s\n' "${output}" | mask >&2
+    echo "源库扩展清单读取失败（已脱敏，见上）——不猜测源库装了什么扩展，停止" >&2
+    exit 1
+  fi
+  SOURCE_EXTENSIONS="${output}"
+  log "源库扩展（不含 plpgsql）：$(printf '%s\n' "${SOURCE_EXTENSIONS}" | grep -c .) 个：$(printf '%s\n' "${SOURCE_EXTENSIONS}" | tr '\n' ' ')"
 }
 
 step_isolate_and_restore() {
@@ -503,14 +534,12 @@ step_isolate_and_restore() {
     \$\$;
   " >/dev/null
 
-  # 副本文件模式的第二处前置：`pg_restore -n public` 只恢复 public 下的对象，dump 里
-  # 的 `extensions` schema 与 CREATE EXTENSION 条目会被跳过，而 public 下的索引定义按
-  # 名引用 `extensions.gin_trgm_ops` 这类扩展成员——不预建就在建索引那一步失败退出
-  # （本机对链头源库的 dump 实测撞到）。全模式今天没有这一步，源库装了扩展时同样
-  # 会撞；那不在本次改动范围，只登记不顺手改。
-  if [[ -n "${SOURCE_DUMP}" ]]; then
-    step_precreate_extensions
-  fi
+  # 第二处前置——扩展：`pg_restore -n public` 只恢复 public 下的对象，dump 里的
+  # `extensions` schema 与 CREATE EXTENSION 条目会被跳过，而 public 下的索引定义按名
+  # 引用 `extensions.gin_trgm_ops` 这类扩展成员——不预建就在建索引那一步失败退出
+  # （本机对链头源库的 dump 实测撞到）。两种模式同一个函数：全模式的清单来自源库
+  # `pg_extension`（step_read_source_extensions），副本模式来自随附清单。
+  precreate_extensions "${SOURCE_EXTENSIONS}"
 
   # --exit-on-error：pg_restore 默认遇错继续跑完、只在汇总里报警告，退出码仍可能
   # 是 0；本文件全程靠 `set -e` 判定成败，没有这个开关会让恢复过程中的错误被
@@ -560,26 +589,35 @@ step_isolate_and_restore() {
   log "属主与授权修复完成：lingxi_retention_cleanup（若存在）已改回属主 lingxi_retention_owner 并补回其读写两张受限表所需的 GRANT"
 }
 
-# 按清单 `extensions` 键预建扩展：schema 固定为 `extensions`（迁移链安装扩展的约定，
-# 也是托管方的默认位置）；名字只允许小写标识符形状（要拼进 SQL，不信任清单里的
-# 任意文本）；版本不钉——以隔离实例镜像自带的版本为准并打印出来，版本漂移是
-# 镜像选型问题、不是恢复失败。`plpgsql` 每个库自带、装在 pg_catalog，跳过。
-step_precreate_extensions() {
-  log "== 副本文件模式：按清单预建扩展（schema extensions，不钉版本）=="
-  local entry name
-  while IFS= read -r entry; do
-    [[ -z "${entry}" ]] && continue
-    name="${entry%%@*}"
-    if [[ ! "${name}" =~ ^[a-z_][a-z0-9_]*$ ]]; then
-      echo "清单里的扩展名不是小写标识符形状，拒绝拼进 SQL：${entry}" >&2
-      exit 1
-    fi
+# 在隔离实例预建扩展：入参是换行分隔的 `<名>|<schema>|<版本>` 行（全模式来自源库
+# `pg_extension`，副本模式来自随附清单）。名字与 schema 都要拼进 SQL，只放行小写
+# 标识符形状（扩展名允许连字符，如 uuid-ossp）并加双引号，不信任来源文本；版本
+# 不钉——以隔离实例镜像自带的版本为准并打印出来，版本漂移是镜像选型问题、不是
+# 恢复失败。隔离实例镜像不提供的扩展（托管方自带的平台扩展）跳过并打印，不算
+# 失败：public 对象若真依赖它，pg_restore 会在该对象处失败退出，不会静默。
+# `plpgsql` 每个库自带、装在 pg_catalog，跳过。
+precreate_extensions() {
+  log "== 预建扩展（按源侧清单，不钉版本）=="
+  local name schema version available
+  while IFS='|' read -r name schema version; do
+    [[ -z "${name}" ]] && continue
     if [[ "${name}" == "plpgsql" ]]; then
       continue
     fi
+    if [[ ! "${name}" =~ ^[a-z_][a-z0-9_-]*$ || ! "${schema}" =~ ^[a-z_][a-z0-9_]*$ ]]; then
+      echo "扩展名或 schema 不是小写标识符形状，拒绝拼进 SQL：${name}|${schema}|${version}" >&2
+      exit 1
+    fi
+    available=$(docker exec "${DRILL_DB_CONTAINER}" psql -At -U "${DRILL_DB_USER}" -d "${DRILL_DB_NAME}" -v ON_ERROR_STOP=1 \
+      -c "SELECT count(*) FROM pg_available_extensions WHERE name = '${name}'")
+    if [[ "${available}" != "1" ]]; then
+      log "跳过扩展 ${name}（源侧 schema ${schema}、版本 ${version}）：隔离实例镜像 ${DRILL_POSTGRES_IMAGE} 不提供；public 对象若依赖它，恢复会在该对象处失败"
+      continue
+    fi
     docker exec "${DRILL_DB_CONTAINER}" psql -U "${DRILL_DB_USER}" -d "${DRILL_DB_NAME}" -v ON_ERROR_STOP=1 \
-      -c "CREATE SCHEMA IF NOT EXISTS extensions; CREATE EXTENSION IF NOT EXISTS ${name} WITH SCHEMA extensions;" >/dev/null
-  done <<<"${MANIFEST_EXTENSIONS}"
+      -c "CREATE SCHEMA IF NOT EXISTS \"${schema}\"; CREATE EXTENSION IF NOT EXISTS \"${name}\" WITH SCHEMA \"${schema}\";" >/dev/null
+    log "已预建扩展 ${name}（schema ${schema}；源侧版本 ${version}）"
+  done <<<"$1"
   log "扩展就绪：$(docker exec "${DRILL_DB_CONTAINER}" psql -At -U "${DRILL_DB_USER}" -d "${DRILL_DB_NAME}" \
     -c "SELECT coalesce(string_agg(extname || '@' || extversion || ' schema=' || n.nspname, ' ' ORDER BY extname), '（无）') FROM pg_extension e JOIN pg_namespace n ON n.oid = e.extnamespace WHERE extname <> 'plpgsql'")"
 }
@@ -962,6 +1000,7 @@ if [[ -n "${SOURCE_DUMP}" ]]; then
 else
   step_precheck_source
   step_backup
+  step_read_source_extensions
 fi
 step_isolate_and_restore
 if [[ "${SKIP_MIGRATE}" == "1" ]]; then
