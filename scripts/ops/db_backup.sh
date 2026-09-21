@@ -23,8 +23,10 @@
 #      "dump_file":"<仅文件名>","dump_bytes":N,"dump_sha256":"<hex>","restore_list_ok":bool,
 #      "tables":N,"retention_kept":N,"transfer":{"mode":"none|scp","ok":true|false|null,
 #      "label":"<标签>"},"error":null|"<错误码>"}
-#   失败时尚未得到的字段为 null；任一步失败都先写状态（ok=false + 错误码）再以非 0 退出，
-#   systemd 记 Result=failed，宿主巡检据状态文件告警。
+#   `ok` 只说本地三件是否成功产出并校验：本地任一步失败 → ok=false + 错误码；异机传输失败
+#   → ok=true、transfer.ok=false、error="transfer_failed"（本地备份仍有效，巡检据此分别报
+#   「本地备份失败」与「异机副本失败」两种告警）。两类失败都先写状态再以非 0 退出，
+#   systemd 记 Result=failed；失败时尚未得到的字段为 null。
 #
 # 已知边界：dump 与行数清单是两次连接、不共享快照——定时器落在低峰（北京 02:30），
 # 两者之间若有写入，恢复后比对会出现可解释的差异；切换脚本的 verify 在停写窗口内跑，
@@ -39,6 +41,7 @@
 #   LINGXI_DB_BACKUP_REMOTE        scp 模式必填：user@host:/path（目录须已存在）
 #   LINGXI_DB_BACKUP_REMOTE_LABEL  进状态文件的可公开短标签，缺省 offsite
 #   LINGXI_DB_BACKUP_SSH_OPTS      ssh / scp 共用选项，缺省 "-o BatchMode=yes -o ConnectTimeout=20"
+#                                  （脚本另加 -o LogLevel=ERROR，只留错误行；错误文本里的远端主机段替换为标签）
 #
 # 退出码：0 成功；1 某一步失败（状态文件已写明错误码）；2 输入不合法。
 set -euo pipefail
@@ -62,10 +65,15 @@ STARTED_EPOCH="$(date +%s)"
 DUMP_FILE="null"; DUMP_BYTES="null"; DUMP_SHA="null"; RESTORE_LIST_OK="false"
 TABLES="null"; RETENTION_KEPT="null"; TRANSFER_OK="null"; STATUS_WRITTEN=0
 
-# 日志只到 stderr（journal），远端地址与任何连接串形态一律脱敏。
+# 日志只到 stderr（journal），远端地址（整串、user@host、host、路径）与任何连接串形态一律脱敏。
 mask() {
-  local text="$1"
-  if [[ -n "${REMOTE}" ]]; then text="${text//"${REMOTE}"/<remote>}"; fi
+  local text="$1" seg
+  if [[ -n "${REMOTE}" ]]; then # 先长后短：整串 → user@host → host → 路径
+    local userhost="${REMOTE%%:*}"
+    for seg in "${REMOTE}" "${userhost}" "${userhost#*@}" "${REMOTE#*:}"; do
+      [[ ${#seg} -ge 2 ]] && text="${text//"${seg}"/<remote>}"
+    done
+  fi
   printf '%s' "${text}" | sed -E 's#://[^@[:space:]]*@#://<creds>@#g'
 }
 log() { printf '%s db_backup: %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$(mask "$*")" >&2; }
@@ -113,6 +121,7 @@ fi
 [[ "${REMOTE_LABEL}" =~ ^[A-Za-z0-9_.-]{1,32}$ ]] || fail invalid_input 2 "LINGXI_DB_BACKUP_REMOTE_LABEL 只接受 1–32 位字母数字 ._-"
 command -v docker >/dev/null 2>&1 || fail invalid_input 2 "缺少 docker 命令"
 read -r -a SSH_OPTS <<< "${SSH_OPTS_RAW}"
+SSH_OPTS+=(-o LogLevel=ERROR)
 
 # ---- ① 前置：容器 healthy、目录 0700 且属主为运行账户、磁盘余量 ≥ 库体量 × 3 -------
 health="$(docker inspect -f '{{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}' "${CONTAINER}" 2>/dev/null)" \
@@ -226,10 +235,14 @@ if [[ "${TRANSFER}" == scp ]]; then
     rm -f "${transfer_log}"
     log "传输完成并在远端校验通过（${REMOTE_LABEL}）"
   else
+    # 本地三件已成功并校验：ok 仍为 true，只标 transfer.ok=false + error=transfer_failed，
+    # 巡检据此报「异机副本失败」而不是「本地备份失败」；退出码仍非 0 让 systemd 记失败。
     TRANSFER_OK="false"
     log "传输失败（${REMOTE_LABEL}）：$(tr '\n' ' ' < "${transfer_log}" | cut -c1-300)"
     rm -f "${transfer_log}"
-    fail transfer_failed 1 "本地三件已保留，待下一轮或人工重传"
+    log "失败（transfer_failed）：本地三件已保留，待下一轮或人工重传"
+    write_status true '"transfer_failed"'
+    exit 1
   fi
 fi
 
