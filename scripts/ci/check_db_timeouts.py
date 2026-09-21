@@ -5,8 +5,10 @@
 ``self._psycopg.connect``，避免把注释或字符串里的历史文字误判为连接入口；工厂本身
 是唯一允许直接调用驱动的文件。
 
-连接借用围栏（``check_connection_borrow_scope``）守的是工厂默认复用路径的调用方义务：
-``connect()`` 归还后旧引用会随下一次借出恢复操作能力，所以默认复用路径的 ``connect()``
+连接借用围栏（``check_connection_borrow_scope``）守的是工厂默认复用路径的调用方义务，它是
+仓库约定而不是运行时缺陷的补丁：默认路径的句柄归还后一律失效、绝不触达他人事务（见
+``adapters/postgres.py`` 模块说明），围栏存在的理由是可读性与义务边界——借用随 ``with`` 退出
+归还、连接与游标不逃出块，读代码的人不必追问句柄此刻归谁。因此默认复用路径的 ``connect()``
 必须写在 ``with`` 语句的上下文表达式位置、``as`` 后只能是一个名字，块内取得的连接与游标
 不得存进属性 / 容器 / 块外名字、不得随 return 逃出（直接或装进容器字面量都算）、不得在块
 退出后继续使用，块内 ``close()`` 之后不得再取 ``connect()``。识别工厂时覆盖
@@ -24,8 +26,9 @@
 块外自赋值（``cur = cur``）后再用（算重新绑定、不再追）、先装进容器再经名字转手
 （``pair = (c, cur)`` 后 ``return pair``；只认 return / 逃逸赋值处的容器字面量），都判不出；
 名字追踪不分先后、以文件 / 块为单位，宁可多判。
-围栏不是修复：归还前取得的游标（``Cursor.connection`` 回指原始连接）、旧 ``pgconn``、
-以及块内提前 ``close()`` 后再取 ``connect()`` 的间接写法，围栏堵不住。
+围栏判不出的写法不构成数据风险：归还前取得的游标、旧事务上下文，以及块内提前 ``close()``
+后再取 ``connect()`` 的间接写法，都由工厂的委托句柄在运行时拒绝（报「连接已关闭」、不触达
+数据库）；围栏只负责让这些写法在评审时就被看见。
 """
 
 from __future__ import annotations
@@ -513,8 +516,8 @@ def _escapes_inside(
                 continue
             if isinstance(target, (ast.Attribute, ast.Subscript)):
                 failures.append(
-                    f"{relative}:{node.lineno} 连接或游标存进了属性 / 容器：它们只在 with 块内"
-                    "有效，归还后旧引用会随下一次借出恢复操作能力"
+                    f"{relative}:{node.lineno} 连接或游标存进了属性 / 容器：借用随 with 退出"
+                    "归还，存起来的句柄与游标之后一律失效，不得逃出 with 块"
                 )
             elif isinstance(target, ast.Name) and (target.id in outward or module_scope):
                 failures.append(
@@ -538,7 +541,7 @@ def _escapes_inside(
             if _is_reused_factory_call(node, bindings) and node.lineno > first_close:
                 failures.append(
                     f"{relative}:{node.lineno} with 块内已 close() 归还的连接，同一块内又取"
-                    " connect()：同一对象会被再次借出，外层 with 退出成为迟到操作者"
+                    " connect()：一次 with 只对应一次借用，提前归还后要再用就另起一个 with 块"
                 )
     return failures
 

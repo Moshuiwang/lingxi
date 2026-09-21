@@ -3,15 +3,13 @@
 三项超时（连接、语句、锁等待）写进 libpq 启动参数，第一条业务语句起就受约束，各适配器不再各自决定
 边界。本模块只依赖标准库；``psycopg`` 在真正建连的函数内延迟导入，没有驱动的纯逻辑测试仍能导入正式包。
 
-``connect()`` 默认返回本进程内可复用的连接：``close()`` 不真正断开，而是把仍然健康的连接
-放回按 (DSN, 超时配置) 分组的空闲栈，供下一次同键的 ``connect()`` 取用，连接已断、回滚失败
-或栈已满才真正关闭（健康检查与会话属性复位见 ``_IdleConnectionPool``、``_ReusableConnectionMixin``）；
-``dedicated=True`` 或任何额外 psycopg 关键字参数取得驱动原生连接，不进空闲栈、``close()``
-立即真正关闭（``LISTEN`` 适配器与常驻轮询用它）；进程退出时 ``atexit`` 清空空闲栈，不留悬挂会话。
-借用者看到的合同与驱动一致，区别只在物理连接未必真的断开——这句尚未完全兑现：句柄失效只由
-共享标志 ``_lingxi_idle`` 维护，连接再次借出后旧引用与旧游标恢复操作能力，「归还后不得再用、
-``with`` 块内 ``close()`` 后不得再取 ``connect()``、游标不得逃出 ``with`` 块」因此是调用方义务，
-由 ``scripts/ci/check_db_timeouts.py`` 守；围栏堵不住的三件事与修复方向见 ``_ReusableConnectionMixin``。
+``connect()`` 默认返回一次借用专用的委托句柄（``_BorrowedConnection``）：物理连接归进程内按
+(DSN, 超时配置) 分组的空闲栈所有，句柄 ``close()`` 把仍然健康的连接放回栈供下一次同键的 ``connect()``
+取用（连接已断、回滚失败或栈已满才真正关闭），同时让该句柄永久失效——归还后旧句柄、从它取得的旧游标
+与旧事务上下文一律报「连接已关闭」且不触达数据库，``with`` 退出对已归还句柄是空操作；句柄只转发
+显式清单里的驱动接口、不暴露物理连接（清单与游标 / 事务包装见 ``_BorrowedConnection``）。
+``dedicated=True`` 或任何额外 psycopg 关键字参数取得驱动原生连接，不进空闲栈、``close()`` 立即真正
+关闭（``LISTEN`` 适配器与常驻轮询用它）；进程退出时 ``atexit`` 清空空闲栈，不留悬挂会话。
 """
 
 from __future__ import annotations
@@ -156,15 +154,15 @@ _PoolKey = tuple[str, PostgresTimeouts]
 
 
 class _IdleConnectionPool:
-    """按 (DSN, 超时配置) 分组的空闲连接栈；只保管此刻没人在用的连接。
+    """按 (DSN, 超时配置) 分组的空闲连接栈；只保管此刻没人在用的物理连接。
 
-    在用的连接不在这里登记：``connect()`` 取走即离开栈，``close()`` 归还才回来。因此同一线程里
-    嵌套的两个 ``with connect()`` 拿到的是两条不同的物理连接，内层退出不会把外层事务一并提交。
+    在用的连接不在这里登记：``connect()`` 取走即离开栈、交给一个新句柄独占，句柄第一次 ``close()``
+    归还才回来。因此同一线程里嵌套的两个 ``with connect()`` 拿到的是两条不同的物理连接，内层退出
+    不会把外层事务一并提交。
 
-    不变量：一个连接对象在栈里最多出现一次，由连接自己的 ``_lingxi_idle`` 标志在锁内维护（压栈置真、
-    弹栈置假），``close()`` 见标志已真就直接返回，重复 ``close()`` 不会让两位借用者共用一条连接。尚未
-    完全兑现：标志只认「此刻是否在栈里」、不认「是谁在用」——对象再次借出后，旧引用迟到的 ``close()``
-    会把在用连接强行归还并回滚在途写入，下一位借用者拿到同一条物理连接；「归还后不得再用」是调用方义务。
+    不变量：任何时刻一条物理连接要么躺在栈里（最多出现一次），要么被恰好一个未归还的句柄持有。
+    出入栈都在锁内；「一次借用只归还一次」由句柄自己的「已归还」位保证（见 ``_BorrowedConnection``）：
+    旧句柄迟到的 ``close()`` 是空操作，不会把别人在用的连接压回栈，也不会回滚它的在途写入。
     """
 
     def __init__(self) -> None:
@@ -180,7 +178,6 @@ class _IdleConnectionPool:
                 if not stack:
                     return None
                 connection, released_at = stack.pop()
-                connection._lingxi_idle = False
             if connection.closed:
                 # 已经物理关闭的连接不能只是跳过：显式 discard() 把释放交给驱动，
                 # 不依赖引用计数的回收时机（驱动对已关闭连接会直接返回）。
@@ -210,12 +207,10 @@ class _IdleConnectionPool:
             stack = self._idle.setdefault(key, [])
             while stack and now - stack[0][1] > MAX_IDLE_AGE_SECONDS:
                 stale, _released_at = stack.pop(0)
-                stale._lingxi_idle = False
                 expired.append(stale)
             if len(stack) >= MAX_IDLE_CONNECTIONS_PER_KEY:
                 accepted = False
             else:
-                connection._lingxi_idle = True
                 stack.append((connection, now))
                 accepted = True
                 if not self._atexit_registered:
@@ -230,9 +225,6 @@ class _IdleConnectionPool:
         with self._lock:
             stacks = list(self._idle.values())
             self._idle.clear()
-            for stack in stacks:
-                for connection, _released_at in stack:
-                    connection._lingxi_idle = False
         closed = 0
         for stack in stacks:
             for connection, _released_at in stack:
@@ -273,65 +265,15 @@ _reusable_connection_type: type | None = None
 
 
 class _ReusableConnectionMixin:
-    """``close()`` 改为归还进程内空闲栈的连接。
+    """池持有的物理连接：归还前复位、取用前探活、真正关闭；借用者拿不到它。
 
     与 ``psycopg.Connection`` 组合成 ``ReusableConnection``（见 :func:`_build_reusable_connection_type`）。
-    借用者看到的合同与驱动一致：``with`` 退出由驱动 ``commit()``/``rollback()`` 再 ``close()``，之后
-    ``closed`` 为真、重复 ``close()`` 空操作、再用报"连接已关闭"，区别只在物理连接没断、等下一位
-    借用者——尚未完全兑现：句柄失效只由共享标志 ``_lingxi_idle`` 维护（见其说明），再次借出后旧引用
-    与旧游标恢复操作能力。围栏堵不住的三件事：``with`` 块内提前 ``close()`` 后再取 ``connect()``
-    （``__exit__`` 成为迟到操作者，AST 只拦得住部分写法）、归还前取得的游标（``Cursor.connection``
-    回指原始连接）、旧 ``pgconn``。修复方向：每次借用返回独立句柄并包装游标；围栏不是修复。
+    借用者看到的合同由 ``_BorrowedConnection`` 兑现；这里不重写 ``close()`` / ``closed`` 等驱动接口，
+    物理连接的生命周期只由池与句柄经 ``discard()`` / ``reset_for_reuse()`` 驱动。
     """
-
-    _lingxi_pool_key: _PoolKey | None = None
-    #: 为真表示对象此刻躺在空闲栈里（或正被池回收）：借用者手里的引用已经失效。尚未完全兑现：
-    #: 这是全体借用者共享的一个标志，``closed`` / ``close()`` / ``cursor()`` / ``commit()`` /
-    #: ``rollback()`` 五处防护都只读它，下一次借出把它置回假、五处防护同时解除，旧引用与旧游标
-    #: 恢复操作能力；归还前取得的游标不经过任何一处防护。「归还后不得再用、``with`` 块内 ``close()``
-    #: 后不得再取 ``connect()``、游标不得逃出 ``with`` 块」由 ``scripts/ci/check_db_timeouts.py`` 守。
-    _lingxi_idle: bool = False
-
-    @property
-    def closed(self) -> bool:  # type: ignore[override]
-        return self._lingxi_idle or super().closed
-
-    def close(self) -> None:
-        if self._lingxi_idle:
-            return
-        key = self._lingxi_pool_key
-        if key is None or super().closed:
-            super().close()
-            return
-        if _IDLE_POOL.release(key, self):
-            return
-        self.discard()
-
-    def cursor(self, *args: Any, **kwargs: Any) -> Any:
-        if self._lingxi_idle:
-            import psycopg
-
-            raise psycopg.OperationalError("the connection is closed")
-        return super().cursor(*args, **kwargs)
-
-    def commit(self) -> None:
-        if self._lingxi_idle:
-            import psycopg
-
-            raise psycopg.OperationalError("the connection is closed")
-        super().commit()
-
-    def rollback(self) -> None:
-        if self._lingxi_idle:
-            import psycopg
-
-            raise psycopg.OperationalError("the connection is closed")
-        super().rollback()
 
     def discard(self) -> None:
         """真正关闭，不再归还。"""
-        self._lingxi_idle = False
-        self._lingxi_pool_key = None
         super().close()
 
     def reset_for_reuse(self) -> bool:
@@ -409,6 +351,267 @@ def _build_reusable_connection_type() -> type:
     return ReusableConnection
 
 
+def _closed_error() -> Exception:
+    """归还后的旧句柄、旧游标与旧事务上下文统一报驱动同文案的「连接已关闭」，不触达数据库。"""
+    import psycopg
+
+    return psycopg.OperationalError("the connection is closed")
+
+
+def _unforwarded(owner: object, name: str) -> AttributeError:
+    return AttributeError(
+        f"{type(owner).__name__} 不转发 {name}：借用句柄只提供 lingxi.adapters.postgres"
+        " 模块说明列出的驱动接口"
+    )
+
+
+class _BorrowedConnection:
+    """一次借用的委托句柄：持有物理连接引用与自己的「已归还」位，借用者只拿到它。
+
+    转发面是显式清单：``cursor`` / ``execute``（返回的游标同样包装）、``commit`` / ``rollback`` /
+    ``transaction``（上下文包装）、``close`` / ``closed``、``autocommit`` / ``read_only`` /
+    ``isolation_level``（读写）、``info`` / ``prepare_threshold`` / ``notifies`` 与 ``with``；清单外
+    的属性（含 ``pgconn``）一律 ``AttributeError``。第一次 ``close()`` 归还物理连接并永久置「已归还」：
+    此后 ``close()`` 空操作、``closed`` 恒真、``with`` 退出空操作，其余转发一律报「连接已关闭」且不
+    触达数据库；归还前取得的游标与事务上下文随句柄一起失效。一个句柄只有一位借用者，不设锁。
+    """
+
+    __slots__ = ("_connection", "_key", "_returned")
+
+    def __init__(self, connection: Any, key: _PoolKey) -> None:
+        self._connection = connection
+        self._key = key
+        self._returned = False
+
+    def _borrowed(self) -> Any:
+        """仍在借用期的物理连接；已归还则报「连接已关闭」。"""
+        if self._returned:
+            raise _closed_error()
+        return self._connection
+
+    def __getattr__(self, name: str) -> Any:
+        raise _unforwarded(self, name)
+
+    @property
+    def closed(self) -> bool:
+        return self._returned or self._connection.closed
+
+    def close(self) -> None:
+        if self._returned:
+            return
+        self._returned = True
+        if not _IDLE_POOL.release(self._key, self._connection):
+            self._connection.discard()
+
+    def __enter__(self) -> _BorrowedConnection:
+        self._borrowed()
+        return self
+
+    def __exit__(self, exc_type: Any, exc_val: Any, exc_tb: Any) -> None:
+        """与驱动一致：异常回滚、否则提交，再归还；已归还或已断开的句柄不再发语句。"""
+        if self._returned:
+            return
+        if not self._connection.closed:
+            if exc_type:
+                try:
+                    self._connection.rollback()
+                except Exception as error:
+                    logger.warning(
+                        "异常退出时回滚失败，忽略后照常归还 error=%s", type(error).__name__
+                    )
+            else:
+                self._connection.commit()
+        self.close()
+
+    def cursor(self, *args: Any, **kwargs: Any) -> _BorrowedCursor:
+        return _BorrowedCursor(self, self._borrowed().cursor(*args, **kwargs))
+
+    def execute(self, query: Any, params: Any = None, **kwargs: Any) -> _BorrowedCursor:
+        return _BorrowedCursor(self, self._borrowed().execute(query, params, **kwargs))
+
+    def commit(self) -> None:
+        self._borrowed().commit()
+
+    def rollback(self) -> None:
+        self._borrowed().rollback()
+
+    def transaction(
+        self, savepoint_name: str | None = None, force_rollback: bool = False
+    ) -> _BorrowedTransaction:
+        return _BorrowedTransaction(
+            self, self._borrowed().transaction(savepoint_name, force_rollback)
+        )
+
+    def notifies(self, *args: Any, **kwargs: Any) -> Any:
+        return self._borrowed().notifies(*args, **kwargs)
+
+    @property
+    def info(self) -> Any:
+        return self._borrowed().info
+
+    @property
+    def prepare_threshold(self) -> int | None:
+        return self._borrowed().prepare_threshold
+
+    @property
+    def autocommit(self) -> bool:
+        return self._borrowed().autocommit
+
+    @autocommit.setter
+    def autocommit(self, value: bool) -> None:
+        self._borrowed().autocommit = value
+
+    @property
+    def read_only(self) -> bool | None:
+        return self._borrowed().read_only
+
+    @read_only.setter
+    def read_only(self, value: bool | None) -> None:
+        self._borrowed().read_only = value
+
+    @property
+    def isolation_level(self) -> Any:
+        return self._borrowed().isolation_level
+
+    @isolation_level.setter
+    def isolation_level(self, value: Any) -> None:
+        self._borrowed().isolation_level = value
+
+
+class _BorrowedCursor:
+    """句柄发出的游标包装：每次触达数据库前先核对句柄未归还；``connection`` 回指句柄而非物理连接。
+
+    转发面：``execute`` / ``executemany`` / ``fetchone`` / ``fetchmany`` / ``fetchall`` / 迭代 /
+    ``scroll`` / ``close`` / ``with``，只读属性 ``rowcount`` / ``description`` / ``statusmessage`` /
+    ``rownumber``；``closed`` 在句柄归还后恒真（状态读取不触达数据库，与句柄自身一致）。清单外
+    （含 ``copy`` / ``stream`` / ``pgresult``）一律 ``AttributeError``。
+    """
+
+    __slots__ = ("_cursor", "_handle")
+
+    def __init__(self, handle: _BorrowedConnection, cursor: Any) -> None:
+        self._handle = handle
+        self._cursor = cursor
+
+    def _live(self) -> Any:
+        self._handle._borrowed()
+        return self._cursor
+
+    def __getattr__(self, name: str) -> Any:
+        raise _unforwarded(self, name)
+
+    @property
+    def connection(self) -> _BorrowedConnection:
+        return self._handle
+
+    @property
+    def closed(self) -> bool:
+        return self._handle._returned or self._cursor.closed
+
+    @property
+    def rowcount(self) -> int:
+        return self._live().rowcount
+
+    @property
+    def description(self) -> Any:
+        return self._live().description
+
+    @property
+    def statusmessage(self) -> str | None:
+        return self._live().statusmessage
+
+    @property
+    def rownumber(self) -> int | None:
+        return self._live().rownumber
+
+    def execute(self, *args: Any, **kwargs: Any) -> _BorrowedCursor:
+        self._live().execute(*args, **kwargs)
+        return self
+
+    def executemany(self, *args: Any, **kwargs: Any) -> None:
+        self._live().executemany(*args, **kwargs)
+
+    def fetchone(self) -> Any:
+        return self._live().fetchone()
+
+    def fetchmany(self, size: int = 0) -> list[Any]:
+        return self._live().fetchmany(size)
+
+    def fetchall(self) -> list[Any]:
+        return self._live().fetchall()
+
+    def scroll(self, value: int, mode: str = "relative") -> None:
+        self._live().scroll(value, mode)
+
+    def __iter__(self) -> Any:
+        rows = iter(self._live())
+        while True:
+            self._handle._borrowed()
+            try:
+                row = next(rows)
+            except StopIteration:
+                return
+            yield row
+
+    def __next__(self) -> Any:
+        return next(self._live())
+
+    def close(self) -> None:
+        self._live().close()
+
+    def __enter__(self) -> _BorrowedCursor:
+        self._live()
+        return self
+
+    def __exit__(self, exc_type: Any, exc_val: Any, exc_tb: Any) -> None:
+        self._live().close()
+
+
+class _BorrowedTransaction:
+    """``transaction()`` 的上下文包装：进出都先核对句柄未归还，其余逐字交给驱动的事务上下文。
+
+    ``with … as tx`` 拿到的是本对象：``connection`` 回指句柄，``savepoint_name`` / ``force_rollback`` /
+    ``status`` 读自驱动事务，块内 ``raise psycopg.Rollback(tx)`` 与驱动语义相同。句柄已归还时
+    ``__exit__`` 报「连接已关闭」而不去提交或回滚——那条物理连接可能已经属于别人。
+    """
+
+    __slots__ = ("_context", "_handle", "_transaction")
+
+    def __init__(self, handle: _BorrowedConnection, context: Any) -> None:
+        self._handle = handle
+        self._context = context
+        self._transaction: Any = None
+
+    def __enter__(self) -> _BorrowedTransaction:
+        self._handle._borrowed()
+        self._transaction = self._context.__enter__()
+        return self
+
+    def __exit__(self, exc_type: Any, exc_val: Any, exc_tb: Any) -> bool:
+        self._handle._borrowed()
+        import psycopg
+
+        if isinstance(exc_val, psycopg.Rollback) and exc_val.transaction is self:
+            exc_val = psycopg.Rollback(self._transaction)
+        return bool(self._context.__exit__(exc_type, exc_val, exc_tb))
+
+    @property
+    def connection(self) -> _BorrowedConnection:
+        return self._handle
+
+    @property
+    def savepoint_name(self) -> str | None:
+        return self._transaction.savepoint_name
+
+    @property
+    def force_rollback(self) -> bool:
+        return self._transaction.force_rollback
+
+    @property
+    def status(self) -> Any:
+        return self._transaction.status
+
+
 def connect(
     dsn: str,
     *,
@@ -418,8 +621,8 @@ def connect(
 ) -> Any:
     """按仓库约定取得一个 PostgreSQL 连接。
 
-    默认返回可复用连接（见模块说明）：优先取空闲栈里的健康连接，没有才真正建连，
-    并关掉服务端预编译（``prepare_threshold=None``）避免长连接触发"cached plan
+    默认返回一次借用专用的委托句柄（见模块说明）：优先取空闲栈里的健康物理连接，没有才真正
+    建连，并关掉服务端预编译（``prepare_threshold=None``）避免长连接触发"cached plan
     must not change result type"。``dedicated=True`` 或任何额外 psycopg 关键字参数
     表示要一条驱动原生独占连接：不进空闲栈，``close()`` 立即真正关闭。
 
@@ -445,14 +648,12 @@ def connect(
 
     key: _PoolKey = (dsn, timeouts)
     connection = _IDLE_POOL.acquire(key)
-    if connection is not None:
-        return connection
-    connection = _build_reusable_connection_type().connect(
-        dsn,
-        connect_timeout=timeouts.connect_timeout_seconds,
-        options=timeouts.libpq_options,
-        prepare_threshold=None,
-        **TCP_KEEPALIVE_PARAMETERS,
-    )
-    connection._lingxi_pool_key = key
-    return connection
+    if connection is None:
+        connection = _build_reusable_connection_type().connect(
+            dsn,
+            connect_timeout=timeouts.connect_timeout_seconds,
+            options=timeouts.libpq_options,
+            prepare_threshold=None,
+            **TCP_KEEPALIVE_PARAMETERS,
+        )
+    return _BorrowedConnection(connection, key)

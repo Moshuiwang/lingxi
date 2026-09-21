@@ -1334,5 +1334,600 @@ class RunReleasePullIntegrationTests(unittest.TestCase):
                     self.assertNotIn(needle, text)
 
 
+class BackupStatusLogicTests(unittest.TestCase):
+    """备份状态文件的解析与三项判据（`parse_backup_status` / `judge_backup_status`）纯逻辑。"""
+
+    NOW = datetime(2026, 9, 21, 3, 0, 0, tzinfo=UTC)
+
+    def _raw(self, **overrides) -> dict:
+        raw = {
+            "schema": 1,
+            "ok": True,
+            "started_at": "2026-09-21T01:00:00Z",
+            "finished_at": "2026-09-21T01:05:00Z",
+            "duration_seconds": 300,
+            "dump_file": "lingxi-20260921T0100Z.dump",
+            "dump_bytes": 1,
+            "dump_sha256": "0" * 64,
+            "restore_list_ok": True,
+            "tables": 46,
+            "retention_kept": 14,
+            "transfer": {"mode": "scp", "ok": True, "label": "stage"},
+            "error": None,
+        }
+        raw.update(overrides)
+        return raw
+
+    def _breaches(self, status, *, max_age_hours: float = 26.0) -> dict[str, bool]:
+        checks = host_health_alert.judge_backup_status(
+            status, now=self.NOW, max_age_hours=max_age_hours
+        )
+        return {key: breached for key, _label, breached, _detail, _required in checks}
+
+    def test_valid_file_parses_all_fields(self) -> None:
+        status = host_health_alert.parse_backup_status(self._raw())
+        self.assertTrue(status.ok)
+        self.assertEqual(status.finished_at, datetime(2026, 9, 21, 1, 5, 0, tzinfo=UTC))
+        self.assertIsNone(status.error)
+        self.assertEqual(status.transfer_mode, "scp")
+        self.assertTrue(status.transfer_ok)
+
+    def test_bad_schema_shapes_raise_schema_code(self) -> None:
+        cases = {
+            "schema=2": self._raw(schema=2),
+            "schema='1'": self._raw(schema="1"),
+            "schema=True": self._raw(schema=True),
+            "ok='true'": self._raw(ok="true"),
+            "not-a-mapping": ["schema", 1],
+        }
+        for name, raw in cases.items():
+            with self.subTest(case=name):
+                with self.assertRaises(ValueError) as ctx:
+                    host_health_alert.parse_backup_status(raw)
+                self.assertEqual(str(ctx.exception), "schema")
+
+    def test_bad_timestamp_shapes_raise_timestamp_code(self) -> None:
+        cases = {
+            "missing": self._raw(finished_at=None),
+            "garbage": self._raw(finished_at="yesterday"),
+            "naive": self._raw(finished_at="2026-09-21T01:05:00"),
+        }
+        for name, raw in cases.items():
+            with self.subTest(case=name):
+                with self.assertRaises(ValueError) as ctx:
+                    host_health_alert.parse_backup_status(raw)
+                self.assertEqual(str(ctx.exception), "timestamp")
+
+    def test_error_code_and_transfer_mode_only_pass_as_short_codes(self) -> None:
+        status = host_health_alert.parse_backup_status(
+            self._raw(
+                ok=False,
+                error="/opt/SENTINEL_PATH/pg_dump failed",
+                transfer={"mode": "scp SENTINEL", "ok": False, "label": "x"},
+            )
+        )
+        self.assertEqual(status.error, "invalid_error_code")
+        self.assertEqual(status.transfer_mode, "unknown")
+
+    def test_healthy_status_breaches_nothing_and_unknown_participates_as_clear(self) -> None:
+        breaches = self._breaches(host_health_alert.parse_backup_status(self._raw()))
+        self.assertEqual(
+            breaches,
+            {
+                host_health_alert.DB_BACKUP_UNKNOWN: False,
+                host_health_alert.DB_BACKUP_STALE: False,
+                host_health_alert.DB_BACKUP_FAILED: False,
+                host_health_alert.DB_BACKUP_TRANSFER_FAILED: False,
+            },
+        )
+
+    def test_stale_boundary_is_strictly_greater_than_max_age(self) -> None:
+        at_threshold = host_health_alert.parse_backup_status(
+            self._raw(finished_at=(self.NOW - timedelta(hours=26)).isoformat())
+        )
+        self.assertFalse(self._breaches(at_threshold)[host_health_alert.DB_BACKUP_STALE])
+        past = host_health_alert.parse_backup_status(
+            self._raw(finished_at=(self.NOW - timedelta(hours=26, seconds=1)).isoformat())
+        )
+        self.assertTrue(self._breaches(past)[host_health_alert.DB_BACKUP_STALE])
+
+    def test_transfer_failure_only_counts_when_backup_itself_succeeded(self) -> None:
+        transfer_failed = host_health_alert.parse_backup_status(
+            self._raw(transfer={"mode": "scp", "ok": False, "label": "x"})
+        )
+        breaches = self._breaches(transfer_failed)
+        self.assertTrue(breaches[host_health_alert.DB_BACKUP_TRANSFER_FAILED])
+        self.assertFalse(breaches[host_health_alert.DB_BACKUP_FAILED])
+        both_failed = host_health_alert.parse_backup_status(
+            self._raw(ok=False, error="pg_dump_failed", transfer={"mode": "scp", "ok": False})
+        )
+        breaches = self._breaches(both_failed)
+        self.assertTrue(breaches[host_health_alert.DB_BACKUP_FAILED])
+        self.assertFalse(breaches[host_health_alert.DB_BACKUP_TRANSFER_FAILED])
+        no_transfer = host_health_alert.parse_backup_status(
+            self._raw(transfer={"mode": "none", "ok": None, "label": ""})
+        )
+        self.assertFalse(self._breaches(no_transfer)[host_health_alert.DB_BACKUP_TRANSFER_FAILED])
+
+
+class DbQueryLogicTests(unittest.TestCase):
+    """两条 psql 查询输出的解析与阈值判据纯逻辑。"""
+
+    def test_connections_output_parses_count_and_limit(self) -> None:
+        self.assertEqual(host_health_alert.parse_connections_output("12|100\n"), (12, 100))
+
+    def test_connections_output_other_shapes_are_unparseable(self) -> None:
+        for value in ("", "12", "12|100|1", "abc|100", "-1|100", "12|0", "12|abc"):
+            with self.subTest(value=value):
+                with self.assertRaises(ValueError) as ctx:
+                    host_health_alert.parse_connections_output(value)
+                self.assertEqual(str(ctx.exception), "unparseable")
+
+    def test_wal_output_parses_bytes(self) -> None:
+        self.assertEqual(host_health_alert.parse_wal_output(" 16777216\n"), 16777216)
+        self.assertEqual(host_health_alert.parse_wal_output("0"), 0)
+
+    def test_wal_output_other_shapes_are_unparseable(self) -> None:
+        for value in ("", "x", "-5", "1|2"):
+            with self.subTest(value=value):
+                with self.assertRaises(ValueError) as ctx:
+                    host_health_alert.parse_wal_output(value)
+                self.assertEqual(str(ctx.exception), "unparseable")
+
+    def test_connections_threshold_is_inclusive(self) -> None:
+        _, _, below, _, _ = host_health_alert.judge_db_connections(79, 100, alert_percent=80)
+        _, _, at, detail, _ = host_health_alert.judge_db_connections(80, 100, alert_percent=80)
+        self.assertFalse(below)
+        self.assertTrue(at)
+        self.assertIn("80/100", detail)
+        self.assertIn("80.0%", detail)
+        self.assertIn("阈值 80%", detail)
+
+    def test_wal_threshold_is_inclusive(self) -> None:
+        _, _, below, _, _ = host_health_alert.judge_db_wal(999, alert_bytes=1000)
+        _, _, at, detail, _ = host_health_alert.judge_db_wal(1000, alert_bytes=1000)
+        self.assertFalse(below)
+        self.assertTrue(at)
+        self.assertIn("1000 字节", detail)
+
+    def test_db_keys_use_database_category_and_release_pull_keeps_its_own(self) -> None:
+        for key in (
+            host_health_alert.DB_BACKUP_STALE,
+            host_health_alert.DB_BACKUP_FAILED,
+            host_health_alert.DB_BACKUP_TRANSFER_FAILED,
+            host_health_alert.DB_BACKUP_UNKNOWN,
+            host_health_alert.DB_CONNECTIONS_HIGH,
+            host_health_alert.DB_WAL_LARGE,
+            host_health_alert.DB_QUERY_UNKNOWN,
+        ):
+            self.assertEqual(host_health_alert._THRESHOLD_CATEGORY[key], "数据库监控")
+        self.assertEqual(
+            host_health_alert._THRESHOLD_CATEGORY[host_health_alert.RELEASE_PULL_UNKNOWN],
+            "宿主监控",
+        )
+
+
+class RunLocalDbIntegrationTests(unittest.TestCase):
+    """`run(--db-container …)` 端到端：伪造 docker（`container inspect` 按容器名吐出预置
+    状态、`exec` 按 SQL 关键字吐出预置输出与退出码），状态文件按四态与五种坏形状写入，
+    验证本地库四项的告警 / 去重 / 恢复、未知形态、缺省关闭与脱敏否定在真正的调用路径上
+    成立。容器主线除本地库容器外用"运行中、无 healthcheck"保持安静。
+    """
+
+    DB_CONTAINER = "local-db"
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.tmp_path = Path(self._tmp.name)
+
+        self.env_path = self.tmp_path / "env"
+        self.env_path.write_text(
+            "LINGXI_FEISHU_APP_ID=a\nLINGXI_FEISHU_APP_SECRET=b\nLINGXI_ADMIN_GROUP_CHAT_ID=oc_x\n",
+            encoding="utf-8",
+        )
+        os.chmod(self.env_path, 0o600)
+
+        self.calls_log = self.tmp_path / "exec-calls.log"
+        self.db_inspect = self.tmp_path / "db-inspect.json"
+        self.db_inspect.write_text('{"Running": true}', encoding="utf-8")
+        self.conn_out = self.tmp_path / "conn.out"
+        self.conn_rc = self.tmp_path / "conn.rc"
+        self.conn_delay = self.tmp_path / "conn.delay"
+        self.wal_out = self.tmp_path / "wal.out"
+        self.wal_rc = self.tmp_path / "wal.rc"
+        self._set_connections("10|100")
+        self._set_wal("0")
+        self.docker_bin = self.tmp_path / "fake-docker"
+        self.docker_bin.write_text(
+            "#!/bin/sh\n"
+            'if [ "$1" = "container" ] && [ "$2" = "inspect" ]; then\n'
+            f'  if [ "$5" = "{self.DB_CONTAINER}" ]; then cat "{self.db_inspect}"; '
+            "else echo '{\"Running\": true}'; fi\n"
+            "  exit 0\n"
+            "fi\n"
+            'if [ "$1" = "exec" ]; then\n'
+            f'  echo "$*" >> "{self.calls_log}"\n'
+            '  for last in "$@"; do :; done\n'
+            '  case "$last" in\n'
+            "    *pg_stat_activity*)\n"
+            f'      [ -f "{self.conn_delay}" ] && exec sleep 5\n'
+            f'      cat "{self.conn_out}"; echo "stderr /opt/SENTINEL_STDERR" >&2; '
+            f'exit "$(cat "{self.conn_rc}")" ;;\n'
+            f'    *pg_ls_waldir*) cat "{self.wal_out}"; exit "$(cat "{self.wal_rc}")" ;;\n'
+            "  esac\n"
+            "  exit 2\n"
+            "fi\n"
+            "exit 1\n",
+            encoding="utf-8",
+        )
+        os.chmod(self.docker_bin, 0o755)
+
+        self.status_dir = self.tmp_path / "status"
+        self.status_dir.mkdir()
+        self.status_path = self.status_dir / "db-backup-status.json"
+        self.now = datetime.now(UTC)
+        self._write_status()
+
+        self.state_path = self.tmp_path / "state.json"
+        self.threshold_state_path = self.tmp_path / "threshold-state.json"
+        self.log_path = self.tmp_path / "log.txt"
+        self.lock_path = self.tmp_path / "lock"
+
+    def _set_connections(self, output: str, *, rc: int = 0, delay: bool = False) -> None:
+        self.conn_out.write_text(output + "\n", encoding="utf-8")
+        self.conn_rc.write_text(f"{rc}\n", encoding="utf-8")
+        if delay:
+            self.conn_delay.write_text("", encoding="utf-8")
+        else:
+            self.conn_delay.unlink(missing_ok=True)
+
+    def _set_wal(self, output: str, *, rc: int = 0) -> None:
+        self.wal_out.write_text(output + "\n", encoding="utf-8")
+        self.wal_rc.write_text(f"{rc}\n", encoding="utf-8")
+
+    def _write_status(
+        self,
+        *,
+        ok: bool = True,
+        finished_at: datetime | str | None = "default",
+        error: str | None = None,
+        transfer: dict | None = None,
+        schema: int = 1,
+        raw_text: str | None = None,
+    ) -> None:
+        if raw_text is not None:
+            self.status_path.write_text(raw_text, encoding="utf-8")
+            return
+        if finished_at == "default":
+            finished_at = self.now - timedelta(hours=1)
+        if isinstance(finished_at, datetime):
+            finished_at = finished_at.strftime("%Y-%m-%dT%H:%M:%SZ")
+        payload = {
+            "schema": schema,
+            "ok": ok,
+            "started_at": (self.now - timedelta(hours=1, minutes=5)).strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "finished_at": finished_at,
+            "duration_seconds": 300,
+            "dump_file": "lingxi-drill.dump",
+            "dump_bytes": 1,
+            "dump_sha256": "0" * 64,
+            "restore_list_ok": ok,
+            "tables": 46,
+            "retention_kept": 14,
+            "transfer": {"mode": "scp", "ok": True, "label": "stage"}
+            if transfer is None
+            else transfer,
+            "error": error,
+        }
+        self.status_path.write_text(json.dumps(payload), encoding="utf-8")
+
+    def _argv(self, *, with_db: bool = True) -> list[str]:
+        argv = [
+            "--env-file",
+            str(self.env_path),
+            "--containers",
+            "unused-container",
+            "--state-file",
+            str(self.state_path),
+            "--log-file",
+            str(self.log_path),
+            "--lock-file",
+            str(self.lock_path),
+            "--docker-bin",
+            str(self.docker_bin),
+            "--threshold-state-file",
+            str(self.threshold_state_path),
+            "--disable-release-pull-check",
+        ]
+        if with_db:
+            argv.extend(
+                [
+                    "--db-container",
+                    self.DB_CONTAINER,
+                    "--db-backup-status-file",
+                    str(self.status_path),
+                ]
+            )
+        return argv
+
+    def _round(self, extra_argv: list[str] | None = None, *, with_db: bool = True) -> list[str]:
+        argv = self._argv(with_db=with_db)
+        if extra_argv:
+            argv.extend(extra_argv)
+        with mock.patch.object(host_health_alert, "feishu_send_text") as sender:
+            exit_code = host_health_alert.run(argv)
+        self.assertEqual(exit_code, 0)
+        return [call.kwargs["text"] for call in sender.call_args_list]
+
+    def _alerting_keys(self) -> set[str]:
+        state = host_health_alert.load_threshold_state(self.threshold_state_path)
+        return {key for key, value in state.items() if value.alerting}
+
+    def test_without_db_container_flag_none_of_the_four_checks_run(self) -> None:
+        # 状态文件缺失、两条查询都会失败——但没给 --db-container 就一处都不该碰。
+        self.status_path.unlink()
+        self._set_connections("garbage", rc=1)
+        self._set_wal("garbage", rc=1)
+        self.assertEqual(self._round(with_db=False), [])
+        self.assertFalse(self.calls_log.exists())
+        self.assertFalse(self.threshold_state_path.exists())
+
+    def test_fresh_ok_status_and_normal_queries_yield_zero_alerts(self) -> None:
+        self.assertEqual(self._round(), [])
+        self.assertFalse(self.threshold_state_path.exists())
+        calls = self.calls_log.read_text(encoding="utf-8").splitlines()
+        self.assertEqual(len(calls), 2)
+        self.assertTrue(
+            all(c.startswith(f"exec {self.DB_CONTAINER} psql -U postgres") for c in calls)
+        )
+        self.assertTrue(any("pg_stat_activity" in c and "-tAc" in c for c in calls))
+        self.assertTrue(any("pg_ls_waldir" in c for c in calls))
+
+    def test_db_container_joins_container_health_checks_without_duplicate(self) -> None:
+        self.db_inspect.write_text('{"Running": false}', encoding="utf-8")
+        texts = self._round(["--containers", "unused-container", self.DB_CONTAINER])
+        container_texts = [t for t in texts if t.startswith("[BI Plus 宿主监控] 告警\n容器：")]
+        self.assertEqual(len(container_texts), 1)
+        self.assertIn(f"容器：{self.DB_CONTAINER}", container_texts[0])
+        self.assertIn("容器未运行", container_texts[0])
+        state = host_health_alert.load_state(self.state_path)
+        self.assertTrue(state[self.DB_CONTAINER].alerting)
+
+    def test_stale_backup_alerts_once_dedupes_then_recovers_once(self) -> None:
+        self._write_status(finished_at=self.now - timedelta(hours=30))
+        texts = self._round()
+        self.assertEqual(len(texts), 1)
+        self.assertTrue(texts[0].startswith("[BI Plus 数据库监控] 告警\n"))
+        self.assertIn("本地库备份过期：上次完成 ", texts[0])
+        self.assertIn("距今 30.", texts[0])
+        self.assertIn("阈值 26 小时", texts[0])
+        self.assertEqual(self._alerting_keys(), {host_health_alert.DB_BACKUP_STALE})
+        self.assertEqual(self._round(), [])
+        self._write_status()
+        texts = self._round()
+        self.assertEqual(len(texts), 1)
+        self.assertTrue(texts[0].startswith("[BI Plus 数据库监控] 恢复\n"))
+        self.assertIn("本地库备份过期：已恢复正常", texts[0])
+        self.assertEqual(self._round(), [])
+        self.assertEqual(self._alerting_keys(), set())
+
+    def test_max_age_is_configurable(self) -> None:
+        self._write_status(finished_at=self.now - timedelta(hours=30))
+        self.assertEqual(self._round(["--db-backup-max-age-hours", "48"]), [])
+
+    def test_failed_backup_alerts_with_error_code_then_recovers(self) -> None:
+        self._write_status(ok=False, error="pg_dump_failed")
+        texts = self._round()
+        self.assertEqual(len(texts), 1)
+        self.assertIn("本地库备份失败：上次备份失败，错误码 pg_dump_failed", texts[0])
+        self.assertEqual(self._alerting_keys(), {host_health_alert.DB_BACKUP_FAILED})
+        self.assertEqual(self._round(), [])
+        self._write_status()
+        texts = self._round()
+        self.assertEqual(len(texts), 1)
+        self.assertIn("本地库备份失败：已恢复正常", texts[0])
+
+    def test_transfer_failure_alerts_only_when_backup_itself_succeeded(self) -> None:
+        self._write_status(transfer={"mode": "scp", "ok": False, "label": "stage"})
+        texts = self._round()
+        self.assertEqual(len(texts), 1)
+        self.assertIn("本地库备份传输失败：上次备份成功但副本传输失败（方式 scp）", texts[0])
+        self.assertEqual(self._alerting_keys(), {host_health_alert.DB_BACKUP_TRANSFER_FAILED})
+        # 备份本身失败时只报失败，不再叠一条传输失败（传输失败随之恢复）。
+        self._write_status(ok=False, error="pg_dump_failed", transfer={"mode": "scp", "ok": False})
+        texts = self._round()
+        self.assertEqual(
+            sorted(t.splitlines()[1].split("：")[0] for t in texts),
+            ["本地库备份传输失败", "本地库备份失败"],
+        )
+        self.assertEqual(self._alerting_keys(), {host_health_alert.DB_BACKUP_FAILED})
+
+    def test_unknown_status_five_shapes_each_alert_once_dedupe_recover_then_realert(self) -> None:
+        def break_missing() -> None:
+            self.status_path.unlink(missing_ok=True)
+
+        def break_invalid_json() -> None:
+            self._write_status(raw_text="{not valid json")
+
+        def break_schema() -> None:
+            self._write_status(schema=2)
+
+        def break_timestamp() -> None:
+            self._write_status(finished_at="yesterday")
+
+        shapes = {
+            "missing": break_missing,
+            "invalid_json": break_invalid_json,
+            "schema": break_schema,
+            "timestamp": break_timestamp,
+        }
+        for reason, break_file in shapes.items():
+            with self.subTest(reason=reason):
+                self.threshold_state_path.unlink(missing_ok=True)
+                break_file()
+                texts = self._round()
+                self.assertEqual(len(texts), 1)
+                self.assertIn(f"本地库备份状态未知：状态文件读不到或不合法（{reason}）", texts[0])
+                self.assertEqual(self._alerting_keys(), {host_health_alert.DB_BACKUP_UNKNOWN})
+                self.assertEqual(self._round(), [])
+                self._write_status()
+                texts = self._round()
+                self.assertEqual(len(texts), 1)
+                self.assertIn("本地库备份状态未知：已恢复正常", texts[0])
+                self.assertEqual(self._alerting_keys(), set())
+                break_file()
+                texts = self._round()
+                self.assertEqual(len(texts), 1)
+                self.assertIn(f"（{reason}）", texts[0])
+
+    def test_unreadable_status_file_alerts_unknown_once_then_recovers_then_realerts(self) -> None:
+        # 0600 归属别人的文件：用 PermissionError 模拟"存在但读不了"，不依赖测试账户是不是 root。
+        original_read_text = host_health_alert.Path.read_text
+        status_path = self.status_path
+
+        def deny_status_file(self_path, *args, **kwargs):
+            if self_path == status_path:
+                raise PermissionError(13, "Permission denied")
+            return original_read_text(self_path, *args, **kwargs)
+
+        with mock.patch.object(
+            host_health_alert.Path, "read_text", autospec=True, side_effect=deny_status_file
+        ):
+            texts = self._round()
+            self.assertEqual(len(texts), 1)
+            self.assertIn("本地库备份状态未知：状态文件读不到或不合法（unreadable）", texts[0])
+            self.assertEqual(self._round(), [])
+        texts = self._round()
+        self.assertEqual(len(texts), 1)
+        self.assertIn("本地库备份状态未知：已恢复正常", texts[0])
+        self.assertEqual(self._alerting_keys(), set())
+        with mock.patch.object(
+            host_health_alert.Path, "read_text", autospec=True, side_effect=deny_status_file
+        ):
+            texts = self._round()
+        self.assertEqual(len(texts), 1)
+        self.assertIn("（unreadable）", texts[0])
+
+    def test_connections_79_percent_silent_80_percent_alerts_then_recovers(self) -> None:
+        self._set_connections("79|100")
+        self.assertEqual(self._round(), [])
+        self._set_connections("80|100")
+        texts = self._round()
+        self.assertEqual(len(texts), 1)
+        self.assertIn("本地库连接数偏高：80/100（80.0%，阈值 80%）", texts[0])
+        self.assertEqual(self._alerting_keys(), {host_health_alert.DB_CONNECTIONS_HIGH})
+        self.assertEqual(self._round(), [])
+        self._set_connections("10|100")
+        texts = self._round()
+        self.assertEqual(len(texts), 1)
+        self.assertIn("本地库连接数偏高：已恢复正常", texts[0])
+        self.assertEqual(self._alerting_keys(), set())
+
+    def test_connections_threshold_is_configurable(self) -> None:
+        self._set_connections("80|100")
+        self.assertEqual(self._round(["--db-connections-alert-percent", "90"]), [])
+
+    def test_wal_threshold_boundary_on_both_sides(self) -> None:
+        self._set_wal("999")
+        self.assertEqual(self._round(["--db-wal-alert-bytes", "1000"]), [])
+        self._set_wal("1000")
+        texts = self._round(["--db-wal-alert-bytes", "1000"])
+        self.assertEqual(len(texts), 1)
+        self.assertIn("本地库 WAL 过大：1000 字节", texts[0])
+        self.assertIn("阈值 1000 字节", texts[0])
+        self.assertEqual(self._round(["--db-wal-alert-bytes", "1000"]), [])
+        self._set_wal("0")
+        texts = self._round(["--db-wal-alert-bytes", "1000"])
+        self.assertEqual(len(texts), 1)
+        self.assertIn("本地库 WAL 过大：已恢复正常", texts[0])
+
+    def test_query_failure_three_reasons_alert_unknown_once_each(self) -> None:
+        self._set_connections("10|100", rc=1)
+        texts = self._round()
+        self.assertEqual(len(texts), 1)
+        self.assertIn("本地库查询状态未知：查询失败（exec_failed）", texts[0])
+        self.assertEqual(self._alerting_keys(), {host_health_alert.DB_QUERY_UNKNOWN})
+        self.assertEqual(self._round(), [])
+
+        self._set_connections("10|100")
+        texts = self._round()
+        self.assertEqual(len(texts), 1)
+        self.assertIn("本地库查询状态未知：已恢复正常", texts[0])
+
+        self._set_connections("10|100", delay=True)
+        texts = self._round(["--timeout-seconds", "0.5"])
+        self.assertEqual(len(texts), 1)
+        self.assertIn("查询失败（timeout）", texts[0])
+        self.assertEqual(self._round(["--timeout-seconds", "0.5"]), [])
+
+        self._set_connections("10|100")
+        self.assertEqual(len(self._round()), 1)
+        self._set_connections("garbage output")
+        texts = self._round()
+        self.assertEqual(len(texts), 1)
+        self.assertIn("查询失败（unparseable）", texts[0])
+
+    def test_one_failed_query_does_not_silence_the_other(self) -> None:
+        self._set_connections("garbage", rc=1)
+        self._set_wal("5000")
+        texts = self._round(["--db-wal-alert-bytes", "1000"])
+        labels = sorted(t.splitlines()[1].split("：")[0] for t in texts)
+        self.assertEqual(labels, ["本地库 WAL 过大", "本地库查询状态未知"])
+
+    def test_old_threshold_state_file_without_db_keys_loads_and_is_preserved(self) -> None:
+        self.threshold_state_path.write_text(
+            json.dumps({"disk": {"alerting": True, "consecutive": 2}}), encoding="utf-8"
+        )
+        self.assertEqual(self._round(), [])
+        state = host_health_alert.load_threshold_state(self.threshold_state_path)
+        self.assertEqual(
+            state["disk"], host_health_alert.ThresholdState(alerting=True, consecutive=2)
+        )
+        self.assertEqual(self._alerting_keys(), {"disk"})
+
+    def test_dry_run_does_not_send_or_persist(self) -> None:
+        self._write_status(finished_at=self.now - timedelta(hours=30))
+        self.assertEqual(self._round(["--dry-run"]), [])
+        self.assertFalse(self.threshold_state_path.exists())
+        self.assertIn("db_backup_stale", self.log_path.read_text(encoding="utf-8"))
+
+    def test_alert_text_never_leaks_paths_container_name_or_query_output(self) -> None:
+        # 哨兵塞满三处：状态文件路径、容器名、psql 输出原文（stdout 与 stderr）；状态文件里
+        # 的错误码与传输字段也塞路径，看它们会不会被原样转发。
+        sentinel_dir = self.tmp_path / "SENTINEL_PATH"
+        sentinel_dir.mkdir()
+        self.status_path = sentinel_dir / "SENTINEL_STATUS.json"
+        self.DB_CONTAINER = "SENTINEL_CONTAINER"
+        self._set_connections("SENTINEL_OUTPUT /opt/SENTINEL_PATH garbage")
+        self._set_wal("SENTINEL_WAL", rc=1)
+        texts = self._round()
+        self._write_status(
+            ok=False,
+            error="/opt/SENTINEL_PATH/pg_dump: failed",
+            transfer={"mode": "/opt/SENTINEL_MODE", "ok": False, "label": "SENTINEL_LABEL"},
+        )
+        texts.extend(self._round())
+        self._write_status(
+            ok=True,
+            transfer={"mode": "scp SENTINEL", "ok": False, "label": "SENTINEL_LABEL"},
+        )
+        texts.extend(self._round())
+        # 未知（状态文件缺失）+ 查询未知，然后备份失败 + 状态未知恢复，然后传输失败 + 失败恢复。
+        self.assertEqual(len(texts), 6)
+        forbidden = (
+            "SENTINEL",
+            "/opt/",
+            str(self.tmp_path),
+            str(self.docker_bin),
+            "pg_stat_activity",
+            "pg_ls_waldir",
+        )
+        for text in texts:
+            for needle in forbidden:
+                with self.subTest(needle=needle, text=text):
+                    self.assertNotIn(needle, text)
+
+
 if __name__ == "__main__":
     unittest.main()

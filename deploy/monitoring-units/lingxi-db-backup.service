@@ -1,0 +1,21 @@
+[Unit]
+Description=Lingxi 本地数据库每日备份单轮（pg_dump → 校验 → 行数清单 → 保留 → 异机传输，Issue #809）
+After=network-online.target docker.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+# 与同目录其它单元不同，本单元**以 root 运行、不用 drop-in 提供 User=**：它要 `docker exec`
+# 进数据库容器，并往 root 0700 的备份目录写未加密的全量 dump（不需口令即可还原全部
+# 业务数据），这两件事都不该交给部署用户账户；备份目录与状态文件的属主 / 权限由脚本
+# 前置核对，属主不是运行账户即拒绝备份。装 `User=<部署用户>` 的 drop-in 循环时跳过本单元。
+User=root
+WorkingDirectory=/opt/lingxi/scripts
+# 输入只经 EnvironmentFile 注入（0600，只放 LINGXI_DB_BACKUP_* 变量，不含任何连接串
+# ——脚本经容器内本地套接字备份，本就不持口令）；异机传输的目标地址也只住在这里，
+# 不进 ExecStart 命令行。
+EnvironmentFile=/opt/lingxi/monitoring/db-backup.env
+ExecStart=/usr/bin/env bash /opt/lingxi/scripts/db_backup.sh
+# 27 MB 级的库整轮不到 1 分钟；留 30 分钟给异机传输与将来的体量增长。超时被杀时
+# 脚本来不及写状态文件，宿主巡检按「状态文件过旧」告警，与失败一样有人知道。
+TimeoutStartSec=1800
