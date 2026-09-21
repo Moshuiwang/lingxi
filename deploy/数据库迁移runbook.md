@@ -46,8 +46,8 @@
 
 ## 五、`verify` 零差异的判据与预期差异
 
-- **判红项**（任一不等即退出非 0、打印逐项差异）：`encoding` / `datcollate` / `datctype` / `datlocprovider` / `datlocale` 五项；角色级 `postgres` 的 `search_path`（来源 `"$user", public, extensions`，`install-pg` 镜像同一条）；`alembic_version`；`public` 对象计数（表 / 索引 / 序列 / 视图 / 函数 / 非内部触发器）；逐表精确行数；序列 `last_value`；逐表触发器名；`pg_trgm` 版本与 schema（`extensions`）；`lingxi_retention_cleanup` 属主 = `lingxi_retention_owner` 且 `prosecdef = true`；`public` 下全部表 / 序列 / 视图 / 函数与 schema 本身的属主逐个相等；同一集合的 ACL 逐对象相等。
-- **预期差异（只列不判红）**：`datcollversion`（来源 153.121，本地 `postgres:17` 实测 153.128——同 ICU 73 系，恢复后索引在本地重建，脚本只把两值记进 `verify.json`）；来源的平台扩展（`supabase_vault` / `pg_stat_statements` / `pgcrypto` / `uuid-ossp` 等）不在目标——应用只依赖 `pg_trgm`；来源的平台角色（`supabase_*` / `authenticator` 等）不比对，只比 `public` 对象引用到的角色，它们已在 `install-pg` 按来源清单占位（`NOLOGIN`、无成员、无属性）。
+- **判红项**（任一不等即退出非 0、打印逐项差异）：`encoding` / `datcollate` / `datctype` / `datlocprovider` / `datlocale` 五项；角色级 `postgres` 的 `search_path`（来源 `"$user", public, extensions`，`install-pg` 镜像同一条）；`alembic_version`；`public` 对象计数（表 / 索引 / 序列 / 视图 / 函数 / 非内部触发器）；逐表精确行数；序列 `last_value`；逐表触发器名；`pg_trgm` 版本与 schema（`extensions`）；`lingxi_retention_cleanup` 属主 = `lingxi_retention_owner` 且 `prosecdef = true`；`public` 下全部表 / 序列 / 视图 / 函数与 schema 本身的属主逐个相等；同一集合的 ACL 逐对象相等（grantee + 权限位）。
+- **预期差异（只列不判红）**：ACL 条目的 grantor（`grantee=权限位/grantor` 里 `/` 后那一段）——比对只按 grantee + 权限位归一，含 grantor 的原文两侧都记进 `verify.json` 的 `acls_raw` 供人工核对（实测 `pg_restore` 以 `SET SESSION AUTHORIZATION` 重放非属主授权、grantor 原样保留，归一只为托管平台侧可能的差异兜底）；`datcollversion`（来源 153.121，本地 `postgres:17` 实测 153.128——同 ICU 73 系，恢复后索引在本地重建，脚本只把两值记进 `verify.json`）；来源的平台扩展（`supabase_vault` / `pg_stat_statements` / `pgcrypto` / `uuid-ossp` 等）不在目标——应用只依赖 `pg_trgm`；来源的平台角色（`supabase_*` / `authenticator` 等）不比对，只比 `public` 对象引用到的角色，它们已在 `install-pg` 按来源清单占位（`NOLOGIN`、无成员、无属性）。
 - 比对基准是 `dump` 时（已停写）写下的来源快照，不是 `preflight`，也不是任何人工抄写的常量：迁移链头在研发机实得 `public` 表 46，与早先只读盘点表上的 85 不一致，`verify` 只认实时读数。
 
 ## 六、回退
