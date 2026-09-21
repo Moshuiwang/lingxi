@@ -1,0 +1,12 @@
+{
+  "candidate_tag": "v2.5.3-rc.109",
+  "evidence_url": "https://github.com/Moshuiwang/lingxi/issues/859#issuecomment-5750432568",
+  "manifest_sha256": "ea80a5799bda7fed7f598e1d3e6b9beb89d881d18afc73f11ec0b26709b53445",
+  "recovery": {
+    "evidence_url": "https://github.com/Moshuiwang/lingxi/issues/859#issuecomment-5750432568",
+    "instructions": "生产回滚 = 切回上一正式版 v2.5.2 的四镜像，不降级数据库；任何回滚动作属显式除外，须产品负责人单独请示与亲跑。路径一（部署器，优先）：按 deploy/拉取代理.md §五与 deploy/releases/README.md「固定计划与一次批准」另存 operation=recover、引用本次 v2.5.3 部署计划的恢复计划并独立批准，以 /opt/lingxi/bin/python3 -B <控制包内 lingxi_deploy.py> recover 执行（恢复计划 old/new 对调，recovery.target_manifest_sha256 = v2.5.2 正式版 Release 附件 release-manifest.json 的 sha256 08414d82bc959498da7308b23514d2568605d4901a68e8d8e0697564b7435b18；部署器在 migrate 阶段只核对库头不降级）。路径二（手工，部署器不可用时）：用 v2.5.2 正式版清单的四镜像 digest（完整值见 Release v2.5.2 附件 release-manifest.json）按部署器为 v2.5.2 计划渲染保存的 compose 与公开配置重起三服务。宿主文件独立于镜像：发布1 由 s29_p1_host_install.sh 装入的新拉取代理文件、新宿主监控脚本与 gh.env.meta，用同一脚本的 rollback 子命令还原（挪回 .bak-s29-* 两份副本、删除本脚本写的 meta）；注意代理自替换发生后其清理会删掉 release_pull_agent.py.bak-* 旧副本，此时代理文件回退改用代理自留的 .bak-<旧摘要前 8 位> 副本或从上一正式版控制包目录取 deploy/release_pull_agent.py 重装（root，属主权限照引导安装 §二.4）。数据库：本候选迁移头仍为 0098_qa_corpus（与 v2.5.2 相同，migrate 阶段无作业），回滚没有库结构回退项。",
+    "previous_tag": "v2.5.2"
+  },
+  "result": "passed",
+  "schema": 1
+}

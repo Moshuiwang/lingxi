@@ -111,6 +111,16 @@ root 0700 目录里，本脚本按部署用户运行读不到。三个判据各�
 （含部署观察），service 仍在运行时不判过期、也不判上一轮失败。任何一步读不到
 （`systemctl` 不存在 / 非零退出 / 属性缺失或解析不了）都以「未知」形态告警一次
 并同样去重，不得静默当作正常。本检查不改变容器主线的退出码语义。
+
+# 本地库检查（``--db-container`` 打开，默认关闭）
+
+迁库后的本地 PostgreSQL 容器与它的每日备份同样没有别的进程替它出声。给出
+``--db-container`` 后：该容器追加进上面的容器健康检查（同一套三态语义与文案）；备份
+脚本写出的状态文件（``--db-backup-status-file``）判过期 / 失败 / 副本传输失败，读不到或
+不合法以「未知」形态告警一次；再经 ``docker exec <容器> psql`` 两条只读查询判客户端连接
+数占比与 WAL 目录大小，任一条失败同样以「未知」形态告警一次。四项的去重记忆与阈值副线
+共用 ``--threshold-state-file``；正文只含结果码与数值，不含路径、连接串与容器输出原文。
+不给 ``--db-container`` 时这四项一处都不执行，既有主机零行为变化。
 """
 
 from __future__ import annotations
@@ -118,6 +128,7 @@ from __future__ import annotations
 import argparse
 import contextlib
 import fcntl
+import functools
 import json
 import logging
 import os
@@ -166,6 +177,13 @@ DEFAULT_STALENESS_THRESHOLD_MINUTES = 10.0
 #: 任何留痕才算停摆。
 DEFAULT_RELEASE_PULL_UNIT = "lingxi-release-pull"
 DEFAULT_RELEASE_PULL_STALE_MINUTES = 15.0
+
+#: 本地库检查（`--db-container` 打开才执行）：备份状态文件位置与三个阈值的缺省值。26 小时
+#: 是每日备份周期加两小时余量；连接数按 `max_connections` 的百分比判；WAL 目录按字节判。
+DEFAULT_DB_BACKUP_STATUS_FILE = "/var/lib/lingxi/db-backup-status.json"
+DEFAULT_DB_BACKUP_MAX_AGE_HOURS = 26.0
+DEFAULT_DB_CONNECTIONS_ALERT_PERCENT = 80.0
+DEFAULT_DB_WAL_ALERT_BYTES = 2_147_483_648
 
 REQUIRED_ENV_KEYS: tuple[str, ...] = (
     "LINGXI_FEISHU_APP_ID",
@@ -411,9 +429,6 @@ _RELEASE_PULL_LABEL: Mapping[str, str] = {
     RELEASE_PULL_UNKNOWN: "拉取代理状态未知",
 }
 
-#: 拉取代理四个键的消息分类词；其余阈值键沿用渲染函数的默认值。
-_THRESHOLD_CATEGORY: Mapping[str, str] = dict.fromkeys(_RELEASE_PULL_LABEL, "宿主监控")
-
 #: oneshot 服务执行中是 `activating`；其余几个是保守起见一并视为"仍在跑"的状态。
 _SERVICE_RUNNING_STATES = frozenset({"activating", "active", "reloading", "deactivating"})
 
@@ -545,6 +560,189 @@ def judge_release_pull(
             )
         )
     return checks
+
+
+# ---------------------------------------------------------------------------
+# 本地库检查的纯逻辑：备份状态文件的解析与三项判据、两条 psql 查询输出的解析与阈值
+# 判据。全部不做进程与文件调用；读取与查询在下面的 I/O 节。
+# ---------------------------------------------------------------------------
+
+#: 阈值副线检查项的形状 `(key, label, breached, detail, consecutive_required)`。
+ThresholdCheck = tuple[str, str, bool, str, int]
+
+DB_BACKUP_STALE = "db_backup_stale"
+DB_BACKUP_FAILED = "db_backup_failed"
+DB_BACKUP_TRANSFER_FAILED = "db_backup_transfer_failed"
+DB_BACKUP_UNKNOWN = "db_backup_unknown"
+DB_CONNECTIONS_HIGH = "db_connections_high"
+DB_WAL_LARGE = "db_wal_large"
+DB_QUERY_UNKNOWN = "db_query_unknown"
+
+_DB_LABEL: Mapping[str, str] = {
+    DB_BACKUP_STALE: "本地库备份过期",
+    DB_BACKUP_FAILED: "本地库备份失败",
+    DB_BACKUP_TRANSFER_FAILED: "本地库备份传输失败",
+    DB_BACKUP_UNKNOWN: "本地库备份状态未知",
+    DB_CONNECTIONS_HIGH: "本地库连接数偏高",
+    DB_WAL_LARGE: "本地库 WAL 过大",
+    DB_QUERY_UNKNOWN: "本地库查询状态未知",
+}
+
+#: 拉取代理与本地库各键的消息分类词；其余阈值键沿用渲染函数的默认值。
+_THRESHOLD_CATEGORY: Mapping[str, str] = {
+    **dict.fromkeys(_RELEASE_PULL_LABEL, "宿主监控"),
+    **dict.fromkeys(_DB_LABEL, "数据库监控"),
+}
+
+#: 两条查询都经 `docker exec <容器> psql -U postgres -d postgres -tAc` 执行：容器内本地
+#: 套接字、无口令。连接数只数客户端后端，不含 autovacuum、复制等内部进程。
+_DB_CONNECTIONS_SQL = (
+    "select count(*), current_setting('max_connections') from pg_stat_activity"
+    " where backend_type='client backend'"
+)
+_DB_WAL_SQL = "select coalesce(sum(size),0) from pg_ls_waldir()"
+
+#: 状态文件里的错误码与传输方式会进告警正文，只许是短标识符；其它形状（路径、命令
+#: 原文）一律以固定占位词代替，不原样转发。
+_SHORT_CODE = re.compile(r"^[A-Za-z0-9_.:-]{1,64}$")
+
+
+@dataclass(frozen=True)
+class BackupStatus:
+    """备份状态文件里判定所需的最小事实集合（文件形状由备份脚本定义）。"""
+
+    ok: bool
+    finished_at: datetime
+    error: str | None
+    transfer_mode: str
+    transfer_ok: bool | None
+
+
+def _short_code(value: object, fallback: str) -> str:
+    return value if isinstance(value, str) and _SHORT_CODE.match(value) else fallback
+
+
+def parse_backup_status(raw: object) -> BackupStatus:
+    """把状态文件的 JSON 转成 BackupStatus；形状不对抛 ``ValueError``，消息即固定原因码。
+
+    `schema` 不是整数 1 或 `ok` 不是布尔 → ``schema``；`finished_at` 缺失、不是 ISO-8601 或
+    不带时区 → ``timestamp``。其余字段缺失按"没有"处理，不算坏文件。
+    """
+
+    if not isinstance(raw, Mapping):
+        raise ValueError("schema")
+    schema, ok = raw.get("schema"), raw.get("ok")
+    if isinstance(schema, bool) or schema != 1 or not isinstance(ok, bool):
+        raise ValueError("schema")
+    finished = raw.get("finished_at")
+    if not isinstance(finished, str):
+        raise ValueError("timestamp")
+    try:
+        finished_at = datetime.fromisoformat(finished)
+    except ValueError as error:
+        raise ValueError("timestamp") from error
+    if finished_at.tzinfo is None:
+        raise ValueError("timestamp")
+    transfer = raw.get("transfer")
+    transfer = transfer if isinstance(transfer, Mapping) else {}
+    transfer_ok = transfer.get("ok")
+    error_code = raw.get("error")
+    return BackupStatus(
+        ok=ok,
+        finished_at=finished_at,
+        error=None if error_code is None else _short_code(error_code, "invalid_error_code"),
+        transfer_mode=_short_code(transfer.get("mode"), "unknown"),
+        transfer_ok=transfer_ok if isinstance(transfer_ok, bool) else None,
+    )
+
+
+def judge_backup_status(
+    status: BackupStatus, *, now: datetime, max_age_hours: float
+) -> list[ThresholdCheck]:
+    """三个判据各自独立成检查项；未知键以未触发形态同批参与，读取恢复后才发得出恢复通知。
+
+    过期看 `finished_at` 距今是否超过阈值——失败的一轮同样更新它，所以"一直失败"报的是
+    失败而不是过期，"定时器根本没跑"才报过期；传输失败只在备份本身成功时判。
+    """
+
+    age_hours = (now - status.finished_at).total_seconds() / 3600
+    return [
+        (DB_BACKUP_UNKNOWN, _DB_LABEL[DB_BACKUP_UNKNOWN], False, "", 1),
+        (
+            DB_BACKUP_STALE,
+            _DB_LABEL[DB_BACKUP_STALE],
+            age_hours > max_age_hours,
+            f"上次完成 {_format_utc(status.finished_at)}，距今 {age_hours:.1f} 小时"
+            f"（阈值 {max_age_hours:.0f} 小时）",
+            1,
+        ),
+        (
+            DB_BACKUP_FAILED,
+            _DB_LABEL[DB_BACKUP_FAILED],
+            not status.ok,
+            f"上次备份失败，错误码 {status.error or 'n/a'}",
+            1,
+        ),
+        (
+            DB_BACKUP_TRANSFER_FAILED,
+            _DB_LABEL[DB_BACKUP_TRANSFER_FAILED],
+            status.ok and status.transfer_ok is False,
+            f"上次备份成功但副本传输失败（方式 {status.transfer_mode}）",
+            1,
+        ),
+    ]
+
+
+def parse_connections_output(text: str) -> tuple[int, int]:
+    """`count|max_connections` 一行两个整数；其它形状抛 ``ValueError("unparseable")``。"""
+
+    parts = text.strip().split("|")
+    if len(parts) != 2:
+        raise ValueError("unparseable")
+    try:
+        used, limit = int(parts[0]), int(parts[1])
+    except ValueError as error:
+        raise ValueError("unparseable") from error
+    if used < 0 or limit <= 0:
+        raise ValueError("unparseable")
+    return used, limit
+
+
+def parse_wal_output(text: str) -> int:
+    """`pg_ls_waldir()` 大小求和的一行整数（字节）；其它形状抛 ``ValueError("unparseable")``。"""
+
+    try:
+        value = int(text.strip())
+    except ValueError as error:
+        raise ValueError("unparseable") from error
+    if value < 0:
+        raise ValueError("unparseable")
+    return value
+
+
+def judge_db_connections(used: int, limit: int, *, alert_percent: float) -> ThresholdCheck:
+    """占比达到阈值（含等于）即告警：阈值本身就是"该看一眼"的水位，不是越过才算。"""
+
+    percent = used / limit * 100
+    return (
+        DB_CONNECTIONS_HIGH,
+        _DB_LABEL[DB_CONNECTIONS_HIGH],
+        percent >= alert_percent,
+        f"{used}/{limit}（{percent:.1f}%，阈值 {alert_percent:.0f}%）",
+        1,
+    )
+
+
+def judge_db_wal(wal_bytes: int, *, alert_bytes: int) -> ThresholdCheck:
+    """WAL 目录字节数达到阈值（含等于）即告警。"""
+
+    return (
+        DB_WAL_LARGE,
+        _DB_LABEL[DB_WAL_LARGE],
+        wal_bytes >= alert_bytes,
+        f"{wal_bytes} 字节（{wal_bytes / 2**30:.2f} GiB，阈值 {alert_bytes} 字节）",
+        1,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -877,6 +1075,48 @@ def read_release_pull_observation(
     )
 
 
+def read_backup_status(path: Path) -> BackupStatus:
+    """读并解析备份状态文件；读不到或不合法一律抛 ``HostMonitorError``，消息即固定原因码
+    （missing / unreadable / invalid_json / schema / timestamp），不带路径与文件内容。
+    """
+
+    try:
+        text = path.read_text(encoding="utf-8")
+    except FileNotFoundError as error:
+        raise HostMonitorError("missing") from error
+    except OSError as error:
+        raise HostMonitorError("unreadable") from error
+    try:
+        raw = json.loads(text)
+    except json.JSONDecodeError as error:
+        raise HostMonitorError("invalid_json") from error
+    try:
+        return parse_backup_status(raw)
+    except ValueError as error:
+        raise HostMonitorError(str(error)) from error
+
+
+def db_query(container: str, sql: str, *, docker_bin: str, timeout_seconds: float) -> str:
+    """`docker exec <容器> psql -U postgres -d postgres -tAc <sql>` 的标准输出（去首尾空白）。
+
+    经容器内本地套接字、无口令。失败只抛固定原因码（exec_failed / timeout），stderr 原文
+    不外传——容器输出可能带路径或连接信息，不进告警正文。
+    """
+
+    argv = [docker_bin, "exec", container, "psql", "-U", "postgres", "-d", "postgres", "-tAc", sql]
+    try:
+        proc = subprocess.run(
+            argv, capture_output=True, text=True, timeout=timeout_seconds, check=False
+        )
+    except FileNotFoundError as error:
+        raise HostMonitorError("exec_failed") from error
+    except subprocess.TimeoutExpired as error:
+        raise HostMonitorError("timeout") from error
+    if proc.returncode != 0:
+        raise HostMonitorError("exec_failed")
+    return proc.stdout.strip()
+
+
 def _feishu_tenant_access_token(
     base_url: str, app_id: str, app_secret: str, *, timeout_seconds: float
 ) -> str:
@@ -1099,6 +1339,35 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--systemctl-bin", default="systemctl", help="systemctl 可执行文件名或路径（测试注入用）"
     )
+    parser.add_argument(
+        "--db-container",
+        default=None,
+        help="本地库容器名；给出后该容器追加进容器健康检查，并额外检查备份状态文件、客户端"
+        "连接数与 WAL 目录大小（默认不给 = 四项全部关闭，既有主机零行为变化）",
+    )
+    parser.add_argument(
+        "--db-backup-status-file",
+        default=DEFAULT_DB_BACKUP_STATUS_FILE,
+        help="备份脚本写出的状态文件路径（读不到或不合法以未知形态告警一次）",
+    )
+    parser.add_argument(
+        "--db-backup-max-age-hours",
+        type=float,
+        default=DEFAULT_DB_BACKUP_MAX_AGE_HOURS,
+        help="上次备份完成距今超过多少小时视为过期",
+    )
+    parser.add_argument(
+        "--db-connections-alert-percent",
+        type=float,
+        default=DEFAULT_DB_CONNECTIONS_ALERT_PERCENT,
+        help="客户端连接数占 max_connections 达到多少百分比告警",
+    )
+    parser.add_argument(
+        "--db-wal-alert-bytes",
+        type=int,
+        default=DEFAULT_DB_WAL_ALERT_BYTES,
+        help="WAL 目录总字节数达到多少告警",
+    )
     return parser
 
 
@@ -1131,7 +1400,11 @@ def run(argv: Sequence[str] | None = None) -> int:
         changed = False
         fatal = False
 
-        for name in args.containers:
+        containers = list(args.containers)
+        if args.db_container and args.db_container not in containers:
+            containers.append(args.db_container)
+
+        for name in containers:
             try:
                 entry = docker_inspect_one(
                     name, docker_bin=args.docker_bin, timeout_seconds=args.timeout_seconds
@@ -1203,7 +1476,11 @@ def run(argv: Sequence[str] | None = None) -> int:
                 logger.error("状态文件写入失败，下一轮可能重复告警 error=%s", error)
                 fatal = True
 
-        if args.enable_resource_thresholds or not args.disable_release_pull_check:
+        if (
+            args.enable_resource_thresholds
+            or not args.disable_release_pull_check
+            or args.db_container
+        ):
             _run_threshold_checks(args, credentials, host=host, logger=logger)
 
         return 2 if fatal else 0
@@ -1238,6 +1515,60 @@ def _collect_release_pull_checks(
     return checks
 
 
+def _collect_db_backup_checks(
+    args: argparse.Namespace, logger: logging.Logger
+) -> list[ThresholdCheck]:
+    """备份状态文件的检查项。读不到或不合法以 `db_backup_unknown` 告警一次，三个正常判据
+    这一轮不出结论、状态原样保留（与拉取代理的未知形态同一条纪律）。
+    """
+
+    try:
+        status = read_backup_status(Path(args.db_backup_status_file))
+    except HostMonitorError as error:
+        logger.warning("本地库备份状态文件读取失败，按未知形态告警 reason=%s", error)
+        detail = f"状态文件读不到或不合法（{error}）"
+        return [(DB_BACKUP_UNKNOWN, _DB_LABEL[DB_BACKUP_UNKNOWN], True, detail, 1)]
+    return judge_backup_status(
+        status, now=datetime.now(UTC), max_age_hours=args.db_backup_max_age_hours
+    )
+
+
+def _collect_db_query_checks(
+    args: argparse.Namespace, logger: logging.Logger
+) -> list[ThresholdCheck]:
+    """连接数与 WAL 两条查询的检查项。任一条失败（容器不在、exec 非零、超时、输出不可
+    解析）以 `db_query_unknown` 告警一次，另一条照常出结论；正文只带固定原因码。
+    """
+
+    query = functools.partial(
+        db_query,
+        args.db_container,
+        docker_bin=args.docker_bin,
+        timeout_seconds=args.timeout_seconds,
+    )
+    checks: list[ThresholdCheck] = []
+    reasons: list[str] = []
+    try:
+        used, limit = parse_connections_output(query(_DB_CONNECTIONS_SQL))
+        checks.append(
+            judge_db_connections(used, limit, alert_percent=args.db_connections_alert_percent)
+        )
+    except (HostMonitorError, ValueError) as error:
+        reasons.append(str(error))
+    try:
+        wal_bytes = parse_wal_output(query(_DB_WAL_SQL))
+        checks.append(judge_db_wal(wal_bytes, alert_bytes=args.db_wal_alert_bytes))
+    except (HostMonitorError, ValueError) as error:
+        reasons.append(str(error))
+    if reasons:
+        logger.warning("本地库查询失败，按未知形态告警 reasons=%s", ",".join(reasons))
+        detail = f"查询失败（{reasons[0]}）"
+        checks.append((DB_QUERY_UNKNOWN, _DB_LABEL[DB_QUERY_UNKNOWN], True, detail, 1))
+    else:
+        checks.append((DB_QUERY_UNKNOWN, _DB_LABEL[DB_QUERY_UNKNOWN], False, "", 1))
+    return checks
+
+
 def _run_threshold_checks(
     args: argparse.Namespace, credentials: Mapping[str, str], *, host: str, logger: logging.Logger
 ) -> None:
@@ -1245,7 +1576,8 @@ def _run_threshold_checks(
     检查共用一份去重状态文件与同一套发送/落盘流程。独立于容器检查的去重状态与
     退出码——采集失败（例如挂载点不存在）只记警告并跳过那一项，不把整个
     host_health_alert 调用判成脚本自身故障（`fatal`/退出码 2 仍然只由容器检查那条
-    主线决定）；拉取代理读取失败则按「未知」形态告警，见 `_collect_release_pull_checks`。
+    主线决定）；拉取代理读取失败则按「未知」形态告警，见 `_collect_release_pull_checks`；
+    本地库四项（`--db-container`）同样挂在这条副线上，读取 / 查询失败也按「未知」告警。
     """
 
     threshold_state_path = Path(args.threshold_state_file)
@@ -1256,6 +1588,9 @@ def _run_threshold_checks(
         checks.extend(_collect_resource_checks(args, logger))
     if not args.disable_release_pull_check:
         checks.extend(_collect_release_pull_checks(args, logger))
+    if args.db_container:
+        checks.extend(_collect_db_backup_checks(args, logger))
+        checks.extend(_collect_db_query_checks(args, logger))
 
     threshold_changed = False
     for key, label, breached, detail, consecutive_required in checks:
