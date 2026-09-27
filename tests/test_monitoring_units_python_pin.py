@@ -86,6 +86,20 @@ class MonitoringUnitsPythonPinTest(unittest.TestCase):
             argv = exec_lines[0].removeprefix("ExecStart=").split()
             self.assertEqual(argv[0], PYTHON_INJECTION_POINT, f"{name}: {exec_lines[0]!r}")
 
+    def test_host_monitor_unit_is_the_whole_replacement_for_old_in_place_versions(self) -> None:
+        """#884 第 7 条：主机在位旧版与本文件的三处差异——系统 python3、``User=`` 写在本体、
+        缺 ``TimeoutStartSec``——本文件一处都不带，整份替换后不再需要换解释器的 drop-in。"""
+
+        active = _active_lines(_unit_text("lingxi-host-monitor.service"))
+        self.assertFalse(
+            [line for line in active if line.startswith("User=")],
+            "User= 只能由 10-local.conf 提供",
+        )
+        self.assertIn("TimeoutStartSec=50", active)
+        exec_lines = [line for line in active if line.startswith("ExecStart=")]
+        self.assertEqual(len(exec_lines), 1)
+        self.assertTrue(exec_lines[0].startswith(f"ExecStart={PYTHON_INJECTION_POINT} "))
+
     def test_release_pull_keeps_no_bytecode_flags(self) -> None:
         """换解释器不能顺手丢掉 F12 的两道禁写字节码缓存。"""
 

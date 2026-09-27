@@ -238,7 +238,9 @@ class OsvClient:
                 last_error = error
             except (urllib.error.URLError, TimeoutError, ValueError, OSError) as error:
                 last_error = error
-        raise AuditInputError(f"严重度接口不可用：{url}：{last_error}")
+        raise AuditInputError(
+            f"未能取得严重度（外部服务不可用），非漏洞判定：严重度接口不可用：{url}：{last_error}"
+        )
 
 
 def load_severity_file(path: Path) -> Callable[[str], dict | None]:
