@@ -357,9 +357,11 @@ class HostMaintenanceFakeRootTest(unittest.TestCase):
         """等到 ① 已写入（单元已换、20-python312.conf 已删）并已进入等轮。"""
         self.wait_for(
             "① 写入后进入等轮",
-            lambda: proc.poll() is None
-            and not self.py_dropin.exists()
-            and self.calls().count("InvocationID") >= 2,
+            lambda: (
+                proc.poll() is None
+                and not self.py_dropin.exists()
+                and self.calls().count("InvocationID") >= 2
+            ),
         )
 
     def test_sighup_during_round_wait_auto_restores(self) -> None:
@@ -381,7 +383,9 @@ class HostMaintenanceFakeRootTest(unittest.TestCase):
         (self.state / "reload_sleep").write_text("1.5", encoding="utf-8")
         reloads = self.calls().count("daemon-reload")
         proc.send_signal(signal.SIGTERM)
-        self.wait_for("回装开始 daemon-reload", lambda: self.calls().count("daemon-reload") > reloads)
+        self.wait_for(
+            "回装开始 daemon-reload", lambda: self.calls().count("daemon-reload") > reloads
+        )
         proc.send_signal(signal.SIGHUP)
         proc.send_signal(signal.SIGINT)
         out, err = proc.communicate(timeout=30)
