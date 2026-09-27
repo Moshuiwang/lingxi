@@ -130,7 +130,10 @@ class DbBackupInstallFakeRootTest(unittest.TestCase):
             r"（不与输入文件 sha 比对）→ ok",
         )
         for name in ("脚本", "service", "timer"):
-            self.assertRegex(result.stdout, rf"\[回读判据\] {name} 输入副本：在位 sha=[0-9a-f]{{64}} = 输入文件声明的 sha → ok")
+            self.assertRegex(
+                result.stdout,
+                rf"\[回读判据\] {name} 输入副本：在位 sha=[0-9a-f]{{64}} = 输入文件声明的 sha → ok",
+            )
         self.assertNotIn("不符", result.stdout)
 
     def test_second_apply_is_idempotent(self) -> None:

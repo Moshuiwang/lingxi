@@ -148,13 +148,16 @@ class DbSwitchToLocalFakeRootTest(unittest.TestCase):
         self.assertNotIn(SECRET, result.stdout + result.stderr)
         self.assertNotIn(SECRET, self.calls_log())  # 连接串只经 --env-file 进容器，不进命令行参数
         seen = (self.state / "source_dsn_seen").read_text(encoding="utf-8").strip()
-        self.assertEqual(seen, f"postgresql://lingxi_app:{SECRET}@{SOURCE_HOST}/postgres?sslmode=require")
+        self.assertEqual(
+            seen, f"postgresql://lingxi_app:{SECRET}@{SOURCE_HOST}/postgres?sslmode=require"
+        )
 
     def test_source_env_file_override_reads_stand_in(self) -> None:
         """#896：来源不可读时改读替身库连接串文件；缺省仍是 .env.<env>.migrate。"""
         stand_in = self.base / "source-stand-in.env"
         stand_in.write_text(
-            "LINGXI_MIGRATION_DSN=postgresql://postgres@127.0.0.1:55433/postgres\n", encoding="utf-8"
+            "LINGXI_MIGRATION_DSN=postgresql://postgres@127.0.0.1:55433/postgres\n",
+            encoding="utf-8",
         )
         self.write_inputs(LINGXI_S30_SOURCE_ENV_FILE=str(stand_in))
         result = self.run_script("preflight")
@@ -190,8 +193,12 @@ class DbSwitchToLocalFakeRootTest(unittest.TestCase):
             f"[回读判据] compose.db.yaml 输入副本：在位 sha={_sha(COMPOSE)} = LINGXI_S30_COMPOSE_SHA → ok",
             first.stdout,
         )
-        self.assertIn("[回读判据] .env.db 现场生成：存在、非空、0600（内容与 sha 不打印）→ ok", first.stdout)
-        self.assertIn("[回读判据] hosts 行 现场生成：127.0.0.1 lingxi-db 匹配行 1 → ok", first.stdout)
+        self.assertIn(
+            "[回读判据] .env.db 现场生成：存在、非空、0600（内容与 sha 不打印）→ ok", first.stdout
+        )
+        self.assertIn(
+            "[回读判据] hosts 行 现场生成：127.0.0.1 lingxi-db 匹配行 1 → ok", first.stdout
+        )
         password = (self.root / "etc" / "lingxi" / "db" / ".env.db").read_text(encoding="utf-8")
         self.assertNotIn(password.split("=", 1)[1].strip(), first.stdout + first.stderr)
 
