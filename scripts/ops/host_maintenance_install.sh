@@ -221,7 +221,7 @@ on_signal() { # $1 = 信号名 $2 = 退出码
   trap '' HUP INT TERM
   case "$PHASE" in
     armed) say "收到 $1 → 中断，自动回装 $BK"; do_restore "$BK"; say "中断，已自动回装（收到 $1；见上方回装行）"; exit "$2" ;;
-    done) say "收到 $1 → 中断；三步已装好并回读通过，未回装（用 status 核对，需要时 restore --yes）"; exit "$2" ;;
+    installed) say "收到 $1 → 中断；三步已装好并回读通过，未回装（用 status 核对，需要时 restore --yes）"; exit "$2" ;;
     *) if [[ -n "$BK" && -d "$BK" && ! -f "$BK/complete" ]]; then rm -rf -- "$BK"; fi
        say "收到 $1 → 中断，尚未写入任何目标，未做改动"; exit "$2" ;;
   esac; }
@@ -330,7 +330,7 @@ case "$SUB" in
     step_unit || auto_restore ①
     step_mon || auto_restore ②
     step_bak || auto_restore ③
-    PHASE=done
+    PHASE=installed
     umask_readback; summary; say "apply 完成（备份留在 $BK，需要时 restore --yes）" ;;
   restore)
     [[ "$CONFIRM" == --yes ]] || die "restore 会改主机，须写 restore --yes"
