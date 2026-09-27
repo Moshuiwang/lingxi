@@ -20,9 +20,12 @@ from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any, Protocol
 
+from lingxi.config.content import ContentError, RenderedCard, default_content_catalog
 from lingxi.core.admin.card_layout import assert_unique_named_form_elements, button_row
 from lingxi.core.admin.display_names import AdminDisplayNames
+from lingxi.core.admin.management_status import PUBLISHING_STATUS_TEXT
 from lingxi.core.admin.views import AdminUserStatusView, LocalPermissionOverrideView
+from lingxi.core.delivery.notice_card import _HEADER_TEMPLATES, NoticeTone, escape_markdown
 
 #: 卡片按钮/表单提交回传的 ``admin_action`` 取值，供
 #: ``core/admin/card_callback.py`` 新增的回调分支识别是哪一类管理卡交互。
@@ -661,6 +664,61 @@ def _render_grant_or_legacy_elements(
     )
 
 
+#: 通知卡片键：进内容目录后管理卡加标题栏、「操作对象」字段与色调，并把「已生效」
+#: 写成「权限已下发」（只在发布确认后才会出现这一态）；未进目录时逐字不变。
+MANAGEMENT_CARD_KEY = "notice.admin.management_card"
+_PUBLISHED_STATUS = "已生效"
+_NOTICE_PUBLISHED_STATUS = "权限已下发"
+
+
+def _management_notice() -> RenderedCard | None:
+    """读管理卡的卡片模板；键未进目录或模板不可用时返回 ``None``（沿用原版式）。"""
+    catalog = default_content_catalog()
+    if not catalog.has_card(MANAGEMENT_CARD_KEY):
+        return None
+    try:
+        return catalog.card(MANAGEMENT_CARD_KEY)
+    except ContentError:
+        return None
+
+
+def _notice_status(value: str | None) -> str | None:
+    """卡片版把机器态翻出来的「已生效」写成「权限已下发」，其余状态原样。"""
+    return _NOTICE_PUBLISHED_STATUS if value == _PUBLISHED_STATUS else value
+
+
+def _management_tone(*, shown: str | None, submitted: bool, closed: bool) -> NoticeTone:
+    """管理卡色调：已下发为绿；已提交 / 正在下发或无状态为蓝；取消与未完成为橙。"""
+    if shown == _PUBLISHED_STATUS:
+        return NoticeTone.DONE
+    if closed:
+        return NoticeTone.ATTENTION
+    if submitted or shown is None or shown == PUBLISHING_STATUS_TEXT:
+        return NoticeTone.PROCESSING
+    return NoticeTone.ATTENTION
+
+
+def _apply_notice_layout(
+    card: dict[str, Any],
+    notice: RenderedCard,
+    *,
+    tone: NoticeTone,
+    user_label: str,
+    display_identifier: str,
+) -> dict[str, Any]:
+    """把原版式的首行（「用户权限管理卡 · 用户 · 标识」）换成标题栏 + 「操作对象」字段。"""
+    obj = (
+        f"**操作对象**：{escape_markdown(user_label)}"
+        f" · 标识 {escape_markdown(_safe_identifier_echo(display_identifier))}"
+    )
+    card["body"]["elements"][0:1] = [_markdown(obj), _markdown(notice.body)]
+    card["header"] = {
+        "title": {"tag": "plain_text", "content": notice.title},
+        "template": _HEADER_TEMPLATES[tone],
+    }
+    return card
+
+
 def render_management_card(
     status: AdminUserStatusView,
     *,
@@ -677,8 +735,42 @@ def render_management_card(
     ``display_identifier`` 长得像内部 ID 时退化为通用占位「该用户」（不影响
     回传给服务端的隐藏 ``identifier`` 字段）；``display_names`` 必填，公司/
     指标/用户标识全部经此翻译成人类可读文本。返回值三个分区依次：银河来源 +
-    本地覆盖、补充授权表单、（无，不额外追加分隔或页脚）。
+    本地覆盖、补充授权表单、（无，不额外追加分隔或页脚）。卡片键
+    :data:`MANAGEMENT_CARD_KEY` 进内容目录时改用通知卡片版式（见 :func:`_apply_notice_layout`）。
     """
+    notice = _management_notice()
+    layout = None
+    if notice is not None:
+        shown = status_message or dispatch_status
+        layout = (notice, _management_tone(shown=shown, submitted=submitted, closed=closed))
+        dispatch_status = _notice_status(dispatch_status)
+        status_message = _notice_status(status_message)
+    return _render_management_card(
+        status,
+        display_identifier=display_identifier,
+        catalog=catalog,
+        display_names=display_names,
+        submitted=submitted,
+        dispatch_status=dispatch_status,
+        status_message=status_message,
+        closed=closed,
+        layout=layout,
+    )
+
+
+def _render_management_card(
+    status: AdminUserStatusView,
+    *,
+    display_identifier: str,
+    catalog: CompanyMetricCatalog,
+    display_names: AdminDisplayNames,
+    submitted: bool,
+    dispatch_status: str | None,
+    status_message: str | None,
+    closed: bool,
+    layout: tuple[RenderedCard, NoticeTone] | None,
+) -> dict[str, Any]:
+    """:func:`render_management_card` 的渲染本体；``layout`` 为 ``None`` 即原版式。"""
     (
         company_label_for,
         metric_label_for,
@@ -717,7 +809,13 @@ def render_management_card(
         )
     )
 
-    return {"schema": "2.0", "config": {"update_multi": True}, "body": {"elements": elements}}
+    card = {"schema": "2.0", "config": {"update_multi": True}, "body": {"elements": elements}}
+    if layout is None:
+        return card
+    notice, tone = layout
+    return _apply_notice_layout(
+        card, notice, tone=tone, user_label=user_label, display_identifier=display_identifier
+    )
 
 
 @dataclass(frozen=True)

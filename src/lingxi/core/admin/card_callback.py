@@ -19,6 +19,7 @@ import json
 from collections.abc import Callable
 from typing import Any
 
+from lingxi.config.content import ContentCatalog
 from lingxi.core.admin.card_callback_management import _ManagementCardCallbackMixin
 from lingxi.core.admin.card_callback_ports import (
     _MANAGEMENT_CARD_REVOKE_REASON as _MANAGEMENT_CARD_REVOKE_REASON,
@@ -51,12 +52,14 @@ from lingxi.core.admin.notification import (
     DECISION_CANCEL,
     DECISION_CONFIRM,
     AdminCardTransport,
+    GroupNotice,
     GroupNotifier,
+    build_group_notice,
+    deliver_group_notice,
     describe_failed_reason,
     describe_galaxy_retention,
     permission_scope_ids,
     render_card_payload,
-    render_group_notice,
     render_terminal_card,
 )
 from lingxi.core.admin.pending_action import (
@@ -105,8 +108,11 @@ class AdminCardCallbackHandler(_ManagementCardCallbackMixin):
         management_state_lookup: Callable[[str], AdminUserStatusView | None] | None = None,
         management_card_refresher: ManagementCardRefresher | None = None,
         post_callback_executor: PostCallbackExecutor | None = None,
+        content_catalog: ContentCatalog | None = None,
     ) -> None:
         """除 ``pending_actions``/``confirm_cards``/``audit``/``display_names`` 外的注入端口均可选，未装配时对应的可选功能各自降级或禁用。"""
+        # 内容目录只决定终态卡与管理群广播用不用通知卡片版式；``None`` = 进程默认目录。
+        self._content_catalog = content_catalog
         self._pending_actions = pending_actions
         self._confirm_cards = confirm_cards
         self._group_notifier = group_notifier
@@ -354,6 +360,23 @@ class AdminCardCallbackHandler(_ManagementCardCallbackMixin):
             self._display_names.metric_label(metric_id=metric_id),
         )
 
+    def _group_notice(self, pending: PendingAction) -> GroupNotice:
+        """管理群广播的纯文本与（卡片键进目录时的）卡片；只渲染，不发送。
+
+        群通知只用 ``render_group_notice`` 内部按形状白名单渲染出的脱敏摘要，不转发
+        本次点击结论的原始 message 文本。目标用户身份/公司/指标同样经
+        AdminDisplayNames 翻译成姓名+邮箱与可读内容。
+        """
+        target_label = self._display_names.user_label(open_id=pending.target_open_id)
+        company_label, metric_label = self._resolve_scope_labels(pending)
+        return build_group_notice(
+            pending,
+            target_label=target_label,
+            company_label=company_label,
+            metric_label=metric_label,
+            content_catalog=self._content_catalog,
+        )
+
     def _update_card_to_terminal(self, pending: PendingAction) -> dict[str, Any] | None:
         """渲染终态卡的 CardKit JSON，并尽力而为地出带外更新已发出的那张卡片。
 
@@ -388,6 +411,7 @@ class AdminCardCallbackHandler(_ManagementCardCallbackMixin):
             outcome_text=_outcome_text(pending),
             company_label=company_label,
             metric_label=metric_label,
+            content_catalog=self._content_catalog,
         )
         return card, render_card_payload(card)
 
@@ -470,20 +494,13 @@ class AdminCardCallbackHandler(_ManagementCardCallbackMixin):
     def _notify_group(self, pending: PendingAction) -> None:
         if self._group_notifier is None or not self._group_chat_id:
             return
-        # 群通知只用 render_group_notice 内部按形状白名单渲染出的脱敏摘要，
-        # 不转发本次点击结论的原始 message 文本。目标用户身份/公司/指标同样
-        # 经 AdminDisplayNames 翻译成姓名+邮箱与可读内容。
-        target_label = self._display_names.user_label(open_id=pending.target_open_id)
-        company_label, metric_label = self._resolve_scope_labels(pending)
-        text = render_group_notice(
-            pending,
-            target_label=target_label,
-            company_label=company_label,
-            metric_label=metric_label,
-        )
+        notice = self._group_notice(pending)
         try:
-            self._group_notifier.send_text(
-                chat_id=self._group_chat_id, text=text, dedupe_key=pending.id
+            deliver_group_notice(
+                self._group_notifier,
+                chat_id=self._group_chat_id,
+                notice=notice,
+                dedupe_key=pending.id,
             )
         except Exception as error:  # 群通知失败不影响已经落库的业务结果
             self._audit.record(

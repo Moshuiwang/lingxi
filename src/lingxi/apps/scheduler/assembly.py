@@ -161,17 +161,17 @@ def _send_management_correction_summary(
     发送成功与水位写入之间若进程崩溃，重试携带同一个键；若后来又有新的补偿
     行，集合变化会得到新的键，避免把新增行静默吞掉。
     """
-    from lingxi.config.content import default_content_catalog
+    from lingxi.core.admin.notification import (
+        correction_summary_notice,
+        deliver_group_notice,
+    )
 
     digest = hashlib.sha256("\n".join(message_ids).encode("utf-8")).hexdigest()[:16]
     dedupe_key = f"management-correction:{datetime.now(UTC).date().isoformat()}:{digest}"
-    text = (
-        default_content_catalog()
-        .text("permission.management_correction_summary", count=len(message_ids))
-        .text
-    )
+    notice = correction_summary_notice(count=len(message_ids))
+    chat_id = config.admin_group_chat_id
     try:
-        sender.send_text(chat_id=config.admin_group_chat_id, text=text, dedupe_key=dedupe_key)
+        deliver_group_notice(sender, chat_id=chat_id, notice=notice, dedupe_key=dedupe_key)
     except Exception as error:  # 下一轮继续用同一批次重试
         audit.record(
             "admin.management_correction_summary_failed",
