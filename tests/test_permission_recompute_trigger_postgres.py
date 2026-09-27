@@ -215,10 +215,12 @@ class SuspendTriggersInstantRevokeTests(PermissionRecomputeTriggerPostgresTestCa
         # handle() 的对应注释）。
         self.assertEqual(outcome["toast"]["type"], "success")
         self.assertEqual(outcome["toast"]["content"], "已确认执行。")
-        self.assertIn(
-            "操作已记录，权限正在下发",
-            outcome["card"]["data"]["body"]["elements"][0]["content"],
-        )
+        # #891 卡片化后按 #890 获批样例：停用写账号动作的真实结果，不混称权限下发；
+        # 「已记录≠权限可用」由下方补充授权用例的「操作已记录，权限正在下发」钉住。
+        terminal_body = outcome["card"]["data"]["body"]["elements"][0]["content"]
+        self.assertIn("**结果**：账号已停用", terminal_body)
+        self.assertNotIn("权限正在下发", terminal_body)
+        self.assertNotIn("权限已下发", terminal_body)
 
         # 账号状态：既有行为不变（本卡不改动这一层）。
         account_state = self.query("SELECT account_state FROM app_user WHERE id = %s", (user_id,))[
