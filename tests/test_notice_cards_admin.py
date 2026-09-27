@@ -91,6 +91,13 @@ def _catalog(*keys: str) -> ContentCatalog:
     return ContentCatalog(version=base.version, texts=base._texts, cards={**base._cards, **extra})
 
 
+def _plain_catalog() -> ContentCatalog:
+    """正式目录去掉本组全部通知卡片键：整合路把键写进正式目录之后仍代表「键未进目录」。"""
+    base = default_content_catalog()
+    cards = {key: card for key, card in base._cards.items() if key not in NOTICE_CARDS}
+    return ContentCatalog(version=base.version, texts=base._texts, cards=cards)
+
+
 def _pending(
     *,
     action_type: PendingActionType = PendingActionType.LOCAL_PERMISSION_GRANT,
@@ -280,16 +287,23 @@ def _real_group(fake: _FakeFeishu) -> FeishuGroupMessages:
 
 class ConfirmCardTests(unittest.TestCase):
     def test_without_card_key_render_is_byte_identical(self) -> None:
-        pending = _pending()
-        legacy = notification.render_confirm_card(pending, target_label=TARGET_LABEL)
-        gated = notification.render_confirm_card(
-            pending, target_label=TARGET_LABEL, content_catalog=default_content_catalog()
+        card = notification.render_confirm_card(
+            _pending(), target_label=TARGET_LABEL, content_catalog=_plain_catalog()
         )
-        self.assertEqual(gated, legacy)
+        self.assertEqual(card.title, "待确认：补充授权用户")
+        self.assertIsNone(card.tone)
         self.assertEqual(
-            notification.render_card_payload(gated), notification.render_card_payload(legacy)
+            card.body,
+            f"动作：补充授权用户\n目标：{TARGET_LABEL}\n"
+            "范围：公司 1011 · 指标 daily_active\n原因：特批\n"
+            "影响：该用户将获得下方指定公司×指标的问数权限（补充授权，独立于银河翻译结果，"
+            "不影响其余已有权限）。\n有效期：10 分钟内有效，过期后需重新查询并发起。",
         )
-        self.assertNotIn("header", notification.render_card_payload(gated))
+        payload = notification.render_card_payload(card)
+        self.assertNotIn("header", payload)
+        self.assertEqual(
+            payload["body"]["elements"][0]["content"], f"**{card.title}**\n\n{card.body}"
+        )
 
     def test_with_card_key_splits_object_scope_impact_and_real_confirm_deadline(self) -> None:
         card = notification.render_confirm_card(
@@ -336,10 +350,15 @@ class TerminalCardTests(unittest.TestCase):
 
     def test_without_card_key_render_is_byte_identical(self) -> None:
         pending = _pending(status=PendingActionStatus.EXECUTED)
-        text = "操作已记录，权限正在下发"
+        card = self._render(pending, "操作已记录，权限正在下发", _plain_catalog())
+        self.assertEqual(card.title, "补充授权用户 · 已结束")
         self.assertEqual(
-            self._render(pending, text, default_content_catalog()), self._render(pending, text)
+            card.body,
+            f"目标：{TARGET_LABEL}\n范围：公司 1011 · 指标 daily_active\n原因：特批\n"
+            "结果：操作已记录，权限正在下发",
         )
+        self.assertIsNone(card.tone)
+        self.assertEqual(card.buttons, ())
 
     def test_recorded_grant_is_not_claimed_as_published(self) -> None:
         pending = _pending(status=PendingActionStatus.EXECUTED)
@@ -388,7 +407,7 @@ class GroupNoticeTests(unittest.TestCase):
         pending = _pending(status=PendingActionStatus.EXECUTED)
         notifier = _NoticeGroup()
         handler, _, _ = _handler(
-            _executed_outcome(pending), notifier=notifier, content_catalog=default_content_catalog()
+            _executed_outcome(pending), notifier=notifier, content_catalog=_plain_catalog()
         )
         handler.handle(
             operator_open_id="ou_admin",
@@ -566,7 +585,7 @@ class ManagementCardTests(unittest.TestCase):
     """管理卡签名已到参数上限，内容目录经进程默认目录注入（测试里替换它）。"""
 
     def _render(self, **kwargs):
-        catalog = kwargs.pop("content_catalog", default_content_catalog())
+        catalog = kwargs.pop("content_catalog", _plain_catalog())
         with mock.patch.object(management_card, "default_content_catalog", return_value=catalog):
             return management_card.render_management_card(
                 _status(kwargs.pop("account_state", "enabled")),
@@ -577,16 +596,14 @@ class ManagementCardTests(unittest.TestCase):
             )
 
     def test_without_card_key_render_is_byte_identical(self) -> None:
-        legacy = management_card.render_management_card(
-            _status(),
-            display_identifier="someone@example.com",
-            catalog=_MetricCatalog(),
-            display_names=_ManagementNames(),
-            dispatch_status="已生效",
-        )
-        self.assertEqual(self._render(dispatch_status="已生效"), legacy)
+        legacy = self._render(dispatch_status="已生效")
         self.assertNotIn("header", legacy)
+        self.assertEqual(
+            legacy["body"]["elements"][0]["content"],
+            "**用户权限管理卡** · 某某人（masked@example.com） · 标识 someone@example.com",
+        )
         self.assertIn("当前状态：已生效", _payload_text(legacy))
+        self.assertNotIn("权限已下发", _payload_text(legacy))
 
     def test_with_card_key_has_header_object_field_and_published_wording(self) -> None:
         card = self._render(dispatch_status="已生效", content_catalog=_catalog())
@@ -627,7 +644,7 @@ class InnertestConfirmCardTests(unittest.TestCase):
 
     def test_without_card_key_body_is_byte_identical(self) -> None:
         card = notification.render_innertest_confirm_card(
-            "pac_x", self.people, content_catalog=default_content_catalog()
+            "pac_x", self.people, content_catalog=_plain_catalog()
         )
         self.assertEqual(card.title, "确认加入内测资格")
         self.assertEqual(
@@ -684,7 +701,7 @@ class CorrectionSummaryTests(unittest.TestCase):
 
     def test_without_card_key_sends_identical_text(self) -> None:
         sender = _NoticeGroup()
-        store, _ = self._send(sender, default_content_catalog())
+        store, _ = self._send(sender, _plain_catalog())
         self.assertEqual(sender.notices, [])
         self.assertEqual(
             [sent["text"] for sent in sender.texts],
@@ -743,7 +760,7 @@ class ContactTodoTests(unittest.TestCase):
 
     def test_without_card_key_sends_identical_text(self) -> None:
         notifier = _NoticeGroup()
-        self._recorder(notifier, email="x@example.com", catalog=default_content_catalog())(
+        self._recorder(notifier, email="x@example.com", catalog=_plain_catalog())(
             "ou_unreach", False, "230013"
         )
         self.assertEqual(notifier.notices, [])
