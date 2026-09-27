@@ -6,6 +6,27 @@
 
 ## [Unreleased]
 
+## [2.6.1] - 未定
+
+维护版（Trace [#898](https://github.com/Moshuiwang/lingxi/issues/898)）：装入 [#864](https://github.com/Moshuiwang/lingxi/issues/864) / [#891](https://github.com/Moshuiwang/lingxi/issues/891) / [#885](https://github.com/Moshuiwang/lingxi/issues/885) / [#887](https://github.com/Moshuiwang/lingxi/issues/887) / [#884](https://github.com/Moshuiwang/lingxi/issues/884) / [#889](https://github.com/Moshuiwang/lingxi/issues/889) / [#874](https://github.com/Moshuiwang/lingxi/issues/874) / [#896](https://github.com/Moshuiwang/lingxi/issues/896) 多处改动，聚焦加密依赖安全、消息与告警卡片体验统一，以及自托管数据库的备份恢复与运维健壮性。
+
+### Added
+
+- **新增从每日备份恢复到三服务可问数的脚本**：`run` 子命令用于生产恢复，`wipe` / `rollback` 子命令仅限预发环境使用（Issue [#885](https://github.com/Moshuiwang/lingxi/issues/885)）。
+- **预发环境改用本地 PostgreSQL 17、与生产同构**：迁库与备份安装脚本随本次改动入仓，便于复现与演练（Issue [#896](https://github.com/Moshuiwang/lingxi/issues/896)）。
+
+### Changed
+
+- **用户与管理员看到的消息、日报与运行告警统一为「先状态 / 结果、再字段、再下一步」的只读卡片**：卡片不含按钮、链接或回调；飞书明确拒绝卡片时回落一次纯文本；结果不明不重复补发；新消息到达时明确提示「这条新消息未受理、不会自动排队」（Issue [#891](https://github.com/Moshuiwang/lingxi/issues/891)）。
+- **拉取代理版本标记升为 3**：拉取失败原因码写入日志，下一次发布起代理据此触发自替换（Issue [#889](https://github.com/Moshuiwang/lingxi/issues/889)）。
+
+### Fixed
+
+- **加密组件清零已公布漏洞**：`cryptography` 从 45.0.7 升到 50.0.1，7 条已公布漏洞清零，豁免清单归零（Issue [#864](https://github.com/Moshuiwang/lingxi/issues/864)）。
+- **迁库留下的空壳平台管理角色已清理**：迁移 `0099` 删除迁库过程中产生、不再对应任何真实管理员的空壳平台管理角色（Issue [#887](https://github.com/Moshuiwang/lingxi/issues/887)）。
+- **备份与巡检更健壮**：数据库连接借用失败归还时不再向外泄漏异常、抢锁失败与被拒输入不再污染后续状态、无法判断的运行状态统一判「未知」并告警、恢复类通知只在本地记录与实际送达都成功后才算完成（Issue [#884](https://github.com/Moshuiwang/lingxi/issues/884)）。
+- **依赖漏洞扫描对漏洞库服务端故障有限重试**：不再因扫描依赖的外部服务偶发故障而直接判红（Issue [#874](https://github.com/Moshuiwang/lingxi/issues/874)）。
+
 ## [2.6.0] - 2026-09-22
 
 迁库版（Trace [#859](https://github.com/Moshuiwang/lingxi/issues/859) 发布2）：候选 `v2.6.0-rc.111` 经预发验收后由 Release Promotion 发布为正式版，生产数据库从 Supabase 迁到生产主机本地 PostgreSQL 17，装入 [#809](https://github.com/Moshuiwang/lingxi/issues/809) / [#835](https://github.com/Moshuiwang/lingxi/issues/835) 两处改动。**切换当日用户可见停机 11 分 28 秒**（合同上限 30 分钟）：窗口内问数与卡片投递暂停，窗口结束后自动恢复；迁移前后逐表行数、属主与迁移头零差异，产品负责人一次真实问数通过（L6）。观察期 2026-09-22 → 09-27 每日备份与异机副本无缺天、零告警，产品负责人 09-27 裁定达标。
