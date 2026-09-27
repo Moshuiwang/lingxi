@@ -17,9 +17,11 @@
 from __future__ import annotations
 
 import json
+import logging
 from typing import Any
 
 from lingxi.config.content import RenderedCard
+from lingxi.core.delivery.notice_card import NoticeCard
 from lingxi.core.delivery.ports import (
     DeliveryOperation,
     DeliveryVerdict,
@@ -30,6 +32,8 @@ from lingxi.core.execution.card_stream import (
     DeliveryRejectedError,
     DeliveryUncertainError,
 )
+
+logger = logging.getLogger(__name__)
 
 # 卡片模板里唯一的可流式更新元素；标题与正文合并渲染进它的 content（见模块说明）。
 _STATUS_ELEMENT_ID = "lingxi_status"
@@ -277,26 +281,69 @@ class LarkDeliveryText:
         self, *, chat_id: str, thread_id: str | None, reply_to_message_id: str, text: str
     ) -> str:
         """发送一条投递文本并返回 ``message_id``。"""
+        return self._reply(
+            thread_id=thread_id,
+            reply_to_message_id=reply_to_message_id,
+            msg_type="text",
+            content={"text": text},
+            operation=DeliveryOperation.TEXT_SEND,
+            label="发送投递文本",
+        )
+
+    def send_notice(
+        self, *, chat_id: str, thread_id: str | None, reply_to_message_id: str, card: NoticeCard
+    ) -> str:
+        """同话题回复一张通知卡并返回 ``message_id``；明确拒绝时补发一次等价纯文本。
+
+        只有 ``DeliveryRejectedError``（飞书完整响应且业务码明确拒绝）才回落；结果
+        不明（``DeliveryUncertainError``、缺回读标识、传输异常）原样上抛、不补发，
+        由调用方沿用现有重试。回落文本自身失败同样原样上抛，不再有第三次尝试。
+        """
+        if not isinstance(card, NoticeCard):
+            raise TypeError("send_notice 只接受 NoticeCard")
+        try:
+            return self._reply(
+                thread_id=thread_id,
+                reply_to_message_id=reply_to_message_id,
+                msg_type="interactive",
+                content=card.to_payload(),
+                operation=DeliveryOperation.CARD_REPLY,
+                label="发送通知卡",
+            )
+        except DeliveryRejectedError as error:
+            logger.warning("同话题通知卡被飞书明确拒绝，补发一次纯文本 code=%s", error.code)
+        return self.send_text(
+            chat_id=chat_id,
+            thread_id=thread_id,
+            reply_to_message_id=reply_to_message_id,
+            text=card.fallback_text,
+        )
+
+    def _reply(
+        self,
+        *,
+        thread_id: str | None,
+        reply_to_message_id: str,
+        msg_type: str,
+        content: dict[str, Any],
+        operation: DeliveryOperation,
+        label: str,
+    ) -> str:
+        """以回复消息的形式发出一条 ``msg_type`` 消息，按 ``operation`` 裁定结果。"""
         from lark_oapi.api.im.v1 import ReplyMessageRequest, ReplyMessageRequestBody
 
-        content = json.dumps({"text": text}, ensure_ascii=False)
         request = (
             ReplyMessageRequest.builder()
             .message_id(reply_to_message_id)
             .request_body(
                 ReplyMessageRequestBody.builder()
-                .content(content)
-                .msg_type("text")
+                .content(json.dumps(content, ensure_ascii=False))
+                .msg_type(msg_type)
                 .reply_in_thread(thread_id is not None)
                 .build()
             )
             .build()
         )
         response = self._client.im.v1.message.reply(request)
-        _verdict(
-            response,
-            operation=DeliveryOperation.TEXT_SEND,
-            field="message_id",
-            label="发送投递文本",
-        )
+        _verdict(response, operation=operation, field="message_id", label=label)
         return response.data.message_id

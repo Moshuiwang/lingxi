@@ -1,12 +1,13 @@
 """用户侧状态通知：由内容目录里的卡片键决定「发卡片」还是「发原文本」。
 
-开通、忙碌 / 会话 / 命令、记忆命令、权限范围变化这几类入口经这里挑选展示形式：
+开通、会话 / 命令、记忆、权限变化、排队提示、文档 / 表格交付经这里挑选展示形式：
 
-- 只有登记在 :data:`NOTICE_TONES` 里的文本键才有资格改成卡片，其余键（管理命令
-  回显、群内 @ 提示等例外）无论目录里有没有卡片键都照旧发文本；
-- 卡片键 ``notice.<原文本键>`` 未进目录时返回 ``None``，调用方照旧发原文本，与卡片化
-  之前逐字相同；撤掉卡片键即退回纯文本；卡片的等价纯文本就是原文本；
-- 动态值进卡片 markdown 前一律转义，不会变成可点链接或提及标签；
+- 只有登记在 :data:`NOTICE_TONES` / :data:`DELIVERY_NOTICE_TONES` 的文本键才能改成
+  卡片，其余键（管理命令回显、群内 @ 提示等例外）照旧发文本；
+- 卡片键 ``notice.<原文本键>`` 未进目录时返回 ``None``，调用方发出与卡片化之前逐字
+  相同的原文本；撤掉卡片键即退回纯文本；卡片的等价纯文本就是原文本；
+- 动态值进卡片前一律转义，只有本系统拼接的链接 ``url``（原样放入并放开链接限制）与
+  只含字母、数字、连字符的追溯号 ``reference`` 原样放入；
 - 本地没造出卡片（占位不齐、带按钮文字、撞上链接校验）同样返回 ``None`` 并留警告
   日志：这不是「飞书拒绝」，发原文本不算回落，用户照旧收到同一句话。
 
@@ -69,7 +70,33 @@ NOTICE_TONES: Mapping[str, NoticeTone] = {
     "permission.range_revoked": NoticeTone.ATTENTION,
 }
 
+#: 投递侧（排队提示、文档 / 表格交付）有资格改成卡片的文本键与色调。与
+#: :data:`NOTICE_TONES` 分表登记、查找时合并，两表键不得重复。
+DELIVERY_NOTICE_TONES: Mapping[str, NoticeTone] = {
+    # 4 排队超时提示
+    "gateway.busy_hint_queued": NoticeTone.PROCESSING,
+    # 11 文档 / 表格交付通知
+    "delivery.document_ready": NoticeTone.DONE,
+    "delivery.document_ready_degraded": NoticeTone.DONE,
+    "delivery.document_ready_simplified": NoticeTone.DONE,
+    "delivery.document_ready_degraded_too_long": NoticeTone.DONE,
+    "delivery.document_ready_degraded_title": NoticeTone.DONE,
+    "delivery.sheet_ready": NoticeTone.DONE,
+    "delivery.document_failed": NoticeTone.FAILURE,
+    "delivery.sheet_failed": NoticeTone.FAILURE,
+    "delivery.document_uncertain": NoticeTone.ATTENTION,
+    "delivery.sheet_uncertain": NoticeTone.ATTENTION,
+}
+
+if set(NOTICE_TONES) & set(DELIVERY_NOTICE_TONES):
+    raise RuntimeError("通知卡色调表的键重复登记")
+_ALL_TONES: Mapping[str, NoticeTone] = {**NOTICE_TONES, **DELIVERY_NOTICE_TONES}
+
 _PLACEHOLDER = re.compile(r"\{([A-Za-z_][A-Za-z0-9_]*)\}")
+#: 原样放入卡片的链接变量：值由本系统拼接，不含用户输入。
+_LINK_VARIABLES = frozenset({"url"})
+#: 追溯号只含字母、数字与连字符时原样放入，否则转义会插入反斜杠、读不完整。
+_REFERENCE_TOKEN = re.compile(r"[A-Za-z0-9-]+")
 
 
 def notice_card_key(text_key: str) -> str:
@@ -85,12 +112,14 @@ def build_notice_card(
     ``values`` 是渲染 ``content`` 时用的那组变量，逐个转义后填进卡片模板；卡片
     模板的占位集合必须与原文本键相同，否则目录渲染报错、本函数返回 ``None``。
     """
-    tone = NOTICE_TONES.get(content.key)
+    tone = _ALL_TONES.get(content.key)
     card_key = notice_card_key(content.key)
     if tone is None or not catalog.has_card(card_key):
         return None
     try:
-        rendered = catalog.card(card_key, {name: escape_markdown(v) for name, v in values.items()})
+        rendered = catalog.card(
+            card_key, {name: _card_value(name, v) for name, v in values.items()}
+        )
         if rendered.button_labels:
             raise ValueError("通知卡不得带按钮文字")
         return NoticeCard(
@@ -98,12 +127,22 @@ def build_notice_card(
             tone=tone,
             sections=_sections(rendered.body),
             fallback_text=content.text,
+            allow_links=bool(_LINK_VARIABLES.intersection(values)),
         )
     except (ContentError, ValueError) as error:
         logger.warning(
             "通知卡构造失败，按原文本发送 key=%s error=%s", card_key, type(error).__name__
         )
         return None
+
+
+def _card_value(name: str, value: object) -> object:
+    """卡片里的一个动态值：链接与纯字符追溯号原样，其余转义。"""
+    if name in _LINK_VARIABLES:
+        return value
+    if name == "reference" and isinstance(value, str) and _REFERENCE_TOKEN.fullmatch(value):
+        return value
+    return escape_markdown(value)
 
 
 def _sections(body: str) -> tuple[NoticeSection, ...]:
@@ -155,7 +194,7 @@ def _match(template: str, text: str, *, lazy: bool) -> dict[str, str] | None:
 
 def reply_notice_card(catalog: ContentCatalog, content: RenderedContent) -> NoticeCard | None:
     """只有成品文本时的配卡入口：先取回变量，取不回就不配卡。"""
-    if content.key not in NOTICE_TONES or not catalog.has_card(notice_card_key(content.key)):
+    if content.key not in _ALL_TONES or not catalog.has_card(notice_card_key(content.key)):
         return None
     values = recover_values(catalog, content)
     if values is None:
@@ -181,12 +220,61 @@ def send_catalog_notice(
     sender.send_text(open_id=open_id, text=content.text, dedupe_key=dedupe_key)
 
 
+class CatalogUserNotices:
+    """把私聊出口与内容目录绑在一起，供按文本键发通知的消费循环持有。
+
+    去重键原样透传：卡片与回落文本的去重 ID 由出口按同一个键推出，调用方「发送
+    成功才记已通知」的语义不变；结果不明时出口上抛、这里不补发。
+    """
+
+    def __init__(self, notifier: Any, *, catalog: ContentCatalog) -> None:
+        """持有私聊出口（``send_text`` / ``send_notice``）与内容目录。"""
+        self._notifier = notifier
+        self._catalog = catalog
+
+    def send(
+        self,
+        *,
+        open_id: str,
+        key: str,
+        dedupe_key: str,
+        variables: Mapping[str, object] | None = None,
+    ) -> None:
+        """发出文本键 ``key`` 对应的通知。"""
+        send_catalog_notice(
+            self._notifier, self._catalog, open_id, key, dict(variables or {}), dedupe_key
+        )
+
+
+def send_reply_notice(texts: Any, catalog: ContentCatalog, key: str, row: Any) -> None:
+    """在 ``row`` 所在话题回复文本键 ``key`` 对应的通知（无变量）。
+
+    ``texts`` 是同话题回复出口（``send_text`` / ``send_notice``）；``row`` 带
+    ``chat_id`` / ``thread_id`` / ``reply_to_message_id``（最后一项可空，与今天一样
+    按空串传）。没有卡片时与今天逐字相同地回复文本。
+    """
+    target = {
+        "chat_id": row.chat_id,
+        "thread_id": row.thread_id,
+        "reply_to_message_id": row.reply_to_message_id or "",
+    }
+    content = catalog.text(key)
+    card = build_notice_card(catalog, content, {})
+    if card is None:
+        texts.send_text(**target, text=content.text)
+        return
+    texts.send_notice(**target, card=card)
+
+
 __all__ = [
     "NOTICE_CARD_PREFIX",
+    "DELIVERY_NOTICE_TONES",
     "NOTICE_TONES",
+    "CatalogUserNotices",
     "build_notice_card",
     "notice_card_key",
     "recover_values",
     "reply_notice_card",
     "send_catalog_notice",
+    "send_reply_notice",
 ]
