@@ -146,7 +146,7 @@ def base_env(bin_dir: Path, state_dir: Path, unit_dir: Path) -> dict[str, str]:
 # ``<state>/world.json``：{"containers": [{"id", "name", "labels", "image", "health"}], "after_health": …}。
 # ``compose … up -d --force-recreate …`` 把每个容器换成新 id（标签与镜像不变）、健康状态改为 after_health，
 # 并把本次 argv 与完整环境追加进 ``<state>/compose_up.json``，供用例逐项断言。
-FAKE_DOCKER_RECREATE = r'''#!__PYTHON__
+FAKE_DOCKER_RECREATE = r"""#!__PYTHON__
 import json, os, sys
 from pathlib import Path
 
@@ -202,7 +202,7 @@ if args[:1] == ["compose"]:
     sys.exit(0)
 print("fake docker：未模拟的调用 " + " ".join(args[:1]), file=sys.stderr)
 sys.exit(64)
-'''
+"""
 
 
 def install_recreate_docker(bin_dir: Path, state_dir: Path) -> Path:

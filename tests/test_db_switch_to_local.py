@@ -303,7 +303,12 @@ class RecreateServicesFakeRootTest(_FakeRootBase):
         self.config_sha = _fingerprint(self.public_config)
         self.images = {
             name: f"ghcr.io/moshuiwang/lingxi-{name}:{self.TAG}@sha256:{digit * 64}"
-            for name, digit in (("scheduler", "1"), ("gateway", "2"), ("worker", "3"), ("migrate", "4"))
+            for name, digit in (
+                ("scheduler", "1"),
+                ("gateway", "2"),
+                ("worker", "3"),
+                ("migrate", "4"),
+            )
         }
         plan = {
             "id": self.PLAN_ID,
