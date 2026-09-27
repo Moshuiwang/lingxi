@@ -24,7 +24,7 @@ from typing import Any, Protocol
 from lingxi.apps.scheduler.audit import AuditSink
 from lingxi.apps.scheduler.config import SchedulerConfig
 from lingxi.core.identity.roster_audit import ArchivedIdentity, RosterAuditReport, compare_roster
-from lingxi.core.identity.roster_report import render_daily_report_content
+from lingxi.core.identity.roster_report import render_daily_report_notice
 from lingxi.core.identity.roster_snapshot import (
     DailyRosterSource,
     RosterRound,
@@ -166,7 +166,7 @@ class RosterAuditDuty:
         today: date,
     ) -> RosterAuditReport:
         """渲染正文并发送；失败只记审计留给下一轮重试，成功则收口水位与日志。"""
-        content = render_daily_report_content(
+        content = render_daily_report_notice(
             report,
             report_date=today,
             # 存档身份段取自**本轮基线**，不是花名册：管理员要定位的是 Lingxi 这一
@@ -177,9 +177,7 @@ class RosterAuditDuty:
         try:
             # 同一天的日报（含失败重试）共用一个去重键：不确定态下的重试因此携带
             # 同一个投递 `uuid`，由飞书服务端去重，而不是必然重复投递。
-            self._sender.send_text(
-                chat_id=self._chat_id, text=content.text, dedupe_key=today.isoformat()
-            )
+            content.send(self._sender, chat_id=self._chat_id, dedupe_key=today.isoformat())
         except Exception as error:  # 发送失败不得带走同一轮的其他职责
             # 只记审计与异常类型：异常正文可能带上群 ID 或响应体。水位不置位，
             # 因此这一天**不算已发送**，下一轮会重试（`V-花名册-30`）。

@@ -26,8 +26,8 @@ from lingxi.apps.scheduler.daily_report_sections import (
     _build_daily_report_sections,
     _DailyReportRawData,
     _DailyReportSections,
-    _render_daily_report_text,
 )
+from lingxi.core import daily_report as daily_report_core
 from lingxi.core.daily_report import DeliveryOutcomeRow, Section, TaskOutcomeRow
 
 logger = logging.getLogger(__name__)
@@ -377,7 +377,7 @@ class DailyReportDuty:
             return None
 
         sections = self._build_sections_from_raw(raw, today)
-        text = _render_daily_report_text(
+        report = daily_report_core.render_daily_report_notice(
             sections,
             window_start=window_start,
             window_end=window_end,
@@ -389,19 +389,19 @@ class DailyReportDuty:
             logger.info("停止信号在通报渲染完成后到达，本轮不发送")
             return None
 
-        if not self._send_daily_report(today, text):
+        if not self._send_daily_report(today, report):
             return None
 
         watermark_persisted = self._persist_daily_report_watermark(today)
         self._finalize_daily_report(
             today,
             sections,
-            text,
+            report.text,
             window_start=window_start,
             window_end=window_end,
             watermark_persisted=watermark_persisted,
         )
-        return text
+        return report.text
 
     def _build_sections_from_raw(
         self, raw: _DailyReportRawData, today: date
@@ -588,8 +588,8 @@ class DailyReportDuty:
             local_override_fetch_reason,
         )
 
-    def _send_daily_report(self, today: date, text: str) -> bool:
-        """发送正文，成功返回 ``True``。
+    def _send_daily_report(self, today: date, report: daily_report_core.DailyReportNotice) -> bool:
+        """发送正文（内容目录登记了通报卡片键时发通知卡），成功返回 ``True``。
 
         失败记审计 + 日志并返回 ``False``（调用方据此提前返回，不置位任何
         节流/水位状态）。
@@ -598,8 +598,8 @@ class DailyReportDuty:
             # 同一天的通报（含失败重试）共用一个去重键：不确定态下的重试因此携带
             # 同一个投递 `uuid`，由飞书服务端去重，与花名册日报同一条纪律
             # （`RosterAuditDuty` 文档字符串「重试与"不确定态"」一节）。
-            self._sender.send_text(
-                chat_id=self._chat_id, text=text, dedupe_key=f"daily-report:{today.isoformat()}"
+            report.send(
+                self._sender, chat_id=self._chat_id, dedupe_key=f"daily-report:{today.isoformat()}"
             )
         except Exception as error:  # 发送失败不得带走同一轮的其他职责
             reason = _classify_send_failure(error)
