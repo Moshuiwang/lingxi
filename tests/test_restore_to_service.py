@@ -59,13 +59,21 @@ class _Base(unittest.TestCase):
         (self.config / ".env.stage").write_text("LINGXI_ENVIRONMENT=stage\n", encoding="utf-8")
         for name in ENV_SERVICES:
             key = "LINGXI_MIGRATION_DSN" if name == "migrate" else "LINGXI_POSTGRES_DSN"
-            (self.config / f".env.stage.{name}").write_text(f"A=1\n{key}={app_dsn}\n", encoding="utf-8")
+            (self.config / f".env.stage.{name}").write_text(
+                f"A=1\n{key}={app_dsn}\n", encoding="utf-8"
+            )
         self.monitor_env = self.root / "opt" / "lingxi" / "monitoring" / "db-business.env"
         self.monitor_env.parent.mkdir(parents=True)
-        self.monitor_env.write_text(f"LINGXI_POSTGRES_DSN=postgresql://postgres:{OLD_PW}@127.0.0.1:5432/postgres\n", encoding="utf-8")
+        self.monitor_env.write_text(
+            f"LINGXI_POSTGRES_DSN=postgresql://postgres:{OLD_PW}@127.0.0.1:5432/postgres\n",
+            encoding="utf-8",
+        )
         self.hosts = self.root / "etc" / "hosts"
         self.hosts.parent.mkdir(parents=True)
-        self.hosts.write_text("127.0.0.1 localhost\n127.0.0.1 lingxi-db  # lingxi-s30：旧行\n::1 ip6-localhost\n", encoding="utf-8")
+        self.hosts.write_text(
+            "127.0.0.1 localhost\n127.0.0.1 lingxi-db  # lingxi-s30：旧行\n::1 ip6-localhost\n",
+            encoding="utf-8",
+        )
         # 现役本地库：数据目录、口令、compose.env、compose 副本，容器在跑
         self.pgdata = self.root / "var" / "lib" / "lingxi" / "pgdata"
         self.pgdata.mkdir(parents=True)
@@ -83,7 +91,9 @@ class _Base(unittest.TestCase):
         self.backups.mkdir()
         self.dump = self.backups / DUMP_NAME
         self.dump.write_bytes(b"PGDMP fake custom archive")
-        (self.backups / f"{DUMP_NAME}.sha256").write_text(f"{_sha(self.dump)}  {DUMP_NAME}\n", encoding="utf-8")
+        (self.backups / f"{DUMP_NAME}.sha256").write_text(
+            f"{_sha(self.dump)}  {DUMP_NAME}\n", encoding="utf-8"
+        )
         (self.backups / f"{DUMP_NAME}.counts.json").write_text(COUNTS_JSON, encoding="utf-8")
         self.offsite = self.root / "home" / "deploy" / "lingxi-backups"
         self.offsite.mkdir(parents=True)
@@ -96,7 +106,13 @@ class _Base(unittest.TestCase):
     def write_contract(self, environment: str) -> None:
         self.contract.parent.mkdir(parents=True, exist_ok=True)
         self.contract.write_text(
-            json.dumps({"project": "lingxi", "environment": environment, "config_root": "/opt/lingxi/config"}),
+            json.dumps(
+                {
+                    "project": "lingxi",
+                    "environment": environment,
+                    "config_root": "/opt/lingxi/config",
+                }
+            ),
             encoding="utf-8",
         )
 
@@ -113,21 +129,37 @@ class _Base(unittest.TestCase):
             FAKE_NEW_PW=NEW_PW,
         )
         env.update(self.overrides)
-        return subprocess.run(["bash", str(SCRIPT), *args], env=env, capture_output=True, text=True, timeout=120, check=False)
+        return subprocess.run(
+            ["bash", str(SCRIPT), *args],
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=120,
+            check=False,
+        )
 
     def calls(self) -> str:
         log = self.state / "calls.log"
         return log.read_text(encoding="utf-8") if log.exists() else ""
 
     def drill(self) -> Path:
-        return Path((self.root / "var" / "lib" / "lingxi" / "restore-drill" / "current").read_text(encoding="utf-8").strip())
+        return Path(
+            (self.root / "var" / "lib" / "lingxi" / "restore-drill" / "current")
+            .read_text(encoding="utf-8")
+            .strip()
+        )
 
     def env_digest(self) -> dict[str, str]:
-        files = [self.config / ".env.stage", self.monitor_env] + [self.config / f".env.stage.{n}" for n in ENV_SERVICES]
+        files = [self.config / ".env.stage", self.monitor_env] + [
+            self.config / f".env.stage.{n}" for n in ENV_SERVICES
+        ]
         return {str(p): _sha(p) for p in files}
 
     def protected_digest(self) -> dict[str, str]:
-        return {**_tree_digest(self.backups), **{"offsite/" + k: v for k, v in _tree_digest(self.offsite).items()}}
+        return {
+            **_tree_digest(self.backups),
+            **{"offsite/" + k: v for k, v in _tree_digest(self.offsite).items()},
+        }
 
 
 class WipeGuardTest(_Base):
@@ -174,7 +206,9 @@ class WipeGuardTest(_Base):
         self.assertFalse(self.pgdata.exists())
         self.assertFalse(self.dbconf.exists())
         self.assertFalse(self.dbinst.exists())
-        self.assertEqual((drill / "wiped" / "pgdata" / "PG_VERSION").read_text(encoding="utf-8"), "old\n")
+        self.assertEqual(
+            (drill / "wiped" / "pgdata" / "PG_VERSION").read_text(encoding="utf-8"), "old\n"
+        )
         self.assertTrue((drill / "wiped" / "db-config" / ".env.db").exists())
         hosts = self.hosts.read_text(encoding="utf-8")
         self.assertNotIn("lingxi-db", hosts)
@@ -187,7 +221,9 @@ class WipeGuardTest(_Base):
         self.assertRegex(calls, r"docker compose --project-name lingxi-db .* down")
         self.assertFalse((self.state / "db.up").exists())
         self.assertEqual(self.protected_digest(), before)
-        self.assertNotIn("backups", "".join(line for line in calls.splitlines() if line.startswith("docker")))
+        self.assertNotIn(
+            "backups", "".join(line for line in calls.splitlines() if line.startswith("docker"))
+        )
         again = self.run_script("wipe", "--yes")
         self.assertEqual(again.returncode, 1)
         self.assertIn("未收口", again.stderr)
@@ -203,7 +239,11 @@ class RunTest(_Base):
         self.assertNotIn(" public ", result.stdout.split("个：", 1)[1])
         # 多一个被授权角色，清单跟着变多：个数来自 dump，不是写死的
         schema = self.base / "support" / "schema.sql"
-        schema.write_text(schema.read_text(encoding="utf-8") + "GRANT SELECT ON TABLE public.t1 TO service_role;\n", encoding="utf-8")
+        schema.write_text(
+            schema.read_text(encoding="utf-8")
+            + "GRANT SELECT ON TABLE public.t1 TO service_role;\n",
+            encoding="utf-8",
+        )
         result = self.run_script("roles", str(self.dump))
         self.assertIn(f"派生的角色 {len(SCHEMA_ROLES) + 1} 个", result.stdout)
         self.assertIn("service_role", result.stdout)
@@ -216,7 +256,9 @@ class RunTest(_Base):
 
     def test_run_rejects_checksum_mismatch(self) -> None:
         self.run_script("wipe", "--yes")
-        (self.backups / f"{DUMP_NAME}.sha256").write_text("0" * 64 + f"  {DUMP_NAME}\n", encoding="utf-8")
+        (self.backups / f"{DUMP_NAME}.sha256").write_text(
+            "0" * 64 + f"  {DUMP_NAME}\n", encoding="utf-8"
+        )
         result = self.run_script("run", str(self.dump))
         self.assertEqual(result.returncode, 1)
         self.assertIn("校验和不符", result.stderr)
@@ -231,7 +273,10 @@ class RunTest(_Base):
         self.assertIn("S30_DATLOCALE='en-US'", seen)
         self.assertIn("S30_DATLOCPROVIDER='i'", seen)
         created = (self.state / "created_roles.log").read_text(encoding="utf-8").split("\n")
-        self.assertEqual(sorted(filter(None, created)), sorted(set(SCHEMA_ROLES) - {"postgres", "pg_database_owner"}))
+        self.assertEqual(
+            sorted(filter(None, created)),
+            sorted(set(SCHEMA_ROLES) - {"postgres", "pg_database_owner"}),
+        )
         self.assertTrue((self.state / "restored").exists())
         self.assertIn("SCHEMA extensions", result.stdout)  # 目标已在位的创建条目被去掉
         self.assertIn("verify 零差异", result.stdout)
@@ -242,7 +287,10 @@ class RunTest(_Base):
         self.assertNotIn(NEW_PW, result.stdout + result.stderr)
         calls = self.calls()
         self.assertIn("switch recreate-services", calls)
-        self.assertIn("systemctl start lingxi-db-business-sample.timer lingxi-release-pull.timer lingxi-db-backup.timer", calls)
+        self.assertIn(
+            "systemctl start lingxi-db-business-sample.timer lingxi-release-pull.timer lingxi-db-backup.timer",
+            calls,
+        )
         # 分段时长表：本地库 10:00:00 起、10:00:07 首次 healthy；三服务最晚 10:05:12 起、10:05:44 首次 healthy（docker 记录）
         self.assertIn("2026-09-27T10:00:07Z", result.stdout)
         self.assertIn("2026-09-27T10:05:12Z", result.stdout)
@@ -261,14 +309,15 @@ class RunTest(_Base):
         result = self.run_script("run", str(self.dump))
         self.assertEqual(result.returncode, 1)
         self.assertIn("tables|public.t1|清单=2|目标=1", result.stdout)
-        self.assertIn("owner|relation:t1|清单=\"lingxi_app\"|目标=\"postgres\"", result.stdout)
+        self.assertIn('owner|relation:t1|清单="lingxi_app"|目标="postgres"', result.stdout)
         self.assertIn("verify 未通过", result.stderr)
         self.assertEqual(self.env_digest(), env_before)
 
     def test_dsn_refuses_foreign_target_without_touching_files(self) -> None:
         self.run_script("wipe", "--yes")
         (self.config / ".env.stage.gateway").write_text(
-            f"LINGXI_POSTGRES_DSN=postgresql://postgres:{OLD_PW}@db.example.invalid:6543/postgres\n", encoding="utf-8"
+            f"LINGXI_POSTGRES_DSN=postgresql://postgres:{OLD_PW}@db.example.invalid:6543/postgres\n",
+            encoding="utf-8",
         )
         env_before = self.env_digest()
         result = self.run_script("run", str(self.dump), "--until=dsn")
@@ -293,8 +342,12 @@ class RunTest(_Base):
         result = self.run_script("rollback", "--yes")
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertEqual((self.pgdata / "PG_VERSION").read_text(encoding="utf-8"), "old\n")
-        self.assertEqual((self.dbconf / ".env.db").read_text(encoding="utf-8"), f"POSTGRES_PASSWORD={OLD_PW}\n")
-        self.assertEqual((drill / "failed-run" / "pgdata" / "PG_VERSION").read_text(encoding="utf-8"), "new\n")
+        self.assertEqual(
+            (self.dbconf / ".env.db").read_text(encoding="utf-8"), f"POSTGRES_PASSWORD={OLD_PW}\n"
+        )
+        self.assertEqual(
+            (drill / "failed-run" / "pgdata" / "PG_VERSION").read_text(encoding="utf-8"), "new\n"
+        )
         self.assertEqual(self.env_digest(), env_before)
         hosts = self.hosts.read_text(encoding="utf-8")
         self.assertEqual(hosts.count("lingxi-db"), 1)
@@ -338,12 +391,35 @@ DO $$ DECLARE r text; BEGIN
 """
 
 
-@unittest.skipUnless(DSN and CONTAINER, "需要真库：设 LINGXI_POSTGRES_DSN 与 LINGXI_TEST_PG_CONTAINER（docker exec 目标）")
+@unittest.skipUnless(
+    DSN and CONTAINER,
+    "需要真库：设 LINGXI_POSTGRES_DSN 与 LINGXI_TEST_PG_CONTAINER（docker exec 目标）",
+)
 class RealDatabaseTest(_Base):
     def psql(self, sql: str) -> str:
         done = subprocess.run(
-            ["docker", "exec", "-i", CONTAINER, "psql", "-U", "postgres", "-d", "postgres", "-X", "-Atq", "-v", "ON_ERROR_STOP=1", "-f", "-"],
-            input=sql, capture_output=True, text=True, timeout=120, check=False,
+            [
+                "docker",
+                "exec",
+                "-i",
+                CONTAINER,
+                "psql",
+                "-U",
+                "postgres",
+                "-d",
+                "postgres",
+                "-X",
+                "-Atq",
+                "-v",
+                "ON_ERROR_STOP=1",
+                "-f",
+                "-",
+            ],
+            input=sql,
+            capture_output=True,
+            text=True,
+            timeout=120,
+            check=False,
         )
         self.assertEqual(done.returncode, 0, done.stderr)
         return done.stdout.strip()
@@ -355,15 +431,27 @@ class RealDatabaseTest(_Base):
         real = self.base / "real-backups"
         real.mkdir(mode=0o700)
         env = {k: v for k, v in os.environ.items() if not k.startswith("LINGXI_")}
-        env.update(LINGXI_DB_BACKUP_CONTAINER=CONTAINER, LINGXI_DB_BACKUP_DIR=str(real),
-                   LINGXI_DB_BACKUP_STATUS_FILE=str(self.base / "status.json"))
-        done = subprocess.run(["bash", str(BACKUP_SCRIPT)], env=env, capture_output=True, text=True, timeout=300, check=False)
+        env.update(
+            LINGXI_DB_BACKUP_CONTAINER=CONTAINER,
+            LINGXI_DB_BACKUP_DIR=str(real),
+            LINGXI_DB_BACKUP_STATUS_FILE=str(self.base / "status.json"),
+        )
+        done = subprocess.run(
+            ["bash", str(BACKUP_SCRIPT)],
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=300,
+            check=False,
+        )
         self.assertEqual(done.returncode, 0, done.stderr)
         self.real_dump = next(real.glob("lingxi-db-*.dump"))
         self.psql(RESET)  # 目标回到「新 initdb + install-pg 已预建」形
         self.psql("CREATE SCHEMA extensions; CREATE EXTENSION pg_trgm WITH SCHEMA extensions;")
         # 真 docker 取绝对路径：用例环境把桩目录排在 PATH 最前，裸 docker 会落到桩上
-        self.overrides.update(LINGXI_S30_DOCKER=shutil.which("docker") or "docker", LINGXI_S30_DB_CONTAINER=CONTAINER)
+        self.overrides.update(
+            LINGXI_S30_DOCKER=shutil.which("docker") or "docker", LINGXI_S30_DB_CONTAINER=CONTAINER
+        )
 
     def tearDown(self) -> None:
         self.psql(RESET)
@@ -376,10 +464,15 @@ class RealDatabaseTest(_Base):
         self.assertIn("新建 NOLOGIN 5", result.stdout)
         self.assertEqual(self.psql("SELECT count(*) FROM public.t1"), "3")
         self.assertEqual(
-            self.psql("SELECT proowner::regrole::text || '|' || prosecdef FROM pg_proc WHERE proname = 'lingxi_retention_cleanup'"),
+            self.psql(
+                "SELECT proowner::regrole::text || '|' || prosecdef FROM pg_proc WHERE proname = 'lingxi_retention_cleanup'"
+            ),
             "lingxi_retention_owner|true",
         )
-        self.assertEqual(self.psql("SELECT relowner::regrole::text FROM pg_class WHERE relname = 't1'"), "lingxi_app")
+        self.assertEqual(
+            self.psql("SELECT relowner::regrole::text FROM pg_class WHERE relname = 't1'"),
+            "lingxi_app",
+        )
 
     def test_tampered_manifest_fails_verify(self) -> None:
         counts = Path(f"{self.real_dump}.counts.json")

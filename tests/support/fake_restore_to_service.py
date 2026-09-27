@@ -36,7 +36,15 @@ GRANT SELECT ON TABLE public.t1 TO "Weird Role";
 -- Name: DEFAULT PRIVILEGES FOR TABLES; Type: DEFAULT ACL; Schema: public; Owner: supabase_admin
 ALTER DEFAULT PRIVILEGES FOR ROLE supabase_admin IN SCHEMA public GRANT ALL ON TABLES TO anon;
 """
-SCHEMA_ROLES = ["Weird Role", "anon", "lingxi_app", "lingxi_retention_owner", "pg_database_owner", "postgres", "supabase_admin"]
+SCHEMA_ROLES = [
+    "Weird Role",
+    "anon",
+    "lingxi_app",
+    "lingxi_retention_owner",
+    "pg_database_owner",
+    "postgres",
+    "supabase_admin",
+]
 
 TOC = """;
 ; Archive created at 2026-09-27 11:46:54 UTC
@@ -226,6 +234,8 @@ def install_fakes(bin_dir: Path, support_dir: Path) -> dict[str, Path]:
     ):
         (support_dir / name).write_text(body, encoding="utf-8")
     return {
-        "docker": write_executable(bin_dir / "docker", FAKE_DOCKER.replace("__PYTHON__", sys.executable)),
+        "docker": write_executable(
+            bin_dir / "docker", FAKE_DOCKER.replace("__PYTHON__", sys.executable)
+        ),
         "switch": write_executable(bin_dir / "db_switch_fake.sh", FAKE_SWITCH),
     }
