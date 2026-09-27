@@ -18,7 +18,7 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 
-FAKE_SYSTEMCTL = r'''#!__PYTHON__
+FAKE_SYSTEMCTL = r"""#!__PYTHON__
 import json, os, sys
 from pathlib import Path
 
@@ -138,7 +138,7 @@ for p in props:
     out.append(v if value else p + "=" + v)
 (st / "units.json").write_text(json.dumps(units), encoding="utf-8")
 print("\n".join(out))
-'''
+"""
 
 # 注入点背后的「解释器」：-c 时打印 FAKE_PY_VERSION 文件里的版本（缺省 3.12.3）；
 # 其余调用（候选脚本 --help 的导入自检）看 FAKE_STATE/py_help_fail，存在即非零退出，模拟 09-20 那种导入失败。

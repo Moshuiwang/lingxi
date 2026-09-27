@@ -74,13 +74,19 @@ class HostMaintenanceFakeRootTest(unittest.TestCase):
         self.frag = self.unit_dir / "lingxi-host-monitor.service"
         self.frag.write_text(_old_unit(user="deployer"), encoding="utf-8")
         self.frag.chmod(0o644)
-        (self.dropin_dir / "10-local.conf").write_text("[Service]\nUser=deployer\n", encoding="utf-8")
+        (self.dropin_dir / "10-local.conf").write_text(
+            "[Service]\nUser=deployer\n", encoding="utf-8"
+        )
         self.py_dropin = self.dropin_dir / "20-python312.conf"
         self.py_dropin.write_text(
-            "[Service]\nExecStart=\nExecStart=/opt/lingxi/bin/python3 " + ARGS + "\n", encoding="utf-8"
+            "[Service]\nExecStart=\nExecStart=/opt/lingxi/bin/python3 " + ARGS + "\n",
+            encoding="utf-8",
         )
         (self.dropin_dir / "30-lingxi-db-checks.conf").write_text(
-            "[Service]\n# 由 s31 生成\nExecStart=\nExecStart=/opt/lingxi/bin/python3 " + ARGS + DB_ARGS + "\n",
+            "[Service]\n# 由 s31 生成\nExecStart=\nExecStart=/opt/lingxi/bin/python3 "
+            + ARGS
+            + DB_ARGS
+            + "\n",
             encoding="utf-8",
         )
         scripts = self.root / "opt" / "lingxi" / "scripts"
@@ -186,12 +192,16 @@ class HostMaintenanceFakeRootTest(unittest.TestCase):
     def test_refuses_missing_injection_link(self) -> None:
         (self.root / "opt" / "lingxi" / "bin" / "python3").unlink()
         self.before = self.snapshot()
-        self.assert_refused(self.run_script("apply", "--yes"), "注入点 /opt/lingxi/bin/python3 不存在")
+        self.assert_refused(
+            self.run_script("apply", "--yes"), "注入点 /opt/lingxi/bin/python3 不存在"
+        )
 
     def test_refuses_input_not_matching_manifest(self) -> None:
         with (self.inputs / "host_health_alert.py").open("a", encoding="utf-8") as f:
             f.write("# 篡改\n")
-        self.assert_refused(self.run_script("apply", "--yes"), "输入 host_health_alert.py 与清单不符")
+        self.assert_refused(
+            self.run_script("apply", "--yes"), "输入 host_health_alert.py 与清单不符"
+        )
 
     def test_refuses_unexpected_unit_diff(self) -> None:
         self.frag.write_text(_old_unit(user="deployer") + "Restart=on-failure\n", encoding="utf-8")
@@ -204,7 +214,8 @@ class HostMaintenanceFakeRootTest(unittest.TestCase):
 
     def test_refuses_dropin_override_off_injection_point(self) -> None:
         (self.dropin_dir / "30-lingxi-db-checks.conf").write_text(
-            "[Service]\nExecStart=\nExecStart=/usr/bin/python3 " + ARGS + DB_ARGS + "\n", encoding="utf-8"
+            "[Service]\nExecStart=\nExecStart=/usr/bin/python3 " + ARGS + DB_ARGS + "\n",
+            encoding="utf-8",
         )
         self.before = self.snapshot()
         self.assert_refused(self.run_script("apply", "--yes"), "不走注入点")
@@ -219,7 +230,10 @@ class HostMaintenanceFakeRootTest(unittest.TestCase):
         self.assert_ok(result)
         self.assert_installed()
         self.assertEqual(result.stdout.count("[等轮] 新轮"), 2, result.stdout)
-        self.assertIn("ExecStart 解释器=/opt/lingxi/bin/python3 User=deployer TimeoutStartUSec=50s", result.stdout)
+        self.assertIn(
+            "ExecStart 解释器=/opt/lingxi/bin/python3 User=deployer TimeoutStartUSec=50s",
+            result.stdout,
+        )
         self.assertLess(result.stdout.index("① 回读"), result.stdout.index("② 回读"))
         backups = list((self.root / "root" / "lingxi-884-backup").iterdir())
         self.assertEqual(len(backups), 1)
@@ -244,7 +258,9 @@ class HostMaintenanceFakeRootTest(unittest.TestCase):
 
     def test_no_round_within_timeout_restores(self) -> None:
         (self.state / "no_rounds").touch()
-        result = self.run_script("apply", "--yes", LINGXI_HM_ROUND_TIMEOUT="1", LINGXI_HM_POLL_SECONDS="0.1")
+        result = self.run_script(
+            "apply", "--yes", LINGXI_HM_ROUND_TIMEOUT="1", LINGXI_HM_POLL_SECONDS="0.1"
+        )
         self.assertNotEqual(result.returncode, 0, result.stdout)
         self.assertIn("1 秒内没有新一轮结束", result.stdout)
         self.assert_back_to_original()
@@ -273,12 +289,13 @@ class HostMaintenanceFakeRootTest(unittest.TestCase):
         self.assertIn("[#886 第 1 处]", result.stdout)
         self.assertEqual(self.snapshot(), self.before)
 
-
     def test_stage_body_user_must_match_local_dropin(self) -> None:
         """预发：本体 User= 与 10-local.conf 不同值即拒绝（生产形由子类的专门用例覆盖）。"""
         if self.environment != "stage":
             self.skipTest("预发专属")
-        (self.dropin_dir / "10-local.conf").write_text("[Service]\nUser=someone-else\n", encoding="utf-8")
+        (self.dropin_dir / "10-local.conf").write_text(
+            "[Service]\nUser=someone-else\n", encoding="utf-8"
+        )
         self.before = self.snapshot()
         self.assert_refused(self.run_script("check"), "10-local.conf 不同值")
 
@@ -294,7 +311,9 @@ class HostMaintenanceProductionTest(HostMaintenanceFakeRootTest):
         self.before = self.snapshot()
 
     def run_script(self, *args: str, **env_extra: str) -> subprocess.CompletedProcess[str]:
-        env_extra.setdefault("LINGXI_HM_PROD_OLD_UNIT_SHA", _sha(self.frag) if self.frag.exists() else "0" * 64)
+        env_extra.setdefault(
+            "LINGXI_HM_PROD_OLD_UNIT_SHA", _sha(self.frag) if self.frag.exists() else "0" * 64
+        )
         return super().run_script(*args, **env_extra)
 
     def test_refuses_unexpected_unit_diff(self) -> None:
