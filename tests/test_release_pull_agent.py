@@ -289,7 +289,11 @@ class PullHarness:
                 status = os.environ.get("DEPLOY_STATUS", "verified")
                 if os.path.exists(failed_marker):
                     status = "failed"
-                print(json.dumps({"status":status}))
+                payload = {"status":status}
+                # 部署器自带原因码（真部署器失败 / 未知时写在 error 字段）；空串表示不带。
+                if os.environ.get("DEPLOY_STATUS_ERROR"):
+                    payload["error"] = os.environ["DEPLOY_STATUS_ERROR"]
+                print(json.dumps(payload))
             else:
                 raise SystemExit(7)
             """,
@@ -385,6 +389,7 @@ class PullHarness:
             "DOCKER_CONTAINERS_JSON": "{}",
             "DOCKER_IMAGES_JSON": "{}",
             "DEPLOY_STATUS": "verified",
+            "DEPLOY_STATUS_ERROR": "",
             "DEPLOY_MODE": "normal",
             "BUNDLE_INSTALL_MODE": "normal",
         }
@@ -1516,6 +1521,18 @@ class AgentTests(unittest.TestCase):
                 lambda h, s: h.set_env(DEPLOY_STATUS="bogus"),
                 lambda h, s: h.set_env(DEPLOY_STATUS="verified"),
                 "deployer_status_unavailable",
+            ),
+            (
+                # 部署器 status 自带原因码：代理日志须透传同一码（#889）；状态账与告警不带 reason。
+                "unknown_status_with_deployer_reason",
+                "unknown",
+                "status",
+                True,
+                lambda h, s: h.set_env(
+                    DEPLOY_STATUS="unknown", DEPLOY_STATUS_ERROR="verified_state_drift"
+                ),
+                lambda h, s: h.set_env(DEPLOY_STATUS="verified", DEPLOY_STATUS_ERROR=""),
+                "verified_state_drift",
             ),
             (
                 "running",
