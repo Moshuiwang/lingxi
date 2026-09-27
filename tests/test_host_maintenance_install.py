@@ -32,17 +32,32 @@ def _sha(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
-def _old_unit(*, user: str | None) -> str:
-    """由仓库单元推出「F17 之前的旧版」：去注释、去 TimeoutStartSec、解释器换系统 python3，预发形把 User= 写进本体。"""
+def _old_unit(*, user: str | None, handmade: bool = False) -> str:
+    """由仓库单元推出「F17 之前的旧版」：去注释、去 TimeoutStartSec、解释器换系统 python3，预发形把 User= 写进本体。
+
+    ``handmade=True`` 再模拟预发 2026-08-28 手装版（编排者 09-27 预发 check 回读）：Description / After / Wants /
+    WorkingDirectory 取值不同，另有 StandardOutput / StandardError 两行。
+    """
     lines = []
     for line in CAND_UNIT.read_text(encoding="utf-8").splitlines():
         if line.startswith("#") or line.startswith("TimeoutStartSec="):
             continue
         if line.startswith("ExecStart="):
             line = "ExecStart=/usr/bin/python3 " + ARGS
+        if handmade and line.startswith("Description="):
+            line = "Description=Lingxi host monitor (manual)"
+        if handmade and line.startswith(("After=", "Wants=")):
+            line = line.split("=")[0] + "=docker.service"
+        if handmade and line.startswith("WorkingDirectory="):
+            line = "WorkingDirectory=/opt/lingxi"
         lines.append(line)
         if line == "Type=oneshot" and user:
             lines.append("User=" + user)
+        if line == "Type=oneshot" and handmade:
+            lines += [
+                "StandardOutput=append:/var/log/hm.log",
+                "StandardError=append:/var/log/hm.log",
+            ]
     return "\n".join(lines) + "\n"
 
 
@@ -98,6 +113,7 @@ class HostMaintenanceFakeRootTest(unittest.TestCase):
         self.bak.write_text("#!/usr/bin/env bash\necho old-backup\n", encoding="utf-8")
         self.bak.chmod(0o755)
         shutil.copy2(BACKUP_UNIT, self.unit_dir / BACKUP_UNIT.name)
+        self.local_conf = self.dropin_dir / "10-local.conf"
         (self.state / "lingxi-host-monitor.timer.active").touch()
         # #886 第 1 处的例行 dump 目录：一份 0644、一份 0600
         self.dumps = self.root / "home" / "deployer" / "backups"
@@ -169,6 +185,12 @@ class HostMaintenanceFakeRootTest(unittest.TestCase):
         self.assertFalse(self.py_dropin.exists())
         self.assertEqual(_sha(self.mon), _sha(CAND_MON))
         self.assertEqual(_sha(self.bak), _sha(CAND_BAK))
+
+    def assert_same_outside_backup_root(self) -> None:
+        """备份目录之外的假根逐文件与安装前一致（备份目录是本脚本应有的产物）。"""
+        backup_root = str(self.root / "root" / "lingxi-884-backup")
+        now = {k: v for k, v in self.snapshot().items() if not k.startswith(backup_root)}
+        self.assertEqual(now, self.before)
 
     def assert_back_to_original(self) -> None:
         now = self.snapshot()
@@ -300,7 +322,90 @@ class HostMaintenanceFakeRootTest(unittest.TestCase):
         result = self.run_script("restore", "--yes")
         self.assert_ok(result)
         self.assert_back_to_original()
-        self.assertEqual(result.stdout.count("逐字节一致"), 4, result.stdout)
+        self.assertEqual(result.stdout.count("逐字节一致"), 5, result.stdout)
+
+    # ---------------- 编排者 09-27 预发 check 三处接缝 ----------------
+
+    def use_release_pull_contract(self) -> Path:
+        """缺省契约路径不存在；拉取代理单元基础 ExecStart 指缺省路径，drop-in 改到 release-pull/ 下（预发实况）。"""
+        (self.root / "opt" / "lingxi" / "control" / "host-contract.json").unlink()
+        real = self.root / "opt" / "lingxi" / "release-pull" / "host-contract.json"
+        real.parent.mkdir(parents=True)
+        real.write_text(json.dumps({"environment": self.environment}), encoding="utf-8")
+        agent = "/opt/lingxi/bin/python3 /opt/lingxi/release-pull/release_pull_agent.py --host-contract "
+        (self.unit_dir / "lingxi-release-pull.service").write_text(
+            "[Service]\nExecStart=" + agent + "/opt/lingxi/control/host-contract.json\n",
+            encoding="utf-8",
+        )
+        drop = self.unit_dir / "lingxi-release-pull.service.d"
+        drop.mkdir()
+        (drop / "20-contract.conf").write_text(
+            "[Service]\nExecStart=\nExecStart="
+            + agent
+            + "/opt/lingxi/release-pull/host-contract.json\n",
+            encoding="utf-8",
+        )
+        self.before = self.snapshot()
+        return real
+
+    def test_contract_path_from_release_pull_effective_execstart(self) -> None:
+        self.use_release_pull_contract()
+        result = self.run_script("check")
+        self.assert_ok(result)
+        self.assertIn(
+            "[契约] 来源=lingxi-release-pull.service 有效 ExecStart 的 --host-contract"
+            " 路径=/opt/lingxi/release-pull/host-contract.json",
+            result.stdout,
+        )
+        self.assertIn(f"environment={self.environment}", result.stdout)
+
+    def test_contract_env_var_takes_precedence(self) -> None:
+        real = self.use_release_pull_contract()
+        other = self.inputs.parent / "elsewhere.json"
+        other.write_text(json.dumps({"environment": "bogus"}), encoding="utf-8")
+        result = self.run_script("check", LINGXI_S30_HOST_CONTRACT=str(other))
+        self.assert_refused(result, "来源=环境变量 LINGXI_S30_HOST_CONTRACT")
+        self.assert_ok(self.run_script("check", LINGXI_S30_HOST_CONTRACT=str(real)))
+
+    def test_handmade_descriptive_keys_are_allowed_and_printed(self) -> None:
+        user = "deployer" if self.environment == "stage" else None
+        self.frag.write_text(_old_unit(user=user, handmade=True), encoding="utf-8")
+        self.before = self.snapshot()
+        result = self.run_script("check")
+        self.assert_ok(result)
+        self.assertIn("[本体差异] StandardOutput：append:/var/log/hm.log → （无）", result.stdout)
+        self.assertIn(
+            "[本体差异] WorkingDirectory：/opt/lingxi → /opt/lingxi/monitoring", result.stdout
+        )
+        self.assertIn("[本体差异] Description：Lingxi host monitor (manual) → ", result.stdout)
+        self.assertEqual(self.snapshot(), self.before)
+
+    def test_stage_writes_local_dropin_when_missing(self) -> None:
+        if self.environment != "stage":
+            self.skipTest("预发专属")
+        self.local_conf.unlink()
+        self.before = self.snapshot()
+        result = self.run_script("apply", "--yes")
+        self.assert_ok(result)
+        self.assert_installed()
+        self.assertEqual(self.local_conf.read_text(encoding="utf-8"), "[Service]\nUser=deployer\n")
+        self.assertEqual(self.local_conf.stat().st_mode & 0o777, 0o644)
+        self.assertIn("User=deployer TimeoutStartUSec=50s", result.stdout)
+        restored = self.run_script("restore", "--yes")
+        self.assert_ok(restored)
+        self.assertFalse(self.local_conf.exists(), restored.stdout)
+        self.assert_same_outside_backup_root()
+
+    def test_stage_local_dropin_written_then_removed_on_round_failure(self) -> None:
+        if self.environment != "stage":
+            self.skipTest("预发专属")
+        self.local_conf.unlink()
+        self.before = self.snapshot()
+        (self.state / "rounds.txt").write_text("exit-code 1\n", encoding="utf-8")
+        result = self.run_script("apply", "--yes")
+        self.assertNotEqual(result.returncode, 0, result.stdout)
+        self.assertIn("① 已写 10-local.conf", result.stdout)
+        self.assert_same_outside_backup_root()
 
     def test_status_is_read_only(self) -> None:
         result = self.run_script("status")
@@ -344,6 +449,12 @@ class HostMaintenanceProductionTest(HostMaintenanceFakeRootTest):
         self.frag.write_text(_old_unit(user="deployer"), encoding="utf-8")
         self.before = self.snapshot()
         self.assert_refused(self.run_script("check"), "生产在位单元本体含 User=")
+
+    def test_production_body_user_without_local_dropin_still_refused(self) -> None:
+        self.frag.write_text(_old_unit(user="deployer"), encoding="utf-8")
+        self.local_conf.unlink()
+        self.before = self.snapshot()
+        self.assert_refused(self.run_script("apply", "--yes"), "生产在位单元本体含 User=")
 
     def test_production_refuses_unknown_old_unit_sha(self) -> None:
         result = self.run_script("check", LINGXI_HM_PROD_OLD_UNIT_SHA="1" * 64)

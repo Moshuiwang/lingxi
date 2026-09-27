@@ -14,11 +14,14 @@
 # 输入副本按清单 sha 判、测试形「非 root + 假根」、systemctl 可注入桩；宿主契约读法与 db_switch_to_local.sh 同一个 json_str。
 # 输入：本脚本同目录放 lingxi-host-monitor.service、host_health_alert.py、db_backup.sh 与清单 SHA256SUMS
 #（sha256sum 格式，由编排者从正式 tag 的仓库内容生成）；任一文件与清单不符即停，不动主机。
-# 路径不写死：环境取自宿主契约 /opt/lingxi/control/host-contract.json 的 environment；单元本体位置取自
+# 路径不写死：环境取自宿主契约的 environment（契约路径依次取 LINGXI_S30_HOST_CONTRACT、拉取代理单元有效 ExecStart 的
+# --host-contract、缺省 /opt/lingxi/control/host-contract.json，打印来源）；单元本体位置取自
 # systemctl show -p FragmentPath；巡检脚本位置取自装后有效 ExecStart 的第二段；备份脚本位置取自
 # lingxi-db-backup.service 的 ExecStart；注入点取自候选单元自己的 ExecStart 第一段。
 # 生产与预发的差异（数据驱动，脚本同一份）：生产在位单元本体须是已知旧版（#859 5757269798 回读的 c14989d1…）
-# 或已是候选版，本体与候选的差异里不许有 User=；预发不钉旧版 sha，本体里的 User= 允许，但 10-local.conf 须给同值。
+# 或已是候选版，本体与候选的差异里不许有 User=；预发不钉旧版 sha，本体里的 User= 允许：10-local.conf 在位须同值，
+# 不在位则 apply 先写一份只含该 User= 的 10-local.conf（纳入备份清单，回装即删）。本体差异白名单：注释 / ExecStart /
+# TimeoutStartSec / User / Description / After / Wants / WorkingDirectory / StandardOutput / StandardError，后六个逐键打印旧值 → 新值。
 # 用法：sudo -n bash host_maintenance_install.sh <子命令>                                     到终态预计时长
 #   check          只读：前提逐项核对 + 计划（每步 already / install），零写入                         < 5 秒
 #   apply --yes    前提 → 对齐到整分后约 10 秒 → 备份 → ① → 等轮 → ② → 等轮 → ③ → ④ → 汇总；
@@ -49,7 +52,6 @@ if [[ "$(id -u)" -ne 0 ]]; then
   OWNER_ARGS=(); say "测试形：非 root + LINGXI_HM_ROOT=$ROOT，跳过属主设置"
 fi
 SYSTEMCTL="${LINGXI_HM_SYSTEMCTL:-systemctl}"
-HOST_CONTRACT="${LINGXI_HM_HOST_CONTRACT:-$ROOT/opt/lingxi/control/host-contract.json}"
 UNIT_DIR="$ROOT/etc/systemd/system"
 MONITOR_UNIT=lingxi-host-monitor.service; MONITOR_TIMER=lingxi-host-monitor.timer; BACKUP_UNIT=lingxi-db-backup.service
 PY_DROPIN_NAME="${LINGXI_HM_PY_DROPIN:-20-python312.conf}"
@@ -68,6 +70,17 @@ exec_field() { # $1=field(path|argv) $2=unit：systemctl show ExecStart 的 { pa
     path) printf '%s' "$raw" | sed -n 's/^{ path=\([^ ;]*\) ;.*/\1/p' ;;
     argv) printf '%s' "$raw" | sed -n 's/.* argv\[\]=\(.*\) ; ignore_errors=.*/\1/p' ;;
   esac; }
+# 宿主契约路径（编排者 2026-09-27 预发实跑后裁定）：环境变量 LINGXI_S30_HOST_CONTRACT（与 db_switch_to_local.sh 同一约定）
+# → 拉取代理单元有效 ExecStart 的 --host-contract 参数（预发的 drop-in 把它改到了别处，缺省路径并不存在）→ 缺省路径
+resolve_contract() {
+  local argv tok prev="" found=""
+  if [[ -n "${LINGXI_S30_HOST_CONTRACT:-}" ]]; then HOST_CONTRACT="$LINGXI_S30_HOST_CONTRACT"; CONTRACT_SOURCE="环境变量 LINGXI_S30_HOST_CONTRACT"; return 0; fi
+  argv="$(exec_field argv lingxi-release-pull.service)"
+  for tok in $argv; do
+    if [[ "$prev" == --host-contract ]]; then found="$tok"; elif [[ "$tok" == --host-contract=* ]]; then found="${tok#--host-contract=}"; fi
+    prev="$tok"; done
+  if [[ -n "$found" ]]; then HOST_CONTRACT="$ROOT$found"; CONTRACT_SOURCE="lingxi-release-pull.service 有效 ExecStart 的 --host-contract"
+  else HOST_CONTRACT="$ROOT/opt/lingxi/control/host-contract.json"; CONTRACT_SOURCE="缺省路径"; fi; }
 exec_count() { sv ExecStart "$1" | grep -o '{ path=' | wc -l; }
 strip_prefix() { local v="$1"; while [[ "$v" == [-@:+!]* ]]; do v="${v:1}"; done; printf '%s' "$v"; }
 effective_from_files() { # 依次读单元与 drop-in：空 ExecStart= 清空、非空覆盖；输出最后的有效命令行
@@ -78,17 +91,20 @@ effective_from_files() { # 依次读单元与 drop-in：空 ExecStart= 清空、
     done < "$f"; done
   printf '%s' "$val"; }
 last_key() { [[ -f "$2" ]] && grep -E "^$1=" "$2" | tail -n1 | cut -d= -f2- || true; }
-unit_core() { grep -vE '^[[:space:]]*([#;]|$)' "$1" | grep -vE '^(ExecStart|TimeoutStartSec|User)=' || true; }
+# 本体差异白名单：注释 / ExecStart / TimeoutStartSec / User，加上编排者预发实跑后裁定放行的六个说明性键（逐键打印旧值 → 新值）
+EXTRA_KEYS=(Description After Wants WorkingDirectory StandardOutput StandardError)
+unit_core() { grep -vE '^[[:space:]]*([#;]|$)' "$1" | grep -vE "^(ExecStart|TimeoutStartSec|User|$(IFS='|'; echo "${EXTRA_KEYS[*]}"))=" || true; }
 diff_keys() { # 两份单元里除注释 / 空行外逐行不同的键名（只打键名，不打值）
   diff <(grep -vE '^[[:space:]]*([#;]|$)' "$1") <(grep -vE '^[[:space:]]*([#;]|$)' "$2") \
     | sed -n 's/^[<>] \([A-Za-z]*\)=.*/\1/p; s/^[<>] \(\[.*\]\)$/\1/p' | sort -u | tr '\n' ' ' || true; }
 
 # ---------------- 前提（check / apply / status 共用；只读） ----------------
 FAIL=(); declare -A WANT=()
-ENVIRONMENT=""; INJECT=""; FRAG=""; PRE_USER=""; PRE_ARGS=""; PY_DROPIN=""; MON_DST=""; BAK_DST=""; BK=""; DROPINS=()
+NEED_LOCAL=0; LOCAL_USER=""; HOST_CONTRACT=""; CONTRACT_SOURCE=""; ENVIRONMENT=""; INJECT=""; FRAG=""; PRE_USER=""; PRE_ARGS=""; PY_DROPIN=""; MON_DST=""; BAK_DST=""; BK=""; DROPINS=()
 preflight() {
   local line name file py ver
   # 宿主契约
+  resolve_contract; say "[契约] 来源=$CONTRACT_SOURCE 路径=${HOST_CONTRACT#"$ROOT"}"
   if [[ -f "$HOST_CONTRACT" ]]; then ENVIRONMENT="$(json_str "$HOST_CONTRACT" environment || true)"; else ENVIRONMENT=""; fi
   [[ "$ENVIRONMENT" == production || "$ENVIRONMENT" == stage ]] || FAIL+=("宿主契约 $HOST_CONTRACT 缺失或 environment 不是 production / stage")
   say "[契约] environment=${ENVIRONMENT:-unknown}"
@@ -137,14 +153,19 @@ preflight() {
   # 本体与候选的差异：只许注释 / ExecStart / TimeoutStartSec /（预发）User=
   if [[ "$(sha_of "$FRAG")" != "${WANT[$MONITOR_UNIT]:-x}" ]]; then
     say "[本体差异] 键：$(diff_keys "$FRAG" "$CAND_UNIT")"
-    [[ "$(unit_core "$FRAG")" == "$(unit_core "$CAND_UNIT")" ]] || FAIL+=("在位单元本体与候选有意外差异（注释 / ExecStart / TimeoutStartSec / User 以外）")
+    local k ov nv
+    for k in "${EXTRA_KEYS[@]}"; do ov="$(last_key "$k" "$FRAG")"; nv="$(last_key "$k" "$CAND_UNIT")"
+      [[ "$ov" == "$nv" ]] || say "[本体差异] $k：${ov:-（无）} → ${nv:-（无）}"; done
+    [[ "$(unit_core "$FRAG")" == "$(unit_core "$CAND_UNIT")" ]] || FAIL+=("在位单元本体与候选有意外差异（注释 / ExecStart / TimeoutStartSec / User / ${EXTRA_KEYS[*]} 以外）")
     [[ -z "$(last_key User "$CAND_UNIT")" ]] || FAIL+=("候选单元本体不应含 User=")
     local body_user local_user; body_user="$(last_key User "$FRAG")"; local_user="$(last_key User "$FRAG.d/10-local.conf")"
     if [[ "$ENVIRONMENT" == production ]]; then
       [[ "$(sha_of "$FRAG")" == "$PROD_OLD_UNIT_SHA" ]] || FAIL+=("生产在位单元本体 sha 既不是已知旧版也不是候选版")
       [[ -z "$body_user" ]] || FAIL+=("生产在位单元本体含 User=（生产不许这类差异）")
+    elif [[ -n "$body_user" && ! -e "$FRAG.d/10-local.conf" ]]; then
+      NEED_LOCAL=1; LOCAL_USER="$body_user"; say "[预发] 本体带 User=、无 10-local.conf：apply 先写 10-local.conf（User= 同值）再换本体"
     elif [[ -n "$body_user" ]]; then
-      [[ "$body_user" == "$local_user" ]] || FAIL+=("预发在位本体 User= 与 10-local.conf 不同值或缺 10-local.conf")
+      [[ "$body_user" == "$local_user" ]] || FAIL+=("预发在位本体 User= 与 10-local.conf 不同值")
     fi
   fi
   # 候选巡检脚本能被注入点解释器导入（避免 09-20 那种装完即坏）；备份脚本语法与单元指向
@@ -159,18 +180,18 @@ plan_steps() {
   [[ "$(sha_of "$FRAG")" == "${WANT[$MONITOR_UNIT]:-none}" && -z "$PY_DROPIN" ]] || NEED_UNIT=1
   [[ "$(sha_of "$MON_DST")" == "${WANT[host_health_alert.py]:-none}" ]] || NEED_MON=1
   [[ "$(sha_of "$BAK_DST")" == "${WANT[db_backup.sh]:-none}" ]] || NEED_BAK=1
-  say "[计划] ① 单元本体 $FRAG 在位 $(sha_of "$FRAG") → $( ((NEED_UNIT)) && echo "install ${WANT[$MONITOR_UNIT]:-none}$([[ -n "$PY_DROPIN" ]] && echo " 并删 $PY_DROPIN_NAME")" || echo already)"
+  say "[计划] ① 单元本体 $FRAG 在位 $(sha_of "$FRAG") → $( ((NEED_UNIT)) && echo "install ${WANT[$MONITOR_UNIT]:-none}$([[ -n "$PY_DROPIN" ]] && echo " 并删 $PY_DROPIN_NAME")$( ((NEED_LOCAL)) && echo " 并先写 10-local.conf")" || echo already)"
   say "[计划] ② 巡检脚本 $MON_DST 在位 $(sha_of "$MON_DST") → $( ((NEED_MON)) && echo "install ${WANT[host_health_alert.py]:-none}" || echo already)"
   say "[计划] ③ 备份脚本 $BAK_DST 在位 $(sha_of "$BAK_DST") → $( ((NEED_BAK)) && echo "install ${WANT[db_backup.sh]:-none}" || echo already)"; }
 require_ok() { if ((${#FAIL[@]})); then local f; for f in "${FAIL[@]}"; do say "前提不符：$f"; done; die "前提不符，未做任何改动"; fi; say "前提全部满足"; }
 
 # ---------------- 备份 / 回装 ----------------
-make_backup() { # 只备份会被改动的四个目标；原本不存在的记 absent，回装时删掉
+make_backup() { # 只备份会被改动的五个目标（含预发可能新写的 10-local.conf）；原本不存在的记 absent，回装时删掉
   local i=0 t
   install -d -m 700 "${OWNER_ARGS[@]}" -- "$BACKUP_ROOT"
   BK="$BACKUP_ROOT/$(stamp)"; install -d -m 700 "${OWNER_ARGS[@]}" -- "$BK"
   "$SYSTEMCTL" cat "$MONITOR_UNIT" > "$BK/systemctl-cat.txt" 2>/dev/null || true
-  for t in "$FRAG" "${PY_DROPIN:-$FRAG.d/$PY_DROPIN_NAME}" "$MON_DST" "$BAK_DST"; do i=$((i + 1))
+  for t in "$FRAG" "${PY_DROPIN:-$FRAG.d/$PY_DROPIN_NAME}" "$FRAG.d/10-local.conf" "$MON_DST" "$BAK_DST"; do i=$((i + 1))
     if [[ -f "$t" ]]; then cp -p -- "$t" "$BK/f$i"; printf 'present %s f%s %s\n' "$(sha_of "$t")" "$i" "$t" >> "$BK/files.list"
     else printf 'absent - f%s %s\n' "$i" "$t" >> "$BK/files.list"; fi; done
   touch "$BK/complete"; say "[备份] $BK（0700）$(wc -l < "$BK/files.list") 项，drop-in 原文另存 systemctl-cat.txt"; }
@@ -210,6 +231,11 @@ place_file() { # src dst mode
 step_unit() {
   if (( ! NEED_UNIT )); then say "① already 单元本体 sha=$(sha_of "$FRAG")，无 $PY_DROPIN_NAME"; return 0; fi
   # 本函数在「|| auto_restore」左侧被调用，bash 在此不触发 set -e：每条写入显式判返回值
+  if (( NEED_LOCAL )); then # 预发：User= 先落进 10-local.conf，再换掉带 User= 的本体
+    install -d -m 755 "${OWNER_ARGS[@]}" -- "$FRAG.d" || return 1
+    printf '[Service]\nUser=%s\n' "$LOCAL_USER" > "$FRAG.d/.10-local.hm" || return 1
+    place_file "$FRAG.d/.10-local.hm" "$FRAG.d/10-local.conf" 644 || return 1; rm -f -- "$FRAG.d/.10-local.hm"
+    say "① 已写 10-local.conf sha=$(sha_of "$FRAG.d/10-local.conf")（User= 与本体同值）"; fi
   place_file "$CAND_UNIT" "$FRAG" 644 || return 1
   if [[ -n "$PY_DROPIN" ]]; then rm -f -- "$PY_DROPIN" || return 1; say "① 已删 $PY_DROPIN_NAME"; fi
   "$SYSTEMCTL" daemon-reload || return 1
