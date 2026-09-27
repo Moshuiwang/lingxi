@@ -215,12 +215,16 @@ docker compose --env-file deploy/.env.prod \
 
 ### 2.3.6 升级窗口注意事项（rc25 补入：挑静默窗口，先查在途）
 
-**① 重启/替换 gateway 之前先确认没有在途任务与在途文档交付。** 只读计数（DSN 从
-`/home/bi-ai-deploy/.config/lingxi/supabase-prod.env` 加载进环境变量后引用，值不回显、
-不粘贴进命令行参数或聊天记录）：
+**① 重启/替换 gateway 之前先确认没有在途任务与在途文档交付。** 只读计数。**自 2026-09-22
+（`v2.6.0`）起生产库是本机容器 `lingxi-db`（PostgreSQL 17），Supabase 只停写待退订**：不得再
+从 `supabase-prod.env` 取连接串查询——那会查到已停写的旧库，结果与生产无关，是假安全信号。
+改在本机库容器内经本地套接字执行，不持有连接串与口令；形态与每日备份脚本
+`scripts/ops/db_backup.sh`、`deploy/监控告警.md` 第十节对同一库的只读查询相同（部署用户须在
+docker 组）。这三项计数本身尚未在本机库上实跑过（预发仍连 Supabase stage，无法先行实测），
+首次使用时输出不是三段整数即按「未知」处理、不 `up -d`：
 
 ```bash
-psql "$LINGXI_POSTGRES_DSN" -Atc "SELECT (SELECT count(*) FROM task WHERE status='running'), (SELECT count(*) FROM task WHERE status='awaiting_delivery'), (SELECT count(*) FROM task_document_delivery_request WHERE status='processing');"
+docker exec lingxi-db psql -U postgres -d postgres -Atc "SELECT (SELECT count(*) FROM task WHERE status='running'), (SELECT count(*) FROM task WHERE status='awaiting_delivery'), (SELECT count(*) FROM task_document_delivery_request WHERE status='processing');"
 ```
 
 期望 `0|0|0`；任一项非零就等一轮再查（在途文档投递的认领回收周期为 180 秒量级），
@@ -243,7 +247,7 @@ psql "$LINGXI_POSTGRES_DSN" -Atc "SELECT (SELECT count(*) FROM task WHERE status
 
 ③ **迁移前必须新取一份备份**：执行 `run --rm migrate` 之前，先由部署用户新跑一次 `pg_dump -Fc` 到 `~/backups/`（权限 `0600`，值不回显、不进任何日志或聊天记录）。这份备份是本次升级的最后恢复点；**从备份恢复库属于本节判据之外的显式除外动作，需要另行向产品负责人请示，不得因为迁移或部署过程中出现异常就自行执行恢复**。
 
-④ **`pg_dump` 客户端版本前提**：执行备份的 `pg_dump` 主版本号必须 **≥** 目标 Supabase 服务器的 PostgreSQL 主版本号，版本不够会直接拒绝连接。已知事实（编排者 2026-09-11 只读回读）：生产主机 `pg_dump` 17.10、Supabase 生产服务器 17.6，**生产主机可以直接用系统自带的 `pg_dump`**；预发主机 `pg_dump` 16.15 对 17.6 服务器**直接拒绝**，预发上的任何备份或恢复演练都必须改用 `docker run --rm postgres:17 pg_dump …`（容器内版本高于服务器，满足前提）。
+④ **`pg_dump` 客户端版本前提**：执行备份的 `pg_dump` 主版本号必须 **≥** 目标服务器的 PostgreSQL 主版本号，版本不够会直接拒绝连接。**自 2026-09-22 起生产库是本机容器 `lingxi-db`，镜像钉 `postgres:17`（17.11，见 `deploy/compose.db.yaml`）**：生产备份一律经 `docker exec lingxi-db pg_dump`，客户端与服务端同一镜像、前提自然满足（写法见 `scripts/ops/db_backup.sh`、[数据库迁移 runbook](数据库迁移runbook.md)）。2026-09-11 本节写作时的参照是 Supabase 生产服务器 17.6、生产主机 `pg_dump` 17.10（编排者只读回读），已不适用；预发仍连 Supabase stage（17.6），预发主机 `pg_dump` 16.15 对 17.6 服务器**直接拒绝**，预发上的任何备份或恢复演练都必须改用 `docker run --rm postgres:17 pg_dump …`（容器内版本高于服务器，满足前提）。
 
 ⑤ **顺序不可调换**（生产整窗口）：G-2 放行 → 自检 → 备份（③）→ 步 0（§2.0）→ `.env.prod` 写入本批 tag 与四份 digest（写之前先把原文件备份为 `.env.prod.before-243-<tag>`）→ 拉取并逐份比对 digest（「三、镜像 digest 固定」）→ `run --rm migrate`（①）→ 回读迁移头 = `0096_plpgsql_search_path` → `up -d` → 健康回读（§2.5）→ 15 分钟观察窗口（「七、观察期」）→ 固定项（`验收.md` §二 F-1/2/3/6）→ [#673](https://github.com/Moshuiwang/lingxi/issues/673) 回填 → 产品负责人真人问数 → 24 小时观察。**`--profile mvp` 与两个 `-f` 覆盖文件，本窗口内每一条 compose 命令都不能省**（§2.4 三条命令形态纪律同样适用于这里新增的每一步）。
 
@@ -439,8 +443,8 @@ docker image inspect --format='{{index .RepoDigests 0}}' \
 
 生产部署后的持续可观测性不在本文件展开，指向同批次另外两张卡交付的文档：
 
-- 基础设施层监控与告警：`deploy/监控告警.md`（Trace #373 H2 批另一张卡交付；本文件写作时该文件尚未创建，链接名字已按批次合同冻结）。
-- 容器日志留存：`deploy/日志留存.md`（同上）。
+- 基础设施层监控与告警：`deploy/监控告警.md`（Trace #373 H2 批另一张卡交付，现已存在；自 `v2.6.0` 起含本机库检查项与每日备份，见其第十节）。
+- 容器日志留存：`deploy/日志留存.md`（同批另一张卡交付，现已存在）。
 
 这两份文件到位后，「七、观察期」之外的长期运行监控与故障发现路径以它们为准；本文件不重复维护监控阈值或日志保留期限的具体数值。
 
