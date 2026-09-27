@@ -73,6 +73,7 @@ def catalog_notice(
         logger.warning("通知卡片模板不可用，沿用原展示 key=%s error=%s", key, type(error).__name__)
         return None
 
+
 #: 术语统一：「新增授权」→「补充授权」、「新增抑制」→「屏蔽指标」、逐行「收回」
 #: →「撤销」，与 ``core/admin/management_card._DIRECTION_LABEL``、
 #: ``core/admin/router._OVERRIDE_DIRECTION_LABEL`` 三处同步，杜绝同一操作两套

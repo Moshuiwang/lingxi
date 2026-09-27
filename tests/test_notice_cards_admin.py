@@ -22,8 +22,8 @@ from lingxi.adapters.feishu_group_message import FeishuGroupMessages
 from lingxi.apps.gateway.admin_followups import GatewayFollowupHandlers
 from lingxi.config import content as content_module
 from lingxi.config.content import ContentCatalog, default_content_catalog
-from lingxi.core.admin.card_callback import AdminCardCallbackHandler
 from lingxi.core.admin import management_card
+from lingxi.core.admin.card_callback import AdminCardCallbackHandler
 from lingxi.core.admin.management_status import PUBLISHING_STATUS_TEXT
 from lingxi.core.admin.pending_action import PendingAction, PendingActionStatus, PendingActionType
 from lingxi.core.admin.views import AdminUserStatusView
@@ -88,9 +88,7 @@ def _catalog(*keys: str) -> ContentCatalog:
     base = default_content_catalog()
     chosen = keys or tuple(NOTICE_CARDS)
     extra = {key: content_module._parse_card_template(key, NOTICE_CARDS[key]) for key in chosen}
-    return ContentCatalog(
-        version=base.version, texts=base._texts, cards={**base._cards, **extra}
-    )
+    return ContentCatalog(version=base.version, texts=base._texts, cards={**base._cards, **extra})
 
 
 def _pending(
@@ -393,7 +391,10 @@ class GroupNoticeTests(unittest.TestCase):
             _executed_outcome(pending), notifier=notifier, content_catalog=default_content_catalog()
         )
         handler.handle(
-            operator_open_id="ou_admin", pending_action_id=pending.id, decision="confirm", trace_id="t"
+            operator_open_id="ou_admin",
+            pending_action_id=pending.id,
+            decision="confirm",
+            trace_id="t",
         )
         expected = notification.render_group_notice(
             pending,
@@ -413,7 +414,10 @@ class GroupNoticeTests(unittest.TestCase):
             _executed_outcome(pending), notifier=notifier, content_catalog=_catalog()
         )
         handler.handle(
-            operator_open_id="ou_admin", pending_action_id=pending.id, decision="confirm", trace_id="t"
+            operator_open_id="ou_admin",
+            pending_action_id=pending.id,
+            decision="confirm",
+            trace_id="t",
         )
         self.assertEqual(notifier.texts, [])
         self.assertEqual(len(notifier.notices), 1)
@@ -476,7 +480,10 @@ class GroupNoticeTests(unittest.TestCase):
             _executed_outcome(pending), notifier=_real_group(fake), content_catalog=_catalog()
         )
         handler.handle(
-            operator_open_id="ou_admin", pending_action_id=pending.id, decision="confirm", trace_id="t"
+            operator_open_id="ou_admin",
+            pending_action_id=pending.id,
+            decision="confirm",
+            trace_id="t",
         )
         self.assertEqual(len(fake.sent("interactive")), 1)
         self.assertEqual(len(fake.sent("text")), 1)
@@ -491,7 +498,10 @@ class GroupNoticeTests(unittest.TestCase):
             _executed_outcome(pending), notifier=_real_group(fake), content_catalog=_catalog()
         )
         handler.handle(
-            operator_open_id="ou_admin", pending_action_id=pending.id, decision="confirm", trace_id="t"
+            operator_open_id="ou_admin",
+            pending_action_id=pending.id,
+            decision="confirm",
+            trace_id="t",
         )
         self.assertEqual(len(fake.sent("interactive")), 1)
         self.assertEqual(fake.sent("text"), [])
@@ -598,9 +608,9 @@ class ManagementCardTests(unittest.TestCase):
         self.assertNotIn("权限已下发", rendered)
 
     def test_disabled_account_line_is_attention_not_dispatching(self) -> None:
-        not_enabled = default_content_catalog().text(
-            "permission.management_account_not_enabled"
-        ).text
+        not_enabled = (
+            default_content_catalog().text("permission.management_account_not_enabled").text
+        )
         card = self._render(
             account_state="suspended", dispatch_status=not_enabled, content_catalog=_catalog()
         )
