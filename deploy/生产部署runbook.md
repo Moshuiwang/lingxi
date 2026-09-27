@@ -64,7 +64,7 @@ stat -c '%U:%G %n' /home/bi-ai-deploy/projects/lingxi/.git/index   # 期望 bi-a
 
 其中**数据库连接串不手工编辑**。**2026-09-22 起生产数据库为生产主机本地 PostgreSQL 17**（容器 `lingxi-db`，Trace [#859](https://github.com/Moshuiwang/lingxi/issues/859) 发布2）：连接串由[数据库迁移 runbook](数据库迁移runbook.md) 的 `switch-dsn` 改写为指向 `lingxi-db`，拉取部署按 `LINGXI_ENV_ROOT` 指定的目录读取 env 文件，不读手工部署时代的项目工作目录；安装、每日备份与恢复演练见[监控告警](监控告警.md)第十节。
 
-> **不要再运行下面这条同步命令**：它从 Supabase 凭据文件重写连接串，现在执行等于把生产改连 Supabase（退订前会造成两库分叉写入，退订后服务起不来）。同理，手工部署时代的工作目录 `deploy/.env.prod.*` 及其 `.before-*` 副本仍是 Supabase 连接串（2026-09-27 只读核对 10 份），不得用于任何应急部署；清理由产品负责人另行安排。以下命令与机制说明仅作迁库前的历史记录：
+> **不要再运行下面这条同步命令**：它从 Supabase 凭据文件重写连接串，现在执行等于把生产改连 Supabase——其付费账号已于 2026-09-27 停止（产品负责人告知），改连后服务起不来或连到切换前的旧数据；生产回切 Supabase 的路径因此不再可用（旧项目可读期未知）。同理，手工部署时代的工作目录 `deploy/.env.prod.*` 及其 `.before-*` 副本仍是 Supabase 连接串（2026-09-27 只读核对 10 份），不得用于任何应急部署；清理由产品负责人另行安排。以下命令与机制说明仅作迁库前的历史记录：
 
 ```bash
 scripts/ops/sync_db_env_from_credentials.sh \
@@ -216,7 +216,7 @@ docker compose --env-file deploy/.env.prod \
 ### 2.3.6 升级窗口注意事项（rc25 补入：挑静默窗口，先查在途）
 
 **① 重启/替换 gateway 之前先确认没有在途任务与在途文档交付。** 只读计数。**自 2026-09-22
-（`v2.6.0`）起生产库是本机容器 `lingxi-db`（PostgreSQL 17），Supabase 只停写待退订**：不得再
+（`v2.6.0`）起生产库是本机容器 `lingxi-db`（PostgreSQL 17），Supabase 付费账号已于 2026-09-27 停止**：不得再
 从 `supabase-prod.env` 取连接串查询——那会查到已停写的旧库，结果与生产无关，是假安全信号。
 改在本机库容器内经本地套接字执行，不持有连接串与口令；形态与每日备份脚本
 `scripts/ops/db_backup.sh`、`deploy/监控告警.md` 第十节对同一库的只读查询相同（部署用户须在
