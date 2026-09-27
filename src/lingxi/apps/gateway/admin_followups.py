@@ -6,7 +6,7 @@ from lingxi.core.admin.followup import FollowupSpec
 from lingxi.core.admin.followup_budget import FollowupDatabaseBudget
 from lingxi.core.admin.followup_consumer import FollowupConsumer, FollowupResult
 from lingxi.core.admin.followup_effect import effect_lease_allowed
-from lingxi.core.admin.notification import render_group_notice
+from lingxi.core.admin.notification import deliver_group_notice, group_notice, render_group_notice
 from lingxi.core.ids import new_id
 from lingxi.core.permission.targeted_recompute import RecomputeKind
 
@@ -108,15 +108,15 @@ class GatewayFollowupHandlers:
         if cb._group_notifier is None or not cb._group_chat_id:
             return FollowupResult("skipped", "notification_not_authorized")
         company, metric = cb._resolve_scope_labels(pending)
-        text = render_group_notice(
-            pending,
-            target_label=cb._display_names.user_label(open_id=pending.target_open_id),
-            company_label=company,
-            metric_label=metric,
-        )
+        target = cb._display_names.user_label(open_id=pending.target_open_id)
+        labels = {"target_label": target, "company_label": company, "metric_label": metric}
+        text = render_group_notice(pending, **labels)
+        notice = group_notice(pending, text=text, **labels)
         if not effect_lease_allowed():
             return FollowupResult("unknown", "lease_lost")
-        cb._group_notifier.send_text(chat_id=cb._group_chat_id, text=text, dedupe_key=pending.id)
+        deliver_group_notice(
+            cb._group_notifier, chat_id=cb._group_chat_id, notice=notice, dedupe_key=pending.id
+        )
         return FollowupResult()
 
 
