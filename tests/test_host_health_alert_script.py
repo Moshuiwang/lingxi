@@ -2081,7 +2081,6 @@ class RunLocalDbIntegrationTests(unittest.TestCase):
                     self.assertNotIn(needle, text)
 
 
-
 class _FakeFeishu:
     """按顺序回放飞书响应的 ``urlopen`` 替身；记录每次请求体，不连网。
 
@@ -2172,6 +2171,7 @@ class NoticeSendSemanticsTests(unittest.TestCase):
         self.assertEqual(self._run_with(fake), 0)
         self.assertEqual(fake.message_types(), [])
         self.assertEqual(host_health_alert.load_state(self.state_path), {})
+
 
 if __name__ == "__main__":
     unittest.main()

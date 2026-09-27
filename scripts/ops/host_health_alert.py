@@ -436,7 +436,9 @@ def render_message(action: str, classification: Classification, *, host: str, no
     raise ValueError("仅 alert / recovery 两种动作需要渲染文本")
 
 
-def render_notice(action: str, classification: Classification, *, host: str, now: str) -> NoticeSpec:
+def render_notice(
+    action: str, classification: Classification, *, host: str, now: str
+) -> NoticeSpec:
     """#27 容器告警 / 恢复卡；等价纯文本即 `render_message` 的输出。"""
     text = render_message(action, classification, host=host, now=now)
     fields = (

@@ -102,7 +102,9 @@ class HostContainerCardTests(unittest.TestCase):
 
     def _notice(self, action: str, reason: str, *, name: str = "lingxi-gateway-1", host="h1"):
         classification = HOST.Classification(name, reason, action == HOST.ACTION_ALERT)
-        return HOST.render_notice(action, classification, host=host, now="2026-09-27T00:00:00+00:00")
+        return HOST.render_notice(
+            action, classification, host=host, now="2026-09-27T00:00:00+00:00"
+        )
 
     def test_alert_and_recovery_match_shared_type(self) -> None:
         for action, reason in (
@@ -268,17 +270,31 @@ class AgentCardTests(unittest.TestCase):
     def test_self_update_alerts(self) -> None:
         for result in ("agent_self_update_rejected", "agent_self_update_failed"):
             with self.subTest(result=result):
-                notice = AGENT._alert_message(HOST_INFO, "v2.6.1", "agent_self_update", result, None)
+                notice = AGENT._alert_message(
+                    HOST_INFO, "v2.6.1", "agent_self_update", result, None
+                )
                 payload = self._assert_parity(notice)
                 self.assertEqual(payload["header"]["template"], "red")
                 self.assertIn("自替换", payload["header"]["title"]["content"])
 
     def test_pat_alerts(self) -> None:
         cases = (
-            ("pat_expiring", {"expires_on": "2026-10-01", "days_left": 4, "reason": None}, "需注意"),
+            (
+                "pat_expiring",
+                {"expires_on": "2026-10-01", "days_left": 4, "reason": None},
+                "需注意",
+            ),
             ("pat_expired", {"expires_on": "2026-09-01", "days_left": 0, "reason": None}, "故障"),
-            ("pat_expiry_unknown", {"expires_on": None, "days_left": None, "reason": "schema"}, "需注意"),
-            ("pat_expiry_recovered", {"expires_on": "2026-12-01", "days_left": 60, "reason": None}, "恢复"),
+            (
+                "pat_expiry_unknown",
+                {"expires_on": None, "days_left": None, "reason": "schema"},
+                "需注意",
+            ),
+            (
+                "pat_expiry_recovered",
+                {"expires_on": "2026-12-01", "days_left": 60, "reason": None},
+                "恢复",
+            ),
         )
         for code, observation, tone in cases:
             with self.subTest(code=code):

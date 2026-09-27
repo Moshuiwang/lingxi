@@ -3401,7 +3401,6 @@ class AgentTests(unittest.TestCase):
         self.assertTrue(expected.issubset(set(bundle.FILES)))
 
 
-
 class _FakeFeishu:
     """按顺序回放飞书响应的 ``urlopen`` 替身；记录每次请求体，不连网。
 
@@ -3512,6 +3511,7 @@ class AlertNoticeSendSemanticsTests(unittest.TestCase):
         self.assertIsNone(raised)
         self.assertEqual(fake.message_types(), ["interactive"])
         self.assertEqual(json.loads(fake.bodies[1]["content"])["header"]["template"], "orange")
+
 
 if __name__ == "__main__":
     unittest.main()
