@@ -51,7 +51,15 @@ from lingxi.core.user_memory import UserMemoryEntry
 
 NOW = datetime(2026, 9, 27, 12, 0, tzinfo=UTC)
 NEXT = "**下一步**"
-_BASE = default_content_catalog()
+_OFFICIAL = default_content_catalog()
+#: 「卡片键未进目录」的目录：正式目录已登记 ``notice.*``，这里剔除后代表撤键退回原文本。
+_BASE = ContentCatalog(
+    version=_OFFICIAL.version,
+    texts=_OFFICIAL._texts,  # noqa: SLF001
+    cards={k: v for k, v in _OFFICIAL._cards.items() if not k.startswith("notice.")},  # noqa: SLF001
+)
+#: 色调登记在 ``NOTICE_TONES`` 但不属于本组清单的键（乙组管理群补齐汇总）。
+_OTHER_GROUP_TONE_KEYS = frozenset({"permission.management_correction_summary"})
 #: 内测未开放提示里的联系方式原样取自正式目录，不在代码里另抄一份。
 _INNERTEST_CONTACT = _BASE.text("onboarding.innertest_not_open").text.split("。", 1)[1]
 
@@ -226,7 +234,10 @@ def catalog_with_cards(
     buttons: tuple[str, ...] = (),
     base: ContentCatalog = _BASE,
 ) -> ContentCatalog:
-    """测试夹具：在正式目录副本上追加 ``notice.*`` 卡片模板，走同一道模板校验。"""
+    """测试夹具：不传参数时就是正式目录（卡片键已登记）；传入模板或按钮文字时在剔除
+    通知卡片键的目录上追加这些模板，走同一道模板校验。"""
+    if cards is None and not buttons and base is _BASE:
+        return _OFFICIAL
     registered = dict(base._cards)  # noqa: SLF001 - 夹具只读正式目录的已校验模板
     for text_key, (title, body) in (PROPOSED_CARDS if cards is None else cards).items():
         key = notice_card_key(text_key)
@@ -294,7 +305,18 @@ def _message(event_id: str = "evt_1", text: str = "本月销售额是多少") ->
 
 class ProposedCatalogTests(unittest.TestCase):
     def test_every_eligible_key_has_a_proposal_and_nothing_else(self) -> None:
-        self.assertEqual(set(PROPOSED_CARDS), set(NOTICE_TONES))
+        self.assertEqual(set(PROPOSED_CARDS), set(NOTICE_TONES) - _OTHER_GROUP_TONE_KEYS)
+        self.assertLessEqual(_OTHER_GROUP_TONE_KEYS, set(NOTICE_TONES))
+
+    def test_the_official_catalog_registers_exactly_the_proposals(self) -> None:
+        for key, (title, body) in PROPOSED_CARDS.items():
+            with self.subTest(key=key):
+                template = _OFFICIAL._cards[notice_card_key(key)]  # noqa: SLF001
+                self.assertEqual((template.title.template, template.body.template), (title, body))
+                self.assertEqual(template.button_labels, ())
+        for key, text in PROPOSED_TEXTS.items():
+            with self.subTest(text_key=key):
+                self.assertEqual(_OFFICIAL.text(key).text, text)
 
     def test_card_placeholders_match_the_text_key_one_for_one(self) -> None:
         for key, (title, body) in PROPOSED_CARDS.items():
@@ -327,10 +349,10 @@ class ProposedCatalogTests(unittest.TestCase):
     def test_registered_real_cards_if_any_keep_placeholders_aligned(self) -> None:
         """整合路合入后生效：正式目录里已有的 ``notice.*`` 卡片与原文本键占位一致。"""
         for key in NOTICE_TONES:
-            if not _BASE.has_card(notice_card_key(key)):
-                continue
             with self.subTest(key=key):
-                self.assertIsNotNone(recover_values(_BASE, _BASE.text(key, **_sample(key))))
+                self.assertTrue(_OFFICIAL.has_card(notice_card_key(key)))
+                content = _OFFICIAL.text(key, **_sample(key))
+                self.assertIsNotNone(recover_values(_OFFICIAL, content))
 
 
 def _sample(key: str) -> dict[str, str]:

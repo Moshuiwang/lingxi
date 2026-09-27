@@ -68,6 +68,8 @@ NOTICE_TONES: Mapping[str, NoticeTone] = {
     # 7 权限范围变化通知
     "permission.range_updated": NoticeTone.DONE,
     "permission.range_revoked": NoticeTone.ATTENTION,
+    # 20 每日权限补齐汇总（管理群，入口在 ``apps/scheduler/assembly.py``）
+    "permission.management_correction_summary": NoticeTone.DONE,
 }
 
 #: 投递侧（排队提示、文档 / 表格交付）有资格改成卡片的文本键与色调。与

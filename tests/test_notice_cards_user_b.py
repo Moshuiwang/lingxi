@@ -87,9 +87,13 @@ FIXTURE_CARDS: dict[str, dict[str, Any]] = {
 
 
 def fixture_catalog(*keys: str) -> ContentCatalog:
-    """默认目录 + 指定的夹具卡片键；不传键时等于「卡片键未进目录」。"""
+    """剔除 ``notice.*`` 的正式目录 + 指定的夹具卡片键；不传键时等于「卡片键未进目录」。
+
+    正式目录已登记通知卡片键，所以基底先剔除它们，演练「未进目录」与单键进目录；
+    正式目录本身的卡片由 :class:`OfficialCatalogCardTests` 钉住。
+    """
     base = default_content_catalog()
-    cards = dict(base._cards)
+    cards = {k: v for k, v in base._cards.items() if not k.startswith("notice.")}
     for key in keys:
         cards[key] = content_module._parse_card_template(key, FIXTURE_CARDS[key])
     return ContentCatalog(version=base.version, texts=base._texts, cards=cards)
@@ -453,6 +457,46 @@ class _SpyReplyTexts:
         return "om-card"
 
 
+class OfficialCatalogCardTests(unittest.TestCase):
+    """正式目录（卡片键已登记）：本组每个文本键都配得出无按钮的卡片，等价纯文本就是原文本。"""
+
+    _SAMPLES: dict[str, dict[str, str]] = {
+        "url": {"url": DOC_URL},
+        "reference": {"reference": "r1"},
+    }
+
+    def test_every_delivery_key_builds_an_actionless_card_from_the_official_catalog(self) -> None:
+        catalog = default_content_catalog()
+        for key in DELIVERY_NOTICE_TONES:
+            with self.subTest(key=key):
+                names = catalog._texts[key].variables
+                values = {k: v for n in names for k, v in self._SAMPLES[n].items()}
+                card = build_catalog_notice(catalog, key, values)
+                self.assertIsNotNone(card)
+                self.assertIs(card.tone, DELIVERY_NOTICE_TONES[key])
+                self.assertEqual(card.fallback_text, catalog.text(key, **values).text)
+                self.assertEqual(card.allow_links, "url" in values)
+
+    def test_official_degraded_cards_other_than_the_paragraph_path_never_claim_nothing_was_cut(
+        self,
+    ) -> None:
+        catalog = default_content_catalog()
+        for key in (
+            "delivery.document_ready_simplified",
+            "delivery.document_ready_degraded_too_long",
+            "delivery.document_ready_degraded_title",
+        ):
+            with self.subTest(key=key):
+                card = build_catalog_notice(catalog, key, {"url": DOC_URL})
+                self.assertNotIn("没有删减", json.dumps(card.to_payload(), ensure_ascii=False))
+
+    def test_official_queued_hint_card_never_asks_to_resend(self) -> None:
+        card = build_catalog_notice(default_content_catalog(), "gateway.busy_hint_queued")
+        payload = json.dumps(card.to_payload(), ensure_ascii=False)
+        self.assertIn("无需重复发送", payload)
+        self.assertNotIn("重新发送", payload)
+
+
 def _queued_consumer(texts: Any, catalog: ContentCatalog) -> DeliveryConsumer:
     return DeliveryConsumer(queue=_StaleQueue(), cards=object(), texts=texts, catalog=catalog)
 
@@ -791,6 +835,13 @@ class StreamingCardHandoffTests(unittest.TestCase):
             "query.status", status=catalog.text("worker.card_handoff_notice").text
         )
         self.assertEqual(self._handoff_frame(catalog), _markdown(expected))
+
+    def test_official_catalog_handoff_frame_keeps_the_original_sentence(self) -> None:
+        catalog = default_content_catalog()
+        frame = self._handoff_frame(catalog)
+        self.assertTrue(frame.startswith("**结果将以新消息发送**"))
+        self.assertIn(catalog.text("worker.card_handoff_notice").text, frame)
+        self.assertNotIn("正在查询", frame)
 
     def test_with_card_key_the_handoff_frame_no_longer_says_querying(self) -> None:
         frame = self._handoff_frame(fixture_catalog("notice.worker.card_handoff_notice"))

@@ -1536,18 +1536,25 @@ class RosterReportNoticeCardTest(unittest.TestCase):
                 self._notice_failures -= 1
                 raise RuntimeError("模拟卡片结果不明")
 
-    def _patch_catalog(self) -> None:
+    def _patch_catalog(self, catalog=None) -> None:
+        """默认注入正式目录（卡片键已登记）；传入目录时用它。"""
         from test_notice_cards_ops import catalog_with_ops_cards
 
         from lingxi.core.identity import roster_report
 
         patcher = unittest.mock.patch.object(
-            roster_report, "default_content_catalog", return_value=catalog_with_ops_cards()
+            roster_report,
+            "default_content_catalog",
+            return_value=catalog if catalog is not None else catalog_with_ops_cards(),
         )
         patcher.start()
         self.addCleanup(patcher.stop)
 
     def test_without_the_card_key_only_text_is_sent(self) -> None:
+        # 正式目录已登记卡片键；「未进目录」注入剔除 ``notice.*`` 的目录演练。
+        from test_notice_cards_ops import _BASE as PLAIN_CATALOG
+
+        self._patch_catalog(PLAIN_CATALOG)
         sender = self._CardSender()
         duty, _, _, _, _ = build_duty(sender=sender)
         duty.run_once()

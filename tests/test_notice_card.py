@@ -13,7 +13,7 @@ from __future__ import annotations
 import json
 import unittest
 
-from lingxi.config.content import default_content_catalog
+from lingxi.config.content import ContentCatalog, default_content_catalog
 from lingxi.core.delivery.notice_card import (
     NoticeCard,
     NoticeSection,
@@ -139,11 +139,24 @@ class EscapeMarkdownTest(unittest.TestCase):
         self.assertEqual(escape_markdown(42), "42")
 
 
+def _catalog_without_notice_cards() -> ContentCatalog:
+    """正式目录去掉全部 ``notice.*`` 卡片键：代表「卡片键未进目录」。"""
+    base = default_content_catalog()
+    cards = {k: v for k, v in base._cards.items() if not k.startswith("notice.")}  # noqa: SLF001
+    return ContentCatalog(version=base.version, texts=base._texts, cards=cards)  # noqa: SLF001
+
+
 class ContentCatalogHasCardTest(unittest.TestCase):
     def test_missing_notice_card_key_is_false(self) -> None:
-        catalog = default_content_catalog()
+        # 正式目录已登记通知卡片键；「未登记」用剔除 ``notice.*`` 后的目录演练。
+        catalog = _catalog_without_notice_cards()
         self.assertFalse(catalog.has_card("notice.gateway.busy_hint"))
         self.assertFalse(catalog.has_card(""))
+        self.assertFalse(default_content_catalog().has_card("notice.no_such_key"))
+        self.assertFalse(default_content_catalog().has_card(""))
+
+    def test_registered_notice_card_key_is_true(self) -> None:
+        self.assertTrue(default_content_catalog().has_card("notice.gateway.busy_hint"))
 
     def test_registered_card_key_is_true(self) -> None:
         self.assertTrue(default_content_catalog().has_card("query.result"))

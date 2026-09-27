@@ -97,8 +97,10 @@ PROPOSED_OPS_CARDS: dict[str, tuple[str, str]] = {
         "文案覆盖文件未通过校验",
         "宿主机上的用户可见文案覆盖文件已被整份忽略，用户看到的仍是随镜像发布的那一版"
         "文案；不影响任何在跑的服务。\n**原因码**：{reason}\n\n"
-        f"{NEXT}\n用 `python -m lingxi.config.content_check` 校验该文件后重新放置，"
-        "并重启相关服务。",
+        # 正式目录受「用户可见文案零内部代号」检查约束，不写完整模块路径；完整命令
+        # 在等价纯文本里。
+        f"{NEXT}\n用随镜像附带的文案校验命令（`config.content_check` 模块）校验该文件后"
+        "重新放置，并重启相关服务。",
     ),
 }
 
@@ -115,7 +117,17 @@ PROPOSED_VARIABLES: dict[str, frozenset[str]] = {
     "notice.content.override_rejected": frozenset({"reason"}),
 }
 
-_BASE = default_content_catalog()
+_OFFICIAL = default_content_catalog()
+
+
+def _catalog_without_notice_cards() -> ContentCatalog:
+    """正式目录去掉全部 ``notice.*`` 卡片键：代表「卡片键未进目录」。"""
+    cards = {k: v for k, v in _OFFICIAL._cards.items() if not k.startswith("notice.")}  # noqa: SLF001
+    return ContentCatalog(version=_OFFICIAL.version, texts=_OFFICIAL._texts, cards=cards)  # noqa: SLF001
+
+
+#: 「键未进目录」的目录：正式目录已登记运维卡片键，这里剔除 ``notice.*``。
+_BASE = _catalog_without_notice_cards()
 CHAT_ID = "oc_fake_chat_for_ops_tests"
 WINDOW_START = datetime(2026, 9, 26, tzinfo=UTC)
 WINDOW_END = datetime(2026, 9, 27, tzinfo=UTC)
@@ -132,7 +144,10 @@ def catalog_with_ops_cards(
     buttons: tuple[str, ...] = (),
     base: ContentCatalog = _BASE,
 ) -> ContentCatalog:
-    """测试夹具：在正式目录副本上追加运维卡片模板，走同一道模板校验。"""
+    """测试夹具：不传参数时就是正式目录（运维卡片键已登记）；传入模板或按钮文字时
+    在剔除通知卡片键的目录上追加这些模板，走同一道模板校验。"""
+    if cards is None and not buttons and base is _BASE:
+        return _OFFICIAL
     registered = dict(base._cards)  # noqa: SLF001 - 夹具只读正式目录的已校验模板
     for key, (title, body) in (PROPOSED_OPS_CARDS if cards is None else cards).items():
         registered[key] = content_module._parse_card_template(  # noqa: SLF001
@@ -232,8 +247,16 @@ class ProposedCardsTest(unittest.TestCase):
                 self.assertEqual(template.variables, PROPOSED_VARIABLES[key])
                 self.assertEqual(template.button_labels, ())
 
-    def test_the_official_catalog_has_none_of_the_ops_card_keys_yet(self) -> None:
-        """整合路合入前正式目录没有这些键：各入口仍发原文本。"""
+    def test_the_official_catalog_registers_exactly_the_proposed_templates(self) -> None:
+        """整合路已把清单写进正式目录：模板逐字等于清单，且无按钮文字。"""
+        for key, (title, body) in PROPOSED_OPS_CARDS.items():
+            with self.subTest(key=key):
+                template = _OFFICIAL._cards[key]  # noqa: SLF001
+                self.assertEqual((template.title.template, template.body.template), (title, body))
+                self.assertEqual(template.button_labels, ())
+
+    def test_the_plain_catalog_has_none_of_the_ops_card_keys(self) -> None:
+        """剔除卡片键后的目录没有这些键：各入口仍发原文本。"""
         for key in OPS_CARD_KEYS:
             self.assertFalse(_BASE.has_card(key))
 
