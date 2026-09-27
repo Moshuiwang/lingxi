@@ -13,7 +13,8 @@ import sys
 from pathlib import Path
 
 # pg_restore --schema-only -f - 的输出节选：取自一次真实 pg_dump（postgres 16）后原样保留的那几类行——
-# TOC 注释头的 Owner 字段、OWNER TO、GRANT / REVOKE、默认权限、策略、会话身份。
+# TOC 注释头的 Owner 字段、OWNER TO、GRANT / REVOKE（带各自的 ACL 注释头）、默认权限、策略、会话身份。
+# verify 的授权内容比对读目标库 pg_dump --schema-only 的同形输出：桩回放 target_schema.sql（缺省与本节选相同）。
 SCHEMA_SQL = """--
 -- Name: extensions; Type: SCHEMA; Schema: -; Owner: postgres
 --
@@ -28,9 +29,12 @@ ALTER FUNCTION public.lingxi_retention_cleanup(p_now timestamp with time zone, p
 ALTER TABLE public.t1 OWNER TO lingxi_app;
 -- Name: t1 p1; Type: POLICY; Schema: public; Owner: lingxi_app
 CREATE POLICY p1 ON public.t1 TO anon USING (true);
+-- Name: SCHEMA public; Type: ACL; Schema: -; Owner: pg_database_owner
 GRANT USAGE ON SCHEMA public TO anon;
+-- Name: FUNCTION lingxi_retention_cleanup(p_now timestamp with time zone, p_days integer); Type: ACL; Schema: public; Owner: lingxi_retention_owner
 REVOKE ALL ON FUNCTION public.lingxi_retention_cleanup(p_now timestamp with time zone, p_days integer) FROM PUBLIC;
 GRANT ALL ON FUNCTION public.lingxi_retention_cleanup(p_now timestamp with time zone, p_days integer) TO lingxi_app;
+-- Name: TABLE t1; Type: ACL; Schema: public; Owner: lingxi_app
 GRANT SELECT,DELETE ON TABLE public.t1 TO lingxi_retention_owner;
 GRANT SELECT ON TABLE public.t1 TO "Weird Role";
 -- Name: DEFAULT PRIVILEGES FOR TABLES; Type: DEFAULT ACL; Schema: public; Owner: supabase_admin
@@ -145,6 +149,9 @@ if cmd == "exec":
     rest = [a for a in args[1:] if a != "-i"]
     if rest[1:3] == ["rm", "-f"]:
         sys.exit(0)
+    if rest[1] == "pg_dump" and "--schema-only" in rest:
+        print(text("target_schema.sql"), end="")
+        sys.exit(0)
     if rest[1] == "pg_restore":
         drain()
         if "--schema-only" in rest:
@@ -231,6 +238,7 @@ def install_fakes(bin_dir: Path, support_dir: Path) -> dict[str, Path]:
     support_dir.mkdir(parents=True, exist_ok=True)
     for name, body in (
         ("schema.sql", SCHEMA_SQL),
+        ("target_schema.sql", SCHEMA_SQL),
         ("toc.txt", TOC),
         ("target.json", TARGET_JSON),
         ("health_db.json", HEALTH_LOG_DB),

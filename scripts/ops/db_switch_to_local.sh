@@ -45,6 +45,11 @@
 # 回退：rollback-dsn → recreate-services（容器已按新 DSN 重建过时必跑；只停未重建过的用 start-services）。
 # 输入全走 LINGXI_S30_* 环境变量，缺省从同目录 db_switch_to_local.env 读（KEY=VALUE，不执行）；清单见文件末尾。
 # 测试形：非 root + LINGXI_S30_ROOT=<假根>（路径全部加前缀、跳过属主设置；systemctl / docker 可注入桩）。
+# 已知边界（外审 #898 W4 B5 / B6 / B8 / B9，编排者裁定接受）：
+#   B5 cleanup --yes 只核工作目录存在、不核它是否落在备份目录：触发须刻意把 LINGXI_S30_WORK_DIR 指向备份目录，输入只从仓库同一提交取；
+#   B6 容器内 psql / pg_dump 的 argv 含来源连接串（下方 src_run 处已声明）：容器随即销毁，且来源 Supabase 已停；
+#   B8 recreate-services 先回读参数、后取部署锁：恢复 / 切换流程在此之前已停拉取 timer（stop-write / wipe），期间没有别的部署轮次；
+#   B9 --force-recreate 半途留下缺失容器时，本子命令会被「三容器不全」挡住：手工重跑部署器补齐容器后再继续。
 set -euo pipefail
 export LC_ALL=C
 umask 077  # 本脚本落盘的都是私有材料；需要 0644 的地方显式 install -m
@@ -123,6 +128,10 @@ ENV_FILES+=("$MONITOR_ENV")
 # 导出装进的临时替身库时，指向一份只含 LINGXI_MIGRATION_DSN=<替身库连接串> 的 0600 文件（不进八份改写清单，switch-dsn 不动它）
 SOURCE_ENV_FILE="${LINGXI_S30_SOURCE_ENV_FILE:-$CONFIG_ROOT/.env.$SUF.migrate}"
 PARAM_OVERRIDE_RE='[?&](host|hostaddr|user|password|dbname|port|service|passfile)='  # F9：查询参数带这些键会覆盖 authority 里的新地址 / 账号（service / passfile 经 libpq 服务文件 / 口令文件间接覆盖）
+# libpq 会先对查询串做一次 %XX 解码再认键（?ho%73t= 即 host=）：判覆盖键前同样解码一次（只认两位十六进制，其余原样）
+pct_decode() { local s="$1" out="" c; while [[ -n "$s" ]]; do
+    if [[ "$s" =~ ^%([0-9A-Fa-f]{2}) ]]; then printf -v c %b "\\x${BASH_REMATCH[1]}"; out+="$c"; s="${s:3}"; else out+="${s:0:1}"; s="${s:1}"; fi
+  done; printf '%s' "$out"; }
 DSN_LINE_RE='^(LINGXI_[A-Z_]*_DSN=)(["'"'"']?)(postgres(ql)?(\+psycopg)?)://([^@[:space:]]*)@([^/?"'"'"'[:space:]]*)/([^?"'"'"'[:space:]]*)(\?[^"'"'"'[:space:]]*)?(["'"'"']?)[[:space:]]*$'
 
 # --- 工作目录：preflight 新建 <WORK_ROOT>/<run_id>/ 并把路径记入 <WORK_ROOT>/current；其余子命令沿用 ---
@@ -460,7 +469,8 @@ do_restore() {
 # ============================ verify ============================
 do_verify() {
   banner 只读 无需回退
-  need_work_dir; [[ -f "$WORK_DIR/source-facts.json" ]] || die "缺 source-facts.json，先跑 dump"
+  need_work_dir; void_verify  # B7：先作废旧记录，本次任何中途退出都不留通过记录授权 switch-dsn
+  [[ -f "$WORK_DIR/source-facts.json" ]] || die "缺 source-facts.json，先跑 dump"
   local id diffs expected dsha; id="$(run_id)"; dsha="$(cut -d' ' -f1 "$WORK_DIR/source.dump.sha256" 2>/dev/null || true)"  # F5：通过记录绑定到本次 dump
   printf '%s\n' "$FACTS_SQL" | tgt_psql | write_private "$WORK_DIR/target-facts.json"
   diffs="$({ printf 'WITH s AS (SELECT '; json_sql s30j "$WORK_DIR/source-facts.json"; printf ' AS j), t AS (SELECT '; json_sql s30t "$WORK_DIR/target-facts.json"; printf ' AS j)\n'
@@ -497,7 +507,8 @@ rewrite_dsn_file() { # 文件 新主机:端口 口令 [dry] → REWRITE_RESULT=c
     [[ "$line" =~ ^LINGXI_[A-Z_]*_DSN= ]] && raw_dsn=$((raw_dsn + 1))
     if [[ "$line" =~ $DSN_LINE_RE ]]; then
       local key="${BASH_REMATCH[1]}" q="${BASH_REMATCH[2]}" scheme="${BASH_REMATCH[3]}" oldhost="${BASH_REMATCH[7]}" params="${BASH_REMATCH[9]}"
-      [[ "${params,,}" =~ $PARAM_OVERRIDE_RE ]] && { override=$((override + 1)); out+="$line"$'\n'; continue; }  # F9
+      local dec; dec="$(pct_decode "$params")"
+      [[ "${dec,,}" =~ $PARAM_OVERRIDE_RE ]] && { override=$((override + 1)); out+="$line"$'\n'; continue; }  # F9（解码后判）
       dsn_lines=$((dsn_lines + 1))
       params="$(printf '%s' "$params" | sed -E 's/sslmode=[A-Za-z-]+/sslmode=disable/')"
       local new="${key}${q}${scheme}://postgres:${pw}@${newhost}/postgres${params}${q}"
