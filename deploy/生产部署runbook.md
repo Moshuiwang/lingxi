@@ -62,14 +62,16 @@ stat -c '%U:%G %n' /home/bi-ai-deploy/projects/lingxi/.git/index   # 期望 bi-a
 
 按 [`deploy/README.md`「准备」](README.md#准备)为 `.env.prod`、`.env.prod.scheduler`、`.env.prod.gateway`、`.env.prod.worker`、`.env.prod.worker-queue`、`.env.prod.migrate`、`.env.prod.reauthorize` 七个文件写入生产凭据。生产凭据集与研发/Stage 凭据集完全隔离，任何一个值都不得与 `.env.stage.*` 系列重复（百炼模型端点凭据除外，见本文件「九」）；不得把研发环境的任何文件复制改名后当作生产文件使用。
 
-其中**数据库连接串不手工编辑**：生产数据库为 Supabase `lingxi-prod`（eu-west-1，Issue #411），凭据事实源是 `biplus-prod` 上的私有文件 `/home/bi-ai-deploy/.config/lingxi/supabase-prod.env`（0600，已就位并验证过登录），用同步脚本按服务写入——scheduler/gateway/worker-queue/reauthorize 得运行 DSN、migrate 得迁移 DSN、worker 零数据库凭据：
+其中**数据库连接串不手工编辑**。**2026-09-22 起生产数据库为生产主机本地 PostgreSQL 17**（容器 `lingxi-db`，Trace [#859](https://github.com/Moshuiwang/lingxi/issues/859) 发布2）：连接串由[数据库迁移 runbook](数据库迁移runbook.md) 的 `switch-dsn` 改写为指向 `lingxi-db`，拉取部署按 `LINGXI_ENV_ROOT` 指定的目录读取 env 文件，不读手工部署时代的项目工作目录；安装、每日备份与恢复演练见[监控告警](监控告警.md)第十节。
+
+> **不要再运行下面这条同步命令**：它从 Supabase 凭据文件重写连接串，现在执行等于把生产改连 Supabase（退订前会造成两库分叉写入，退订后服务起不来）。同理，手工部署时代的工作目录 `deploy/.env.prod.*` 及其 `.before-*` 副本仍是 Supabase 连接串（2026-09-27 只读核对 10 份），不得用于任何应急部署；清理由产品负责人另行安排。以下命令与机制说明仅作迁库前的历史记录：
 
 ```bash
 scripts/ops/sync_db_env_from_credentials.sh \
   /home/bi-ai-deploy/.config/lingxi/supabase-prod.env deploy .env.prod
 ```
 
-机制详见 [`deploy/README.md`「数据库凭据源」](README.md#数据库凭据源supabase-私有凭据文件issue-411)（含 session 模式连接约束）。**截至 2026-08-29 生产尚未切换/部署**：本节只登记同构加载方式，实际执行在生产发布的独立 ops 卡内。
+旧机制详见 [`deploy/README.md`「数据库凭据源」](README.md#数据库凭据源supabase-私有凭据文件issue-411)。
 
 **资源与并发（Issue #494/#496/#502）**：生产机器型号与 stage 一致。在目标机外部根
 `deploy/.env.prod`（不入库、不写入本仓库）核对并写入以下**七行**：

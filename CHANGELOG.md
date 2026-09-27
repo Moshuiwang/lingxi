@@ -6,11 +6,13 @@
 
 ## [Unreleased]
 
-2.6.0 迁库版（Trace [#859](https://github.com/Moshuiwang/lingxi/issues/859) 发布2）：生产数据库从 Supabase 迁到生产主机本地 PostgreSQL 17，装入 [#809](https://github.com/Moshuiwang/lingxi/issues/809) / [#835](https://github.com/Moshuiwang/lingxi/issues/835) 两处改动。**切换当日有一个不超过 30 分钟的停写窗口**：窗口内问数与卡片投递暂停，窗口结束后自动恢复，窗口前已提交的请求不丢失；本节随批次合入逐条追加。
+## [2.6.0] - 2026-09-22
+
+迁库版（Trace [#859](https://github.com/Moshuiwang/lingxi/issues/859) 发布2）：候选 `v2.6.0-rc.111` 经预发验收后由 Release Promotion 发布为正式版，生产数据库从 Supabase 迁到生产主机本地 PostgreSQL 17，装入 [#809](https://github.com/Moshuiwang/lingxi/issues/809) / [#835](https://github.com/Moshuiwang/lingxi/issues/835) 两处改动。**切换当日用户可见停机 11 分 28 秒**（合同上限 30 分钟）：窗口内问数与卡片投递暂停，窗口结束后自动恢复；迁移前后逐表行数、属主与迁移头零差异，产品负责人一次真实问数通过（L6）。观察期 2026-09-22 → 09-27 每日备份与异机副本无缺天、零告警，产品负责人 09-27 裁定达标。
 
 ### Changed
 
-- **生产数据库改为生产主机本地 PostgreSQL 17，每日备份 + 异机副本 + 恢复演练成为自托管标配**：新增本地库编排 `deploy/compose.db.yaml`（钉摘要的官方镜像、加入应用栈既有网络、只在回环发布端口、参数全走环境变量）、每日备份单元 `lingxi-db-backup.timer`（UTC 18:30 `pg_dump` → 校验和 → `pg_restore --list` 完整性 → 逐表行数清单 → 保留 14 组 → 可选传到异机并回读校验 → 状态文件，任一步失败写错误码并让 systemd 记失败）、宿主巡检本地库检查项（容器 / 备份过旧或失败 / 连接数 / WAL）与恢复演练脚本的本地库形；安装与检查项见 `deploy/监控告警.md` 第十节。**已知边界**：应用沿用来源库的角色名连库，在本地实例上它是超级用户（收紧另立工作项）；观察期内 Supabase 只停写不退役、可回切；切换后新增写入的回退处置 = 本地 `pg_dump` 导出待人工回放，不能假设改回连接串即无损（Issue [#809](https://github.com/Moshuiwang/lingxi/issues/809)）。
+- **生产数据库改为生产主机本地 PostgreSQL 17，每日备份 + 异机副本 + 恢复演练成为自托管标配**：新增本地库编排 `deploy/compose.db.yaml`（钉摘要的官方镜像、加入应用栈既有网络、只在回环发布端口、参数全走环境变量）、每日备份单元 `lingxi-db-backup.timer`（UTC 18:30 `pg_dump` → 校验和 → `pg_restore --list` 完整性 → 逐表行数清单 → 保留 14 组 → 可选传到异机并回读校验 → 状态文件，任一步失败写错误码并让 systemd 记失败）、宿主巡检本地库检查项（容器 / 备份过旧或失败 / 连接数 / WAL）与恢复演练脚本的本地库形；安装与检查项见 `deploy/监控告警.md` 第十节。**已知边界**：应用沿用来源库的角色名连库，在本地实例上它是超级用户（收紧另立工作项）；观察期已于 2026-09-27 达标，Supabase 退订由产品负责人在控制台执行，退订前旧项目只停写、可回切；切换后新增写入的回退处置 = 本地 `pg_dump` 导出待人工回放，不能假设改回连接串即无损（Issue [#809](https://github.com/Moshuiwang/lingxi/issues/809)）。
 - **数据库连接借用合同真正兑现**：借用者归还后拿到的旧引用与旧游标永久失效，不再触达他人事务；用户可见行为零变化（Issue [#835](https://github.com/Moshuiwang/lingxi/issues/835)）。
 
 ## [2.5.3] - 2026-09-20
