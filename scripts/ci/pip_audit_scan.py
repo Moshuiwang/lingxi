@@ -7,8 +7,9 @@
 「查到了漏洞」与「没查成」是两种红，只对后者重试：
 - 扫描器写出了完整结果（顶层有 dependencies 列表）→ 不论退出码是 0 还是 1（发现漏洞）都不重试，
   结论交给判定脚本 pip_audit_check.py；真高危不可能被重试掩盖。
-- 没有完整结果且错误输出带服务端错误特征（5xx、ServiceError、连接 / 读取超时）且不带客户端
-  错误（4xx）特征 → 最多重试 2 次、间隔递增；每次重试的序号与间隔都打到日志。
+- 没有完整结果且错误输出带服务端错误特征（5xx、ServiceError、连接 / 读取超时、
+  「Could not connect to … vulnerability feed」）且不带客户端错误（4xx）特征
+  → 最多重试 2 次、间隔递增；每次重试的序号与间隔都打到日志。
 - 重试用尽仍失败 → 删除残留结果文件、退出码 2，信息写明「未能取得严重度（外部服务不可用），
   非漏洞判定」；不降级为告警、不放行。
 - 其他失败（结果缺失但不是服务端故障）→ 不重试、退出码 0，由判定脚本按「未知」判失败，
@@ -35,6 +36,9 @@ UNAVAILABLE = "未能取得严重度（外部服务不可用），非漏洞判�
 _SERVICE_ERROR = re.compile(
     r"\b5\d\d Server Error\b|ServiceError|ConnectionError|ConnectTimeout|ReadTimeout"
     r"|Read timed out|timed out|Max retries exceeded"
+    # pip-audit 2.10.1 把 requests.ConnectTimeout 转成服务层 ConnectionError，CLI 只记日志消息
+    # （如「Could not connect to OSV's vulnerability feed」），不带异常类名。
+    r"|Could not connect to \S+ vulnerability feed"
 )
 _CLIENT_ERROR = re.compile(r"\b4\d\d Client Error\b")
 

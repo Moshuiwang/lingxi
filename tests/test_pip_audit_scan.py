@@ -52,7 +52,13 @@ FAKE_SCANNER = textwrap.dedent(
         )
         sys.exit(1)
     if step == "timeout":
-        sys.stderr.write("requests.exceptions.ConnectTimeout: connect timeout=15\\n")
+        # pip-audit 2.10.1 真实文本：osv.py 把 requests.ConnectTimeout 转成服务层 ConnectionError，
+        # CLI 只把消息写进日志，不打印异常类名。
+        sys.stderr.write(
+            "ERROR:pip_audit._cli:Could not connect to OSV's vulnerability feed\\n"
+            "ERROR:pip_audit._cli:Tip: your network may be blocking this service. "
+            "Try another service with `-s SERVICE`\\n"
+        )
         sys.exit(1)
     if step == "4xx":
         sys.stderr.write(
