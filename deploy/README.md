@@ -107,7 +107,7 @@ $EDITOR deploy/.env.stage.reauthorize                # 重授权所需数据库�
 
 ### 数据库凭据源：Supabase 私有凭据文件（Issue #411）
 
-stage 与生产的数据库为 Supabase 云托管（[#40 决策](https://github.com/Moshuiwang/lingxi/issues/40)，2026-08-05）。数据库连接串的**唯一事实源**是目标机器上、仓库工作副本之外的私有凭据文件（0600，属主为部署用户）：
+stage 的数据库为 Supabase 云托管（[#40 决策](https://github.com/Moshuiwang/lingxi/issues/40)，2026-08-05）；生产首发同样如此，**2026-09-22（`v2.6.0`）起改为生产主机本地 PostgreSQL 17**（`lingxi-db`，见[数据库迁移 runbook](数据库迁移runbook.md)），下表生产行是首发时的凭据位置，迁库后是否仍在使用未经本次文档核对。数据库连接串的**唯一事实源**是目标机器上、仓库工作副本之外的私有凭据文件（0600，属主为部署用户）：
 
 | 环境 | 机器 | 凭据文件 |
 | --- | --- | --- |
@@ -576,7 +576,7 @@ docker compose --env-file deploy/.env.prod -f deploy/compose.yaml -f deploy/comp
 docker compose --env-file deploy/.env.prod -f deploy/compose.yaml -f deploy/compose.prod.yaml --profile mvp up -d
 ```
 
-数据库备份与恢复遵循 Supabase 托管方案。两个持久卷单独备份。
+数据库备份与恢复：生产（本机 PostgreSQL 17，2026-09-22 起）见 `deploy/监控告警.md` 第十节的每日备份单元与[数据库迁移 runbook](数据库迁移runbook.md)；预发 Supabase 测试实例遵循其托管方案。两个持久卷单独备份。
 
 ## 两个持久卷
 
