@@ -504,7 +504,9 @@ class RealDatabaseTest(_Base):
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertIn("verify 零差异", result.stdout)
         self.assertIn("新建 NOLOGIN 6", result.stdout)  # 含只在默认权限行出现的 "Mixed Owner"
-        self.assertEqual(self.psql("SELECT count(*) FROM pg_roles WHERE rolname = 'Mixed Owner'"), "1")
+        self.assertEqual(
+            self.psql("SELECT count(*) FROM pg_roles WHERE rolname = 'Mixed Owner'"), "1"
+        )
         self.assertEqual(self.psql("SELECT count(*) FROM public.t1"), "3")
         self.assertEqual(
             self.psql(
