@@ -1,5 +1,5 @@
 [meta]
-version = "2026-09-27.891-1"
+version = "2026-09-27.891-2"
 
 [texts]
 "worker.failure_reference" = "追溯号：{reference}。"
@@ -645,7 +645,7 @@ button_labels = []
 
 [cards."notice.worker.card_handoff_notice"]
 title = "结果将以新消息发送"
-body = "本次处理时间较长，此卡片不再更新；处理完成后结果将以新消息发送，请留意。"
+body = "本次处理时间较长，此卡片可能很快不再更新；处理完成后结果将以新消息发送，请留意。"
 button_labels = []
 
 # #891 乙 管理卡与管理群通知

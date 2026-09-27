@@ -703,18 +703,31 @@ class CorrectionSummaryTests(unittest.TestCase):
 
         store, audit = _Store(), _Audit()
         config = mock.Mock(admin_group_chat_id=CHAT_ID)
-        tones = (
-            {notification.CORRECTION_SUMMARY_TEXT_KEY: NoticeTone.DONE} if tone_registered else {}
-        )
+        key = notification.CORRECTION_SUMMARY_TEXT_KEY
+        tones = {k: v for k, v in catalog_notice._ALL_TONES.items() if k != key}
+        if tone_registered:
+            tones[key] = NoticeTone.DONE
         with (
             mock.patch.object(notification, "default_content_catalog", return_value=catalog),
-            # 色调表在模块导入时合并成 ``_ALL_TONES``，演练「已登记」只能替换合并后的表。
-            mock.patch.dict(catalog_notice._ALL_TONES, tones),
+            # 色调表在模块导入时合并成 ``_ALL_TONES``；正式代码已登记该键，演练「未登记」
+            # 必须整表替换（clear=True）才能真正移除它。
+            mock.patch.dict(catalog_notice._ALL_TONES, tones, clear=True),
         ):
             _send_management_correction_summary(
                 config=config, audit=audit, sender=sender, store=store, message_ids=("m1", "m2")
             )
         return store, audit
+
+    def test_the_summary_tone_is_registered_in_code(self) -> None:
+        key = notification.CORRECTION_SUMMARY_TEXT_KEY
+        self.assertIs(catalog_notice.NOTICE_TONES[key], NoticeTone.DONE)
+
+    def test_official_catalog_sends_the_summary_as_a_card(self) -> None:
+        sender = _NoticeGroup()
+        self._send(sender, default_content_catalog())
+        self.assertEqual(sender.texts, [])
+        self.assertEqual(len(sender.notices), 1)
+        assert_no_actionable_elements(sender.notices[0]["card"].to_payload())
 
     def test_card_key_without_registered_tone_keeps_text(self) -> None:
         sender = _NoticeGroup()

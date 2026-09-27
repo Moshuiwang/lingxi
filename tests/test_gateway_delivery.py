@@ -22,7 +22,7 @@ from postgres_schema import ensure_production_schema, psycopg_available, reset_p
 
 from lingxi.adapters.postgres_conversation import PostgresTaskQueue
 from lingxi.apps.gateway.delivery import DeliveryConsumer
-from lingxi.config.content import default_content_catalog
+from lingxi.config.content import ContentCatalog, default_content_catalog
 from lingxi.core.delivery.ports import (
     DELIVERY_OPERATIONS,
     DeliveryOperation,
@@ -1307,6 +1307,24 @@ class PreprovisionNoticeConsumptionTests(DeliveryConsumerTestCase):
         self.assertIsNone(self._peek())
 
 
+def _catalog_without_notice_cards() -> ContentCatalog:
+    """正式目录去掉全部 ``notice.*`` 卡片键：代表「卡片键撤出目录」时的纯文本路径。"""
+    base = default_content_catalog()
+    cards = {k: v for k, v in base._cards.items() if not k.startswith("notice.")}  # noqa: SLF001
+    return ContentCatalog(version=base.version, texts=base._texts, cards=cards)  # noqa: SLF001
+
+
+class RecordingNoticeText(RecordingText):
+    """同话题回复出口多一个卡片发送口，记录每次卡片发送。"""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.notices: list[dict] = []
+
+    def send_notice(self, **kwargs: object) -> None:
+        self.notices.append(kwargs)
+
+
 class QueueDelayHintTests(DeliveryConsumerTestCase):
     """Issue #465（rc22 S-3，排队可感知）：真库读取面 + `DeliveryConsumer` 消费面。
 
@@ -1360,8 +1378,13 @@ class QueueDelayHintTests(DeliveryConsumerTestCase):
     def test_delivery_consumer_sends_the_hint_exactly_once_per_stale_task(self) -> None:
         self.seed_queued_task(task_id="tsk-stale", conversation_id="cnv-1", created_seconds_ago=30)
         texts = RecordingText()
+        # 正式目录已登记排队提示卡片键；本用例钉纯文本路径，注入剔除卡片键的目录。
         consumer = DeliveryConsumer(
-            queue=self.queue, cards=RecordingCards(), texts=texts, queue_delay_hint_seconds=12.0
+            queue=self.queue,
+            cards=RecordingCards(),
+            texts=texts,
+            queue_delay_hint_seconds=12.0,
+            catalog=_catalog_without_notice_cards(),
         )
 
         consumer.run_once()
@@ -1398,7 +1421,11 @@ class QueueDelayHintTests(DeliveryConsumerTestCase):
         self.seed_queued_task(task_id="tsk-stale", conversation_id="cnv-1", created_seconds_ago=30)
         texts = RecordingText()
         consumer = DeliveryConsumer(
-            queue=self.queue, cards=RecordingCards(), texts=texts, queue_delay_hint_seconds=12.0
+            queue=self.queue,
+            cards=RecordingCards(),
+            texts=texts,
+            queue_delay_hint_seconds=12.0,
+            catalog=_catalog_without_notice_cards(),
         )
         consumer.run_once()
         self.assertEqual(len(texts.calls), 1)
@@ -1415,6 +1442,26 @@ class QueueDelayHintTests(DeliveryConsumerTestCase):
         consumer.run_once()
 
         self.assertEqual(len(texts.calls), 2)
+
+    def test_official_catalog_sends_one_card_per_stale_task_and_no_text(self) -> None:
+        """正式目录（排队提示卡片键已登记）：同一任务持续排队只发一张卡，不发文本。"""
+        self.seed_queued_task(task_id="tsk-stale", conversation_id="cnv-1", created_seconds_ago=30)
+        texts = RecordingNoticeText()
+        consumer = DeliveryConsumer(
+            queue=self.queue, cards=RecordingCards(), texts=texts, queue_delay_hint_seconds=12.0
+        )
+
+        consumer.run_once()
+        consumer.run_once()
+
+        self.assertEqual(texts.calls, [])
+        self.assertEqual(len(texts.notices), 1, "同一个任务在持续排队期间只提示一次")
+        card = texts.notices[0]["card"]
+        self.assertEqual(
+            card.fallback_text, default_content_catalog().text("gateway.busy_hint_queued").text
+        )
+        self.assertEqual(texts.notices[0]["chat_id"], "chat-cnv-1")
+        self.assertEqual(self.scalar("SELECT status FROM task WHERE id='tsk-stale'"), "queued")
 
 
 class TerminalReceiptRequiredBeforeConfirmTests(DeliveryConsumerTestCase):

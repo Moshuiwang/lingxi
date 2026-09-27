@@ -934,6 +934,10 @@ class DailyReportNoticeCardTests(unittest.TestCase):
         self.addCleanup(patcher.stop)
 
     def test_without_the_card_key_the_duty_sends_the_same_text_and_no_card(self) -> None:
+        # 正式目录已登记卡片键；「未进目录」注入剔除 ``notice.*`` 的目录演练。
+        from test_notice_cards_ops import _BASE as PLAIN_CATALOG
+
+        self._patch_catalog(PLAIN_CATALOG)
         sender = NoticeCardSender()
         duty, parts = build_duty(sender=sender)
         text = duty.run_once()

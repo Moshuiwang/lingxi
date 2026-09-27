@@ -2,8 +2,8 @@
 # 由 scripts/ci/check_content_version.py 生成与校验，请不要手工编辑。
 # 改完 content.toml 的文案后：先递增 [meta] version，再运行
 #   python3 scripts/ci/check_content_version.py --refresh
-version = "2026-09-27.891-1"
-digest = "sha256:a5760e05ff8c55ce141c80821d527457903eee3a2bcedd909a4644765445c736"
+version = "2026-09-27.891-2"
+digest = "sha256:fd52f0e82dfe66fa0a6d9f80649ddfca14cd7e03c824df760a07c4b68c70d38d"
 
 # 用过的旧版本标识，不得复用：同一个版本号对应两批文案会让落库的追溯依据失效。
 retired_versions = [
@@ -45,6 +45,7 @@ retired_versions = [
   "2026-09-09.668",
   "2026-09-10.717",
   "2026-09-10.717-2",
+  "2026-09-27.891-1",
 ]
 
 # 每条用户可见文案的短摘要，用于在门禁失败时指出具体是哪几个键变了。
@@ -161,7 +162,7 @@ retired_versions = [
 "cards.notice.permission.range_updated.title" = "424248108ba3e44f"
 "cards.notice.roster.daily_report.body" = "87e6a89872dd6eca"
 "cards.notice.roster.daily_report.title" = "41d2a4fca156643a"
-"cards.notice.worker.card_handoff_notice.body" = "282d7f9e84c7513d"
+"cards.notice.worker.card_handoff_notice.body" = "f926d145f0f18496"
 "cards.notice.worker.card_handoff_notice.title" = "36f632b968b86902"
 "cards.query.empty.body" = "b3cf697a38b609f5"
 "cards.query.empty.title" = "463b2262ebe14a9f"
