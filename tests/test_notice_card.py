@@ -104,8 +104,12 @@ class NoticeCardShapeTest(unittest.TestCase):
 
     def test_sections_are_normalized_to_notice_sections(self) -> None:
         card = _card()
-        self.assertEqual(card.sections[0], NoticeSection(heading="概况", lines=("今日新开通 2 人。",)))
-        self.assertEqual(card.to_payload()["body"]["elements"][0]["content"], "**概况**\n今日新开通 2 人。")
+        self.assertEqual(
+            card.sections[0], NoticeSection(heading="概况", lines=("今日新开通 2 人。",))
+        )
+        self.assertEqual(
+            card.to_payload()["body"]["elements"][0]["content"], "**概况**\n今日新开通 2 人。"
+        )
 
     def test_empty_sections_or_lines_are_rejected(self) -> None:
         with self.assertRaises(ValueError):

@@ -43,7 +43,7 @@ ACCEPTED = {"code": 0, "data": {"message_id": "om-fake"}}
 REJECTED = {"code": 230099, "msg": "card rejected"}
 
 
-class TransportTimeout(Exception):
+class TransportTimeoutError(Exception):
     """模拟传输层超时：请求可能已被服务端收下，调用方听不到回音。"""
 
 
@@ -64,7 +64,7 @@ class FakeFeishu:
         step = script.pop(0) if len(script) > 1 else script[0]
         if step == "deliver_then_timeout":
             self.delivered_uuids.add(body["uuid"])
-            raise TransportTimeout("timeout")
+            raise TransportTimeoutError("timeout")
         if isinstance(step, BaseException):
             raise step
         if step.get("code") == 0:
@@ -116,7 +116,9 @@ class CardUuidPrefixTest(unittest.TestCase):
         self.assertEqual(len(derived), len(prefixes))
         self.assertTrue(derived.isdisjoint(prefixes))
         for prefix in derived:
-            self.assertLessEqual(len(delivery_uuid(CHAT_ID, "k", prefix=prefix)), DELIVERY_UUID_MAX_LENGTH)
+            self.assertLessEqual(
+                len(delivery_uuid(CHAT_ID, "k", prefix=prefix)), DELIVERY_UUID_MAX_LENGTH
+            )
 
 
 class GroupSendNoticeTest(unittest.TestCase):
@@ -129,7 +131,9 @@ class GroupSendNoticeTest(unittest.TestCase):
         self.assertEqual(json.loads(card_body["content"]), CARD.to_payload())
         self.assertEqual(
             card_body["uuid"],
-            delivery_uuid(CHAT_ID, "2026-09-27", prefix=card_uuid_prefix_for(DAILY_REPORT_UUID_PREFIX)),
+            delivery_uuid(
+                CHAT_ID, "2026-09-27", prefix=card_uuid_prefix_for(DAILY_REPORT_UUID_PREFIX)
+            ),
         )
         self.assertEqual(outcomes, [("message_final", True)])
 
@@ -155,7 +159,7 @@ class GroupSendNoticeTest(unittest.TestCase):
         self.assertEqual(outcomes, [("message_final", False)])
 
     def test_uncertain_card_result_never_falls_back(self) -> None:
-        for step in (TransportTimeout("t"), {}, {"code": 0, "data": {}}):
+        for step in (TransportTimeoutError("t"), {}, {"code": 0, "data": {}}):
             with self.subTest(step=step):
                 fake = FakeFeishu(card=step)
                 outcomes: list = []
@@ -168,7 +172,7 @@ class GroupSendNoticeTest(unittest.TestCase):
     def test_retry_with_same_dedupe_key_leaves_one_message(self) -> None:
         fake = FakeFeishu(card=["deliver_then_timeout", ACCEPTED])
         messages = _group(fake)
-        with self.assertRaises(TransportTimeout):
+        with self.assertRaises(TransportTimeoutError):
             messages.send_notice(chat_id=CHAT_ID, card=CARD, dedupe_key="2026-09-27")
         messages.send_notice(chat_id=CHAT_ID, card=CARD, dedupe_key="2026-09-27")
         uuids = [body["uuid"] for body in fake.sent("interactive")]
@@ -179,7 +183,9 @@ class GroupSendNoticeTest(unittest.TestCase):
 
     def test_send_text_request_shape_is_unchanged(self) -> None:
         fake = FakeFeishu()
-        _group(fake, prefix=DELIVERY_UUID_PREFIX).send_text(chat_id=CHAT_ID, text="日报", dedupe_key="d")
+        _group(fake, prefix=DELIVERY_UUID_PREFIX).send_text(
+            chat_id=CHAT_ID, text="日报", dedupe_key="d"
+        )
         [body] = fake.sent("text")
         self.assertEqual(
             body,
@@ -201,7 +207,9 @@ class UserSendNoticeTest(unittest.TestCase):
         self.assertIn("receive_id_type=open_id", fake.calls[0]["url"])
         self.assertEqual(
             card_body["uuid"],
-            delivery_uuid(OPEN_ID, "perm-change-1", prefix=card_uuid_prefix_for(NOTICE_UUID_PREFIX)),
+            delivery_uuid(
+                OPEN_ID, "perm-change-1", prefix=card_uuid_prefix_for(NOTICE_UUID_PREFIX)
+            ),
         )
 
     def test_definite_rejection_falls_back_to_text_exactly_once_with_text_prefix(self) -> None:
@@ -210,7 +218,9 @@ class UserSendNoticeTest(unittest.TestCase):
         self.assertEqual(len(fake.sent("interactive")), 1)
         [text_body] = fake.sent("text")
         self.assertEqual(json.loads(text_body["content"]), {"text": CARD.fallback_text})
-        self.assertEqual(text_body["uuid"], delivery_uuid(OPEN_ID, "perm-change-1", prefix=NOTICE_UUID_PREFIX))
+        self.assertEqual(
+            text_body["uuid"], delivery_uuid(OPEN_ID, "perm-change-1", prefix=NOTICE_UUID_PREFIX)
+        )
 
     def test_uncertain_card_result_never_falls_back(self) -> None:
         for step in (FeishuUserMessageError("transport_error"), {}, {"code": 0, "data": {}}):
@@ -224,7 +234,7 @@ class UserSendNoticeTest(unittest.TestCase):
     def test_retry_with_same_dedupe_key_leaves_one_message(self) -> None:
         fake = FakeFeishu(card=["deliver_then_timeout", ACCEPTED])
         messages = _user(fake)
-        with self.assertRaises(TransportTimeout):
+        with self.assertRaises(TransportTimeoutError):
             messages.send_notice(open_id=OPEN_ID, card=CARD, dedupe_key="perm-change-1")
         messages.send_notice(open_id=OPEN_ID, card=CARD, dedupe_key="perm-change-1")
         self.assertEqual(len({body["uuid"] for body in fake.sent("interactive")}), 1)
