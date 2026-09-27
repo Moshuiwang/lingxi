@@ -138,3 +138,78 @@ def base_env(bin_dir: Path, state_dir: Path, unit_dir: Path) -> dict[str, str]:
     env["FAKE_STATE"] = str(state_dir)
     env["FAKE_UNIT_DIR"] = str(unit_dir)
     return env
+
+
+# --- recreate-services（#896）用的 docker 桩 ---
+# 与上面的 FAKE_DOCKER 分开：recreate-services 按部署器口径以 ``env -i`` 调 docker compose，子进程拿不到
+# FAKE_STATE，所以本桩从自身同目录的 ``.fake_state`` 文件找状态目录。三容器的现场写在
+# ``<state>/world.json``：{"containers": [{"id", "name", "labels", "image", "health"}], "after_health": …}。
+# ``compose … up -d --force-recreate …`` 把每个容器换成新 id（标签与镜像不变）、健康状态改为 after_health，
+# 并把本次 argv 与完整环境追加进 ``<state>/compose_up.json``，供用例逐项断言。
+FAKE_DOCKER_RECREATE = r'''#!__PYTHON__
+import json, os, sys
+from pathlib import Path
+
+here = Path(__file__).resolve().parent
+state = Path(os.environ.get("FAKE_STATE") or (here / ".fake_state").read_text(encoding="utf-8").strip())
+args = sys.argv[1:]
+with (state / "calls.log").open("a", encoding="utf-8") as log:
+    log.write("docker " + " ".join(args) + "\n")
+world_path = state / "world.json"
+world = json.loads(world_path.read_text(encoding="utf-8"))
+
+
+def find(ref):
+    for c in world["containers"]:
+        if ref in (c["id"], c["name"]):
+            return c
+    return None
+
+
+if args[:1] == ["ps"]:
+    project = args[-1].split("com.docker.compose.project=", 1)[1]
+    for c in world["containers"]:
+        if c["labels"].get("com.docker.compose.project") == project:
+            print(c["id"])
+    sys.exit(0)
+if args[:1] == ["inspect"]:
+    fmt = args[args.index("--format") + 1] if "--format" in args else args[args.index("-f") + 1]
+    c = find(args[-1])
+    if c is None:
+        sys.exit(1)
+    if ".Config.Labels" in fmt:
+        print(json.dumps(c["labels"]))
+        print(json.dumps(c["image"]))
+    elif "Health" in fmt:
+        print(c["health"])
+    else:
+        sys.exit(64)
+    sys.exit(0)
+if args[:1] == ["compose"]:
+    if "up" not in args or "--force-recreate" not in args:
+        print("fake docker：未模拟的 compose 调用", file=sys.stderr)
+        sys.exit(64)
+    record = state / "compose_up.json"
+    calls = json.loads(record.read_text(encoding="utf-8")) if record.exists() else []
+    env = dict(os.environ)
+    env.pop("LC_CTYPE", None)  # 空环境下解释器按 PEP 538 自己补的，不是调用方传的
+    calls.append({"argv": args, "env": env})
+    record.write_text(json.dumps(calls), encoding="utf-8")
+    for c in world["containers"]:
+        c["id"] = c["id"] + "r"
+        c["health"] = world.get("after_health", "healthy")
+    world_path.write_text(json.dumps(world), encoding="utf-8")
+    sys.exit(0)
+print("fake docker：未模拟的调用 " + " ".join(args[:1]), file=sys.stderr)
+sys.exit(64)
+'''
+
+
+def install_recreate_docker(bin_dir: Path, state_dir: Path) -> Path:
+    """装 recreate-services 用的 docker 桩（``bin_dir/docker-recreate``），并登记状态目录。"""
+    import sys
+
+    bin_dir.mkdir(parents=True, exist_ok=True)
+    (bin_dir / ".fake_state").write_text(str(state_dir), encoding="utf-8")
+    body = FAKE_DOCKER_RECREATE.replace("__PYTHON__", sys.executable)
+    return write_executable(bin_dir / "docker-recreate", body)
