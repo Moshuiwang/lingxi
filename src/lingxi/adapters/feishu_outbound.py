@@ -128,7 +128,9 @@ class LarkReplies:
         if outcome.accepted:
             return
         if outcome.verdict is not DeliveryVerdict.REJECTED:
-            raise RuntimeError(f"通知卡回复结果不明：{outcome.reason} log_id={response.get_log_id()}")
+            raise RuntimeError(
+                f"通知卡回复结果不明：{outcome.reason} log_id={response.get_log_id()}"
+            )
         logger.warning("通知卡回复被飞书明确拒绝，补发一次纯文本 code=%s", response.code)
         self.send_text(
             chat_id=chat_id,

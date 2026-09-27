@@ -259,7 +259,7 @@ class FakeNoticeReplies(FakeReplies):
 
 
 class FakeUserSender:
-    """主动私聊假实现；``with_notice=False`` 模拟尚未接卡片口的旧发送口。"""
+    """主动私聊假实现；前 ``notice_failures`` 次卡片发送抛错，模拟结果不明。"""
 
     def __init__(self, *, notice_failures: int = 0) -> None:
         self.calls: list[tuple[str, dict]] = []
@@ -375,7 +375,9 @@ class NegativeWordingTests(unittest.TestCase):
         self.assertIn("共清空 3 条", _payload_text(card))
 
     def test_button_labels_on_a_notice_card_are_refused(self) -> None:
-        catalog = catalog_with_cards({"gateway.new_session": ("已开启", "可以提问")}, buttons=("好",))
+        catalog = catalog_with_cards(
+            {"gateway.new_session": ("已开启", "可以提问")}, buttons=("好",)
+        )
         content = catalog.text("gateway.new_session")
         self.assertIsNone(build_notice_card(catalog, content, {}))
 
@@ -589,7 +591,9 @@ class ProactiveNoticeTests(unittest.TestCase):
 
     def _dispatcher(self, sender, catalog):
         return PermissionNoticeDispatcher(
-            sender=sender, audit=SimpleNamespace(record=lambda *a, **k: None), sleep=lambda _: None,
+            sender=sender,
+            audit=SimpleNamespace(record=lambda *a, **k: None),
+            sleep=lambda _: None,
             catalog=catalog,
         )
 
@@ -605,7 +609,9 @@ class ProactiveNoticeTests(unittest.TestCase):
     def test_permission_notice_with_card_key_sends_one_card(self) -> None:
         sender = FakeUserSender()
         result = self._dispatcher(sender, catalog_with_cards()).notify(
-            user_id="usr_1", open_id="ou_1", permission_version=3,
+            user_id="usr_1",
+            open_id="ou_1",
+            permission_version=3,
             permissions='{"1011":["日活"]}',
         )
         self.assertTrue(result.delivered)
@@ -681,12 +687,10 @@ class LarkRepliesNoticeTests(unittest.TestCase):
                 raise outcome
             return outcome
 
-        client = SimpleNamespace(im=SimpleNamespace(v1=SimpleNamespace(message=SimpleNamespace(
-            reply=reply
-        ))))
-        card = build_notice_card(
-            catalog_with_cards(), _BASE.text("gateway.new_session"), {}
+        client = SimpleNamespace(
+            im=SimpleNamespace(v1=SimpleNamespace(message=SimpleNamespace(reply=reply)))
         )
+        card = build_notice_card(catalog_with_cards(), _BASE.text("gateway.new_session"), {})
         with unittest.mock.patch.dict(sys.modules, _fake_lark_modules()):
             try:
                 LarkReplies(client).send_notice(
