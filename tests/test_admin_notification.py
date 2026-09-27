@@ -9,8 +9,10 @@ from __future__ import annotations
 import pathlib
 import unittest
 from datetime import UTC, datetime, timedelta
+from unittest import mock
 
 import lingxi.core.admin.notification as notification_module
+from lingxi.config.content import ContentCatalog, default_content_catalog
 from lingxi.core.admin.notification import (
     DECISION_CANCEL,
     DECISION_CONFIRM,
@@ -22,6 +24,30 @@ from lingxi.core.admin.pending_action import PendingAction, PendingActionStatus,
 
 NOW = datetime(2026, 8, 24, 12, 0, 0, tzinfo=UTC)
 TARGET_OPEN_ID = "ou_target_user_masked"
+
+
+def _catalog_without_notice_cards() -> ContentCatalog:
+    """正式目录去掉全部 ``notice.*`` 卡片键：代表「卡片键撤出目录」时的原版式。"""
+    base = default_content_catalog()
+    cards = {k: v for k, v in base._cards.items() if not k.startswith("notice.")}  # noqa: SLF001
+    return ContentCatalog(version=base.version, texts=base._texts, cards=cards)  # noqa: SLF001
+
+
+#: #891 起管理卡正文随 ``notice.admin.*`` 卡片键改成「字段 + 下一步」版式、动态值转义。
+#: 本模块的断言（含「不渲染方向行」「管理群通知不含 open_id」等否定断言）钉的是原版式，
+#: 也就是撤掉卡片键后的退回路径：整模块注入不含通知卡片键的目录，断言一条不改；卡片
+#: 版式由 ``tests/test_notice_cards_admin.py`` 与下方 ``NoticeCardLayoutTests`` 钉住。
+_PLAIN_CATALOG_PATCH = mock.patch.object(
+    notification_module, "default_content_catalog", _catalog_without_notice_cards
+)
+
+
+def setUpModule() -> None:  # noqa: N802 - unittest 约定名
+    _PLAIN_CATALOG_PATCH.start()
+
+
+def tearDownModule() -> None:  # noqa: N802 - unittest 约定名
+    _PLAIN_CATALOG_PATCH.stop()
 
 
 def _pending(
@@ -471,6 +497,46 @@ class AdminSurfaceTerminologySweepTests(unittest.TestCase):
             "notification._ACTION_LABEL 为准（补充授权 / 屏蔽指标 / 撤销）：\n"
             + "\n".join(offenders),
         )
+
+
+class NoticeCardLayoutTests(unittest.TestCase):
+    """#891 正式目录（卡片键已登记）下的同一组范围 / 方向断言：值转义后仍在，
+    补充授权不渲染「撤销的是」行，确认卡不写授权有效期。"""
+
+    def setUp(self) -> None:
+        # 模块级替身只换了 ``notification`` 里的取目录函数；这里显式传正式目录。
+        self.catalog = default_content_catalog()
+        self.assertTrue(self.catalog.has_card(notification_module.CONFIRM_CARD_KEY))
+
+    def test_grant_confirm_card_keeps_scope_and_reason_escaped(self) -> None:
+        pending = _pending(
+            action_type=PendingActionType.LOCAL_PERMISSION_GRANT, payload=_GRANT_PAYLOAD
+        )
+        card = render_confirm_card(
+            pending, target_label=TARGET_OPEN_ID, content_catalog=self.catalog
+        )
+        self.assertIn("待本人确认", card.title)
+        self.assertIn("**操作范围**：公司 1011 · 指标 daily\\_active", card.body)
+        self.assertIn("**原因**：特批", card.body)
+        self.assertIn("ou\\_target\\_user\\_masked", card.body)
+        self.assertNotIn("撤销的是", card.body)
+        self.assertNotIn("授权有效期", card.body)
+
+    def test_revoke_terminal_card_keeps_scope_and_direction(self) -> None:
+        pending = _pending(
+            action_type=PendingActionType.LOCAL_PERMISSION_REVOKE,
+            status=PendingActionStatus.EXECUTED,
+            payload=_REVOKE_GRANT_PAYLOAD,
+        )
+        card = render_terminal_card(
+            pending,
+            target_label=TARGET_OPEN_ID,
+            outcome_text="已确认执行",
+            content_catalog=self.catalog,
+        )
+        self.assertIn("**操作范围**：公司 1011 · 指标 daily\\_active", card.body)
+        self.assertIn("**撤销的是**：补充授权", card.body)
+        self.assertIn("本卡已结束", card.body)
 
 
 if __name__ == "__main__":  # pragma: no cover

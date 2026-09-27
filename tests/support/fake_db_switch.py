@@ -85,6 +85,11 @@ case "$cmd" in
     fi ;;
   exec) sql="$(cat)"
     case "$sql" in
+      # verify 的四段查询：目标事实 / 差异 / 预期扩展 / ACL 原文；用例放 verify_diffs 造差异、verify_fail_expected 让中途查询失败
+      *"WITH cls AS ("*) echo '{"counts" : {"tables" : 2}, "datcollversion" : "153.1"}' ;;
+      *"WITH s AS (SELECT "*) cat "$st/verify_diffs" 2>/dev/null || true ;;
+      *"FROM jsonb_array_elements("*) [[ ! -f "$st/verify_fail_expected" ]] || { echo "fake docker：连接中断" >&2; exit 2; }; echo "" ;;
+      *"json_build_object('source', "*) echo '{"source" : [], "target" : []}' ;;
       "SELECT 1") echo 1 ;;
       *s30_probe*) echo 1 ;;
       *"max_connections="*) echo "max_connections=100 idle_in_txn=0 checksums=on" ;;

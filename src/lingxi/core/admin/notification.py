@@ -17,11 +17,18 @@ SDK，可以在没有装 SDK 的环境里测试全部渲染断言。
 from __future__ import annotations
 
 import json
+import logging
 import re
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any, Protocol
 
+from lingxi.config.content import (
+    ContentCatalog,
+    ContentError,
+    RenderedCard,
+    default_content_catalog,
+)
 from lingxi.core.admin.card_layout import button_row
 from lingxi.core.admin.pending_action import (
     LOCAL_PERMISSION_ACTION_TYPES,
@@ -30,6 +37,43 @@ from lingxi.core.admin.pending_action import (
     PendingActionStatus,
     PendingActionType,
 )
+from lingxi.core.delivery.catalog_notice import build_notice_card
+from lingxi.core.delivery.notice_card import (
+    _HEADER_TEMPLATES,
+    NoticeCard,
+    NoticeTone,
+    escape_markdown,
+)
+
+logger = logging.getLogger(__name__)
+
+#: 管理类通知的卡片键。键未进内容目录时各入口逐字沿用原渲染；进目录后标题与「下一步」
+#: 取自目录，字段区由本模块按真实状态拼出，动态值一律经 ``escape_markdown`` 转义。
+CONFIRM_CARD_KEY = "notice.admin.confirm"
+TERMINAL_CARD_KEY = "notice.admin.terminal"
+GROUP_NOTICE_CARD_KEY = "notice.admin.group_notice"
+INNERTEST_CONFIRM_CARD_KEY = "notice.admin.innertest_confirm"
+CORRECTION_SUMMARY_TEXT_KEY = "permission.management_correction_summary"
+
+
+def _dynamic_notice(
+    content_catalog: ContentCatalog | None, key: str, **values: object
+) -> RenderedCard | None:
+    """动态拼正文的管理类入口：卡片键进了目录就渲染它的标题与「下一步」，否则返回 ``None``。
+
+    这些入口没有原文本键，不走 :mod:`lingxi.core.delivery.catalog_notice` 的「文本键配卡片键」。
+    模板与变量对不上属于目录配置错误：只记一条不含正文的日志并返回 ``None``，入口退回
+    今天的纯文本 / 原卡片，不让一条管理通知因为展示问题整条丢失。
+    """
+    source = content_catalog if content_catalog is not None else default_content_catalog()
+    if not source.has_card(key):
+        return None
+    try:
+        return source.card(key, **values)
+    except ContentError as error:
+        logger.warning("通知卡片模板不可用，沿用原展示 key=%s error=%s", key, type(error).__name__)
+        return None
+
 
 #: 术语统一：「新增授权」→「补充授权」、「新增抑制」→「屏蔽指标」、逐行「收回」
 #: →「撤销」，与 ``core/admin/management_card._DIRECTION_LABEL``、
@@ -289,11 +333,16 @@ class ConfirmCardButton:
 
 @dataclass(frozen=True)
 class RenderedConfirmCard:
-    """一张确认卡片的展示内容。``buttons`` 为空元组表示终态卡片（不可再操作）。"""
+    """一张确认卡片的展示内容。``buttons`` 为空元组表示终态卡片（不可再操作）。
+
+    ``tone`` 为 ``None`` 是卡片化之前的原版式（标题加粗写在正文首行）；有值时标题
+    进卡片标题栏、按色调着色。
+    """
 
     title: str
     body: str
     buttons: tuple[ConfirmCardButton, ...]
+    tone: NoticeTone | None = None
 
     @property
     def is_terminal(self) -> bool:
@@ -310,9 +359,8 @@ def render_card_payload(card: RenderedConfirmCard) -> dict[str, Any]:
     [{"type": "callback", "value": {...}}]``，按钮不在 ``form`` 容器内不需要
     ``name`` 字段。``buttons`` 为空（终态卡片）时只有一个 markdown 元素。
     """
-    elements: list[dict[str, Any]] = [
-        {"tag": "markdown", "content": f"**{card.title}**\n\n{card.body}"}
-    ]
+    head = card.body if card.tone is not None else f"**{card.title}**\n\n{card.body}"
+    elements: list[dict[str, Any]] = [{"tag": "markdown", "content": head}]
     if card.buttons:
         buttons = [
             {
@@ -332,7 +380,17 @@ def render_card_payload(card: RenderedConfirmCard) -> dict[str, Any]:
             for button in card.buttons
         ]
         elements.append(button_row(buttons))
-    return {"schema": "2.0", "config": {"update_multi": True}, "body": {"elements": elements}}
+    payload: dict[str, Any] = {
+        "schema": "2.0",
+        "config": {"update_multi": True},
+        "body": {"elements": elements},
+    }
+    if card.tone is not None:
+        payload["header"] = {
+            "title": {"tag": "plain_text", "content": card.title},
+            "template": _HEADER_TEMPLATES[card.tone],
+        }
+    return payload
 
 
 @dataclass(frozen=True)
@@ -410,8 +468,9 @@ def render_confirm_card(
     target_label: str,
     company_label: str | None = None,
     metric_label: str | None = None,
+    content_catalog: ContentCatalog | None = None,
 ) -> RenderedConfirmCard:
-    """建卡时的初始展示：动作、目标、影响范围与有效期。
+    """建卡时的初始展示：动作、目标、影响范围与有效期（卡片键进目录时改用分区版式）。
 
     ``target_label`` 必须已是姓名+邮箱：调用方经
     ``AdminDisplayNames.user_label`` 解析 ``pending.target_open_id`` 得到——
@@ -423,6 +482,24 @@ def render_confirm_card(
     """
     action_label = _ACTION_LABEL[pending.action_type]
     ttl_minutes = PENDING_ACTION_TTL_SECONDS // 60
+    buttons = _confirm_buttons(pending.id)
+    notice = _dynamic_notice(content_catalog, CONFIRM_CARD_KEY, action=action_label)
+    if notice is not None:
+        fields = [f"**操作对象**：{escape_markdown(target_label)}"]
+        fields += _scope_field_lines(
+            pending, company_label=company_label, metric_label=metric_label, preview=False
+        )
+        fields += [
+            # 卡片版里范围写在影响之前，原句的「下方」随之改成「上述」。
+            f"**影响**：{_IMPACT_TEXT[pending.action_type].replace('下方', '上述')}",
+            f"**本次确认有效期**：发起后 {ttl_minutes} 分钟内，过期后需重新查询并发起",
+        ]
+        return RenderedConfirmCard(
+            title=notice.title,
+            body="\n".join(fields) + f"\n\n{notice.body}",
+            buttons=buttons,
+            tone=NoticeTone.ATTENTION,
+        )
     body = (
         f"动作：{action_label}用户\n"
         f"目标：{target_label}\n"
@@ -430,20 +507,74 @@ def render_confirm_card(
         f"影响：{_IMPACT_TEXT[pending.action_type]}\n"
         f"有效期：{ttl_minutes} 分钟内有效，过期后需重新查询并发起。"
     )
-    return RenderedConfirmCard(
-        title=f"待确认：{action_label}用户",
-        body=body,
-        buttons=(
-            ConfirmCardButton(
-                label="确认执行",
-                value={"pending_action_id": pending.id, "decision": DECISION_CONFIRM},
-            ),
-            ConfirmCardButton(
-                label="取消",
-                value={"pending_action_id": pending.id, "decision": DECISION_CANCEL},
-            ),
+    return RenderedConfirmCard(title=f"待确认：{action_label}用户", body=body, buttons=buttons)
+
+
+def _confirm_buttons(pending_action_id: str) -> tuple[ConfirmCardButton, ...]:
+    """确认 / 取消两个按钮；回传值只带待确认操作 ID 与决定，两种版式共用。"""
+    return (
+        ConfirmCardButton(
+            label="确认执行",
+            value={"pending_action_id": pending_action_id, "decision": DECISION_CONFIRM},
+        ),
+        ConfirmCardButton(
+            label="取消",
+            value={"pending_action_id": pending_action_id, "decision": DECISION_CANCEL},
         ),
     )
+
+
+def _scope_display(payload: Mapping[str, Any], company_label: str | None) -> str:
+    """职位范围授权的「公司范围」展示：通配写实际公司数，其余优先用人性化标签。"""
+    scope = payload.get("company_scope", "")
+    if scope == "*":
+        return f"全部（{_position_company_count(payload)} 家公司）"
+    return company_label if company_label is not None else str(scope)
+
+
+def _preview(reason: object, preview: bool) -> str:
+    """管理群广播截断原因到与管理卡一致的长度；发起人私聊卡不截断。"""
+    text = str(reason)
+    if preview and len(text) > _GROUP_REASON_PREVIEW_LENGTH:
+        return text[:_GROUP_REASON_PREVIEW_LENGTH] + "…"
+    return text
+
+
+def _scope_field_lines(
+    pending: PendingAction,
+    *,
+    company_label: str | None,
+    metric_label: str | None,
+    preview: bool,
+) -> list[str]:
+    """卡片版「操作范围 / 原因」字段行；非本地权限动作没有范围，返回空列表。
+
+    与原版 :func:`_permission_scope_block` 同一组数据与降级：payload 不可用时显式写
+    「范围信息不可用」，不静默省略。所有动态值（含管理员填写的原因）逐个转义。
+    """
+    if pending.action_type not in LOCAL_PERMISSION_ACTION_TYPES:
+        return []
+    payload = _permission_payload(pending)
+    if payload is None:
+        return ["**操作范围**：范围信息不可用，请取消本卡重新发起"]
+    esc = escape_markdown
+    if payload.get("position_name"):
+        lines = [
+            f"**操作范围**：职位 {esc(payload.get('position_name', ''))}"
+            f" · 公司范围 {esc(_scope_display(payload, company_label))}"
+        ]
+        reused = _reused_pairs_line(payload).strip()
+        if reused:
+            lines.append(f"**沿用**：{reused}")
+    else:
+        company = company_label if company_label is not None else payload.get("company_id", "")
+        metric = metric_label if metric_label is not None else payload.get("metric_name", "")
+        lines = [f"**操作范围**：公司 {esc(company)} · 指标 {esc(metric)}"]
+        direction = payload.get("direction")
+        if direction:
+            lines.append(f"**撤销的是**：{esc(_DIRECTION_LABEL.get(direction, direction))}")
+    lines.append(f"**原因**：{esc(_preview(payload.get('reason', ''), preview))}")
+    return lines
 
 
 def render_terminal_card(
@@ -453,14 +584,35 @@ def render_terminal_card(
     outcome_text: str,
     company_label: str | None = None,
     metric_label: str | None = None,
+    content_catalog: ContentCatalog | None = None,
 ) -> RenderedConfirmCard:
     """终态更新：不再带任何按钮（合同"更新为不可再次操作的最终状态"）。
 
     本地权限三类动作同样带上"范围+原因"（撤销再多一行"方向"）这一行，与
     确认卡同一姿态（见 ``render_confirm_card``；``target_label``/
-    ``company_label``/``metric_label`` 缺省时退回原始 ID）。
+    ``company_label``/``metric_label`` 缺省时退回原始 ID）。卡片键
+    :data:`TERMINAL_CARD_KEY` 进目录时改用通知卡片版式：标题直写终态，停用 / 恢复
+    写账号结果而不是「权限正在下发」。
     """
     action_label = _ACTION_LABEL[pending.action_type]
+    notice = _dynamic_notice(
+        content_catalog,
+        TERMINAL_CARD_KEY,
+        action=action_label,
+        outcome=_outcome_headline(pending),
+    )
+    if notice is not None:
+        fields = [f"**操作对象**：{escape_markdown(target_label)}"]
+        fields += _scope_field_lines(
+            pending, company_label=company_label, metric_label=metric_label, preview=False
+        )
+        fields.append(f"**结果**：{_notice_result(pending, outcome_text)}")
+        return RenderedConfirmCard(
+            title=notice.title,
+            body="\n".join(fields) + f"\n\n{notice.body}",
+            buttons=(),
+            tone=_outcome_tone(pending),
+        )
     scope_block = _permission_scope_block(
         pending, company_label=company_label, metric_label=metric_label
     )
@@ -549,3 +701,196 @@ def render_group_notice(
         pending, company_label=company_label, metric_label=metric_label
     )
     return f"管理操作：{action_label} {target_label}{scope_suffix} · {_group_outcome_text(pending)}"
+
+
+#: 账号类动作执行后的真实结果：停用 / 恢复在确认事务里就改了账号状态，不能混称
+#: 「权限正在下发」。
+_ACCOUNT_RESULT: dict[PendingActionType, str] = {
+    PendingActionType.SUSPEND_USER: "账号已停用",
+    PendingActionType.RESUME_USER: "账号已恢复",
+}
+
+
+def _outcome_headline(pending: PendingAction) -> str:
+    """卡片标题里的一句终态；「已记录」只说正在下发，不说已下发、已生效或可用。"""
+    status = pending.status
+    if status is PendingActionStatus.EXECUTED:
+        if pending.action_type in _ACCOUNT_RESULT:
+            return _ACCOUNT_RESULT[pending.action_type]
+        if pending.action_type is PendingActionType.INNERTEST_ADDITIONS:
+            return "已确认 · 资格与开通结果待逐人查询"
+        return "已记录 · 权限正在下发"
+    if status is PendingActionStatus.CANCELLED:
+        return "已取消"
+    if status is PendingActionStatus.EXPIRED:
+        return "已过期，未执行"
+    if status is PendingActionStatus.FAILED:
+        return "未执行"
+    return "状态未知"
+
+
+def _outcome_tone(pending: PendingAction) -> NoticeTone:
+    """终态色调：账号动作完成为绿，已记录待下发为蓝，取消 / 过期为橙，失败为红。"""
+    status = pending.status
+    if status is PendingActionStatus.EXECUTED:
+        return NoticeTone.DONE if pending.action_type in _ACCOUNT_RESULT else NoticeTone.PROCESSING
+    if status is PendingActionStatus.FAILED:
+        return NoticeTone.FAILURE
+    return NoticeTone.ATTENTION
+
+
+def _notice_result(pending: PendingAction, outcome_text: str) -> str:
+    """卡片「结果」字段：账号动作改写成账号结果，其余沿用调用方算好的终态文案。"""
+    if pending.status is PendingActionStatus.EXECUTED and pending.action_type in _ACCOUNT_RESULT:
+        return _ACCOUNT_RESULT[pending.action_type]
+    return outcome_text
+
+
+@dataclass(frozen=True)
+class GroupNotice:
+    """一条管理群通知：``text`` 是今天的纯文本；``card`` 为 ``None`` 表示只发文本。
+
+    有卡片时 ``text`` 就是卡片的等价纯文本，飞书明确拒绝卡片时由出口补发它。
+    """
+
+    text: str
+    card: NoticeCard | None = None
+
+
+def build_group_notice(
+    pending: PendingAction,
+    *,
+    target_label: str,
+    company_label: str | None = None,
+    metric_label: str | None = None,
+    content_catalog: ContentCatalog | None = None,
+) -> GroupNotice:
+    """管理群终态广播：卡片键 :data:`GROUP_NOTICE_CARD_KEY` 未进目录时只有原文本。
+
+    卡片没有按钮、链接或回调；对象、范围与管理员填写的原因逐个转义，原因沿用群
+    广播的截断长度；``FAILED`` 分支沿用 :func:`_group_outcome_text` 的形状白名单。
+    """
+    text = render_group_notice(
+        pending, target_label=target_label, company_label=company_label, metric_label=metric_label
+    )
+    return group_notice(
+        pending,
+        text=text,
+        target_label=target_label,
+        company_label=company_label,
+        metric_label=metric_label,
+        content_catalog=content_catalog,
+    )
+
+
+def group_notice(
+    pending: PendingAction,
+    *,
+    text: str,
+    target_label: str,
+    company_label: str | None = None,
+    metric_label: str | None = None,
+    content_catalog: ContentCatalog | None = None,
+) -> GroupNotice:
+    """给已渲染好的群广播纯文本 ``text`` 配上卡片（卡片键进目录时）。
+
+    先查目录再读 ``pending``：卡片键未进目录时原样返回纯文本，不触碰其余字段。
+    """
+    source = content_catalog if content_catalog is not None else default_content_catalog()
+    if not source.has_card(GROUP_NOTICE_CARD_KEY):
+        return GroupNotice(text=text)
+    notice = _dynamic_notice(
+        source,
+        GROUP_NOTICE_CARD_KEY,
+        action=_ACTION_LABEL[pending.action_type],
+        outcome=_outcome_headline(pending),
+    )
+    if notice is None:
+        return GroupNotice(text=text)
+    fields = [f"**对象**：{escape_markdown(target_label)}"]
+    fields += _scope_field_lines(
+        pending, company_label=company_label, metric_label=metric_label, preview=True
+    )
+    result = _notice_result(pending, _group_outcome_text(pending))
+    sections = [(None, tuple(fields)), ("结果", (result,)), ("下一步", (notice.body,))]
+    return GroupNotice(
+        text=text, card=_notice_card_or_none(notice.title, _outcome_tone(pending), sections, text)
+    )
+
+
+def _notice_card_or_none(
+    title: str, tone: NoticeTone, sections: Sequence[tuple[str | None, tuple[str, ...]]], text: str
+) -> NoticeCard | None:
+    """构造通知卡；本地校验不通过（例如转义后仍像链接）时退回纯文本，不丢这条通知。"""
+    try:
+        return NoticeCard(title=title, tone=tone, sections=tuple(sections), fallback_text=text)
+    except ValueError as error:
+        logger.warning("通知卡片构造未通过校验，改发纯文本 error=%s", error)
+        return None
+
+
+def deliver_group_notice(
+    notifier: Any, *, chat_id: str, notice: GroupNotice, dedupe_key: str
+) -> None:
+    """有卡片且出口支持 ``send_notice`` 就发卡片，否则按今天的方式发纯文本。
+
+    去重键两条路径相同；卡片的「明确拒绝才回落一次、结果不明上抛不补发」由出口的
+    ``send_notice`` 负责。只会记日志的出口（未配置管理群）没有 ``send_notice``，照发文本。
+    """
+    send_notice = getattr(notifier, "send_notice", None)
+    if notice.card is not None and callable(send_notice):
+        send_notice(chat_id=chat_id, card=notice.card, dedupe_key=dedupe_key)
+        return
+    notifier.send_text(chat_id=chat_id, text=notice.text, dedupe_key=dedupe_key)
+
+
+def correction_summary_notice(
+    *, count: int, content_catalog: ContentCatalog | None = None
+) -> GroupNotice:
+    """每日权限补齐汇总（管理群）：有原文本键，按用户侧同一套「文本键配卡片键」规则配卡。
+
+    卡片键未进目录、或该文本键未登记色调时只有原文本；等价纯文本就是原文本。
+    """
+    source = content_catalog if content_catalog is not None else default_content_catalog()
+    content = source.text(CORRECTION_SUMMARY_TEXT_KEY, count=count)
+    return GroupNotice(text=content.text, card=build_notice_card(source, content, {"count": count}))
+
+
+def render_innertest_confirm_card(
+    pending_action_id: str,
+    people: Sequence[tuple[str, str | None]],
+    *,
+    content_catalog: ContentCatalog | None = None,
+) -> RenderedConfirmCard:
+    """内测入组确认卡（发给发起人本人）：``people`` 是本批待加入的（邮箱, 人员编号）。
+
+    卡片键 :data:`INNERTEST_CONFIRM_CARD_KEY` 未进目录时正文逐字沿用原版；进目录后
+    分区展示，并写明入组不授业务权限、开通结果逐人查询，不把入组写成已开通。
+    """
+    buttons = _confirm_buttons(pending_action_id)
+    unresolved = any(personnel is None for _, personnel in people)
+    notice = _dynamic_notice(content_catalog, INNERTEST_CONFIRM_CARD_KEY)
+    if notice is None:
+        body = f"加入内测资格，不授业务权限；资格与开通结果逐人查询。\n本批 {len(people)} 项：\n"
+        body += "\n".join(
+            f"{email}（{personnel or '待执行阶段解析'}）" for email, personnel in people
+        )
+        if unresolved:
+            body += "\n待解析项仅在执行时确认唯一在职身份后加入资格；未知或冲突不加入。"
+        body += "\n请本人在10分钟内确认；取消不新增资格。"
+        return RenderedConfirmCard(title="确认加入内测资格", body=body, buttons=buttons)
+    lines = ["**影响**：只加入内测资格，不授业务权限；资格与开通结果需逐人查询"]
+    lines.append(f"**本批**：{len(people)} 项")
+    lines += [
+        f"- {escape_markdown(email)}（{escape_markdown(personnel or '待执行阶段解析')}）"
+        for email, personnel in people
+    ]
+    if unresolved:
+        lines.append("待解析项仅在执行时确认唯一在职身份后加入资格；未知或冲突不加入")
+    lines.append(f"**本次确认有效期**：发起后 {PENDING_ACTION_TTL_SECONDS // 60} 分钟内")
+    return RenderedConfirmCard(
+        title=notice.title,
+        body="\n".join(lines) + f"\n\n{notice.body}",
+        buttons=buttons,
+        tone=NoticeTone.ATTENTION,
+    )

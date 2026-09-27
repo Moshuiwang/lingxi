@@ -63,6 +63,17 @@ scheduler/gateway/worker-queue **自己的进程里**——它们能发现"数�
 其中之一，它是宿主基础设施层，本来就要在"容器化的结构化输出到 stdout 会被谁
 收集"这条链路之外独立留痕，因此刻意写本地文件。
 
+# 通知形态：卡片，明确拒绝时回落纯文本一次（#891）
+
+告警 / 恢复都以只读通知卡发出（「状态 → 字段 → 下一步」，故障红色、恢复青绿色，
+无按钮、链接、回调）。卡片 JSON 由本文件内置的标准库构造拼出，与仓库共用类型
+`lingxi.core.delivery.notice_card.NoticeCard` 的输出逐键一致（对照用例
+`tests/test_notice_cards_host.py`）；主机名、容器名、错误原文等自由文本进卡片前转义。
+每张卡带一段等价纯文本，即改造前逐字相同的那段文本。业务码为 0 才算送达；只有飞书
+**明确拒绝**卡片（业务码为非零整数或纯数字字符串）时才在同一轮补发一次纯文本；传输
+异常、超时、响应不可解析、缺码或码值畸形（null、列表、非数字字符串等）属结果不明，
+不补发，按「发送失败不落盘、下一轮重试」处理。请求里没有去重 `uuid`，本次不新增。
+
 # 单实例纪律
 
 同一时刻只允许一个实例真正执行检查（`fcntl.flock` 独占锁，`--lock-file`）：
@@ -227,6 +238,85 @@ class HostMonitorError(RuntimeError):
     """
 
 
+class FeishuRejectedError(HostMonitorError):
+    """飞书对消息请求返回了非零业务码：明确拒绝，不是结果不明。"""
+
+
+# ---------------------------------------------------------------------------
+# 通知卡的标准库构造（#891）：与 `lingxi.core.delivery.notice_card` 同形。本脚本不导入
+# 仓库包，对照用例钉住两边输出一致。只产出标题栏、markdown 与分隔线三种元素。
+# ---------------------------------------------------------------------------
+
+#: 色调（中文值）到标题栏颜色的映射，与共用类型 `NoticeTone` 一一对应。
+NOTICE_HEADER_TEMPLATES: Mapping[str, str] = {
+    "处理中": "blue",
+    "完成": "green",
+    "需注意": "orange",
+    "故障": "red",
+    "恢复": "turquoise",
+}
+_MARKDOWN_SPECIALS = frozenset("\\`*_~[]()#+-!|>{}")
+_HTML_ENTITIES = {"&": "&amp;", "<": "&lt;", ">": "&gt;"}
+
+NoticeSections = tuple[tuple[str | None, tuple[str, ...]], ...]
+
+
+def escape_markdown(value: object) -> str:
+    """自由文本转义：markdown 标点加反斜杠，``& < >`` 转实体，``://`` 插零宽空格断链。"""
+    pieces = []
+    for character in str(value):
+        if character in _HTML_ENTITIES:
+            pieces.append(_HTML_ENTITIES[character])
+        elif character in _MARKDOWN_SPECIALS:
+            pieces.append("\\" + character)
+        else:
+            pieces.append(character)
+    return "".join(pieces).replace("://", ":​//")
+
+
+def notice_card_payload(title: str, tone: str, sections: NoticeSections) -> dict[str, object]:
+    """拼飞书 schema 2.0 通知卡：分段之间一条分隔线，有小标题时加粗置于首行。"""
+    elements: list[dict[str, str]] = []
+    for index, (heading, lines) in enumerate(sections):
+        if index:
+            elements.append({"tag": "hr"})
+        body = "\n".join(lines)
+        if heading is not None:
+            body = f"**{heading}**\n{body}"
+        elements.append({"tag": "markdown", "content": body})
+    return {
+        "schema": "2.0",
+        "header": {
+            "title": {"tag": "plain_text", "content": title},
+            "template": NOTICE_HEADER_TEMPLATES[tone],
+        },
+        "body": {"elements": elements},
+    }
+
+
+@dataclass(frozen=True)
+class NoticeSpec:
+    """一张通知卡的全部输入与它的等价纯文本；``text`` 就是改造前逐字相同的正文。"""
+
+    title: str
+    tone: str
+    sections: NoticeSections
+    text: str
+
+    def payload(self) -> dict[str, object]:
+        """序列化成卡片 JSON。"""
+        return notice_card_payload(self.title, self.tone, self.sections)
+
+
+def _field_line(name: str, value: object) -> str:
+    return f"**{name}**：{escape_markdown(value)}"
+
+
+#: 两类通知共用的「下一步」：故障只提示去查，恢复无需处理；都不承诺自动动作。
+_NEXT_STEP_ALERT = "请登录该主机按上面的判据排查；本通知不会自动重启、修复或重发。"
+_NEXT_STEP_RECOVERY = "无需处理；本通知不会自动执行任何操作。"
+
+
 # ---------------------------------------------------------------------------
 # 纯逻辑：状态判定与去重状态机
 #
@@ -347,6 +437,40 @@ def render_message(action: str, classification: Classification, *, host: str, no
     raise ValueError("仅 alert / recovery 两种动作需要渲染文本")
 
 
+def render_notice(
+    action: str, classification: Classification, *, host: str, now: str
+) -> NoticeSpec:
+    """#27 容器告警 / 恢复卡；等价纯文本即 `render_message` 的输出。"""
+    text = render_message(action, classification, host=host, now=now)
+    fields = (
+        _field_line("容器", classification.name),
+        _field_line("主机", host),
+        _field_line("时间", now),
+    )
+    if action == ACTION_ALERT:
+        label = _REASON_LABEL.get(classification.reason, classification.reason)
+        return NoticeSpec(
+            title=f"宿主监控告警：{label}",
+            tone="故障",
+            sections=(
+                (None, (f"容器状态异常：{escape_markdown(label)}",)),
+                (None, fields),
+                ("下一步", (_NEXT_STEP_ALERT,)),
+            ),
+            text=text,
+        )
+    return NoticeSpec(
+        title="宿主监控恢复：容器已恢复正常",
+        tone="恢复",
+        sections=(
+            (None, ("容器已恢复正常。",)),
+            (None, fields),
+            ("下一步", (_NEXT_STEP_RECOVERY,)),
+        ),
+        text=text,
+    )
+
+
 # ---------------------------------------------------------------------------
 # 可选阈值检查的纯逻辑（S-RC20-410，Issue #410）：磁盘用量、系统负载、采样文件
 # 停更。与上面的容器判据共用 ACTION_* 常量，但去重状态的形状不同，见模块文档
@@ -410,6 +534,37 @@ def render_threshold_message(
     if action == ACTION_RECOVERY:
         return f"[BI Plus {category}] 恢复\n{label}：已恢复正常\n主机：{host}\n时间：{now}"
     raise ValueError("仅 alert / recovery 两种动作需要渲染文本")
+
+
+def render_threshold_notice(
+    action: str, *, label: str, detail: str, host: str, now: str, category: str = "资源监控"
+) -> NoticeSpec:
+    """#28 阈值告警 / 恢复卡；等价纯文本即 `render_threshold_message` 的输出。"""
+    text = render_threshold_message(
+        action, label=label, detail=detail, host=host, now=now, category=category
+    )
+    fields = (_field_line("主机", host), _field_line("时间", now))
+    if action == ACTION_ALERT:
+        return NoticeSpec(
+            title=f"{category}告警：{label}",
+            tone="故障",
+            sections=(
+                (None, (f"{escape_markdown(label)}：{escape_markdown(detail)}",)),
+                (None, fields),
+                ("下一步", (_NEXT_STEP_ALERT,)),
+            ),
+            text=text,
+        )
+    return NoticeSpec(
+        title=f"{category}恢复：{label}",
+        tone="恢复",
+        sections=(
+            (None, (f"{escape_markdown(label)}：已恢复正常。",)),
+            (None, fields),
+            ("下一步", (_NEXT_STEP_RECOVERY,)),
+        ),
+        text=text,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1194,11 +1349,72 @@ def feishu_send_text(
     token = _feishu_tenant_access_token(
         base_url, app_id, app_secret, timeout_seconds=timeout_seconds
     )
+    _feishu_post_message(
+        base_url,
+        token,
+        chat_id=chat_id,
+        msg_type="text",
+        content={"text": text},
+        timeout_seconds=timeout_seconds,
+    )
+
+
+def feishu_send_notice(
+    *,
+    base_url: str,
+    chat_id: str,
+    app_id: str,
+    app_secret: str,
+    text: str,
+    card: Mapping[str, object],
+    timeout_seconds: float = DEFAULT_TIMEOUT_SECONDS,
+) -> None:
+    """先发通知卡；飞书明确拒绝（非零业务码）时同一令牌补发一次等价纯文本 `text`。
+
+    结果不明（传输异常、超时、响应不可解析）原样上抛、不补发——调用方据此不落盘，下一轮
+    重试（见模块文档「通知形态」）。补发也失败同样上抛，不再有第三次。
+    """
+
+    token = _feishu_tenant_access_token(
+        base_url, app_id, app_secret, timeout_seconds=timeout_seconds
+    )
+    try:
+        _feishu_post_message(
+            base_url,
+            token,
+            chat_id=chat_id,
+            msg_type="interactive",
+            content=card,
+            timeout_seconds=timeout_seconds,
+        )
+    except FeishuRejectedError:
+        _feishu_post_message(
+            base_url,
+            token,
+            chat_id=chat_id,
+            msg_type="text",
+            content={"text": text},
+            timeout_seconds=timeout_seconds,
+        )
+
+
+def _feishu_post_message(
+    base_url: str,
+    token: str,
+    *,
+    chat_id: str,
+    msg_type: str,
+    content: Mapping[str, object],
+    timeout_seconds: float,
+) -> None:
+    """向群发一条指定类型的消息；业务码为 0 才算成功，整数非零码抛 `FeishuRejectedError`，
+    缺码 / 畸形码及其余失败为结果不明（`HostMonitorError`）。"""
+
     body = json.dumps(
         {
             "receive_id": chat_id,
-            "msg_type": "text",
-            "content": json.dumps({"text": text}, ensure_ascii=False),
+            "msg_type": msg_type,
+            "content": json.dumps(content, ensure_ascii=False),
         },
         ensure_ascii=False,
     ).encode("utf-8")
@@ -1218,9 +1434,25 @@ def feishu_send_text(
         raise HostMonitorError(f"feishu_send_transport_error:{type(error).__name__}") from error
     if not isinstance(payload, Mapping):
         raise HostMonitorError("feishu_send_invalid_response_shape")
-    code = payload.get("code")
-    if code not in (None, 0, "0"):
-        raise HostMonitorError(f"feishu_send_error_code_{code}")
+    code = _business_code(payload.get("code"))
+    if code is None:
+        # 缺码、null 或非数字码：响应不合预期，既不能算成功也不能算拒绝（外审 C1/C2）。
+        raise HostMonitorError("feishu_send_invalid_response_code")
+    if code != 0:
+        raise FeishuRejectedError(f"feishu_send_error_code_{code}")
+
+
+def _business_code(value: object) -> int | None:
+    """飞书业务码只认整数或纯数字字符串；其余（缺失、null、布尔、列表、字典、
+    非数字字符串）返回 ``None``，由调用方判结果不明。"""
+
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value
+    if isinstance(value, str) and value.isascii() and value.isdigit():
+        return int(value)
+    return None
 
 
 @contextlib.contextmanager
@@ -1456,7 +1688,7 @@ def run(argv: Sequence[str] | None = None) -> int:
             if action == ACTION_NONE:
                 continue
 
-            text = render_message(action, classification, host=host, now=_now_iso())
+            notice = render_notice(action, classification, host=host, now=_now_iso())
 
             if args.dry_run:
                 logger.info(
@@ -1468,12 +1700,13 @@ def run(argv: Sequence[str] | None = None) -> int:
                 continue
 
             try:
-                feishu_send_text(
+                feishu_send_notice(
                     base_url=args.base_url,
                     chat_id=credentials["chat_id"],
                     app_id=credentials["app_id"],
                     app_secret=credentials["app_secret"],
-                    text=text,
+                    text=notice.text,
+                    card=notice.payload(),
                     timeout_seconds=args.timeout_seconds,
                 )
             except Exception as error:  # noqa: BLE001 - 发送路径任何异常都不能
@@ -1636,7 +1869,7 @@ def _run_threshold_checks(
                 threshold_changed = True
             continue
 
-        text = render_threshold_message(
+        notice = render_threshold_notice(
             action,
             label=label,
             detail=detail,
@@ -1650,12 +1883,13 @@ def _run_threshold_checks(
             continue
 
         try:
-            feishu_send_text(
+            feishu_send_notice(
                 base_url=args.base_url,
                 chat_id=credentials["chat_id"],
                 app_id=credentials["app_id"],
                 app_secret=credentials["app_secret"],
-                text=text,
+                text=notice.text,
+                card=notice.payload(),
                 timeout_seconds=args.timeout_seconds,
             )
         except Exception as error:  # noqa: BLE001 - 与容器告警发送路径同一条纪律

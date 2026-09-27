@@ -274,6 +274,10 @@ SendOutcomeCallback = Callable[[str, bool], None]
 # 会触发这条提示，届时距真实自动关闭仍有≥48 秒余量。
 CARD_AUTO_CLOSE_HANDOFF_SECONDS = 540.0
 
+# 改用文字消息前最后一帧的卡片键：命名沿用「notice.<原文本键>」，登记
+# 与否由内容目录决定，见 ``CardStream._status_card_handoff_notice``。
+HANDOFF_NOTICE_CARD_KEY = "notice.worker.card_handoff_notice"
+
 
 class CardRateLimiter:
     """一个 worker 进程共享：单话题 500ms、全进程 50 次/秒。"""
@@ -831,8 +835,13 @@ class CardStream:
         """G-CARD 10 分钟自动关闭提前收口的固定文案。
 
         复用 ``query.status`` 卡片形状，不是常规的"{action} · {elapsed_seconds}
-        秒"状态句，直接展示一句完整、不含占位符的说明。
+        秒"状态句，直接展示一句完整、不含占位符的说明。这一帧之后卡片不再更新，
+        内容目录登记了 :data:`HANDOFF_NOTICE_CARD_KEY` 时改用它自己的标题，
+        不让一张不再更新的卡片停在「正在查询」；未登记时与既有形状逐字相同。
+        仍是同一个 markdown 元素，不加标题栏、不多一次更新调用。
         """
+        if self._catalog.has_card(HANDOFF_NOTICE_CARD_KEY):
+            return self._catalog.card(HANDOFF_NOTICE_CARD_KEY)
         return self._catalog.card(
             "query.status", status=self._catalog.text("worker.card_handoff_notice").text
         )

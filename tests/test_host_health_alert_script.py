@@ -480,7 +480,7 @@ class RunIntegrationTests(unittest.TestCase):
 
         with mock.patch.object(
             host_health_alert,
-            "feishu_send_text",
+            "feishu_send_notice",
             side_effect=host_health_alert.HostMonitorError("simulated_send_failure"),
         ) as sender:
             exit_code = self._run()
@@ -489,7 +489,7 @@ class RunIntegrationTests(unittest.TestCase):
         # 发送失败：状态文件不应该被创建/更新——下一轮必须能重新判定为"首次触发"。
         self.assertEqual(host_health_alert.load_state(self.state_path), {})
 
-        with mock.patch.object(host_health_alert, "feishu_send_text") as sender:
+        with mock.patch.object(host_health_alert, "feishu_send_notice") as sender:
             exit_code = self._run()
         self.assertEqual(exit_code, 0)
         self.assertEqual(sender.call_count, 1)
@@ -507,7 +507,7 @@ class RunIntegrationTests(unittest.TestCase):
 
         with mock.patch.object(
             host_health_alert,
-            "feishu_send_text",
+            "feishu_send_notice",
             side_effect=ValueError("simulated_unexpected_error"),
         ) as sender:
             exit_code = self._run()
@@ -516,7 +516,7 @@ class RunIntegrationTests(unittest.TestCase):
         # 状态未落盘：下一轮仍会重新判定为"首次触发"并重试发送。
         self.assertEqual(host_health_alert.load_state(self.state_path), {})
 
-        with mock.patch.object(host_health_alert, "feishu_send_text") as sender:
+        with mock.patch.object(host_health_alert, "feishu_send_notice") as sender:
             exit_code = self._run()
         self.assertEqual(exit_code, 0)
         self.assertEqual(sender.call_count, 1)
@@ -525,18 +525,18 @@ class RunIntegrationTests(unittest.TestCase):
 
     def test_successful_alert_then_dedupe_then_recovery_round_trip(self) -> None:
         self._set_container_state(running=True, health_status="unhealthy")
-        with mock.patch.object(host_health_alert, "feishu_send_text") as sender:
+        with mock.patch.object(host_health_alert, "feishu_send_notice") as sender:
             self._run()
         self.assertEqual(sender.call_count, 1)
 
         # 原因不变：同一事件不应该再发一次。
-        with mock.patch.object(host_health_alert, "feishu_send_text") as sender:
+        with mock.patch.object(host_health_alert, "feishu_send_notice") as sender:
             self._run()
         self.assertEqual(sender.call_count, 0)
 
         # 恢复健康：应该发一条恢复通知，并清空记忆状态。
         self._set_container_state(running=True, health_status="healthy")
-        with mock.patch.object(host_health_alert, "feishu_send_text") as sender:
+        with mock.patch.object(host_health_alert, "feishu_send_notice") as sender:
             self._run()
         self.assertEqual(sender.call_count, 1)
         state = host_health_alert.load_state(self.state_path)
@@ -544,7 +544,7 @@ class RunIntegrationTests(unittest.TestCase):
 
     def test_dry_run_never_calls_sender_or_persists_state(self) -> None:
         self._set_container_state(running=False, health_status=None)
-        with mock.patch.object(host_health_alert, "feishu_send_text") as sender:
+        with mock.patch.object(host_health_alert, "feishu_send_notice") as sender:
             exit_code = self._run(["--dry-run"])
         self.assertEqual(exit_code, 0)
         sender.assert_not_called()
@@ -786,7 +786,7 @@ class RunThresholdIntegrationTests(unittest.TestCase):
             str(self.docker_bin),
             "--disable-release-pull-check",
         ]
-        with mock.patch.object(host_health_alert, "feishu_send_text") as sender:
+        with mock.patch.object(host_health_alert, "feishu_send_notice") as sender:
             exit_code = host_health_alert.run(argv)
         self.assertEqual(exit_code, 0)
         sender.assert_not_called()
@@ -796,7 +796,7 @@ class RunThresholdIntegrationTests(unittest.TestCase):
         with (
             mock.patch.object(host_health_alert, "read_disk_usage_percent", return_value=90.0),
             mock.patch.object(host_health_alert, "read_load_per_cpu", return_value=(0.1, 4)),
-            mock.patch.object(host_health_alert, "feishu_send_text") as sender,
+            mock.patch.object(host_health_alert, "feishu_send_notice") as sender,
         ):
             self._run()
         self.assertEqual(sender.call_count, 1)
@@ -808,7 +808,7 @@ class RunThresholdIntegrationTests(unittest.TestCase):
         with (
             mock.patch.object(host_health_alert, "read_disk_usage_percent", return_value=91.0),
             mock.patch.object(host_health_alert, "read_load_per_cpu", return_value=(0.1, 4)),
-            mock.patch.object(host_health_alert, "feishu_send_text") as sender,
+            mock.patch.object(host_health_alert, "feishu_send_notice") as sender,
         ):
             self._run()
         self.assertEqual(sender.call_count, 0)
@@ -817,7 +817,7 @@ class RunThresholdIntegrationTests(unittest.TestCase):
         with (
             mock.patch.object(host_health_alert, "read_disk_usage_percent", return_value=10.0),
             mock.patch.object(host_health_alert, "read_load_per_cpu", return_value=(0.1, 4)),
-            mock.patch.object(host_health_alert, "feishu_send_text") as sender,
+            mock.patch.object(host_health_alert, "feishu_send_notice") as sender,
         ):
             self._run()
         self.assertEqual(sender.call_count, 1)
@@ -828,7 +828,7 @@ class RunThresholdIntegrationTests(unittest.TestCase):
         with (
             mock.patch.object(host_health_alert, "read_disk_usage_percent", return_value=1.0),
             mock.patch.object(host_health_alert, "read_load_per_cpu", return_value=(20.0, 4)),
-            mock.patch.object(host_health_alert, "feishu_send_text") as sender,
+            mock.patch.object(host_health_alert, "feishu_send_notice") as sender,
         ):
             self._run()
         self.assertEqual(sender.call_count, 0)
@@ -836,7 +836,7 @@ class RunThresholdIntegrationTests(unittest.TestCase):
         with (
             mock.patch.object(host_health_alert, "read_disk_usage_percent", return_value=1.0),
             mock.patch.object(host_health_alert, "read_load_per_cpu", return_value=(20.0, 4)),
-            mock.patch.object(host_health_alert, "feishu_send_text") as sender,
+            mock.patch.object(host_health_alert, "feishu_send_notice") as sender,
         ):
             self._run()
         self.assertEqual(sender.call_count, 1)
@@ -848,7 +848,7 @@ class RunThresholdIntegrationTests(unittest.TestCase):
         with (
             mock.patch.object(host_health_alert, "read_disk_usage_percent", return_value=1.0),
             mock.patch.object(host_health_alert, "read_load_per_cpu", return_value=(0.1, 4)),
-            mock.patch.object(host_health_alert, "feishu_send_text") as sender,
+            mock.patch.object(host_health_alert, "feishu_send_notice") as sender,
         ):
             self._run()
         sent_labels = {
@@ -863,7 +863,7 @@ class RunThresholdIntegrationTests(unittest.TestCase):
             mock.patch.object(host_health_alert, "read_load_per_cpu", return_value=(0.1, 4)),
             mock.patch.object(
                 host_health_alert,
-                "feishu_send_text",
+                "feishu_send_notice",
                 side_effect=host_health_alert.HostMonitorError("simulated_send_failure"),
             ),
         ):
@@ -874,7 +874,7 @@ class RunThresholdIntegrationTests(unittest.TestCase):
         with (
             mock.patch.object(host_health_alert, "read_disk_usage_percent", return_value=90.0),
             mock.patch.object(host_health_alert, "read_load_per_cpu", return_value=(0.1, 4)),
-            mock.patch.object(host_health_alert, "feishu_send_text") as sender,
+            mock.patch.object(host_health_alert, "feishu_send_notice") as sender,
         ):
             self._run()
         # 上一轮发送失败但连续计数已经达标（consecutive_required=1），这一轮应
@@ -888,7 +888,7 @@ class RunThresholdIntegrationTests(unittest.TestCase):
         with (
             mock.patch.object(host_health_alert, "read_disk_usage_percent", return_value=90.0),
             mock.patch.object(host_health_alert, "read_load_per_cpu", return_value=(0.1, 4)),
-            mock.patch.object(host_health_alert, "feishu_send_text") as sender,
+            mock.patch.object(host_health_alert, "feishu_send_notice") as sender,
         ):
             self._run(["--dry-run"])
         sender.assert_not_called()
@@ -1172,7 +1172,7 @@ class RunReleasePullIntegrationTests(unittest.TestCase):
         return host_health_alert.run(argv)
 
     def _round(self, extra_argv: list[str] | None = None) -> list[str]:
-        with mock.patch.object(host_health_alert, "feishu_send_text") as sender:
+        with mock.patch.object(host_health_alert, "feishu_send_notice") as sender:
             exit_code = self._run(extra_argv)
         self.assertEqual(exit_code, 0)
         return [call.kwargs["text"] for call in sender.call_args_list]
@@ -1281,7 +1281,7 @@ class RunReleasePullIntegrationTests(unittest.TestCase):
 
     def test_missing_systemctl_binary_alerts_unknown_without_exit_code_two(self) -> None:
         self._set_timer(active_state="inactive")
-        with mock.patch.object(host_health_alert, "feishu_send_text") as sender:
+        with mock.patch.object(host_health_alert, "feishu_send_notice") as sender:
             exit_code = self._run(["--systemctl-bin", str(self.tmp_path / "no-such-systemctl")])
         self.assertEqual(exit_code, 0)
         self.assertEqual(sender.call_count, 1)
@@ -1699,7 +1699,7 @@ class RunLocalDbIntegrationTests(unittest.TestCase):
         argv = self._argv(with_db=with_db)
         if extra_argv:
             argv.extend(extra_argv)
-        with mock.patch.object(host_health_alert, "feishu_send_text") as sender:
+        with mock.patch.object(host_health_alert, "feishu_send_notice") as sender:
             exit_code = host_health_alert.run(argv)
         self.assertEqual(exit_code, 0)
         return [call.kwargs["text"] for call in sender.call_args_list]
@@ -2079,6 +2079,138 @@ class RunLocalDbIntegrationTests(unittest.TestCase):
             for needle in forbidden:
                 with self.subTest(needle=needle, text=text):
                     self.assertNotIn(needle, text)
+
+
+class _FakeFeishu:
+    """按顺序回放飞书响应的 ``urlopen`` 替身；记录每次请求体，不连网。
+
+    每个元素是一个响应字典（按 JSON 返回）或一个异常实例（原样抛出，模拟结果不明）。
+    """
+
+    def __init__(self, *responses: object) -> None:
+        self._responses = list(responses)
+        self.bodies: list[dict] = []
+
+    def __call__(self, request, timeout=None):  # noqa: ARG002 - 与 urlopen 同签名
+        self.bodies.append(json.loads(request.data.decode("utf-8")))
+        response = self._responses.pop(0)
+        if isinstance(response, BaseException):
+            raise response
+        payload = json.dumps(response).encode("utf-8")
+
+        class _Response:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                return False
+
+            def read(self):
+                return payload
+
+        return _Response()
+
+    def message_types(self) -> list[str]:
+        return [body["msg_type"] for body in self.bodies if "msg_type" in body]
+
+
+_TOKEN_OK = {"code": 0, "tenant_access_token": "t"}
+_SEND_OK = {"code": 0, "data": {"message_id": "om_1"}}
+_CARD_REJECTED = {"code": 230099, "msg": "card rejected"}
+_MALFORMED_CODE_RESPONSES = (
+    {},
+    {"code": None},
+    {"code": []},
+    {"code": {}},
+    {"code": "unexpected"},
+    {"code": True},
+)
+
+
+class NoticeSendSemanticsTests(unittest.TestCase):
+    """#891 K-5：先发卡片；只在飞书明确拒绝时补发一次纯文本；结果不明不补发；
+    发送成功才落状态。经真实 ``feishu_send_notice`` 走到 ``urlopen`` 替身。
+    借用 `RunIntegrationTests` 的夹具（不继承，免得把那边的用例再跑一遍）。"""
+
+    setUp = RunIntegrationTests.setUp
+    _set_container_state = RunIntegrationTests._set_container_state
+    _run = RunIntegrationTests._run
+
+    def _run_with(self, fake: _FakeFeishu) -> int:
+        self._set_container_state(running=True, health_status="unhealthy")
+        with mock.patch.object(host_health_alert.urllib.request, "urlopen", fake):
+            return self._run()
+
+    def test_card_accepted_sends_one_card_and_persists(self) -> None:
+        fake = _FakeFeishu(_TOKEN_OK, _SEND_OK)
+        self.assertEqual(self._run_with(fake), 0)
+        self.assertEqual(fake.message_types(), ["interactive"])
+        card = json.loads(fake.bodies[1]["content"])
+        self.assertEqual(card["header"]["template"], "red")
+        self.assertNotIn("uuid", fake.bodies[1])
+        self.assertTrue(host_health_alert.load_state(self.state_path)["target-container"].alerting)
+
+    def test_definite_rejection_falls_back_to_text_once_then_persists(self) -> None:
+        fake = _FakeFeishu(_TOKEN_OK, _CARD_REJECTED, _SEND_OK)
+        self.assertEqual(self._run_with(fake), 0)
+        self.assertEqual(fake.message_types(), ["interactive", "text"])
+        text = json.loads(fake.bodies[2]["content"])["text"]
+        self.assertTrue(text.startswith("[BI Plus 宿主监控] 告警"))
+        self.assertTrue(host_health_alert.load_state(self.state_path)["target-container"].alerting)
+
+    def test_fallback_also_rejected_does_not_persist_and_sends_only_once(self) -> None:
+        fake = _FakeFeishu(_TOKEN_OK, _CARD_REJECTED, _CARD_REJECTED)
+        self.assertEqual(self._run_with(fake), 0)
+        self.assertEqual(fake.message_types(), ["interactive", "text"])
+        self.assertEqual(host_health_alert.load_state(self.state_path), {})
+
+    def test_unknown_outcome_does_not_fall_back_or_persist(self) -> None:
+        for outcome in (TimeoutError("timed out"), ["not", "a", "mapping"]):
+            with self.subTest(outcome=type(outcome).__name__):
+                if self.state_path.exists():
+                    self.state_path.unlink()
+                fake = _FakeFeishu(_TOKEN_OK, outcome)
+                self.assertEqual(self._run_with(fake), 0)
+                self.assertEqual(fake.message_types(), ["interactive"])
+                self.assertEqual(host_health_alert.load_state(self.state_path), {})
+
+    def test_malformed_business_code_is_unknown_outcome(self) -> None:
+        # 外审 C1/C2：缺码、null 与非数字码都只证明响应不合预期，不证明成功或拒绝。
+        for response in _MALFORMED_CODE_RESPONSES:
+            with self.subTest(response=response):
+                if self.state_path.exists():
+                    self.state_path.unlink()
+                fake = _FakeFeishu(_TOKEN_OK, response)
+                self.assertEqual(self._run_with(fake), 0)
+                self.assertEqual(fake.message_types(), ["interactive"])
+                self.assertEqual(host_health_alert.load_state(self.state_path), {})
+
+    def test_numeric_business_code_is_definite_rejection(self) -> None:
+        for response in ({"code": 230001}, {"code": "230001"}):
+            with self.subTest(response=response):
+                if self.state_path.exists():
+                    self.state_path.unlink()
+                fake = _FakeFeishu(_TOKEN_OK, response, _SEND_OK)
+                self.assertEqual(self._run_with(fake), 0)
+                self.assertEqual(fake.message_types(), ["interactive", "text"])
+                state = host_health_alert.load_state(self.state_path)
+                self.assertTrue(state["target-container"].alerting)
+
+    def test_fallback_malformed_response_is_unknown_without_third_send(self) -> None:
+        for response in _MALFORMED_CODE_RESPONSES:
+            with self.subTest(response=response):
+                if self.state_path.exists():
+                    self.state_path.unlink()
+                fake = _FakeFeishu(_TOKEN_OK, _CARD_REJECTED, response)
+                self.assertEqual(self._run_with(fake), 0)
+                self.assertEqual(fake.message_types(), ["interactive", "text"])
+                self.assertEqual(host_health_alert.load_state(self.state_path), {})
+
+    def test_token_failure_sends_nothing(self) -> None:
+        fake = _FakeFeishu({"code": 99991663})
+        self.assertEqual(self._run_with(fake), 0)
+        self.assertEqual(fake.message_types(), [])
+        self.assertEqual(host_health_alert.load_state(self.state_path), {})
 
 
 if __name__ == "__main__":

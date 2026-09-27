@@ -234,6 +234,58 @@ class DbSwitchToLocalFakeRootTest(_FakeRootBase):
         self.assertEqual(self.env_snapshot(), before)
         self.assertFalse((self.root / "root" / "lingxi-s30-backup").exists())
 
+    def _verified(self) -> Path:
+        """preflight → install-pg → 放来源快照与 dump 校验和 → verify 通过；返回工作目录。"""
+        self.assertEqual(self.run_script("preflight").returncode, 0)
+        self.assertEqual(self.run_script("install-pg").returncode, 0)
+        work = Path(
+            (self.root / "var" / "lib" / "lingxi" / "migrate" / "current")
+            .read_text(encoding="utf-8")
+            .strip()
+        )
+        (work / "source-facts.json").write_text(
+            '{"counts" : {"tables" : 2}, "datcollversion" : "153.1"}', encoding="utf-8"
+        )
+        (work / "source.dump.sha256").write_text("ab" * 32 + "  source.dump\n", encoding="utf-8")
+        passed = self.run_script("verify")
+        self.assertEqual(passed.returncode, 0, passed.stdout + passed.stderr)
+        self.assertIn('"ok":true', (work / "verify.json").read_text(encoding="utf-8"))
+        return work
+
+    def test_reverify_failing_midway_voids_old_pass(self) -> None:
+        # B7：同轮先 verify 通过 → 目标变了、再 verify 算出差异后中途查询失败 → 旧的通过记录不得授权 switch-dsn
+        work = self._verified()
+        (self.state / "verify_diffs").write_text("tables|public.t1|2|1\n", encoding="utf-8")
+        (self.state / "verify_fail_expected").touch()
+        again = self.run_script("verify")
+        self.assertNotEqual(again.returncode, 0, again.stdout + again.stderr)
+        record = work / "verify.json"
+        self.assertFalse(
+            record.exists() and '"ok":true' in record.read_text(encoding="utf-8"),
+            "中途失败的 verify 留下了旧的通过记录",
+        )
+        before = self.env_snapshot()
+        switched = self.run_script("switch-dsn")
+        self.assertEqual(switched.returncode, 1, switched.stdout + switched.stderr)
+        self.assertIn("verify", switched.stderr)
+        self.assertEqual(self.env_snapshot(), before)
+
+    def test_switch_dsn_rejects_percent_encoded_override_keys(self) -> None:
+        # W2 遗留 P2：查询串键经 %XX 编码（libpq 会先解码）同样判「覆盖连接目标」，不改任何文件
+        self._verified()
+        gateway = self.config / ".env.stage.gateway"
+        for query in ("?ho%73t=db.example.invalid", "?sslmode=require&db%6eame=other"):
+            with self.subTest(query=query):
+                gateway.write_text(
+                    f"LINGXI_POSTGRES_DSN='postgresql+psycopg://lingxi_app:{SECRET}@{SOURCE_HOST}/postgres{query}'\n",
+                    encoding="utf-8",
+                )
+                before = self.env_snapshot()
+                result = self.run_script("switch-dsn")
+                self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+                self.assertIn("连接覆盖键", result.stderr)
+                self.assertEqual(self.env_snapshot(), before)
+
     def test_status_summarizes_without_secrets(self) -> None:
         self.assertEqual(self.run_script("preflight").returncode, 0)
         self.assertEqual(self.run_script("install-pg").returncode, 0)

@@ -107,6 +107,7 @@ from lingxi.apps.gateway.document_delivery import (
 )
 from lingxi.apps.worker.config import WorkerConfig
 from lingxi.apps.worker.service import WorkerService
+from lingxi.config.content import ContentCatalog, default_content_catalog
 
 DSN = os.environ.get("LINGXI_POSTGRES_DSN")
 SKIP_REASON = (
@@ -1988,6 +1989,21 @@ class RealNotifierWiringTest(unittest.TestCase):
     OPEN_ID = "ou_real_shaped_user"
     BASE_URL = "https://feishu.invalid/open-apis"
 
+    @staticmethod
+    def _plain_catalog() -> ContentCatalog:
+        """正式目录去掉 ``notice.*`` 卡片键：演练「卡片键撤出目录」时的纯文本路径。"""
+        base = default_content_catalog()
+        cards = {k: v for k, v in base._cards.items() if not k.startswith("notice.")}  # noqa: SLF001
+        return ContentCatalog(version=base.version, texts=base._texts, cards=cards)  # noqa: SLF001
+
+    @staticmethod
+    def _card_text(body: dict[str, Any]) -> str:
+        """通知卡请求体里用户可见的全部文字（标题 + 各 markdown 段）。"""
+        payload = json.loads(body["content"])
+        parts = [payload["header"]["title"]["content"]]
+        parts += [element.get("content", "") for element in payload["body"]["elements"]]
+        return "\n".join(parts)
+
     def _real_notifier(self, transport: _RecordingUserMessageTransport) -> FeishuUserMessages:
         # 与 assemble_document_delivery_consumer 里的构造逐字同形（app_id/
         # app_secret/uuid_prefix 取值不同不影响验证目标：真实值来自配置注入，
@@ -2001,6 +2017,18 @@ class RealNotifierWiringTest(unittest.TestCase):
         )
 
     def test_ready_notice_sends_through_the_real_adapter_without_error(self) -> None:
+        """正式目录已登记 ``notice.delivery.document_ready``：走通知卡。"""
+        method, url, body, token, store, alerts = self._drive_ready(catalog=None)
+        self.assertEqual(alerts, [], "真实形状下不应该触发 notice_failed 告警")
+        self.assertEqual(store.notified, ["tdd-ready-1"])
+        self.assertEqual(method, "POST")
+        self.assertEqual(url, f"{self.BASE_URL}/im/v1/messages?receive_id_type=open_id")
+        self.assertEqual(body["receive_id"], self.OPEN_ID)
+        self.assertEqual(body["msg_type"], "interactive")
+        self.assertIn("已生成", self._card_text(body))
+        self.assertEqual(token, "t-fake-tenant-access-token")
+
+    def _drive_ready(self, *, catalog: ContentCatalog | None):
         transport = _RecordingUserMessageTransport(
             [_real_shape_tenant_token_response(), _real_shape_send_message_response()]
         )
@@ -2011,19 +2039,23 @@ class RealNotifierWiringTest(unittest.TestCase):
             docx=_SpyDocx(),
             notifier=self._real_notifier(transport),
             on_alert=lambda kind, task_id: alerts.append((kind, task_id)),
+            catalog=catalog,
         )
-
         consumer._send_ready_notice(
             request_id="tdd-ready-1",
             task_id="tsk-ready-1",
             requester_open_id=self.OPEN_ID,
             document_id="doc-ready-1",
         )
-
-        self.assertEqual(alerts, [], "真实形状下不应该触发 notice_failed 告警")
-        self.assertEqual(store.notified, ["tdd-ready-1"])
         self.assertEqual(len(transport.calls), 2)
         method, url, body, token = transport.calls[1]
+        return method, url, body, token, store, alerts
+
+    def test_ready_notice_without_the_card_key_sends_text_through_the_real_adapter(self) -> None:
+        """卡片键撤出目录时退回纯文本，与卡片化之前逐字同形。"""
+        method, url, body, token, store, alerts = self._drive_ready(catalog=self._plain_catalog())
+        self.assertEqual(alerts, [], "真实形状下不应该触发 notice_failed 告警")
+        self.assertEqual(store.notified, ["tdd-ready-1"])
         self.assertEqual(method, "POST")
         self.assertEqual(url, f"{self.BASE_URL}/im/v1/messages?receive_id_type=open_id")
         self.assertEqual(body["receive_id"], self.OPEN_ID)
@@ -2097,7 +2129,9 @@ class RealNotifierWiringTest(unittest.TestCase):
         method, url, body, token = transport.calls[1]
         self.assertEqual(url, f"{self.BASE_URL}/im/v1/messages?receive_id_type=open_id")
         self.assertEqual(body["receive_id"], self.OPEN_ID)
-        self.assertIn("暂无法确认", json.loads(body["content"])["text"])
+        # 正式目录已登记该卡片键：走通知卡。
+        self.assertEqual(body["msg_type"], "interactive")
+        self.assertIn("暂无法确认", self._card_text(body))
 
     def test_failed_terminal_notice_sends_through_the_real_adapter_without_error(self) -> None:
         transport = _RecordingUserMessageTransport(
@@ -2119,7 +2153,9 @@ class RealNotifierWiringTest(unittest.TestCase):
         method, url, body, token = transport.calls[1]
         self.assertEqual(url, f"{self.BASE_URL}/im/v1/messages?receive_id_type=open_id")
         self.assertEqual(body["receive_id"], self.OPEN_ID)
-        self.assertIn("生成失败", json.loads(body["content"])["text"])
+        # 正式目录已登记该卡片键：走通知卡。
+        self.assertEqual(body["msg_type"], "interactive")
+        self.assertIn("生成失败", self._card_text(body))
 
 
 class TenantDomainNotConfiguredSentinelTest(unittest.TestCase):

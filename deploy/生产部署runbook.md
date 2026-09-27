@@ -530,6 +530,8 @@ systemctl cat lingxi-host-monitor.service lingxi-release-pull.service \
 
 **装之前先 `systemctl cat <单元>` 与仓库版本逐行比对**：现装的那几份是首发现场手写的，不保证与仓库版本等价；差异逐条确认后再覆盖，不要盲覆盖。
 
+**巡检单元本体、巡检脚本与备份脚本的升级（#884 / #891 宿主侧）走 `scripts/ops/host_maintenance_install.sh`，不手敲 `install`**：控制包不带 `scripts/ops/` 与宿主单元，这几份文件只能这样到主机。姿势：编排者从正式 tag 导出 `lingxi-host-monitor.service`、`host_health_alert.py`、`db_backup.sh`、脚本本身与清单 `SHA256SUMS` 到同一个 0700 目录，先在预发 `check` → `apply --yes` 跑通并留回读原文，生产再由产品负责人 `sudo -n bash <目录>/host_maintenance_install.sh apply --yes` 一次执行（排在 Promotion 与问数验收之后，失败自动回装、不影响发布结论）。先装单元、确认有效解释器是注入点，再装脚本——顺序反过来就是 2026-09-20 那次 9 小时静默崩溃。备份脚本替换后**不手动触发**备份，等下一次 UTC 18:30 自然轮，按脚本收尾打印的两条只读命令回读。备份与回装覆盖五个目标（单元本体、`20-python312.conf`、`10-local.conf`、巡检脚本、备份脚本，原本不存在的回装时删掉），明细见 `deploy/监控告警.md`「三.3」。**命令中途断开时先跑 `status`，需要时 `restore --yes`**：已开始写入的 apply 收到 HUP / INT / TERM 会自行回装并打印「中断，已自动回装」，尚未写入则零改动退出；断开后不要凭记忆判断停在哪一步。
+
 **2026-09-04 实际安装终态（rc25 升级窗口；取代上一段 2026-09-02 的「未装齐」状态）**：
 
 - **投放姿势**：单元文件、`10-local.conf`（`User=bi-ai-deploy`）与 logrotate 配置先以部署用户写进 `/home/bi-ai-deploy/rc25-units/`（12 个单元＋drop-in＋配置），root 级安装一律 `install` 自该目录取文件，32 条扁平命令逐条执行、逐条回读（产品负责人当场放行，权限规则路径钉死）。

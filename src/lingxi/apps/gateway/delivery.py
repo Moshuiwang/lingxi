@@ -26,6 +26,7 @@ from enum import Enum
 from typing import Any
 
 from lingxi.config.content import ContentCatalog, RenderedContent, default_content_catalog
+from lingxi.core.delivery.catalog_notice import send_reply_notice
 from lingxi.core.delivery.ports import TerminalKind
 from lingxi.core.execution.card_stream import (
     CardRateLimiter,
@@ -339,9 +340,10 @@ class DeliveryConsumer:
 
         只在真正越过阈值时才发，不产生噪音；只发一次，去重靠进程内内存
         集合，不新增数据库列或表——这是一条尽力而为的体验提示。不是 outbox
-        事件、不经过 ``CardStream``：只是一次独立的 ``Replies.send_text``
-        调用。``getattr`` 取可选队列方法：旧的注入式假队列没有这个方法时
-        整体跳过，行为与本功能加入之前逐字节一致。
+        事件、不经过 ``CardStream``：只是一次独立的同话题回复（卡片键进内容
+        目录后改为通知卡，见 ``core.delivery.catalog_notice``）。``getattr``
+        取可选队列方法：旧的注入式假队列没有这个方法时整体跳过，行为与本
+        功能加入之前逐字节一致。
         """
         list_stale = getattr(self._queue, "list_stale_queued_tasks", None)
         if list_stale is None:
@@ -356,17 +358,11 @@ class DeliveryConsumer:
         self._queue_delay_notified &= current_ids
         if not stale:
             return
-        content = self._catalog.text("gateway.busy_hint_queued")
         for row in stale:
             if row.task_id in self._queue_delay_notified:
                 continue
             try:
-                self._texts.send_text(
-                    chat_id=row.chat_id,
-                    thread_id=row.thread_id,
-                    reply_to_message_id=row.reply_to_message_id or "",
-                    text=content.text,
-                )
+                send_reply_notice(self._texts, self._catalog, "gateway.busy_hint_queued", row)
             except Exception as error:  # 单条发送失败不影响其余候选，下一轮重试
                 logger.error(
                     "排队提示发送失败，下一轮重试 task_id=%s error=%s",

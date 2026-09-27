@@ -336,6 +336,8 @@ class RunTest(_Base):
             ".env.stage.gateway": "?host=db.example.invalid",
             ".env.stage.worker": "?sslmode=disable&hostaddr=192.0.2.10",
             ".env.stage.scheduler": "?DBName=other",
+            ".env.stage.migrate": "?ho%73t=db.example.invalid",
+            ".env.stage.reauthorize": "?sslmode=disable&db%6eame=other",
         }
         for name, query in cases.items():
             with self.subTest(query=query):
@@ -367,6 +369,146 @@ class RunTest(_Base):
             (self.config / ".env.stage.gateway").read_text(encoding="utf-8"),
             f"LINGXI_POSTGRES_DSN='postgresql+psycopg://postgres:{NEW_PW}@lingxi-db:5432/postgres?sslmode=disable'\n",
         )
+
+    def test_from_past_verify_requires_this_rounds_pass(self) -> None:
+        # B1：--from 越过 verify（dsn / services / timers）须有本轮、同一 dump 的 verify 通过记录
+        fresh = self.run_script("run", str(self.dump), "--from=dsn")  # 新轮次、无任何记录
+        self.assertEqual(fresh.returncode, 1, fresh.stdout + fresh.stderr)
+        self.assertIn("先从 verify 跑", fresh.stderr)
+        self.assertNotIn("switch recreate-services", self.calls())
+        self.assertEqual(self.run_script("wipe", "--yes").returncode, 0)
+        target = self.base / "support" / "target.json"
+        good = target.read_text(encoding="utf-8")
+        data = json.loads(good)
+        data["tables"]["public.t1"] = 1
+        target.write_text(json.dumps(data), encoding="utf-8")
+        failed = self.run_script("run", str(self.dump))
+        self.assertEqual(failed.returncode, 1)
+        self.assertIn("verify 未通过", failed.stderr)
+        env_before = self.env_digest()
+        for step in ("dsn", "services", "timers"):
+            with self.subTest(step=step):
+                skipped = self.run_script("run", str(self.dump), f"--from={step}")
+                self.assertEqual(skipped.returncode, 1, skipped.stdout + skipped.stderr)
+                self.assertIn("先从 verify 跑", skipped.stderr)
+                self.assertEqual(self.env_digest(), env_before)
+        self.assertNotIn("switch recreate-services", self.calls())
+        target.write_text(good, encoding="utf-8")
+        passed = self.run_script("run", str(self.dump), "--from=verify", "--until=verify")
+        self.assertEqual(passed.returncode, 0, passed.stdout + passed.stderr)
+        resumed = self.run_script("run", str(self.dump), "--from=services")
+        self.assertEqual(resumed.returncode, 0, resumed.stdout + resumed.stderr)
+        self.assertIn("switch recreate-services", self.calls())
+
+    def _verified_round(self) -> None:
+        self.assertEqual(self.run_script("wipe", "--yes").returncode, 0)
+        done = self.run_script("run", str(self.dump), "--until=verify")
+        self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
+        self.assertIn("verify 零差异", done.stdout)
+
+    def test_pass_record_is_bound_to_dump_sha(self) -> None:
+        # B1'：本轮有 verify 通过记录，但 --from=dsn 换成另一份 dump 仍拒绝（记录须与 dump sha 相同）
+        self._verified_round()
+        other = self.backups / "lingxi-db-20260927T120000Z.dump"
+        other.write_bytes(b"PGDMP other fake archive")
+        (self.backups / f"{other.name}.sha256").write_text(
+            f"{_sha(other)}  {other.name}\n", encoding="utf-8"
+        )
+        (self.backups / f"{other.name}.counts.json").write_text(COUNTS_JSON, encoding="utf-8")
+        env_before = self.env_digest()
+        result = self.run_script("run", str(other), "--from=dsn")
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertIn(f"没有这份 dump（sha256 {_sha(other)}）的 verify 通过记录", result.stderr)
+        self.assertEqual(self.env_digest(), env_before)
+        same = self.run_script("run", str(self.dump), "--from=dsn", "--until=dsn")
+        self.assertEqual(same.returncode, 0, same.stdout + same.stderr)
+
+    def test_rerun_restore_voids_pass_record(self) -> None:
+        # B7'：重跑 --from=restore（步骤开始即作废记录；目标非空时步骤本身随后拒绝）后 --from=dsn 被拒
+        self._verified_round()
+        redo = self.run_script("run", str(self.dump), "--from=restore", "--until=restore")
+        self.assertEqual(redo.returncode, 1, redo.stdout + redo.stderr)
+        self.assertIn("步骤 restore 开始", redo.stdout)
+        result = self.run_script("run", str(self.dump), "--from=dsn")
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertIn("verify 通过记录", result.stderr)
+        state = (self.drill() / "state.env").read_text(encoding="utf-8")
+        self.assertIn("RTS_VERIFY_OK=\n", state + "\n")
+
+    def test_verify_compares_acl_content_not_presence(self) -> None:
+        # B10：目标上某张表的授权内容变了（仍非空）→ verify 报差异、不进 dsn
+        self.assertEqual(self.run_script("wipe", "--yes").returncode, 0)
+        target_sql = self.base / "support" / "target_schema.sql"
+        text = target_sql.read_text(encoding="utf-8")
+        self.assertIn('GRANT SELECT ON TABLE public.t1 TO "Weird Role";', text)
+        target_sql.write_text(
+            text.replace(
+                'GRANT SELECT ON TABLE public.t1 TO "Weird Role";',
+                'GRANT INSERT ON TABLE public.t1 TO "Weird Role";',
+            ),
+            encoding="utf-8",
+        )
+        env_before = self.env_digest()
+        result = self.run_script("run", str(self.dump))
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertIn("acl|ACL public TABLE t1|", result.stdout)
+        self.assertIn("verify 未通过", result.stderr)
+        self.assertEqual(self.env_digest(), env_before)
+        self.assertNotIn("switch recreate-services", self.calls())
+
+    def test_rollback_restores_dir_moved_before_wipe_was_interrupted(self) -> None:
+        # B3：wipe 在把 pgdata 移进保留目录之后、记账之前被杀 → rollback 仍能把它移回
+        write_executable(
+            self.base / "bin" / "mv",
+            '#!/usr/bin/env bash\n/usr/bin/mv "$@" || exit $?\n'
+            'if [[ -n "${FAKE_MV_KILL_DEST:-}" && "${*: -1}" == *"$FAKE_MV_KILL_DEST" ]]; then kill -9 "$PPID"; fi\n',
+        )
+        self.overrides["FAKE_MV_KILL_DEST"] = "/wiped/pgdata"
+        crashed = self.run_script("wipe", "--yes")
+        self.assertEqual(crashed.returncode, -9, crashed.stdout + crashed.stderr)
+        self.assertFalse(self.pgdata.exists())
+        del self.overrides["FAKE_MV_KILL_DEST"]
+        result = self.run_script("rollback", "--yes")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual((self.pgdata / "PG_VERSION").read_text(encoding="utf-8"), "old\n")
+        self.assertTrue((self.dbconf / ".env.db").exists())
+
+    def test_rollback_rerun_after_partial_failure_is_idempotent(self) -> None:
+        # B2：rollback 移回目录后在后续步骤失败 → 二跑成功，已恢复的原目录不被再次移走、failed-run 不嵌套
+        self.assertEqual(self.run_script("wipe", "--yes").returncode, 0)
+        self.assertEqual(self.run_script("run", str(self.dump), "--until=dsn").returncode, 0)
+        drill = self.drill()
+        self.overrides["FAKE_SWITCH_FAIL"] = "recreate-services"
+        partial = self.run_script("rollback", "--yes")
+        self.assertEqual(partial.returncode, 1, partial.stdout + partial.stderr)
+        self.assertEqual((self.pgdata / "PG_VERSION").read_text(encoding="utf-8"), "old\n")
+        del self.overrides["FAKE_SWITCH_FAIL"]
+        again = self.run_script("rollback", "--yes")
+        self.assertEqual(again.returncode, 0, again.stdout + again.stderr)
+        self.assertIn("already", again.stdout)
+        self.assertEqual((self.pgdata / "PG_VERSION").read_text(encoding="utf-8"), "old\n")
+        self.assertEqual(
+            (drill / "failed-run" / "pgdata" / "PG_VERSION").read_text(encoding="utf-8"), "new\n"
+        )
+        self.assertFalse((drill / "failed-run" / "pgdata" / "pgdata").exists())
+        self.assertIn("rollback 完成", again.stdout)
+
+    def test_rollback_does_not_nest_into_existing_failed_run(self) -> None:
+        # B2：failed-run/<名> 已存在时另起带后缀的目录，不嵌套进去
+        self.assertEqual(self.run_script("wipe", "--yes").returncode, 0)
+        self.assertEqual(self.run_script("run", str(self.dump), "--until=dsn").returncode, 0)
+        drill = self.drill()
+        earlier = drill / "failed-run" / "pgdata"
+        earlier.mkdir(parents=True)
+        (earlier / "PG_VERSION").write_text("earlier\n", encoding="utf-8")
+        result = self.run_script("rollback", "--yes")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(sorted(p.name for p in earlier.iterdir()), ["PG_VERSION"])
+        self.assertEqual((earlier / "PG_VERSION").read_text(encoding="utf-8"), "earlier\n")
+        moved = [p for p in (drill / "failed-run").iterdir() if p.name.startswith("pgdata.")]
+        self.assertEqual(len(moved), 1, list((drill / "failed-run").iterdir()))
+        self.assertEqual((moved[0] / "PG_VERSION").read_text(encoding="utf-8"), "new\n")
+        self.assertEqual((self.pgdata / "PG_VERSION").read_text(encoding="utf-8"), "old\n")
 
     def test_rollback_returns_to_pre_wipe(self) -> None:
         env_before = self.env_digest()
@@ -527,6 +669,18 @@ class RealDatabaseTest(_Base):
         result = self.run_script("run", str(self.real_dump), "--from=roles", "--until=verify")
         self.assertEqual(result.returncode, 1)
         self.assertIn("tables|public.t1|清单=99|目标=3", result.stdout)
+
+    def test_changed_grant_content_fails_verify(self) -> None:
+        # B10：恢复后把一张表的授权改成另一组（仍非空）→ verify 报差异
+        restored = self.run_script("run", str(self.real_dump), "--from=roles", "--until=verify")
+        self.assertEqual(restored.returncode, 0, restored.stdout + restored.stderr)
+        self.psql(
+            'REVOKE SELECT ON public.t1 FROM "Weird Role"; GRANT INSERT ON public.t1 TO "Weird Role";'
+        )
+        result = self.run_script("run", str(self.real_dump), "--from=verify", "--until=verify")
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertIn("acl|ACL public TABLE t1|", result.stdout)
+        self.assertIn("verify 未通过", result.stderr)
 
 
 if __name__ == "__main__":

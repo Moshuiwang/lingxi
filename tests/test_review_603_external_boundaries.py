@@ -7,8 +7,16 @@ from unittest.mock import Mock, patch
 
 from lingxi.apps.gateway.admin_followups import GatewayFollowupHandlers
 from lingxi.apps.gateway.management_cards import ManagementCardRefresher
+from lingxi.config.content import ContentCatalog, default_content_catalog
 from lingxi.core.admin.followup_consumer import FollowupConsumer
 from lingxi.core.admin.followup_renewal import FollowupLeaseKeeper
+
+
+def _catalog_without_notice_cards() -> ContentCatalog:
+    """正式目录去掉全部 ``notice.*`` 卡片键。"""
+    base = default_content_catalog()
+    cards = {k: v for k, v in base._cards.items() if not k.startswith("notice.")}  # noqa: SLF001
+    return ContentCatalog(version=base.version, texts=base._texts, cards=cards)  # noqa: SLF001
 
 
 class FollowupExternalBoundaryTests(unittest.TestCase):
@@ -74,10 +82,21 @@ class FollowupExternalBoundaryTests(unittest.TestCase):
                     cb._resolve_scope_labels.side_effect = scope
                 elif source != "healthy":
                     cb._display_names.user_label.side_effect = name
-                with patch(
-                    "lingxi.apps.gateway.admin_followups.render_group_notice", return_value="notice"
+                # #891：``notice.admin.group_notice`` 进正式目录后群广播会配卡片并读
+                # ``pending.action_type``，而本用例的替身只关心续租复核。注入不含通知卡片键
+                # 的目录，让出口保持「只发纯文本」这一条路径；否定断言同时覆盖卡片发送口。
+                with (
+                    patch(
+                        "lingxi.apps.gateway.admin_followups.render_group_notice",
+                        return_value="notice",
+                    ),
+                    patch(
+                        "lingxi.core.admin.notification.default_content_catalog",
+                        _catalog_without_notice_cards,
+                    ),
                 ):
                     self.assertTrue(consumer.run_once())
+                cb._group_notifier.send_notice.assert_not_called()
                 if source == "healthy":
                     cb._group_notifier.send_text.assert_called_once()
                 else:
