@@ -2117,6 +2117,14 @@ class _FakeFeishu:
 _TOKEN_OK = {"code": 0, "tenant_access_token": "t"}
 _SEND_OK = {"code": 0, "data": {"message_id": "om_1"}}
 _CARD_REJECTED = {"code": 230099, "msg": "card rejected"}
+_MALFORMED_CODE_RESPONSES = (
+    {},
+    {"code": None},
+    {"code": []},
+    {"code": {}},
+    {"code": "unexpected"},
+    {"code": True},
+)
 
 
 class NoticeSendSemanticsTests(unittest.TestCase):
@@ -2164,6 +2172,38 @@ class NoticeSendSemanticsTests(unittest.TestCase):
                 fake = _FakeFeishu(_TOKEN_OK, outcome)
                 self.assertEqual(self._run_with(fake), 0)
                 self.assertEqual(fake.message_types(), ["interactive"])
+                self.assertEqual(host_health_alert.load_state(self.state_path), {})
+
+    def test_malformed_business_code_is_unknown_outcome(self) -> None:
+        # 外审 C1/C2：缺码、null 与非数字码都只证明响应不合预期，不证明成功或拒绝。
+        for response in _MALFORMED_CODE_RESPONSES:
+            with self.subTest(response=response):
+                if self.state_path.exists():
+                    self.state_path.unlink()
+                fake = _FakeFeishu(_TOKEN_OK, response)
+                self.assertEqual(self._run_with(fake), 0)
+                self.assertEqual(fake.message_types(), ["interactive"])
+                self.assertEqual(host_health_alert.load_state(self.state_path), {})
+
+    def test_numeric_business_code_is_definite_rejection(self) -> None:
+        for response in ({"code": 230001}, {"code": "230001"}):
+            with self.subTest(response=response):
+                if self.state_path.exists():
+                    self.state_path.unlink()
+                fake = _FakeFeishu(_TOKEN_OK, response, _SEND_OK)
+                self.assertEqual(self._run_with(fake), 0)
+                self.assertEqual(fake.message_types(), ["interactive", "text"])
+                state = host_health_alert.load_state(self.state_path)
+                self.assertTrue(state["target-container"].alerting)
+
+    def test_fallback_malformed_response_is_unknown_without_third_send(self) -> None:
+        for response in _MALFORMED_CODE_RESPONSES:
+            with self.subTest(response=response):
+                if self.state_path.exists():
+                    self.state_path.unlink()
+                fake = _FakeFeishu(_TOKEN_OK, _CARD_REJECTED, response)
+                self.assertEqual(self._run_with(fake), 0)
+                self.assertEqual(fake.message_types(), ["interactive", "text"])
                 self.assertEqual(host_health_alert.load_state(self.state_path), {})
 
     def test_token_failure_sends_nothing(self) -> None:

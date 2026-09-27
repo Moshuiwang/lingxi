@@ -3437,6 +3437,14 @@ class _FakeFeishu:
 _TOKEN_OK = {"code": 0, "tenant_access_token": "t"}
 _SEND_OK = {"code": 0, "data": {"message_id": "om_1"}}
 _CARD_REJECTED = {"code": 230099, "msg": "card rejected"}
+_MALFORMED_CODE_RESPONSES = (
+    {},
+    {"code": None},
+    {"code": []},
+    {"code": {}},
+    {"code": "unexpected"},
+    {"code": True},
+)
 
 
 class AlertNoticeSendSemanticsTests(unittest.TestCase):
@@ -3501,6 +3509,45 @@ class AlertNoticeSendSemanticsTests(unittest.TestCase):
                 record, raised = self._send(fake)
                 self.assertEqual(raised.code, "alert_delivery_failed")
                 self.assertEqual(fake.message_types(), ["interactive"])
+                self.assertFalse(record["sent"])
+
+    def test_malformed_business_code_is_unknown_outcome(self) -> None:
+        # 外审 C1/C2：缺码、null 与非数字码都只证明响应不合预期，不证明成功或拒绝。
+        for response in _MALFORMED_CODE_RESPONSES:
+            with self.subTest(response=response):
+                fake = _FakeFeishu(_TOKEN_OK, response)
+                record, raised = self._send(fake)
+                self.assertIsNotNone(raised)
+                self.assertEqual(raised.code, "alert_delivery_failed")
+                self.assertEqual(fake.message_types(), ["interactive"])
+                self.assertFalse(record["sent"])
+
+    def test_zero_business_code_is_success(self) -> None:
+        for response in ({"code": 0}, {"code": "0"}):
+            with self.subTest(response=response):
+                fake = _FakeFeishu(_TOKEN_OK, response)
+                record, raised = self._send(fake)
+                self.assertIsNone(raised)
+                self.assertEqual(fake.message_types(), ["interactive"])
+                self.assertTrue(record["sent"])
+
+    def test_numeric_business_code_is_definite_rejection(self) -> None:
+        for response in ({"code": 230001}, {"code": "230001"}):
+            with self.subTest(response=response):
+                fake = _FakeFeishu(_TOKEN_OK, response, _SEND_OK)
+                record, raised = self._send(fake)
+                self.assertIsNone(raised)
+                self.assertEqual(fake.message_types(), ["interactive", "text"])
+                self.assertTrue(record["sent"])
+
+    def test_fallback_malformed_response_is_unknown_without_third_send(self) -> None:
+        for response in _MALFORMED_CODE_RESPONSES:
+            with self.subTest(response=response):
+                fake = _FakeFeishu(_TOKEN_OK, _CARD_REJECTED, response)
+                record, raised = self._send(fake)
+                self.assertIsNotNone(raised)
+                self.assertEqual(raised.code, "alert_delivery_failed")
+                self.assertEqual(fake.message_types(), ["interactive", "text"])
                 self.assertFalse(record["sent"])
 
     def test_pat_notice_also_goes_as_card(self) -> None:

@@ -69,8 +69,9 @@ scheduler/gateway/worker-queue **自己的进程里**——它们能发现"数�
 无按钮、链接、回调）。卡片 JSON 由本文件内置的标准库构造拼出，与仓库共用类型
 `lingxi.core.delivery.notice_card.NoticeCard` 的输出逐键一致（对照用例
 `tests/test_notice_cards_host.py`）；主机名、容器名、错误原文等自由文本进卡片前转义。
-每张卡带一段等价纯文本，即改造前逐字相同的那段文本。只有飞书**明确拒绝**卡片（返回
-非零业务码）时才在同一轮补发一次纯文本；传输异常、超时、响应不可解析属结果不明，
+每张卡带一段等价纯文本，即改造前逐字相同的那段文本。业务码为 0 才算送达；只有飞书
+**明确拒绝**卡片（业务码为非零整数或纯数字字符串）时才在同一轮补发一次纯文本；传输
+异常、超时、响应不可解析、缺码或码值畸形（null、列表、非数字字符串等）属结果不明，
 不补发，按「发送失败不落盘、下一轮重试」处理。请求里没有去重 `uuid`，本次不新增。
 
 # 单实例纪律
@@ -1406,7 +1407,8 @@ def _feishu_post_message(
     content: Mapping[str, object],
     timeout_seconds: float,
 ) -> None:
-    """向群发一条指定类型的消息；非零业务码抛 `FeishuRejectedError`，其余失败为结果不明。"""
+    """向群发一条指定类型的消息；业务码为 0 才算成功，整数非零码抛 `FeishuRejectedError`，
+    缺码 / 畸形码及其余失败为结果不明（`HostMonitorError`）。"""
 
     body = json.dumps(
         {
@@ -1432,9 +1434,25 @@ def _feishu_post_message(
         raise HostMonitorError(f"feishu_send_transport_error:{type(error).__name__}") from error
     if not isinstance(payload, Mapping):
         raise HostMonitorError("feishu_send_invalid_response_shape")
-    code = payload.get("code")
-    if code not in (None, 0, "0"):
+    code = _business_code(payload.get("code"))
+    if code is None:
+        # 缺码、null 或非数字码：响应不合预期，既不能算成功也不能算拒绝（外审 C1/C2）。
+        raise HostMonitorError("feishu_send_invalid_response_code")
+    if code != 0:
         raise FeishuRejectedError(f"feishu_send_error_code_{code}")
+
+
+def _business_code(value: object) -> int | None:
+    """飞书业务码只认整数或纯数字字符串；其余（缺失、null、布尔、列表、字典、
+    非数字字符串）返回 ``None``，由调用方判结果不明。"""
+
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value
+    if isinstance(value, str) and value.isascii() and value.isdigit():
+        return int(value)
+    return None
 
 
 @contextlib.contextmanager
