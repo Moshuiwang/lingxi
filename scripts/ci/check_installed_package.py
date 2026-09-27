@@ -1011,6 +1011,10 @@ PROCESS_RUNTIME_IMPORTS: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {
             # 管理卡状态机的取值域：card_dispatch 的上下文默认值、followup 确认
             # 适配器的状态翻译与持久上下文适配器都引用它；只有常量，不带入别的闭包。
             "lingxi.core.admin.management_card_states",
+            # 管理卡的通知卡片版式按「正在下发」那句唯一字面量定色调，从
+            # management_status 取它，随之带进跳过原因码所在的定向重算模块。
+            "lingxi.core.admin.management_status",
+            "lingxi.core.permission.targeted_recompute",
             # 「本地权限覆盖活动」段（Issue #319 S-P-1c）：
             # `_build_local_override_activity_check` 在函数内 import 本地权限
             # 覆盖表的读路径，与上面两个通报 adapter 同一条"函数内 import 证明
