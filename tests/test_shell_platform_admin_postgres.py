@@ -124,7 +124,12 @@ class ShellPlatformAdminTestCase(unittest.TestCase):
         suffix = uuid.uuid4().hex[:8]
         self.role = f"p887_admin_{suffix}"
         # 第一位沿用真实的 postgres（任何集群都有），其余三位是探针，与原文位次一一对应。
-        self.grantees = ("postgres", f"p887_anon_{suffix}", f"p887_auth_{suffix}", f"p887_svc_{suffix}")
+        self.grantees = (
+            "postgres",
+            f"p887_anon_{suffix}",
+            f"p887_auth_{suffix}",
+            f"p887_svc_{suffix}",
+        )
         self.executor = f"p887_exec_{suffix}"
         # 登记顺序与执行顺序相反：先删探针库（清掉库内依赖），再删角色。
         for name in (self.role, *self.grantees[1:], self.executor):
@@ -161,7 +166,9 @@ class ShellPlatformAdminTestCase(unittest.TestCase):
 
         notices: list[str] = []
         with self._psycopg.connect(dsn) as connection:
-            connection.add_notice_handler(lambda diagnostic: notices.append(diagnostic.message_primary))
+            connection.add_notice_handler(
+                lambda diagnostic: notices.append(diagnostic.message_primary)
+            )
             with connection.cursor() as cursor:
                 if as_role:
                     cursor.execute(f"SET ROLE {as_role}")
@@ -238,7 +245,9 @@ class ShellPlatformAdminTestCase(unittest.TestCase):
     def assert_untouched(self, dsn: str, notices: list[str], reason: str) -> None:
         self.assertTrue(self.role_exists(self.role), "非空壳角色被删了")
         self.assertEqual(self.default_acl(dsn), self.expected_acl(), "非空壳角色的默认权限被动了")
-        self.assertTrue(any(reason in notice for notice in notices), f"提示里没有说明原因：{notices}")
+        self.assertTrue(
+            any(reason in notice for notice in notices), f"提示里没有说明原因：{notices}"
+        )
 
     # ---------- ① 无角色 ----------
 
@@ -261,7 +270,9 @@ class ShellPlatformAdminTestCase(unittest.TestCase):
         _run_alembic(self.probe, "downgrade", PARENT)
         self.assertFalse(self.role_exists(REAL_ROLE))
         _run_alembic(self.probe, "upgrade", REVISION)
-        self.assertEqual(self.scalar("SELECT version_num FROM alembic_version", dsn=self.probe), REVISION)
+        self.assertEqual(
+            self.scalar("SELECT version_num FROM alembic_version", dsn=self.probe), REVISION
+        )
         self.assertFalse(self.role_exists(REAL_ROLE))
 
     # ---------- ② 空壳往返 ----------
@@ -295,7 +306,9 @@ class ShellPlatformAdminTestCase(unittest.TestCase):
             ),
             [(False, False, False, False, False, False)],
         )
-        self.assertEqual(self.default_acl(self.probe), self.expected_acl(), "downgrade 没有逐字复原三行")
+        self.assertEqual(
+            self.default_acl(self.probe), self.expected_acl(), "downgrade 没有逐字复原三行"
+        )
         self.assertEqual(self.others_snapshot(self.probe), before)
 
         # 复原后再 upgrade 仍能清掉：往返是闭合的。
@@ -316,7 +329,10 @@ class ShellPlatformAdminTestCase(unittest.TestCase):
 
     def test_role_owning_an_object_is_skipped(self) -> None:
         self.build_stage_shape(self.probe)
-        self.admin(f"CREATE TABLE public.p887_owned (id int); ALTER TABLE public.p887_owned OWNER TO {self.role}", dsn=self.probe)
+        self.admin(
+            f"CREATE TABLE public.p887_owned (id int); ALTER TABLE public.p887_owned OWNER TO {self.role}",
+            dsn=self.probe,
+        )
         self.assert_untouched(self.probe, self.upgrade(self.probe), "拥有")
 
     def test_role_referenced_from_another_database_is_skipped(self) -> None:
@@ -337,7 +353,9 @@ class ShellPlatformAdminTestCase(unittest.TestCase):
             self.upgrade(self.probe, as_role=self.executor)
         self.assertIn("无权清理空壳角色", str(caught.exception))
         self.assertTrue(self.role_exists(self.role))
-        self.assertEqual(self.default_acl(self.probe), self.expected_acl(), "失败后默认权限没有原样保留")
+        self.assertEqual(
+            self.default_acl(self.probe), self.expected_acl(), "失败后默认权限没有原样保留"
+        )
 
 
 if __name__ == "__main__":
