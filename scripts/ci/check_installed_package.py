@@ -1245,6 +1245,8 @@ PROCESS_RUNTIME_IMPORTS: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {
             # adapters.postgres_conversation 与 apps.worker.service 共同依赖。
             "lingxi.core.delivery",
             "lingxi.core.delivery.ports",
+            "lingxi.core.delivery.notice_card",
+            "lingxi.core.delivery.catalog_notice",
             # 回合终态判定与回合报告字段读取（理由见 REQUIRED_MODULES 同名条目）：
             # `apps/worker/service.py`、`terminal_outcome.py`、`turn.py` 模块级 import。
             "lingxi.core.delivery.turn_outcome",
