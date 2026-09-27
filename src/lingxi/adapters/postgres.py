@@ -222,9 +222,7 @@ class _IdleConnectionPool:
             try:
                 stale.discard()
             except Exception as error:
-                logger.warning(
-                    "关闭过期空闲连接失败，继续归还 error=%s", type(error).__name__
-                )
+                logger.warning("关闭过期空闲连接失败，继续归还 error=%s", type(error).__name__)
         return accepted
 
     def close_all(self) -> int:

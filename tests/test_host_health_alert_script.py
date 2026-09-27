@@ -1452,7 +1452,6 @@ class BackupStatusLogicTests(unittest.TestCase):
         )
         self.assertFalse(self._breaches(no_transfer)[host_health_alert.DB_BACKUP_TRANSFER_FAILED])
 
-
     def test_uninterpretable_transfer_section_raises_transfer_code(self) -> None:
         """#884 F19：缺 transfer 段、transfer 不是对象、ok 是字符串、scp 成功却没有传输结论。"""
 
