@@ -9,8 +9,9 @@
 告警发送逻辑最小复制自 ``scripts/ops/host_health_alert.py`` 的
 ``load_credentials`` 与飞书群文本通道：复用同一应用、同一管理群字段、同一
 0600/属主检查，不通过导入仓库脚本来获得独立可分发性。告警以只读通知卡发出，
-卡片构造同样内置于本文件（与仓库共用通知卡类型同形，由对照用例钉住）；飞书明确
-拒绝卡片时补发一次等价纯文本，结果不明不补发。
+卡片构造同样内置于本文件（与仓库共用通知卡类型同形，由对照用例钉住）；业务码为 0
+才算送达，飞书明确拒绝卡片（业务码为非零整数或纯数字字符串）时补发一次等价纯文本；
+缺码、码值畸形及其他结果不明情形不补发。
 """
 
 from __future__ import annotations
@@ -1749,7 +1750,8 @@ def send_alert(message: str, env_file: Path, timeout_seconds: int) -> None:
 
 
 def _post_alert(token: str, chat_id: str, msg_type: str, content: dict, timeout: int) -> None:
-    """发一条指定类型的群消息；非零业务码抛 ``AlertRejectedError``，其余失败为结果不明。"""
+    """发一条指定类型的群消息；业务码为 0 才算成功，整数非零码抛 ``AlertRejectedError``，
+    缺码 / 畸形码及其余失败为结果不明。"""
     body = json.dumps(
         {
             "receive_id": chat_id,
@@ -1774,8 +1776,24 @@ def _post_alert(token: str, chat_id: str, msg_type: str, content: dict, timeout:
         raise AgentError("alert_delivery_failed") from None
     if not isinstance(payload, dict):
         raise AgentError("alert_delivery_failed")
-    if payload.get("code") not in (None, 0, "0"):
+    code = _alert_business_code(payload.get("code"))
+    if code is None:
+        # 缺码、null 或非数字码：响应不合预期，既不能算成功也不能算拒绝（外审 C1/C2）。
+        raise AgentError("alert_delivery_failed")
+    if code != 0:
         raise AlertRejectedError()
+
+
+def _alert_business_code(value: object) -> int | None:
+    """飞书业务码只认整数或纯数字字符串；其余（缺失、null、布尔、列表、字典、
+    非数字字符串）返回 ``None``，由调用方判结果不明。"""
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value
+    if isinstance(value, str) and value.isascii() and value.isdigit():
+        return int(value)
+    return None
 
 
 def _alert_message(
