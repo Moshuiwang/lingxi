@@ -24,6 +24,10 @@ from typing import Any
 from lingxi.config.content import ContentCatalog, RenderedContent, default_content_catalog
 from lingxi.core.delivery.notice_card import NoticeCard, NoticeSection, NoticeTone, escape_markdown
 from lingxi.core.delivery.ops_notice import (
+    HEADING_ANOMALIES,
+    HEADING_NEXT_STEP,
+    HEADING_OVERVIEW,
+    ROSTER_NO_ANOMALY,
     ROSTER_REPORT_CARD_KEY,
     escaped_lines,
     ops_notice_card,
@@ -317,12 +321,12 @@ def render_daily_report_card(
     anomalies, overview = _card_anomalies(report, parts, snapshot)
     sections = [
         NoticeSection(
-            heading="先看异常",
-            lines=escaped_lines(anomalies or ["无：本轮读取正常，未发现需要人工核实的条目"]),
+            heading=HEADING_ANOMALIES,
+            lines=escaped_lines(anomalies or [ROSTER_NO_ANOMALY]),
         )
     ]
     if overview:
-        sections.append(NoticeSection(heading="比对概况", lines=escaped_lines(overview)))
+        sections.append(NoticeSection(heading=HEADING_OVERVIEW, lines=escaped_lines(overview)))
     for heading, entries in parts.sections:
         sections.append(
             NoticeSection(heading=escape_markdown(heading), lines=escaped_lines(entries))
@@ -334,7 +338,9 @@ def render_daily_report_card(
         fallback_text=text,
         values={"report_date": report_date.isoformat()},
         sections=sections,
-        trailing=[NoticeSection(heading="下一步", lines=escaped_lines([parts.disclaimer]))],
+        trailing=[
+            NoticeSection(heading=HEADING_NEXT_STEP, lines=escaped_lines([parts.disclaimer]))
+        ],
     )
 
 

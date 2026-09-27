@@ -35,6 +35,13 @@ ALERT_RECOVERY_CARD_KEY = notice_card_key("alert.recovery")
 #: 文案覆盖文件校验告警。模板占位：``reason``。
 CONTENT_OVERRIDE_CARD_KEY = notice_card_key("content.override_rejected")
 
+#: 卡片里代码追加的分段小标题。花名册日报的正文渲染（``core/identity/roster_report``）
+#: 不许内嵌中文文案，这几句卡片专用的固定标题放在这里。
+HEADING_ANOMALIES = "先看异常"
+HEADING_OVERVIEW = "比对概况"
+HEADING_NEXT_STEP = "下一步"
+ROSTER_NO_ANOMALY = "无：本轮读取正常，未发现需要人工核实的条目"
+
 OPS_CARD_KEYS: tuple[str, ...] = (
     DAILY_REPORT_CARD_KEY,
     ROSTER_REPORT_CARD_KEY,
@@ -185,7 +192,11 @@ __all__ = [
     "CONTENT_OVERRIDE_CARD_KEY",
     "CONTENT_OVERRIDE_UUID_PREFIX",
     "DAILY_REPORT_CARD_KEY",
+    "HEADING_ANOMALIES",
+    "HEADING_NEXT_STEP",
+    "HEADING_OVERVIEW",
     "OPS_CARD_KEYS",
+    "ROSTER_NO_ANOMALY",
     "ROSTER_REPORT_CARD_KEY",
     "escaped_lines",
     "ops_notice_card",

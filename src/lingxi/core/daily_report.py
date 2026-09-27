@@ -67,6 +67,7 @@ from lingxi.core.daily_report_stats import build_token_usage_stats as build_toke
 from lingxi.core.delivery.notice_card import NoticeCard, NoticeSection, NoticeTone
 from lingxi.core.delivery.ops_notice import (
     DAILY_REPORT_CARD_KEY,
+    HEADING_ANOMALIES,
     escaped_lines,
     ops_notice_card,
     send_group_notice,
@@ -491,7 +492,7 @@ def _card_sections(
     )
     parts: list[tuple[str, Sequence[str]]] = [
         ("统计窗口", _window_lines(inputs.window_start, inputs.window_end)),
-        ("先看异常", anomalies or ["无：失败、拦截、拒绝类计数均为 0，各段均可判定"]),
+        (HEADING_ANOMALIES, anomalies or ["无：失败、拦截、拒绝类计数均为 0，各段均可判定"]),
         (
             "使用情况",
             [
