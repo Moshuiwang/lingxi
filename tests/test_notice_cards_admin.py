@@ -708,7 +708,8 @@ class CorrectionSummaryTests(unittest.TestCase):
         )
         with (
             mock.patch.object(notification, "default_content_catalog", return_value=catalog),
-            mock.patch.dict(catalog_notice.NOTICE_TONES, tones),
+            # 色调表在模块导入时合并成 ``_ALL_TONES``，演练「已登记」只能替换合并后的表。
+            mock.patch.dict(catalog_notice._ALL_TONES, tones),
         ):
             _send_management_correction_summary(
                 config=config, audit=audit, sender=sender, store=store, message_ids=("m1", "m2")
