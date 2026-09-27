@@ -11,7 +11,7 @@
 | 当前事实 | 值 |
 | --- | --- |
 | 基线 revision（链首） | `20260806_baseline` |
-| head revision | `0098_qa_corpus` |
+| head revision | `0099_drop_shell_platform_admin` |
 | 配置文件 | 仓库根目录 `alembic.ini` |
 | revision 目录 | `migrations/alembic/versions/` |
 | 连接串环境变量 | `LINGXI_MIGRATION_DSN`（缺失即失败，无默认值） |
@@ -693,7 +693,7 @@ Trace [#643](https://github.com/Moshuiwang/lingxi/issues/643) IN-06（工作卡
    `lingxi_migrate`）随本 revision 幂等创建，但 **`downgrade` 不删除它们**：角色是
    集群级共享对象，同集群的其他数据库或运维授权可能已经引用，一次数据库级回滚去删
    集群级对象影响面超出本迁移且不可逆。角色本身不持有内容，留着不构成数据风险；
-   清退由 Ops 显式执行。四个角色一律 `NOLOGIN` 且无口令，运行时进程仍用现有连接身份；
+   清退由 Ops 显式执行（唯一例外见 `0099_drop_shell_platform_admin` 小节）。四个角色一律 `NOLOGIN` 且无口令，运行时进程仍用现有连接身份；
    授予登录能力属部署接线。`downgrade` 的全部 `REVOKE` 都先查角色是否存在——回滚可能
    跑在一个"角色已被 Ops 另行清退"的集群上，那时对不存在的角色 `REVOKE` 会直接报错，
    把一次本该成功的回滚变成失败。
@@ -850,3 +850,9 @@ OAuth 路径已被 2026-07-28 决策排除；它们此前**不属于生产链**�
 ## `0097_operation_audit`（运营操作的持久审计账）
 
 新表 `operation_audit`：预开通、欢迎卡、内测扩员这类运营操作从此有一张能回答「谁发起、谁确认、谁执行、目的与目标范围、结果、证据指针」的数据库账；此前只有结构化日志，跨进程不可关联。形态是 append-only 事件行——一次操作的各阶段各一行，用 `operation_id` 关联，各进程只 INSERT 不争行锁；表内没有自由文本列，`operation` 是正则 + 长度 CHECK 的开放集合，`phase` / `entry_point` 是封闭集合，confirmed / cancelled 阶段必须有 `decided_by`，executed 阶段必须有 `executor` 与 `result_code`。**不建外键**（`ON DELETE` 动作会以 UPDATE / DELETE 触发行级触发器，与只追加冲突）。两只触发器都在定义语句里固定 `search_path = pg_catalog, pg_temp`：`operation_audit_fix_expiry`（BEFORE INSERT）把 `expires_at` 写死为 `created_at + 2160 小时`，`operation_audit_append_only`（BEFORE UPDATE）一律拒绝。五个索引：按操作号、按时间、到期清理扫描、追溯号与目标用户两个部分索引。它**不是**数据库设计里那张「未建」的分区表 `audit_event`，后者继续未建。到期整行删除接在既有载体清理的待确认操作事务里。降级：表非空即拒绝（应用回退只切镜像不降库）；空表时删表并删两只触发器函数，完整逆转。
+
+## `0099_drop_shell_platform_admin`（清掉迁库留下的空壳平台管理角色）
+
+[Issue #887](https://github.com/Moshuiwang/lingxi/issues/887)。2.6.0 迁到本机 PostgreSQL 时，为原样恢复来源库的默认权限，目标库按同名建了占位角色 `supabase_admin`：不能登录、没有特殊属性、无成员关系、不拥有对象，只承载三行 `public` 下的默认权限（FUNCTIONS / TABLES / SEQUENCES，授予 `postgres` / `anon` / `authenticated` / `service_role`）。本机库上没人以它的身份建对象，这三行永远不生效。本 revision 在一个 `DO` 块里：角色不存在 → 什么都不做；**空壳守卫**（六个属性全假、成员关系 0、本库属主对象 0、`pg_shdepend` 里引用它的每一行都是本库、它自己名下的 schema 级默认权限）任一不满足 → 只发 `NOTICE`、什么都不做；执行身份无权 → 响亮失败；否则逐行撤掉它名下的默认权限、回读为 0 行，再 `DROP ROLE`。**不碰** `anon` / `authenticated` / `service_role` 及其他任何角色的权限与属主。降级只在该角色不存在且四个被授权角色都在时重建 `NOLOGIN` 角色并按预发实读原文补回三行（表的 `MAINTAIN` 只在 PostgreSQL 17 及以上补）；其余情况什么都不做。
+
+**对「角色清退由 Ops 显式执行」（`0054` 小节）的例外，理由与边界**：那条原则防的是库级迁移去删「可能被同集群别处引用」的集群级对象。本角色是迁库时为承载默认权限而造的占位空壳，不是任何进程的身份；删之前由空壳守卫与跨库零引用守卫在同一事务里证明它在集群里除本库自己名下的默认权限外没有任何引用——证明不了就跳过、留给 Ops，而不是硬删。随发布执行让预发与生产在同一个候选里完成同一件事，不另开一条人工操作。例外只覆盖这一个角色，不推广到其他占位角色。
