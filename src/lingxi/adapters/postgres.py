@@ -218,7 +218,7 @@ class _IdleConnectionPool:
                     self._atexit_registered = True
         for stale in expired:
             # 刚归还的连接此时可能已经入栈：关旧连接失败只记日志，不能让异常冒到调用方
-            # 那里、再被当成"归还失败"把栈里这条好连接连带关掉（#884 F3）。
+            # 那里、再被当成"归还失败"把栈里这条好连接连带关掉。
             try:
                 stale.discard()
             except Exception as error:
@@ -406,7 +406,7 @@ class _BorrowedConnection:
             return
         self._returned = True
         # 归还路径任一步抛错（复位、加锁），句柄已标归还、再 close() 是空操作——此时
-        # 必须兜底真正关闭，不能留下既没入栈也没关的物理连接（#884 F3）；异常照常上抛。
+        # 必须兜底真正关闭，不能留下既没入栈也没关的物理连接；异常照常上抛。
         accepted = False
         try:
             accepted = _IDLE_POOL.release(self._key, self._connection)
