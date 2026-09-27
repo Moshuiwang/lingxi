@@ -31,7 +31,7 @@
 30	src/lingxi/apps/gateway/alerting.py
 343	src/lingxi/apps/gateway/assembly.py
 195	src/lingxi/apps/gateway/config.py
-486	src/lingxi/apps/gateway/delivery.py
+481	src/lingxi/apps/gateway/delivery.py
 57	src/lingxi/apps/gateway/delivery_assembly.py
 509	src/lingxi/apps/gateway/document_delivery.py
 155	src/lingxi/apps/gateway/event_handler.py

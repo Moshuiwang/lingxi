@@ -28,6 +28,7 @@ from lingxi.adapters.postgres_document_delivery import (
     PostgresDocumentDeliveryStore,
 )
 from lingxi.config.content import ContentCatalog, default_content_catalog
+from lingxi.core.delivery.catalog_notice import CatalogUserNotices
 
 logger = logging.getLogger(__name__)
 
@@ -97,8 +98,7 @@ class DocumentDeliveryConsumer:
         # 表格能力可选——单测/未装配表格能力时可以不传，只要队列里不出现
         # delivery_type='sheet' 的行就不会被触碰（见 _process_claim 的分派）。
         self._sheets = sheets
-        self._notifier = notifier
-        self._catalog = catalog or default_content_catalog()
+        self._notices = CatalogUserNotices(notifier, catalog=catalog or default_content_catalog())
         self._alert = on_alert or _default_alert
         self._limit = limit
 
@@ -572,10 +572,10 @@ class DocumentDeliveryConsumer:
                 resource_url=resource_url,
                 body_degraded_reason=body_degraded_reason,
             )
-            content = self._catalog.text(content_key, url=url)
-            self._notifier.send_text(
+            self._notices.send(
                 open_id=requester_open_id,
-                text=content.text,
+                key=content_key,
+                variables={"url": url},
                 dedupe_key=f"{dedupe_prefix}:{request_id}",
             )
             self._store.mark_notified(request_id=request_id)
@@ -604,10 +604,10 @@ class DocumentDeliveryConsumer:
         带 ``{reference}``，由调用方显式传入。
         """
         try:
-            content = self._catalog.text(key, **(template_variables or {}))
-            self._notifier.send_text(
+            self._notices.send(
                 open_id=claim.requester_open_id,
-                text=content.text,
+                key=key,
+                variables=template_variables,
                 dedupe_key=f"{dedupe_prefix}:{claim.id}",
             )
         except Exception as error:  # 通知失败不得回滚已经落库的终态
