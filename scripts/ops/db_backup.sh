@@ -23,10 +23,14 @@
 #      "dump_file":"<仅文件名>","dump_bytes":N,"dump_sha256":"<hex>","restore_list_ok":bool,
 #      "tables":N,"retention_kept":N,"transfer":{"mode":"none|scp","ok":true|false|null,
 #      "label":"<标签>"},"error":null|"<错误码>"}
+#   输入校验没通过时 transfer.mode / label 固定写 "invalid"，不回显任何输入原值（#884 F16）。
 #   `ok` 只说本地三件是否成功产出并校验：本地任一步失败 → ok=false + 错误码；异机传输失败
 #   → ok=true、transfer.ok=false、error="transfer_failed"（本地备份仍有效，巡检据此分别报
 #   「本地备份失败」与「异机副本失败」两种告警）。两类失败都先写状态再以非 0 退出，
 #   systemd 记 Result=failed；失败时尚未得到的字段为 null。
+#   例外：抢不到目录锁（另一轮正在跑）时**不写**状态文件、以 1 退出——状态文件归正在跑
+#   的那一轮，不能被"已在运行"覆盖（#884 F13；运维口径见生产部署 runbook「timer 窗口内
+#   不手工跑」）。
 #
 # 已知边界：dump 与行数清单是两次连接、不共享快照——定时器落在低峰（北京 02:30），
 # 两者之间若有写入，恢复后比对会出现可解释的差异；切换脚本的 verify 在停写窗口内跑，
@@ -64,6 +68,9 @@ STARTED_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 STARTED_EPOCH="$(date +%s)"
 DUMP_FILE="null"; DUMP_BYTES="null"; DUMP_SHA="null"; RESTORE_LIST_OK="false"
 TABLES="null"; RETENTION_KEPT="null"; TRANSFER_OK="null"; STATUS_WRITTEN=0
+# 进状态文件的 transfer.mode / label：输入全部校验通过之前只写固定占位词，被拒的值
+# （可能是误填的连接串）不得落进 0644 的状态文件。
+STATUS_MODE="invalid"; STATUS_LABEL="invalid"
 
 # 日志只到 stderr（journal），远端地址（整串、user@host、host、路径）与任何连接串形态一律脱敏。
 mask() {
@@ -86,8 +93,8 @@ write_status() {
   tmp="${STATUS_FILE}.tmp.$$"
   printf '{"schema":1,"ok":%s,"started_at":"%s","finished_at":"%s","duration_seconds":%s,"dump_file":%s,"dump_bytes":%s,"dump_sha256":%s,"restore_list_ok":%s,"tables":%s,"retention_kept":%s,"transfer":{"mode":"%s","ok":%s,"label":"%s"},"error":%s}\n' \
     "${ok}" "${STARTED_AT}" "${finished_at}" "${duration}" "${DUMP_FILE}" "${DUMP_BYTES}" \
-    "${DUMP_SHA}" "${RESTORE_LIST_OK}" "${TABLES}" "${RETENTION_KEPT}" "${TRANSFER}" \
-    "${TRANSFER_OK}" "${REMOTE_LABEL}" "${error}" > "${tmp}"
+    "${DUMP_SHA}" "${RESTORE_LIST_OK}" "${TABLES}" "${RETENTION_KEPT}" "${STATUS_MODE}" \
+    "${TRANSFER_OK}" "${STATUS_LABEL}" "${error}" > "${tmp}"
   chmod 0644 "${tmp}"
   mv -f "${tmp}" "${STATUS_FILE}"
   STATUS_WRITTEN=1
@@ -119,6 +126,7 @@ if [[ "${TRANSFER}" == scp ]]; then
     || fail invalid_input 2 "scp 模式须设 LINGXI_DB_BACKUP_REMOTE=user@host:/path"
 fi
 [[ "${REMOTE_LABEL}" =~ ^[A-Za-z0-9_.-]{1,32}$ ]] || fail invalid_input 2 "LINGXI_DB_BACKUP_REMOTE_LABEL 只接受 1–32 位字母数字 ._-"
+STATUS_MODE="${TRANSFER}"; STATUS_LABEL="${REMOTE_LABEL}"
 command -v docker >/dev/null 2>&1 || fail invalid_input 2 "缺少 docker 命令"
 read -r -a SSH_OPTS <<< "${SSH_OPTS_RAW}"
 SSH_OPTS+=(-o LogLevel=ERROR)
@@ -133,7 +141,12 @@ dir_stat="$(stat -c '%u %a' "${BACKUP_DIR}")"
 [[ "${dir_stat}" == "$(id -u) 700" ]] || fail backup_dir_invalid 1 "备份目录属主 / 权限为「${dir_stat}」，要求「$(id -u) 700」"
 
 exec 9>"${BACKUP_DIR}/.lock"
-flock -n 9 || fail already_running 1 "上一轮尚未结束（目录锁被占）"
+if ! flock -n 9; then
+  # 不走 fail()：状态文件属于持锁的那一轮，这里一个字节都不写；置位让兜底 trap 也不写。
+  STATUS_WRITTEN=1
+  log "失败（already_running）：上一轮尚未结束（目录锁被占），不改写状态文件"
+  exit 1
+fi
 
 db_bytes="$(docker exec "${CONTAINER}" psql -U "${DB_USER}" -d "${DB_NAME}" -Atc \
   "SELECT pg_database_size(current_database())" 2>/dev/null)" \
