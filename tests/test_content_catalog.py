@@ -613,5 +613,66 @@ class ModelGeneratedTextValidationTests(unittest.TestCase):
             ContentCatalog.from_mapping(card_document)
 
 
+class NoticeCardRegistrationTests(unittest.TestCase):
+    """#891 通知卡片键的登记完整性：每个 ``notice.*`` 卡片键都有色调归属，占位与
+    原文本键逐一相同；色调缺失时不发卡片、照旧发原文本。"""
+
+    @staticmethod
+    def _dynamic_owner_keys() -> frozenset[str]:
+        """无原文本键、色调由各自模块按状态决定的卡片键（从代码常量实取）。"""
+        from lingxi.core.admin import management_card, notification
+        from lingxi.core.delivery.ops_notice import OPS_CARD_KEYS
+        from lingxi.core.execution.card_stream import HANDOFF_NOTICE_CARD_KEY
+        from lingxi.core.outreach.contact_reachability import CONTACT_TODO_CARD_KEY
+
+        return frozenset(
+            {
+                notification.CONFIRM_CARD_KEY,
+                notification.TERMINAL_CARD_KEY,
+                notification.GROUP_NOTICE_CARD_KEY,
+                notification.INNERTEST_CONFIRM_CARD_KEY,
+                management_card.MANAGEMENT_CARD_KEY,
+                CONTACT_TODO_CARD_KEY,
+                HANDOFF_NOTICE_CARD_KEY,
+                *OPS_CARD_KEYS,
+            }
+        )
+
+    def test_every_notice_card_key_has_a_tone_or_a_dynamic_owner(self) -> None:
+        from lingxi.core.delivery import catalog_notice
+
+        dynamic = self._dynamic_owner_keys()
+        notice_keys = {key for key in REQUIRED_CARD_KEYS if key.startswith("notice.")}
+        self.assertLessEqual(dynamic, notice_keys, "动态通知卡的键必须登记进目录")
+        for key in sorted(notice_keys - dynamic):
+            with self.subTest(key=key):
+                text_key = key.removeprefix(catalog_notice.NOTICE_CARD_PREFIX)
+                self.assertIn(text_key, catalog_notice._ALL_TONES)  # noqa: SLF001
+        for text_key in catalog_notice._ALL_TONES:  # noqa: SLF001
+            with self.subTest(tone_key=text_key):
+                self.assertIn(catalog_notice.notice_card_key(text_key), notice_keys)
+
+    def test_text_key_cards_keep_the_text_keys_placeholders(self) -> None:
+        from lingxi.core.delivery import catalog_notice
+
+        catalog = default_content_catalog()
+        for text_key in catalog_notice._ALL_TONES:  # noqa: SLF001
+            with self.subTest(key=text_key):
+                card = catalog._cards[catalog_notice.notice_card_key(text_key)]  # noqa: SLF001
+                self.assertEqual(card.variables, catalog._texts[text_key].variables)  # noqa: SLF001
+                self.assertEqual(card.button_labels, ())
+
+    def test_card_without_a_tone_falls_back_to_the_original_text(self) -> None:
+        from unittest import mock
+
+        from lingxi.core.delivery import catalog_notice
+
+        catalog = default_content_catalog()
+        content = catalog.text("gateway.new_session")
+        self.assertIsNotNone(catalog_notice.build_notice_card(catalog, content, {}))
+        with mock.patch.dict(catalog_notice._ALL_TONES, {}, clear=True):  # noqa: SLF001
+            self.assertIsNone(catalog_notice.build_notice_card(catalog, content, {}))
+
+
 if __name__ == "__main__":
     unittest.main()

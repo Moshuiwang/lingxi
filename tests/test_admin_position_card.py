@@ -252,8 +252,10 @@ class PositionManagementCardTests(unittest.TestCase):
         self.assertEqual(len(transport.updated), 1)
         elements = list(_walk(transport.updated[0]["card"]["body"]["elements"]))
         self.assertTrue([element for element in elements if element.get("tag") == "form"])
+        # #891：``notice.admin.management_card`` 已进正式目录，卡片版把库内机器态
+        # 「已生效」写成「权限已下发」（库内状态不变）；断言的仍是状态已更新到终态。
         self.assertIn(
-            "已生效",
+            "当前状态：权限已下发",
             "\n".join(
                 element.get("content", "")
                 for element in elements
