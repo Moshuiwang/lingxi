@@ -470,16 +470,21 @@ step_verify() {
   say "verify 零差异（alembic / 逐表行数 / 序列 / 扩展 / TOC 属主 / ACL / 清理函数 SECURITY DEFINER）"
 }
 DSN_RE='^(LINGXI_[A-Z_]*_DSN=)(["'"'"']?)(postgres(ql)?(\+psycopg)?)://([^:@/[:space:]]+):([^@[:space:]]*)@([^/?"'"'"'[:space:]]+)/([^?"'"'"'[:space:]]*)(\?[^"'"'"'[:space:]]*)?(["'"'"']?)[[:space:]]*$'
+# 查询串里带这些键会经 libpq 覆盖 authority 里的主机 / 账号 / 库（service / passfile 经服务文件 / 口令文件间接覆盖）：
+# 与 db_switch_to_local.sh 的 PARAM_OVERRIDE_RE 同义，命中即按「指向别处」拒绝
+PARAM_OVERRIDE_RE='[?&](host|hostaddr|user|password|dbname|port|service|passfile)='
 dsn_scan() { # $1 文件 $2 期望主机:端口（空格分隔多个） $3 新口令 $4 dry|write → DSN_RESULT
-  local file="$1" want=" $2 " pw="$3" mode="$4" line out="" n=0 stale=0 bad=""
+  local file="$1" want=" $2 " pw="$3" mode="$4" line out="" n=0 stale=0 bad="" params
   while IFS= read -r line || [[ -n "$line" ]]; do
     if [[ "$line" =~ ^LINGXI_[A-Z_]*_DSN= ]]; then
       n=$((n + 1))
       if [[ "$line" =~ $DSN_RE ]]; then
         local user="${BASH_REMATCH[6]}" oldpw="${BASH_REMATCH[7]}" host="${BASH_REMATCH[8]}" db="${BASH_REMATCH[9]}"
+        local head="${BASH_REMATCH[1]}${BASH_REMATCH[2]}${BASH_REMATCH[3]}" tail="${BASH_REMATCH[11]}"; params="${BASH_REMATCH[10]}"
         if [[ "$want" != *" $host "* || "$user" != postgres || "$db" != postgres ]]; then bad="第 $n 条 DSN 不指向本地库 postgres@{$2}/postgres"
+        elif [[ "${params,,}" =~ $PARAM_OVERRIDE_RE ]]; then bad="第 $n 条 DSN 的查询参数会覆盖连接目标（host / dbname 等）"
         elif [[ "$oldpw" != "$pw" ]]; then stale=$((stale + 1))
-          line="${BASH_REMATCH[1]}${BASH_REMATCH[2]}${BASH_REMATCH[3]}://${user}:${pw}@${host}/${db}${BASH_REMATCH[10]}${BASH_REMATCH[11]}"; fi
+          line="${head}://${user}:${pw}@${host}/${db}${params}${tail}"; fi
       else bad="第 $n 条 DSN 形状不可解析"; fi
     fi
     out+="$line"$'\n'

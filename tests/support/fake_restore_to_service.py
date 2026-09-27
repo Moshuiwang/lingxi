@@ -35,8 +35,12 @@ GRANT SELECT,DELETE ON TABLE public.t1 TO lingxi_retention_owner;
 GRANT SELECT ON TABLE public.t1 TO "Weird Role";
 -- Name: DEFAULT PRIVILEGES FOR TABLES; Type: DEFAULT ACL; Schema: public; Owner: supabase_admin
 ALTER DEFAULT PRIVILEGES FOR ROLE supabase_admin IN SCHEMA public GRANT ALL ON TABLES TO anon;
+-- Name: DEFAULT PRIVILEGES FOR SEQUENCES; Type: DEFAULT ACL; Schema: public; Owner: supabase_admin
+ALTER DEFAULT PRIVILEGES FOR ROLE supabase_admin IN SCHEMA public GRANT SELECT ON SEQUENCES TO "Mixed Owner";
 """
+# "Mixed Owner" 只在默认权限行的 TO 之后出现（带引号大小写名）：钉住「默认权限行的被授权角色」这条派生路径
 SCHEMA_ROLES = [
+    "Mixed Owner",
     "Weird Role",
     "anon",
     "lingxi_app",
