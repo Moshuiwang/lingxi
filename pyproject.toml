@@ -37,14 +37,14 @@ requires-python = ">=3.12"
 # scheduler 镜像也承载一次性 reauthorize job，因此显式带上 OAuth Bridge WebSocket
 # 传输依赖；常驻 scheduler 本身仍不加载 OAuth Bridge 业务模块。
 scheduler = [
-    "cryptography==45.0.7",
+    "cryptography==50.0.1",
     "psycopg[binary]>=3.2,<4",
     "websockets>=15,<16",
 ]
 # 正式重授权是 scheduler 镜像里的独立一次性 job，但 #76 的干净环境门禁按进程
 # 闭包逐项对账，因此保留同一依赖闭包的独立 extra 供 CI 验证；部署仍复用 scheduler
 # 镜像，不额外构建第五个生产镜像。
-reauthorize = ["cryptography==45.0.7", "psycopg[binary]>=3.2,<4", "websockets>=15,<16"]
+reauthorize = ["cryptography==50.0.1", "psycopg[binary]>=3.2,<4", "websockets>=15,<16"]
 # lingxi-worker 进程（`python -m lingxi.apps.worker`：turn/queue 两种受控执行模式）。
 # 依据：入口 → queue service → PostgreSQL queue adapter，以及 Agent SDK session adapter。
 # 精确锁版本，不用范围：执行层的只读边界建立在这个版本的 hook 事件名与工具名上
