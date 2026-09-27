@@ -196,6 +196,14 @@ class HostMaintenanceFakeRootTest(unittest.TestCase):
             self.run_script("apply", "--yes"), "注入点 /opt/lingxi/bin/python3 不存在"
         )
 
+    def test_refuses_injection_point_that_is_not_a_link(self) -> None:
+        link = self.root / "opt" / "lingxi" / "bin" / "python3"
+        target = link.resolve()
+        link.unlink()
+        shutil.copy2(target, link)
+        self.before = self.snapshot()
+        self.assert_refused(self.run_script("check"), "不是链接")
+
     def test_refuses_input_not_matching_manifest(self) -> None:
         with (self.inputs / "host_health_alert.py").open("a", encoding="utf-8") as f:
             f.write("# 篡改\n")
@@ -254,6 +262,17 @@ class HostMaintenanceFakeRootTest(unittest.TestCase):
         result = self.run_script("apply", "--yes")
         self.assertNotEqual(result.returncode, 0, result.stdout)
         self.assertIn("第 ② 步不符 → 自动回装", result.stdout)
+        self.assert_back_to_original()
+
+    def test_restore_removes_target_that_did_not_exist_before(self) -> None:
+        """在位巡检脚本原本不存在：装上后下一轮失败，回装须把它删掉而不是留下新版。"""
+        self.mon.unlink()
+        self.before = self.snapshot()
+        (self.state / "rounds.txt").write_text("success 0\nexit-code 1\n", encoding="utf-8")
+        result = self.run_script("apply", "--yes")
+        self.assertNotEqual(result.returncode, 0, result.stdout)
+        self.assertFalse(self.mon.exists(), result.stdout)
+        self.targets.remove(self.mon)
         self.assert_back_to_original()
 
     def test_no_round_within_timeout_restores(self) -> None:
