@@ -18,6 +18,7 @@ from datetime import datetime, timedelta
 from enum import Enum
 from typing import Protocol
 
+from lingxi.core.delivery.notice_card import NoticeCard
 from lingxi.core.user_memory import UserMemoryEntry
 
 
@@ -388,6 +389,21 @@ class Replies(Protocol):
         self, *, chat_id: str, thread_id: str | None, reply_to_message_id: str, text: str
     ) -> None:
         """发一条文本回复。"""
+        ...
+
+
+class NoticeReplies(Replies, Protocol):
+    """发文本之外还能以通知卡回复。
+
+    只在内容目录登记了对应卡片键时才会被调用；实现必须在飞书明确拒绝卡片时补发
+    一次 ``card.fallback_text``、结果不明时直接抛出而不补发。没有这个方法的
+    ``Replies`` 实现照旧只收到文本。
+    """
+
+    def send_notice(
+        self, *, chat_id: str, thread_id: str | None, reply_to_message_id: str, card: NoticeCard
+    ) -> None:
+        """以一张通知卡回复。"""
         ...
 
 
