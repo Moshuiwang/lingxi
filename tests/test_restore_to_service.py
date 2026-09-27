@@ -327,6 +327,47 @@ class RunTest(_Base):
         self.assertEqual(self.env_digest(), env_before)
         self.assertNotIn(OLD_PW, result.stdout + result.stderr)
 
+    def test_dsn_refuses_param_override_without_touching_files(self) -> None:
+        # authority 指向本地库、查询串里带 libpq 覆盖键（host / hostaddr / dbname …）实际连到别处：同样判「指向别处」
+        self.assertEqual(self.run_script("wipe", "--yes").returncode, 0)
+        ready = self.run_script("run", str(self.dump), "--until=verify")
+        self.assertEqual(ready.returncode, 0, ready.stdout + ready.stderr)
+        cases = {
+            ".env.stage.gateway": "?host=db.example.invalid",
+            ".env.stage.worker": "?sslmode=disable&hostaddr=192.0.2.10",
+            ".env.stage.scheduler": "?DBName=other",
+        }
+        for name, query in cases.items():
+            with self.subTest(query=query):
+                (self.config / name).write_text(
+                    f"LINGXI_POSTGRES_DSN='postgresql+psycopg://postgres:{OLD_PW}@lingxi-db:5432/postgres{query}'\n",
+                    encoding="utf-8",
+                )
+                env_before = self.env_digest()
+                result = self.run_script("run", str(self.dump), "--from=dsn", "--until=dsn")
+                self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+                self.assertIn("连接串核对不符", result.stderr)
+                self.assertIn(name, result.stderr)
+                self.assertEqual(self.env_digest(), env_before)
+                self.assertNotIn(OLD_PW, result.stdout + result.stderr)
+                (self.config / name).write_text(
+                    f"LINGXI_POSTGRES_DSN='postgresql+psycopg://postgres:{OLD_PW}@lingxi-db:5432/postgres'\n",
+                    encoding="utf-8",
+                )
+
+    def test_dsn_keeps_harmless_query_string(self) -> None:
+        self.run_script("wipe", "--yes")
+        (self.config / ".env.stage.gateway").write_text(
+            f"LINGXI_POSTGRES_DSN='postgresql+psycopg://postgres:{OLD_PW}@lingxi-db:5432/postgres?sslmode=disable'\n",
+            encoding="utf-8",
+        )
+        result = self.run_script("run", str(self.dump), "--until=dsn")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(
+            (self.config / ".env.stage.gateway").read_text(encoding="utf-8"),
+            f"LINGXI_POSTGRES_DSN='postgresql+psycopg://postgres:{NEW_PW}@lingxi-db:5432/postgres?sslmode=disable'\n",
+        )
+
     def test_rollback_returns_to_pre_wipe(self) -> None:
         env_before = self.env_digest()
         hosts_before = self.hosts.read_text(encoding="utf-8")
@@ -367,7 +408,7 @@ DSN = os.environ.get("LINGXI_POSTGRES_DSN")
 CONTAINER = os.environ.get("LINGXI_TEST_PG_CONTAINER")
 SEED = """
 CREATE ROLE lingxi_app NOLOGIN; CREATE ROLE lingxi_retention_owner NOLOGIN; CREATE ROLE anon NOLOGIN;
-CREATE ROLE supabase_admin NOLOGIN; CREATE ROLE "Weird Role" NOLOGIN;
+CREATE ROLE supabase_admin NOLOGIN; CREATE ROLE "Weird Role" NOLOGIN; CREATE ROLE "Mixed Owner" NOLOGIN;
 CREATE SCHEMA extensions; CREATE EXTENSION pg_trgm WITH SCHEMA extensions;
 CREATE TABLE public.t1(id serial PRIMARY KEY, name text); INSERT INTO public.t1(name) VALUES ('a'), ('b'), ('c');
 CREATE INDEX t1_trgm ON public.t1 USING gin (name extensions.gin_trgm_ops);
@@ -379,13 +420,14 @@ GRANT SELECT, DELETE ON public.t1 TO lingxi_retention_owner; GRANT SELECT ON pub
 REVOKE ALL ON FUNCTION public.lingxi_retention_cleanup(timestamptz, integer) FROM PUBLIC;
 GRANT EXECUTE ON FUNCTION public.lingxi_retention_cleanup(timestamptz, integer) TO lingxi_app;
 ALTER DEFAULT PRIVILEGES FOR ROLE supabase_admin IN SCHEMA public GRANT ALL ON TABLES TO anon;
+ALTER DEFAULT PRIVILEGES FOR ROLE supabase_admin IN SCHEMA public GRANT SELECT ON SEQUENCES TO "Mixed Owner";
 GRANT USAGE ON SCHEMA public TO anon;
 CREATE POLICY p1 ON public.t1 TO anon USING (true);
 """
 RESET = """
 DROP SCHEMA IF EXISTS extensions CASCADE; DROP SCHEMA IF EXISTS public CASCADE; CREATE SCHEMA public;
 DO $$ DECLARE r text; BEGIN
-  FOR r IN SELECT rolname FROM pg_roles WHERE rolname IN ('lingxi_app', 'lingxi_retention_owner', 'anon', 'supabase_admin', 'Weird Role') LOOP
+  FOR r IN SELECT rolname FROM pg_roles WHERE rolname IN ('lingxi_app', 'lingxi_retention_owner', 'anon', 'supabase_admin', 'Weird Role', 'Mixed Owner') LOOP
     EXECUTE format('DROP OWNED BY %I', r); EXECUTE format('DROP ROLE %I', r);
   END LOOP; END $$;
 """
@@ -461,7 +503,8 @@ class RealDatabaseTest(_Base):
         result = self.run_script("run", str(self.real_dump), "--from=roles", "--until=verify")
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertIn("verify 零差异", result.stdout)
-        self.assertIn("新建 NOLOGIN 5", result.stdout)
+        self.assertIn("新建 NOLOGIN 6", result.stdout)  # 含只在默认权限行出现的 "Mixed Owner"
+        self.assertEqual(self.psql("SELECT count(*) FROM pg_roles WHERE rolname = 'Mixed Owner'"), "1")
         self.assertEqual(self.psql("SELECT count(*) FROM public.t1"), "3")
         self.assertEqual(
             self.psql(
