@@ -171,6 +171,7 @@ class ExitCodeTests(_Case):
         )
         self.assertEqual(result.returncode, 2, result.stdout)
         self.assertIn("严重度接口不可用", result.stdout)
+        self.assertIn("未能取得严重度（外部服务不可用），非漏洞判定", result.stdout)
 
     def test_unparseable_inputs_are_unknown(self) -> None:
         broken_json = self.write("broken.json", "{not json")
@@ -418,6 +419,13 @@ class WorkflowShapeTests(unittest.TestCase):
             self.assertIn("--format json", text)
             self.assertIn("scripts/ci/pip_audit_check.py", text)
 
+    def test_scan_goes_through_the_service_error_retry_wrapper_in_both_workflows(self) -> None:
+        # #874：两处扫描调用都经 pip_audit_scan.py（服务端故障重试、用尽判失败），不得再吞掉退出码。
+        for text in (self.audit, _job_block(self.weekly, "audit")):
+            self.assertEqual(text.count("scripts/ci/pip_audit_scan.py"), 1)
+            self.assertNotIn("|| echo", text)
+            self.assertNotIn("|| true", text)
+
     def test_weekly_workflow_only_runs_on_schedule_and_manual_trigger(self) -> None:
         on_block = re.search(r"^on:\n((?:  [^\n]*\n|\n)+)", self.weekly, re.M).group(1)
         triggers = re.findall(r"^  ([a-z_]+):", on_block, re.M)
@@ -431,22 +439,10 @@ class WorkflowShapeTests(unittest.TestCase):
 
 
 class AllowlistFileTests(unittest.TestCase):
-    def test_repository_allowlist_holds_exactly_the_ruled_cryptography_exemptions(self) -> None:
-        # 产品负责人 2026-09-20 裁定 A（#859 评论 5748497593）：cryptography 45.0.7 的 4 条 HIGH
-        # 豁免到 2026-10-20；MODERATE / LOW 只告警、不入清单。多一条或换日期都要回到裁定处说明。
-        entries = pac.parse_allowlist(ALLOWLIST)
-        self.assertEqual(
-            {entry.vuln_id for entry in entries},
-            {
-                "GHSA-r6ph-v2qm-q3c2",
-                "GHSA-537c-gmf6-5ccf",
-                "GHSA-jwv3-5hgf-82ww",
-                "GHSA-g6cj-pr64-35w5",
-            },
-        )
-        self.assertEqual({entry.expires.isoformat() for entry in entries}, {"2026-10-20"})
-        for entry in entries:
-            self.assertIn("5748497593", entry.reason)
+    def test_repository_allowlist_holds_no_exemptions(self) -> None:
+        # #864：cryptography 已升到 50.x，裁定 A（#859 评论 5748497593）的 4 条 HIGH 豁免随升级删除，
+        # 清单回到零条目。新增任何条目都要回到产品负责人裁定处说明并同步改本断言。
+        self.assertEqual(pac.parse_allowlist(ALLOWLIST), [])
         self.assertTrue(ALLOWLIST.read_text(encoding="utf-8").startswith("#"))
 
 

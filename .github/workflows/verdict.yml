@@ -111,7 +111,7 @@ jobs:
           python-version: '3.12'
 
       - name: 安装验签依赖（锁版）
-        run: python3 -m pip install --quiet --disable-pip-version-check 'cryptography==45.0.7'
+        run: python3 -m pip install --quiet --disable-pip-version-check 'cryptography==50.0.1'
 
       - name: 验签并核对声明
         id: verify
