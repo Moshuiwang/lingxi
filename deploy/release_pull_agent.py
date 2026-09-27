@@ -39,7 +39,7 @@ sys.dont_write_bytecode = True
 
 # 代理程序自身的版本标记：自替换只在包内代理的标记严格大于在位标记时进行（单调，防降级）。
 # 标记按下面的正则从源码文本读出，不导入、不执行候选文件；代理行为有改动时同步加一。
-AGENT_VERSION = 2
+AGENT_VERSION = 3
 AGENT_VERSION_PATTERN = re.compile(r"^AGENT_VERSION = ([0-9]+)$", re.MULTILINE)
 AGENT_BUNDLE_PATH = "deploy/release_pull_agent.py"
 AGENT_FILE_LIMIT = 2 * 1024 * 1024
@@ -141,6 +141,22 @@ IMMEDIATE_ALERT_CODES = frozenset(
     }
 )
 HEALTHY_CODES = frozenset({"verified", "already_in_place", "already_in_place_external"})
+# 非 AgentError 路径（结构性判定、非编码异常）仍需要 journal `reason=` 时使用的固定原因；
+# 与 AgentError.code 一样属于模块内常量，禁止用自由文本或 "unknown" 充数。
+REASON_NO_MATCHING_CURRENT_RELEASE = "no_matching_current_release"
+REASON_CONTINUATION_OLD_MANIFEST_MISSING = "continuation_old_manifest_missing"
+REASON_FROZEN_MANIFEST_MISMATCH = "frozen_manifest_mismatch"
+REASON_APPROVAL_SOURCE_MISMATCH = "approval_source_mismatch"
+REASON_UNEXPECTED_EXCEPTION = "unexpected_exception"
+STATIC_REASON_CODES = frozenset(
+    {
+        REASON_NO_MATCHING_CURRENT_RELEASE,
+        REASON_CONTINUATION_OLD_MANIFEST_MISSING,
+        REASON_FROZEN_MANIFEST_MISMATCH,
+        REASON_APPROVAL_SOURCE_MISMATCH,
+        REASON_UNEXPECTED_EXCEPTION,
+    }
+)
 # 引导安装收据（`<config_root>/deployment-installation.json`）：键集合与六项人工核对项
 # 复制自部署器 `deploy_runtime.Runtime.installation_receipt`，两处必须同形。
 INSTALLATION_RECEIPT_NAME = "deployment-installation.json"
@@ -1551,7 +1567,8 @@ def _run_hook(
     )
 
 
-def _parse_status(raw: str) -> str:
+def _parse_status(raw: str) -> tuple[str, str | None]:
+    """返回部署器状态与其自带的原因码；两侧对同一次失败要能给出同一原因。"""
     try:
         value = json.loads(raw)
     except (UnicodeDecodeError, json.JSONDecodeError):
@@ -1559,7 +1576,8 @@ def _parse_status(raw: str) -> str:
     status = value.get("status") if isinstance(value, dict) else None
     if status not in DEPLOYER_STATES:
         raise AgentError("deployer_status_unavailable")
-    return status
+    reason = value.get("error") if isinstance(value, dict) else None
+    return status, (reason if isinstance(reason, str) else None)
 
 
 def _parse_env_file(path: Path) -> dict[str, str]:
@@ -1747,8 +1765,12 @@ def _finish(  # noqa: PLR0913
     deployed_tag: str | None = None,
     verified_digests: dict[str, str] | None = None,
     remember_target: bool = False,
+    reason: str | None = None,
 ) -> int:
     """收口一轮：写状态账并按结果码告警。
+
+    ``reason`` 只进 journal 的 `state` 日志行，不进状态账、不进告警正文：状态账与告警只带
+    稳定结果码，细化原因只是排障用的日志字段。
 
     状态账的 ``target_tag`` / ``release_url`` 只在本轮写出 ``verified``（部署器 status、
     外部在位、状态账级在位复核通过）时才推进到目标，即 ``remember_target=True``；任何失败
@@ -1813,6 +1835,7 @@ def _finish(  # noqa: PLR0913
         tag=tag,
         release_url=logged_url,
         plan_id=plan_id,
+        reason=reason,
         **_audit_fields(next_state),
     )
 
@@ -1963,8 +1986,8 @@ def _recheck_verified_target(
                 )
             expected = _expected_digests(manifest)
         actual = _inspect_running_digests(host, config["poll_timeout_seconds"])
-    except AgentError:
-        _log("idempotence", "unknown", tag=tag, release_url=release_url)
+    except AgentError as error:
+        _log("idempotence", "unknown", tag=tag, release_url=release_url, reason=error.code)
         return _finish(
             state,
             host,
@@ -1974,6 +1997,7 @@ def _recheck_verified_target(
             stage="idempotence",
             tag=tag,
             release_url=release_url,
+            reason=error.code,
         )
     if actual == expected:
         _log("idempotence", "already_in_place", tag=tag, release_url=release_url)
@@ -2456,8 +2480,8 @@ def _run_locked(
                 if continuing
                 else _inspect_digests(host, configured_manifest, config["poll_timeout_seconds"])
             )
-        except AgentError:
-            _log("idempotence", "unknown", tag=tag, release_url=release_url)
+        except AgentError as error:
+            _log("idempotence", "unknown", tag=tag, release_url=release_url, reason=error.code)
             return _finish(
                 state,
                 host,
@@ -2469,6 +2493,7 @@ def _run_locked(
                 release_url=release_url,
                 deployer_state="unknown",
                 release_record=release_audit,
+                reason=error.code,
             )
         if not continuing and _all_digests_match(actual, configured_manifest):
             _log("idempotence", "already_in_place_external", tag=tag, release_url=release_url)
@@ -2487,8 +2512,12 @@ def _run_locked(
                 verified_digests=_expected_digests(configured_manifest),
                 remember_target=True,
             )
+        old_manifest_reason = None
         if continuing:
             old_manifest = previous.get("old") if isinstance(previous, dict) else None
+            if old_manifest is None:
+                # 接续中的计划本应带 old；缺失是数据形状问题，不是「没有原因」的正常空结果。
+                old_manifest_reason = REASON_CONTINUATION_OLD_MANIFEST_MISSING
         else:
             old_manifest = None
             if state.get("deployer_state") == "verified" and isinstance(previous, dict):
@@ -2508,10 +2537,22 @@ def _run_locked(
                         config,
                         temporary,
                     )
-                except AgentError:
+                except AgentError as error:
                     old_manifest = None
+                    old_manifest_reason = error.code
+                else:
+                    if old_manifest is None:
+                        # 没有异常：只是列出的 Release 里没有一个匹配运行中容器的摘要，
+                        # 这一步本身没有原因码，不得填 "unknown" 充数。
+                        old_manifest_reason = REASON_NO_MATCHING_CURRENT_RELEASE
         if not isinstance(old_manifest, dict):
-            _log("current_release", "unknown", tag=tag, release_url=release_url)
+            _log(
+                "current_release",
+                "unknown",
+                tag=tag,
+                release_url=release_url,
+                reason=old_manifest_reason,
+            )
             return _finish(
                 state,
                 host,
@@ -2523,6 +2564,7 @@ def _run_locked(
                 release_url=release_url,
                 deployer_state="unknown",
                 release_record=release_audit,
+                reason=old_manifest_reason,
             )
         # 运行中的版本也是已部署版本：状态账没记到的外部安装同样不允许被降级覆盖。
         deployed_tag = _higher_tag(highest_deployed, _valid_tag(old_manifest.get("tag")))
@@ -2602,7 +2644,7 @@ def _run_locked(
                 host["environment"],
                 temporary,
             )
-        except AgentError:
+        except AgentError as error:
             return _finish(
                 state,
                 host,
@@ -2615,6 +2657,7 @@ def _run_locked(
                 deployer_state="unknown",
                 bundle_digest=configured_manifest["control_bundle"]["sha256"],
                 release_record=release_audit,
+                reason=error.code,
             )
         if canonical(installed_manifest) != canonical(configured_manifest):
             return _finish(
@@ -2629,6 +2672,7 @@ def _run_locked(
                 deployer_state="unknown",
                 bundle_digest=configured_manifest["control_bundle"]["sha256"],
                 release_record=release_audit,
+                reason=REASON_FROZEN_MANIFEST_MISMATCH,
             )
         installed_deployer = (
             Path(host["bundle_root"])
@@ -2744,7 +2788,7 @@ def _run_locked(
                     release_record=release_audit,
                 )
                 _log("plan", "written", tag=tag, plan_id=plan["id"])
-            except AgentError:
+            except AgentError as error:
                 return _finish(
                     state,
                     host,
@@ -2757,6 +2801,7 @@ def _run_locked(
                     deployer_state="unknown",
                     bundle_digest=configured_manifest["control_bundle"]["sha256"],
                     release_record=release_audit,
+                    reason=error.code,
                 )
         plan_path = _ensure_plan_file(state_directory, plan)
         source = plan.get("approval_source")
@@ -2774,6 +2819,7 @@ def _run_locked(
                 deployer_state="planned",
                 bundle_digest=configured_manifest["control_bundle"]["sha256"],
                 release_record=release_audit,
+                reason=REASON_APPROVAL_SOURCE_MISMATCH,
             )
         try:
             existing = _existing_approval(state_directory, plan)
@@ -2784,7 +2830,7 @@ def _run_locked(
             else:
                 approval, approval_path = existing
                 approval_result = "approval_reused"
-        except AgentError:
+        except AgentError as error:
             return _finish(
                 state,
                 host,
@@ -2798,6 +2844,7 @@ def _run_locked(
                 deployer_state="planned",
                 bundle_digest=configured_manifest["control_bundle"]["sha256"],
                 release_record=release_audit,
+                reason=error.code,
             )
         approval_sha = fingerprint(approval)
         _checkpoint(
@@ -2904,11 +2951,18 @@ def _run_locked(
                 [plan["id"]],
                 config["poll_timeout_seconds"],
             )
-            deployer_state = _parse_status(status_raw)
-        except AgentError:
-            deployer_state = "unknown"
+            deployer_state, deployer_reason = _parse_status(status_raw)
+        except AgentError as error:
+            deployer_state, deployer_reason = "unknown", error.code
         result = deployer_state
-        _log("status", result, tag=tag, plan_id=plan["id"], deployer_state=deployer_state)
+        _log(
+            "status",
+            result,
+            tag=tag,
+            plan_id=plan["id"],
+            deployer_state=deployer_state,
+            reason=deployer_reason,
+        )
         verified = deployer_state == "verified"
         return _finish(
             state,
@@ -2927,6 +2981,7 @@ def _run_locked(
             deployed_tag=tag if verified else None,
             verified_digests=_expected_digests(configured_manifest) if verified else None,
             remember_target=verified,
+            reason=deployer_reason,
         )
 
 
@@ -2973,7 +3028,9 @@ def run_once(host_path: Path, config_path: Path, state_directory: Path) -> int:
             except AgentError as error:
                 state = _load_state(state_directory / "pull-agent.json", host)
                 result = error.code if error.code in FAILURE_CODES else "unknown"
-                _log("agent", result, host=host["host"])
+                # result 不在 FAILURE_CODES 时被折成 "unknown"，但 error.code 本身不能因此
+                # 丢掉：journal 仍要能看出真正的原因。
+                _log("agent", result, host=host["host"], reason=error.code)
                 return _finish(
                     state,
                     host,
@@ -2982,10 +3039,13 @@ def run_once(host_path: Path, config_path: Path, state_directory: Path) -> int:
                     result=result,
                     stage="agent",
                     deployer_state="unknown" if result == "unknown" else None,
+                    reason=error.code,
                 )
             except Exception:
                 state = _load_state(state_directory / "pull-agent.json", host)
-                _log("agent", "unknown", host=host["host"])
+                # 非 AgentError 的意外异常没有稳定原因码：用固定哨兵值区分「未捕获的 bug」
+                # 与「有编码但读不到」，不得填 reason="unknown" 充数。
+                _log("agent", "unknown", host=host["host"], reason=REASON_UNEXPECTED_EXCEPTION)
                 return _finish(
                     state,
                     host,
@@ -2994,6 +3054,7 @@ def run_once(host_path: Path, config_path: Path, state_directory: Path) -> int:
                     result="unknown",
                     stage="agent",
                     deployer_state="unknown",
+                    reason=REASON_UNEXPECTED_EXCEPTION,
                 )
     except AgentError as error:
         if error.code == "concurrent_run_refused":
