@@ -161,6 +161,7 @@ REQUIRED_MODULES = (
     # 由 adapters.postgres_conversation 与 apps.worker.service 共同依赖。
     "lingxi.core.delivery",
     "lingxi.core.delivery.ports",
+    "lingxi.core.delivery.notice_card",
     # 回合终态判定（真中断 → 其他失败 → 协议残骸 → 正文被拒发 → 成功）与回合报告
     # 字段读取，从 apps/worker 平移进 core 的纯函数；`apps/worker/service.py`、
     # `terminal_outcome.py`、`turn.py` 模块级 import。
@@ -1079,6 +1080,7 @@ PROCESS_RUNTIME_IMPORTS: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {
             "lingxi.core.conversation.session_window",
             "lingxi.core.delivery",
             "lingxi.core.delivery.ports",
+            "lingxi.core.delivery.notice_card",
             "lingxi.adapters.postgres_admin_followup_projection",
             "lingxi.adapters.task_trace_query",
             "lingxi.apps.scheduler.lifecycle",
@@ -1545,6 +1547,7 @@ PROCESS_RUNTIME_IMPORTS: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {
             # ——卡片顺序、限流与失败回退（Issue #152）。
             "lingxi.core.delivery",
             "lingxi.core.delivery.ports",
+            "lingxi.core.delivery.notice_card",
             "lingxi.core.execution",
             "lingxi.core.execution.card_stream",
             "lingxi.core.ids",

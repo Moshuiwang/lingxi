@@ -22,6 +22,7 @@ from collections.abc import Callable, Mapping
 from typing import Any
 
 from lingxi.adapters.feishu_directory import urllib_transport
+from lingxi.core.delivery.notice_card import NoticeCard
 from lingxi.core.delivery.ports import (
     DeliveryOperation,
     DeliveryVerdict,
@@ -52,6 +53,10 @@ MANAGEMENT_CORRECTION_UUID_PREFIX = "lingxi-perm-fix-"
 #: 误判为同一逻辑投递。长度为 15 + 32 = 47，落在飞书的 50 字符 ``uuid`` 上限内。
 CONTACT_UNAVAILABLE_UUID_PREFIX = "lingxi-unreach-"
 DELIVERY_UUID_MAX_LENGTH = 50
+#: 通知卡片的去重前缀由同一投递语义的文本前缀推出：把 ``lingxi-`` 换成等长的
+#: ``lxcard-``。长度不变，合法的文本前缀推出的卡片前缀必然也在 50 字符上限内。
+TEXT_UUID_PREFIX_HEAD = "lingxi-"
+CARD_UUID_PREFIX_HEAD = "lxcard-"
 SendOutcomeCallback = Callable[[str, bool], None]
 
 
@@ -71,6 +76,18 @@ def delivery_uuid(chat_id: str, dedupe_key: str, *, prefix: str = DELIVERY_UUID_
     if len(value) > DELIVERY_UUID_MAX_LENGTH:
         raise ValueError("投递去重 ID 超过飞书的 50 字符上限")
     return value
+
+
+def card_uuid_prefix_for(text_prefix: str) -> str:
+    """由文本去重前缀推出同一投递语义的卡片去重前缀。
+
+    卡片与回落文本各用一个前缀，飞书就不会把「卡片被拒后补发的文本」当成被拒
+    卡片的重试而丢掉；按语义推导而不是全局共用一个卡片前缀，是为了让不同投递
+    语义在同一去重键下仍各算各的。
+    """
+    if not isinstance(text_prefix, str) or not text_prefix.startswith(TEXT_UUID_PREFIX_HEAD):
+        raise ValueError(f"文本去重前缀必须以 {TEXT_UUID_PREFIX_HEAD} 开头才能推出卡片前缀")
+    return CARD_UUID_PREFIX_HEAD + text_prefix[len(TEXT_UUID_PREFIX_HEAD) :]
 
 
 class FeishuGroupMessageError(RuntimeError):
@@ -235,3 +252,61 @@ class FeishuGroupMessages:
         # 只记「发过了」。群 ID 与日报正文都不进日志：正文虽已脱敏，但它是给管理群的，
         # 不是给运维日志的（`V-花名册-33`）。
         logger.info("管理群通知已发送 字符数=%s", len(text))
+
+    def _post_message(
+        self, token: str, *, chat_id: str, msg_type: str, content: Any, uuid: str
+    ) -> None:
+        """向群发一条指定类型的消息并按「通知」档裁定响应；拒绝与不明都抛错。"""
+        response = self._transport(
+            "POST",
+            f"{self._base_url}/im/v1/messages?receive_id_type=chat_id",
+            body={
+                "receive_id": chat_id,
+                "msg_type": msg_type,
+                "content": json.dumps(content, ensure_ascii=False),
+                "uuid": uuid,
+            },
+            token=token,
+        )
+        self._assert_accepted(response)
+
+    def send_notice(self, *, chat_id: str, card: NoticeCard, dedupe_key: str) -> None:
+        """向 `chat_id` 发一张通知卡；飞书明确拒绝卡片时补发一次等价纯文本。
+
+        卡片用 :func:`card_uuid_prefix_for` 推出的前缀，回落文本沿用本实例的文本
+        前缀，两者同一 `dedupe_key`。结果不明（传输异常、缺码、缺回读标识）直接
+        上抛、不补发，由调用方沿用现有重试：同一去重键重试得到同一个卡片去重 ID。
+        """
+        if not isinstance(card, NoticeCard):
+            raise TypeError("send_notice 只接受 NoticeCard")
+        card_uuid = delivery_uuid(
+            chat_id, dedupe_key, prefix=card_uuid_prefix_for(self._uuid_prefix)
+        )
+        fell_back = False
+        try:
+            token = self._tenant_access_token()
+            try:
+                self._post_message(
+                    token,
+                    chat_id=chat_id,
+                    msg_type="interactive",
+                    content=card.to_payload(),
+                    uuid=card_uuid,
+                )
+            except FeishuGroupMessageError as error:
+                if not error.definite:
+                    raise
+                logger.warning("管理群通知卡片被飞书明确拒绝，补发一次纯文本 code=%s", error.code)
+                fell_back = True
+                self._post_message(
+                    token,
+                    chat_id=chat_id,
+                    msg_type="text",
+                    content={"text": card.fallback_text},
+                    uuid=delivery_uuid(chat_id, dedupe_key, prefix=self._uuid_prefix),
+                )
+        except Exception:
+            self._notify_send("message_final", False)
+            raise
+        self._notify_send("message_final", True)
+        logger.info("管理群通知已发送 形式=%s", "纯文本回落" if fell_back else "卡片")
