@@ -221,7 +221,7 @@ REQUIRED_CARD_KEYS: tuple[str, ...] = (
     "query.result",
     "query.failure",
     "query.empty",
-    # #891 通知卡片：用户侧 ``notice.<原文本键>``（色调见
+    # 通知卡片：用户侧 ``notice.<原文本键>``（色调见
     # ``core/delivery/catalog_notice``）；卡片键撤出目录即退回原文本。
     "notice.onboarding.checking",
     "notice.onboarding.matched",
