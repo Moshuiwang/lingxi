@@ -23,6 +23,8 @@ from typing import Any, Protocol
 
 from lingxi.config.content import ContentCatalog, RenderedContent, default_content_catalog
 from lingxi.config.metric_labels import default_metric_labels
+from lingxi.core.delivery.catalog_notice import build_notice_card
+from lingxi.core.delivery.notice_card import NoticeCard
 from lingxi.core.permission.publish_row import (
     ALL_COMPANIES_KEY,
     lookup_metrics,
@@ -61,6 +63,9 @@ class PermissionNotice:
 
     kind: NoticeKind
     content: RenderedContent
+    #: 内容目录登记了 ``notice.<键>`` 卡片时配好的通知卡；未登记时为 ``None``，
+    #: 照旧发 ``text``。卡片的等价纯文本就是 ``text``。
+    card: NoticeCard | None = None
 
     @property
     def key(self) -> str:
@@ -185,16 +190,19 @@ def render_scope_notice(
     source = catalog or default_content_catalog()
     document = parse_permissions(permissions)
     if not lookup_metrics(document):
+        content = source.text(CONTENT_KEY_RANGE_REVOKED)
         return PermissionNotice(
             kind=NoticeKind.RANGE_REVOKED,
-            content=source.text(CONTENT_KEY_RANGE_REVOKED),
+            content=content,
+            card=build_notice_card(source, content, {}),
         )
     companies, functions = describe_scope(document, catalog=source, company_names=company_names)
+    values = {"company_name": companies, "function_name": functions}
+    content = source.text(CONTENT_KEY_RANGE_UPDATED, **values)
     return PermissionNotice(
         kind=NoticeKind.RANGE_UPDATED,
-        content=source.text(
-            CONTENT_KEY_RANGE_UPDATED, company_name=companies, function_name=functions
-        ),
+        content=content,
+        card=build_notice_card(source, content, values),
     )
 
 
@@ -220,6 +228,10 @@ class UserMessageSender(Protocol):
     def send_text(self, *, open_id: str, text: str, dedupe_key: str) -> None:
         """发送一条文本消息；失败时抛异常。"""
         ...
+
+    # 可选的 ``send_notice(*, open_id, card, dedupe_key)``：登记了卡片键时改发通知卡，
+    # 飞书明确拒绝才补发一次纯文本、结果不明直接抛出（见适配器同名方法）。没有这个
+    # 方法的发送口照旧只收到文本。
 
 
 class _AuditSink(Protocol):
@@ -312,15 +324,22 @@ class PermissionNoticeDispatcher:
         self,
         *,
         open_id: str,
-        text: str,
+        notice: PermissionNotice,
         dedupe_key: str,
         user_id: str,
         permission_version: int,
         attempt_no: int,
     ) -> str | None:
-        """尝试发送一次；成功返回 ``None``，失败返回错误分类并记一条警告日志。"""
+        """尝试发送一次；成功返回 ``None``，失败返回错误分类并记一条警告日志。
+
+        配好了卡片且发送口能发卡片时发卡片：明确拒绝的回落在发送口里完成，结果不明
+        在这里按普通失败进入既有重试（同一去重键再发同一张卡），不另补发文本。
+        """
         try:
-            self._sender.send_text(open_id=open_id, text=text, dedupe_key=dedupe_key)
+            if notice.card is not None and hasattr(self._sender, "send_notice"):
+                self._sender.send_notice(open_id=open_id, card=notice.card, dedupe_key=dedupe_key)
+            else:
+                self._sender.send_text(open_id=open_id, text=notice.text, dedupe_key=dedupe_key)
         except Exception as error:  # 通知失败不得阻塞权限生效
             error_code = _error_code(error)
             logger.warning(
@@ -359,7 +378,7 @@ class PermissionNoticeDispatcher:
             self._wait_before_retry(attempt_no)
             last_error = self._send_once(
                 open_id=open_id,
-                text=notice.text,
+                notice=notice,
                 dedupe_key=dedupe_key,
                 user_id=user_id,
                 permission_version=permission_version,

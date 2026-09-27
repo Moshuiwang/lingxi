@@ -22,6 +22,7 @@ from datetime import UTC, datetime
 from typing import Any
 
 from lingxi.config.content import RenderedContent
+from lingxi.core.delivery.catalog_notice import reply_notice_card
 from lingxi.core.ids import new_id
 
 from .commands import (
@@ -278,12 +279,7 @@ class EventPipeline:
         捕获 ``Exception`` 是刻意的——回复失败不得改变任何已经提交的结论。
         """
         try:
-            self._replies.send_text(
-                chat_id=message.chat_id,
-                thread_id=message.thread_id,
-                reply_to_message_id=message.message_id,
-                text=content.text,
-            )
+            self._send_reply_once(message, content)
             self._audit.record(
                 "reply.sent",
                 event_id=message.event_id,
@@ -300,6 +296,29 @@ class EventPipeline:
                 error=f"{type(error).__name__}: {error}",
                 trace_id=message.trace_id,
             )
+
+    def _send_reply_once(self, message: InboundMessage, content: RenderedContent) -> None:
+        """按内容目录的卡片键选形式发一次：有卡片键且回复口能发卡片就发卡片，否则发原文本。
+
+        卡片键未进目录时与卡片化之前逐字相同；卡片的明确拒绝回落与结果不明不补发都由
+        回复口自己负责（``NoticeReplies``），这里不重试、不补发。
+        """
+        send_notice = getattr(self._replies, "send_notice", None)
+        card = reply_notice_card(self._texts.catalog, content) if send_notice else None
+        if card is not None:
+            send_notice(
+                chat_id=message.chat_id,
+                thread_id=message.thread_id,
+                reply_to_message_id=message.message_id,
+                card=card,
+            )
+            return
+        self._replies.send_text(
+            chat_id=message.chat_id,
+            thread_id=message.thread_id,
+            reply_to_message_id=message.message_id,
+            text=content.text,
+        )
 
     def _audit_reply_skipped(self, message: InboundMessage, content: RenderedContent) -> None:
         """停机中跳过一条回复时的留痕。"""
