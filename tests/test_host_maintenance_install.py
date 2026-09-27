@@ -11,8 +11,10 @@ import hashlib
 import json
 import os
 import shutil
+import signal
 import subprocess
 import tempfile
+import time
 import unittest
 from pathlib import Path
 
@@ -147,7 +149,7 @@ class HostMaintenanceFakeRootTest(unittest.TestCase):
                 out[str(p)] = (_sha(p), p.stat().st_mode & 0o7777)
         return out
 
-    def run_script(self, *args: str, **env_extra: str) -> subprocess.CompletedProcess[str]:
+    def script_env(self, **env_extra: str) -> dict[str, str]:
         env = {k: v for k, v in os.environ.items() if not k.startswith("LINGXI_")}
         env.update(
             {
@@ -163,9 +165,12 @@ class HostMaintenanceFakeRootTest(unittest.TestCase):
             }
         )
         env.update(env_extra)
+        return env
+
+    def run_script(self, *args: str, **env_extra: str) -> subprocess.CompletedProcess[str]:
         return subprocess.run(
             ["bash", str(self.inputs / SCRIPT.name), *args],
-            env=env,
+            env=self.script_env(**env_extra),
             capture_output=True,
             text=True,
             timeout=60,
@@ -324,6 +329,81 @@ class HostMaintenanceFakeRootTest(unittest.TestCase):
         self.assert_back_to_original()
         self.assertEqual(result.stdout.count("逐字节一致"), 5, result.stdout)
 
+    # ---------------- 中断：HUP / INT / TERM（ssh 断开）----------------
+
+    def start_apply(self, **env_extra: str) -> subprocess.Popen[str]:
+        env_extra.setdefault("LINGXI_HM_POLL_SECONDS", "0.1")
+        return subprocess.Popen(
+            ["bash", str(self.inputs / SCRIPT.name), "apply", "--yes"],
+            env=self.script_env(**env_extra),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+
+    def wait_for(self, what: str, cond) -> None:  # noqa: ANN001
+        deadline = time.monotonic() + 20
+        while time.monotonic() < deadline:
+            if cond():
+                return
+            time.sleep(0.05)
+        self.fail(f"20 秒内没等到：{what}")
+
+    def calls(self) -> str:
+        log = self.state / "calls.log"
+        return log.read_text(encoding="utf-8") if log.exists() else ""
+
+    def wait_in_first_round(self, proc: subprocess.Popen[str]) -> None:
+        """等到 ① 已写入（单元已换、20-python312.conf 已删）并已进入等轮。"""
+        self.wait_for(
+            "① 写入后进入等轮",
+            lambda: proc.poll() is None
+            and not self.py_dropin.exists()
+            and self.calls().count("InvocationID") >= 2,
+        )
+
+    def test_sighup_during_round_wait_auto_restores(self) -> None:
+        """审核者复现改写：等轮中 ssh 断开（SIGHUP）→ 与失败同一条自动回装，现场逐字节回到安装前。"""
+        proc = self.start_apply(FAKE_ROUND_AFTER="100000")
+        self.wait_in_first_round(proc)
+        self.assertEqual(_sha(self.frag), _sha(CAND_UNIT), "此刻应已处在半装态")
+        proc.send_signal(signal.SIGHUP)
+        out, err = proc.communicate(timeout=30)
+        self.assertEqual(proc.returncode, 129, out + err)
+        self.assertIn("中断，已自动回装", out)
+        self.assertEqual(out.count("逐字节一致"), 5, out)
+        self.assertNotIn("② 回读", out)
+        self.assert_same_outside_backup_root()
+
+    def test_signal_during_restore_is_not_reentered(self) -> None:
+        proc = self.start_apply(FAKE_ROUND_AFTER="100000")
+        self.wait_in_first_round(proc)
+        (self.state / "reload_sleep").write_text("1.5", encoding="utf-8")
+        reloads = self.calls().count("daemon-reload")
+        proc.send_signal(signal.SIGTERM)
+        self.wait_for("回装开始 daemon-reload", lambda: self.calls().count("daemon-reload") > reloads)
+        proc.send_signal(signal.SIGHUP)
+        proc.send_signal(signal.SIGINT)
+        out, err = proc.communicate(timeout=30)
+        self.assertEqual(proc.returncode, 143, out + err)
+        self.assertEqual(out.count("中断，已自动回装"), 1, out)
+        self.assertEqual(out.count("逐字节一致"), 5, out)
+        self.assertEqual(self.calls().count("daemon-reload"), reloads + 1)
+        self.assert_same_outside_backup_root()
+
+    def test_signal_before_any_write_changes_nothing(self) -> None:
+        """前提阶段（候选脚本导入自检）收到信号：直接退出，假根零写入、不建备份目录。"""
+        (self.state / "py_sleep").write_text("1", encoding="utf-8")
+        proc = self.start_apply()
+        self.wait_for("前提阶段导入自检", lambda: "--help" in self.calls())
+        proc.send_signal(signal.SIGHUP)
+        out, err = proc.communicate(timeout=30)
+        self.assertEqual(proc.returncode, 129, out + err)
+        self.assertIn("尚未写入任何目标，未做改动", out)
+        self.assertNotIn("[备份]", out)
+        self.assertEqual(self.snapshot(), self.before)
+        self.assertFalse((self.root / "root" / "lingxi-884-backup").exists())
+
     # ---------------- 编排者 09-27 预发 check 三处接缝 ----------------
 
     def use_release_pull_contract(self) -> Path:
@@ -434,11 +514,11 @@ class HostMaintenanceProductionTest(HostMaintenanceFakeRootTest):
         self.frag.write_text(_old_unit(user=None), encoding="utf-8")
         self.before = self.snapshot()
 
-    def run_script(self, *args: str, **env_extra: str) -> subprocess.CompletedProcess[str]:
+    def script_env(self, **env_extra: str) -> dict[str, str]:
         env_extra.setdefault(
             "LINGXI_HM_PROD_OLD_UNIT_SHA", _sha(self.frag) if self.frag.exists() else "0" * 64
         )
-        return super().run_script(*args, **env_extra)
+        return super().script_env(**env_extra)
 
     def test_refuses_unexpected_unit_diff(self) -> None:
         self.frag.write_text(_old_unit(user=None) + "Restart=on-failure\n", encoding="utf-8")
@@ -455,6 +535,36 @@ class HostMaintenanceProductionTest(HostMaintenanceFakeRootTest):
         self.local_conf.unlink()
         self.before = self.snapshot()
         self.assert_refused(self.run_script("apply", "--yes"), "生产在位单元本体含 User=")
+
+    def test_routine_dump_dir_follows_deploy_user_when_unit_has_no_user(self) -> None:
+        """#886 第 1 处：巡检单元无 User=（按 root 跑）时，回读部署用户的 ~/backups，不读 /root/backups。"""
+        self.local_conf.unlink()
+        sample = self.unit_dir / "lingxi-resource-sample.service"
+        sample.write_text("[Service]\nType=oneshot\n", encoding="utf-8")
+        (self.unit_dir / "lingxi-resource-sample.service.d").mkdir()
+        (self.unit_dir / "lingxi-resource-sample.service.d" / "10-local.conf").write_text(
+            "[Service]\nUser=deployer\n", encoding="utf-8"
+        )
+        root_dumps = self.root / "root" / "backups"
+        root_dumps.mkdir(parents=True)
+        (root_dumps / "c.dump").write_text("x", encoding="utf-8")
+        result = self.run_script("status", LINGXI_HM_ROUTINE_DUMP_DIR="")
+        self.assert_ok(result)
+        self.assertIn("User=root", result.stdout)
+        self.assertIn(
+            "部署用户=deployer（来源：lingxi-resource-sample.service 的有效 User=）", result.stdout
+        )
+        self.assertIn(f"目录 {self.dumps} ", result.stdout)
+        self.assertIn("dump 共 2 份，非 0600 的 1 份", result.stdout)
+        self.assertNotIn(str(root_dumps), result.stdout)
+
+    def test_routine_dump_dir_unknown_deploy_user_skips_instead_of_root(self) -> None:
+        self.local_conf.unlink()
+        (self.root / "root" / "backups").mkdir(parents=True)
+        result = self.run_script("status", LINGXI_HM_ROUTINE_DUMP_DIR="")
+        self.assert_ok(result)
+        self.assertIn("部署用户未知", result.stdout)
+        self.assertNotIn("/root/backups", result.stdout)
 
     def test_production_refuses_unknown_old_unit_sha(self) -> None:
         result = self.run_script("check", LINGXI_HM_PROD_OLD_UNIT_SHA="1" * 64)

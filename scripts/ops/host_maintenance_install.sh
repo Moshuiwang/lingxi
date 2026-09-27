@@ -26,6 +26,8 @@
 #   check          只读：前提逐项核对 + 计划（每步 already / install），零写入                         < 5 秒
 #   apply --yes    前提 → 对齐到整分后约 10 秒 → 备份 → ① → 等轮 → ② → 等轮 → ③ → ④ → 汇总；
 #                  任一步不符自动 restore 并以非零退出；各步已是目标 sha 的打印 already 跳过          ≤ 3 分钟
+#                  中途收到 HUP / INT / TERM（含 ssh 断开）：已开始写入则同样自动回装，打印「中断，已自动回装」
+#                  后以 128+信号号 退出；尚未写入则直接退出、零写入。断开后重新登录先跑 status，需要时 restore --yes
 #   restore --yes  按最近一份完整备份回装（逐字节、保留属主与权限）→ daemon-reload → 回读                 < 5 秒
 #   status         只读汇总：在位 sha、单元有效解释器、最近一轮结果、备份份数、#886 第 1 处回读          < 5 秒
 # 输出只含 sha / 计数 / 状态字段与路径；不读、不打印任何凭据文件内容。
@@ -206,7 +208,24 @@ do_restore() { # $1 = 备份目录
   say "[回装后] 解释器=$(exec_field path "$MONITOR_UNIT") DropInPaths=$(for d in $(sv DropInPaths); do basename -- "$d"; done | tr '\n' ' ')User=$(sv User) 最近一轮 Result=$(sv Result) ExecMainStatus=$(sv ExecMainStatus)"
   (( bad == 0 )) || die "回装后 sha 与备份不一致，请人工核对 $1"; }
 latest_backup() { local d last=""; shopt -s nullglob; for d in "$BACKUP_ROOT"/*/; do [[ -f "$d/complete" ]] && last="${d%/}"; done; shopt -u nullglob; printf '%s' "$last"; }
-auto_restore() { say "第 $1 步不符 → 自动回装 $BK"; do_restore "$BK"; die "第 $1 步不符，已自动回装到安装前状态（见上方回装行）"; }
+auto_restore() { trap '' HUP INT TERM  # 回装期间再来信号一律忽略，不重入（忽略态也传给回装里起的子进程）
+  say "第 $1 步不符 → 自动回装 $BK"; do_restore "$BK"; die "第 $1 步不符，已自动回装到安装前状态（见上方回装行）"; }
+# ---------------- 中断（HUP / INT / TERM；ssh 断开即 HUP） ----------------
+# 本地断开 ssh 不会停下远端脚本的「半截」：不处理就停在任意一步（单元已换、脚本未装）。PHASE 标出现在处在哪段：
+#   pre     前提 / 对齐 / 备份未完成：直接退出；未完成的备份目录（无 complete 标记）删掉，目标文件零写入
+#   armed   完整备份已落、目标可能已写：与步骤失败同一条自动回装，完成后以 128+信号号 退出
+#   done    三步都已装好并回读通过，余下只是只读汇总：不回装，提示用 status 核对
+# 信号在前台子进程结束后才由 bash 处理（等轮里的 sleep 至多 LINGXI_HM_POLL_SECONDS 秒）。
+PHASE=pre
+on_signal() { # $1 = 信号名 $2 = 退出码
+  trap '' HUP INT TERM
+  case "$PHASE" in
+    armed) say "收到 $1 → 中断，自动回装 $BK"; do_restore "$BK"; say "中断，已自动回装（收到 $1；见上方回装行）"; exit "$2" ;;
+    done) say "收到 $1 → 中断；三步已装好并回读通过，未回装（用 status 核对，需要时 restore --yes）"; exit "$2" ;;
+    *) if [[ -n "$BK" && -d "$BK" && ! -f "$BK/complete" ]]; then rm -rf -- "$BK"; fi
+       say "收到 $1 → 中断，尚未写入任何目标，未做改动"; exit "$2" ;;
+  esac; }
+trap 'on_signal HUP 129' HUP; trap 'on_signal INT 130' INT; trap 'on_signal TERM 143' TERM
 
 # ---------------- 等下一整分轮 ----------------
 align_minute() { # 整分后约 10 秒动手：巡检每分钟 :00 触发，动手时刻落在两轮之间
@@ -264,9 +283,26 @@ step_bak() {
   say "③ 回读 $BAK_DST sha=$(sha_of "$BAK_DST") mode=$(stat -c %a -- "$BAK_DST") bash -n=$(bash -n "$BAK_DST" 2>/dev/null && echo ok || echo fail) 单元 ExecStart 末段=${argv##* }"
   [[ "$(sha_of "$BAK_DST")" == "${WANT[db_backup.sh]}" ]] && bash -n "$BAK_DST" 2>/dev/null && [[ "$ROOT${argv##* }" == "$BAK_DST" ]]; }
 
+# 部署用户（#886 第 1 处回读用）：宿主契约没有「用户」键，/opt/lingxi/deploy 是 root 0700（引导安装 F14），都不能当依据。
+# 依据是仓库既有约定「以部署用户运行的单元一律经 drop-in 10-local.conf 提供 User=」（deploy/监控告警.md「三.3」第 5 步、
+# 生产部署runbook rc25 S-5 终态回读）：先取巡检单元自己的 User=，没有再依次取资源采样 / 业务采样 / 日志收集单元的有效 User=；
+# 取到 root 或都取不到即为「未知」，不回退到 /root。
+deploy_user() {
+  local u unit
+  for unit in "$MONITOR_UNIT" lingxi-resource-sample.service lingxi-db-business-sample.service lingxi-log-collect.service; do
+    if [[ "$unit" == "$MONITOR_UNIT" ]]; then u="$PRE_USER"; else u="$(sv User "$unit")"; fi
+    if [[ -n "$u" && "$u" != root ]]; then DEPLOY_USER="$u"; DEPLOY_USER_SOURCE="$unit 的有效 User="; return 0; fi
+  done
+  DEPLOY_USER=""; DEPLOY_USER_SOURCE=""; }
 umask_readback() { # #886 第 1 处：部署用户 ~/backups 例行 dump 的权限位，只读
   local dir="${LINGXI_HM_ROUTINE_DUMP_DIR:-}" home n bad newest
-  if [[ -z "$dir" ]]; then home="$(getent passwd "${PRE_USER:-root}" 2>/dev/null | cut -d: -f6 || true)"; dir="$ROOT${home:-/nonexistent}/backups"; fi
+  if [[ -n "$dir" ]]; then say "[#886 第 1 处] 目录取自 LINGXI_HM_ROUTINE_DUMP_DIR"
+  else
+    deploy_user
+    if [[ -z "$DEPLOY_USER" ]]; then say "[#886 第 1 处] 部署用户未知（巡检与采样单元都没有非 root 的 User=），跳过；可设 LINGXI_HM_ROUTINE_DUMP_DIR 指定目录"; return 0; fi
+    home="$(getent passwd "$DEPLOY_USER" 2>/dev/null | cut -d: -f6 || true)"; home="${home:-/home/$DEPLOY_USER}"
+    dir="$ROOT$home/backups"; say "[#886 第 1 处] 部署用户=$DEPLOY_USER（来源：$DEPLOY_USER_SOURCE）"
+  fi
   if [[ ! -d "$dir" ]]; then say "[#886 第 1 处] $dir absent"; return 0; fi
   n="$(find "$dir" -maxdepth 1 -type f -name '*.dump' | wc -l)"; bad="$(find "$dir" -maxdepth 1 -type f -name '*.dump' ! -perm 600 | wc -l)"
   newest="$(find "$dir" -maxdepth 1 -type f -name '*.dump' -printf '%T@ %p\n' | sort -n | tail -n1 | cut -d' ' -f2-)"
@@ -290,14 +326,15 @@ case "$SUB" in
     preflight; plan_steps; require_ok
     if (( NEED_UNIT + NEED_MON + NEED_BAK == 0 )); then
       say "三步全部 already，未改动；最近一轮 Result=$(sv Result) ExecMainStatus=$(sv ExecMainStatus)"; umask_readback; summary; exit 0; fi
-    align_minute; make_backup
+    align_minute; make_backup; PHASE=armed
     step_unit || auto_restore ①
     step_mon || auto_restore ②
     step_bak || auto_restore ③
+    PHASE=done
     umask_readback; summary; say "apply 完成（备份留在 $BK，需要时 restore --yes）" ;;
   restore)
     [[ "$CONFIRM" == --yes ]] || die "restore 会改主机，须写 restore --yes"
     BK="$(latest_backup)"; [[ -n "$BK" ]] || die "$BACKUP_ROOT 下没有完整备份"
-    say "[回装] 取最近备份 $BK"; do_restore "$BK"; say "restore 完成" ;;
+    trap '' HUP INT TERM; say "[回装] 取最近备份 $BK"; do_restore "$BK"; say "restore 完成" ;;
   *) die "未知子命令 $SUB（check|apply --yes|restore --yes|status）" ;;
 esac

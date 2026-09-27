@@ -400,6 +400,41 @@ class RunTest(_Base):
         self.assertEqual(resumed.returncode, 0, resumed.stdout + resumed.stderr)
         self.assertIn("switch recreate-services", self.calls())
 
+    def _verified_round(self) -> None:
+        self.assertEqual(self.run_script("wipe", "--yes").returncode, 0)
+        done = self.run_script("run", str(self.dump), "--until=verify")
+        self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
+        self.assertIn("verify 零差异", done.stdout)
+
+    def test_pass_record_is_bound_to_dump_sha(self) -> None:
+        # B1'：本轮有 verify 通过记录，但 --from=dsn 换成另一份 dump 仍拒绝（记录须与 dump sha 相同）
+        self._verified_round()
+        other = self.backups / "lingxi-db-20260927T120000Z.dump"
+        other.write_bytes(b"PGDMP other fake archive")
+        (self.backups / f"{other.name}.sha256").write_text(
+            f"{_sha(other)}  {other.name}\n", encoding="utf-8"
+        )
+        (self.backups / f"{other.name}.counts.json").write_text(COUNTS_JSON, encoding="utf-8")
+        env_before = self.env_digest()
+        result = self.run_script("run", str(other), "--from=dsn")
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertIn(f"没有这份 dump（sha256 {_sha(other)}）的 verify 通过记录", result.stderr)
+        self.assertEqual(self.env_digest(), env_before)
+        same = self.run_script("run", str(self.dump), "--from=dsn", "--until=dsn")
+        self.assertEqual(same.returncode, 0, same.stdout + same.stderr)
+
+    def test_rerun_restore_voids_pass_record(self) -> None:
+        # B7'：重跑 --from=restore（步骤开始即作废记录；目标非空时步骤本身随后拒绝）后 --from=dsn 被拒
+        self._verified_round()
+        redo = self.run_script("run", str(self.dump), "--from=restore", "--until=restore")
+        self.assertEqual(redo.returncode, 1, redo.stdout + redo.stderr)
+        self.assertIn("步骤 restore 开始", redo.stdout)
+        result = self.run_script("run", str(self.dump), "--from=dsn")
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertIn("verify 通过记录", result.stderr)
+        state = (self.drill() / "state.env").read_text(encoding="utf-8")
+        self.assertIn("RTS_VERIFY_OK=\n", state + "\n")
+
     def test_verify_compares_acl_content_not_presence(self) -> None:
         # B10：目标上某张表的授权内容变了（仍非空）→ verify 报差异、不进 dsn
         self.assertEqual(self.run_script("wipe", "--yes").returncode, 0)

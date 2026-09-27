@@ -8,7 +8,9 @@
 - 轮次状态在 ``FAKE_STATE/units.json``：每读一次 ``InvocationID`` 计一次轮询，满 ``FAKE_ROUND_AFTER``
   （缺省 2）次就「跑完一轮」——换新 ``InvocationID``，结果取 ``FAKE_STATE/rounds.txt`` 第一行
   （``success 0`` / ``exit-code 1``，读后删去；文件空或不存在按成功）；``FAKE_STATE/no_rounds`` 存在则永不出新轮；
-- 定时器是否 active 以 ``FAKE_STATE/<单元>.active`` 为准；每次调用逐行追加到 ``FAKE_STATE/calls.log``。
+- 定时器是否 active 以 ``FAKE_STATE/<单元>.active`` 为准；每次调用逐行追加到 ``FAKE_STATE/calls.log``；
+- 中断用例用的两个减速开关：``FAKE_STATE/reload_sleep``（``daemon-reload`` 睡这么多秒，把回装拉长）、
+  ``FAKE_STATE/py_sleep``（假解释器非 ``-c`` 调用睡这么多秒，把前提阶段拉长）。
 
 遇到没模拟的调用形状一律非零退出，让用例红在明处。
 """
@@ -19,7 +21,7 @@ import sys
 from pathlib import Path
 
 FAKE_SYSTEMCTL = r"""#!__PYTHON__
-import json, os, sys
+import json, os, sys, time
 from pathlib import Path
 
 st = Path(os.environ["FAKE_STATE"])
@@ -72,6 +74,9 @@ def new_round(u):
 cmd = args[0] if args else ""
 rest = args[1:]
 if cmd == "daemon-reload":
+    slow = st / "reload_sleep"
+    if slow.exists():
+        time.sleep(float(slow.read_text(encoding="utf-8").strip() or "1"))
     sys.exit(0)
 if cmd == "is-active":
     active = (st / (rest[0] + ".active")).exists()
@@ -146,6 +151,7 @@ FAKE_PYTHON = r"""#!/usr/bin/env bash
 st="${FAKE_STATE:?}"
 printf 'python %s\n' "$*" >> "$st/calls.log"
 if [[ "${1:-}" == -c ]]; then cat "$st/py_version" 2>/dev/null || echo 3.12.3; exit 0; fi
+[[ -f "$st/py_sleep" ]] && sleep "$(cat "$st/py_sleep")"
 [[ -f "$st/py_help_fail" ]] && { echo "ImportError: cannot import name 'UTC'" >&2; exit 1; }
 exit 0
 """
