@@ -13,6 +13,7 @@ from __future__ import annotations
 import importlib.util
 import json
 import os
+import re
 import stat
 import sys
 import tempfile
@@ -1443,11 +1444,55 @@ class BackupStatusLogicTests(unittest.TestCase):
         )
         breaches = self._breaches(both_failed)
         self.assertTrue(breaches[host_health_alert.DB_BACKUP_FAILED])
-        self.assertFalse(breaches[host_health_alert.DB_BACKUP_TRANSFER_FAILED])
+        # #884 F20：本地备份失败时传输是否成功无从得知，传输键这一轮不出结论（不参与），
+        # 否则已告警的「传输失败」会被判成恢复。
+        self.assertNotIn(host_health_alert.DB_BACKUP_TRANSFER_FAILED, breaches)
         no_transfer = host_health_alert.parse_backup_status(
             self._raw(transfer={"mode": "none", "ok": None, "label": ""})
         )
         self.assertFalse(self._breaches(no_transfer)[host_health_alert.DB_BACKUP_TRANSFER_FAILED])
+
+
+    def test_uninterpretable_transfer_section_raises_transfer_code(self) -> None:
+        """#884 F19：缺 transfer 段、transfer 不是对象、ok 是字符串、scp 成功却没有传输结论。"""
+
+        raw_missing = self._raw()
+        del raw_missing["transfer"]
+        cases = {
+            "missing": raw_missing,
+            "not-a-mapping": self._raw(transfer="scp"),
+            "ok='false'": self._raw(transfer={"mode": "scp", "ok": "false", "label": "x"}),
+            "ok=0": self._raw(transfer={"mode": "scp", "ok": 0, "label": "x"}),
+            "scp-without-verdict": self._raw(transfer={"mode": "scp", "ok": None, "label": "x"}),
+        }
+        for name, raw in cases.items():
+            with self.subTest(case=name):
+                with self.assertRaises(ValueError) as ctx:
+                    host_health_alert.parse_backup_status(raw)
+                self.assertEqual(str(ctx.exception), "transfer")
+
+    def test_failed_backup_may_carry_no_transfer_verdict(self) -> None:
+        status = host_health_alert.parse_backup_status(
+            self._raw(ok=False, error="dump_failed", transfer={"mode": "scp", "ok": None})
+        )
+        self.assertIsNone(status.transfer_ok)
+
+    def test_future_finished_at_is_unknown_beyond_clock_skew_tolerance(self) -> None:
+        """#884 F19：完成时间在未来（超出时钟误差容忍）判未知，三个正常判据这一轮不出结论。"""
+
+        within = host_health_alert.parse_backup_status(
+            self._raw(finished_at=(self.NOW + timedelta(minutes=4)).isoformat())
+        )
+        self.assertFalse(self._breaches(within)[host_health_alert.DB_BACKUP_UNKNOWN])
+        future = host_health_alert.parse_backup_status(
+            self._raw(finished_at=(self.NOW + timedelta(hours=2)).isoformat())
+        )
+        checks = host_health_alert.judge_backup_status(future, now=self.NOW, max_age_hours=26.0)
+        self.assertEqual(
+            [(key, breached) for key, _label, breached, _detail, _required in checks],
+            [(host_health_alert.DB_BACKUP_UNKNOWN, True)],
+        )
+        self.assertIn("future_timestamp", checks[0][3])
 
 
 class DbQueryLogicTests(unittest.TestCase):
@@ -1664,6 +1709,15 @@ class RunLocalDbIntegrationTests(unittest.TestCase):
         state = host_health_alert.load_threshold_state(self.threshold_state_path)
         return {key for key, value in state.items() if value.alerting}
 
+    def _dry_run_actions(self, extra_argv: list[str] | None = None) -> set[tuple[str, str]]:
+        """故障注入的 dry-run 一轮（#859 S-4-4 同法）：只判不发、不落盘，从日志取
+        「本会发送」的 (键, 动作)。"""
+
+        self.log_path.unlink(missing_ok=True)
+        self.assertEqual(self._round(["--dry-run", *(extra_argv or [])]), [])
+        log = self.log_path.read_text(encoding="utf-8")
+        return set(re.findall(r"dry-run，未真实发送 threshold=(\S+) action=(\S+)", log))
+
     def test_without_db_container_flag_none_of_the_four_checks_run(self) -> None:
         # 状态文件缺失、两条查询都会失败——但没给 --db-container 就一处都不该碰。
         self.status_path.unlink()
@@ -1734,14 +1788,18 @@ class RunLocalDbIntegrationTests(unittest.TestCase):
         self.assertEqual(len(texts), 1)
         self.assertIn("本地库备份传输失败：上次备份成功但副本传输失败（方式 scp）", texts[0])
         self.assertEqual(self._alerting_keys(), {host_health_alert.DB_BACKUP_TRANSFER_FAILED})
-        # 备份本身失败时只报失败，不再叠一条传输失败（传输失败随之恢复）。
+        # 备份本身失败时只报失败，不再叠一条传输失败；传输键不出结论、告警记忆原样保留
+        # （#884 F20：不得在本地仍失败时发「副本已恢复」）。
         self._write_status(ok=False, error="pg_dump_failed", transfer={"mode": "scp", "ok": False})
         texts = self._round()
         self.assertEqual(
-            sorted(t.splitlines()[1].split("：")[0] for t in texts),
-            ["本地库备份传输失败", "本地库备份失败"],
+            [t.splitlines()[1].split("：")[0] for t in texts],
+            ["本地库备份失败"],
         )
-        self.assertEqual(self._alerting_keys(), {host_health_alert.DB_BACKUP_FAILED})
+        self.assertEqual(
+            self._alerting_keys(),
+            {host_health_alert.DB_BACKUP_FAILED, host_health_alert.DB_BACKUP_TRANSFER_FAILED},
+        )
 
     def test_unknown_status_five_shapes_each_alert_once_dedupe_recover_then_realert(self) -> None:
         def break_missing() -> None:
@@ -1808,6 +1866,101 @@ class RunLocalDbIntegrationTests(unittest.TestCase):
             texts = self._round()
         self.assertEqual(len(texts), 1)
         self.assertIn("（unreadable）", texts[0])
+
+    def test_non_utf8_status_file_alerts_unknown_without_interrupting_other_checks(self) -> None:
+        """#884 F18：状态文件不是 UTF-8 → 该项判未知告警，同轮 WAL 检查照常出结论。"""
+
+        self.status_path.write_bytes(b'\xff\xfe{"schema":1,"ok":\xc3true}')
+        self._set_wal("5000")
+        wal_limit = ["--db-wal-alert-bytes", "1000"]
+        self.assertEqual(
+            self._dry_run_actions(wal_limit),
+            {
+                (host_health_alert.DB_BACKUP_UNKNOWN, "alert"),
+                (host_health_alert.DB_WAL_LARGE, "alert"),
+            },
+        )
+        self.assertFalse(self.threshold_state_path.exists(), "dry-run 不落盘")
+        texts = self._round(wal_limit)
+        self.assertEqual(
+            sorted(t.splitlines()[1].split("：")[0] for t in texts),
+            ["本地库 WAL 过大", "本地库备份状态未知"],
+        )
+        self.assertTrue(any("（invalid_encoding）" in t for t in texts))
+        self.assertEqual(
+            self._alerting_keys(),
+            {host_health_alert.DB_BACKUP_UNKNOWN, host_health_alert.DB_WAL_LARGE},
+        )
+
+    def test_uninterpretable_status_shapes_alert_unknown_instead_of_normal(self) -> None:
+        """#884 F19：未来时间 / 传输结论是字符串 / 缺 transfer 段——都不得判正常。"""
+
+        def future() -> None:
+            self._write_status(finished_at=self.now + timedelta(hours=2))
+
+        def string_false() -> None:
+            self._write_status(transfer={"mode": "scp", "ok": "false", "label": "stage"})
+
+        def missing_transfer() -> None:
+            self._write_status()
+            raw = json.loads(self.status_path.read_text(encoding="utf-8"))
+            del raw["transfer"]
+            self.status_path.write_text(json.dumps(raw), encoding="utf-8")
+
+        shapes = {
+            "future_timestamp": future,
+            "transfer": string_false,
+            "transfer-missing": missing_transfer,
+        }
+        for name, break_file in shapes.items():
+            with self.subTest(shape=name):
+                self.threshold_state_path.unlink(missing_ok=True)
+                break_file()
+                self.assertEqual(
+                    self._dry_run_actions(), {(host_health_alert.DB_BACKUP_UNKNOWN, "alert")}
+                )
+                texts = self._round()
+                self.assertEqual(len(texts), 1)
+                reason = name.split("-")[0]
+                self.assertIn(f"本地库备份状态未知：状态文件读不到或不合法（{reason}）", texts[0])
+                self.assertEqual(self._alerting_keys(), {host_health_alert.DB_BACKUP_UNKNOWN})
+                self._write_status()
+                texts = self._round()
+                self.assertEqual(len(texts), 1)
+                self.assertIn("本地库备份状态未知：已恢复正常", texts[0])
+
+    def test_transfer_recovery_needs_local_success_and_transfer_success(self) -> None:
+        """#884 F20：传输失败告警后本地备份又失败——不得发「副本已恢复」；两者都成功才恢复。"""
+
+        self._write_status(transfer={"mode": "scp", "ok": False, "label": "stage"})
+        self.assertEqual(len(self._round()), 1)
+        self.assertEqual(self._alerting_keys(), {host_health_alert.DB_BACKUP_TRANSFER_FAILED})
+
+        self._write_status(ok=False, error="dump_failed", transfer={"mode": "scp", "ok": None})
+        self.assertEqual(self._dry_run_actions(), {(host_health_alert.DB_BACKUP_FAILED, "alert")})
+        texts = self._round()
+        self.assertEqual(len(texts), 1)
+        self.assertIn("本地库备份失败：上次备份失败，错误码 dump_failed", texts[0])
+        self.assertFalse(any("已恢复正常" in t for t in texts))
+        self.assertEqual(
+            self._alerting_keys(),
+            {host_health_alert.DB_BACKUP_FAILED, host_health_alert.DB_BACKUP_TRANSFER_FAILED},
+        )
+
+        self._write_status()
+        self.assertEqual(
+            self._dry_run_actions(),
+            {
+                (host_health_alert.DB_BACKUP_FAILED, "recovery"),
+                (host_health_alert.DB_BACKUP_TRANSFER_FAILED, "recovery"),
+            },
+        )
+        texts = self._round()
+        self.assertEqual(
+            sorted(t.splitlines()[1] for t in texts),
+            ["本地库备份传输失败：已恢复正常", "本地库备份失败：已恢复正常"],
+        )
+        self.assertEqual(self._alerting_keys(), set())
 
     def test_connections_79_percent_silent_80_percent_alerts_then_recovers(self) -> None:
         self._set_connections("79|100")
