@@ -243,7 +243,9 @@ class DbSwitchToLocalFakeRootTest(_FakeRootBase):
             .read_text(encoding="utf-8")
             .strip()
         )
-        (work / "source-facts.json").write_text('{"counts" : {"tables" : 2}, "datcollversion" : "153.1"}', encoding="utf-8")
+        (work / "source-facts.json").write_text(
+            '{"counts" : {"tables" : 2}, "datcollversion" : "153.1"}', encoding="utf-8"
+        )
         (work / "source.dump.sha256").write_text("ab" * 32 + "  source.dump\n", encoding="utf-8")
         passed = self.run_script("verify")
         self.assertEqual(passed.returncode, 0, passed.stdout + passed.stderr)

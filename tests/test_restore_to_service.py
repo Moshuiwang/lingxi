@@ -639,7 +639,9 @@ class RealDatabaseTest(_Base):
         # B10：恢复后把一张表的授权改成另一组（仍非空）→ verify 报差异
         restored = self.run_script("run", str(self.real_dump), "--from=roles", "--until=verify")
         self.assertEqual(restored.returncode, 0, restored.stdout + restored.stderr)
-        self.psql('REVOKE SELECT ON public.t1 FROM "Weird Role"; GRANT INSERT ON public.t1 TO "Weird Role";')
+        self.psql(
+            'REVOKE SELECT ON public.t1 FROM "Weird Role"; GRANT INSERT ON public.t1 TO "Weird Role";'
+        )
         result = self.run_script("run", str(self.real_dump), "--from=verify", "--until=verify")
         self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
         self.assertIn("acl|ACL public TABLE t1|", result.stdout)
