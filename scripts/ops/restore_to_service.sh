@@ -14,7 +14,8 @@
 #                         host（空白核对 → 仓库 compose / 新口令 / hosts 行 / 容器 healthy，经 db_switch install-pg）
 #                         → roles（角色骨架：从 dump 的属主 / ACL / 默认权限 / 策略引用派生，不写死个数）
 #                         → restore（目标须空；TOC 去掉目标已在位的 SCHEMA / EXTENSION 条目；不带 --no-owner）
-#                         → verify（.counts.json 逐表行数 / 序列 / alembic / 扩展 + TOC 属主 / ACL + 清理函数属主链）
+#                         → verify（.counts.json 逐表行数 / 序列 / alembic / 扩展 + TOC 属主 + 逐条目授权内容 + 清理函数属主链；
+#                           授权内容 = dump 与目标库 pg_dump --schema-only 两侧每个 ACL / DEFAULT ACL 条目下的 GRANT / REVOKE 原文）
 #                         → dsn（八份 env 的本地库连接串改用新口令；先备份；指向别处即拒绝）
 #                         → services（db_switch recreate-services，三服务 healthy）→ timers（起三个 timer）。
 #                         每步打印 UTC 时刻；计时以 docker（容器 StartedAt / 健康日志）与 systemd 记录为准，末尾打分段时长表。
@@ -26,6 +27,15 @@
 # 停止条件：任一「错误：」行即停（已做的步骤不自动撤销，现场保留）；verify 出「差异」不得进入 dsn；
 # services 超时 → 先看 docker ps -a / 容器日志，再决定重跑 `run <dump> --from=services` 或 rollback --yes。
 # 保留目录（<LINGXI_RESTORE_ROOT>/<轮次>/wiped/）本脚本从不删除，演练收尾由编排者决定清理。
+# 续跑守门：run --from=dsn / services / timers 须有本轮、同一 dump sha 的 verify 通过记录（RTS_VERIFY_OK），
+# 否则拒绝并提示先从 verify 跑；host / roles / restore / verify 任一步开始即作废该记录（verify 失败不留通过记录）。
+# wipe 记账先于移动：manifest.tsv 先写「pending」行再 mv，mv 成功后改「done」；rollback 按现场逐目录判断
+# （保留目录里有 → 移回；保留目录里没有而原路径在 → 已恢复，打印 already 跳过），可在部分完成后直接重跑。
+# 已知边界（外审 #898 W4 B4 / B9，编排者裁定接受）：
+#   B4 备份保护只按路径字符串比较（不解析符号链接）、不守 LINGXI_RESTORE_ROOT 本身：触发须刻意把路径环境变量指向备份目录，
+#      输入只从仓库同一提交的输入文件取，不接受这种配置；
+#   B9 recreate-services 半途留下缺失的服务容器时，rollback 末尾的 recreate-services 同样会被「三容器不全」挡住：
+#      按 db_switch_to_local.sh 的报错手工重跑部署器补齐容器，再重跑 rollback --yes（目录与 env 还原已幂等）。
 # 测试形：非 root + LINGXI_S30_ROOT=<假根>（与 db_switch_to_local.sh 同一约定；docker / systemctl / 切换脚本可注入桩）。
 set -euo pipefail
 export LC_ALL=C
@@ -170,9 +180,25 @@ TOC_REL = re.compile(r"^\d+; \d+ \d+ (TABLE|SEQUENCE|VIEW|MATERIALIZED VIEW) pub
 TOC_FUNC = re.compile(r"^\d+; \d+ \d+ FUNCTION public ([^(\s]+)\(.*\) (\S+)$")
 TOC_SCHEMA = re.compile(r"^\d+; \d+ \d+ SCHEMA - (\S+) (\S+)$")
 TOC_EXT = re.compile(r"^\d+; \d+ \d+ EXTENSION - (\S+)\s*$")
-ACL_REL = re.compile(r"^\d+; 0 0 ACL public (?:TABLE|SEQUENCE|VIEW|MATERIALIZED VIEW) (\S+) \S+$")
-ACL_FUNC = re.compile(r"^\d+; 0 0 ACL public FUNCTION ([^(\s]+)\(")
-ACL_SCHEMA = re.compile(r"^\d+; 0 0 ACL - SCHEMA (\S+) \S+$")
+SQL_HEAD = re.compile(r"^-- Name: (.*); Type: (.*); Schema: (\S+); Owner: ?(.*)$")
+
+
+def acl_blocks(path):
+    """schema-only SQL（dump 侧 pg_restore -f -、目标侧 pg_dump --schema-only，同一 pg_dump 大版本）里的授权原文：
+    每个 ACL / DEFAULT ACL 条目 → 其下全部 GRANT / REVOKE 语句（被授权角色、权限位、WITH GRANT OPTION 都在语句里）。"""
+    blocks, cur = {}, None
+    for line in open(path, encoding="utf-8").read().splitlines():
+        m = SQL_HEAD.match(line)
+        if m:
+            cur = None
+            if m.group(2) in ("ACL", "DEFAULT ACL"):
+                cur = "%s %s %s" % (m.group(2), m.group(3), m.group(1))
+                blocks.setdefault(cur, [])
+            continue
+        if cur is None or not line.strip() or line.startswith("--") or line.startswith("\\"):
+            continue  # 空行 / 注释 / psql 元命令（pg_dump 17 的 \restrict 随机键）不进比对
+        blocks[cur].append(line)
+    return {k: sorted(v) for k, v in blocks.items()}
 
 
 def tocfilter(schemas, exts, out):
@@ -200,7 +226,7 @@ def manifest(path):
     print("%s %d %d" % (data.get("alembic_head"), len(data["tables"]), sum(data["tables"].values())))
 
 
-def verify(counts_path, toc_path, target_path):
+def verify(counts_path, toc_path, target_path, dump_sql_path, target_sql_path):
     want = json.load(open(counts_path, encoding="utf-8"))
     have = json.load(open(target_path, encoding="utf-8"))
     toc = open(toc_path, encoding="utf-8").read().splitlines()
@@ -218,7 +244,7 @@ def verify(counts_path, toc_path, target_path):
                 diff(sec, key, w.get(key), h.get(key))
     if sorted(want.get("extensions") or []) != sorted(have.get("extensions") or []):
         diff("extensions", "*", sorted(want.get("extensions") or []), sorted(have.get("extensions") or []))
-    rel_owner, func_owner, schema_owner, acl_rel, acl_func, acl_schema = {}, {}, {}, set(), set(), set()
+    rel_owner, func_owner, schema_owner = {}, {}, {}
     for line in toc:
         m = TOC_REL.match(line)
         if m:
@@ -229,10 +255,6 @@ def verify(counts_path, toc_path, target_path):
         m = TOC_SCHEMA.match(line)
         if m:
             schema_owner[m.group(1)] = m.group(2)
-        for pat, bucket in ((ACL_REL, acl_rel), (ACL_FUNC, acl_func), (ACL_SCHEMA, acl_schema)):
-            m = pat.match(line)
-            if m:
-                bucket.add(m.group(1))
     for name, owner in sorted(rel_owner.items()):
         if (have.get("rel_owners") or {}).get(name) != owner:
             diff("owner", "relation:" + name, owner, (have.get("rel_owners") or {}).get(name))
@@ -242,9 +264,11 @@ def verify(counts_path, toc_path, target_path):
     for name, owner in sorted(schema_owner.items()):
         if (have.get("schema_owners") or {}).get(name) != owner:
             diff("owner", "schema:" + name, owner, (have.get("schema_owners") or {}).get(name))
-    for bucket, key, label in ((acl_rel, "rel_acl", "relation"), (acl_func, "func_acl", "function"), (acl_schema, "schema_acl", "schema")):
-        for name in sorted(bucket - set(have.get(key) or [])):
-            diff("acl", label + ":" + name, "有授权条目", "无 ACL")
+    # 授权内容逐条目比对（B10）：dump 与目标两侧的 GRANT / REVOKE 原文，多 / 少 / 不同都算差异
+    acl_want, acl_have = acl_blocks(dump_sql_path), acl_blocks(target_sql_path)
+    for key in sorted(set(acl_want) | set(acl_have)):
+        if acl_want.get(key) != acl_have.get(key):
+            diff("acl", key, acl_want.get(key), acl_have.get(key))
     if "lingxi_retention_cleanup" in func_owner and not (have.get("retention_cleanup") or {}).get("prosecdef"):
         diff("retention_cleanup", "prosecdef", True, (have.get("retention_cleanup") or {}).get("prosecdef"))
     for line in diffs:
@@ -252,7 +276,7 @@ def verify(counts_path, toc_path, target_path):
     print("SUMMARY 表 %d 张（逐表行数）、序列 %d、alembic %s、扩展 %d、属主 %d 项、ACL %d 项、清理函数属主链 %s" % (
         len(want.get("tables") or {}), len(want.get("sequences") or {}), want.get("alembic_head"),
         len(want.get("extensions") or []), len(rel_owner) + len(func_owner) + len(schema_owner),
-        len(acl_rel) + len(acl_func) + len(acl_schema),
+        len(acl_want),
         json.dumps(have.get("retention_cleanup"), ensure_ascii=False)))
     sys.exit(1 if diffs else 0)
 
@@ -323,6 +347,9 @@ start_timers() {
 }
 
 # ============================ wipe ============================
+manifest_mark() { # $1 名 $2 状态：改写 manifest.tsv 里该名的第三列（先临时文件再 mv）
+  awk -v n="$1" -v st="$2" 'BEGIN { FS = OFS = "\t" } $1 == n { $3 = st } { print }' "$DRILL/wiped/manifest.tsv" > "$DRILL/wiped/manifest.tsv.tmp"
+  mv -f -- "$DRILL/wiped/manifest.tsv.tmp" "$DRILL/wiped/manifest.tsv"; }
 do_wipe() {
   need_yes "${1:-}"; need_stage
   say "== wipe：可逆（只移动不删除）；回退 = rollback --yes"
@@ -339,8 +366,9 @@ do_wipe() {
   compose_db down > "$DRILL/compose-down.log" 2>&1 || die "compose down 失败：见 $DRILL/compose-down.log"
   [[ "$(db_state "$DB_CONTAINER")" == absent ]] || die "down 之后本地库容器仍在：$DB_CONTAINER"
   : > "$DRILL/wiped/manifest.tsv"
-  while IFS=$'\t' read -r name path; do
-    if [[ -e "$path" ]]; then mv -- "$path" "$DRILL/wiped/$name"; printf '%s\t%s\n' "$name" "$path" >> "$DRILL/wiped/manifest.tsv"; say "[移走] $path → $DRILL/wiped/$name"
+  while IFS=$'\t' read -r name path; do  # 先记账（pending）再移动、移动成功后标 done：任一时刻被杀，rollback 都认得这个目录（B3）
+    if [[ -e "$path" ]]; then printf '%s\t%s\tpending\n' "$name" "$path" >> "$DRILL/wiped/manifest.tsv"
+      mv -- "$path" "$DRILL/wiped/$name"; manifest_mark "$name" "done"; say "[移走] $path → $DRILL/wiped/$name"
     else say "[移走] $path 不存在，跳过"; fi
   done < <(move_targets)
   if [[ -f "$HOSTS_FILE" ]]; then
@@ -356,7 +384,7 @@ do_wipe() {
 }
 
 # ============================ run ============================
-DUMP=""
+DUMP=""; DUMP_SHA=""
 dump_sql() { # dump 的 schema-only SQL 文本：本地库容器在跑就借它的 pg_restore，否则一次性容器（不联网）
   if [[ "$(db_state "$DB_CONTAINER")" != absent ]]; then "$DOCKER" exec -i "$DB_CONTAINER" pg_restore --schema-only -f - < "$DUMP"
   else "$DOCKER" run --rm -i --network none "$PG_IMAGE" pg_restore --schema-only -f - < "$DUMP"; fi
@@ -367,6 +395,7 @@ check_dump() {
   local want have; want="$(cut -d' ' -f1 < "$DUMP.sha256")"; have="$(sha256sum -- "$DUMP" | cut -d' ' -f1)"
   [[ "$want" =~ ^[0-9a-f]{64}$ && "$want" == "$have" ]] || die "dump 校验和不符（.sha256 记 ${want:-空}，实算 $have），拒绝恢复"
   local m; m="$(helper manifest "$DUMP.counts.json")" || die "行数清单不可用：$m"
+  DUMP_SHA="$have"
   say "输入：$(basename -- "$DUMP")（sha256 相符 $have）；清单 alembic / 表数 / 总行数 = $m"
 }
 locale_args() { # 仓库 compose.db.yaml 的 LINGXI_DB_INITDB_ARGS 缺省值 → preflight.env 的 locale 五项
@@ -461,18 +490,26 @@ SQL
 step_verify() {
   [[ -f "$DRILL/dump.toc" ]] || "$DOCKER" exec -i "$DB_CONTAINER" pg_restore -l < "$DUMP" > "$DRILL/dump.toc"
   tgt_sql "$TARGET_SQL" > "$DRILL/target.json"
-  local out rc=0; out="$(helper verify "$DUMP.counts.json" "$DRILL/dump.toc" "$DRILL/target.json")" || rc=$?
+  # 授权内容两侧同源同形：dump 的 schema-only SQL 与目标库 pg_dump --schema-only（同一容器的 pg_dump）
+  dump_sql > "$DRILL/dump-schema.sql" || die "读不出 dump 的 schema-only SQL（授权内容比对用）"
+  "$DOCKER" exec "$DB_CONTAINER" pg_dump -U postgres -d postgres --schema-only > "$DRILL/target-schema.sql" || die "目标库 pg_dump --schema-only 失败（授权内容比对用）"
+  local out rc=0; out="$(helper verify "$DUMP.counts.json" "$DRILL/dump.toc" "$DRILL/target.json" "$DRILL/dump-schema.sql" "$DRILL/target-schema.sql")" || rc=$?
   printf '%s\n' "$out" | sed -n 's/^SUMMARY /核对项：/p' | sed 's/^/rts /'
   if (( rc != 0 )); then
     say "差异 $(grep -c '^DIFF ' <<< "$out") 项（段|键|清单|目标）："; grep '^DIFF ' <<< "$out" | sed 's/^DIFF /  /'
     die "verify 未通过，不得进入 dsn（清单与 dump 不是同一快照时，差异应只落在那段时间有写入的表上；先核对再决定）"
   fi
-  say "verify 零差异（alembic / 逐表行数 / 序列 / 扩展 / TOC 属主 / ACL / 清理函数 SECURITY DEFINER）"
+  state_set RTS_VERIFY_OK "$DUMP_SHA"  # 本轮、这份 dump 的通过记录：run --from=dsn / services / timers 只认它
+  say "verify 零差异（alembic / 逐表行数 / 序列 / 扩展 / TOC 属主 / ACL 授权内容 / 清理函数 SECURITY DEFINER）"
 }
 DSN_RE='^(LINGXI_[A-Z_]*_DSN=)(["'"'"']?)(postgres(ql)?(\+psycopg)?)://([^:@/[:space:]]+):([^@[:space:]]*)@([^/?"'"'"'[:space:]]+)/([^?"'"'"'[:space:]]*)(\?[^"'"'"'[:space:]]*)?(["'"'"']?)[[:space:]]*$'
 # 查询串里带这些键会经 libpq 覆盖 authority 里的主机 / 账号 / 库（service / passfile 经服务文件 / 口令文件间接覆盖）：
 # 与 db_switch_to_local.sh 的 PARAM_OVERRIDE_RE 同义，命中即按「指向别处」拒绝
 PARAM_OVERRIDE_RE='[?&](host|hostaddr|user|password|dbname|port|service|passfile)='
+# libpq 会先对查询串做一次 %XX 解码再认键（?ho%73t= 即 host=）：判覆盖键前同样解码一次（只认两位十六进制，其余原样）
+pct_decode() { local s="$1" out="" c; while [[ -n "$s" ]]; do
+    if [[ "$s" =~ ^%([0-9A-Fa-f]{2}) ]]; then printf -v c %b "\\x${BASH_REMATCH[1]}"; out+="$c"; s="${s:3}"; else out+="${s:0:1}"; s="${s:1}"; fi
+  done; printf '%s' "$out"; }
 dsn_scan() { # $1 文件 $2 期望主机:端口（空格分隔多个） $3 新口令 $4 dry|write → DSN_RESULT
   local file="$1" want=" $2 " pw="$3" mode="$4" line out="" n=0 stale=0 bad="" params
   while IFS= read -r line || [[ -n "$line" ]]; do
@@ -481,8 +518,9 @@ dsn_scan() { # $1 文件 $2 期望主机:端口（空格分隔多个） $3 新�
       if [[ "$line" =~ $DSN_RE ]]; then
         local user="${BASH_REMATCH[6]}" oldpw="${BASH_REMATCH[7]}" host="${BASH_REMATCH[8]}" db="${BASH_REMATCH[9]}"
         local head="${BASH_REMATCH[1]}${BASH_REMATCH[2]}${BASH_REMATCH[3]}" tail="${BASH_REMATCH[11]}"; params="${BASH_REMATCH[10]}"
+        local dec; dec="$(pct_decode "$params")"
         if [[ "$want" != *" $host "* || "$user" != postgres || "$db" != postgres ]]; then bad="第 $n 条 DSN 不指向本地库 postgres@{$2}/postgres"
-        elif [[ "${params,,}" =~ $PARAM_OVERRIDE_RE ]]; then bad="第 $n 条 DSN 的查询参数会覆盖连接目标（host / dbname 等）"
+        elif [[ "${dec,,}" =~ $PARAM_OVERRIDE_RE ]]; then bad="第 $n 条 DSN 的查询参数会覆盖连接目标（host / dbname 等）"
         elif [[ "$oldpw" != "$pw" ]]; then stale=$((stale + 1))
           line="${head}://${user}:${pw}@${host}/${db}${params}${tail}"; fi
       else bad="第 $n 条 DSN 形状不可解析"; fi
@@ -567,6 +605,11 @@ do_run() {
   for a in "$@"; do case "$a" in --from=*) from="${a#--from=}" ;; --until=*) until="${a#--until=}" ;; *) die "run 不认识的参数：$a" ;; esac; done
   [[ " ${STEPS[*]} " == *" $from "* && " ${STEPS[*]} " == *" $until "* ]] || die "--from / --until 只认：${STEPS[*]}"
   check_dump
+  case "$from" in dsn|services|timers) # 越过 verify 续跑：须有本轮、同一 dump 的 verify 通过记录（B1）
+    drill_open || die "--from=$from 越过 verify，但没有进行中的轮次（新轮次无 verify 通过记录）：先从 verify 跑（run <dump> --from=verify）"
+    [[ "$(state_get RTS_VERIFY_OK)" == "$DUMP_SHA" ]] || die "--from=$from 越过 verify，但本轮没有这份 dump（sha256 $DUMP_SHA）的 verify 通过记录：先从 verify 跑（run <dump> --from=verify）"
+    say "本轮 verify 通过记录与这份 dump 一致，允许从 $from 续跑" ;;
+  esac
   if drill_open; then say "沿用进行中的轮次 $DRILL"; else new_drill; fi
   [[ -n "$(state_get RTS_RUN_START_AT)" ]] || state_set RTS_RUN_START_AT "$(now_utc)"
   state_set RTS_DUMP "$(basename -- "$DUMP")"
@@ -575,6 +618,7 @@ do_run() {
     [[ "$s" == "$from" ]] && on=1
     (( on )) || continue
     step_say "== 步骤 $s 开始"
+    case "$s" in host|roles|restore|verify) state_set RTS_VERIFY_OK "" ;; esac  # 目标可能变了：旧通过记录作废
     "step_$s"
     state_set "RTS_T_$s" "$(now_utc)"; step_say "== 步骤 $s 完成"
     [[ "$s" == "$until" ]] && break
@@ -591,7 +635,8 @@ do_rollback() {
   [[ -z "$(state_get RTS_ROLLBACK_AT)" ]] || die "本轮已回退过（$(state_get RTS_ROLLBACK_AT)）"
   [[ -z "$(state_get RTS_RUN_DONE_AT)" ]] || say "注意：本轮 run 已完成，回退会换回 wipe 前的原库（恢复出的库移进 failed-run/）"
   local name path fr="$DRILL/failed-run"
-  while IFS=$'\t' read -r name path; do guard_move_target "$path"; done < "$DRILL/wiped/manifest.tsv"
+  local st
+  while IFS=$'\t' read -r name path st; do guard_move_target "$path"; done < "$DRILL/wiped/manifest.tsv"
   step_say "停三服务与 timer（db_switch stop-write）"
   switch stop-write
   "$SYSTEMCTL" stop "$BACKUP_TIMER" || true
@@ -601,9 +646,16 @@ do_rollback() {
     say "[容器] 本次新建的 $DB_CONTAINER 已下线（数据目录移进 failed-run/，不删）"
   fi
   install -d -m 700 -- "$fr"
-  while IFS=$'\t' read -r name path; do
-    if [[ -e "$path" ]]; then mv -- "$path" "$fr/$name"; say "[移开] 本次新建 $path → $fr/$name"; fi
-    mv -- "$DRILL/wiped/$name" "$path"; say "[移回] $DRILL/wiped/$name → $path"
+  local dest k
+  while IFS=$'\t' read -r name path st; do  # 逐目录按现场判断，部分完成后可直接重跑（B2）；pending 行同样处理（B3）
+    if [[ ! -e "$DRILL/wiped/$name" ]]; then
+      [[ -e "$path" ]] || die "$name：保留目录 $DRILL/wiped/$name 与原路径 $path 都不存在，无法回退（现场保留，人工核对）"
+      say "[already] $path 已是回退后的原目录（保留目录里已无 $name），跳过"; continue
+    fi
+    if [[ -e "$path" ]]; then dest="$fr/$name"; k=0  # failed-run/<名> 已有时另起带时间后缀的目录，不嵌套进去
+      while [[ -e "$dest" ]]; do k=$((k + 1)); dest="$fr/$name.$(date -u +%Y%m%dT%H%M%SZ).$k"; done
+      mv -- "$path" "$dest"; say "[移开] 本次新建 $path → $dest"; fi
+    mv -- "$DRILL/wiped/$name" "$path"; say "[移回] $DRILL/wiped/$name → $path（记账 ${st:-done}）"
   done < "$DRILL/wiped/manifest.tsv"
   if [[ -s "$DRILL/wiped/hosts.lines" && "$(hosts_count)" == 0 ]]; then cat "$DRILL/wiped/hosts.lines" >> "$HOSTS_FILE"; fi
   say "[hosts] 匹配行 $(hosts_count)"
