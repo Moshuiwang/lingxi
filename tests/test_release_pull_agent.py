@@ -933,12 +933,17 @@ class AgentTests(unittest.TestCase):
             self.assertEqual(messages, [])
         with self.subTest(case="docker_unavailable_keeps_verified_for_next_round"):
             self.harness.set_env(DOCKER_MODE="daemon")
-            code, _ = self.run_agent(sender=sender)
+            code, output = self.run_agent(sender=sender)
             self.assertEqual(code, 0)
+            # journal 带上原因码；状态账与告警正文都不带（否定验证）。
+            self.assertIn("阶段=idempotence 结果码=unknown", output)
+            self.assertIn("reason=docker_inspect_unavailable", output)
             state = self.read_state()
             self.assertEqual(state["last_result"], "unknown")
             self.assertEqual(state["deployer_state"], "verified")
+            self.assertNotIn("reason", (self.harness.state / "pull-agent.json").read_text())
             self.assertEqual(len(messages), 1)
+            self.assertNotIn("reason", messages[0])
             self.harness.set_env(DOCKER_MODE="match")
             code, _ = self.run_agent(sender=sender)
             self.assertEqual(code, 0)
@@ -1360,7 +1365,7 @@ class AgentTests(unittest.TestCase):
             # 假部署器把首次 apply 的批准指纹钉在状态目录；failed 后重新 plan 会换批准。
             (h.state / ".fake-approval-sha").unlink()
 
-        # (名称, 结果码, 阶段, 计划已落盘, 注入故障, 排除故障)
+        # (名称, 结果码, 阶段, 计划已落盘, 注入故障, 排除故障, 期望 reason 或 None)
         cases = [
             (
                 "release_list_unavailable",
@@ -1369,6 +1374,7 @@ class AgentTests(unittest.TestCase):
                 False,
                 lambda h, s: h.set_releases([]),
                 lambda h, s: h.set_releases(both_releases(h)),
+                None,
             ),
             (
                 "downgrade_refused",
@@ -1379,6 +1385,7 @@ class AgentTests(unittest.TestCase):
                     [h._release(h.old_tag, False), h._release("v2.4.3-rc.9", True)]
                 ),
                 lambda h, s: h.set_releases(both_releases(h)),
+                None,
             ),
             (
                 "unknown_idempotence_docker_daemon",
@@ -1387,6 +1394,7 @@ class AgentTests(unittest.TestCase):
                 False,
                 lambda h, s: h.set_env(DOCKER_MODE="daemon"),
                 lambda h, s: h.set_env(DOCKER_MODE="records"),
+                "docker_inspect_unavailable",
             ),
             (
                 "unknown_idempotence_manifest_unresolvable",
@@ -1395,6 +1403,7 @@ class AgentTests(unittest.TestCase):
                 False,
                 hide_target_manifest,
                 restore_target_manifest,
+                "command_failed",
             ),
             (
                 "unknown_current_release",
@@ -1403,6 +1412,7 @@ class AgentTests(unittest.TestCase):
                 False,
                 hide_plan_and_old_release,
                 lambda h, s: h.set_releases(both_releases(h)),
+                AGENT.REASON_NO_MATCHING_CURRENT_RELEASE,
             ),
             (
                 "bundle_digest_mismatch",
@@ -1411,6 +1421,7 @@ class AgentTests(unittest.TestCase):
                 False,
                 tamper_asset,
                 lambda h, s: h.asset.write_bytes(s["asset"]),
+                None,
             ),
             (
                 "unknown_bundle_download_failed",
@@ -1419,6 +1430,7 @@ class AgentTests(unittest.TestCase):
                 False,
                 lambda h, s: h.set_env(ASSET_FILE=str(h.root / "missing.tar")),
                 lambda h, s: h.set_env(ASSET_FILE=str(h.asset)),
+                None,
             ),
             (
                 "unknown_frozen_manifest",
@@ -1427,6 +1439,7 @@ class AgentTests(unittest.TestCase):
                 False,
                 break_installed_manifest,
                 lambda h, s: _exec(h.installed_manifest, s["source"]),
+                "command_failed",
             ),
             (
                 "installation_receipt_unusable",
@@ -1437,6 +1450,7 @@ class AgentTests(unittest.TestCase):
                     checks=dict(h.receipt()["checks"], sudo_policy=False)
                 ),
                 lambda h, s: h.install_receipt(),
+                None,
             ),
             (
                 "unknown_plan",
@@ -1445,6 +1459,7 @@ class AgentTests(unittest.TestCase):
                 False,
                 break_public_config,
                 restore_public_config,
+                "json_file_invalid",
             ),
             (
                 "unknown_approval",
@@ -1455,6 +1470,7 @@ class AgentTests(unittest.TestCase):
                     s, "_make_approval", side_effect=AGENT.AgentError("plan_expired")
                 ),
                 lambda h, s: s["patch"].stop(),
+                "plan_expired",
             ),
             (
                 "pre_apply_hook_unsafe",
@@ -1463,6 +1479,7 @@ class AgentTests(unittest.TestCase):
                 True,
                 unsafe_hook,
                 lambda h, s: set_hooks(h, []),
+                None,
             ),
             (
                 "pre_apply_hook_failed",
@@ -1471,6 +1488,7 @@ class AgentTests(unittest.TestCase):
                 True,
                 failing_hook,
                 clear_failing_hook,
+                None,
             ),
             (
                 "deploy_timeout",
@@ -1479,6 +1497,7 @@ class AgentTests(unittest.TestCase):
                 True,
                 apply_timeout,
                 lambda h, s: h.set_env(DEPLOY_MODE="normal"),
+                None,
             ),
             (
                 "failed",
@@ -1487,6 +1506,7 @@ class AgentTests(unittest.TestCase):
                 True,
                 lambda h, s: h.set_env(DEPLOY_STATUS="failed"),
                 status_verified_with_new_approval,
+                None,
             ),
             (
                 "unknown_status",
@@ -1495,6 +1515,7 @@ class AgentTests(unittest.TestCase):
                 True,
                 lambda h, s: h.set_env(DEPLOY_STATUS="bogus"),
                 lambda h, s: h.set_env(DEPLOY_STATUS="verified"),
+                "deployer_status_unavailable",
             ),
             (
                 "running",
@@ -1503,9 +1524,10 @@ class AgentTests(unittest.TestCase):
                 True,
                 lambda h, s: h.set_env(DEPLOY_STATUS="running"),
                 lambda h, s: h.set_env(DEPLOY_STATUS="verified"),
+                None,
             ),
         ]
-        for name, result, stage, checkpointed, inject, clear in cases:
+        for name, result, stage, checkpointed, inject, clear, expected_reason in cases:
             with self.subTest(case=name):
                 self.harness.close()
                 harness = self.harness = PullHarness()
@@ -1523,7 +1545,21 @@ class AgentTests(unittest.TestCase):
                 self.assertEqual(code, 0)
                 self.assertIn(f"阶段={stage} 结果码={result}", output)
                 self.assertNotIn("结果码=already_in_place", output)
+                if expected_reason is not None:
+                    matching = [
+                        line
+                        for line in output.splitlines()
+                        if f"阶段={stage} 结果码={result}" in line
+                    ]
+                    self.assertTrue(matching, name)
+                    self.assertTrue(
+                        any(f"reason={expected_reason}" in line for line in matching),
+                        (name, matching),
+                    )
                 state = self.read_state()
+                self.assertNotIn("reason", (self.harness.state / "pull-agent.json").read_text())
+                if messages:
+                    self.assertFalse(any("reason" in message for message in messages))
                 self.assertEqual(state["last_result"], result)
                 self.assertEqual(state["highest_deployed_tag"], harness.old_tag)
                 self.assertEqual(
@@ -1565,6 +1601,93 @@ class AgentTests(unittest.TestCase):
                     )
                 )
                 self.assertIn("verified", messages[-1])
+
+    def test_frozen_manifest_mismatch_gets_a_fixed_reason_not_unknown(self):
+        """已装版本目录里的清单与代理事先核对的配置清单不同：没有异常，仍要给可辨识原因。"""
+        harness = self.harness
+        harness.state_for_old()
+        original_source = harness.installed_manifest.read_text(encoding="utf-8")
+        _exec(
+            harness.installed_manifest,
+            r"""
+            #!/usr/bin/env python3
+            import json, os, sys
+            tag = sys.argv[sys.argv.index("--tag") + 1]
+            with open(os.path.join(os.environ["MANIFESTS_DIR"], tag + ".json"), encoding="utf-8") as source:
+                data = json.load(source)
+            data["run_id"] = data["run_id"] + 1000
+            with open(sys.argv[sys.argv.index("--manifest-output") + 1], "w", encoding="utf-8") as destination:
+                json.dump(data, destination, ensure_ascii=False, sort_keys=True, indent=2)
+                destination.write("\n")
+            """,
+        )
+        self.addCleanup(lambda: _exec(harness.installed_manifest, original_source))
+        messages = []
+        code, output = self.run_agent(sender=lambda message, env, timeout: messages.append(message))
+        self.assertEqual(code, 0)
+        self.assertIn("阶段=frozen_manifest 结果码=unknown", output)
+        self.assertIn(f"reason={AGENT.REASON_FROZEN_MANIFEST_MISMATCH}", output)
+        state = self.read_state()
+        self.assertEqual(state["last_result"], "unknown")
+        self.assertNotIn("reason", (harness.state / "pull-agent.json").read_text())
+        self.assertTrue(messages)
+        self.assertNotIn("reason", messages[0])
+
+    def test_approval_source_mismatch_gets_a_fixed_reason_not_unknown(self):
+        """计划里的批准来源不在契约允许列表：结构性判定、没有异常，但仍要给可辨识原因。"""
+        harness = self.harness
+        harness.state_for_old()
+        original_build_request = AGENT._build_request
+
+        def tampered(*args, **kwargs):
+            request = original_build_request(*args, **kwargs)
+            request["approval_source"] = "https://github.com/Moshuiwang/lingxi/issues/1"
+            return request
+
+        patcher = patch.object(AGENT, "_build_request", side_effect=tampered)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        messages = []
+        code, output = self.run_agent(sender=lambda message, env, timeout: messages.append(message))
+        self.assertEqual(code, 0)
+        self.assertIn("阶段=approval 结果码=unknown", output)
+        self.assertIn(f"reason={AGENT.REASON_APPROVAL_SOURCE_MISMATCH}", output)
+        state = self.read_state()
+        self.assertEqual(state["last_result"], "unknown")
+        self.assertNotIn("reason", (harness.state / "pull-agent.json").read_text())
+        self.assertTrue(messages)
+        self.assertNotIn("reason", messages[0])
+
+    def test_uncoded_result_from_run_locked_keeps_original_reason_in_journal(self):
+        """内部异常码不属于稳定失败集合而被折成 unknown 时，原始原因码仍要留在 journal 里。"""
+        patcher = patch.object(
+            AGENT, "_run_locked", side_effect=AGENT.AgentError("host_paths_must_be_absolute")
+        )
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        messages = []
+        code, output = self.run_agent(sender=lambda message, env, timeout: messages.append(message))
+        self.assertEqual(code, 0)
+        self.assertIn("阶段=agent 结果码=unknown", output)
+        self.assertIn("reason=host_paths_must_be_absolute", output)
+        state = self.read_state()
+        self.assertEqual(state["last_result"], "unknown")
+        self.assertNotIn("reason", (self.harness.state / "pull-agent.json").read_text())
+
+    def test_unexpected_exception_in_run_locked_gets_a_fixed_sentinel_reason(self):
+        """非 AgentError 的意外异常没有稳定原因码：用固定哨兵值区分，不填 "unknown" 充数。"""
+        patcher = patch.object(AGENT, "_run_locked", side_effect=RuntimeError("boom"))
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        messages = []
+        code, output = self.run_agent(sender=lambda message, env, timeout: messages.append(message))
+        self.assertEqual(code, 0)
+        self.assertIn("阶段=agent 结果码=unknown", output)
+        self.assertIn(f"reason={AGENT.REASON_UNEXPECTED_EXCEPTION}", output)
+        self.assertNotIn("boom", output)
+        state = self.read_state()
+        self.assertEqual(state["last_result"], "unknown")
+        self.assertNotIn("reason", (self.harness.state / "pull-agent.json").read_text())
 
     def test_uses_the_newly_installed_bundle_scripts(self):
         self.harness.state_for_old()
