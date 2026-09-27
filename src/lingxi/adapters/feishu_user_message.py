@@ -21,7 +21,8 @@ import logging
 from collections.abc import Callable, Mapping
 from typing import Any
 
-from lingxi.adapters.feishu_group_message import delivery_uuid
+from lingxi.adapters.feishu_group_message import card_uuid_prefix_for, delivery_uuid
+from lingxi.core.delivery.notice_card import NoticeCard
 from lingxi.core.delivery.ports import (
     DeliveryOperation,
     DeliveryVerdict,
@@ -249,6 +250,60 @@ class FeishuUserMessages:
         _assert_notice_accepted(response)
         # 只记「发过了」。open_id 与通知正文都不进日志：正文里是这个人的权限范围。
         logger.info("权限变化通知已发送 字符数=%s", len(text))
+
+    def _post_message(
+        self, token: str, *, receiver: str, msg_type: str, content: Any, uuid: str
+    ) -> None:
+        """向这个人发一条指定类型的消息并按「通知」档裁定响应；拒绝与不明都抛错。"""
+        response = self._transport(
+            "POST",
+            f"{self._base_url}/im/v1/messages?receive_id_type=open_id",
+            body={
+                "receive_id": receiver,
+                "msg_type": msg_type,
+                "content": json.dumps(content, ensure_ascii=False),
+                "uuid": uuid,
+            },
+            token=token,
+        )
+        _assert_notice_accepted(response)
+
+    def send_notice(self, *, open_id: str, card: NoticeCard, dedupe_key: str) -> None:
+        """向 ``open_id`` 这个人发一张通知卡；飞书明确拒绝卡片时补发一次等价纯文本。
+
+        语义与 ``FeishuGroupMessages.send_notice`` 相同：卡片用推出的卡片前缀，回落
+        文本沿用本实例的文本前缀；结果不明直接上抛、不补发，同一去重键重试得到同一
+        个卡片去重 ID。收件人形状与去重键在发出任何请求之前校验。
+        """
+        receiver = validate_user_open_id(open_id)
+        if not isinstance(card, NoticeCard):
+            raise TypeError("send_notice 只接受 NoticeCard")
+        if not isinstance(dedupe_key, str) or not dedupe_key.strip():
+            raise ValueError("通知去重键不能为空")
+        card_prefix = card_uuid_prefix_for(self._uuid_prefix)
+        token = self._tenant_access_token()
+        try:
+            self._post_message(
+                token,
+                receiver=receiver,
+                msg_type="interactive",
+                content=card.to_payload(),
+                uuid=delivery_uuid(receiver, dedupe_key, prefix=card_prefix),
+            )
+        except FeishuUserMessageError as error:
+            if not error.definite:
+                raise
+            logger.warning("用户通知卡片被飞书明确拒绝，补发一次纯文本 code=%s", error.code)
+            self._post_message(
+                token,
+                receiver=receiver,
+                msg_type="text",
+                content={"text": card.fallback_text},
+                uuid=delivery_uuid(receiver, dedupe_key, prefix=self._uuid_prefix),
+            )
+            logger.info("用户通知已发送 形式=纯文本回落")
+            return
+        logger.info("用户通知已发送 形式=卡片")
 
 
 __all__ = [

@@ -477,6 +477,10 @@ class ContentCatalog:
             texts[key] = template
         return ContentCatalog(version=self.version, texts=texts, cards=self._cards)
 
+    def has_card(self, key: str) -> bool:
+        """某个卡片键是否已登记；调用方据此在「发卡片」与「发原文本」之间选择。"""
+        return key in self._cards
+
     def text_keys(self) -> tuple[str, ...]:
         """目录中全部文本模板的键。"""
         return tuple(self._texts)
