@@ -17,7 +17,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from support.fake_db_switch import base_env, install_stubs
+from support.fake_db_switch import base_env, install_recreate_docker, install_stubs
 
 REPOSITORY_ROOT = Path(__file__).parents[1]
 SCRIPT = REPOSITORY_ROOT / "scripts" / "ops" / "db_switch_to_local.sh"
@@ -37,8 +37,8 @@ def _free_port() -> int:
         return sock.getsockname()[1]
 
 
-class DbSwitchToLocalFakeRootTest(unittest.TestCase):
-    """以临时目录充当 ``/``，跑切换脚本不碰真库的那几步。"""
+class _FakeRootBase(unittest.TestCase):
+    """假根目录现场：以临时目录充当 ``/``，桩替换 docker / systemctl。"""
 
     def setUp(self) -> None:
         self._tmp = tempfile.TemporaryDirectory(prefix="lingxi-896-s30-")
@@ -116,6 +116,10 @@ class DbSwitchToLocalFakeRootTest(unittest.TestCase):
         log = self.state / "calls.log"
         return log.read_text(encoding="utf-8") if log.exists() else ""
 
+
+class DbSwitchToLocalFakeRootTest(_FakeRootBase):
+    """跑切换脚本不碰真库的那几步。"""
+
     # --- 运行身份与前置检查 ---
 
     def test_refuses_non_root_without_fake_root(self) -> None:
@@ -128,6 +132,7 @@ class DbSwitchToLocalFakeRootTest(unittest.TestCase):
         self.assertEqual(usage.returncode, 2)
         self.assertTrue(usage.stderr.startswith("# 用法：sudo -n bash db_switch_to_local.sh"))
         self.assertIn("#   smoke-test ", usage.stderr)
+        self.assertIn("#   recreate-services ", usage.stderr)
         unknown = self.run_script("frobnicate")
         self.assertEqual(unknown.returncode, 1)
         self.assertIn("未知子命令", unknown.stderr)
@@ -238,6 +243,201 @@ class DbSwitchToLocalFakeRootTest(unittest.TestCase):
         self.assertIn("hosts 行=1", result.stdout)
         self.assertIn("env .env.stage.gateway：DSN 行 1、指向本地库 0", result.stdout)
         self.assertNotIn(SECRET, result.stdout + result.stderr)
+
+
+def _fingerprint(value: object) -> str:
+    """与部署器 ``deploy_state.fingerprint`` 同一编码。"""
+    text = json.dumps(value, sort_keys=True, ensure_ascii=False, indent=2) + "\n"
+    return hashlib.sha256(text.encode()).hexdigest()
+
+
+class RecreateServicesFakeRootTest(_FakeRootBase):
+    """recreate-services（#896）：从三容器标签与部署器状态账回读参数，按部署器 start 同一 argv 重建。"""
+
+    BUNDLE = "b" * 64
+    PLAN_ID = "20260927-fake0001"
+    TAG = "v2.6.1-rc.1"
+    STATE = "/opt/lingxi/state"
+    CONFIG_ROOT = "/opt/lingxi/config"
+    PUBLIC_SECRET = "recreate-sentinel-pw-91ab"
+
+    def setUp(self) -> None:
+        super().setUp()
+        contract = self.root / "opt" / "lingxi" / "control" / "host-contract.json"
+        contract.write_text(
+            json.dumps(
+                {
+                    "project": "lingxi",
+                    "environment": "stage",
+                    "config_root": self.CONFIG_ROOT,
+                    "deploy_root": "/opt/lingxi",
+                    "bundle_root": "/opt/lingxi/bundles",
+                }
+            ),
+            encoding="utf-8",
+        )
+        self.docker = install_recreate_docker(self.bin, self.state)
+        deploy_dir = self.root / "opt" / "lingxi" / "bundles" / self.BUNDLE / "deploy"
+        deploy_dir.mkdir(parents=True)
+        (deploy_dir / "compose.yaml").write_text("services: {}\n", encoding="utf-8")
+        (deploy_dir / "compose.stage.yaml").write_text("services: {}\n", encoding="utf-8")
+        state_dir = self.root / self.STATE.lstrip("/")
+        state_dir.mkdir(parents=True)
+        (state_dir / f"{self.PLAN_ID}.channel.compose.json").write_text("{}\n", encoding="utf-8")
+        self.public_config = {
+            "schema": 1,
+            "values": {
+                "LINGXI_WORKER_MAX_CONCURRENCY": "4",
+                "LINGXI_FAKE_DSN": f"postgresql://u:{self.PUBLIC_SECRET}@h/db",
+            },
+            "files": {"scheduler": {}, "worker": {}},
+        }
+        control = self.root / "opt" / "lingxi" / "control"
+        (control / "public-config.json").write_text(
+            json.dumps(self.public_config), encoding="utf-8"
+        )
+        (control / "release-pull-agent.json").write_text(
+            json.dumps({"public_config": "/opt/lingxi/control/public-config.json"}),
+            encoding="utf-8",
+        )
+        self.config_sha = _fingerprint(self.public_config)
+        self.images = {
+            name: f"ghcr.io/moshuiwang/lingxi-{name}:{self.TAG}@sha256:{digit * 64}"
+            for name, digit in (
+                ("scheduler", "1"),
+                ("gateway", "2"),
+                ("worker", "3"),
+                ("migrate", "4"),
+            )
+        }
+        plan = {
+            "id": self.PLAN_ID,
+            "project": "lingxi",
+            "environment": "stage",
+            "config_sha256": self.config_sha,
+            "new": {
+                "schema": 2,
+                "repository": "Moshuiwang/lingxi",
+                "tag": self.TAG,
+                "control_bundle": {"sha256": self.BUNDLE},
+                "images": self.images,
+            },
+        }
+        (state_dir / f"{self.PLAN_ID}.plan.json").write_text(json.dumps(plan), encoding="utf-8")
+        self.config_files = [
+            f"/opt/lingxi/bundles/{self.BUNDLE}/deploy/compose.yaml",
+            f"/opt/lingxi/bundles/{self.BUNDLE}/deploy/compose.stage.yaml",
+            f"{self.STATE}/{self.PLAN_ID}.channel.compose.json",
+        ]
+        containers = []
+        for service in ("scheduler", "gateway", "worker-queue"):
+            image_key = "worker" if service == "worker-queue" else service
+            containers.append(
+                {
+                    "id": f"id-{service}",
+                    "name": f"lingxi-{service}-1",
+                    "health": "healthy",
+                    "image": self.images[image_key],
+                    "labels": {
+                        "com.docker.compose.project": "lingxi",
+                        "com.docker.compose.service": service,
+                        "com.docker.compose.project.working_dir": self.CONFIG_ROOT,
+                        "com.docker.compose.project.config_files": ",".join(self.config_files),
+                        "io.lingxi.config-sha256": self.config_sha,
+                        "io.lingxi.bundle-sha256": self.BUNDLE,
+                        "io.lingxi.deployment-id": self.PLAN_ID,
+                    },
+                }
+            )
+        self.world = {"containers": containers, "after_health": "healthy"}
+        self.save_world()
+        self.write_inputs(LINGXI_S30_DOCKER=str(self.docker))
+
+    def save_world(self) -> None:
+        (self.state / "world.json").write_text(json.dumps(self.world), encoding="utf-8")
+
+    def compose_calls(self) -> list[dict]:
+        record = self.state / "compose_up.json"
+        return json.loads(record.read_text(encoding="utf-8")) if record.exists() else []
+
+    def expected_env(self) -> dict[str, str]:
+        env = {
+            "PATH": "/usr/bin:/bin",
+            "HOME": "/opt/lingxi",
+            "LINGXI_ENV_ROOT": self.CONFIG_ROOT,
+            **self.public_config["values"],
+            "LINGXI_IMAGE_REGISTRY": "ghcr.io/moshuiwang",
+            "LINGXI_IMAGE_TAG": self.TAG,
+        }
+        for name, image in self.images.items():
+            env[f"LINGXI_{name.upper()}_IMAGE_DIGEST"] = "@" + image.split("@")[1]
+        return env
+
+    def expected_compose_args(self) -> list[str]:
+        args = ["compose", "--project-name", "lingxi", "--project-directory", self.CONFIG_ROOT]
+        for path in self.config_files:
+            args += ["-f", path]
+        args += ["--profile", "mvp", "up", "-d", "--force-recreate", "--no-build"]
+        return args + ["--pull", "never", "scheduler", "gateway", "worker-queue"]
+
+    def test_dry_run_prints_full_argv_without_secret(self) -> None:
+        result = self.run_script("recreate-services", "--dry-run")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        printed = [
+            line.split("] ", 1)[1].split(": ", 1)[1]
+            for line in result.stdout.splitlines()
+            if line.startswith("s30 [argv] ")
+        ]
+        env_items = [
+            f"{key}=<已隐去>" if "DSN" in key else f"{key}={value}"
+            for key, value in self.expected_env().items()
+        ]
+        expected = ["env", "-i", *env_items, str(self.docker), *self.expected_compose_args()]
+        self.assertEqual(printed, expected)
+        self.assertNotIn(self.PUBLIC_SECRET, result.stdout + result.stderr)
+        self.assertIn("dry-run：未执行", result.stdout)
+        self.assertEqual(self.compose_calls(), [])
+
+    def test_refuses_inconsistent_labels(self) -> None:
+        self.world["containers"][1]["labels"]["io.lingxi.deployment-id"] = "20260926-other"
+        self.save_world()
+        result = self.run_script("recreate-services")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("前置不满足：三容器标签不一致", result.stdout + result.stderr)
+        self.assertEqual(self.compose_calls(), [])
+
+    def test_refuses_missing_config_file(self) -> None:
+        missing = self.root / self.config_files[1].lstrip("/")
+        missing.unlink()
+        result = self.run_script("recreate-services")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn(f"前置不满足：compose 文件不存在：{missing}", result.stdout + result.stderr)
+        self.assertEqual(self.compose_calls(), [])
+
+    def test_recreates_once_with_deployer_argv_and_env(self) -> None:
+        result = self.run_script("recreate-services")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        calls = self.compose_calls()
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0]["argv"], self.expected_compose_args())
+        self.assertEqual(calls[0]["env"], self.expected_env())
+        self.assertIn("[回读判据] 三容器 Recreate ×3（容器 id 全部更换）→ ok", result.stdout)
+        self.assertIn("[回读判据] 三容器 healthy", result.stdout)
+        self.assertIn("[回读判据] 三容器标签与镜像与重建前逐一相同 → ok", result.stdout)
+        self.assertNotIn(self.PUBLIC_SECRET, result.stdout + result.stderr)
+
+    def test_health_timeout_fails(self) -> None:
+        self.world["after_health"] = "starting"
+        self.save_world()
+        self.write_inputs(
+            LINGXI_S30_DOCKER=str(self.docker),
+            LINGXI_S30_RECREATE_TIMEOUT="2",
+            LINGXI_S30_RECREATE_POLL="1",
+        )
+        result = self.run_script("recreate-services")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("超时", result.stderr)
+        self.assertEqual(len(self.compose_calls()), 1)
 
 
 if __name__ == "__main__":

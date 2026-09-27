@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 # db_switch_to_local.sh —— 数据库切换脚本：托管库（Supabase）→ 同主机本地 PostgreSQL 17 容器（deploy/compose.db.yaml）。
 # 来源：Issue #809 v2.2 定稿、2026-09-22 生产实跑的那一版（原名 s30_p2_db_switch.sh），#896 脱敏入仓；与实跑版的行为
-# 差异只有四处，见 #896 留痕：缺省输入文件名、用法打印取段方式、来源连接串文件可改（LINGXI_S30_SOURCE_ENV_FILE，
-# 不设时与实跑版逐字同一文件）、install-pg 末尾加打「[回读判据]」行（#886 第 2 处）。
+# 差异只有五处，见 #896 留痕：缺省输入文件名、用法打印取段方式、来源连接串文件可改（LINGXI_S30_SOURCE_ENV_FILE，
+# 不设时与实跑版逐字同一文件）、install-pg 末尾加打「[回读判据]」行（#886 第 2 处）、新增 recreate-services 子命令
+# （实跑版没有；取代预发 W4 用过的仓库外重建步骤，#859 评论 5756579636 R-c）。
 # 对来源库永远只读：不写、不删、不改来源侧任何对象。
 # 适用场景：生产（2026-09-22 已迁完，不再跑）/ 预发（#896：来源 = Supabase stage，或其保底导出装进的临时替身库）/
 # 恢复演练（只用 install-pg + restore + verify 形，不跑 stop-write / switch-dsn）。
@@ -27,13 +28,21 @@
 #   verify        目标 vs 来源快照逐项比对：对象计数 / 逐表行数 / 序列 / 触发器 / pg_trgm / 属主 /
 #                 ACL / SECURITY DEFINER / alembic / 编码与 locale 五项 / 角色级 search_path；任一差异非 0 退出 < 1 分
 #   switch-dsn    八份文件原子替换 DSN（先备份到独立目录）→ 回读；须 verify 通过且同一 run_id      < 1 分
+#   recreate-services [--dry-run]  三容器按部署器 start 阶段同一 compose argv / 环境值 --force-recreate 重建
+#                 （不拉镜像、不构建、不改控制包与状态账），让 env 文件里的新 DSN 生效；参数只从三容器标签 +
+#                 部署器状态账 + public-config 回读，不猜；--dry-run 只打印 argv（DSN / 口令类键只打印键名）。
+#                 位置：switch-dsn 之后、postcheck 之前（不发新版本的预发同构 / 恢复演练 #885 走这条）；
+#                 rollback-dsn 之后同样要跑（容器里烙的仍是本地库 DSN）                            < 1 分
 #   start-timers  起拉取 timer + 采样 timer（Promotion 之后跑，让拉取代理部署新版本）
-#   postcheck     等三容器 healthy（Promotion 后由部署器起）→ 容器内只读回读 → 记 postcheck_at、打印停写时长
-#   rollback-dsn  备份目录里的文件原子还原 + 回读 + 起两个 timer（不动本地库容器、不删数据）
+#   postcheck     等三容器 healthy（Promotion 后由部署器起，或由 recreate-services 重建）→ 容器内只读回读 → 记 postcheck_at、打印停写时长
+#   rollback-dsn  备份目录里的文件原子还原 + 回读 + 起两个 timer（不动本地库容器、不删数据）；容器切换后已重建过的，
+#                 随后须跑 recreate-services 才回到旧 DSN
 #   start-services 起三个已停的旧容器（旧 DSN 已烙进容器：等于回到 Supabase，切换前回退用）
 #   smoke-test    仅测试形：以 postgres 调 lingxi_retention_cleanup(now(), 1)，证 SECURITY DEFINER 属主链
 #   status        只读汇总；cleanup --yes 只删工作目录下的 dump 三件
 # 停写窗口预算 30 分：stop-write → dump → restore → verify → switch-dsn → Promotion → start-timers → 部署 → postcheck。
+# 不发新版本时：stop-write → dump → restore → verify → switch-dsn → recreate-services → start-timers → postcheck；
+# 回退：rollback-dsn → recreate-services（容器已按新 DSN 重建过时必跑；只停未重建过的用 start-services）。
 # 输入全走 LINGXI_S30_* 环境变量，缺省从同目录 db_switch_to_local.env 读（KEY=VALUE，不执行）；清单见文件末尾。
 # 测试形：非 root + LINGXI_S30_ROOT=<假根>（路径全部加前缀、跳过属主设置；systemctl / docker 可注入桩）。
 set -euo pipefail
@@ -96,6 +105,13 @@ MIN_FREE_GB="${LINGXI_S30_MIN_FREE_GB:-10}"
 PUBLIC_MODE="${LINGXI_S30_PUBLIC_MODE:-toc}"
 ALLOW_NONEMPTY="${LINGXI_S30_ALLOW_NONEMPTY_RESTORE:-0}"
 POSTCHECK_TIMEOUT="${LINGXI_S30_POSTCHECK_TIMEOUT:-1200}"
+# recreate-services：public-config 路径缺省从拉取代理配置的 public_config 键读（预发代理配置在别处，见输入样例）；
+# 健康等待硬上限（秒）与轮询间隔；解释器只用于解析 JSON 与算指纹（不导入部署器模块）
+PULL_CONFIG="$ROOT${LINGXI_S30_PULL_CONFIG:-/opt/lingxi/control/release-pull-agent.json}"
+PUBLIC_CONFIG_IN="${LINGXI_S30_PUBLIC_CONFIG:-}"
+RECREATE_TIMEOUT="${LINGXI_S30_RECREATE_TIMEOUT:-180}"
+RECREATE_POLL="${LINGXI_S30_RECREATE_POLL:-5}"
+PYTHON_BIN="${LINGXI_S30_PYTHON:-}"
 PULL_SETTLE_TIMEOUT="${LINGXI_S30_PULL_SETTLE_TIMEOUT:-600}"  # F4：stop-write 等在途拉取单轮退出的上限（秒）
 PULL_TIMER="${LINGXI_S30_PULL_TIMER:-lingxi-release-pull.timer}"
 SAMPLER_TIMER="${LINGXI_S30_SAMPLER_TIMER:-lingxi-db-business-sample.timer}"
@@ -528,7 +544,7 @@ do_switch_dsn() {
   (( all_ok )) || die "回读发现旧主机段残留，请立即 rollback-dsn"
   say "回读：旧主机段 ${OLD_HOSTS[*]:-（无变化）} 在八份文件中 0 命中；应用侧主机 $DB_CONTAINER:5432、宿主采样侧 127.0.0.1:$DB_HOST_PORT；sslmode 若有已改 disable"
   state_set S30_SWITCH_DSN_AT "$(now_utc)"; [[ -d "$BACKUP_DIR" ]] && say "备份目录 $BACKUP_DIR（0700）"
-  say "switch-dsn 完成 → 产品负责人点 Release Promotion → start-timers → 部署 → postcheck"
+  say "switch-dsn 完成 → 产品负责人点 Release Promotion → start-timers → 部署 → postcheck（不发新版本时：recreate-services → start-timers → postcheck）"
 }
 do_rollback_dsn() {
   banner "可逆动作本身" "再次 switch-dsn"
@@ -539,13 +555,195 @@ do_rollback_dsn() {
     cp -p -- "$b" "$f.tmp-s30"; mv -f -- "$f.tmp-s30" "$f"; cmp -s -- "$b" "$f" || die "$f 还原后与备份不一致"
     restored=$((restored + 1)); say "[$(basename -- "$f")] restored（逐字节等于备份）"
   done
-  say "rollback-dsn：还原 $restored、已一致 $same；本地库容器与数据目录未动"
+  say "rollback-dsn：还原 $restored、已一致 $same；本地库容器与数据目录未动；三容器若已按新 DSN 重建过，接着跑 recreate-services"
   do_start_timers
 }
 do_start_timers() { "$SYSTEMCTL" start "$SAMPLER_TIMER" "$PULL_TIMER"; say "[timer] $SAMPLER_TIMER / $PULL_TIMER 已起（is-active：$("$SYSTEMCTL" is-active "$SAMPLER_TIMER" "$PULL_TIMER" | tr '\n' ' ')）"; }
 do_start_services() {
   banner "可逆" "stop-write"
   local svc name; for svc in "${APP_SERVICES[@]}"; do name="$PROJECT-${svc%%:*}-1"; "$DOCKER" start "$name" >/dev/null; say "[容器] $name started（沿用容器创建时的 DSN）"; done
+}
+
+# ============================ recreate-services ============================
+# 按部署器 start 阶段（deploy/deploy_runtime.py compose() + perform("start")）同一 argv / 环境值重建三个常驻服务，
+# 只多一个 --force-recreate：env 文件改过（switch-dsn / rollback-dsn）而镜像与参数不变时，Compose 不会自己重建。
+# 参数一律回读，不猜：compose 项目 / 工作目录 / config_files 取三容器标签（三者必须一致）；环境值按 compose() 同一规则组装：
+# PATH=/usr/bin:/bin、HOME=宿主契约 deploy_root、LINGXI_ENV_ROOT=宿主契约 config_root、public-config 的 values（其指纹须等于
+# 容器标签 io.lingxi.config-sha256），镜像三项取部署器状态账 <状态目录>/<部署编号>.plan.json 的 new 侧（与三容器现行镜像摘要
+# 逐一相同才用）。解释器只解析 JSON / 算指纹，不导入部署器模块、不写任何文件。
+RECREATE_SERVICES=(scheduler gateway worker-queue)
+RECREATE_PY=$(cat <<'PY'
+import hashlib, json, os, stat, sys
+from pathlib import Path
+
+SERVICES = ("scheduler", "gateway", "worker-queue")
+KEYS = ("io.lingxi.bundle-sha256", "io.lingxi.config-sha256", "io.lingxi.deployment-id", "com.docker.compose.project",
+        "com.docker.compose.project.working_dir", "com.docker.compose.project.config_files")
+
+
+def fail(message):
+    print("ERR " + message)
+    sys.exit(3)
+
+
+def fingerprint(value):  # 与 deploy_state.fingerprint 同一编码
+    return hashlib.sha256((json.dumps(value, sort_keys=True, ensure_ascii=False, indent=2) + "\n").encode()).hexdigest()
+
+
+def main(dump, project, config_root, bundle_root, deploy_root, public_config, root, test_form):
+    lines = Path(dump).read_text(encoding="utf-8").splitlines()
+    if len(lines) % 3:
+        fail("容器回读形状异常")
+    found = {}
+    for index in range(0, len(lines), 3):
+        labels, image = json.loads(lines[index + 1]) or {}, json.loads(lines[index + 2])
+        service = labels.get("com.docker.compose.service")
+        if service not in SERVICES:
+            continue
+        if service in found:
+            fail("同一服务有两个容器：" + service)
+        found[service] = (lines[index], labels, image)
+    missing = [s for s in SERVICES if s not in found]
+    if missing:
+        fail("三容器不全，缺：" + " ".join(missing))
+    for key in KEYS:
+        seen = {s: found[s][1].get(key) for s in SERVICES}
+        if len(set(seen.values())) != 1 or not seen["scheduler"]:
+            fail("三容器标签不一致或缺失：" + key + " → " + "；".join(f"{s}={v}" for s, v in seen.items()))
+    first = found["scheduler"][1]
+    bundle, config_sha, deployment = (first[k] for k in KEYS[:3])
+    if first["com.docker.compose.project"] != project:
+        fail("容器标签 compose 项目 ≠ 宿主契约 project：" + first["com.docker.compose.project"])
+    if first["com.docker.compose.project.working_dir"] != config_root:
+        fail("容器标签 working_dir ≠ 宿主契约 config_root：" + first["com.docker.compose.project.working_dir"])
+    files = first["com.docker.compose.project.config_files"].split(",")
+    if len(files) != 3 or os.path.basename(files[2]) != deployment + ".channel.compose.json":
+        fail("容器标签 config_files 不是「控制包两份 compose + <状态目录>/<部署编号>.channel.compose.json」：" + ",".join(files))
+    owner = os.getuid() if test_form == "1" else 0
+    for name in files:
+        path = root + name
+        if not os.path.lexists(path):
+            fail("compose 文件不存在：" + path)
+        info = os.lstat(path)
+        if not stat.S_ISREG(info.st_mode):
+            fail("compose 文件不是普通文件（或是符号链接）：" + path)
+        if info.st_uid != owner:
+            fail(f"compose 文件属主不是 root：{path}（uid={info.st_uid}）")
+    state_directory = os.path.dirname(files[2])
+    plan_path = root + state_directory + "/" + deployment + ".plan.json"
+    if not os.path.isfile(plan_path):
+        fail("部署器状态账缺计划文件：" + plan_path)
+    plan = json.loads(Path(plan_path).read_text(encoding="utf-8"))
+    release = plan["new"]
+    control = release["control_bundle"] if release["schema"] == 2 else plan["recovery"]["historical"]["control_bundle"]
+    if plan["id"] != deployment or plan["project"] != project:
+        fail("计划文件的 id / project 与容器标签不符")
+    if plan["config_sha256"] != config_sha or control["sha256"] != bundle:
+        fail("计划文件的 config_sha256 / 控制包摘要与容器标签不符")
+    override = "prod" if plan["environment"] == "production" else "stage"
+    base = os.path.normpath(bundle_root) + "/" + bundle + "/deploy/"
+    if files[:2] != [base + "compose.yaml", base + f"compose.{override}.yaml"]:
+        fail("容器标签 config_files 的控制包路径 ≠ 宿主契约 bundle_root/<控制包摘要>/deploy/compose{,." + override + "}.yaml")
+    for service in SERVICES:
+        want = release["images"]["worker" if service == "worker-queue" else service].split("@")[-1]
+        have = found[service][2].split("@")[-1]
+        if want != have:
+            fail(f"{service} 现行镜像摘要 ≠ 状态账 new 侧登记（{have} / {want}）")
+    if not os.path.isfile(public_config):
+        fail("public-config 不存在：" + public_config)
+    config = json.loads(Path(public_config).read_text(encoding="utf-8"))
+    if fingerprint(config) != config_sha:
+        fail("public-config 指纹 ≠ 容器标签 io.lingxi.config-sha256：部署后被改过，重建会带入未部署的配置（按拉取代理文档处置）")
+    env = {"PATH": "/usr/bin:/bin", "HOME": deploy_root, "LINGXI_ENV_ROOT": config_root, **config["values"]}
+    env.update(LINGXI_IMAGE_REGISTRY="ghcr.io/" + release["repository"].lower().rsplit("/", 1)[0], LINGXI_IMAGE_TAG=release["tag"])
+    for service, image in release["images"].items():
+        env[f"LINGXI_{service.upper()}_IMAGE_DIGEST"] = "@" + image.split("@")[1]
+    for key, value in env.items():
+        if not isinstance(value, str) or "\n" in value or "=" in key or "\n" in key:
+            fail("环境值形状异常：" + str(key))
+    print(f"SRC 部署编号 {deployment}；控制包 {bundle}；配置指纹 {config_sha}（三容器标签一致）")
+    print(f"SRC compose 项目 / 工作目录 / config_files ← 三容器标签（= 宿主契约 project / config_root / bundle_root）")
+    print(f"SRC HOME / LINGXI_ENV_ROOT ← 宿主契约 deploy_root / config_root；values ← {public_config}（指纹 = 容器标签）")
+    print(f"SRC LINGXI_IMAGE_* ← 状态账 {plan_path} 的 new 侧（repository / tag / images；三服务摘要 = 容器现行镜像）")
+    for service in SERVICES:
+        ident, labels, image = found[service]
+        print("ID " + service + " " + ident)
+        print("LABEL " + service + " " + json.dumps({"labels": {k: labels.get(k) for k in KEYS}, "image": image}, sort_keys=True))
+    for key, value in env.items():
+        print("ENV " + key + "=" + value)
+    args = ["compose", "--project-name", project, "--project-directory", config_root, "-f", files[0], "-f", files[1],
+            "-f", files[2], "--profile", "mvp", "up", "-d", "--force-recreate", "--no-build", "--pull", "never", *SERVICES]
+    for arg in args:
+        print("ARG " + arg)
+
+
+try:
+    main(*sys.argv[1:9])
+except SystemExit:
+    raise
+except Exception as error:  # 形状异常：只报类型与键名，不回显文件内容
+    fail(f"状态账 / public-config / 标签形状异常（{type(error).__name__}: {str(error)[:80]}）")
+PY
+)
+recreate_collect() { # $1 输出文件：每容器三行（id、标签 JSON、镜像引用 JSON），与部署器 containers() 同一 inspect 字段
+  local ids id; ids="$("$DOCKER" ps -aq --filter "label=com.docker.compose.project=$PROJECT")" || die "docker ps 失败"
+  : > "$1"
+  for id in $ids; do printf '%s\n' "$id" >> "$1"
+    "$DOCKER" inspect --format $'{{json .Config.Labels}}\n{{json .Config.Image}}' "$id" >> "$1" || die "docker inspect $id 失败"; done
+}
+recreate_resolve() { # $1 回读文件 $2 失败前缀 → 全局 RC_ENV / RC_ARGS / RC_SRC 数组与 RC_ID / RC_LABEL 关联数组
+  local out line
+  if ! out="$("$RC_PY" -B -c "$RECREATE_PY" "$1" "$PROJECT" "$RC_CONFIG_ROOT" "$RC_BUNDLE_ROOT" "$RC_DEPLOY_ROOT" "$PUBLIC_CONFIG" "$ROOT" "$TEST_FORM")"; then
+    line="$(printf '%s\n' "$out" | sed -n 's/^ERR //p' | head -n1)"; die "$2${line:-回读解析失败}"
+  fi
+  RC_ENV=(); RC_ARGS=(); RC_SRC=(); RC_ID=(); RC_LABEL=()
+  while IFS= read -r line; do case "${line%% *}" in
+      ENV) RC_ENV+=("${line#ENV }") ;; ARG) RC_ARGS+=("${line#ARG }") ;; SRC) RC_SRC+=("${line#SRC }") ;;
+      ID) line="${line#ID }"; RC_ID["${line%% *}"]="${line#* }" ;; LABEL) line="${line#LABEL }"; RC_LABEL["${line%% *}"]="${line#* }" ;;
+    esac; done <<< "$out"
+}
+do_recreate_services() {
+  local dry=0; [[ "$FLAG" == --dry-run ]] && dry=1
+  banner "可逆（同一镜像与参数重建，数据不在容器里）" "rollback-dsn 后再跑本子命令"
+  RC_CONFIG_ROOT="${CONFIG_ROOT#"$ROOT"}"; RC_BUNDLE_ROOT="$(json_str "$HOST_CONTRACT" bundle_root || true)"; RC_DEPLOY_ROOT="$(json_str "$HOST_CONTRACT" deploy_root || true)"
+  [[ -n "$RC_BUNDLE_ROOT" && -n "$RC_DEPLOY_ROOT" ]] || die "前置不满足：宿主契约缺 bundle_root / deploy_root：$HOST_CONTRACT"
+  RC_PY="$PYTHON_BIN"; [[ -n "$RC_PY" ]] || { if [[ -x /opt/lingxi/bin/python3 ]]; then RC_PY=/opt/lingxi/bin/python3; else RC_PY=python3; fi; }
+  command -v "$RC_PY" >/dev/null || die "前置不满足：找不到解释器 $RC_PY（设 LINGXI_S30_PYTHON）"
+  if [[ -n "$PUBLIC_CONFIG_IN" ]]; then PUBLIC_CONFIG="$ROOT$PUBLIC_CONFIG_IN"
+  else [[ -f "$PULL_CONFIG" ]] || die "前置不满足：拉取代理配置不存在：$PULL_CONFIG（或设 LINGXI_S30_PUBLIC_CONFIG）"
+    PUBLIC_CONFIG="$(json_str "$PULL_CONFIG" public_config || true)"; [[ -n "$PUBLIC_CONFIG" ]] || die "前置不满足：$PULL_CONFIG 缺 public_config 键"; PUBLIC_CONFIG="$ROOT$PUBLIC_CONFIG"; fi
+  local scratch; scratch="$(mktemp -d -- "${TMPDIR:-/tmp}/.s30-recreate.XXXXXX")"
+  # shellcheck disable=SC2064 # 路径此刻就定下，退出时删这一份
+  trap "rm -rf -- '$scratch'" EXIT
+  declare -gA RC_ID RC_LABEL; local -A pre_id pre_label; local svc item i=0
+  recreate_collect "$scratch/before"; recreate_resolve "$scratch/before" "前置不满足："
+  for svc in "${RECREATE_SERVICES[@]}"; do pre_id[$svc]="${RC_ID[$svc]}"; pre_label[$svc]="${RC_LABEL[$svc]}"; done
+  for item in "${RC_SRC[@]}"; do say "[取值来源] $item"; done
+  local shown=(env -i); for item in "${RC_ENV[@]}"; do
+    if [[ "${item%%=*}" =~ (DSN|PASSWORD|PASSWD|SECRET|TOKEN) ]]; then shown+=("${item%%=*}=<已隐去>"); else shown+=("$item"); fi; done
+  shown+=("$DOCKER" "${RC_ARGS[@]}")
+  for item in "${shown[@]}"; do say "[argv] $i: $item"; i=$((i + 1)); done
+  (( dry )) && { say "dry-run：未执行（三容器未动）"; return 0; }
+  local lock lockfd; lock="$(json_str "$HOST_CONTRACT" lock_path || true)"
+  if [[ -n "$lock" && -f "$ROOT$lock" ]]; then exec {lockfd}<"$ROOT$lock"
+    flock -n "$lockfd" || die "前置不满足：部署器主机锁被占用（部署在途），等其结束再跑"; say "[锁] 已取部署器主机锁（与部署器互斥，重建命令返回即释放）"
+  else say "[锁] 宿主契约无 lock_path 或锁文件不存在（本机未由部署器部署过），跳过互斥"; fi
+  env -i "${RC_ENV[@]}" "$DOCKER" "${RC_ARGS[@]}" || die "docker compose up --force-recreate 失败（现场 docker ps -a；参数未变，可直接重跑本子命令）"
+  [[ -z "${lockfd:-}" ]] || exec {lockfd}<&-
+  recreate_collect "$scratch/after"; recreate_resolve "$scratch/after" "重建后回读不符："
+  for svc in "${RECREATE_SERVICES[@]}"; do [[ "${RC_ID[$svc]}" != "${pre_id[$svc]}" ]] || die "重建后回读不符：$svc 容器 id 未变（未重建）"; done
+  say "[回读判据] 三容器 Recreate ×3（容器 id 全部更换）→ ok"
+  local start=$SECONDS pending h
+  while :; do pending=""
+    for svc in "${RECREATE_SERVICES[@]}"; do h="$(db_health "${RC_ID[$svc]}")"; [[ "$h" == healthy ]] || pending+="$svc=$h "; done
+    [[ -z "$pending" ]] && break
+    (( SECONDS - start < RECREATE_TIMEOUT )) || die "超时：${RECREATE_TIMEOUT}s 内未全部 healthy：$pending"
+    sleep "$RECREATE_POLL"
+  done
+  say "[回读判据] 三容器 healthy（用时 $((SECONDS - start))s ≤ 上限 ${RECREATE_TIMEOUT}s）→ ok"
+  for svc in "${RECREATE_SERVICES[@]}"; do [[ "${RC_LABEL[$svc]}" == "${pre_label[$svc]}" ]] || die "重建后回读不符：$svc 标签或镜像与重建前不同"; done
+  say "[回读判据] 三容器标签与镜像与重建前逐一相同 → ok"
+  say "recreate-services 完成 → start-timers → postcheck（rollback-dsn 之后跑的，到此即回到旧 DSN）"
 }
 
 # ============================ postcheck ============================
@@ -603,7 +801,7 @@ do_cleanup() {
 case "$SUB" in
   preflight) do_preflight ;; install-pg) do_install_pg ;; stop-write) do_stop_write ;; dump) do_dump ;;
   restore) do_restore ;; verify) do_verify ;; switch-dsn) do_switch_dsn ;; start-timers) banner 可逆 "systemctl stop"; do_start_timers ;;
-  postcheck) do_postcheck ;; rollback-dsn) do_rollback_dsn ;; start-services) do_start_services ;;
+  postcheck) do_postcheck ;; rollback-dsn) do_rollback_dsn ;; start-services) do_start_services ;; recreate-services) do_recreate_services ;;
   smoke-test) do_smoke_test ;; status) do_status ;; cleanup) do_cleanup ;;
   *) die "未知子命令 $SUB" ;;
 esac
@@ -611,3 +809,5 @@ esac
 # DOCKER SYSTEMCTL（可注入桩）APP_NETWORK DB_PROJECT DB_CONTAINER DB_HOST_PORT DB_CONFIG_DIR DB_INSTALL_DIR DB_DATA_DIR
 # WORK_ROOT WORK_DIR BACKUP_ROOT MONITOR_ENV SOURCE_ENV_FILE（缺省 <config_root>/.env.<env>.migrate）HOSTS_FILE（缺省 /etc/hosts）COMPOSE_SRC COMPOSE_SHA（必填）PG_IMAGE MIN_FREE_GB PUBLIC_MODE(drop|toc)
 # ALLOW_NONEMPTY_RESTORE POSTCHECK_TIMEOUT PULL_SETTLE_TIMEOUT PULL_TIMER SAMPLER_TIMER ENV_FILE；DBVAR_<NAME>=值 → compose.env 的 LINGXI_DB_<NAME>
+# recreate-services：PULL_CONFIG（缺省 /opt/lingxi/control/release-pull-agent.json）PUBLIC_CONFIG（设了就不读 PULL_CONFIG）
+# RECREATE_TIMEOUT（healthy 硬上限，缺省 180 秒）RECREATE_POLL（缺省 5 秒）PYTHON（缺省 /opt/lingxi/bin/python3，没有则 python3）
