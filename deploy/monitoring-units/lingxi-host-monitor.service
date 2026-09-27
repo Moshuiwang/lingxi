@@ -20,3 +20,7 @@ WorkingDirectory=/opt/lingxi/monitoring
 ExecStart=/opt/lingxi/bin/python3 /opt/lingxi/scripts/host_health_alert.py --env-file /opt/lingxi/monitoring/host-monitor.env
 # 小于 timer 的 60s 周期：脚本自带文件锁，超时被杀不会与下一轮重叠。
 TimeoutStartSec=50
+# 主机上装的若还是本文件的旧版（ExecStart 为系统 python3、或 User= 写在本体、或缺
+# TimeoutStartSec），靠另加一份覆盖 ExecStart 的 drop-in 换解释器只是临时补丁：先与本文件
+# 逐行比对，再整份替换并把 User= 迁进 10-local.conf，换解释器的那份 drop-in 随之删除——
+# 解释器只由上面的注入点声明（#884 第 7 条）。
