@@ -217,7 +217,7 @@ docker compose --env-file deploy/.env.prod \
 
 **① 重启/替换 gateway 之前先确认没有在途任务与在途文档交付。** 只读计数。**自 2026-09-22
 （`v2.6.0`）起生产库是本机容器 `lingxi-db`（PostgreSQL 17），Supabase 只停写待退订**：不得再
-从 `supabase-prod.env` 取连接串查询——那会查到已停写的旧库、恒得 `0|0|0`，是假安全信号。
+从 `supabase-prod.env` 取连接串查询——那会查到已停写的旧库，结果与生产无关，是假安全信号。
 改在本机库容器内经本地套接字执行，不持有连接串与口令；形态与每日备份脚本
 `scripts/ops/db_backup.sh`、`deploy/监控告警.md` 第十节对同一库的只读查询相同（部署用户须在
 docker 组）。这三项计数本身尚未在本机库上实跑过（预发仍连 Supabase stage，无法先行实测），
