@@ -1750,8 +1750,10 @@ def send_alert(message: str, env_file: Path, timeout_seconds: int) -> None:
 
 
 def _post_alert(token: str, chat_id: str, msg_type: str, content: dict, timeout: int) -> None:
-    """发一条指定类型的群消息；业务码为 0 才算成功，整数非零码抛 ``AlertRejectedError``，
-    缺码 / 畸形码及其余失败为结果不明。"""
+    """发一条指定类型的群消息；只有业务码为 0 才算成功。
+
+    整数非零码抛 ``AlertRejectedError``，缺码 / 畸形码及其余失败为结果不明。
+    """
     body = json.dumps(
         {
             "receive_id": chat_id,
@@ -1785,8 +1787,10 @@ def _post_alert(token: str, chat_id: str, msg_type: str, content: dict, timeout:
 
 
 def _alert_business_code(value: object) -> int | None:
-    """飞书业务码只认整数或纯数字字符串；其余（缺失、null、布尔、列表、字典、
-    非数字字符串）返回 ``None``，由调用方判结果不明。"""
+    """飞书业务码只认整数或纯数字字符串。
+
+    其余（缺失、null、布尔、列表、字典、非数字字符串）返回 ``None``，由调用方判结果不明。
+    """
     if isinstance(value, bool):
         return None
     if isinstance(value, int):
