@@ -18,8 +18,11 @@ from __future__ import annotations
 
 import re
 from collections.abc import Sequence
+from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
+from typing import Any
 
+from lingxi.config.content import ContentCatalog, ContentError, default_content_catalog
 from lingxi.core.daily_report_stats import (
     DENIED_COUNT_ALL_NULL_REASON as DENIED_COUNT_ALL_NULL_REASON,
 )
@@ -61,6 +64,13 @@ from lingxi.core.daily_report_stats import (
     build_status_distribution as build_status_distribution,
 )
 from lingxi.core.daily_report_stats import build_token_usage_stats as build_token_usage_stats
+from lingxi.core.delivery.notice_card import NoticeCard, NoticeSection, NoticeTone
+from lingxi.core.delivery.ops_notice import (
+    DAILY_REPORT_CARD_KEY,
+    escaped_lines,
+    ops_notice_card,
+    send_group_notice,
+)
 
 #: 失败分类 reason_code 渲染前的形状白名单；已知边界见 :func:`_safe_reason_code`
 #: 文档。
@@ -408,3 +418,192 @@ def render_daily_report(
     if local_override_line:
         lines.extend(["", local_override_line])
     return "\n".join(lines)
+
+
+# --------------------------------------------------------------------------
+# 通知卡：卡片键未进内容目录时只发上面渲染的纯文本，逐字不变
+# --------------------------------------------------------------------------
+
+
+def _window_lines(window_start: datetime, window_end: datetime) -> tuple[str, str]:
+    """统计窗口拆成 UTC 与北京时间两行，两端各自带完整日期（V-通报-06）。"""
+    utc_start, utc_end = window_start.astimezone(UTC), window_end.astimezone(UTC)
+    beijing_start, beijing_end = utc_start + _BEIJING_OFFSET, utc_end + _BEIJING_OFFSET
+    return (
+        f"UTC：{utc_start:%Y-%m-%d %H:%M} 至 {utc_end:%Y-%m-%d %H:%M}",
+        f"北京时间：{beijing_start:%Y-%m-%d %H:%M} 至 {beijing_end:%Y-%m-%d %H:%M}",
+    )
+
+
+def daily_report_anomalies(inputs: DailyReportInputs) -> list[str]:
+    """「先看异常」的行（K-4 默认）：失败 / 拦截 / 拒绝类计数大于 0，及不可判定的段落。
+
+    不新增阈值、不改统计口径：每行就是正文里对应那一行的原文。调用次数对照恒为
+    不可判定，是结构性缺口而不是当天的异常，不归入这里（仍留在耗时段原位）。
+    """
+    lines: list[str] = []
+    status = inputs.status_distribution
+    if status.is_determined and status.value and (status.value.failed or status.value.timeout):
+        lines.append(_render_status_distribution(status))
+    if inputs.guard_triggered.is_determined and inputs.guard_triggered.value:
+        lines.append(_render_guard_triggered(inputs.guard_triggered))
+    denied = inputs.denied_count
+    if denied.is_determined and denied.value is not None and denied.value.total:
+        lines.append(_render_denied_count(denied))
+    undetermined = (
+        (inputs.active_users, _render_active_users),
+        (inputs.status_distribution, _render_status_distribution),
+        (inputs.failure_top, lambda section: _render_failure_top(section, None)[0]),
+        (inputs.guard_triggered, _render_guard_triggered),
+        (inputs.denied_count, _render_denied_count),
+        (inputs.latency, lambda section: _render_latency(section).split("\n", 1)[0]),
+        (inputs.resource_usage, _render_resource_usage),
+        (inputs.delivery_outcome, _undetermined_delivery_line),
+        (inputs.metric_coverage_gap, _render_metric_coverage_gap),
+        (inputs.local_override_activity, _render_local_override_activity),
+    )
+    for section, render in undetermined:
+        if section is not None and not section.is_determined:
+            lines.append(render(section))
+    return lines
+
+
+#: 卡片里投递结果段的窗口说明（纯文本里同一句话在「本段窗口」括注中）。
+_DELIVERY_WINDOW_REASON = (
+    "比上方统计窗口早一天：24 小时投递确认期必须已经完全关闭，「过期」这一桶才有可能统计到非零值"
+)
+
+
+def _undetermined_delivery_line(section: Section[DeliveryOutcomeStats]) -> str:
+    assert section.undetermined_reason is not None
+    return f"投递结果分布：{_render_undetermined(section.undetermined_reason)}"
+
+
+def _card_sections(
+    inputs: DailyReportInputs, throttled: Sequence[ThrottledFailureLine] | None
+) -> list[NoticeSection]:
+    """数据分段：统计窗口 → 先看异常 → 使用情况 → … → 投递结果（更早窗口）→ 可选段。"""
+    anomalies = daily_report_anomalies(inputs)
+    delivery = _render_delivery_outcome(
+        inputs.delivery_outcome,
+        window_start=inputs.delivery_window_start,
+        window_end=inputs.delivery_window_end,
+    )
+    parts: list[tuple[str, Sequence[str]]] = [
+        ("统计窗口", _window_lines(inputs.window_start, inputs.window_end)),
+        ("先看异常", anomalies or ["无：失败、拦截、拒绝类计数均为 0，各段均可判定"]),
+        (
+            "使用情况",
+            [
+                _render_active_users(inputs.active_users),
+                _render_status_distribution(inputs.status_distribution),
+            ],
+        ),
+        ("失败分类", _render_failure_top(inputs.failure_top, throttled)),
+        (
+            "守卫与拒绝",
+            [
+                _render_guard_triggered(inputs.guard_triggered),
+                _render_denied_count(inputs.denied_count),
+            ],
+        ),
+        (
+            "耗时与资源",
+            [_render_latency(inputs.latency), _render_resource_usage(inputs.resource_usage)],
+        ),
+        (
+            "投递结果（使用更早的窗口）",
+            [
+                *_window_lines(inputs.delivery_window_start, inputs.delivery_window_end),
+                delivery.split("\n", 1)[0],
+                _DELIVERY_WINDOW_REASON,
+            ],
+        ),
+    ]
+    for heading, line in (
+        ("待分配", _render_metric_coverage_gap(inputs.metric_coverage_gap)),
+        ("本地权限覆盖活动", _render_local_override_activity(inputs.local_override_activity)),
+    ):
+        if line:
+            parts.append((heading, [line]))
+    return [NoticeSection(heading=heading, lines=escaped_lines(lines)) for heading, lines in parts]
+
+
+def render_daily_report_card(
+    inputs: DailyReportInputs,
+    *,
+    text: str,
+    throttled_failure_lines: Sequence[ThrottledFailureLine] | None = None,
+    catalog: ContentCatalog | None = None,
+) -> NoticeCard | None:
+    """配一张每日通报卡；卡片键未登记或本地造不出卡片时返回 ``None``（照旧发 ``text``）。
+
+    有「先看异常」行时用「需注意」色调，否则「完成」。卡片没有按钮、链接或回调；
+    等价纯文本就是 ``text``。
+    """
+    if catalog is None:
+        try:
+            catalog = default_content_catalog()
+        except ContentError:
+            return None
+    tone = NoticeTone.ATTENTION if daily_report_anomalies(inputs) else NoticeTone.DONE
+    return ops_notice_card(
+        catalog,
+        DAILY_REPORT_CARD_KEY,
+        tone=tone,
+        fallback_text=text,
+        sections=_card_sections(inputs, throttled_failure_lines),
+    )
+
+
+@dataclass(frozen=True)
+class DailyReportNotice:
+    """一轮通报的纯文本与（卡片键已登记时的）通知卡。"""
+
+    text: str
+    card: NoticeCard | None
+
+    def send(self, sender: Any, *, chat_id: str, dedupe_key: str) -> None:
+        """有卡片发卡片（飞书明确拒绝时发送口回落文本一次），否则发纯文本。"""
+        send_group_notice(
+            sender, chat_id=chat_id, text=self.text, card=self.card, dedupe_key=dedupe_key
+        )
+
+
+def render_daily_report_notice(
+    sections: Any,
+    *,
+    window_start: datetime,
+    window_end: datetime,
+    delivery_window_start: datetime,
+    delivery_window_end: datetime,
+    catalog: ContentCatalog | None = None,
+) -> DailyReportNotice:
+    """把 scheduler 聚合出的各段装进 :class:`DailyReportInputs`，渲染纯文本并配卡。
+
+    ``sections`` 是 scheduler 的段落聚合结果（各段 ``Section`` 与 ``throttled_lines``
+    属性）；纯文本与 ``apps/scheduler/daily_report_sections._render_daily_report_text``
+    逐字相同。
+    """
+    inputs = DailyReportInputs(
+        window_start=window_start,
+        window_end=window_end,
+        active_users=sections.active_users,
+        status_distribution=sections.status_distribution,
+        failure_top=sections.failure_top,
+        guard_triggered=sections.guard_triggered,
+        denied_count=sections.denied_count,
+        latency=sections.latency,
+        resource_usage=sections.resource_usage,
+        delivery_outcome=sections.delivery_outcome,
+        metric_coverage_gap=sections.metric_coverage_gap,
+        local_override_activity=sections.local_override_activity,
+        delivery_window_start=delivery_window_start,
+        delivery_window_end=delivery_window_end,
+    )
+    throttled = sections.throttled_lines
+    text = render_daily_report(inputs, throttled_failure_lines=throttled)
+    card = render_daily_report_card(
+        inputs, text=text, throttled_failure_lines=throttled, catalog=catalog
+    )
+    return DailyReportNotice(text=text, card=card)

@@ -17,6 +17,7 @@ from __future__ import annotations
 import threading
 import time
 import unittest
+import unittest.mock
 from datetime import UTC, date, datetime, timedelta
 
 from lingxi.apps.scheduler.daily_report import DailyReportDuty
@@ -905,6 +906,69 @@ class LocalOverrideActivityWiringTests(unittest.TestCase):
         self.assertEqual(len(observed), 1)
         active_users_window = parts["source"].calls["active_user_task_counts"][0]
         self.assertEqual(observed[0], active_users_window)
+
+
+class NoticeCardSender(FakeSender):
+    """多一个卡片发送口；``notice_failures`` 次卡片结果不明（抛错）。"""
+
+    def __init__(self, *, notice_failures: int = 0) -> None:
+        super().__init__()
+        self._notice_failures = notice_failures
+        self.notices: list[dict[str, object]] = []
+
+    def send_notice(self, *, chat_id: str, card, dedupe_key: str) -> None:
+        self.notices.append({"chat_id": chat_id, "card": card, "dedupe_key": dedupe_key})
+        if self._notice_failures > 0:
+            self._notice_failures -= 1
+            raise RuntimeError("模拟卡片结果不明")
+
+
+class DailyReportNoticeCardTests(unittest.TestCase):
+    """#891：卡片键进目录后发通知卡；未进目录时行为与今天逐字相同。"""
+
+    def _patch_catalog(self, catalog) -> None:
+        from lingxi.core import daily_report as core
+
+        patcher = unittest.mock.patch.object(core, "default_content_catalog", return_value=catalog)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def test_without_the_card_key_the_duty_sends_the_same_text_and_no_card(self) -> None:
+        sender = NoticeCardSender()
+        duty, parts = build_duty(sender=sender)
+        text = duty.run_once()
+        self.assertEqual([payload["text"] for payload in sender.payloads], [text])
+        self.assertEqual(sender.notices, [])
+
+    def test_with_the_card_key_one_card_goes_out_and_the_watermark_is_set(self) -> None:
+        from test_notice_cards_ops import catalog_with_ops_cards
+
+        self._patch_catalog(catalog_with_ops_cards())
+        sender = NoticeCardSender()
+        duty, parts = build_duty(sender=sender)
+        text = duty.run_once()
+        self.assertEqual(sender.attempts, [])
+        self.assertEqual(len(sender.notices), 1)
+        notice = sender.notices[0]
+        self.assertEqual(notice["dedupe_key"], "daily-report:2026-08-24")
+        self.assertEqual(notice["card"].fallback_text, text)
+        self.assertEqual(parts["watermark"].mark_sent_calls, [("2026-08-24", FAKE_CHAT_ID)])
+
+    def test_an_unclear_card_result_sends_no_text_and_retries_next_round(self) -> None:
+        from test_notice_cards_ops import catalog_with_ops_cards
+
+        self._patch_catalog(catalog_with_ops_cards())
+        sender = NoticeCardSender(notice_failures=1)
+        duty, parts = build_duty(sender=sender)
+        self.assertIsNone(duty.run_once())
+        self.assertEqual(sender.attempts, [])
+        self.assertEqual(parts["watermark"].mark_sent_calls, [])
+        self.assertIn("daily_report.send_failed", parts["audit"].actions())
+        self.assertIsNotNone(duty.run_once())
+        keys = {notice["dedupe_key"] for notice in sender.notices}
+        self.assertEqual(keys, {"daily-report:2026-08-24"})
+        self.assertEqual(len(sender.notices), 2)
+        self.assertEqual(sender.attempts, [])
 
 
 if __name__ == "__main__":

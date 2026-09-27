@@ -60,7 +60,7 @@
 86	src/lingxi/apps/scheduler/permission_readiness_assembly.py
 504	src/lingxi/apps/scheduler/permission_refresh.py
 127	src/lingxi/apps/scheduler/permission_refresh_ports.py
-298	src/lingxi/apps/scheduler/roster_audit.py
+296	src/lingxi/apps/scheduler/roster_audit.py
 311	src/lingxi/apps/scheduler/stalled_provisioning.py
 290	src/lingxi/apps/trace/__init__.py
 509	src/lingxi/apps/worker/cli.py

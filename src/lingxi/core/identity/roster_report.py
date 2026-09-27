@@ -17,9 +17,18 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
+from dataclasses import dataclass
 from datetime import UTC, date
+from typing import Any
 
 from lingxi.config.content import ContentCatalog, RenderedContent, default_content_catalog
+from lingxi.core.delivery.notice_card import NoticeCard, NoticeSection, NoticeTone, escape_markdown
+from lingxi.core.delivery.ops_notice import (
+    ROSTER_REPORT_CARD_KEY,
+    escaped_lines,
+    ops_notice_card,
+    send_group_notice,
+)
 from lingxi.core.identity.roster_audit import (
     ARCHIVED_FIELDS,
     ArchivedIdentity,
@@ -179,6 +188,70 @@ def _snapshot_lines(status: RosterSnapshotStatus, *, catalog) -> list[str]:
     return lines
 
 
+@dataclass(frozen=True)
+class _ReportParts:
+    """日报正文的各部分；纯文本与通知卡都由它拼出，保证两者内容同源。"""
+
+    header: str
+    summary: str
+    snapshot_lines: tuple[str, ...]
+    disclaimer: str
+    sections: tuple[tuple[str, tuple[str, ...]], ...]
+
+    def lines(self) -> list[str]:
+        """按原有纯文本版式展开成行。"""
+        lines = [self.header, self.summary, *self.snapshot_lines, self.disclaimer]
+        for heading, entries in self.sections:
+            lines.extend(["", heading, *entries])
+        return lines
+
+
+def _report_parts(
+    report: RosterAuditReport,
+    *,
+    report_date: date,
+    identities: Mapping[str, ArchivedIdentity] | None,
+    snapshot: RosterSnapshotStatus | None,
+    catalog: ContentCatalog,
+) -> _ReportParts:
+    index: Mapping[str, ArchivedIdentity] = identities or {}
+    title = catalog.text("roster.report_title").text
+    header = catalog.text("roster.header", title=title, report_date=report_date.isoformat()).text
+    if snapshot is not None and not snapshot.available:
+        # 没比对就不能说「本次发现 N 条」——那句话在这一天是假的。
+        summary = catalog.text("roster.summary_not_compared").text
+    else:
+        summary = catalog.text(
+            "roster.summary", examined=report.examined, entries=len(report.entries)
+        ).text
+    snapshot_lines = (
+        tuple(_snapshot_lines(snapshot, catalog=catalog)) if snapshot is not None else ()
+    )
+    sections: list[tuple[str, tuple[str, ...]]] = []
+    for kind in _SECTION_ORDER:
+        section = tuple(entry for entry in report.entries if entry.kind is kind)
+        if not section:
+            continue
+        section_title = catalog.text(_SECTION_TITLE_KEYS[kind]).text
+        note = catalog.text(_SECTION_NOTE_KEYS[kind]).text
+        heading = catalog.text(
+            "roster.section_heading", title=section_title, count=len(section)
+        ).text
+        if note:
+            heading = catalog.text(
+                "roster.section_heading_with_note", heading=heading, note=note
+            ).text
+        entries = tuple(_entry_line(entry, catalog=catalog, identities=index) for entry in section)
+        sections.append((heading, entries))
+    return _ReportParts(
+        header=header,
+        summary=summary,
+        snapshot_lines=snapshot_lines,
+        disclaimer=catalog.text("roster.disclaimer").text,
+        sections=tuple(sections),
+    )
+
+
 def render_daily_report_content(
     report: RosterAuditReport,
     *,
@@ -195,41 +268,119 @@ def render_daily_report_content(
     产品承诺，只供不涉及这两段的单元测试使用。
     """
     catalog = catalog or default_content_catalog()
-    index: Mapping[str, ArchivedIdentity] = identities or {}
-    title = catalog.text("roster.report_title").text
-    lines = [catalog.text("roster.header", title=title, report_date=report_date.isoformat()).text]
+    parts = _report_parts(
+        report, report_date=report_date, identities=identities, snapshot=snapshot, catalog=catalog
+    )
+    return catalog.text("roster.daily_report", body="\n".join(parts.lines()))
 
-    if snapshot is not None and not snapshot.available:
-        # 没比对就不能说「本次发现 N 条」——那句话在这一天是假的。
-        lines.append(catalog.text("roster.summary_not_compared").text)
+
+def _card_anomalies(
+    report: RosterAuditReport, parts: _ReportParts, snapshot: RosterSnapshotStatus | None
+) -> tuple[list[str], list[str]]:
+    """把概况行分成「先看异常」与「比对概况」两组，每行只出现一次。
+
+    异常：快照不可用 / 本轮读取未成功沿用旧快照 / 快照超龄，以及有待核实条目时的
+    比对摘要。其余（正常读取的快照行、无条目的摘要）归入比对概况。
+    """
+    anomalies: list[str] = []
+    overview: list[str] = []
+    snapshot_ok = snapshot is None or (snapshot.available and snapshot.refreshed)
+    if report.entries or (snapshot is not None and not snapshot.available):
+        anomalies.append(parts.summary)
     else:
-        lines.append(
-            catalog.text(
-                "roster.summary", examined=report.examined, entries=len(report.entries)
-            ).text
-        )
-    if snapshot is not None:
-        lines.extend(_snapshot_lines(snapshot, catalog=catalog))
-    lines.append(catalog.text("roster.disclaimer").text)
+        overview.append(parts.summary)
+    for index, line in enumerate(parts.snapshot_lines):
+        # 第一行是读取状态（正常 / 沿用 / 不可用），其后只可能是超龄提醒。
+        (overview if index == 0 and snapshot_ok else anomalies).append(line)
+    return anomalies, overview
 
-    for kind in _SECTION_ORDER:
-        section = tuple(entry for entry in report.entries if entry.kind is kind)
-        if not section:
-            continue
-        section_title = catalog.text(_SECTION_TITLE_KEYS[kind]).text
-        note = catalog.text(_SECTION_NOTE_KEYS[kind]).text
-        heading = catalog.text(
-            "roster.section_heading", title=section_title, count=len(section)
-        ).text
-        lines.append("")
-        lines.append(
-            catalog.text("roster.section_heading_with_note", heading=heading, note=note).text
-            if note
-            else heading
-        )
-        lines.extend(_entry_line(entry, catalog=catalog, identities=index) for entry in section)
 
-    return catalog.text("roster.daily_report", body="\n".join(lines))
+def render_daily_report_card(
+    report: RosterAuditReport,
+    *,
+    report_date: date,
+    text: str,
+    identities: Mapping[str, ArchivedIdentity] | None = None,
+    snapshot: RosterSnapshotStatus | None = None,
+    catalog: ContentCatalog | None = None,
+) -> NoticeCard | None:
+    """配一张花名册日报卡；卡片键未登记或本地造不出卡片时返回 ``None``（照旧发 ``text``）。
+
+    分段：目录模板（日期等）→ 先看异常 → 比对概况 → 各类条目 → 说明与下一步。条目
+    与存档身份逐行转义；卡片没有按钮、链接或回调（`V-花名册-24`），等价纯文本就是
+    ``text``。
+    """
+    catalog = catalog or default_content_catalog()
+    parts = _report_parts(
+        report, report_date=report_date, identities=identities, snapshot=snapshot, catalog=catalog
+    )
+    anomalies, overview = _card_anomalies(report, parts, snapshot)
+    sections = [
+        NoticeSection(
+            heading="先看异常",
+            lines=escaped_lines(anomalies or ["无：本轮读取正常，未发现需要人工核实的条目"]),
+        )
+    ]
+    if overview:
+        sections.append(NoticeSection(heading="比对概况", lines=escaped_lines(overview)))
+    for heading, entries in parts.sections:
+        sections.append(
+            NoticeSection(heading=escape_markdown(heading), lines=escaped_lines(entries))
+        )
+    return ops_notice_card(
+        catalog,
+        ROSTER_REPORT_CARD_KEY,
+        tone=NoticeTone.ATTENTION if anomalies else NoticeTone.DONE,
+        fallback_text=text,
+        values={"report_date": report_date.isoformat()},
+        sections=sections,
+        trailing=[NoticeSection(heading="下一步", lines=escaped_lines([parts.disclaimer]))],
+    )
+
+
+@dataclass(frozen=True)
+class RosterReportNotice:
+    """一轮花名册日报的已渲染文本（带内容键 / 版本）与通知卡。"""
+
+    content: RenderedContent
+    card: NoticeCard | None
+
+    @property
+    def key(self) -> str:
+        """纯文本的内容键，写进审计。"""
+        return self.content.key
+
+    @property
+    def version(self) -> str:
+        """内容目录版本，写进审计。"""
+        return self.content.version
+
+    @property
+    def text(self) -> str:
+        """纯文本正文（卡片的等价纯文本）。"""
+        return self.content.text
+
+    def send(self, sender: Any, *, chat_id: str, dedupe_key: str) -> None:
+        """有卡片发卡片（飞书明确拒绝时发送口回落文本一次），否则发纯文本。"""
+        send_group_notice(
+            sender, chat_id=chat_id, text=self.text, card=self.card, dedupe_key=dedupe_key
+        )
+
+
+def render_daily_report_notice(
+    report: RosterAuditReport,
+    *,
+    report_date: date,
+    identities: Mapping[str, ArchivedIdentity] | None = None,
+    snapshot: RosterSnapshotStatus | None = None,
+    catalog: ContentCatalog | None = None,
+) -> RosterReportNotice:
+    """渲染纯文本并配卡；卡片键未登记时 ``card`` 为 ``None``，只发纯文本。"""
+    catalog = catalog or default_content_catalog()
+    kwargs = {"report_date": report_date, "identities": identities, "snapshot": snapshot}
+    content = render_daily_report_content(report, catalog=catalog, **kwargs)
+    card = render_daily_report_card(report, text=content.text, catalog=catalog, **kwargs)
+    return RosterReportNotice(content=content, card=card)
 
 
 def render_daily_report(

@@ -163,6 +163,9 @@ REQUIRED_MODULES = (
     "lingxi.core.delivery.ports",
     "lingxi.core.delivery.notice_card",
     "lingxi.core.delivery.catalog_notice",
+    # 管理群运维通知卡（Issue #891）：`core/alerting.py` 发送时函数内 import alert_card。
+    "lingxi.core.delivery.ops_notice",
+    "lingxi.core.alert_card",
     # 回合终态判定（真中断 → 其他失败 → 协议残骸 → 正文被拒发 → 成功）与回合报告
     # 字段读取，从 apps/worker 平移进 core 的纯函数；`apps/worker/service.py`、
     # `terminal_outcome.py`、`turn.py` 模块级 import。
@@ -1087,6 +1090,9 @@ PROCESS_RUNTIME_IMPORTS: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {
             "lingxi.core.delivery.ports",
             "lingxi.core.delivery.notice_card",
             "lingxi.core.delivery.catalog_notice",
+            # 管理群运维通知卡（Issue #891）：`core/alerting.py` 发送时函数内 import alert_card。
+            "lingxi.core.delivery.ops_notice",
+            "lingxi.core.alert_card",
             "lingxi.adapters.postgres_admin_followup_projection",
             "lingxi.adapters.task_trace_query",
             "lingxi.apps.scheduler.lifecycle",
@@ -1251,6 +1257,9 @@ PROCESS_RUNTIME_IMPORTS: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {
             "lingxi.core.delivery.ports",
             "lingxi.core.delivery.notice_card",
             "lingxi.core.delivery.catalog_notice",
+            # 管理群运维通知卡（Issue #891）：`core/alerting.py` 发送时函数内 import alert_card。
+            "lingxi.core.delivery.ops_notice",
+            "lingxi.core.alert_card",
             # 回合终态判定与回合报告字段读取（理由见 REQUIRED_MODULES 同名条目）：
             # `apps/worker/service.py`、`terminal_outcome.py`、`turn.py` 模块级 import。
             "lingxi.core.delivery.turn_outcome",
@@ -1557,6 +1566,9 @@ PROCESS_RUNTIME_IMPORTS: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {
             "lingxi.core.delivery.ports",
             "lingxi.core.delivery.notice_card",
             "lingxi.core.delivery.catalog_notice",
+            # 管理群运维通知卡（Issue #891）：`core/alerting.py` 发送时函数内 import alert_card。
+            "lingxi.core.delivery.ops_notice",
+            "lingxi.core.alert_card",
             "lingxi.core.execution",
             "lingxi.core.execution.card_stream",
             "lingxi.core.ids",
