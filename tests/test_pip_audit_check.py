@@ -171,6 +171,7 @@ class ExitCodeTests(_Case):
         )
         self.assertEqual(result.returncode, 2, result.stdout)
         self.assertIn("严重度接口不可用", result.stdout)
+        self.assertIn("未能取得严重度（外部服务不可用），非漏洞判定", result.stdout)
 
     def test_unparseable_inputs_are_unknown(self) -> None:
         broken_json = self.write("broken.json", "{not json")
@@ -417,6 +418,13 @@ class WorkflowShapeTests(unittest.TestCase):
             self.assertIn("--vulnerability-service osv", text)
             self.assertIn("--format json", text)
             self.assertIn("scripts/ci/pip_audit_check.py", text)
+
+    def test_scan_goes_through_the_service_error_retry_wrapper_in_both_workflows(self) -> None:
+        # #874：两处扫描调用都经 pip_audit_scan.py（服务端故障重试、用尽判失败），不得再吞掉退出码。
+        for text in (self.audit, _job_block(self.weekly, "audit")):
+            self.assertEqual(text.count("scripts/ci/pip_audit_scan.py"), 1)
+            self.assertNotIn("|| echo", text)
+            self.assertNotIn("|| true", text)
 
     def test_weekly_workflow_only_runs_on_schedule_and_manual_trigger(self) -> None:
         on_block = re.search(r"^on:\n((?:  [^\n]*\n|\n)+)", self.weekly, re.M).group(1)
