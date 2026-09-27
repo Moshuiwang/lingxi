@@ -626,7 +626,9 @@ def parse_backup_status(raw: object) -> BackupStatus:
     """把状态文件的 JSON 转成 BackupStatus；形状不对抛 ``ValueError``，消息即固定原因码。
 
     `schema` 不是整数 1 或 `ok` 不是布尔 → ``schema``；`finished_at` 缺失、不是 ISO-8601 或
-    不带时区 → ``timestamp``。其余字段缺失按"没有"处理，不算坏文件。
+    不带时区 → ``timestamp``；`transfer` 缺失或不是对象、`transfer.ok` 不是布尔也不是 null、
+    或备份成功且方式为 scp 却没有传输结论 → ``transfer``（#884 F19：解释不了的形状判未知，
+    不能按"没有"当作正常）。`error` 与 `transfer.mode` 形状不对只换成固定占位词，不算坏文件。
     """
 
     if not isinstance(raw, Mapping):
@@ -644,16 +646,31 @@ def parse_backup_status(raw: object) -> BackupStatus:
     if finished_at.tzinfo is None:
         raise ValueError("timestamp")
     transfer = raw.get("transfer")
-    transfer = transfer if isinstance(transfer, Mapping) else {}
+    if not isinstance(transfer, Mapping):
+        raise ValueError("transfer")
     transfer_ok = transfer.get("ok")
+    if transfer_ok is not None and not isinstance(transfer_ok, bool):
+        raise ValueError("transfer")
+    if ok and transfer.get("mode") == "scp" and transfer_ok is None:
+        raise ValueError("transfer")
     error_code = raw.get("error")
     return BackupStatus(
         ok=ok,
         finished_at=finished_at,
         error=None if error_code is None else _short_code(error_code, "invalid_error_code"),
         transfer_mode=_short_code(transfer.get("mode"), "unknown"),
-        transfer_ok=transfer_ok if isinstance(transfer_ok, bool) else None,
+        transfer_ok=transfer_ok,
     )
+
+
+#: 状态文件完成时间允许领先本机时钟的上限：两台主机 NTP 正常时误差在秒级，超出即说明
+#: 时钟或文件本身不可信，判未知（#884 F19）。
+BACKUP_FUTURE_TOLERANCE = timedelta(minutes=5)
+
+
+def _backup_unknown_check(reason: str) -> ThresholdCheck:
+    detail = f"状态文件读不到或不合法（{reason}）"
+    return (DB_BACKUP_UNKNOWN, _DB_LABEL[DB_BACKUP_UNKNOWN], True, detail, 1)
 
 
 def judge_backup_status(
@@ -662,11 +679,18 @@ def judge_backup_status(
     """三个判据各自独立成检查项；未知键以未触发形态同批参与，读取恢复后才发得出恢复通知。
 
     过期看 `finished_at` 距今是否超过阈值——失败的一轮同样更新它，所以"一直失败"报的是
-    失败而不是过期，"定时器根本没跑"才报过期；传输失败只在备份本身成功时判。
+    失败而不是过期，"定时器根本没跑"才报过期。`finished_at` 领先本机时钟超过
+    `BACKUP_FUTURE_TOLERANCE` 时只出未知一项，三个判据这一轮不出结论。
+
+    传输失败只在备份本身成功时出结论：本地失败的一轮根本没走到传输，这时传输键不参与
+    （告警记忆原样保留），否则已告警的「传输失败」会被判成恢复（#884 F20）——恢复通知
+    必须同时满足本地成功与传输成功。
     """
 
+    if status.finished_at - now > BACKUP_FUTURE_TOLERANCE:
+        return [_backup_unknown_check("future_timestamp")]
     age_hours = (now - status.finished_at).total_seconds() / 3600
-    return [
+    checks: list[ThresholdCheck] = [
         (DB_BACKUP_UNKNOWN, _DB_LABEL[DB_BACKUP_UNKNOWN], False, "", 1),
         (
             DB_BACKUP_STALE,
@@ -683,14 +707,18 @@ def judge_backup_status(
             f"上次备份失败，错误码 {status.error or 'n/a'}",
             1,
         ),
-        (
-            DB_BACKUP_TRANSFER_FAILED,
-            _DB_LABEL[DB_BACKUP_TRANSFER_FAILED],
-            status.ok and status.transfer_ok is False,
-            f"上次备份成功但副本传输失败（方式 {status.transfer_mode}）",
-            1,
-        ),
     ]
+    if status.ok:
+        checks.append(
+            (
+                DB_BACKUP_TRANSFER_FAILED,
+                _DB_LABEL[DB_BACKUP_TRANSFER_FAILED],
+                status.transfer_ok is False,
+                f"上次备份成功但副本传输失败（方式 {status.transfer_mode}）",
+                1,
+            )
+        )
+    return checks
 
 
 def parse_connections_output(text: str) -> tuple[int, int]:
@@ -1077,7 +1105,9 @@ def read_release_pull_observation(
 
 def read_backup_status(path: Path) -> BackupStatus:
     """读并解析备份状态文件；读不到或不合法一律抛 ``HostMonitorError``，消息即固定原因码
-    （missing / unreadable / invalid_json / schema / timestamp），不带路径与文件内容。
+    （missing / unreadable / invalid_encoding / invalid_json / schema / timestamp / transfer），
+    不带路径与文件内容。解码失败（``UnicodeDecodeError``）与 JSON 里超长整数之类的
+    ``ValueError`` 同样收成原因码——它们不是 ``OSError``，漏掉会让整轮阈值检查中断（#884 F18）。
     """
 
     try:
@@ -1086,9 +1116,11 @@ def read_backup_status(path: Path) -> BackupStatus:
         raise HostMonitorError("missing") from error
     except OSError as error:
         raise HostMonitorError("unreadable") from error
+    except UnicodeDecodeError as error:
+        raise HostMonitorError("invalid_encoding") from error
     try:
         raw = json.loads(text)
-    except json.JSONDecodeError as error:
+    except (ValueError, RecursionError) as error:
         raise HostMonitorError("invalid_json") from error
     try:
         return parse_backup_status(raw)
@@ -1526,8 +1558,7 @@ def _collect_db_backup_checks(
         status = read_backup_status(Path(args.db_backup_status_file))
     except HostMonitorError as error:
         logger.warning("本地库备份状态文件读取失败，按未知形态告警 reason=%s", error)
-        detail = f"状态文件读不到或不合法（{error}）"
-        return [(DB_BACKUP_UNKNOWN, _DB_LABEL[DB_BACKUP_UNKNOWN], True, detail, 1)]
+        return [_backup_unknown_check(str(error))]
     return judge_backup_status(
         status, now=datetime.now(UTC), max_age_hours=args.db_backup_max_age_hours
     )

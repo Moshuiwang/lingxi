@@ -448,6 +448,8 @@ docker image inspect --format='{{index .RepoDigests 0}}' \
 
 这两份文件到位后，「七、观察期」之外的长期运行监控与故障发现路径以它们为准；本文件不重复维护监控阈值或日志保留期限的具体数值。
 
+**每日备份 timer 窗口内不手工跑备份**：`lingxi-db-backup.timer` 落在 UTC 18:30 起的 5 分钟随机延迟内，单轮连同异机传输最长 30 分钟；这段时间里不要手工 `systemctl start lingxi-db-backup.service` 或直接执行 `db_backup.sh`。两轮相撞时后到的一轮抢不到目录锁、不改写状态文件、以失败退出（[#884](https://github.com/Moshuiwang/lingxi/issues/884)），手工那一轮等于白跑；需要临时补一份备份，先 `systemctl show -p ActiveState lingxi-db-backup.service` 确认不是 `activating` 再动手。
+
 ### 10.1 systemd 单元安装（本节 rc25 补入；此前正文里一条 `systemctl` 都没有）
 
 **为什么必须写在这里**：2026-09-02 首发时 `biplus-prod` 上那三个 timer 是**现场手工装的**，仓库正文没有任何安装步骤，也就没有可复现的记录——下一次换机器或重装，只能靠人回忆。本节补齐这条缺口，具体单元内容与凭据文件仍以 `deploy/监控告警.md`、`deploy/日志留存.md` 为准，这里只固定**装什么、什么顺序、怎么回读**。
