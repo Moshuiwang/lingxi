@@ -69,7 +69,9 @@ def run_scan(command: list[str], output: Path, label: str, delay_base: float) ->
     while True:
         output.unlink(missing_ok=True)
         attempt = retries + 1
-        print(f"[{label}] 扫描第 {attempt} 次调用：{' '.join(command)} --output {output}", flush=True)
+        print(
+            f"[{label}] 扫描第 {attempt} 次调用：{' '.join(command)} --output {output}", flush=True
+        )
         result = subprocess.run(
             [*command, "--output", str(output)], capture_output=True, text=True, check=False
         )

@@ -78,7 +78,12 @@ HIGH_RESULT = {
             "name": "examplepkg",
             "version": "1.0.0",
             "vulns": [
-                {"id": HIGH_ID, "aliases": [HIGH_GHSA], "fix_versions": ["9.9.9"], "description": ""}
+                {
+                    "id": HIGH_ID,
+                    "aliases": [HIGH_GHSA],
+                    "fix_versions": ["9.9.9"],
+                    "description": "",
+                }
             ],
         }
     ]

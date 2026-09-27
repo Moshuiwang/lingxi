@@ -445,5 +445,6 @@ class AllowlistFileTests(unittest.TestCase):
         self.assertEqual(pac.parse_allowlist(ALLOWLIST), [])
         self.assertTrue(ALLOWLIST.read_text(encoding="utf-8").startswith("#"))
 
+
 if __name__ == "__main__":
     unittest.main()
