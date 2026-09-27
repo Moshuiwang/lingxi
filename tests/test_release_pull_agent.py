@@ -3401,5 +3401,117 @@ class AgentTests(unittest.TestCase):
         self.assertTrue(expected.issubset(set(bundle.FILES)))
 
 
+class _FakeFeishu:
+    """按顺序回放飞书响应的 ``urlopen`` 替身；记录每次请求体，不连网。
+
+    每个元素是一个响应字典（按 JSON 返回）或一个异常实例（原样抛出，模拟结果不明）。
+    """
+
+    def __init__(self, *responses: object) -> None:
+        self._responses = list(responses)
+        self.bodies: list[dict] = []
+
+    def __call__(self, request, timeout=None):  # noqa: ARG002 - 与 urlopen 同签名
+        self.bodies.append(json.loads(request.data.decode("utf-8")))
+        response = self._responses.pop(0)
+        if isinstance(response, BaseException):
+            raise response
+        payload = json.dumps(response).encode("utf-8")
+
+        class _Response:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                return False
+
+            def read(self):
+                return payload
+
+        return _Response()
+
+    def message_types(self) -> list[str]:
+        return [body["msg_type"] for body in self.bodies if "msg_type" in body]
+
+
+_TOKEN_OK = {"code": 0, "tenant_access_token": "t"}
+_SEND_OK = {"code": 0, "data": {"message_id": "om_1"}}
+_CARD_REJECTED = {"code": 230099, "msg": "card rejected"}
+
+
+class AlertNoticeSendSemanticsTests(unittest.TestCase):
+    """#891 K-5：先发卡片；只在飞书明确拒绝时补发一次纯文本；结果不明不补发；
+    发送成功才落去重记录。经真实 ``send_alert`` 走到 ``urlopen`` 替身。"""
+
+    CONFIG = {"alert_env_file": "/nonexistent/alert.env", "poll_timeout_seconds": 5}
+    HOST = {"host": "synthetic-host", "environment": "stage"}
+
+    def _send(self, fake: _FakeFeishu, notice=None) -> tuple[dict, BaseException | None]:
+        state: dict = {}
+        notice = notice or AGENT._alert_message(self.HOST, "v2.6.1", "deploy", "failed", "p1")
+        credentials = {
+            "LINGXI_FEISHU_APP_ID": "a",
+            "LINGXI_FEISHU_APP_SECRET": "b",
+            "LINGXI_ADMIN_GROUP_CHAT_ID": "oc_x",
+        }
+        raised = None
+        with (
+            patch.object(AGENT, "_load_alert_credentials", return_value=credentials),
+            patch.object(AGENT.urllib.request, "urlopen", fake),
+        ):
+            try:
+                AGENT._send_once(
+                    state, "k", notice, active=True, config=self.CONFIG, state_directory=Path("/")
+                )
+            except AGENT.AgentError as error:
+                raised = error
+        return state["alerts"]["k"], raised
+
+    def test_card_accepted_sends_one_card_and_records_sent(self) -> None:
+        fake = _FakeFeishu(_TOKEN_OK, _SEND_OK)
+        record, raised = self._send(fake)
+        self.assertIsNone(raised)
+        self.assertEqual(fake.message_types(), ["interactive"])
+        self.assertEqual(json.loads(fake.bodies[1]["content"])["header"]["template"], "red")
+        self.assertNotIn("uuid", fake.bodies[1])
+        self.assertTrue(record["sent"])
+
+    def test_definite_rejection_falls_back_to_text_once_then_records_sent(self) -> None:
+        fake = _FakeFeishu(_TOKEN_OK, _CARD_REJECTED, _SEND_OK)
+        record, raised = self._send(fake)
+        self.assertIsNone(raised)
+        self.assertEqual(fake.message_types(), ["interactive", "text"])
+        self.assertEqual(
+            json.loads(fake.bodies[2]["content"])["text"],
+            str(AGENT._alert_message(self.HOST, "v2.6.1", "deploy", "failed", "p1")),
+        )
+        self.assertTrue(record["sent"])
+
+    def test_fallback_also_rejected_is_not_recorded_and_sends_only_once(self) -> None:
+        fake = _FakeFeishu(_TOKEN_OK, _CARD_REJECTED, _CARD_REJECTED)
+        record, raised = self._send(fake)
+        self.assertEqual(raised.code, "alert_delivery_failed")
+        self.assertEqual(fake.message_types(), ["interactive", "text"])
+        self.assertFalse(record["sent"])
+
+    def test_unknown_outcome_does_not_fall_back_or_record(self) -> None:
+        for outcome in (TimeoutError("timed out"), ["not", "a", "mapping"]):
+            with self.subTest(outcome=type(outcome).__name__):
+                fake = _FakeFeishu(_TOKEN_OK, outcome)
+                record, raised = self._send(fake)
+                self.assertEqual(raised.code, "alert_delivery_failed")
+                self.assertEqual(fake.message_types(), ["interactive"])
+                self.assertFalse(record["sent"])
+
+    def test_pat_notice_also_goes_as_card(self) -> None:
+        observation = {"expires_on": "2026-10-01", "days_left": 4, "reason": None}
+        notice = AGENT._pat_alert_message(self.HOST, observation, "pat_expiring")
+        fake = _FakeFeishu(_TOKEN_OK, _SEND_OK)
+        record, raised = self._send(fake, notice)
+        self.assertIsNone(raised)
+        self.assertEqual(fake.message_types(), ["interactive"])
+        self.assertEqual(json.loads(fake.bodies[1]["content"])["header"]["template"], "orange")
+
+
 if __name__ == "__main__":
     unittest.main()
