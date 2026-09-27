@@ -27,7 +27,12 @@ from lingxi.core.admin.card_callback import AdminCardCallbackHandler
 from lingxi.core.admin.management_status import PUBLISHING_STATUS_TEXT
 from lingxi.core.admin.pending_action import PendingAction, PendingActionStatus, PendingActionType
 from lingxi.core.admin.views import AdminUserStatusView
-from lingxi.core.delivery.notice_card import NoticeCard, assert_no_actionable_elements
+from lingxi.core.delivery import catalog_notice
+from lingxi.core.delivery.notice_card import (
+    NoticeCard,
+    NoticeTone,
+    assert_no_actionable_elements,
+)
 from lingxi.core.outreach.contact_reachability import (
     TODO_DEDUPE_PREFIX,
     ContactReachabilityRecorder,
@@ -67,8 +72,11 @@ NOTICE_CARDS: dict[str, dict[str, object]] = {
         "button_labels": [],
     },
     "notice.permission.management_correction_summary": {
-        "title": "每日权限批处理 · 已补齐 {count} 条下发",
-        "body": "无需处理；个别用户的权限状态可在私聊查询其管理卡。",
+        "title": "每日权限批处理 · 已补齐下发",
+        "body": (
+            "**已补齐**：{count} 条此前未完成的权限下发\n\n"
+            "**下一步**\n无需处理；个别用户的权限状态可在私聊查询其管理卡。"
+        ),
         "button_labels": [],
     },
     "notice.admin.contact_todo": {
@@ -688,16 +696,30 @@ class _Store:
 
 
 class CorrectionSummaryTests(unittest.TestCase):
-    def _send(self, sender, catalog):
+    """有原文本键，复用用户侧「文本键配卡片键」：色调登记在 ``NOTICE_TONES`` 才配卡。"""
+
+    def _send(self, sender, catalog, *, tone_registered=True):
         from lingxi.apps.scheduler.assembly import _send_management_correction_summary
 
         store, audit = _Store(), _Audit()
         config = mock.Mock(admin_group_chat_id=CHAT_ID)
-        with mock.patch.object(notification, "default_content_catalog", return_value=catalog):
+        tones = (
+            {notification.CORRECTION_SUMMARY_TEXT_KEY: NoticeTone.DONE} if tone_registered else {}
+        )
+        with (
+            mock.patch.object(notification, "default_content_catalog", return_value=catalog),
+            mock.patch.dict(catalog_notice.NOTICE_TONES, tones),
+        ):
             _send_management_correction_summary(
                 config=config, audit=audit, sender=sender, store=store, message_ids=("m1", "m2")
             )
         return store, audit
+
+    def test_card_key_without_registered_tone_keeps_text(self) -> None:
+        sender = _NoticeGroup()
+        self._send(sender, _catalog(), tone_registered=False)
+        self.assertEqual(sender.notices, [])
+        self.assertEqual(len(sender.texts), 1)
 
     def test_without_card_key_sends_identical_text(self) -> None:
         sender = _NoticeGroup()
@@ -716,7 +738,7 @@ class CorrectionSummaryTests(unittest.TestCase):
         card: NoticeCard = sender.notices[0]["card"]
         assert_no_actionable_elements(card.to_payload())
         self.assertEqual(card.to_payload()["header"]["template"], "green")
-        self.assertIn("2", card.title)
+        self.assertIn("**已补齐**：2 条", _payload_text(card.to_payload()))
         self.assertEqual(card.fallback_text, "每日权限批处理已补齐 2 条此前未完成的权限下发。")
         self.assertTrue(sender.notices[0]["dedupe_key"].startswith("management-correction:"))
         self.assertEqual(store.marked, [("m1", "m2")])

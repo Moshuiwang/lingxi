@@ -37,6 +37,7 @@ from lingxi.core.admin.pending_action import (
     PendingActionStatus,
     PendingActionType,
 )
+from lingxi.core.delivery.catalog_notice import build_notice_card
 from lingxi.core.delivery.notice_card import (
     _HEADER_TEMPLATES,
     NoticeCard,
@@ -53,16 +54,16 @@ TERMINAL_CARD_KEY = "notice.admin.terminal"
 GROUP_NOTICE_CARD_KEY = "notice.admin.group_notice"
 INNERTEST_CONFIRM_CARD_KEY = "notice.admin.innertest_confirm"
 CORRECTION_SUMMARY_TEXT_KEY = "permission.management_correction_summary"
-CORRECTION_SUMMARY_CARD_KEY = f"notice.{CORRECTION_SUMMARY_TEXT_KEY}"
 
 
-def catalog_notice(
+def _dynamic_notice(
     content_catalog: ContentCatalog | None, key: str, **values: object
 ) -> RenderedCard | None:
-    """卡片键进了目录就渲染它的标题与「下一步」，否则返回 ``None``（调用方走原路径）。
+    """动态拼正文的管理类入口：卡片键进了目录就渲染它的标题与「下一步」，否则返回 ``None``。
 
-    模板与传入变量对不上属于目录配置错误：只记一条不含正文的日志并返回 ``None``，
-    让入口退回今天的纯文本 / 原卡片，而不是让一条管理通知因为展示问题整条丢失。
+    这些入口没有原文本键，不走 :mod:`lingxi.core.delivery.catalog_notice` 的「文本键配卡片键」。
+    模板与变量对不上属于目录配置错误：只记一条不含正文的日志并返回 ``None``，入口退回
+    今天的纯文本 / 原卡片，不让一条管理通知因为展示问题整条丢失。
     """
     source = content_catalog if content_catalog is not None else default_content_catalog()
     if not source.has_card(key):
@@ -482,7 +483,7 @@ def render_confirm_card(
     action_label = _ACTION_LABEL[pending.action_type]
     ttl_minutes = PENDING_ACTION_TTL_SECONDS // 60
     buttons = _confirm_buttons(pending.id)
-    notice = catalog_notice(content_catalog, CONFIRM_CARD_KEY, action=action_label)
+    notice = _dynamic_notice(content_catalog, CONFIRM_CARD_KEY, action=action_label)
     if notice is not None:
         fields = [f"**操作对象**：{escape_markdown(target_label)}"]
         fields += _scope_field_lines(
@@ -594,7 +595,7 @@ def render_terminal_card(
     写账号结果而不是「权限正在下发」。
     """
     action_label = _ACTION_LABEL[pending.action_type]
-    notice = catalog_notice(
+    notice = _dynamic_notice(
         content_catalog,
         TERMINAL_CARD_KEY,
         action=action_label,
@@ -798,7 +799,7 @@ def group_notice(
     source = content_catalog if content_catalog is not None else default_content_catalog()
     if not source.has_card(GROUP_NOTICE_CARD_KEY):
         return GroupNotice(text=text)
-    notice = catalog_notice(
+    notice = _dynamic_notice(
         source,
         GROUP_NOTICE_CARD_KEY,
         action=_ACTION_LABEL[pending.action_type],
@@ -846,19 +847,13 @@ def deliver_group_notice(
 def correction_summary_notice(
     *, count: int, content_catalog: ContentCatalog | None = None
 ) -> GroupNotice:
-    """每日权限补齐汇总（管理群）；卡片键未进目录时只有原文本。"""
+    """每日权限补齐汇总（管理群）：有原文本键，按用户侧同一套「文本键配卡片键」规则配卡。
+
+    卡片键未进目录、或该文本键未登记色调时只有原文本；等价纯文本就是原文本。
+    """
     source = content_catalog if content_catalog is not None else default_content_catalog()
-    text = source.text(CORRECTION_SUMMARY_TEXT_KEY, count=count).text
-    notice = catalog_notice(source, CORRECTION_SUMMARY_CARD_KEY, count=count)
-    if notice is None:
-        return GroupNotice(text=text)
-    sections = [
-        (None, (f"**已补齐**：{count} 条此前未完成的权限下发",)),
-        ("下一步", (notice.body,)),
-    ]
-    return GroupNotice(
-        text=text, card=_notice_card_or_none(notice.title, NoticeTone.DONE, sections, text)
-    )
+    content = source.text(CORRECTION_SUMMARY_TEXT_KEY, count=count)
+    return GroupNotice(text=content.text, card=build_notice_card(source, content, {"count": count}))
 
 
 def render_innertest_confirm_card(
@@ -874,7 +869,7 @@ def render_innertest_confirm_card(
     """
     buttons = _confirm_buttons(pending_action_id)
     unresolved = any(personnel is None for _, personnel in people)
-    notice = catalog_notice(content_catalog, INNERTEST_CONFIRM_CARD_KEY)
+    notice = _dynamic_notice(content_catalog, INNERTEST_CONFIRM_CARD_KEY)
     if notice is None:
         body = f"加入内测资格，不授业务权限；资格与开通结果逐人查询。\n本批 {len(people)} 项：\n"
         body += "\n".join(
