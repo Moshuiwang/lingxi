@@ -1748,7 +1748,14 @@ def run(argv: Sequence[str] | None = None) -> int:
         ):
             _run_threshold_checks(args, credentials, host=host, logger=logger)
 
-        return 2 if fatal else 0
+        exit_code = 2 if fatal else 0
+        # 每轮完整跑完都写一行心跳，不论有无告警：主机外的独立监控只看本日志文件
+        # 的修改时间来判「巡检自身还活着」。全绿时若一行不写，日志会长时间不动，
+        # 外部监控就会把「一切正常」误报成「巡检停摆」——而巡检停摆恰恰是它唯一
+        # 需要替我们盯住的事。拿不到锁、凭据或 docker 不可用这几条提前返回的路径
+        # 本身已各写一行，不在此重复。
+        logger.info("巡检完成 退出码=%d", exit_code)
+        return exit_code
 
 
 def _collect_release_pull_checks(

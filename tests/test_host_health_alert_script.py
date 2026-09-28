@@ -550,6 +550,34 @@ class RunIntegrationTests(unittest.TestCase):
         sender.assert_not_called()
         self.assertFalse(self.state_path.exists())
 
+    def test_every_completed_round_writes_one_heartbeat_line(self) -> None:
+        # 主机外的独立监控只看日志文件修改时间判巡检存活：全绿的轮次也必须写一行，
+        # 否则「一切正常」会被误报成「巡检停摆」。两轮全绿 → 两行心跳。
+        self._set_container_state(running=True, health_status="healthy")
+        with mock.patch.object(host_health_alert, "feishu_send_notice") as sender:
+            self.assertEqual(self._run(), 0)
+            self.assertEqual(self._run(), 0)
+        sender.assert_not_called()
+        heartbeats = [
+            line
+            for line in self.log_path.read_text(encoding="utf-8").splitlines()
+            if "巡检完成 退出码=0" in line
+        ]
+        self.assertEqual(len(heartbeats), 2)
+
+    def test_heartbeat_carries_nonzero_exit_code_when_round_is_fatal(self) -> None:
+        # 有容器查不了（本轮 fatal）时心跳照写，且如实带出退出码 2，不能写成正常。
+        with mock.patch.object(
+            host_health_alert,
+            "docker_inspect_one",
+            side_effect=host_health_alert.HostMonitorError("simulated_inspect_failure"),
+        ):
+            exit_code = self._run()
+        self.assertEqual(exit_code, 2)
+        log_text = self.log_path.read_text(encoding="utf-8")
+        self.assertIn("巡检完成 退出码=2", log_text)
+        self.assertNotIn("巡检完成 退出码=0", log_text)
+
     def test_missing_env_file_returns_exit_code_two_without_touching_docker(self) -> None:
         os.remove(self.env_path)
         with mock.patch.object(host_health_alert, "docker_inspect_one") as inspector:
