@@ -6,13 +6,13 @@
 
 ## [Unreleased]
 
-## [2.6.1] - 未定
+## [2.6.1] - 2026-09-28
 
-维护版（Trace [#898](https://github.com/Moshuiwang/lingxi/issues/898)）：装入 [#864](https://github.com/Moshuiwang/lingxi/issues/864) / [#891](https://github.com/Moshuiwang/lingxi/issues/891) / [#885](https://github.com/Moshuiwang/lingxi/issues/885) / [#887](https://github.com/Moshuiwang/lingxi/issues/887) / [#884](https://github.com/Moshuiwang/lingxi/issues/884) / [#889](https://github.com/Moshuiwang/lingxi/issues/889) / [#874](https://github.com/Moshuiwang/lingxi/issues/874) / [#896](https://github.com/Moshuiwang/lingxi/issues/896) 多处改动，聚焦加密依赖安全、消息与告警卡片体验统一，以及自托管数据库的备份恢复与运维健壮性。
+维护版（Trace [#898](https://github.com/Moshuiwang/lingxi/issues/898)）：候选 `v2.6.1-rc.112` 经预发验收后由 Release Promotion 发布为正式版，生产由拉取代理 + 部署器无人值守升级，产品负责人一次真实问数通过（L5）。装入 [#864](https://github.com/Moshuiwang/lingxi/issues/864) / [#891](https://github.com/Moshuiwang/lingxi/issues/891) / [#885](https://github.com/Moshuiwang/lingxi/issues/885) / [#887](https://github.com/Moshuiwang/lingxi/issues/887) / [#884](https://github.com/Moshuiwang/lingxi/issues/884) / [#889](https://github.com/Moshuiwang/lingxi/issues/889) / [#874](https://github.com/Moshuiwang/lingxi/issues/874) / [#896](https://github.com/Moshuiwang/lingxi/issues/896) 多处改动，聚焦加密依赖安全、消息与告警卡片体验统一，以及自托管数据库的备份恢复与运维健壮性。
 
 ### Added
 
-- **新增从每日备份恢复到三服务可问数的脚本**：`run` 子命令用于生产恢复，`wipe` / `rollback` 子命令仅限预发环境使用（Issue [#885](https://github.com/Moshuiwang/lingxi/issues/885)）。
+- **新增从每日备份恢复到三服务可问数的脚本**：`run` 子命令用于生产恢复，`wipe` / `rollback` 子命令仅限预发环境使用；预发实测从一份每日备份恢复到三服务全部 healthy 用时 55 秒（不含人工首次问数，核对零差异）（Issue [#885](https://github.com/Moshuiwang/lingxi/issues/885)）。
 - **预发环境改用本地 PostgreSQL 17、与生产同构**：迁库与备份安装脚本随本次改动入仓，便于复现与演练（Issue [#896](https://github.com/Moshuiwang/lingxi/issues/896)）。
 
 ### Changed
