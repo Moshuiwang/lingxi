@@ -24,6 +24,7 @@ import textwrap
 import threading
 import time
 import unittest
+import unittest.mock
 from datetime import UTC, date, datetime, timedelta
 
 from lingxi.apps.scheduler import (
@@ -1518,6 +1519,69 @@ class RedactedIdentifierUsageTest(unittest.TestCase):
         every, _inside = self._redaction_calls(tree)
 
         self.assertEqual(every, [], "日报渲染不得调用 redact_identifier（裁定 C1）")
+
+
+class RosterReportNoticeCardTest(unittest.TestCase):
+    """#891：卡片键进目录后发通知卡；未进目录时行为与今天逐字相同。"""
+
+    class _CardSender(FakeSender):
+        def __init__(self, *, notice_failures: int = 0) -> None:
+            super().__init__()
+            self._notice_failures = notice_failures
+            self.notices: list[dict[str, object]] = []
+
+        def send_notice(self, *, chat_id: str, card, dedupe_key: str) -> None:
+            self.notices.append({"chat_id": chat_id, "card": card, "dedupe_key": dedupe_key})
+            if self._notice_failures > 0:
+                self._notice_failures -= 1
+                raise RuntimeError("模拟卡片结果不明")
+
+    def _patch_catalog(self, catalog=None) -> None:
+        """默认注入正式目录（卡片键已登记）；传入目录时用它。"""
+        from test_notice_cards_ops import catalog_with_ops_cards
+
+        from lingxi.core.identity import roster_report
+
+        patcher = unittest.mock.patch.object(
+            roster_report,
+            "default_content_catalog",
+            return_value=catalog if catalog is not None else catalog_with_ops_cards(),
+        )
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def test_without_the_card_key_only_text_is_sent(self) -> None:
+        # 正式目录已登记卡片键；「未进目录」注入剔除 ``notice.*`` 的目录演练。
+        from test_notice_cards_ops import _BASE as PLAIN_CATALOG
+
+        self._patch_catalog(PLAIN_CATALOG)
+        sender = self._CardSender()
+        duty, _, _, _, _ = build_duty(sender=sender)
+        duty.run_once()
+        self.assertEqual(len(sender.payloads), 1)
+        self.assertEqual(sender.notices, [])
+
+    def test_with_the_card_key_one_card_is_sent_with_the_date_dedupe_key(self) -> None:
+        self._patch_catalog()
+        sender = self._CardSender()
+        duty, _, audit, _, _ = build_duty(sender=sender)
+        duty.run_once()
+        self.assertEqual(sender.attempts, [])
+        self.assertEqual([notice["dedupe_key"] for notice in sender.notices], ["2026-08-06"])
+        self.assertIn("roster_audit.report_sent", audit.actions())
+        self.assertEqual(duty.completed_on, date(2026, 8, 6))
+
+    def test_an_unclear_card_result_is_not_completed_and_sends_no_text(self) -> None:
+        self._patch_catalog()
+        sender = self._CardSender(notice_failures=1)
+        duty, _, audit, _, _ = build_duty(sender=sender)
+        duty.run_once()
+        self.assertEqual(audit.actions(), ["roster_audit.send_failed"])
+        self.assertIsNone(duty.completed_on)
+        self.assertEqual(sender.attempts, [])
+        duty.run_once()
+        self.assertEqual([n["dedupe_key"] for n in sender.notices], ["2026-08-06", "2026-08-06"])
+        self.assertEqual(sender.attempts, [])
 
 
 if __name__ == "__main__":

@@ -13,6 +13,7 @@ from __future__ import annotations
 import importlib.util
 import json
 import os
+import re
 import stat
 import sys
 import tempfile
@@ -479,7 +480,7 @@ class RunIntegrationTests(unittest.TestCase):
 
         with mock.patch.object(
             host_health_alert,
-            "feishu_send_text",
+            "feishu_send_notice",
             side_effect=host_health_alert.HostMonitorError("simulated_send_failure"),
         ) as sender:
             exit_code = self._run()
@@ -488,7 +489,7 @@ class RunIntegrationTests(unittest.TestCase):
         # 发送失败：状态文件不应该被创建/更新——下一轮必须能重新判定为"首次触发"。
         self.assertEqual(host_health_alert.load_state(self.state_path), {})
 
-        with mock.patch.object(host_health_alert, "feishu_send_text") as sender:
+        with mock.patch.object(host_health_alert, "feishu_send_notice") as sender:
             exit_code = self._run()
         self.assertEqual(exit_code, 0)
         self.assertEqual(sender.call_count, 1)
@@ -506,7 +507,7 @@ class RunIntegrationTests(unittest.TestCase):
 
         with mock.patch.object(
             host_health_alert,
-            "feishu_send_text",
+            "feishu_send_notice",
             side_effect=ValueError("simulated_unexpected_error"),
         ) as sender:
             exit_code = self._run()
@@ -515,7 +516,7 @@ class RunIntegrationTests(unittest.TestCase):
         # 状态未落盘：下一轮仍会重新判定为"首次触发"并重试发送。
         self.assertEqual(host_health_alert.load_state(self.state_path), {})
 
-        with mock.patch.object(host_health_alert, "feishu_send_text") as sender:
+        with mock.patch.object(host_health_alert, "feishu_send_notice") as sender:
             exit_code = self._run()
         self.assertEqual(exit_code, 0)
         self.assertEqual(sender.call_count, 1)
@@ -524,18 +525,18 @@ class RunIntegrationTests(unittest.TestCase):
 
     def test_successful_alert_then_dedupe_then_recovery_round_trip(self) -> None:
         self._set_container_state(running=True, health_status="unhealthy")
-        with mock.patch.object(host_health_alert, "feishu_send_text") as sender:
+        with mock.patch.object(host_health_alert, "feishu_send_notice") as sender:
             self._run()
         self.assertEqual(sender.call_count, 1)
 
         # 原因不变：同一事件不应该再发一次。
-        with mock.patch.object(host_health_alert, "feishu_send_text") as sender:
+        with mock.patch.object(host_health_alert, "feishu_send_notice") as sender:
             self._run()
         self.assertEqual(sender.call_count, 0)
 
         # 恢复健康：应该发一条恢复通知，并清空记忆状态。
         self._set_container_state(running=True, health_status="healthy")
-        with mock.patch.object(host_health_alert, "feishu_send_text") as sender:
+        with mock.patch.object(host_health_alert, "feishu_send_notice") as sender:
             self._run()
         self.assertEqual(sender.call_count, 1)
         state = host_health_alert.load_state(self.state_path)
@@ -543,7 +544,7 @@ class RunIntegrationTests(unittest.TestCase):
 
     def test_dry_run_never_calls_sender_or_persists_state(self) -> None:
         self._set_container_state(running=False, health_status=None)
-        with mock.patch.object(host_health_alert, "feishu_send_text") as sender:
+        with mock.patch.object(host_health_alert, "feishu_send_notice") as sender:
             exit_code = self._run(["--dry-run"])
         self.assertEqual(exit_code, 0)
         sender.assert_not_called()
@@ -785,7 +786,7 @@ class RunThresholdIntegrationTests(unittest.TestCase):
             str(self.docker_bin),
             "--disable-release-pull-check",
         ]
-        with mock.patch.object(host_health_alert, "feishu_send_text") as sender:
+        with mock.patch.object(host_health_alert, "feishu_send_notice") as sender:
             exit_code = host_health_alert.run(argv)
         self.assertEqual(exit_code, 0)
         sender.assert_not_called()
@@ -795,7 +796,7 @@ class RunThresholdIntegrationTests(unittest.TestCase):
         with (
             mock.patch.object(host_health_alert, "read_disk_usage_percent", return_value=90.0),
             mock.patch.object(host_health_alert, "read_load_per_cpu", return_value=(0.1, 4)),
-            mock.patch.object(host_health_alert, "feishu_send_text") as sender,
+            mock.patch.object(host_health_alert, "feishu_send_notice") as sender,
         ):
             self._run()
         self.assertEqual(sender.call_count, 1)
@@ -807,7 +808,7 @@ class RunThresholdIntegrationTests(unittest.TestCase):
         with (
             mock.patch.object(host_health_alert, "read_disk_usage_percent", return_value=91.0),
             mock.patch.object(host_health_alert, "read_load_per_cpu", return_value=(0.1, 4)),
-            mock.patch.object(host_health_alert, "feishu_send_text") as sender,
+            mock.patch.object(host_health_alert, "feishu_send_notice") as sender,
         ):
             self._run()
         self.assertEqual(sender.call_count, 0)
@@ -816,7 +817,7 @@ class RunThresholdIntegrationTests(unittest.TestCase):
         with (
             mock.patch.object(host_health_alert, "read_disk_usage_percent", return_value=10.0),
             mock.patch.object(host_health_alert, "read_load_per_cpu", return_value=(0.1, 4)),
-            mock.patch.object(host_health_alert, "feishu_send_text") as sender,
+            mock.patch.object(host_health_alert, "feishu_send_notice") as sender,
         ):
             self._run()
         self.assertEqual(sender.call_count, 1)
@@ -827,7 +828,7 @@ class RunThresholdIntegrationTests(unittest.TestCase):
         with (
             mock.patch.object(host_health_alert, "read_disk_usage_percent", return_value=1.0),
             mock.patch.object(host_health_alert, "read_load_per_cpu", return_value=(20.0, 4)),
-            mock.patch.object(host_health_alert, "feishu_send_text") as sender,
+            mock.patch.object(host_health_alert, "feishu_send_notice") as sender,
         ):
             self._run()
         self.assertEqual(sender.call_count, 0)
@@ -835,7 +836,7 @@ class RunThresholdIntegrationTests(unittest.TestCase):
         with (
             mock.patch.object(host_health_alert, "read_disk_usage_percent", return_value=1.0),
             mock.patch.object(host_health_alert, "read_load_per_cpu", return_value=(20.0, 4)),
-            mock.patch.object(host_health_alert, "feishu_send_text") as sender,
+            mock.patch.object(host_health_alert, "feishu_send_notice") as sender,
         ):
             self._run()
         self.assertEqual(sender.call_count, 1)
@@ -847,7 +848,7 @@ class RunThresholdIntegrationTests(unittest.TestCase):
         with (
             mock.patch.object(host_health_alert, "read_disk_usage_percent", return_value=1.0),
             mock.patch.object(host_health_alert, "read_load_per_cpu", return_value=(0.1, 4)),
-            mock.patch.object(host_health_alert, "feishu_send_text") as sender,
+            mock.patch.object(host_health_alert, "feishu_send_notice") as sender,
         ):
             self._run()
         sent_labels = {
@@ -862,7 +863,7 @@ class RunThresholdIntegrationTests(unittest.TestCase):
             mock.patch.object(host_health_alert, "read_load_per_cpu", return_value=(0.1, 4)),
             mock.patch.object(
                 host_health_alert,
-                "feishu_send_text",
+                "feishu_send_notice",
                 side_effect=host_health_alert.HostMonitorError("simulated_send_failure"),
             ),
         ):
@@ -873,7 +874,7 @@ class RunThresholdIntegrationTests(unittest.TestCase):
         with (
             mock.patch.object(host_health_alert, "read_disk_usage_percent", return_value=90.0),
             mock.patch.object(host_health_alert, "read_load_per_cpu", return_value=(0.1, 4)),
-            mock.patch.object(host_health_alert, "feishu_send_text") as sender,
+            mock.patch.object(host_health_alert, "feishu_send_notice") as sender,
         ):
             self._run()
         # 上一轮发送失败但连续计数已经达标（consecutive_required=1），这一轮应
@@ -887,7 +888,7 @@ class RunThresholdIntegrationTests(unittest.TestCase):
         with (
             mock.patch.object(host_health_alert, "read_disk_usage_percent", return_value=90.0),
             mock.patch.object(host_health_alert, "read_load_per_cpu", return_value=(0.1, 4)),
-            mock.patch.object(host_health_alert, "feishu_send_text") as sender,
+            mock.patch.object(host_health_alert, "feishu_send_notice") as sender,
         ):
             self._run(["--dry-run"])
         sender.assert_not_called()
@@ -1171,7 +1172,7 @@ class RunReleasePullIntegrationTests(unittest.TestCase):
         return host_health_alert.run(argv)
 
     def _round(self, extra_argv: list[str] | None = None) -> list[str]:
-        with mock.patch.object(host_health_alert, "feishu_send_text") as sender:
+        with mock.patch.object(host_health_alert, "feishu_send_notice") as sender:
             exit_code = self._run(extra_argv)
         self.assertEqual(exit_code, 0)
         return [call.kwargs["text"] for call in sender.call_args_list]
@@ -1280,7 +1281,7 @@ class RunReleasePullIntegrationTests(unittest.TestCase):
 
     def test_missing_systemctl_binary_alerts_unknown_without_exit_code_two(self) -> None:
         self._set_timer(active_state="inactive")
-        with mock.patch.object(host_health_alert, "feishu_send_text") as sender:
+        with mock.patch.object(host_health_alert, "feishu_send_notice") as sender:
             exit_code = self._run(["--systemctl-bin", str(self.tmp_path / "no-such-systemctl")])
         self.assertEqual(exit_code, 0)
         self.assertEqual(sender.call_count, 1)
@@ -1443,11 +1444,54 @@ class BackupStatusLogicTests(unittest.TestCase):
         )
         breaches = self._breaches(both_failed)
         self.assertTrue(breaches[host_health_alert.DB_BACKUP_FAILED])
-        self.assertFalse(breaches[host_health_alert.DB_BACKUP_TRANSFER_FAILED])
+        # #884 F20：本地备份失败时传输是否成功无从得知，传输键这一轮不出结论（不参与），
+        # 否则已告警的「传输失败」会被判成恢复。
+        self.assertNotIn(host_health_alert.DB_BACKUP_TRANSFER_FAILED, breaches)
         no_transfer = host_health_alert.parse_backup_status(
             self._raw(transfer={"mode": "none", "ok": None, "label": ""})
         )
         self.assertFalse(self._breaches(no_transfer)[host_health_alert.DB_BACKUP_TRANSFER_FAILED])
+
+    def test_uninterpretable_transfer_section_raises_transfer_code(self) -> None:
+        """#884 F19：缺 transfer 段、transfer 不是对象、ok 是字符串、scp 成功却没有传输结论。"""
+
+        raw_missing = self._raw()
+        del raw_missing["transfer"]
+        cases = {
+            "missing": raw_missing,
+            "not-a-mapping": self._raw(transfer="scp"),
+            "ok='false'": self._raw(transfer={"mode": "scp", "ok": "false", "label": "x"}),
+            "ok=0": self._raw(transfer={"mode": "scp", "ok": 0, "label": "x"}),
+            "scp-without-verdict": self._raw(transfer={"mode": "scp", "ok": None, "label": "x"}),
+        }
+        for name, raw in cases.items():
+            with self.subTest(case=name):
+                with self.assertRaises(ValueError) as ctx:
+                    host_health_alert.parse_backup_status(raw)
+                self.assertEqual(str(ctx.exception), "transfer")
+
+    def test_failed_backup_may_carry_no_transfer_verdict(self) -> None:
+        status = host_health_alert.parse_backup_status(
+            self._raw(ok=False, error="dump_failed", transfer={"mode": "scp", "ok": None})
+        )
+        self.assertIsNone(status.transfer_ok)
+
+    def test_future_finished_at_is_unknown_beyond_clock_skew_tolerance(self) -> None:
+        """#884 F19：完成时间在未来（超出时钟误差容忍）判未知，三个正常判据这一轮不出结论。"""
+
+        within = host_health_alert.parse_backup_status(
+            self._raw(finished_at=(self.NOW + timedelta(minutes=4)).isoformat())
+        )
+        self.assertFalse(self._breaches(within)[host_health_alert.DB_BACKUP_UNKNOWN])
+        future = host_health_alert.parse_backup_status(
+            self._raw(finished_at=(self.NOW + timedelta(hours=2)).isoformat())
+        )
+        checks = host_health_alert.judge_backup_status(future, now=self.NOW, max_age_hours=26.0)
+        self.assertEqual(
+            [(key, breached) for key, _label, breached, _detail, _required in checks],
+            [(host_health_alert.DB_BACKUP_UNKNOWN, True)],
+        )
+        self.assertIn("future_timestamp", checks[0][3])
 
 
 class DbQueryLogicTests(unittest.TestCase):
@@ -1655,7 +1699,7 @@ class RunLocalDbIntegrationTests(unittest.TestCase):
         argv = self._argv(with_db=with_db)
         if extra_argv:
             argv.extend(extra_argv)
-        with mock.patch.object(host_health_alert, "feishu_send_text") as sender:
+        with mock.patch.object(host_health_alert, "feishu_send_notice") as sender:
             exit_code = host_health_alert.run(argv)
         self.assertEqual(exit_code, 0)
         return [call.kwargs["text"] for call in sender.call_args_list]
@@ -1663,6 +1707,15 @@ class RunLocalDbIntegrationTests(unittest.TestCase):
     def _alerting_keys(self) -> set[str]:
         state = host_health_alert.load_threshold_state(self.threshold_state_path)
         return {key for key, value in state.items() if value.alerting}
+
+    def _dry_run_actions(self, extra_argv: list[str] | None = None) -> set[tuple[str, str]]:
+        """故障注入的 dry-run 一轮（#859 S-4-4 同法）：只判不发、不落盘，从日志取
+        「本会发送」的 (键, 动作)。"""
+
+        self.log_path.unlink(missing_ok=True)
+        self.assertEqual(self._round(["--dry-run", *(extra_argv or [])]), [])
+        log = self.log_path.read_text(encoding="utf-8")
+        return set(re.findall(r"dry-run，未真实发送 threshold=(\S+) action=(\S+)", log))
 
     def test_without_db_container_flag_none_of_the_four_checks_run(self) -> None:
         # 状态文件缺失、两条查询都会失败——但没给 --db-container 就一处都不该碰。
@@ -1734,14 +1787,18 @@ class RunLocalDbIntegrationTests(unittest.TestCase):
         self.assertEqual(len(texts), 1)
         self.assertIn("本地库备份传输失败：上次备份成功但副本传输失败（方式 scp）", texts[0])
         self.assertEqual(self._alerting_keys(), {host_health_alert.DB_BACKUP_TRANSFER_FAILED})
-        # 备份本身失败时只报失败，不再叠一条传输失败（传输失败随之恢复）。
+        # 备份本身失败时只报失败，不再叠一条传输失败；传输键不出结论、告警记忆原样保留
+        # （#884 F20：不得在本地仍失败时发「副本已恢复」）。
         self._write_status(ok=False, error="pg_dump_failed", transfer={"mode": "scp", "ok": False})
         texts = self._round()
         self.assertEqual(
-            sorted(t.splitlines()[1].split("：")[0] for t in texts),
-            ["本地库备份传输失败", "本地库备份失败"],
+            [t.splitlines()[1].split("：")[0] for t in texts],
+            ["本地库备份失败"],
         )
-        self.assertEqual(self._alerting_keys(), {host_health_alert.DB_BACKUP_FAILED})
+        self.assertEqual(
+            self._alerting_keys(),
+            {host_health_alert.DB_BACKUP_FAILED, host_health_alert.DB_BACKUP_TRANSFER_FAILED},
+        )
 
     def test_unknown_status_five_shapes_each_alert_once_dedupe_recover_then_realert(self) -> None:
         def break_missing() -> None:
@@ -1808,6 +1865,101 @@ class RunLocalDbIntegrationTests(unittest.TestCase):
             texts = self._round()
         self.assertEqual(len(texts), 1)
         self.assertIn("（unreadable）", texts[0])
+
+    def test_non_utf8_status_file_alerts_unknown_without_interrupting_other_checks(self) -> None:
+        """#884 F18：状态文件不是 UTF-8 → 该项判未知告警，同轮 WAL 检查照常出结论。"""
+
+        self.status_path.write_bytes(b'\xff\xfe{"schema":1,"ok":\xc3true}')
+        self._set_wal("5000")
+        wal_limit = ["--db-wal-alert-bytes", "1000"]
+        self.assertEqual(
+            self._dry_run_actions(wal_limit),
+            {
+                (host_health_alert.DB_BACKUP_UNKNOWN, "alert"),
+                (host_health_alert.DB_WAL_LARGE, "alert"),
+            },
+        )
+        self.assertFalse(self.threshold_state_path.exists(), "dry-run 不落盘")
+        texts = self._round(wal_limit)
+        self.assertEqual(
+            sorted(t.splitlines()[1].split("：")[0] for t in texts),
+            ["本地库 WAL 过大", "本地库备份状态未知"],
+        )
+        self.assertTrue(any("（invalid_encoding）" in t for t in texts))
+        self.assertEqual(
+            self._alerting_keys(),
+            {host_health_alert.DB_BACKUP_UNKNOWN, host_health_alert.DB_WAL_LARGE},
+        )
+
+    def test_uninterpretable_status_shapes_alert_unknown_instead_of_normal(self) -> None:
+        """#884 F19：未来时间 / 传输结论是字符串 / 缺 transfer 段——都不得判正常。"""
+
+        def future() -> None:
+            self._write_status(finished_at=self.now + timedelta(hours=2))
+
+        def string_false() -> None:
+            self._write_status(transfer={"mode": "scp", "ok": "false", "label": "stage"})
+
+        def missing_transfer() -> None:
+            self._write_status()
+            raw = json.loads(self.status_path.read_text(encoding="utf-8"))
+            del raw["transfer"]
+            self.status_path.write_text(json.dumps(raw), encoding="utf-8")
+
+        shapes = {
+            "future_timestamp": future,
+            "transfer": string_false,
+            "transfer-missing": missing_transfer,
+        }
+        for name, break_file in shapes.items():
+            with self.subTest(shape=name):
+                self.threshold_state_path.unlink(missing_ok=True)
+                break_file()
+                self.assertEqual(
+                    self._dry_run_actions(), {(host_health_alert.DB_BACKUP_UNKNOWN, "alert")}
+                )
+                texts = self._round()
+                self.assertEqual(len(texts), 1)
+                reason = name.split("-")[0]
+                self.assertIn(f"本地库备份状态未知：状态文件读不到或不合法（{reason}）", texts[0])
+                self.assertEqual(self._alerting_keys(), {host_health_alert.DB_BACKUP_UNKNOWN})
+                self._write_status()
+                texts = self._round()
+                self.assertEqual(len(texts), 1)
+                self.assertIn("本地库备份状态未知：已恢复正常", texts[0])
+
+    def test_transfer_recovery_needs_local_success_and_transfer_success(self) -> None:
+        """#884 F20：传输失败告警后本地备份又失败——不得发「副本已恢复」；两者都成功才恢复。"""
+
+        self._write_status(transfer={"mode": "scp", "ok": False, "label": "stage"})
+        self.assertEqual(len(self._round()), 1)
+        self.assertEqual(self._alerting_keys(), {host_health_alert.DB_BACKUP_TRANSFER_FAILED})
+
+        self._write_status(ok=False, error="dump_failed", transfer={"mode": "scp", "ok": None})
+        self.assertEqual(self._dry_run_actions(), {(host_health_alert.DB_BACKUP_FAILED, "alert")})
+        texts = self._round()
+        self.assertEqual(len(texts), 1)
+        self.assertIn("本地库备份失败：上次备份失败，错误码 dump_failed", texts[0])
+        self.assertFalse(any("已恢复正常" in t for t in texts))
+        self.assertEqual(
+            self._alerting_keys(),
+            {host_health_alert.DB_BACKUP_FAILED, host_health_alert.DB_BACKUP_TRANSFER_FAILED},
+        )
+
+        self._write_status()
+        self.assertEqual(
+            self._dry_run_actions(),
+            {
+                (host_health_alert.DB_BACKUP_FAILED, "recovery"),
+                (host_health_alert.DB_BACKUP_TRANSFER_FAILED, "recovery"),
+            },
+        )
+        texts = self._round()
+        self.assertEqual(
+            sorted(t.splitlines()[1] for t in texts),
+            ["本地库备份传输失败：已恢复正常", "本地库备份失败：已恢复正常"],
+        )
+        self.assertEqual(self._alerting_keys(), set())
 
     def test_connections_79_percent_silent_80_percent_alerts_then_recovers(self) -> None:
         self._set_connections("79|100")
@@ -1927,6 +2079,138 @@ class RunLocalDbIntegrationTests(unittest.TestCase):
             for needle in forbidden:
                 with self.subTest(needle=needle, text=text):
                     self.assertNotIn(needle, text)
+
+
+class _FakeFeishu:
+    """按顺序回放飞书响应的 ``urlopen`` 替身；记录每次请求体，不连网。
+
+    每个元素是一个响应字典（按 JSON 返回）或一个异常实例（原样抛出，模拟结果不明）。
+    """
+
+    def __init__(self, *responses: object) -> None:
+        self._responses = list(responses)
+        self.bodies: list[dict] = []
+
+    def __call__(self, request, timeout=None):  # noqa: ARG002 - 与 urlopen 同签名
+        self.bodies.append(json.loads(request.data.decode("utf-8")))
+        response = self._responses.pop(0)
+        if isinstance(response, BaseException):
+            raise response
+        payload = json.dumps(response).encode("utf-8")
+
+        class _Response:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                return False
+
+            def read(self):
+                return payload
+
+        return _Response()
+
+    def message_types(self) -> list[str]:
+        return [body["msg_type"] for body in self.bodies if "msg_type" in body]
+
+
+_TOKEN_OK = {"code": 0, "tenant_access_token": "t"}
+_SEND_OK = {"code": 0, "data": {"message_id": "om_1"}}
+_CARD_REJECTED = {"code": 230099, "msg": "card rejected"}
+_MALFORMED_CODE_RESPONSES = (
+    {},
+    {"code": None},
+    {"code": []},
+    {"code": {}},
+    {"code": "unexpected"},
+    {"code": True},
+)
+
+
+class NoticeSendSemanticsTests(unittest.TestCase):
+    """#891 K-5：先发卡片；只在飞书明确拒绝时补发一次纯文本；结果不明不补发；
+    发送成功才落状态。经真实 ``feishu_send_notice`` 走到 ``urlopen`` 替身。
+    借用 `RunIntegrationTests` 的夹具（不继承，免得把那边的用例再跑一遍）。"""
+
+    setUp = RunIntegrationTests.setUp
+    _set_container_state = RunIntegrationTests._set_container_state
+    _run = RunIntegrationTests._run
+
+    def _run_with(self, fake: _FakeFeishu) -> int:
+        self._set_container_state(running=True, health_status="unhealthy")
+        with mock.patch.object(host_health_alert.urllib.request, "urlopen", fake):
+            return self._run()
+
+    def test_card_accepted_sends_one_card_and_persists(self) -> None:
+        fake = _FakeFeishu(_TOKEN_OK, _SEND_OK)
+        self.assertEqual(self._run_with(fake), 0)
+        self.assertEqual(fake.message_types(), ["interactive"])
+        card = json.loads(fake.bodies[1]["content"])
+        self.assertEqual(card["header"]["template"], "red")
+        self.assertNotIn("uuid", fake.bodies[1])
+        self.assertTrue(host_health_alert.load_state(self.state_path)["target-container"].alerting)
+
+    def test_definite_rejection_falls_back_to_text_once_then_persists(self) -> None:
+        fake = _FakeFeishu(_TOKEN_OK, _CARD_REJECTED, _SEND_OK)
+        self.assertEqual(self._run_with(fake), 0)
+        self.assertEqual(fake.message_types(), ["interactive", "text"])
+        text = json.loads(fake.bodies[2]["content"])["text"]
+        self.assertTrue(text.startswith("[BI Plus 宿主监控] 告警"))
+        self.assertTrue(host_health_alert.load_state(self.state_path)["target-container"].alerting)
+
+    def test_fallback_also_rejected_does_not_persist_and_sends_only_once(self) -> None:
+        fake = _FakeFeishu(_TOKEN_OK, _CARD_REJECTED, _CARD_REJECTED)
+        self.assertEqual(self._run_with(fake), 0)
+        self.assertEqual(fake.message_types(), ["interactive", "text"])
+        self.assertEqual(host_health_alert.load_state(self.state_path), {})
+
+    def test_unknown_outcome_does_not_fall_back_or_persist(self) -> None:
+        for outcome in (TimeoutError("timed out"), ["not", "a", "mapping"]):
+            with self.subTest(outcome=type(outcome).__name__):
+                if self.state_path.exists():
+                    self.state_path.unlink()
+                fake = _FakeFeishu(_TOKEN_OK, outcome)
+                self.assertEqual(self._run_with(fake), 0)
+                self.assertEqual(fake.message_types(), ["interactive"])
+                self.assertEqual(host_health_alert.load_state(self.state_path), {})
+
+    def test_malformed_business_code_is_unknown_outcome(self) -> None:
+        # 外审 C1/C2：缺码、null 与非数字码都只证明响应不合预期，不证明成功或拒绝。
+        for response in _MALFORMED_CODE_RESPONSES:
+            with self.subTest(response=response):
+                if self.state_path.exists():
+                    self.state_path.unlink()
+                fake = _FakeFeishu(_TOKEN_OK, response)
+                self.assertEqual(self._run_with(fake), 0)
+                self.assertEqual(fake.message_types(), ["interactive"])
+                self.assertEqual(host_health_alert.load_state(self.state_path), {})
+
+    def test_numeric_business_code_is_definite_rejection(self) -> None:
+        for response in ({"code": 230001}, {"code": "230001"}):
+            with self.subTest(response=response):
+                if self.state_path.exists():
+                    self.state_path.unlink()
+                fake = _FakeFeishu(_TOKEN_OK, response, _SEND_OK)
+                self.assertEqual(self._run_with(fake), 0)
+                self.assertEqual(fake.message_types(), ["interactive", "text"])
+                state = host_health_alert.load_state(self.state_path)
+                self.assertTrue(state["target-container"].alerting)
+
+    def test_fallback_malformed_response_is_unknown_without_third_send(self) -> None:
+        for response in _MALFORMED_CODE_RESPONSES:
+            with self.subTest(response=response):
+                if self.state_path.exists():
+                    self.state_path.unlink()
+                fake = _FakeFeishu(_TOKEN_OK, _CARD_REJECTED, response)
+                self.assertEqual(self._run_with(fake), 0)
+                self.assertEqual(fake.message_types(), ["interactive", "text"])
+                self.assertEqual(host_health_alert.load_state(self.state_path), {})
+
+    def test_token_failure_sends_nothing(self) -> None:
+        fake = _FakeFeishu({"code": 99991663})
+        self.assertEqual(self._run_with(fake), 0)
+        self.assertEqual(fake.message_types(), [])
+        self.assertEqual(host_health_alert.load_state(self.state_path), {})
 
 
 if __name__ == "__main__":

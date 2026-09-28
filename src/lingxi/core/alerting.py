@@ -632,6 +632,8 @@ class AlertSender(Protocol):
     def send_text(self, *, chat_id: str, text: str, dedupe_key: str) -> None:
         """发送一条文本告警；``dedupe_key`` 供实现自行去重，失败时应抛出异常。"""
 
+    # 可选 ``send_notice(*, chat_id, card, dedupe_key)``：登记了告警卡片键时改发卡片，见 alert_card。
+
 
 @dataclass
 class _PendingAlert:
@@ -707,15 +709,13 @@ class AlertDispatcher:
                 pending.in_flight = True
                 claimed.append((dedupe_key, pending))
 
+        from lingxi.core.alert_card import deliver_alert  # 卡片与文本二选一，见该模块
+
         sent = 0
         for dedupe_key, pending in claimed:
             notice = pending.notice
             try:
-                self._sender.send_text(
-                    chat_id=self._chat_id,
-                    text=notice.text,
-                    dedupe_key=notice.dedupe_key,
-                )
+                deliver_alert(self._sender, self._chat_id, notice)
             except Exception as error:  # 告警失败只进入本地重试队列
                 self._finalize_failure(pending, now=now, error=error)
                 continue

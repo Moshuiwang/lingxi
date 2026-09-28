@@ -35,6 +35,7 @@ from lingxi.apps.innertest import build_roster_gate
 from lingxi.apps.scheduler.audit import AuditSink
 from lingxi.apps.scheduler.config import SchedulerConfig
 from lingxi.apps.scheduler.permission_publish import PermissionPublishDuty
+from lingxi.core.delivery.catalog_notice import send_catalog_notice
 from lingxi.core.permission.mcp_readiness_base import ReadinessSchedule
 from lingxi.core.permission.metric_translation import metric_translation_available
 
@@ -347,9 +348,8 @@ class CatalogNotifier:
     def send(
         self, *, open_id: str, key: str, values: Mapping[str, object], dedupe_key: str
     ) -> None:
-        """渲染内容目录里的一条 key 并私聊发给用户本人。"""
-        content = self._catalog.text(key, **values)
-        self._sender.send_text(open_id=open_id, text=content.text, dedupe_key=dedupe_key)
+        """渲染内容目录里的一条 key 并私聊发给用户本人；登记了卡片键时发通知卡。"""
+        send_catalog_notice(self._sender, self._catalog, open_id, key, values, dedupe_key)
 
 
 # ----------------------------------------------------------------------

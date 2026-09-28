@@ -6,20 +6,17 @@ from lingxi.adapters.postgres_innertest import InnertestPrincipal
 from lingxi.core.admin.followup_consumer import FollowupResult
 from lingxi.core.admin.followup_effect import effect_allowed
 from lingxi.core.admin.innertest import InnertestError, target_digest
-from lingxi.core.admin.notification import (
-    ConfirmCardButton,
-    RenderedConfirmCard,
-    render_card_payload,
-)
+from lingxi.core.admin.notification import render_card_payload, render_innertest_confirm_card
 
 
 class InnertestConfirmationCard:
     """发卡结果不明保持 unknown，不因查询或同 request_key 重新发送。"""
 
-    def __init__(self, *, service, store, create_card, send_card):
-        """CardKit 建卡与发送分开，取得 card_id 后先持久保存。"""
+    def __init__(self, *, service, store, create_card, send_card, content_catalog=None):
+        """CardKit 建卡与发送分开，取得 card_id 后先持久保存；内容目录只决定卡片版式。"""
         self.service, self.store = service, store
         self.create_card, self.send_card = create_card, send_card
+        self.content_catalog = content_catalog
 
     def __call__(self, item):
         """发送前重读本人绑定和批次；网络在事务外。"""
@@ -100,25 +97,10 @@ class InnertestConfirmationCard:
                 (item.batch_id,),
             )
             people = cursor.fetchall()
-        body = f"加入内测资格，不授业务权限；资格与开通结果逐人查询。\n本批 {len(people)} 项：\n"
-        body += "\n".join(
-            f"{email}（{personnel or '待执行阶段解析'}）" for email, personnel in people
+        card = render_innertest_confirm_card(
+            item.pending_action_id, people, content_catalog=self.content_catalog
         )
-        if any(personnel is None for _, personnel in people):
-            body += "\n待解析项仅在执行时确认唯一在职身份后加入资格；未知或冲突不加入。"
-        body += "\n请本人在10分钟内确认；取消不新增资格。"
-        buttons = tuple(
-            ConfirmCardButton(
-                label=label,
-                value={"pending_action_id": item.pending_action_id, "decision": decision},
-            )
-            for label, decision in (("确认执行", "confirm"), ("取消", "cancel"))
-        )
-        return (
-            row[0],
-            RenderedConfirmCard(title="确认加入内测资格", body=body, buttons=buttons),
-            row[6],
-        )
+        return row[0], card, row[6]
 
     def _delivered(self, item, card_id, message_id):
         """平台接收与阶段成功同事务；中断仍有外发标记而不是未发。"""

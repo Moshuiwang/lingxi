@@ -500,6 +500,69 @@ class IdleConnectionPoolDiscardsClosedConnectionsTests(unittest.TestCase):
         self.assertEqual(pool._idle, {}, "清理后空闲栈必须为空")
 
 
+class ReturnPathNeverStrandsAConnectionTests(unittest.TestCase):
+    """#884 第 1 条（F3）：归还路径上任何一步抛错，物理连接要么已入空闲栈、要么已关闭，
+    不得"句柄已标归还、连接既没入栈也没关"。假连接对象，不需要真库。
+
+    变异对照：把 ``_BorrowedConnection.close()`` 的 ``try/finally`` 去掉、恢复成
+    ``if not release(...): discard()``，``test_close_discards_when_reset_for_reuse_raises`` 必红。
+    """
+
+    class _FakeConnection:
+        def __init__(self, *, reset_error: bool = False, discard_error: bool = False) -> None:
+            self.closed = False
+            self.reset_error = reset_error
+            self.discard_error = discard_error
+            self.discard_calls = 0
+
+        def reset_for_reuse(self) -> bool:
+            if self.reset_error:
+                raise RuntimeError("reset boom")
+            return True
+
+        def discard(self) -> None:
+            self.discard_calls += 1
+            self.closed = True
+            if self.discard_error:
+                raise RuntimeError("discard boom")
+
+    def setUp(self) -> None:
+        self.pool = postgres._IdleConnectionPool()
+        self.key = ("postgresql://test/f3", PostgresTimeouts())
+        patcher = mock.patch.object(postgres, "_IDLE_POOL", self.pool)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def test_close_discards_when_reset_for_reuse_raises(self) -> None:
+        connection = self._FakeConnection(reset_error=True)
+        handle = postgres._BorrowedConnection(connection, self.key)
+
+        with self.assertRaises(RuntimeError):
+            handle.close()
+
+        self.assertEqual(connection.discard_calls, 1, "复位抛错后物理连接必须被真正关闭")
+        self.assertEqual(self.pool.idle_count(), 0)
+        self.assertTrue(handle.closed)
+        handle.close()
+        self.assertEqual(connection.discard_calls, 1, "已归还句柄再 close() 仍是空操作")
+
+    def test_close_keeps_the_returned_connection_when_discarding_an_expired_one_fails(
+        self,
+    ) -> None:
+        stale = self._FakeConnection(discard_error=True)
+        self.pool._idle[self.key] = [(stale, 0.0)]
+        connection = self._FakeConnection()
+        handle = postgres._BorrowedConnection(connection, self.key)
+
+        with mock.patch.object(postgres, "MAX_IDLE_AGE_SECONDS", 0.0):
+            handle.close()
+
+        self.assertEqual(stale.discard_calls, 1, "过期连接照常尝试关闭")
+        self.assertEqual(connection.discard_calls, 0, "刚归还的连接已入栈，不得被连带关闭")
+        self.assertEqual(self.pool.idle_count(), 1)
+        self.assertIs(self.pool._idle[self.key][0][0], connection)
+
+
 class DedicatedCallSiteWiringTests(unittest.TestCase):
     """三处长期手工持有连接的调用点必须声明 ``dedicated=True``，不进空闲栈。"""
 

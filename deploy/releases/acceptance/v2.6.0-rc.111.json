@@ -1,0 +1,12 @@
+{
+  "candidate_tag": "v2.6.0-rc.111",
+  "evidence_url": "https://github.com/Moshuiwang/lingxi/issues/859#issuecomment-5756757491",
+  "manifest_sha256": "0b18f203c2ab54acc744ad47e65d2c689aff499291eb52ae0993b54bdb386569",
+  "recovery": {
+    "evidence_url": "https://github.com/Moshuiwang/lingxi/issues/859#issuecomment-5756579636",
+    "instructions": "发布2 = 应用镜像 v2.6.0 + 数据库从 Supabase 切到生产主机本地 PostgreSQL 17，两层各自可回退；任何生产回滚动作属显式除外，须产品负责人单独请示与亲跑（deploy/数据库迁移runbook.md 六）。一、镜像层（v2.6.0 → v2.5.3）：路径一（部署器，优先）按 deploy/拉取代理.md §五与 deploy/releases/README.md「固定计划与一次批准」另存 operation=recover、引用本次 v2.6.0 部署计划的恢复计划并独立批准，以 /opt/lingxi/bin/python3 -B <控制包内 lingxi_deploy.py> recover 执行（恢复计划 old/new 对调，recovery.target_manifest_sha256 = v2.5.3 正式版 Release 附件 release-manifest.json 的 sha256 2da4cddbd1515ac4 起始的完整值，见该附件）；路径二（手工）：用 v2.5.3 正式版清单的四镜像 digest 按部署器为 v2.5.3 计划渲染保存的 compose 与公开配置重起三服务。两版迁移头同为 0098_qa_corpus，migrate 阶段无作业，镜像回滚没有库结构回退项；v2.5.3 镜像与本地库或 Supabase 都能配合，镜像回滚不强制连接串回退。二、数据库层（本地库 → Supabase）：切换前失败（未点 Promotion）= start-services → rollback-dsn（s30 脚本备份目录逐字节还原八份连接串文件并回读，末尾自带起两只 timer）；切换后（Promotion 已点）不得直接跑 rollback-dsn（拉取代理会把新版本部署到旧连接串），须请示获批后 rollback-dsn 再按路径一或正常发布把三容器重建为旧连接串（预发实证：rollback-dsn 2 秒、按部署器同形 compose 调用重建三容器 35 秒 healthy）。切换后新增写入：先在本地库 pg_dump -Fc 导出（含切换后到回切时刻的全部写入）待人工回放到 Supabase，当日 lingxi-db-backup 定时产物只在导出不可得时用。观察期 7 天内 Supabase 只停写不退役、可回切；本地库容器可停可删、数据目录与 /var/lib/lingxi/backups 保留；宿主 /etc/hosts 的 127.0.0.1 lingxi-db 一行对回退无害、不需删除。三、宿主文件（s31 装入的备份单元、db-backup.env、巡检脚本 W4 版与 drop-in）用同一脚本 rollback 子命令还原（巡检脚本只还原不删）。",
+    "previous_tag": "v2.5.3"
+  },
+  "result": "passed",
+  "schema": 1
+}

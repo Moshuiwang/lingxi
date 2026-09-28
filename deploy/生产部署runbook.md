@@ -62,14 +62,18 @@ stat -c '%U:%G %n' /home/bi-ai-deploy/projects/lingxi/.git/index   # 期望 bi-a
 
 按 [`deploy/README.md`「准备」](README.md#准备)为 `.env.prod`、`.env.prod.scheduler`、`.env.prod.gateway`、`.env.prod.worker`、`.env.prod.worker-queue`、`.env.prod.migrate`、`.env.prod.reauthorize` 七个文件写入生产凭据。生产凭据集与研发/Stage 凭据集完全隔离，任何一个值都不得与 `.env.stage.*` 系列重复（百炼模型端点凭据除外，见本文件「九」）；不得把研发环境的任何文件复制改名后当作生产文件使用。
 
-其中**数据库连接串不手工编辑**：生产数据库为 Supabase `lingxi-prod`（eu-west-1，Issue #411），凭据事实源是 `biplus-prod` 上的私有文件 `/home/bi-ai-deploy/.config/lingxi/supabase-prod.env`（0600，已就位并验证过登录），用同步脚本按服务写入——scheduler/gateway/worker-queue/reauthorize 得运行 DSN、migrate 得迁移 DSN、worker 零数据库凭据：
+其中**数据库连接串不手工编辑**。**2026-09-22 起生产数据库为生产主机本地 PostgreSQL 17**（容器 `lingxi-db`，Trace [#859](https://github.com/Moshuiwang/lingxi/issues/859) 发布2）：连接串由[数据库迁移 runbook](数据库迁移runbook.md) 的 `switch-dsn` 改写为指向 `lingxi-db`，拉取部署按 `LINGXI_ENV_ROOT` 指定的目录读取 env 文件，不读手工部署时代的项目工作目录；安装、每日备份与恢复演练见[监控告警](监控告警.md)第十节。
+
+**回读判据分两类，不得混用（`scripts/ops/db_switch_to_local.sh` `install-pg`、`scripts/ops/db_backup_install.sh` 的「[回读判据]」逐行标注，#886 第 2 处）**：`compose.db.yaml` 一类**输入副本**——在位 sha 须等于对应输入文件（仓库文件或安装时声明的 sha）；`compose.env` / `.env.db` / 备份巡检 drop-in 一类**现场生成**——内容由脚本本次执行动态产出，其在位 sha 只能与「本次 apply 打印的 installed 值」比对，**不得**与任何输入文件的 sha 比对（两者必然不同，按输入文件 sha 判据核会必假红）。核对前先看脚本这次执行打出的「[回读判据]」行，不要自行另造判据。
+
+> **不要再运行下面这条同步命令**：它从 Supabase 凭据文件重写连接串，现在执行等于把生产改连 Supabase——其付费账号已于 2026-09-27 停止（产品负责人告知），改连后服务起不来或连到切换前的旧数据；生产回切 Supabase 的路径因此不再可用（旧项目可读期未知）。同理，手工部署时代的工作目录 `deploy/.env.prod.*` 及其 `.before-*` 副本仍是 Supabase 连接串（2026-09-27 只读核对 10 份），不得用于任何应急部署；清理由产品负责人另行安排。以下命令与机制说明仅作迁库前的历史记录：
 
 ```bash
 scripts/ops/sync_db_env_from_credentials.sh \
   /home/bi-ai-deploy/.config/lingxi/supabase-prod.env deploy .env.prod
 ```
 
-机制详见 [`deploy/README.md`「数据库凭据源」](README.md#数据库凭据源supabase-私有凭据文件issue-411)（含 session 模式连接约束）。**截至 2026-08-29 生产尚未切换/部署**：本节只登记同构加载方式，实际执行在生产发布的独立 ops 卡内。
+旧机制详见 [`deploy/README.md`「数据库凭据源」](README.md#数据库凭据源supabase-私有凭据文件issue-411)。
 
 **资源与并发（Issue #494/#496/#502）**：生产机器型号与 stage 一致。在目标机外部根
 `deploy/.env.prod`（不入库、不写入本仓库）核对并写入以下**七行**：
@@ -213,12 +217,16 @@ docker compose --env-file deploy/.env.prod \
 
 ### 2.3.6 升级窗口注意事项（rc25 补入：挑静默窗口，先查在途）
 
-**① 重启/替换 gateway 之前先确认没有在途任务与在途文档交付。** 只读计数（DSN 从
-`/home/bi-ai-deploy/.config/lingxi/supabase-prod.env` 加载进环境变量后引用，值不回显、
-不粘贴进命令行参数或聊天记录）：
+**① 重启/替换 gateway 之前先确认没有在途任务与在途文档交付。** 只读计数。**自 2026-09-22
+（`v2.6.0`）起生产库是本机容器 `lingxi-db`（PostgreSQL 17），Supabase 付费账号已于 2026-09-27 停止**：不得再
+从 `supabase-prod.env` 取连接串查询——那会查到已停写的旧库，结果与生产无关，是假安全信号。
+改在本机库容器内经本地套接字执行，不持有连接串与口令；形态与每日备份脚本
+`scripts/ops/db_backup.sh`、`deploy/监控告警.md` 第十节对同一库的只读查询相同（部署用户须在
+docker 组）。这三项计数本身尚未在本机库上实跑过（预发仍连 Supabase stage，无法先行实测），
+首次使用时输出不是三段整数即按「未知」处理、不 `up -d`：
 
 ```bash
-psql "$LINGXI_POSTGRES_DSN" -Atc "SELECT (SELECT count(*) FROM task WHERE status='running'), (SELECT count(*) FROM task WHERE status='awaiting_delivery'), (SELECT count(*) FROM task_document_delivery_request WHERE status='processing');"
+docker exec lingxi-db psql -U postgres -d postgres -Atc "SELECT (SELECT count(*) FROM task WHERE status='running'), (SELECT count(*) FROM task WHERE status='awaiting_delivery'), (SELECT count(*) FROM task_document_delivery_request WHERE status='processing');"
 ```
 
 期望 `0|0|0`；任一项非零就等一轮再查（在途文档投递的认领回收周期为 180 秒量级），
@@ -239,9 +247,9 @@ psql "$LINGXI_POSTGRES_DSN" -Atc "SELECT (SELECT count(*) FROM task WHERE status
 
 ② **单向门（本批不做数据库降级）**：`0091`、`0092` 两条迁移只要表里已有数据就会拒绝降级（`downgrade` 直接报错退出，不会静默截断数据）；`0095` 降级会静默丢失「说过话」状态。因此**本批一律不执行数据库降级**：回滚 = 切回现网 tag（`20260907-71fcc88e7059` 对应版本）与四份 digest 后 `up -d`（见「六、回滚判据与步骤」），**不降级迁移、不动数据卷**。
 
-③ **迁移前必须新取一份备份**：执行 `run --rm migrate` 之前，先由部署用户新跑一次 `pg_dump -Fc` 到 `~/backups/`（权限 `0600`，值不回显、不进任何日志或聊天记录）。这份备份是本次升级的最后恢复点；**从备份恢复库属于本节判据之外的显式除外动作，需要另行向产品负责人请示，不得因为迁移或部署过程中出现异常就自行执行恢复**。
+③ **迁移前必须新取一份备份**：执行 `run --rm migrate` 之前，先由部署用户新跑一次 `umask 077 && docker exec lingxi-db pg_dump -U postgres -Fc --no-password postgres > ~/backups/<文件名>.dump`，落到 `~/backups/`（**先 `umask 077` 再重定向，命令与文字一致**：权限要求 `0600`，值不回显、不进任何日志或聊天记录）。**此前文档只写「权限 0600」但命令未带 `umask`，2026-09-22 生产实跑回读到的是 `644`（在 `700` 目录内，无暴露面）；补上 `umask 077` 后是否能跑出 `0600` 尚未实跑回读，标注「未实测」，待 S-4-1 判定是否安排下一次生产实跑核验**。这份备份是本次升级的最后恢复点；**从备份恢复库属于本节判据之外的显式除外动作，需要另行向产品负责人请示，不得因为迁移或部署过程中出现异常就自行执行恢复**。
 
-④ **`pg_dump` 客户端版本前提**：执行备份的 `pg_dump` 主版本号必须 **≥** 目标 Supabase 服务器的 PostgreSQL 主版本号，版本不够会直接拒绝连接。已知事实（编排者 2026-09-11 只读回读）：生产主机 `pg_dump` 17.10、Supabase 生产服务器 17.6，**生产主机可以直接用系统自带的 `pg_dump`**；预发主机 `pg_dump` 16.15 对 17.6 服务器**直接拒绝**，预发上的任何备份或恢复演练都必须改用 `docker run --rm postgres:17 pg_dump …`（容器内版本高于服务器，满足前提）。
+④ **`pg_dump` 客户端版本前提**：执行备份的 `pg_dump` 主版本号必须 **≥** 目标服务器的 PostgreSQL 主版本号，版本不够会直接拒绝连接。**自 2026-09-22 起生产库是本机容器 `lingxi-db`，镜像钉 `postgres:17`（17.11，见 `deploy/compose.db.yaml`）**：生产备份一律经 `docker exec lingxi-db pg_dump`，客户端与服务端同一镜像、前提自然满足（写法见 `scripts/ops/db_backup.sh`、[数据库迁移 runbook](数据库迁移runbook.md)）。2026-09-11 本节写作时的参照是 Supabase 生产服务器 17.6、生产主机 `pg_dump` 17.10（编排者只读回读），已不适用；预发仍连 Supabase stage（17.6），预发主机 `pg_dump` 16.15 对 17.6 服务器**直接拒绝**，预发上的任何备份或恢复演练都必须改用 `docker run --rm postgres:17 pg_dump …`（容器内版本高于服务器，满足前提）。
 
 ⑤ **顺序不可调换**（生产整窗口）：G-2 放行 → 自检 → 备份（③）→ 步 0（§2.0）→ `.env.prod` 写入本批 tag 与四份 digest（写之前先把原文件备份为 `.env.prod.before-243-<tag>`）→ 拉取并逐份比对 digest（「三、镜像 digest 固定」）→ `run --rm migrate`（①）→ 回读迁移头 = `0096_plpgsql_search_path` → `up -d` → 健康回读（§2.5）→ 15 分钟观察窗口（「七、观察期」）→ 固定项（`验收.md` §二 F-1/2/3/6）→ [#673](https://github.com/Moshuiwang/lingxi/issues/673) 回填 → 产品负责人真人问数 → 24 小时观察。**`--profile mvp` 与两个 `-f` 覆盖文件，本窗口内每一条 compose 命令都不能省**（§2.4 三条命令形态纪律同样适用于这里新增的每一步）。
 
@@ -433,14 +441,22 @@ docker image inspect --format='{{index .RepoDigests 0}}' \
 - **生产首发起步**：docker compose secrets 或 `0600` env 文件二选一，均可满足首发要求；本 runbook 「二、首次部署步骤」按 `0600` env 文件路径给出命令（与 `deploy/README.md` 既有机制一致），选择 compose secrets 时按 Compose 官方 `secrets:` 顶层键与逐服务 `secrets:` 挂载改写对应命令，凭据不进 `--env-file` 明文的效果与 `0600` env 文件等价，实施细节在真正切换该路径的独立工作项中确定。
 - **OS 级密钥管理迁移路线**：作为后续路线书面登记，不在本次落地。触发条件（满足任一即评估启动迁移）：出现监管或审计对密钥管理提出强制要求；需要频繁轮换密钥且当前手工替换 `0600` 文件的方式不可持续；需要向多主机分发同一份生产凭据。大致形态：候选包括 systemd credentials（宿主机原生、不引入新的常驻服务）、云厂商托管密钥服务（如 KMS/Secrets Manager 类产品，取决于最终生产主机所在的云环境）；具体产品与工具选型在触发时由独立 `[ops]` 或 `[task]` Issue 决定，本文件不预先选定供应商。
 
+### 时刻类留痕与远程脚本中断处置（2026-09-22 实录，#886 第 4 处）
+
+**时刻类留痕一律取独立记录，不取脚本自己打印的时刻**：容器用 `docker inspect --format='{{.State.FinishedAt}}'`，systemd 单元用 `systemctl show -p InactiveEnterTimestamp`；脚本打印的时刻只是「脚本被执行到那一行」的时间，与事件实际发生的时间之间可能存在延迟（2026-09-22 生产切换当日，首次 ssh 被中断，脚本打印的停写时刻比容器 `FinishedAt` 回读到的真实停机时刻晚 18–23 秒）。凡按脚本打印时刻计算的停机时长，一律系统性偏低，不得作为对外或对内的时长结论。
+
+**本地断开 ssh 不会停止远端脚本**：远端脚本在本地连接中断后仍会继续执行，会停在任意一步，不能假定「要么没跑、要么跑完」。中断后必须逐步回读（容器状态、systemd 单元状态、脚本自身的分步留痕文件）确认脚本实际停在哪一步，确认前不得重跑——重跑一个仍在执行或已经跑完一部分的脚本，可能造成重复操作或状态冲突。
+
 ## 十、监控与日志
 
 生产部署后的持续可观测性不在本文件展开，指向同批次另外两张卡交付的文档：
 
-- 基础设施层监控与告警：`deploy/监控告警.md`（Trace #373 H2 批另一张卡交付；本文件写作时该文件尚未创建，链接名字已按批次合同冻结）。
-- 容器日志留存：`deploy/日志留存.md`（同上）。
+- 基础设施层监控与告警：`deploy/监控告警.md`（Trace #373 H2 批另一张卡交付，现已存在；自 `v2.6.0` 起含本机库检查项与每日备份，见其第十节）。
+- 容器日志留存：`deploy/日志留存.md`（同批另一张卡交付，现已存在）。
 
 这两份文件到位后，「七、观察期」之外的长期运行监控与故障发现路径以它们为准；本文件不重复维护监控阈值或日志保留期限的具体数值。
+
+**每日备份 timer 窗口内不手工跑备份**：`lingxi-db-backup.timer` 落在 UTC 18:30 起的 5 分钟随机延迟内，单轮连同异机传输最长 30 分钟；这段时间里不要手工 `systemctl start lingxi-db-backup.service` 或直接执行 `db_backup.sh`。两轮相撞时后到的一轮抢不到目录锁、不改写状态文件、以失败退出（[#884](https://github.com/Moshuiwang/lingxi/issues/884)），手工那一轮等于白跑；需要临时补一份备份，先 `systemctl show -p ActiveState lingxi-db-backup.service` 确认不是 `activating` 再动手。
 
 ### 10.1 systemd 单元安装（本节 rc25 补入；此前正文里一条 `systemctl` 都没有）
 
@@ -513,6 +529,8 @@ systemctl cat lingxi-host-monitor.service lingxi-release-pull.service \
 ```
 
 **装之前先 `systemctl cat <单元>` 与仓库版本逐行比对**：现装的那几份是首发现场手写的，不保证与仓库版本等价；差异逐条确认后再覆盖，不要盲覆盖。
+
+**巡检单元本体、巡检脚本与备份脚本的升级（#884 / #891 宿主侧）走 `scripts/ops/host_maintenance_install.sh`，不手敲 `install`**：控制包不带 `scripts/ops/` 与宿主单元，这几份文件只能这样到主机。姿势：编排者从正式 tag 导出 `lingxi-host-monitor.service`、`host_health_alert.py`、`db_backup.sh`、脚本本身与清单 `SHA256SUMS` 到同一个 0700 目录，先在预发 `check` → `apply --yes` 跑通并留回读原文，生产再由产品负责人 `sudo -n bash <目录>/host_maintenance_install.sh apply --yes` 一次执行（排在 Promotion 与问数验收之后，失败自动回装、不影响发布结论）。先装单元、确认有效解释器是注入点，再装脚本——顺序反过来就是 2026-09-20 那次 9 小时静默崩溃。备份脚本替换后**不手动触发**备份，等下一次 UTC 18:30 自然轮，按脚本收尾打印的两条只读命令回读。备份与回装覆盖五个目标（单元本体、`20-python312.conf`、`10-local.conf`、巡检脚本、备份脚本，原本不存在的回装时删掉），明细见 `deploy/监控告警.md`「三.3」。**命令中途断开时先跑 `status`，需要时 `restore --yes`**：已开始写入的 apply 收到 HUP / INT / TERM 会自行回装并打印「中断，已自动回装」，尚未写入则零改动退出；断开后不要凭记忆判断停在哪一步。
 
 **2026-09-04 实际安装终态（rc25 升级窗口；取代上一段 2026-09-02 的「未装齐」状态）**：
 

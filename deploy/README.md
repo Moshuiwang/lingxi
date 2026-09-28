@@ -107,7 +107,7 @@ $EDITOR deploy/.env.stage.reauthorize                # 重授权所需数据库�
 
 ### 数据库凭据源：Supabase 私有凭据文件（Issue #411）
 
-stage 与生产的数据库为 Supabase 云托管（[#40 决策](https://github.com/Moshuiwang/lingxi/issues/40)，2026-08-05）。数据库连接串的**唯一事实源**是目标机器上、仓库工作副本之外的私有凭据文件（0600，属主为部署用户）：
+stage 的数据库为 Supabase 云托管（[#40 决策](https://github.com/Moshuiwang/lingxi/issues/40)，2026-08-05）；生产首发同样如此，**2026-09-22（`v2.6.0`）起改为生产主机本地 PostgreSQL 17**（`lingxi-db`，见[数据库迁移 runbook](数据库迁移runbook.md)），下表生产行是首发时的凭据位置，迁库后**不得再用**（见[生产部署 runbook §2.1](生产部署runbook.md#21-准备七个-env-文件)）。数据库连接串的**唯一事实源**是目标机器上、仓库工作副本之外的私有凭据文件（0600，属主为部署用户）：
 
 | 环境 | 机器 | 凭据文件 |
 | --- | --- | --- |
@@ -576,7 +576,13 @@ docker compose --env-file deploy/.env.prod -f deploy/compose.yaml -f deploy/comp
 docker compose --env-file deploy/.env.prod -f deploy/compose.yaml -f deploy/compose.prod.yaml --profile mvp up -d
 ```
 
-数据库备份与恢复遵循 Supabase 托管方案。两个持久卷单独备份。
+数据库备份与恢复：生产（本机 PostgreSQL 17，2026-09-22 起）见 `deploy/监控告警.md` 第十节的每日备份单元与[数据库迁移 runbook](数据库迁移runbook.md)；预发 Supabase 测试实例遵循其托管方案。两个持久卷单独备份。
+
+## 一次性运维 / 装配脚本的取用规则（Issue #814 第 3 条并入 #886 第 5 项，产品负责人 2026-09-22 裁定）
+
+**引导安装、一次性生产装配所用的脚本，必须从仓库取，不得从任何个人目录、scratchpad 或聊天记录取。** 这条已重复出现过三次同一失效模式：脚本只存在于某个人的临时目录，下一次操作只能"照抄"，一旦那个目录不在了就无据可查（Trace #770 生产装配脚本、2026-09-22 生产切换配套脚本均属此列，详见 Issue #886 建单说明）。
+
+确有一次性脚本产生时，收口前二选一：脱敏后入仓（如本次 `scripts/ops/db_switch_to_local.sh`、`scripts/ops/db_backup_install.sh` 的路径），或在收口盘点里写明「不入仓 + 理由 + 谁持有 + 何时清」，不能什么都不写。本条不要求补建历史样例目录，从下一次引导安装起生效。
 
 ## 两个持久卷
 

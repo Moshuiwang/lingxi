@@ -6,11 +6,35 @@
 
 ## [Unreleased]
 
-2.6.0 迁库版（Trace [#859](https://github.com/Moshuiwang/lingxi/issues/859) 发布2）：生产数据库从 Supabase 迁到生产主机本地 PostgreSQL 17，装入 [#809](https://github.com/Moshuiwang/lingxi/issues/809) / [#835](https://github.com/Moshuiwang/lingxi/issues/835) 两处改动。**切换当日有一个不超过 30 分钟的停写窗口**：窗口内问数与卡片投递暂停，窗口结束后自动恢复，窗口前已提交的请求不丢失；本节随批次合入逐条追加。
+## [2.6.1] - 未定
+
+维护版（Trace [#898](https://github.com/Moshuiwang/lingxi/issues/898)）：装入 [#864](https://github.com/Moshuiwang/lingxi/issues/864) / [#891](https://github.com/Moshuiwang/lingxi/issues/891) / [#885](https://github.com/Moshuiwang/lingxi/issues/885) / [#887](https://github.com/Moshuiwang/lingxi/issues/887) / [#884](https://github.com/Moshuiwang/lingxi/issues/884) / [#889](https://github.com/Moshuiwang/lingxi/issues/889) / [#874](https://github.com/Moshuiwang/lingxi/issues/874) / [#896](https://github.com/Moshuiwang/lingxi/issues/896) 多处改动，聚焦加密依赖安全、消息与告警卡片体验统一，以及自托管数据库的备份恢复与运维健壮性。
+
+### Added
+
+- **新增从每日备份恢复到三服务可问数的脚本**：`run` 子命令用于生产恢复，`wipe` / `rollback` 子命令仅限预发环境使用（Issue [#885](https://github.com/Moshuiwang/lingxi/issues/885)）。
+- **预发环境改用本地 PostgreSQL 17、与生产同构**：迁库与备份安装脚本随本次改动入仓，便于复现与演练（Issue [#896](https://github.com/Moshuiwang/lingxi/issues/896)）。
 
 ### Changed
 
-- **生产数据库改为生产主机本地 PostgreSQL 17，每日备份 + 异机副本 + 恢复演练成为自托管标配**：新增本地库编排 `deploy/compose.db.yaml`（钉摘要的官方镜像、加入应用栈既有网络、只在回环发布端口、参数全走环境变量）、每日备份单元 `lingxi-db-backup.timer`（UTC 18:30 `pg_dump` → 校验和 → `pg_restore --list` 完整性 → 逐表行数清单 → 保留 14 组 → 可选传到异机并回读校验 → 状态文件，任一步失败写错误码并让 systemd 记失败）、宿主巡检本地库检查项（容器 / 备份过旧或失败 / 连接数 / WAL）与恢复演练脚本的本地库形；安装与检查项见 `deploy/监控告警.md` 第十节。**已知边界**：应用沿用来源库的角色名连库，在本地实例上它是超级用户（收紧另立工作项）；观察期内 Supabase 只停写不退役、可回切；切换后新增写入的回退处置 = 本地 `pg_dump` 导出待人工回放，不能假设改回连接串即无损（Issue [#809](https://github.com/Moshuiwang/lingxi/issues/809)）。
+- **用户与管理员看到的消息、日报与运行告警统一为「先状态 / 结果、再字段、再下一步」的只读卡片**：卡片不含按钮、链接或回调；飞书明确拒绝卡片时回落一次纯文本；结果不明不重复补发；新消息到达时明确提示「这条新消息未受理、不会自动排队」（Issue [#891](https://github.com/Moshuiwang/lingxi/issues/891)）。
+- **拉取代理多处判定为「未知」的结果，日志新增机器可读的固定原因码**：状态账与告警正文逐字不变，仍需要看日志才能定位（Issue [#889](https://github.com/Moshuiwang/lingxi/issues/889)）。
+- **拉取代理版本标记升至 3**：随本次发布，各主机代理按「版本标记严格更高才替换」规则各自完成自替换（Issue [#889](https://github.com/Moshuiwang/lingxi/issues/889)）。
+
+### Fixed
+
+- **加密组件清零已公布漏洞**：`cryptography` 从 45.0.7 升到 50.0.1，7 条已公布漏洞清零，豁免清单归零（Issue [#864](https://github.com/Moshuiwang/lingxi/issues/864)）。
+- **迁库带入的 Supabase 空壳平台角色已清理**：迁移 `0099` 撤销 `supabase_admin` 名下三行默认权限并删除该角色；角色仍拥有对象或被其他角色依赖时跳过不清（Issue [#887](https://github.com/Moshuiwang/lingxi/issues/887)）。
+- **备份与巡检更健壮**：数据库连接归还（release / discard）抛错时不再泄漏底层物理连接、并发抢锁失败与被拒的输入不再改写或污染状态文件、无法解释的状态统一判「未知」并告警而不误判正常或中断其余检查、恢复类通知只在本地记录与实际送达都成功后才发出（Issue [#884](https://github.com/Moshuiwang/lingxi/issues/884)）。
+- **依赖漏洞扫描对漏洞库服务端故障有限重试**：不再因扫描依赖的外部服务偶发故障而直接判红（Issue [#874](https://github.com/Moshuiwang/lingxi/issues/874)）。
+
+## [2.6.0] - 2026-09-22
+
+迁库版（Trace [#859](https://github.com/Moshuiwang/lingxi/issues/859) 发布2）：候选 `v2.6.0-rc.111` 经预发验收后由 Release Promotion 发布为正式版，生产数据库从 Supabase 迁到生产主机本地 PostgreSQL 17，装入 [#809](https://github.com/Moshuiwang/lingxi/issues/809) / [#835](https://github.com/Moshuiwang/lingxi/issues/835) 两处改动。**切换当日用户可见停机 11 分 28 秒**（合同上限 30 分钟）：窗口内问数与卡片投递暂停，窗口结束后自动恢复；迁移前后逐表行数、属主与迁移头零差异，产品负责人一次真实问数通过（L6）。观察期 2026-09-22 → 09-27 每日备份与异机副本无缺天、零告警，产品负责人 09-27 裁定达标。
+
+### Changed
+
+- **生产数据库改为生产主机本地 PostgreSQL 17，每日备份 + 异机副本 + 恢复演练成为自托管标配**：新增本地库编排 `deploy/compose.db.yaml`（钉摘要的官方镜像、加入应用栈既有网络、只在回环发布端口、参数全走环境变量）、每日备份单元 `lingxi-db-backup.timer`（UTC 18:30 `pg_dump` → 校验和 → `pg_restore --list` 完整性 → 逐表行数清单 → 保留 14 组 → 可选传到异机并回读校验 → 状态文件，任一步失败写错误码并让 systemd 记失败）、宿主巡检本地库检查项（容器 / 备份过旧或失败 / 连接数 / WAL）与恢复演练脚本的本地库形；安装与检查项见 `deploy/监控告警.md` 第十节。**已知边界**：应用沿用来源库的角色名连库，在本地实例上它是超级用户（收紧另立工作项）；观察期已于 2026-09-27 达标；Supabase 付费账号已于同日停止（产品负责人告知），生产回切 Supabase 的路径不再可用（旧项目可读期未知）；切换后新增写入的回退处置 = 本地 `pg_dump` 导出待人工回放，不能假设改回连接串即无损（Issue [#809](https://github.com/Moshuiwang/lingxi/issues/809)）。
 - **数据库连接借用合同真正兑现**：借用者归还后拿到的旧引用与旧游标永久失效，不再触达他人事务；用户可见行为零变化（Issue [#835](https://github.com/Moshuiwang/lingxi/issues/835)）。
 
 ## [2.5.3] - 2026-09-20

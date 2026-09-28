@@ -1471,6 +1471,28 @@ class MigrationResumeCliTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         return json.loads(result.stdout)
 
+    def test_status_demotes_drifted_verified_target_with_a_fixed_reason(self):
+        """已验证目标被外部改动：status 把它降级为 unknown 时必须带上固定原因码。
+
+        假 docker 对 ``ps`` 一律不回任何容器，所以只要阶段账已经声称 ``verified``，
+        真实 Runtime.complete("start", ...) 一定判它不完整——这条路径此前只把
+        ``status`` 改成 ``unknown``，没有写 ``error``，人没法从 status 输出分辨这是
+        外部改动还是别的原因。
+        """
+        self.store.save(
+            self.plan,
+            {
+                "schema": 1,
+                "plan_sha256": state.fingerprint(self.plan),
+                "status": "verified",
+                "stages": {},
+                "approval_sha256": None,
+            },
+        )
+        status = self._status()
+        self.assertEqual(status["status"], "unknown")
+        self.assertEqual(status["error"], "verified_state_drift")
+
     def test_status_reports_state_sha256_and_resume_round_trips_through_the_cli(self):
         self.assertIsNone(self._status()["state_sha256"])
         self.runtime.kill_before = "migrate"

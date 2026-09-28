@@ -1,5 +1,5 @@
 [meta]
-version = "2026-09-10.717-2"
+version = "2026-09-27.891-2"
 
 [texts]
 "worker.failure_reference" = "追溯号：{reference}。"
@@ -50,7 +50,8 @@ version = "2026-09-10.717-2"
 # 不需要第二套取值。
 "onboarding.preprovisioned_first_chat" = "你的 BI Plus 已经开通，当前可用范围：公司：{company_name}；职能：{function_name}。你可以直接提问；不知道从哪里开始，可以直接问我“你能查什么？”。"
 
-"gateway.busy_hint" = "当前任务仍在处理中"
+# #891：补明这条新消息未受理、不会自动排队（原句只说"处理中"，可被读成新消息已跟上）。
+"gateway.busy_hint" = "当前任务仍在处理中，这条新消息未受理，也不会自动排队；如仍需要，请等当前任务结束后重新发送。"
 # Issue #465（rc22 S-3，100% 响应覆盖）：同一个"话题被占用"状态按任务真实所处
 # 阶段拆成两条文案——已被 worker 领取、正在执行用 `gateway.busy_hint`
 # （"处理中"是真话）。
@@ -63,13 +64,15 @@ version = "2026-09-10.717-2"
 # 用户据此以为补充已经生效——把它继续换成"请重发"又会让前者真正排队中的任务也
 # 被要求重发（白重发一次）。因此两个场景**从今天起拆成两个键**：这一条**只**留给
 # 已入队任务的排队阈值提示；新消息未受理的那一支改取 `gateway.busy_hint_rejected`。
-"gateway.busy_hint_queued" = "前面还有任务在排队，请稍等"
+# #891：已受理、正在排队——明确"无需重复发送"（#890 样例 01），不得出现"重新发送"。
+"gateway.busy_hint_queued" = "你的问题已在排队，无需重复发送；前面还有任务在处理，请稍等。"
 # Issue #717④ 新增：话题被占用（现有任务仍在排队、还没被任何 worker 领取）期间
 # 又来的新消息——这条消息本身**没有被受理**（不进对话历史、不排队、不会在现有
 # 任务结束后自动提交或生效），与上面 `gateway.busy_hint_queued` 描述的"你自己的
 # 任务已经排队、请稍等"是相反的事实，因此不能沿用同一句话，也不能说"请重发"以外
 # 的任何暗示已生效的话。取用点见 `core/conversation/pipeline.py::_busy_hint_for`。
-"gateway.busy_hint_rejected" = "前面还有任务在排队，这条消息暂时不会被处理；如果仍然需要，请稍后重新发送。"
+# #891：原句"暂时不会被处理"可被读成稍后会处理，改成与 `gateway.busy_hint` 同一说法。
+"gateway.busy_hint_rejected" = "前面还有任务在排队，这条新消息未受理，也不会自动排队；如仍需要，请等前面的任务结束后重新发送。"
 "gateway.suspended" = "你的 BI Plus 账号当前已停用，暂时无法发起新的问数。"
 "gateway.queue_failed" = "消息已收到，但当前暂时无法开始处理，请稍后重试。错误码：LX-QUEUE-001"
 # Issue #465（rc22 S-3，100% 响应覆盖）：`EventPipeline.handle_message` 的兜底
@@ -414,4 +417,299 @@ title = "查询完成"
 # 合并成一句连贯的话，"已完成"这个事实与"没有可用结果"这个结论同一句话说完，
 # 不再分两行陈述。
 body = "已完成 · {elapsed_seconds} 秒，本次未取得可用结果。"
+button_labels = []
+
+# #891 甲-a 用户侧状态通知（开通、忙碌 / 会话 / 命令、记忆、权限范围变化）
+
+[cards."notice.onboarding.checking"]
+title = "正在核对身份"
+body = "已收到你的消息，正在核对你的身份和银河权限。\n\n**下一步**\n请稍候，无需重复发送。"
+button_labels = []
+
+[cards."notice.onboarding.matched"]
+title = "正在开通"
+body = "已核对到你的银河权限，正在完成 BI Plus 开通和权限同步。\n\n**下一步**\n请稍候，同步完成后会通知你。"
+button_labels = []
+
+[cards."notice.onboarding.syncing"]
+title = "权限正在同步"
+body = "已核对到你的银河权限，正在完成 BI Plus 开通和权限同步。\n预计最多需要十五分钟。\n\n**下一步**\n无需重复开通，同步完成后会通知你。"
+button_labels = []
+
+[cards."notice.onboarding.innertest_waiting"]
+title = "已加入内测 · 等待开通"
+body = "你已加入内测，**开通尚未开始**。\n\n**下一步**\n请稍后重新发送消息。"
+button_labels = []
+
+[cards."notice.onboarding.completed"]
+title = "开通完成"
+body = "你现在可以开始使用 BI Plus。\n\n**当前可用范围**\n公司：{company_name}\n职能：{function_name}\n\n**下一步**\n开通过程中发送的内容不会被处理；如果仍然需要那个问题的答案，请现在重新发送。"
+button_labels = []
+
+[cards."notice.onboarding.preprovisioned_first_chat"]
+title = "已开通"
+body = "你的 BI Plus 已经开通。\n\n**当前可用范围**\n公司：{company_name}\n职能：{function_name}\n\n**下一步**\n你可以直接提问；不知道从哪里开始，可以直接问我“你能查什么？”。"
+button_labels = []
+
+[cards."notice.onboarding.not_authorized"]
+title = "没有可用的银河权限"
+body = "当前没有可用的银河权限。BI Plus 不能代替你申请或扩大银河权限。\n\n**下一步**\n请先在银河申请或补充权限；生效并完成同步后，再回到 BI Plus 使用。\n如果你在银河已经有权限但仍看到此提示，请联系银河管理员。"
+button_labels = []
+
+[cards."notice.onboarding.sync_timeout"]
+title = "权限同步未完成"
+body = "权限同步未完成，已转交处理。\n追溯号：{reference}\n\n**下一步**\n无需重复开通。"
+button_labels = []
+
+[cards."notice.onboarding.innertest_not_open"]
+title = "暂未向你开放"
+body = "BI Plus 目前处于内测阶段，暂未向你开放。\n\n**下一步**\n内测咨询请联系王志鹏（wangzp@startimes.com.cn），咨询不代表一定获得资格。"
+button_labels = []
+
+[cards."notice.onboarding.delegated_subject"]
+title = "专用账号不提供问数"
+body = "这个账号是组织资料同步的专用账号，不提供问数服务，也不会建立使用记录。"
+button_labels = []
+
+[cards."notice.onboarding.internal_error"]
+title = "暂时无法完成开通"
+body = "当前暂时无法完成开通，已转交管理员处理。\n错误码：LX-ONBOARD-001\n追溯号：{reference}\n\n**下一步**\n你可以稍后重新发送消息重试；处理完成后我们会通知你。"
+button_labels = []
+
+[cards."notice.onboarding.stalled"]
+title = "开通已停止等待"
+body = "距离你发起开通已经过了较长时间，仍然没有得到结果，本次已经停止等待。\n错误码：LX-ONBOARD-001\n追溯号：{reference}\n\n**下一步**\n你可以再发一条消息重新开始。"
+button_labels = []
+
+[cards."notice.gateway.busy_hint"]
+title = "这条消息未受理"
+body = "当前任务仍在处理中，这条新消息**未受理**，也不会自动排队。\n\n**下一步**\n如仍需要，请等当前任务结束后重新发送。"
+button_labels = []
+
+[cards."notice.gateway.busy_hint_rejected"]
+title = "这条消息未受理"
+body = "前面还有任务在排队，这条新消息**未受理**，也不会自动排队。\n\n**下一步**\n如仍需要，请等前面的任务结束后重新发送。"
+button_labels = []
+
+[cards."notice.gateway.suspended"]
+title = "账号已停用"
+body = "你的 BI Plus 账号当前已停用，暂时无法发起新的问数。"
+button_labels = []
+
+[cards."notice.gateway.delivery_expired"]
+title = "上次结果已过期"
+body = "上一次问数结果因超过投递时限未能确认送达，已过期。\n\n**下一步**\n请重新提问。"
+button_labels = []
+
+[cards."notice.gateway.slash_rejected"]
+title = "暂不支持系统命令"
+body = "以 / 开头的内容会被识别为系统命令，暂不支持。\n\n**下一步**\n请去掉开头的斜杠，用自然语言重新描述你的问题。"
+button_labels = []
+
+[cards."notice.gateway.queue_failed"]
+title = "暂时无法开始处理"
+body = "消息已收到，但当前暂时无法开始处理。\n错误码：LX-QUEUE-001\n\n**下一步**\n请稍后重试。"
+button_labels = []
+
+[cards."notice.gateway.unexpected_error"]
+title = "处理出现内部问题"
+body = "处理这条消息时出现了内部问题，暂时无法完成。\n错误码：LX-GATEWAY-001\n追溯号：{reference}\n\n**下一步**\n请稍后重试。"
+button_labels = []
+
+[cards."notice.gateway.new_session"]
+title = "已开启新会话"
+body = "可以开始提问。"
+button_labels = []
+
+[cards."notice.gateway.session_rotated"]
+title = "已开启新会话"
+body = "距上次对话已超过两小时，本次提问不携带此前上下文。"
+button_labels = []
+
+[cards."notice.memory.usage_help"]
+title = "记忆命令用法"
+body = "/memory list：查看已登记记忆（附带序号）\n/memory remember 〈类型〉 〈关键词〉 => 〈说明〉：登记\n/memory forget 〈序号〉：删除一条（序号见 /memory list，也可以直接用完整 id）\n/memory clear：清空全部\n\n**类型**\nterm\\_mapping（术语映射）/ calibration\\_preference（口径偏好）/ convention\\_template（惯例模板）\n\n**须知**\n记忆只接受“关键词 => 说明”这一种登记形状，不会存查询结果、数字等数据本身。\n最多登记 50 条，达到上限后新的登记会被拒绝，需要先用 /memory clear 或 /memory forget 删除几条。\n账号被停用或数据权限发生变化时，已登记的记忆会被清空且无法恢复。"
+button_labels = []
+
+[cards."notice.memory.remember_unsafe"]
+title = "记忆未能登记"
+body = "其中包含疑似系统指令或内部标识的文本，无法安全展示或使用。\n\n**下一步**\n请修改关键词或说明后重试。"
+button_labels = []
+
+[cards."notice.memory.limit_exceeded"]
+title = "记忆已达上限"
+body = "已达到记忆条数上限（50 条）。\n\n**下一步**\n请先用 /memory clear 或 /memory forget 〈序号〉 删除几条后再登记。"
+button_labels = []
+
+[cards."notice.memory.forget_not_found"]
+title = "没有找到这条记忆"
+body = "可能已被删除、不属于你，或序号已过期。\n\n**下一步**\n可以先用 /memory list 重新查看当前序号。"
+button_labels = []
+
+[cards."notice.memory.remembered"]
+title = "已登记这条记忆"
+body = "下一次提问开始生效。\n\n**下一步**\n可以用 /memory list 查看全部。"
+button_labels = []
+
+[cards."notice.memory.forgotten"]
+title = "已删除这条记忆"
+body = "类型：{type_label}\n关键词：{memory_key}\n说明：{memory_value}"
+button_labels = []
+
+[cards."notice.memory.forgotten_unsafe"]
+title = "已删除这条记忆"
+body = "类型：{type_label}\n该条内容无法安全展示。"
+button_labels = []
+
+[cards."notice.memory.cleared"]
+title = "已清空全部记忆"
+body = "共清空 {count} 条。"
+button_labels = []
+
+[cards."notice.memory.list_empty"]
+title = "还没有登记记忆"
+body = "你还没有登记任何记忆。\n\n**下一步**\n可以用 /memory remember 〈类型〉 〈关键词〉 => 〈说明〉 登记，类型可选 term\\_mapping（术语映射）/ calibration\\_preference（口径偏好）/ convention\\_template（惯例模板）。"
+button_labels = []
+
+[cards."notice.memory.list"]
+title = "已登记的记忆"
+body = "{entries}"
+button_labels = []
+
+[cards."notice.permission.range_updated"]
+title = "可用范围已更新"
+body = "**当前可用范围**\n公司：{company_name}\n职能：{function_name}\n\n**下一步**\n你可以直接发起一次查询验证；如有疑问请联系管理员。"
+button_labels = []
+
+[cards."notice.permission.range_revoked"]
+title = "可用范围已更新"
+body = "当前暂无可用的数据范围。\n\n**下一步**\n如有疑问请联系管理员。"
+button_labels = []
+
+# #891 甲-b 排队提示、文档 / 表格交付、流式卡换手帧
+
+[cards."notice.gateway.busy_hint_queued"]
+title = "已在排队"
+body = "你的问题已在排队，无需重复发送。\n\n前面还有任务在处理，请稍等。"
+button_labels = []
+
+[cards."notice.delivery.document_ready"]
+title = "文档已生成"
+body = "**[打开文档]({url})**\n**你的权限**：可管理"
+button_labels = []
+
+[cards."notice.delivery.document_ready_degraded"]
+title = "文档已生成 · 排版已简化"
+body = "**[打开文档]({url})**\n**你的权限**：可管理\n\n**排版说明**\n这次回答里有暂时无法排版的结构，文档已按纯文本段落交付：表格被拍平成文字，正文里可能残留 | 和 --- 这类符号。内容本身没有删减。\n\n**下一步**\n需要规整的表格时，可以让我改用电子表格重新生成一份。"
+button_labels = []
+
+[cards."notice.delivery.document_ready_simplified"]
+title = "文档已生成 · 排版已简化"
+body = "**[打开文档]({url})**\n**你的权限**：可管理\n\n**排版说明**\n这份文档的排版由飞书自动完成，格式做了简化，个别不支持的结构可能没有呈现出来，建议打开后核对。\n\n**下一步**\n需要规整的表格时，可以让我改用电子表格重新生成一份。"
+button_labels = []
+
+[cards."notice.delivery.document_ready_degraded_too_long"]
+title = "文档已生成 · 排版已简化"
+body = "**[打开文档]({url})**\n**你的权限**：可管理\n\n**排版说明**\n这次回答的正文超出了带格式排版的长度上限，文档已按纯文本段落交付：表格被拍平成文字，正文里可能残留 | 和 --- 这类符号。\n\n**下一步**\n需要规整的表格时，可以让我改用电子表格重新生成一份。"
+button_labels = []
+
+[cards."notice.delivery.document_ready_degraded_title"]
+title = "文档已生成 · 排版已简化"
+body = "**[打开文档]({url})**\n**你的权限**：可管理\n\n**排版说明**\n这次回答的标题里含有带格式排版暂不支持的特殊字符，文档已按纯文本段落交付：表格被拍平成文字，正文里可能残留 | 和 --- 这类符号。\n\n**下一步**\n需要规整的表格时，可以让我改用电子表格重新生成一份。"
+button_labels = []
+
+[cards."notice.delivery.sheet_ready"]
+title = "表格已生成"
+body = "**[打开表格]({url})**\n**你的权限**：可管理"
+button_labels = []
+
+[cards."notice.delivery.document_failed"]
+title = "文档生成失败"
+body = "问题已记录。\n\n**下一步**\n你可以重新发起问数再试一次。"
+button_labels = []
+
+[cards."notice.delivery.sheet_failed"]
+title = "表格生成失败"
+body = "问题已记录。\n**追溯号**：{reference}\n\n**下一步**\n你可以重新发起问数再试一次。"
+button_labels = []
+
+[cards."notice.delivery.document_uncertain"]
+title = "文档生成结果待确认"
+body = "文档生成结果暂无法确认，已转人工核对。\n\n**下一步**\n请先等待核对，避免重复生成。"
+button_labels = []
+
+[cards."notice.delivery.sheet_uncertain"]
+title = "表格生成结果待确认"
+body = "表格生成结果暂无法确认，已转人工核对。\n**追溯号**：{reference}\n\n**下一步**\n请先等待核对，避免重复生成。"
+button_labels = []
+
+[cards."notice.worker.card_handoff_notice"]
+title = "结果将以新消息发送"
+body = "本次处理时间较长，此卡片可能很快不再更新；处理完成后结果将以新消息发送，请留意。"
+button_labels = []
+
+# #891 乙 管理卡与管理群通知
+
+[cards."notice.admin.confirm"]
+title = "待本人确认 · {action}"
+body = "请先核对对象、范围和期限；确认后才执行，取消不做任何变更。"
+button_labels = []
+
+[cards."notice.admin.terminal"]
+title = "{action} · {outcome}"
+body = "本卡已结束，不能再次操作。"
+button_labels = []
+
+[cards."notice.admin.group_notice"]
+title = "管理操作 · {action} · {outcome}"
+body = "本群消息只通知结果，不能在群内操作；需要处理请在私聊查询管理卡。"
+button_labels = []
+
+[cards."notice.admin.innertest_confirm"]
+title = "待本人确认 · 加入内测资格"
+body = "请核对名单后确认；取消不新增资格。"
+button_labels = []
+
+[cards."notice.admin.management_card"]
+title = "用户权限管理卡"
+body = "写操作都要在随后的确认卡上由本人确认后才执行。"
+button_labels = []
+
+[cards."notice.permission.management_correction_summary"]
+title = "每日权限批处理 · 已补齐下发"
+body = "**已补齐**：{count} 条此前未完成的权限下发\n\n**下一步**\n无需处理；个别用户的权限状态可在私聊查询其管理卡。"
+button_labels = []
+
+[cards."notice.admin.contact_todo"]
+title = "联系待办 · 需人工触达"
+body = "请改用其它方式手动触达这位用户；本条是联系待办，不是故障告警。"
+button_labels = []
+
+# #891 丙-1 管理群运维通知（日报、花名册日报、告警、文案覆盖）
+
+[cards."notice.innertest.daily_report"]
+title = "内测每日通报"
+body = "本报告为统计级数据，不含用户对话原文、姓名、工号或邮箱。"
+button_labels = []
+
+[cards."notice.roster.daily_report"]
+title = "花名册每日资料比对"
+body = "**日期**：{report_date}（UTC）"
+button_labels = []
+
+[cards."notice.alert.fault"]
+title = "运行故障：{kind_label}"
+body = "**类型**：{kind_label}\n**范围**：{scope}\n**次数**：{count}\n**时间**：{observed_at}\n**{reference_label}**：{reference}\n\n**下一步**\n请按类型与范围排查；本通知不会自动重启、修复或重发。"
+button_labels = []
+
+[cards."notice.alert.recovery"]
+title = "已恢复：{kind_label}"
+body = "**类型**：{kind_label}\n**范围**：{scope}\n**次数**：{count}\n**时间**：{observed_at}\n**{reference_label}**：{reference}\n\n**下一步**\n无需处理；本通知不会自动执行任何操作。"
+button_labels = []
+
+# 卡片正文也受「用户可见文案不含内部代号」的全局检查约束，因此不写完整模块路径；
+# 完整命令仍在等价纯文本（``core/delivery/ops_notice.CONTENT_OVERRIDE_ALERT_TEXT``）里。
+[cards."notice.content.override_rejected"]
+title = "文案覆盖文件未通过校验"
+body = "宿主机上的用户可见文案覆盖文件已被整份忽略，用户看到的仍是随镜像发布的那一版文案；不影响任何在跑的服务。\n**原因码**：{reason}\n\n**下一步**\n用随镜像附带的文案校验命令（`config.content_check` 模块）校验该文件后重新放置，并重启相关服务。"
 button_labels = []

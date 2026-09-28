@@ -731,7 +731,10 @@ def main():
             actual = runtime.snapshot(plan, readonly=True)
             result = dict(state, actual=actual)
             if state["status"] == "verified" and not runtime.complete("start", plan, actual):
+                # 已验证目标被外部改动：与 execute() 里失败时 state["error"] 同一固定原因码
+                # 集合，不能让这条降级路径悄悄不带原因。
                 result["status"] = "unknown"
+                result["error"] = "verified_state_drift"
         except Exception:
             result = dict(state, status="unknown", error="actual_state_unavailable")
         # 阶段账文件原文的 sha256；resume-migration 的 --acknowledge 必须逐字等于它。

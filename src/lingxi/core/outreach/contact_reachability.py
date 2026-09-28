@@ -19,6 +19,8 @@ from collections.abc import Callable
 from datetime import UTC, datetime
 from typing import Any, Protocol
 
+from lingxi.config.content import ContentCatalog, ContentError, default_content_catalog
+from lingxi.core.delivery.notice_card import NoticeCard, NoticeTone, escape_markdown
 from lingxi.core.identity.identifiers import redact_identifier
 
 logger = logging.getLogger(__name__)
@@ -32,6 +34,9 @@ AUDIT_STATE_WRITE_FAILED = "outreach.contact_state_write_failed"
 
 #: 群待办的去重键前缀：同一个人短时间内重复失败只占管理员一条待办。
 TODO_DEDUPE_PREFIX = "contact-unavailable:"
+
+#: 通知卡片键：未进内容目录时待办逐字沿用 :func:`admin_todo_text` 纯文本。
+CONTACT_TODO_CARD_KEY = "notice.admin.contact_todo"
 
 
 class ContactStateStore(Protocol):
@@ -68,6 +73,46 @@ def admin_todo_text(*, open_id: str, email: str | None, error_code: str | None) 
     )
 
 
+def admin_todo_card(
+    *,
+    open_id: str,
+    email: str | None,
+    error_code: str | None,
+    content_catalog: ContentCatalog | None = None,
+) -> NoticeCard | None:
+    """管理员待办的卡片版；卡片键未进目录或模板 / 校验不可用时返回 ``None``（发纯文本）。
+
+    字段与纯文本同源：open_id、邮箱（缺失写「邮箱未知」，不留空）、错误码（缺失写
+    ``unknown``）；等价纯文本就是 :func:`admin_todo_text`。卡片不带按钮、链接或回调。
+    """
+    source = content_catalog if content_catalog is not None else default_content_catalog()
+    if not source.has_card(CONTACT_TODO_CARD_KEY):
+        return None
+    contact = email or "邮箱未知，请按 open_id 查花名册"
+    try:
+        notice = source.card(CONTACT_TODO_CARD_KEY)
+        return NoticeCard(
+            title=notice.title,
+            tone=NoticeTone.ATTENTION,
+            sections=(
+                (None, ("主动发送未能送达一位用户，机器人当前无法与其私聊",)),
+                (
+                    "联系对象",
+                    (
+                        f"**用户标识**：{escape_markdown(open_id)}",
+                        f"**邮箱**：{escape_markdown(contact)}",
+                        f"**错误码**：{escape_markdown(error_code or 'unknown')}",
+                    ),
+                ),
+                ("下一步", (notice.body,)),
+            ),
+            fallback_text=admin_todo_text(open_id=open_id, email=email, error_code=error_code),
+        )
+    except (ContentError, ValueError) as error:
+        logger.warning("联系待办卡片不可用，改发纯文本 error=%s", type(error).__name__)
+        return None
+
+
 class ContactReachabilityRecorder:
     """把一次正式发送的明确结果落成状态；失败时另转一条管理群待办。
 
@@ -83,8 +128,10 @@ class ContactReachabilityRecorder:
         chat_id: str,
         audit: _AuditSink | None = None,
         clock: Callable[[], datetime] | None = None,
+        content_catalog: ContentCatalog | None = None,
     ) -> None:
-        """接线状态存取口、管理群通道、目标群与审计出口；时钟可注入以便测试。"""
+        """接线状态存取口、管理群通道、目标群与审计出口；时钟与内容目录可注入以便测试。"""
+        self._content_catalog = content_catalog
         self._store = store
         self._notifier = notifier
         self._chat_id = chat_id
@@ -134,17 +181,36 @@ class ContactReachabilityRecorder:
             logger.error("联系待办查邮箱失败 error=%s", type(error).__name__)
             email = None
         try:
-            self._notifier.send_text(
-                chat_id=self._chat_id,
-                text=admin_todo_text(open_id=open_id, email=email, error_code=error_code),
-                dedupe_key=TODO_DEDUPE_PREFIX + open_id,
-            )
+            self._deliver(open_id=open_id, email=email, error_code=error_code)
         except Exception as error:  # 群通知失败不得带走已经落库的状态
             logger.error("联系不可达管理员待办发送失败 error=%s", type(error).__name__)
             self._record(AUDIT_TODO_NOTIFY_FAILED, error=type(error).__name__)
             return
         logger.info("联系不可达管理员待办已发送 open_id=%s", redact_identifier(open_id))
         self._record(AUDIT_TODO_NOTIFIED)
+
+    def _deliver(self, *, open_id: str, email: str | None, error_code: str) -> None:
+        """有卡片且通道支持 ``send_notice`` 就发卡片，否则发今天的纯文本；去重键相同。
+
+        只会记日志的通道（未配置管理群）没有 ``send_notice``。卡片被明确拒绝时由通道补发
+        一次等价纯文本；结果不明上抛，落进调用方「待办发送失败」的审计，不补发。
+        """
+        dedupe_key = TODO_DEDUPE_PREFIX + open_id
+        card = admin_todo_card(
+            open_id=open_id,
+            email=email,
+            error_code=error_code,
+            content_catalog=self._content_catalog,
+        )
+        send_notice = getattr(self._notifier, "send_notice", None)
+        if card is not None and callable(send_notice):
+            send_notice(chat_id=self._chat_id, card=card, dedupe_key=dedupe_key)
+            return
+        self._notifier.send_text(
+            chat_id=self._chat_id,
+            text=admin_todo_text(open_id=open_id, email=email, error_code=error_code),
+            dedupe_key=dedupe_key,
+        )
 
     def _record(self, action: str, **fields: object) -> None:
         if self._audit is not None:
@@ -157,9 +223,11 @@ __all__ = [
     "AUDIT_STATE_WRITE_FAILED",
     "AUDIT_TODO_NOTIFIED",
     "AUDIT_TODO_NOTIFY_FAILED",
+    "CONTACT_TODO_CARD_KEY",
     "TODO_DEDUPE_PREFIX",
     "AdminTodoNotifier",
     "ContactReachabilityRecorder",
     "ContactStateStore",
+    "admin_todo_card",
     "admin_todo_text",
 ]

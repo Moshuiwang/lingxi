@@ -31,7 +31,7 @@
 30	src/lingxi/apps/gateway/alerting.py
 343	src/lingxi/apps/gateway/assembly.py
 195	src/lingxi/apps/gateway/config.py
-486	src/lingxi/apps/gateway/delivery.py
+481	src/lingxi/apps/gateway/delivery.py
 57	src/lingxi/apps/gateway/delivery_assembly.py
 509	src/lingxi/apps/gateway/document_delivery.py
 155	src/lingxi/apps/gateway/event_handler.py
@@ -60,7 +60,7 @@
 86	src/lingxi/apps/scheduler/permission_readiness_assembly.py
 504	src/lingxi/apps/scheduler/permission_refresh.py
 127	src/lingxi/apps/scheduler/permission_refresh_ports.py
-298	src/lingxi/apps/scheduler/roster_audit.py
+296	src/lingxi/apps/scheduler/roster_audit.py
 311	src/lingxi/apps/scheduler/stalled_provisioning.py
 290	src/lingxi/apps/trace/__init__.py
 509	src/lingxi/apps/worker/cli.py
