@@ -1,0 +1,12 @@
+{
+  "candidate_tag": "v2.6.1-rc.112",
+  "evidence_url": "https://github.com/Moshuiwang/lingxi/issues/898#issuecomment-5862149477",
+  "manifest_sha256": "70014a7b63fccc1b97b49f3908fa93f417d1434fbf2acbd2554a69e9fcb84371",
+  "recovery": {
+    "evidence_url": "https://github.com/Moshuiwang/lingxi/issues/898#issuecomment-5862079968",
+    "instructions": "v2.6.1 → v2.6.0 回退；任何生产回滚动作属显式除外，须产品负责人单独请示与亲跑。一、镜像层：路径一（部署器，优先）按 deploy/拉取代理.md §五与 deploy/releases/README.md「固定计划与一次批准」另存 operation=recover、引用本次 v2.6.1 部署计划的恢复计划并独立批准，以 /opt/lingxi/bin/python3 -B <控制包内 lingxi_deploy.py> recover 执行（recovery.target_manifest_sha256 = v2.6.0 正式版 Release 附件 release-manifest.json 的 sha256 6bab23f258c6262f340c7c6bd79ba056e2308f390f3f686a123e313c023c6db0）；路径二（手工）：用 v2.6.0 正式版清单的四镜像 digest 按部署器为 v2.6.0 计划渲染保存的 compose 与公开配置重起三服务。二、数据库层：v2.6.1 迁移头 0099_drop_shell_platform_admin 只删除空壳角色 supabase_admin 及其名下三行默认权限、不改任何表结构，v2.6.0 镜像可直接在 0099 上运行，镜像回滚不强制库回退；如需还原该角色，以 v2.6.1 迁移镜像执行 alembic downgrade 0098_qa_corpus（逐字重建角色与三行默认权限）。三、拉取代理：本版代理版本标记 3 已自替换，只升不降——镜像回滚不回退代理；如需回退代理，用同目录留存的 <代理文件名>.bak-<旧摘要前 8 位> 原子换回。四、宿主维护（可选步骤 ⑤ 若已执行）：同一脚本 scripts/ops/host_maintenance_install.sh restore --yes 按 /root/lingxi-884-backup/<时间戳> 逐字节还原单元本体、drop-in、巡检脚本与备份脚本。",
+    "previous_tag": "v2.6.0"
+  },
+  "result": "passed",
+  "schema": 1
+}
