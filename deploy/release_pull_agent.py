@@ -3214,6 +3214,9 @@ PRUNE_REFUSED_NEW_MISSING = "new_release_missing"
 PRUNE_REFUSED_FIRST_TAKEOVER = "first_takeover"
 PRUNE_REFUSED_OLD_SOURCE_UNKNOWN = "old_source_unknown"
 PRUNE_REFUSED_PREVIOUS_UNAVAILABLE = "previous_release_unavailable"
+PRUNE_REFUSED_DEPLOYER_POINTER = "deployer_pointer_mismatch"
+PRUNE_REFUSED_HOST_BUSY = "host_deployment_busy"
+PRUNE_REFUSED_DEPLOYER_ACTIVE = "deployer_active_marker"
 _IMAGE_ID = re.compile(r"^sha256:[0-9a-f]{64}$")
 _CONTAINER_ID = re.compile(r"^[0-9a-f]{12,64}$")
 
@@ -3505,19 +3508,91 @@ def run_image_prune(plan: dict, old_source: object, docker, *, dry_run: bool) ->
     return summary
 
 
+@contextlib.contextmanager
+def _deployer_host_lock(host: dict):
+    """非阻塞取得部署器的主机锁（宿主契约 ``lock_path``，与部署器同一把）；取不到即拒绝，不等待。
+
+    持锁顺序固定为「代理运行锁 → 主机锁」，且这里从不阻塞等待，所以与部署器（只取主机锁）、
+    代理自身的运行锁之间不会形成互相等待。
+    """
+    try:
+        fd = os.open(host["lock_path"], os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+    except OSError:
+        raise AgentError("host_lock_unavailable") from None
+    try:
+        info = os.fstat(fd)
+        if (
+            info.st_uid != os.geteuid()
+            or stat.S_IMODE(info.st_mode) != 0o600
+            or not stat.S_ISREG(info.st_mode)
+        ):
+            raise AgentError("host_lock_permissions")
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            raise AgentError(PRUNE_REFUSED_HOST_BUSY) from None
+        yield
+    finally:
+        os.close(fd)
+
+
+def _deployer_marker(host: dict, kind: str) -> Path:
+    """与部署器 ``host_marker`` 同一规则：主机锁同目录的 ``active`` / ``verified`` 指针。"""
+    return Path(host["lock_path"]).with_suffix(f".{kind}.json")
+
+
+def _deployer_gate(host: dict, plan: dict, *, check_pointer: bool) -> str | None:
+    """持有主机锁期间的部署器现状核对；通过返回 None，否则返回拒绝原因码。
+
+    ``active`` 标记不存在，或部署器已收口成 ``verified`` 的常态都放行；仍是别的状态（在途 / 失败待恢复）
+    即拒绝，避免清掉在途部署要用的镜像。``check_pointer`` 时另要求部署器「上一次验证成功」指针
+    指向的正是本次名单所用计划（id 与指纹都相符）：代理状态账落后于直接调用部署器的推进时，
+    名单会把当前版当旧版，此处拦下。
+    """
+    active = _deployer_marker(host, "active")
+    if active.exists():
+        try:
+            marker = _read_json(active, private=True)
+        except AgentError:
+            return PRUNE_REFUSED_DEPLOYER_ACTIVE
+        if not isinstance(marker, dict) or marker.get("status") != "verified":
+            return PRUNE_REFUSED_DEPLOYER_ACTIVE
+    if check_pointer:
+        try:
+            pointer = _read_json(_deployer_marker(host, "verified"), private=True)
+        except AgentError:
+            return PRUNE_REFUSED_DEPLOYER_POINTER
+        if (
+            not isinstance(pointer, dict)
+            or pointer.get("status") != "verified"
+            or pointer.get("id") != plan.get("id")
+            or pointer.get("plan_sha256") != fingerprint(plan)
+        ):
+            return PRUNE_REFUSED_DEPLOYER_POINTER
+    return None
+
+
 def _prune_after_verified(host: dict, config: dict, state_directory: Path, plan: dict) -> None:
     """部署器 verified 之后的自动清理：任何异常都只记一行日志，绝不外抛。"""
     try:
         if not _image_prune_enabled(config):
             _log("image_prune", "disabled", plan_id=plan.get("id"))
             return
-        run_image_prune(
-            plan,
-            _plan_old_source(state_directory, plan),
-            DockerImages(host["docker"], config["poll_timeout_seconds"]),
-            dry_run=False,
-        )
+        with _deployer_host_lock(host):
+            reason = _deployer_gate(host, plan, check_pointer=False)
+            if reason is not None:
+                _log("image_prune", "skipped", plan_id=plan.get("id"), reason=reason)
+                return
+            run_image_prune(
+                plan,
+                _plan_old_source(state_directory, plan),
+                DockerImages(host["docker"], config["poll_timeout_seconds"]),
+                dry_run=False,
+            )
     except AgentError as error:
+        if error.code == PRUNE_REFUSED_HOST_BUSY:
+            _log("image_prune", "skipped", plan_id=plan.get("id"), reason=error.code)
+            return
         _log("image_prune", "error", plan_id=plan.get("id"), reason=error.code)
     except Exception:
         _log("image_prune", "error", plan_id=plan.get("id"), reason=REASON_UNEXPECTED_EXCEPTION)
@@ -3571,6 +3646,12 @@ def prune_images_once(
         if plan is None:
             _log("image_prune", "refused", reason=PRUNE_REFUSED_PREVIOUS_UNAVAILABLE)
             return 1
+        if not dry_run:
+            # 真删须在持有主机锁期间核对部署器现状；演练只列名单，不取锁、不核对。
+            reason = _deployer_gate(host, plan, check_pointer=True)
+            if reason is not None:
+                _log("image_prune", "refused", reason=reason)
+                return 1
         summary = run_image_prune(
             plan,
             _plan_old_source(state_directory, plan),
@@ -3583,9 +3664,12 @@ def prune_images_once(
     if dry_run:
         return _once()
     try:
-        with _run_lock(state_directory):
+        with _run_lock(state_directory), _deployer_host_lock(host):
             return _once()
     except AgentError as error:
+        if error.code in {PRUNE_REFUSED_HOST_BUSY, "host_lock_unavailable", "host_lock_permissions"}:
+            _log("image_prune", "refused", reason=error.code, host=host["host"])
+            return 1
         _log("image_prune", error.code, host=host["host"])
         return 1
 

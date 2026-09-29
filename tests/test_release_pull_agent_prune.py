@@ -6,8 +6,10 @@ Docker 调用全部经可注入的桩对象，本文件不接触真实 Docker、
 from __future__ import annotations
 
 import contextlib
+import fcntl
 import io
 import json
+import os
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -412,6 +414,41 @@ class AgentIntegrationTests(unittest.TestCase):
                 self.assertIn("阶段=image_prune 结果码=error", output)
                 self.assert_verified_outcome(code, keys)
 
+    @contextlib.contextmanager
+    def host_lock_held(self):
+        """模拟部署器（或另一手工清理）正持有同一把主机锁。"""
+        fd = os.open(self.harness.host["lock_path"], os.O_RDWR | os.O_CREAT, 0o600)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            yield
+        finally:
+            os.close(fd)
+
+    def write_active(self, status: str, plan_id: str = "other-plan") -> None:
+        marker = AGENT.Path(self.harness.host["lock_path"]).with_suffix(".active.json")
+        _json(marker, {"id": plan_id, "plan_sha256": "0" * 64, "status": status})
+
+    def test_auto_prune_skips_when_host_lock_is_held(self):
+        """#910 外审 F3：部署器主机锁被占时自动清理零删除、只记日志，不改部署结果。"""
+        keys = self.disabled_keys()
+        docker = FakeDocker(_deploy_images(), set())
+        with self.host_lock_held():
+            code, output = self.deploy(docker)
+        self.assertEqual(docker.removed(), [])
+        self.assertIn("阶段=image_prune 结果码=skipped", output)
+        self.assertIn("reason=host_deployment_busy", output)
+        self.assert_verified_outcome(code, keys)
+
+    def test_auto_prune_skips_when_deployer_active_marker_is_in_flight(self):
+        keys = self.disabled_keys()
+        docker = FakeDocker(_deploy_images(), set())
+        self.harness.state_for_old()
+        self.write_active("running")
+        code, output = self.run_agent(docker)
+        self.assertEqual(docker.removed(), [])
+        self.assertIn("reason=deployer_active_marker", output)
+        self.assert_verified_outcome(code, keys)
+
     def test_first_takeover_deploy_does_not_prune(self):
         docker = FakeDocker(_deploy_images(), set())
         code, output = self.deploy(docker, old_source="first_takeover")
@@ -458,6 +495,25 @@ class ManualPruneCommandTests(unittest.TestCase):
             {"inventory": {"old_source": "earlier-plan"}},
         )
         self.docker = FakeDocker(_deploy_images(), set())
+        self.write_pointer("old-plan")
+
+    def write_pointer(self, plan_id: str, *, sha: str | None = None) -> None:
+        """部署器 verified 收口时写下的「上一次验证成功」指针（与部署器同一形状）。"""
+        plan = json.loads((self.harness.state / "old-plan.plan.json").read_text())
+        marker = AGENT.Path(self.harness.host["lock_path"]).with_suffix(".verified.json")
+        _json(
+            marker,
+            {"id": plan_id, "plan_sha256": sha or AGENT.fingerprint(plan), "status": "verified"},
+        )
+
+    @contextlib.contextmanager
+    def host_lock_held(self):
+        fd = os.open(self.harness.host["lock_path"], os.O_RDWR | os.O_CREAT, 0o600)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            yield
+        finally:
+            os.close(fd)
 
     def run_command(self, *mode: str):
         output = io.StringIO()
@@ -526,6 +582,46 @@ class ManualPruneCommandTests(unittest.TestCase):
                 self.assertEqual(code, 1)
                 self.assertIn("reason=previous_release_unavailable", output)
                 self.assertEqual(self.docker.calls, [])
+
+    def test_yes_refuses_when_deployer_pointer_is_ahead_of_agent_ledger(self):
+        """#910 外审 F2：代理账仍指向旧计划、部署器已推进（指针指向别的计划）→ 拒绝、零删除。"""
+        self.write_pointer("plan-c")
+        code, output = self.run_command("--yes")
+        self.assertEqual(code, 1)
+        self.assertIn("reason=deployer_pointer_mismatch", output)
+        self.assertEqual(self.docker.calls, [])
+
+    def test_yes_refuses_when_pointer_fingerprint_differs_or_is_unreadable(self):
+        self.write_pointer("old-plan", sha="f" * 64)
+        code, output = self.run_command("--yes")
+        self.assertEqual((code, self.docker.calls), (1, []))
+        self.assertIn("reason=deployer_pointer_mismatch", output)
+        AGENT.Path(self.harness.host["lock_path"]).with_suffix(".verified.json").unlink()
+        code, output = self.run_command("--yes")
+        self.assertEqual((code, self.docker.calls), (1, []))
+        self.assertIn("reason=deployer_pointer_mismatch", output)
+
+    def test_yes_refuses_when_host_lock_is_held_but_dry_run_does_not_lock(self):
+        """#910 外审 F3：手工 --yes 与部署器互斥（非阻塞）；--dry-run 不取锁。"""
+        with self.host_lock_held():
+            code, output = self.run_command("--yes")
+            self.assertEqual((code, self.docker.calls), (1, []))
+            self.assertIn("reason=host_deployment_busy", output)
+            code, _ = self.run_command("--dry-run")
+            self.assertEqual(code, 0)
+        self.assertEqual(self.docker.removed(), [])
+
+    def test_yes_refuses_while_deployer_active_marker_is_in_flight(self):
+        marker = AGENT.Path(self.harness.host["lock_path"]).with_suffix(".active.json")
+        _json(marker, {"id": "old-plan", "plan_sha256": "0" * 64, "status": "running"})
+        code, output = self.run_command("--yes")
+        self.assertEqual((code, self.docker.calls), (1, []))
+        self.assertIn("reason=deployer_active_marker", output)
+        # 部署器收口后留下的 verified 标记是常态，不拦。
+        _json(marker, {"id": "old-plan", "plan_sha256": "0" * 64, "status": "verified"})
+        code, _ = self.run_command("--yes")
+        self.assertEqual(code, 0)
+        self.assertEqual(set(self.docker.removed()), PRODUCT_OLDER)
 
     def test_first_takeover_ledger_refuses(self):
         _json(
