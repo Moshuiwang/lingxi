@@ -6,6 +6,24 @@
 
 ## [Unreleased]
 
+## [2.6.2] - 未发布
+
+维护版（Trace [#913](https://github.com/Moshuiwang/lingxi/issues/913)）：装入 [#903](https://github.com/Moshuiwang/lingxi/issues/903) / [#908](https://github.com/Moshuiwang/lingxi/issues/908) / [#909](https://github.com/Moshuiwang/lingxi/issues/909) / [#910](https://github.com/Moshuiwang/lingxi/issues/910) / [#911](https://github.com/Moshuiwang/lingxi/issues/911) 多处改动，聚焦委托凭据并发正确性、宿主维护安装安全、管理群卡片辨识与时间标注，以及生产旧镜像自动清理。
+
+### Added
+
+- **拉取代理部署成功后按名单自动清理旧版本镜像**：保留当前版、上一正式版与容器引用的镜像；只删本产品四个镜像仓库；禁用 prune；配置键 `image_prune` 缺省开启；新增 `prune-images --dry-run / --yes` 单次命令（Issue [#910](https://github.com/Moshuiwang/lingxi/issues/910)）。
+
+### Changed
+
+- **宿主维护安装遇来历不明的在位文件先停下、须逐文件显式放行**：维护包改由生成脚本产出（含 Git 历史已知版本清单）（Issue [#908](https://github.com/Moshuiwang/lingxi/issues/908)）。
+- **发到管理群的卡片标题与纯文本首行统一带 `[lingxi] ` 前缀**：个人私聊不变；旧 `[BI Plus …]` 标签改写为 `[lingxi] …` 并保留其余字样（Issue [#909](https://github.com/Moshuiwang/lingxi/issues/909)）。
+- **运行告警与宿主监控卡片时间同时显示 UTC 与北京时间**；拉取代理版本标记升至 4（Issue [#911](https://github.com/Moshuiwang/lingxi/issues/911)）。
+
+### Fixed
+
+- **委托凭据读取并发下可能返回已消费旧凭据或误删新授权凭据**（Issue [#903](https://github.com/Moshuiwang/lingxi/issues/903)）。
+
 ## [2.6.1] - 2026-09-28
 
 维护版（Trace [#898](https://github.com/Moshuiwang/lingxi/issues/898)）：候选 `v2.6.1-rc.112` 经预发验收后由 Release Promotion 发布为正式版，生产由拉取代理 + 部署器无人值守升级，产品负责人一次真实问数通过（L5）。装入 [#864](https://github.com/Moshuiwang/lingxi/issues/864) / [#891](https://github.com/Moshuiwang/lingxi/issues/891) / [#885](https://github.com/Moshuiwang/lingxi/issues/885) / [#887](https://github.com/Moshuiwang/lingxi/issues/887) / [#884](https://github.com/Moshuiwang/lingxi/issues/884) / [#889](https://github.com/Moshuiwang/lingxi/issues/889) / [#874](https://github.com/Moshuiwang/lingxi/issues/874) / [#896](https://github.com/Moshuiwang/lingxi/issues/896) 多处改动，聚焦加密依赖安全、消息与告警卡片体验统一，以及自托管数据库的备份恢复与运维健壮性。

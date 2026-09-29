@@ -25,6 +25,7 @@ from lingxi.adapters.feishu_group_message import (
     FeishuGroupMessages,
     card_uuid_prefix_for,
     delivery_uuid,
+    with_group_prefix,
 )
 from lingxi.apps.scheduler.daily_report_sections import _render_daily_report_text
 from lingxi.config import content as content_module
@@ -631,7 +632,7 @@ class AlertCardTest(unittest.TestCase):
         body = payload_text(card)
         for field in ("**类型**", "**范围**", "**次数**", "**时间**", "**追溯号**"):
             self.assertIn(field, body)
-        self.assertIn("2026\\-09\\-27 10:00:00 UTC", body)
+        self.assertIn("2026\\-09\\-27 10:00 UTC（北京 18:00）", body)
         self.assertIn("trace\\-abc", body)
         self.assertNotIn("错误类型", body)  # K-3 默认：不新增字段
 
@@ -661,7 +662,10 @@ class AlertCardTest(unittest.TestCase):
         self.assertEqual(dispatcher.run_once(at=OBSERVED), 1)
         texts = fake.sent("text")
         self.assertEqual(len(texts), 1)
-        self.assertEqual(json.loads(texts[0]["content"])["text"], alert().text)
+        self.assertEqual(
+            json.loads(texts[0]["content"])["text"],
+            with_group_prefix(alert().text),
+        )
         self.assertEqual(
             texts[0]["uuid"], delivery_uuid(CHAT_ID, "d" * 64, prefix=DELIVERY_UUID_PREFIX)
         )
@@ -756,7 +760,8 @@ class ContentOverrideCardTest(unittest.TestCase):
         self._run(_BASE, fake)
         self.assertEqual(fake.sent("interactive"), [])
         self.assertEqual(
-            [json.loads(b["content"])["text"] for b in fake.sent("text")], [self._text()]
+            [json.loads(b["content"])["text"] for b in fake.sent("text")],
+            [with_group_prefix(self._text())],
         )
 
     def test_with_the_card_key_a_read_only_card_is_sent(self) -> None:
@@ -776,7 +781,8 @@ class ContentOverrideCardTest(unittest.TestCase):
         fake = FakeFeishu(card=REJECTED)
         self._run(catalog_with_ops_cards(), fake)
         self.assertEqual(
-            [json.loads(b["content"])["text"] for b in fake.sent("text")], [self._text()]
+            [json.loads(b["content"])["text"] for b in fake.sent("text")],
+            [with_group_prefix(self._text())],
         )
 
     def test_an_unclear_result_sends_no_text_and_is_audited_as_failed(self) -> None:

@@ -22,6 +22,7 @@ from support.fake_host_maintenance import write_python, write_systemctl
 
 REPOSITORY_ROOT = Path(__file__).parents[1]
 SCRIPT = REPOSITORY_ROOT / "scripts" / "ops" / "host_maintenance_install.sh"
+BUNDLE = REPOSITORY_ROOT / "scripts" / "ops" / "build_host_maintenance_bundle.sh"
 CAND_UNIT = REPOSITORY_ROOT / "deploy" / "monitoring-units" / "lingxi-host-monitor.service"
 CAND_MON = REPOSITORY_ROOT / "scripts" / "ops" / "host_health_alert.py"
 CAND_BAK = REPOSITORY_ROOT / "scripts" / "ops" / "db_backup.sh"
@@ -32,6 +33,30 @@ DB_ARGS = " --db-container lingxi-db --db-backup-status-file /var/lib/lingxi/db-
 
 def _sha(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def _git(*args: str) -> str:
+    return subprocess.run(
+        ["git", "-C", str(REPOSITORY_ROOT), *args], capture_output=True, text=True, check=True
+    ).stdout
+
+
+def _shallow() -> bool:
+    return _git("rev-parse", "--is-shallow-repository").strip() != "false"
+
+
+def _historic_versions(repo_path: str, current: Path) -> list[bytes]:
+    """该文件在本仓 Git 历史中出现过、且内容不同于当前版本的各个版本（新到旧）。"""
+    out = []
+    for commit in _git("log", "--follow", "--format=%H", "--", repo_path).split():
+        blob = subprocess.run(
+            ["git", "-C", str(REPOSITORY_ROOT), "show", f"{commit}:{repo_path}"],
+            capture_output=True,
+            check=False,
+        )
+        if blob.returncode == 0 and blob.stdout != current.read_bytes() and blob.stdout not in out:
+            out.append(blob.stdout)
+    return out
 
 
 def _old_unit(*, user: str | None, handmade: bool = False) -> str:
@@ -83,7 +108,7 @@ class HostMaintenanceFakeRootTest(unittest.TestCase):
         # 输入目录：脚本本身 + 三份仓库文件 + 清单
         for src in (SCRIPT, CAND_UNIT, CAND_MON, CAND_BAK):
             shutil.copy2(src, self.inputs / src.name)
-        self.write_manifest()
+        self.write_known()
         # 在位现场：旧单元本体 + 三份 drop-in + 旧脚本 + 备份单元 + 定时器 active
         self.unit_dir = self.root / "etc" / "systemd" / "system"
         self.dropin_dir = self.unit_dir / "lingxi-host-monitor.service.d"
@@ -124,7 +149,7 @@ class HostMaintenanceFakeRootTest(unittest.TestCase):
             (self.dumps / name).write_text("x", encoding="utf-8")
             (self.dumps / name).chmod(mode)
         self.targets = [self.frag, self.py_dropin, self.mon, self.bak]
-        self.before = self.snapshot()
+        self.reset_before()
 
     def tearDown(self) -> None:
         self._tmp.cleanup()
@@ -134,8 +159,37 @@ class HostMaintenanceFakeRootTest(unittest.TestCase):
         contract.parent.mkdir(parents=True, exist_ok=True)
         contract.write_text(json.dumps({"schema": 1, "environment": environment}), encoding="utf-8")
 
+    def write_known(self, extra: tuple[tuple[str, str], ...] = ()) -> None:
+        """已知版本清单：三份目标各自的 sha + 假根里旧脚本的 sha（模拟 Git 历史里出现过）+ extra。"""
+        rows = [
+            (_sha(CAND_UNIT), "lingxi-host-monitor.service"),
+            (_sha(CAND_MON), "host_health_alert.py"),
+            (_sha(CAND_BAK), "db_backup.sh"),
+            (hashlib.sha256("# 旧版巡检脚本\n".encode()).hexdigest(), "host_health_alert.py"),
+            # 预发在位的旧单元本体（F17 之前的仓库版）也是 Git 历史里出现过的已知版本
+            (
+                hashlib.sha256(_old_unit(user="deployer").encode()).hexdigest(),
+                "lingxi-host-monitor.service",
+            ),
+            (
+                hashlib.sha256(b"#!/usr/bin/env bash\necho old-backup\n").hexdigest(),
+                "db_backup.sh",
+            ),
+            *extra,
+        ]
+        (self.inputs / "KNOWN_SHAS").write_text(
+            "".join(f"{sha}  {name}\n" for sha, name in rows), encoding="utf-8"
+        )
+        self.write_manifest()
+
     def write_manifest(self) -> None:
-        names = ("lingxi-host-monitor.service", "host_health_alert.py", "db_backup.sh", SCRIPT.name)
+        names = (
+            "lingxi-host-monitor.service",
+            "host_health_alert.py",
+            "db_backup.sh",
+            SCRIPT.name,
+            "KNOWN_SHAS",
+        )
         text = "".join(f"{_sha(self.inputs / n)}  {n}\n" for n in names)
         (self.inputs / "SHA256SUMS").write_text(text, encoding="utf-8")
 
@@ -180,10 +234,21 @@ class HostMaintenanceFakeRootTest(unittest.TestCase):
     def assert_ok(self, result: subprocess.CompletedProcess[str]) -> None:
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
+    def reset_before(self) -> None:
+        self.before = self.snapshot()
+        self.before_mtimes = self.mtimes()
+
+    def mtimes(self) -> dict[str, int]:
+        return {str(p): p.stat().st_mtime_ns for p in sorted(self.root.rglob("*")) if p.is_file()}
+
     def assert_refused(self, result: subprocess.CompletedProcess[str], needle: str) -> None:
         self.assertNotEqual(result.returncode, 0, result.stdout)
         self.assertIn(needle, result.stdout + result.stderr)
         self.assertEqual(self.snapshot(), self.before, "拒绝时假根不得有任何改动")
+        self.assertEqual(self.mtimes(), self.before_mtimes, "拒绝时任何文件的修改时间都不得变")
+        self.assertFalse(
+            (self.root / "root" / "lingxi-884-backup").exists(), "拒绝时不得产生备份目录"
+        )
 
     def assert_installed(self) -> None:
         self.assertEqual(_sha(self.frag), _sha(CAND_UNIT))
@@ -202,6 +267,159 @@ class HostMaintenanceFakeRootTest(unittest.TestCase):
         for t in self.targets:
             self.assertEqual(now.get(str(t)), self.before[str(t)], f"{t} 未逐字节回到安装前")
 
+    # ---------------- 来历判定（#908） ----------------
+
+    def make_bundle(self, name: str = "bundle") -> Path:
+        out = Path(self._tmp.name) / name
+        result = subprocess.run(
+            ["bash", str(BUNDLE), "--out", str(out)], capture_output=True, text=True, check=False
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        return out
+
+    def test_bundle_contains_known_list_registered_in_manifest(self) -> None:
+        if _shallow():
+            self.skipTest("浅克隆没有完整历史，维护包生成脚本会拒绝")
+        out = self.make_bundle()
+        for name in (
+            "host_maintenance_install.sh",
+            "lingxi-host-monitor.service",
+            "host_health_alert.py",
+            "db_backup.sh",
+            "KNOWN_SHAS",
+            "SHA256SUMS",
+        ):
+            self.assertTrue((out / name).is_file(), name)
+        manifest = (out / "SHA256SUMS").read_text(encoding="utf-8")
+        self.assertIn(f"{_sha(out / 'KNOWN_SHAS')}  KNOWN_SHAS", manifest)
+        known = (out / "KNOWN_SHAS").read_text(encoding="utf-8")
+        for name in ("lingxi-host-monitor.service", "host_health_alert.py", "db_backup.sh"):
+            self.assertIn(f"{_sha(out / name)}  {name}", known, "目标版本自己也在已知清单里")
+        # 历史里出现过的旧版都在清单里
+        for repo_path, name in (
+            ("scripts/ops/host_health_alert.py", "host_health_alert.py"),
+            ("scripts/ops/db_backup.sh", "db_backup.sh"),
+        ):
+            for old in _historic_versions(repo_path, out / name):
+                self.assertIn(f"{hashlib.sha256(old).hexdigest()}  {name}", known)
+        # 生成物能被安装脚本的清单校验通过
+        result = subprocess.run(
+            ["sha256sum", "-c", "SHA256SUMS"], cwd=out, capture_output=True, text=True, check=False
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    def test_bundle_refuses_non_empty_output_dir(self) -> None:
+        out = Path(self._tmp.name) / "occupied"
+        out.mkdir()
+        (out / "x").write_text("x", encoding="utf-8")
+        result = subprocess.run(
+            ["bash", str(BUNDLE), "--out", str(out)], capture_output=True, text=True, check=False
+        )
+        self.assertNotEqual(result.returncode, 0)
+
+    def test_known_old_versions_from_git_history_upgrade(self) -> None:
+        """在位是本仓 Git 历史里的真实旧版（巡检脚本与备份脚本）→ 已知旧版 → 升级并装到目标。"""
+        if _shallow():
+            self.skipTest("浅克隆没有完整历史")
+        old_mon = _historic_versions("scripts/ops/host_health_alert.py", CAND_MON)
+        old_bak = _historic_versions("scripts/ops/db_backup.sh", CAND_BAK)
+        self.assertTrue(old_mon and old_bak, "历史里应有不同于当前的旧版")
+        self.mon.write_bytes(old_mon[-1])
+        self.bak.write_bytes(old_bak[-1])
+        shutil.copy2(self.make_bundle() / "KNOWN_SHAS", self.inputs / "KNOWN_SHAS")
+        # 假根里的旧单元本体是合成的（真实历史里没有这份），并入清单以免本用例被单元本体来历判定拦下
+        with (self.inputs / "KNOWN_SHAS").open("a", encoding="utf-8") as fh:
+            fh.write(f"{_sha(self.frag)}  lingxi-host-monitor.service\n")
+        self.write_manifest()
+        self.reset_before()
+        checked = self.run_script("check")
+        self.assert_ok(checked)
+        self.assertEqual(checked.stdout.count("是已知旧版 → 升级"), 2, checked.stdout)
+        self.assertEqual(self.snapshot(), self.before)
+        result = self.run_script("apply", "--yes")
+        self.assert_ok(result)
+        self.assertIn("是已知旧版 → 升级", result.stdout)
+        self.assert_installed()
+
+    def test_target_versions_are_already(self) -> None:
+        self.mon.write_bytes(CAND_MON.read_bytes())
+        self.bak.write_bytes(CAND_BAK.read_bytes())
+        self.reset_before()
+        result = self.run_script("check")
+        self.assert_ok(result)
+        self.assertEqual(result.stdout.count("= 目标 → already"), 2, result.stdout)
+
+    def test_unknown_monitor_script_refused_and_apply_writes_nothing(self) -> None:
+        self.mon.write_text("# 有人手改过\n", encoding="utf-8")
+        self.reset_before()
+        sha = _sha(self.mon)
+        self.assert_refused(self.run_script("check"), "来历不明")
+        result = self.run_script("check")
+        self.assertIn(f"host_health_alert.py sha={sha}", result.stdout)
+        self.assertIn(f"--accept-unknown host_health_alert.py={sha}", result.stdout)
+        self.assert_refused(self.run_script("apply", "--yes"), "来历不明")
+
+    def test_unknown_backup_script_refused_and_apply_writes_nothing(self) -> None:
+        self.bak.write_text("#!/usr/bin/env bash\necho 手改\n", encoding="utf-8")
+        self.reset_before()
+        self.assert_refused(self.run_script("check"), "备份脚本在位文件 db_backup.sh")
+        self.assert_refused(self.run_script("apply", "--yes"), "来历不明")
+
+    def test_accept_unknown_with_wrong_sha_still_refused(self) -> None:
+        self.mon.write_text("# 有人手改过\n", encoding="utf-8")
+        self.reset_before()
+        wrong = "0" * 64
+        self.assert_refused(
+            self.run_script("apply", "--yes", "--accept-unknown", f"host_health_alert.py={wrong}"),
+            "来历不明",
+        )
+        # 别的文件名 + 对的 sha 同样不放行
+        self.assert_refused(
+            self.run_script("apply", "--yes", "--accept-unknown", f"db_backup.sh={_sha(self.mon)}"),
+            "来历不明",
+        )
+
+    def test_accept_unknown_with_exact_sha_installs_and_records(self) -> None:
+        self.mon.write_text("# 有人手改过\n", encoding="utf-8")
+        self.reset_before()
+        arg = f"host_health_alert.py={_sha(self.mon)}"
+        checked = self.run_script("check", "--accept-unknown", arg)
+        self.assert_ok(checked)
+        self.assertIn("放行", checked.stdout)
+        self.assertEqual(self.snapshot(), self.before, "check 零写入")
+        result = self.run_script("apply", "--accept-unknown", arg, "--yes")
+        self.assert_ok(result)
+        self.assertIn(f"按 --accept-unknown {arg} 放行", result.stdout)
+        self.assert_installed()
+
+    def test_accept_unknown_repeatable_for_both_scripts(self) -> None:
+        self.mon.write_text("# 手改一\n", encoding="utf-8")
+        self.bak.write_text("#!/usr/bin/env bash\necho 手改二\n", encoding="utf-8")
+        self.reset_before()
+        result = self.run_script(
+            "apply",
+            "--yes",
+            "--accept-unknown",
+            f"host_health_alert.py={_sha(self.mon)}",
+            "--accept-unknown",
+            f"db_backup.sh={_sha(self.bak)}",
+        )
+        self.assert_ok(result)
+        self.assert_installed()
+
+    def test_missing_known_list_refused_without_fallback(self) -> None:
+        (self.inputs / "KNOWN_SHAS").unlink()
+        self.assert_refused(self.run_script("check"), "缺已知版本清单")
+
+    def test_tampered_known_list_refused(self) -> None:
+        with (self.inputs / "KNOWN_SHAS").open("a", encoding="utf-8") as fh:
+            fh.write(f"{_sha(self.mon)}  host_health_alert.py\n")
+        self.assert_refused(self.run_script("check"), "KNOWN_SHAS 在位 sha")
+
+    def test_unknown_argument_rejected(self) -> None:
+        result = self.run_script("check", "--bogus")
+        self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+
     # ---------------- check：零写入 + 前提拒绝 ----------------
 
     def test_check_passes_and_writes_nothing(self) -> None:
@@ -218,7 +436,7 @@ class HostMaintenanceFakeRootTest(unittest.TestCase):
 
     def test_refuses_missing_injection_link(self) -> None:
         (self.root / "opt" / "lingxi" / "bin" / "python3").unlink()
-        self.before = self.snapshot()
+        self.reset_before()
         self.assert_refused(
             self.run_script("apply", "--yes"), "注入点 /opt/lingxi/bin/python3 不存在"
         )
@@ -228,7 +446,7 @@ class HostMaintenanceFakeRootTest(unittest.TestCase):
         target = link.resolve()
         link.unlink()
         shutil.copy2(target, link)
-        self.before = self.snapshot()
+        self.reset_before()
         self.assert_refused(self.run_script("check"), "不是链接")
 
     def test_refuses_input_not_matching_manifest(self) -> None:
@@ -240,7 +458,7 @@ class HostMaintenanceFakeRootTest(unittest.TestCase):
 
     def test_refuses_unexpected_unit_diff(self) -> None:
         self.frag.write_text(_old_unit(user="deployer") + "Restart=on-failure\n", encoding="utf-8")
-        self.before = self.snapshot()
+        self.reset_before()
         self.assert_refused(self.run_script("apply", "--yes"), "意外差异")
 
     def test_refuses_candidate_that_cannot_import_under_injection_point(self) -> None:
@@ -252,7 +470,7 @@ class HostMaintenanceFakeRootTest(unittest.TestCase):
             "[Service]\nExecStart=\nExecStart=/usr/bin/python3 " + ARGS + DB_ARGS + "\n",
             encoding="utf-8",
         )
-        self.before = self.snapshot()
+        self.reset_before()
         self.assert_refused(self.run_script("apply", "--yes"), "不走注入点")
 
     def test_apply_requires_yes(self) -> None:
@@ -294,7 +512,7 @@ class HostMaintenanceFakeRootTest(unittest.TestCase):
     def test_restore_removes_target_that_did_not_exist_before(self) -> None:
         """在位巡检脚本原本不存在：装上后下一轮失败，回装须把它删掉而不是留下新版。"""
         self.mon.unlink()
-        self.before = self.snapshot()
+        self.reset_before()
         (self.state / "rounds.txt").write_text("success 0\nexit-code 1\n", encoding="utf-8")
         result = self.run_script("apply", "--yes")
         self.assertNotEqual(result.returncode, 0, result.stdout)
@@ -429,7 +647,7 @@ class HostMaintenanceFakeRootTest(unittest.TestCase):
             + "/opt/lingxi/release-pull/host-contract.json\n",
             encoding="utf-8",
         )
-        self.before = self.snapshot()
+        self.reset_before()
         return real
 
     def test_contract_path_from_release_pull_effective_execstart(self) -> None:
@@ -451,11 +669,47 @@ class HostMaintenanceFakeRootTest(unittest.TestCase):
         self.assert_refused(result, "来源=环境变量 LINGXI_S30_HOST_CONTRACT")
         self.assert_ok(self.run_script("check", LINGXI_S30_HOST_CONTRACT=str(real)))
 
+    def test_stage_hand_edited_unit_body_needs_accept_unknown(self) -> None:
+        """#910 外审 F4：预发在位单元本体也做来历判定；手改过（不在已知清单）→ 拒绝，逐 sha 放行后通过。"""
+        if self.environment != "stage":
+            self.skipTest("预发专属；生产的单元本体来历由既有钉版 sha + 已知清单判定")
+        self.frag.write_text(_old_unit(user="deployer", handmade=True), encoding="utf-8")
+        self.reset_before()
+        arg = f"lingxi-host-monitor.service={_sha(self.frag)}"
+        refused = self.run_script("check")
+        self.assert_refused(refused, "预发在位单元本体 sha=")
+        self.assertIn("来历不明（不是目标、不在已知版本清单）", refused.stdout)
+        self.assertIn(f"--accept-unknown {arg}", refused.stdout)
+        self.assert_refused(self.run_script("apply", "--yes"), "来历不明")
+        wrong = "lingxi-host-monitor.service=" + "0" * 64
+        self.assert_refused(self.run_script("check", "--accept-unknown", wrong), "来历不明")
+        checked = self.run_script("check", "--accept-unknown", arg)
+        self.assert_ok(checked)
+        self.assertIn(f"按 --accept-unknown {arg} 放行", checked.stdout)
+        self.assertEqual(self.snapshot(), self.before, "check 零写入")
+        result = self.run_script("apply", "--accept-unknown", arg, "--yes")
+        self.assert_ok(result)
+        self.assert_installed()
+
+    def test_stage_unit_already_target_is_not_provenance_checked(self) -> None:
+        """预发在位单元本体已是目标版：不进来历判定（不会被拦）。"""
+        if self.environment != "stage":
+            self.skipTest("预发专属")
+        self.frag.write_bytes(CAND_UNIT.read_bytes())
+        self.py_dropin.unlink()
+        self.reset_before()
+        self.assert_ok(self.run_script("check"))
+
     def test_handmade_descriptive_keys_are_allowed_and_printed(self) -> None:
         user = "deployer" if self.environment == "stage" else None
         self.frag.write_text(_old_unit(user=user, handmade=True), encoding="utf-8")
-        self.before = self.snapshot()
-        result = self.run_script("check")
+        self.reset_before()
+        accept = (
+            ("--accept-unknown", f"lingxi-host-monitor.service={_sha(self.frag)}")
+            if self.environment == "stage"
+            else ()
+        )
+        result = self.run_script("check", *accept)
         self.assert_ok(result)
         self.assertIn("[本体差异] StandardOutput：append:/var/log/hm.log → （无）", result.stdout)
         self.assertIn(
@@ -468,7 +722,7 @@ class HostMaintenanceFakeRootTest(unittest.TestCase):
         if self.environment != "stage":
             self.skipTest("预发专属")
         self.local_conf.unlink()
-        self.before = self.snapshot()
+        self.reset_before()
         result = self.run_script("apply", "--yes")
         self.assert_ok(result)
         self.assert_installed()
@@ -484,7 +738,7 @@ class HostMaintenanceFakeRootTest(unittest.TestCase):
         if self.environment != "stage":
             self.skipTest("预发专属")
         self.local_conf.unlink()
-        self.before = self.snapshot()
+        self.reset_before()
         (self.state / "rounds.txt").write_text("exit-code 1\n", encoding="utf-8")
         result = self.run_script("apply", "--yes")
         self.assertNotEqual(result.returncode, 0, result.stdout)
@@ -504,7 +758,7 @@ class HostMaintenanceFakeRootTest(unittest.TestCase):
         (self.dropin_dir / "10-local.conf").write_text(
             "[Service]\nUser=someone-else\n", encoding="utf-8"
         )
-        self.before = self.snapshot()
+        self.reset_before()
         self.assert_refused(self.run_script("check"), "10-local.conf 不同值")
 
 
@@ -516,7 +770,7 @@ class HostMaintenanceProductionTest(HostMaintenanceFakeRootTest):
     def setUp(self) -> None:
         super().setUp()
         self.frag.write_text(_old_unit(user=None), encoding="utf-8")
-        self.before = self.snapshot()
+        self.reset_before()
 
     def script_env(self, **env_extra: str) -> dict[str, str]:
         env_extra.setdefault(
@@ -526,18 +780,18 @@ class HostMaintenanceProductionTest(HostMaintenanceFakeRootTest):
 
     def test_refuses_unexpected_unit_diff(self) -> None:
         self.frag.write_text(_old_unit(user=None) + "Restart=on-failure\n", encoding="utf-8")
-        self.before = self.snapshot()
+        self.reset_before()
         self.assert_refused(self.run_script("apply", "--yes"), "意外差异")
 
     def test_production_refuses_body_user_line(self) -> None:
         self.frag.write_text(_old_unit(user="deployer"), encoding="utf-8")
-        self.before = self.snapshot()
+        self.reset_before()
         self.assert_refused(self.run_script("check"), "生产在位单元本体含 User=")
 
     def test_production_body_user_without_local_dropin_still_refused(self) -> None:
         self.frag.write_text(_old_unit(user="deployer"), encoding="utf-8")
         self.local_conf.unlink()
-        self.before = self.snapshot()
+        self.reset_before()
         self.assert_refused(self.run_script("apply", "--yes"), "生产在位单元本体含 User=")
 
     def test_routine_dump_dir_follows_deploy_user_when_unit_has_no_user(self) -> None:
@@ -577,10 +831,111 @@ class HostMaintenanceProductionTest(HostMaintenanceFakeRootTest):
     def test_same_body_user_is_accepted_on_stage_only(self) -> None:
         """同一份「本体带 User=」现场：预发契约下放行、生产契约下拒绝。"""
         self.frag.write_text(_old_unit(user="deployer"), encoding="utf-8")
-        self.before = self.snapshot()
+        self.reset_before()
         self.assert_refused(self.run_script("check"), "生产在位单元本体含 User=")
         self.write_contract("stage")
         self.assert_ok(self.run_script("check"))
+
+
+class BundleKnownFromMainTest(unittest.TestCase):
+    """#908 修复：release/* 由 squash 同步，已知版本清单须并入 main 历史（生成脚本的 ``--known-from``）。"""
+
+    PATHS = {
+        "host_maintenance_install.sh": "scripts/ops/host_maintenance_install.sh",
+        "lingxi-host-monitor.service": "deploy/monitoring-units/lingxi-host-monitor.service",
+        "host_health_alert.py": "scripts/ops/host_health_alert.py",
+        "db_backup.sh": "scripts/ops/db_backup.sh",
+    }
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory(prefix="lingxi-908-known-")
+        self.addCleanup(self._tmp.cleanup)
+        self.repo = Path(self._tmp.name) / "repo"
+        (self.repo / "scripts" / "ops").mkdir(parents=True)
+        shutil.copy2(BUNDLE, self.repo / "scripts" / "ops" / BUNDLE.name)
+        self.env = {
+            **os.environ,
+            "GIT_AUTHOR_NAME": "t",
+            "GIT_AUTHOR_EMAIL": "t@example.invalid",
+            "GIT_COMMITTER_NAME": "t",
+            "GIT_COMMITTER_EMAIL": "t@example.invalid",
+        }
+        self.git("init", "-q", "-b", "main")
+        self.commit("v1", monitor="monitor-v1")  # 两条历史的共同祖先
+        self.commit(
+            "main-only", monitor="monitor-main-only"
+        )  # main 上的中间版本（如已上生产的 #907）
+        self.git("checkout", "-q", "-b", "release", "HEAD~1")
+        self.commit(
+            "squash-sync", monitor="monitor-final"
+        )  # squash 形：release 历史里没有 main-only
+        self.git("checkout", "-q", "main")
+
+    def git(self, *args: str) -> str:
+        return subprocess.run(
+            ["git", "-C", str(self.repo), *args],
+            capture_output=True,
+            text=True,
+            check=True,
+            env=self.env,
+        ).stdout
+
+    def commit(self, message: str, *, monitor: str) -> None:
+        for name, repo_path in self.PATHS.items():
+            target = self.repo / repo_path
+            target.parent.mkdir(parents=True, exist_ok=True)
+            if name != "host_maintenance_install.sh":
+                target.write_text(
+                    monitor if name == "host_health_alert.py" else name, encoding="utf-8"
+                )
+            else:
+                target.write_text("#!/bin/sh\n", encoding="utf-8")
+        self.git("add", "-A")
+        self.git("commit", "-q", "-m", message)
+
+    def build(self, *args: str) -> subprocess.CompletedProcess[str]:
+        out = Path(self._tmp.name) / f"out-{len(list(Path(self._tmp.name).glob('out-*')))}"
+        result = subprocess.run(
+            ["bash", str(self.repo / "scripts" / "ops" / BUNDLE.name), "--out", str(out), *args],
+            capture_output=True,
+            text=True,
+            check=False,
+            env=self.env,
+        )
+        result.out = out  # type: ignore[attr-defined]
+        return result
+
+    @staticmethod
+    def monitor_line(text: str) -> str:
+        return f"{hashlib.sha256(text.encode()).hexdigest()}  host_health_alert.py"
+
+    def test_release_ref_bundle_includes_main_only_versions(self) -> None:
+        """--ref 取 squash 形 release：清单仍含 main 独有版本（缺省来源取本地 main）；输出打印两个来源与条数。"""
+        result = self.build("--ref", "release")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        known = (result.out / "KNOWN_SHAS").read_text(encoding="utf-8")  # type: ignore[attr-defined]
+        for version in ("monitor-v1", "monitor-main-only", "monitor-final"):
+            self.assertIn(self.monitor_line(version), known, version)
+        self.assertIn("已知版本来源：release 历史", result.stdout)
+        self.assertIn("main 历史", result.stdout)
+
+    def test_explicit_known_from_is_used(self) -> None:
+        self.git("branch", "-m", "main", "trunk")
+        self.assertNotEqual(self.build("--ref", "release").returncode, 0)
+        result = self.build("--ref", "release", "--known-from", "trunk")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        known = (result.out / "KNOWN_SHAS").read_text(encoding="utf-8")  # type: ignore[attr-defined]
+        self.assertIn(self.monitor_line("monitor-main-only"), known)
+
+    def test_missing_main_history_fails_instead_of_degrading(self) -> None:
+        self.git("branch", "-m", "main", "trunk")
+        result = self.build("--ref", "release")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("取不到 main 历史", result.stderr)
+        self.assertFalse((result.out / "KNOWN_SHAS").exists())  # type: ignore[attr-defined]
+        bad = self.build("--ref", "release", "--known-from", "no-such-ref")
+        self.assertNotEqual(bad.returncode, 0)
+        self.assertIn("找不到 --known-from", bad.stderr)
 
 
 if __name__ == "__main__":

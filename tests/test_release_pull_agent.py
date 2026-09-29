@@ -3491,7 +3491,8 @@ class AlertNoticeSendSemanticsTests(unittest.TestCase):
         self.assertEqual(fake.message_types(), ["interactive", "text"])
         self.assertEqual(
             json.loads(fake.bodies[2]["content"])["text"],
-            str(AGENT._alert_message(self.HOST, "v2.6.1", "deploy", "failed", "p1")),
+            # #909：回落纯文本首行加项目名前缀，其余与正文逐字相同。
+            "[lingxi] " + str(AGENT._alert_message(self.HOST, "v2.6.1", "deploy", "failed", "p1")),
         )
         self.assertTrue(record["sent"])
 
