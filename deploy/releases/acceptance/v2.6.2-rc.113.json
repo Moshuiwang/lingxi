@@ -1,0 +1,12 @@
+{
+  "candidate_tag": "v2.6.2-rc.113",
+  "evidence_url": "https://github.com/Moshuiwang/lingxi/issues/913#issuecomment-5885915597",
+  "manifest_sha256": "2099c08125a1dfa4ee125a2cce7bbdf619d06ff892142796c6ef7c808eac0b20",
+  "recovery": {
+    "evidence_url": "https://github.com/Moshuiwang/lingxi/issues/913#issuecomment-5885915597",
+    "instructions": "v2.6.2 → v2.6.1 回退；任何生产回滚动作属显式除外，须产品负责人单独请示与亲跑。一、镜像层：路径一（部署器，优先）按 deploy/拉取代理.md §五与 deploy/releases/README.md「固定计划与一次批准」另存 operation=recover、引用本次 v2.6.2 部署计划的恢复计划并独立批准，以 /opt/lingxi/bin/python3 -B <控制包内 lingxi_deploy.py> recover 执行（recovery.target_manifest_sha256 = v2.6.1 正式版 Release 附件 release-manifest.json 的 sha256 7ec6a17331b8bbd3cd97ffac6c6f2a38c96ef28f62df108d9b92567c4f8bee8f）；路径二（手工）：用 v2.6.1 正式版清单的四镜像 digest 按部署器为 v2.6.1 计划渲染保存的 compose 与公开配置重起三服务。v2.6.1 四镜像是本版自动清理的保留集（上一正式版），回退前先 docker image inspect 按摘要确认在位，缺失则按 deploy/数据库迁移runbook.md 按摘要重拉。二、数据库层：本版无迁移，迁移头仍为 0099_drop_shell_platform_admin，v2.6.1 镜像可直接运行，无需库回退。三、拉取代理：本版代理版本标记 4 已自替换，只升不降——镜像回滚不回退代理；如需回退代理，用同目录留存的 <代理文件名>.bak-<旧摘要前 8 位> 原子换回；如需只关自动清理，在代理配置写 image_prune=false。四、宿主维护：同一脚本 scripts/ops/host_maintenance_install.sh restore --yes 按 /root/lingxi-884-backup/<时间戳> 逐字节还原单元本体、drop-in、巡检脚本与备份脚本。",
+    "previous_tag": "v2.6.1"
+  },
+  "result": "passed",
+  "schema": 1
+}
