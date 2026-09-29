@@ -61,18 +61,25 @@ TEXT_UUID_PREFIX_HEAD = "lingxi-"
 CARD_UUID_PREFIX_HEAD = "lxcard-"
 #: 管理群消息统一带的项目名前缀；只加在发往管理群的消息上，个人私聊不经本出口。
 GROUP_TITLE_PREFIX = "[lingxi] "
-_LEGACY_LABEL_PATTERN = re.compile(r"^\[BI Plus[^\]\n]*\]\s*")
+_LEGACY_LABEL_PATTERN = re.compile(r"^\[BI Plus\s*([^\]\n]*)\]\s*")
 SendOutcomeCallback = Callable[[str, bool], None]
+
+
+def _keep_label(match: re.Match[str]) -> str:
+    """旧标签去掉 ``BI Plus`` 与方括号，保留其余字样（如「运行告警」）并与后文隔一个空格。"""
+    label = match.group(1).strip()
+    return f"{label} " if label else ""
 
 
 def with_group_prefix(text: str) -> str:
     """给管理群消息的标题或首行加 ``[lingxi] `` 前缀；已带则原样返回（幂等）。
 
-    首行以旧标签 ``[BI Plus …]`` 开头的先去掉该标签再加前缀，避免出现两层方括号。
+    首行以旧标签 ``[BI Plus …]`` 开头的，去掉 ``BI Plus`` 与方括号、保留标签内其余字样，
+    避免出现两层方括号。
     """
     if text.startswith(GROUP_TITLE_PREFIX):
         return text
-    return GROUP_TITLE_PREFIX + _LEGACY_LABEL_PATTERN.sub("", text, count=1)
+    return GROUP_TITLE_PREFIX + _LEGACY_LABEL_PATTERN.sub(_keep_label, text, count=1)
 
 
 def delivery_uuid(chat_id: str, dedupe_key: str, *, prefix: str = DELIVERY_UUID_PREFIX) -> str:

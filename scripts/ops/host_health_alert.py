@@ -275,19 +275,25 @@ def escape_markdown(value: object) -> str:
 
 
 GROUP_TITLE_PREFIX = "[lingxi] "
-_LEGACY_LABEL_PATTERN = re.compile(r"^\[BI Plus[^\]\n]*\]\s*")
+_LEGACY_LABEL_PATTERN = re.compile(r"^\[BI Plus\s*([^\]\n]*)\]\s*")
 _BEIJING_OFFSET = timedelta(hours=8)
 
 
+def _keep_label(match: re.Match[str]) -> str:
+    """旧标签去掉 ``BI Plus`` 与方括号，保留其余字样（如「运行告警」）并与后文隔一个空格。"""
+    label = match.group(1).strip()
+    return f"{label} " if label else ""
+
+
 def with_group_prefix(text: str) -> str:
-    """管理群消息标题或首行统一带 ``[lingxi] ``；已带则不叠加，旧 ``[BI Plus …]`` 标签被替换。
+    """管理群消息标题或首行统一带 ``[lingxi] ``；已带则不叠加，旧 ``[BI Plus …]`` 标签改写为保留内部字样的形式。
 
     与镜像内 `lingxi.adapters.feishu_group_message.with_group_prefix` 同口径；本脚本
     在镜像外独立运行，故自带一份。
     """
     if text.startswith(GROUP_TITLE_PREFIX):
         return text
-    return GROUP_TITLE_PREFIX + _LEGACY_LABEL_PATTERN.sub("", text, count=1)
+    return GROUP_TITLE_PREFIX + _LEGACY_LABEL_PATTERN.sub(_keep_label, text, count=1)
 
 
 def format_utc_with_beijing(moment: datetime) -> str:

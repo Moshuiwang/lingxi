@@ -55,11 +55,14 @@ class GroupPrefixTests(unittest.TestCase):
     def test_prefix_function(self) -> None:
         self.assertEqual(with_group_prefix("内测每日通报"), "[lingxi] 内测每日通报")
         self.assertEqual(
-            with_group_prefix("[BI Plus 运行告警] 故障\n类型：x"), "[lingxi] 故障\n类型：x"
+            with_group_prefix("[BI Plus 运行告警] 故障\n类型：x"), "[lingxi] 运行告警 故障\n类型：x"
         )
         self.assertEqual(with_group_prefix("[lingxi] 已带"), "[lingxi] 已带")
+        self.assertEqual(with_group_prefix("[BI Plus] 后文"), "[lingxi] 后文")
+        self.assertEqual(with_group_prefix("[BI Plus 资源监控] 告警"), "[lingxi] 资源监控 告警")
         self.assertEqual(
-            with_group_prefix(with_group_prefix("[BI Plus 宿主监控] 恢复")), "[lingxi] 恢复"
+            with_group_prefix(with_group_prefix("[BI Plus 宿主监控] 恢复")),
+            "[lingxi] 宿主监控 恢复",
         )
 
     def test_card_title_prefixed_and_not_stacked(self) -> None:
@@ -75,14 +78,16 @@ class GroupPrefixTests(unittest.TestCase):
     def test_text_and_rejected_card_fallback_prefixed(self) -> None:
         transport = _Transport()
         _sender(transport).send_text(chat_id="oc_1", text="[BI Plus 运行告警] 故障", dedupe_key="k")
-        self.assertEqual(json.loads(transport.messages[0]["content"])["text"], "[lingxi] 故障")
+        self.assertEqual(
+            json.loads(transport.messages[0]["content"])["text"], "[lingxi] 运行告警 故障"
+        )
         transport = _Transport(card_response=_REJECTED)
         _sender(transport).send_notice(
             chat_id="oc_1", card=_card("标题", "[BI Plus 运行告警] 故障\n类型：x"), dedupe_key="k2"
         )
         self.assertEqual([m["msg_type"] for m in transport.messages], ["interactive", "text"])
         self.assertEqual(
-            json.loads(transport.messages[1]["content"])["text"], "[lingxi] 故障\n类型：x"
+            json.loads(transport.messages[1]["content"])["text"], "[lingxi] 运行告警 故障\n类型：x"
         )
 
     def test_private_notice_title_unchanged(self) -> None:

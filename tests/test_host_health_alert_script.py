@@ -252,8 +252,9 @@ class GroupTitlePrefixTests(unittest.TestCase):
     def test_prefix_rewrite_and_idempotence(self) -> None:
         f = host_health_alert.with_group_prefix
         self.assertEqual(f("宿主监控告警：x"), "[lingxi] 宿主监控告警：x")
-        self.assertEqual(f("[BI Plus 资源监控] 告警\n主机：h"), "[lingxi] 告警\n主机：h")
-        self.assertEqual(f(f("[BI Plus 宿主监控] 恢复")), "[lingxi] 恢复")
+        self.assertEqual(f("[BI Plus 资源监控] 告警\n主机：h"), "[lingxi] 资源监控 告警\n主机：h")
+        self.assertEqual(f(f("[BI Plus 宿主监控] 恢复")), "[lingxi] 宿主监控 恢复")
+        self.assertEqual(f("[BI Plus] 后文"), "[lingxi] 后文")
         self.assertEqual(f("[lingxi] 已带"), "[lingxi] 已带")
 
     def test_send_prefixes_card_without_mutating_input(self) -> None:
@@ -2206,7 +2207,7 @@ class NoticeSendSemanticsTests(unittest.TestCase):
         self.assertEqual(self._run_with(fake), 0)
         self.assertEqual(fake.message_types(), ["interactive", "text"])
         text = json.loads(fake.bodies[2]["content"])["text"]
-        self.assertTrue(text.startswith("[lingxi] 告警\n"))
+        self.assertTrue(text.startswith("[lingxi] 宿主监控 告警\n"))
         self.assertNotIn("[BI Plus", text)
         self.assertTrue(host_health_alert.load_state(self.state_path)["target-container"].alerting)
 
