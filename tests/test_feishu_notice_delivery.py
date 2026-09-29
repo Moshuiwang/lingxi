@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import json
 import unittest
+from dataclasses import replace
 
 from lingxi.adapters.feishu_group_message import (
     DAILY_REPORT_UUID_PREFIX,
@@ -22,6 +23,7 @@ from lingxi.adapters.feishu_group_message import (
     FeishuGroupMessages,
     card_uuid_prefix_for,
     delivery_uuid,
+    with_group_prefix,
 )
 from lingxi.adapters.feishu_user_message import (
     NOTICE_UUID_PREFIX,
@@ -128,7 +130,10 @@ class GroupSendNoticeTest(unittest.TestCase):
         _send_group(fake, outcomes=outcomes)
         [card_body] = fake.sent("interactive")
         self.assertEqual(fake.sent("text"), [])
-        self.assertEqual(json.loads(card_body["content"]), CARD.to_payload())
+        self.assertEqual(
+            json.loads(card_body["content"]),
+            replace(CARD, title=with_group_prefix(CARD.title)).to_payload(),
+        )
         self.assertEqual(
             card_body["uuid"],
             delivery_uuid(
@@ -143,7 +148,9 @@ class GroupSendNoticeTest(unittest.TestCase):
         _send_group(fake, outcomes=outcomes)
         self.assertEqual(len(fake.sent("interactive")), 1)
         [text_body] = fake.sent("text")
-        self.assertEqual(json.loads(text_body["content"]), {"text": CARD.fallback_text})
+        self.assertEqual(
+            json.loads(text_body["content"]), {"text": with_group_prefix(CARD.fallback_text)}
+        )
         self.assertEqual(
             text_body["uuid"], delivery_uuid(CHAT_ID, "2026-09-27", prefix=DAILY_REPORT_UUID_PREFIX)
         )
@@ -192,7 +199,7 @@ class GroupSendNoticeTest(unittest.TestCase):
             {
                 "receive_id": CHAT_ID,
                 "msg_type": "text",
-                "content": json.dumps({"text": "日报"}, ensure_ascii=False),
+                "content": json.dumps({"text": "[lingxi] 日报"}, ensure_ascii=False),
                 "uuid": delivery_uuid(CHAT_ID, "d", prefix=DELIVERY_UUID_PREFIX),
             },
         )

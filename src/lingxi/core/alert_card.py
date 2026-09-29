@@ -13,6 +13,7 @@
 
 from __future__ import annotations
 
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 from lingxi.config.content import ContentCatalog, ContentError, default_content_catalog
@@ -25,6 +26,24 @@ from lingxi.core.delivery.ops_notice import (
     send_group_notice,
 )
 from lingxi.core.task_reference import task_reference
+
+_BEIJING_OFFSET = timedelta(hours=8)
+
+
+def format_utc_with_beijing(moment: datetime) -> str:
+    """告警时间的统一写法：UTC 与北京时间并列，精确到分钟。
+
+    北京时间与 UTC 同日时只写时分（``… 03:15 UTC（北京 11:15）``）；落在另一天时
+    北京侧带月日。北京时间固定 UTC+8（无夏令时）。
+    """
+    if moment.tzinfo is None or moment.utcoffset() is None:
+        raise ValueError("告警时间必须带时区")
+    utc_moment = moment.astimezone(UTC)
+    beijing = utc_moment + _BEIJING_OFFSET
+    beijing_text = (
+        f"{beijing:%H:%M}" if beijing.date() == utc_moment.date() else f"{beijing:%m-%d %H:%M}"
+    )
+    return f"{utc_moment:%Y-%m-%d %H:%M} UTC（北京 {beijing_text}）"
 
 
 def alert_card_values(notice: AlertNotice) -> dict[str, object]:
@@ -39,7 +58,7 @@ def alert_card_values(notice: AlertNotice) -> dict[str, object]:
         "kind_label": _ALERT_KIND_LABEL.get(notice.kind, notice.kind.value),
         "scope": notice.scope,
         "count": notice.count,
-        "observed_at": notice.observed_at.strftime("%Y-%m-%d %H:%M:%S UTC"),
+        "observed_at": format_utc_with_beijing(notice.observed_at),
         "reference_label": reference_label,
         "reference": reference,
     }
@@ -75,4 +94,4 @@ def deliver_alert(sender: Any, chat_id: str, notice: AlertNotice) -> None:
     )
 
 
-__all__ = ["alert_card_values", "alert_notice_card", "deliver_alert"]
+__all__ = ["alert_card_values", "alert_notice_card", "deliver_alert", "format_utc_with_beijing"]
