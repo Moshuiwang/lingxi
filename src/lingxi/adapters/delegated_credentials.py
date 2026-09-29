@@ -321,30 +321,37 @@ class HostFileDelegatedCredentialVault:
         return registered_delegated_subject_open_id(self._dsn, timeouts=self._timeouts)
 
     def load(self, *, now: datetime | None = None) -> StoredCredential | None:
-        """取出当前凭据供同步使用。解密失败或已失效时撤销并返回 ``None``。"""
-        moment = now or datetime.now(UTC)
+        """取出当前凭据供同步使用。解密失败或已失效时撤销并返回 ``None``。
+
+        读取、消费判断、主体核对与撤销**全部在同一把文件锁内**完成：
+        锁外按旧快照判断时，别的进程可能在读取与判断之间置位消费标记或写入新
+        一代凭据，结果就是返回已消费的旧令牌、或把新授权误删。所有删除都经
+        :meth:`_discard_locked` 核对读取时的世代号，世代不符即放弃。
+        """
         with self._locked():
+            # 时刻在锁内取，与 `claim_due` 一致：等锁的时长不该让过期判定用上旧时刻。
+            moment = now or datetime.now(UTC)
             payload = self._read_payload()
-        if payload is None:
-            return None
-        if payload is UNDECRYPTABLE:
-            # **先判解密、再判主体**（C-2）：顺序反过来时，一次密钥配错会被读成
-            # 「文件主体与登记不一致」并删掉密文。这里既不删文件也不连库。
-            logger.error(_UNDECRYPTABLE_MESSAGE)
-            return None
-        if not self._subject_matches_registry(payload):
-            return None
-        credential = self._to_credential(payload)
-        if credential is None:
-            self.revoke(reason="credential_undecryptable")
-            return None
-        if payload.get("consumed_at"):
-            # 消费中：旧令牌可能已被飞书作废，任何读取路径都不得再拿到它。
-            return None
-        if credential.expires_at <= moment:
-            self.revoke(reason="credential_expired")
-            return None
-        return credential
+            if payload is None:
+                return None
+            if payload is UNDECRYPTABLE:
+                # **先判解密、再判主体**（C-2）：顺序反过来时，一次密钥配错会被读成
+                # 「文件主体与登记不一致」并删掉密文。这里既不删文件也不连库。
+                logger.error(_UNDECRYPTABLE_MESSAGE)
+                return None
+            if not self._subject_matches_registry(payload):
+                return None
+            credential = self._to_credential(payload)
+            if credential is None:
+                self._discard_locked(payload, reason="credential_undecryptable")
+                return None
+            if payload.get("consumed_at"):
+                # 消费中：旧令牌可能已被飞书作废，任何读取路径都不得再拿到它。
+                return None
+            if credential.expires_at <= moment:
+                self._discard_locked(payload, reason="credential_expired")
+                return None
+            return credential
 
     def claim_due(
         self,
@@ -428,7 +435,8 @@ class HostFileDelegatedCredentialVault:
 
         主体 A→B 更换途中崩溃会留下「登记指向 B、文件仍是 A」：此时 A 已不在
         登记表里，双向触发器只护着 B，继续用 A 的凭据等于在防线外运行。
-        清除旧文件并要求重新授权是唯一安全的恢复。
+        清除旧文件并要求重新授权是唯一安全的恢复。调用方必须已持有文件锁，
+        清除经 :meth:`_discard_locked` 按世代号核对后才执行。
         """
         with (
             connect(self._dsn, timeouts=self._timeouts) as connection,
@@ -442,9 +450,23 @@ class HostFileDelegatedCredentialVault:
         registered = None if row is None else str(row[0])
         if registered == payload.get("subject_open_id"):
             return True
-        logger.error("不可恢复：凭据文件主体与数据库登记不一致，已清除文件，需人工重新授权")
-        self._path.unlink(missing_ok=True)
+        if self._discard_locked(payload, reason="subject_mismatch"):
+            logger.error("不可恢复：凭据文件主体与数据库登记不一致，已清除文件，需人工重新授权")
         return False
+
+    def _discard_locked(self, payload: dict[str, Any], *, reason: str) -> bool:
+        """删除**读取时那一代**凭据文件；调用方必须已持有文件锁。
+
+        删除前按读取时的世代号再核对一次磁盘上的文件：世代不符（期间写入了新
+        一代）或解不开都放弃删除——旧快照得出的结论不得删掉新凭据。
+        """
+        current = self._read_payload()
+        if not isinstance(current, dict) or current.get("generation") != payload.get("generation"):
+            logger.warning("撤销目标已被新授权取代或无法核对，跳过 reason=%s", reason)
+            return False
+        self._path.unlink(missing_ok=True)
+        logger.warning("专用授权凭据已撤销 reason=%s", reason)
+        return True
 
     def _read_payload(self) -> dict[str, Any] | _Undecryptable | None:
         """``None`` = 没有文件；:data:`UNDECRYPTABLE` = 有文件但解不开；否则是明文 payload。
