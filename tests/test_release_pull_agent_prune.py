@@ -545,7 +545,11 @@ class NoticePrefixTests(unittest.TestCase):
         for raw, expected in (
             ("版本部署已完成", "[lingxi] 版本部署已完成"),
             ("[lingxi] 版本部署已完成", "[lingxi] 版本部署已完成"),
-            ("[BI Plus 预发] 版本部署已完成", "[lingxi] 版本部署已完成"),
+            # 标签内除 BI Plus 外的字样（环境名）保留，只去掉 BI Plus 与方括号。
+            ("[BI Plus 预发] 部署完成", "[lingxi] 预发 部署完成"),
+            ("[BI Plus 生产]部署完成", "[lingxi] 生产 部署完成"),
+            # 标签内只有 BI Plus：前缀直接接后文。
+            ("[BI Plus] 版本部署已完成", "[lingxi] 版本部署已完成"),
             ("[BI Plus]版本部署已完成", "[lingxi] 版本部署已完成"),
         ):
             with self.subTest(raw=raw):
@@ -555,6 +559,7 @@ class NoticePrefixTests(unittest.TestCase):
     def test_text_prefix_only_on_first_line(self):
         self.assertEqual(AGENT.prefixed_text("甲\n乙"), "[lingxi] 甲\n乙")
         self.assertEqual(AGENT.prefixed_text("[lingxi] 甲\n乙"), "[lingxi] 甲\n乙")
+        self.assertEqual(AGENT.prefixed_text("[BI Plus 预发] 甲\n乙"), "[lingxi] 预发 甲\n乙")
 
     def test_alert_card_title_is_prefixed_once(self):
         host = {"host": "h", "environment": "stage"}

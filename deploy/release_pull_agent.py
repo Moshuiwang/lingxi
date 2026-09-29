@@ -1705,15 +1705,20 @@ def notice_card_payload(title: str, tone: str, sections) -> dict:
 
 
 NOTICE_PREFIX = "[lingxi] "
-# 旧版标题标签（如「[BI Plus 预发]」）：改写成项目名前缀，不出现两层方括号。
-_LEGACY_TITLE_TAG = re.compile(r"^\[BI Plus[^\]\n]*\]\s*")
+# 旧版标题标签（如「[BI Plus 预发]」）：去掉 BI Plus 与方括号、保留标签内其余字样
+# （「预发」这类字样区分环境，不能丢），不出现两层方括号。
+_LEGACY_TITLE_TAG = re.compile(r"^\[BI Plus([^\]\n]*)\]\s*")
 
 
 def with_notice_prefix(line: str) -> str:
     """管理群消息的标题或纯文本首行加项目名前缀；已带前缀不叠加，旧 BI Plus 标签改写。"""
     if line.startswith(NOTICE_PREFIX):
         return line
-    return NOTICE_PREFIX + _LEGACY_TITLE_TAG.sub("", line, count=1)
+    match = _LEGACY_TITLE_TAG.match(line)
+    if match is None:
+        return NOTICE_PREFIX + line
+    kept = match.group(1).strip()
+    return NOTICE_PREFIX + (kept + " " if kept else "") + line[match.end() :]
 
 
 def prefixed_text(text: str) -> str:
