@@ -225,23 +225,45 @@ class RenderMessageTests(unittest.TestCase):
 
 
 class NowIsoTimezoneAnnotationTests(unittest.TestCase):
-    """B-8 遗留第 3 项（Trace #469 修复包 B）核实结论：``_now_iso()`` 用于
-    `render_message`/`render_threshold_message` 里「时间：{now}」这一行，已经
-    是带显式 UTC 偏移量的 ISO-8601 字符串（``datetime.now(timezone.utc)
-    .astimezone().isoformat()``——先转成本机时区的 aware datetime，再序列化，
-    偏移量永远和序列化时刻的本机时钟一致），与 ``core/alerting.py`` S-1 修复
-    的告警范式（``AlertNotice.text`` 的 ``self.observed_at.isoformat()``，
-    同样是 aware datetime 直接 isoformat，同一套"数字偏移量而非人类可读时区名"
-    表达方式）完全一致——不是本批新引入的裸 ``datetime.now()`` 无时区字符串。
-    核实证据，不改代码。"""
+    """告警「时间」字段（#911）：基于 UTC 而非宿主本机时区，同时标注北京时间。"""
 
-    def test_now_iso_includes_an_explicit_utc_offset(self) -> None:
+    def test_format_same_day_and_cross_day(self) -> None:
+        same = datetime(2026, 9, 28, 3, 15, 40, tzinfo=UTC)
+        cross = datetime(2026, 9, 28, 17, 15, 0, tzinfo=UTC)
+        self.assertEqual(
+            host_health_alert.format_utc_with_beijing(same), "2026-09-28 03:15 UTC（北京 11:15）"
+        )
+        self.assertEqual(
+            host_health_alert.format_utc_with_beijing(cross),
+            "2026-09-28 17:15 UTC（北京 09-29 01:15）",
+        )
+
+    def test_now_iso_is_utc_with_beijing_annotation(self) -> None:
         text = host_health_alert._now_iso()
 
-        parsed = datetime.fromisoformat(text)
+        self.assertRegex(
+            text, r"^\d{4}-\d{2}-\d{2} \d{2}:\d{2} UTC（北京 (\d{2}-\d{2} )?\d{2}:\d{2}）$"
+        )
 
-        self.assertIsNotNone(parsed.tzinfo, "时间戳必须带显式时区，不能是裸 naive datetime")
-        self.assertIsNotNone(parsed.utcoffset())
+
+class GroupTitlePrefixTests(unittest.TestCase):
+    """管理群前缀（#909）：加前缀、幂等、旧 ``[BI Plus …]`` 标签改写。"""
+
+    def test_prefix_rewrite_and_idempotence(self) -> None:
+        f = host_health_alert.with_group_prefix
+        self.assertEqual(f("宿主监控告警：x"), "[lingxi] 宿主监控告警：x")
+        self.assertEqual(f("[BI Plus 资源监控] 告警\n主机：h"), "[lingxi] 资源监控 告警\n主机：h")
+        self.assertEqual(f(f("[BI Plus 宿主监控] 恢复")), "[lingxi] 宿主监控 恢复")
+        self.assertEqual(f("[BI Plus] 后文"), "[lingxi] 后文")
+        self.assertEqual(f("[lingxi] 已带"), "[lingxi] 已带")
+
+    def test_send_prefixes_card_without_mutating_input(self) -> None:
+        card = host_health_alert.notice_card_payload("宿主监控告警：x", "故障", [(None, ["a"])])
+        prefixed = host_health_alert._prefixed_card(card)
+        self.assertEqual(prefixed["header"]["title"]["content"], "[lingxi] 宿主监控告警：x")
+        self.assertEqual(card["header"]["title"]["content"], "宿主监控告警：x")
+        again = host_health_alert._prefixed_card(prefixed)
+        self.assertEqual(again["header"]["title"]["content"], "[lingxi] 宿主监控告警：x")
 
 
 class CredentialLoadingTests(unittest.TestCase):
@@ -549,6 +571,34 @@ class RunIntegrationTests(unittest.TestCase):
         self.assertEqual(exit_code, 0)
         sender.assert_not_called()
         self.assertFalse(self.state_path.exists())
+
+    def test_every_completed_round_writes_one_heartbeat_line(self) -> None:
+        # 主机外的独立监控只看日志文件修改时间判巡检存活：全绿的轮次也必须写一行，
+        # 否则「一切正常」会被误报成「巡检停摆」。两轮全绿 → 两行心跳。
+        self._set_container_state(running=True, health_status="healthy")
+        with mock.patch.object(host_health_alert, "feishu_send_notice") as sender:
+            self.assertEqual(self._run(), 0)
+            self.assertEqual(self._run(), 0)
+        sender.assert_not_called()
+        heartbeats = [
+            line
+            for line in self.log_path.read_text(encoding="utf-8").splitlines()
+            if "巡检完成 退出码=0" in line
+        ]
+        self.assertEqual(len(heartbeats), 2)
+
+    def test_heartbeat_carries_nonzero_exit_code_when_round_is_fatal(self) -> None:
+        # 有容器查不了（本轮 fatal）时心跳照写，且如实带出退出码 2，不能写成正常。
+        with mock.patch.object(
+            host_health_alert,
+            "docker_inspect_one",
+            side_effect=host_health_alert.HostMonitorError("simulated_inspect_failure"),
+        ):
+            exit_code = self._run()
+        self.assertEqual(exit_code, 2)
+        log_text = self.log_path.read_text(encoding="utf-8")
+        self.assertIn("巡检完成 退出码=2", log_text)
+        self.assertNotIn("巡检完成 退出码=0", log_text)
 
     def test_missing_env_file_returns_exit_code_two_without_touching_docker(self) -> None:
         os.remove(self.env_path)
@@ -1028,7 +1078,7 @@ class JudgeReleasePullTests(unittest.TestCase):
         self.assertIn("单元 lingxi-release-pull", detail)
         self.assertIn("timer=inactive（not-found）", detail)
         self.assertIn("service=inactive", detail)
-        self.assertIn("上一次触发 2026-09-20T06:55:00Z", detail)
+        self.assertIn("上一次触发 2026-09-20 06:55 UTC（北京 14:55）", detail)
         self.assertIn("上一轮 exit-code/1", detail)
         self.assertIn("阈值 15 分钟", detail)
 
@@ -2147,6 +2197,8 @@ class NoticeSendSemanticsTests(unittest.TestCase):
         self.assertEqual(fake.message_types(), ["interactive"])
         card = json.loads(fake.bodies[1]["content"])
         self.assertEqual(card["header"]["template"], "red")
+        self.assertTrue(card["header"]["title"]["content"].startswith("[lingxi] 宿主监控告警"))
+        self.assertNotIn("[lingxi] [lingxi]", card["header"]["title"]["content"])
         self.assertNotIn("uuid", fake.bodies[1])
         self.assertTrue(host_health_alert.load_state(self.state_path)["target-container"].alerting)
 
@@ -2155,7 +2207,8 @@ class NoticeSendSemanticsTests(unittest.TestCase):
         self.assertEqual(self._run_with(fake), 0)
         self.assertEqual(fake.message_types(), ["interactive", "text"])
         text = json.loads(fake.bodies[2]["content"])["text"]
-        self.assertTrue(text.startswith("[BI Plus 宿主监控] 告警"))
+        self.assertTrue(text.startswith("[lingxi] 宿主监控 告警\n"))
+        self.assertNotIn("[BI Plus", text)
         self.assertTrue(host_health_alert.load_state(self.state_path)["target-container"].alerting)
 
     def test_fallback_also_rejected_does_not_persist_and_sends_only_once(self) -> None:

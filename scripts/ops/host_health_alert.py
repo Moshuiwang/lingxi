@@ -274,6 +274,38 @@ def escape_markdown(value: object) -> str:
     return "".join(pieces).replace("://", ":​//")
 
 
+GROUP_TITLE_PREFIX = "[lingxi] "
+_LEGACY_LABEL_PATTERN = re.compile(r"^\[BI Plus\s*([^\]\n]*)\]\s*")
+_BEIJING_OFFSET = timedelta(hours=8)
+
+
+def _keep_label(match: re.Match[str]) -> str:
+    """旧标签去掉 ``BI Plus`` 与方括号，保留其余字样（如「运行告警」）并与后文隔一个空格。"""
+    label = match.group(1).strip()
+    return f"{label} " if label else ""
+
+
+def with_group_prefix(text: str) -> str:
+    """管理群消息标题或首行统一带 ``[lingxi] ``；已带则不叠加，旧 ``[BI Plus …]`` 标签改写为保留内部字样的形式。
+
+    与镜像内 `lingxi.adapters.feishu_group_message.with_group_prefix` 同口径；本脚本
+    在镜像外独立运行，故自带一份。
+    """
+    if text.startswith(GROUP_TITLE_PREFIX):
+        return text
+    return GROUP_TITLE_PREFIX + _LEGACY_LABEL_PATTERN.sub(_keep_label, text, count=1)
+
+
+def format_utc_with_beijing(moment: datetime) -> str:
+    """UTC 与北京时间并列：``2026-09-28 03:15 UTC（北京 11:15）``；北京侧跨日时带日期。"""
+    utc_moment = moment.astimezone(UTC)
+    beijing = utc_moment + _BEIJING_OFFSET
+    beijing_text = (
+        f"{beijing:%H:%M}" if beijing.date() == utc_moment.date() else f"{beijing:%m-%d %H:%M}"
+    )
+    return f"{utc_moment:%Y-%m-%d %H:%M} UTC（北京 {beijing_text}）"
+
+
 def notice_card_payload(title: str, tone: str, sections: NoticeSections) -> dict[str, object]:
     """拼飞书 schema 2.0 通知卡：分段之间一条分隔线，有小标题时加粗置于首行。"""
     elements: list[dict[str, str]] = []
@@ -630,7 +662,7 @@ def parse_systemd_timestamp(value: str | None) -> datetime | None:
 def _format_utc(moment: datetime | None) -> str:
     if moment is None:
         return "n/a"
-    return moment.astimezone(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
+    return format_utc_with_beijing(moment)
 
 
 def release_pull_trace_at(observation: ReleasePullObservation) -> datetime | None:
@@ -1354,9 +1386,21 @@ def feishu_send_text(
         token,
         chat_id=chat_id,
         msg_type="text",
-        content={"text": text},
+        content={"text": with_group_prefix(text)},
         timeout_seconds=timeout_seconds,
     )
+
+
+def _prefixed_card(card: Mapping[str, object]) -> Mapping[str, object]:
+    """发出前给卡片标题加管理群前缀；不改动传入的卡片对象。"""
+    header = card.get("header")
+    title = header.get("title") if isinstance(header, Mapping) else None
+    if not isinstance(header, Mapping) or not isinstance(title, Mapping):
+        return card
+    content = title.get("content")
+    if not isinstance(content, str):
+        return card
+    return {**card, "header": {**header, "title": {**title, "content": with_group_prefix(content)}}}
 
 
 def feishu_send_notice(
@@ -1384,7 +1428,7 @@ def feishu_send_notice(
             token,
             chat_id=chat_id,
             msg_type="interactive",
-            content=card,
+            content=_prefixed_card(card),
             timeout_seconds=timeout_seconds,
         )
     except FeishuRejectedError:
@@ -1393,7 +1437,7 @@ def feishu_send_notice(
             token,
             chat_id=chat_id,
             msg_type="text",
-            content={"text": text},
+            content={"text": with_group_prefix(text)},
             timeout_seconds=timeout_seconds,
         )
 
@@ -1487,7 +1531,7 @@ def single_instance_lock(path: Path) -> Iterator[bool]:
 
 
 def _now_iso() -> str:
-    return datetime.now(UTC).astimezone().isoformat(timespec="seconds")
+    return format_utc_with_beijing(datetime.now(UTC))
 
 
 def _configure_logger(log_file: str) -> logging.Logger:
@@ -1748,7 +1792,14 @@ def run(argv: Sequence[str] | None = None) -> int:
         ):
             _run_threshold_checks(args, credentials, host=host, logger=logger)
 
-        return 2 if fatal else 0
+        exit_code = 2 if fatal else 0
+        # 每轮完整跑完都写一行心跳，不论有无告警：主机外的独立监控只看本日志文件
+        # 的修改时间来判「巡检自身还活着」。全绿时若一行不写，日志会长时间不动，
+        # 外部监控就会把「一切正常」误报成「巡检停摆」——而巡检停摆恰恰是它唯一
+        # 需要替我们盯住的事。拿不到锁、凭据或 docker 不可用这几条提前返回的路径
+        # 本身已各写一行，不在此重复。
+        logger.info("巡检完成 退出码=%d", exit_code)
+        return exit_code
 
 
 def _collect_release_pull_checks(
