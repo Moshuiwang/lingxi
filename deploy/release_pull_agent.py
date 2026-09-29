@@ -3667,7 +3667,11 @@ def prune_images_once(
         with _run_lock(state_directory), _deployer_host_lock(host):
             return _once()
     except AgentError as error:
-        if error.code in {PRUNE_REFUSED_HOST_BUSY, "host_lock_unavailable", "host_lock_permissions"}:
+        if error.code in {
+            PRUNE_REFUSED_HOST_BUSY,
+            "host_lock_unavailable",
+            "host_lock_permissions",
+        }:
             _log("image_prune", "refused", reason=error.code, host=host["host"])
             return 1
         _log("image_prune", error.code, host=host["host"])

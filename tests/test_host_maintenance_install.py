@@ -862,9 +862,13 @@ class BundleKnownFromMainTest(unittest.TestCase):
         }
         self.git("init", "-q", "-b", "main")
         self.commit("v1", monitor="monitor-v1")  # 两条历史的共同祖先
-        self.commit("main-only", monitor="monitor-main-only")  # main 上的中间版本（如已上生产的 #907）
+        self.commit(
+            "main-only", monitor="monitor-main-only"
+        )  # main 上的中间版本（如已上生产的 #907）
         self.git("checkout", "-q", "-b", "release", "HEAD~1")
-        self.commit("squash-sync", monitor="monitor-final")  # squash 形：release 历史里没有 main-only
+        self.commit(
+            "squash-sync", monitor="monitor-final"
+        )  # squash 形：release 历史里没有 main-only
         self.git("checkout", "-q", "main")
 
     def git(self, *args: str) -> str:
@@ -881,7 +885,9 @@ class BundleKnownFromMainTest(unittest.TestCase):
             target = self.repo / repo_path
             target.parent.mkdir(parents=True, exist_ok=True)
             if name != "host_maintenance_install.sh":
-                target.write_text(monitor if name == "host_health_alert.py" else name, encoding="utf-8")
+                target.write_text(
+                    monitor if name == "host_health_alert.py" else name, encoding="utf-8"
+                )
             else:
                 target.write_text("#!/bin/sh\n", encoding="utf-8")
         self.git("add", "-A")
