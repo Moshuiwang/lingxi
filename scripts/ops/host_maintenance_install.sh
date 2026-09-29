@@ -15,7 +15,7 @@
 # 输入：本脚本同目录放 lingxi-host-monitor.service、host_health_alert.py、db_backup.sh、已知版本清单 KNOWN_SHAS 与清单
 # SHA256SUMS（sha256sum 格式）。整个目录由 scripts/ops/build_host_maintenance_bundle.sh 从正式 tag 生成，不手工拼；
 # 任一文件与清单不符即停，不动主机。KNOWN_SHAS 也登记在 SHA256SUMS 里，被改动即停。
-# 来历判定（#908）：巡检脚本与备份脚本在位版本 = 目标 → already；属于 KNOWN_SHAS（该文件在 main 历史里出现过的版本）→
+# 来历判定（#908）：单元本体、巡检脚本与备份脚本三份在位版本 = 目标 → already；属于 KNOWN_SHAS（该文件在 main 历史里出现过的版本）→
 # install（已知旧版 → 升级）；都不是 → 「前提不符」，check 非零、apply 零写入拒绝，须先读运维记录核对来历，
 # 再用 --accept-unknown <文件名>=<sha256> 逐文件逐 sha 放行（可重复）。缺 KNOWN_SHAS 同样判前提不符。
 # 路径不写死：环境取自宿主契约的 environment（契约路径依次取 LINGXI_S30_HOST_CONTRACT、拉取代理单元有效 ExecStart 的
@@ -23,7 +23,7 @@
 # systemctl show -p FragmentPath；巡检脚本位置取自装后有效 ExecStart 的第二段；备份脚本位置取自
 # lingxi-db-backup.service 的 ExecStart；注入点取自候选单元自己的 ExecStart 第一段。
 # 生产与预发的差异（数据驱动，脚本同一份）：生产在位单元本体须是已知旧版（#859 5757269798 回读的 c14989d1…）
-# 或已是候选版，本体与候选的差异里不许有 User=；预发不钉旧版 sha，本体里的 User= 允许：10-local.conf 在位须同值，
+# 或已是候选版，本体与候选的差异里不许有 User=；预发不钉旧版 sha，在位本体同样须是候选版、已知旧版或按 --accept-unknown 放行，本体里的 User= 允许：10-local.conf 在位须同值，
 # 不在位则 apply 先写一份只含该 User= 的 10-local.conf（纳入备份清单，回装即删）。本体差异白名单：注释 / ExecStart /
 # TimeoutStartSec / User / Description / After / Wants / WorkingDirectory / StandardOutput / StandardError，后六个逐键打印旧值 → 新值。
 # 用法：sudo -n bash host_maintenance_install.sh <子命令> [--accept-unknown 文件名=sha256 ...]    到终态预计时长
@@ -199,11 +199,14 @@ preflight() {
     [[ "$(unit_core "$FRAG")" == "$(unit_core "$CAND_UNIT")" ]] || FAIL+=("在位单元本体与候选有意外差异（注释 / ExecStart / TimeoutStartSec / User / ${EXTRA_KEYS[*]} 以外）")
     [[ -z "$(last_key User "$CAND_UNIT")" ]] || FAIL+=("候选单元本体不应含 User=")
     local body_user local_user; body_user="$(last_key User "$FRAG")"; local_user="$(last_key User "$FRAG.d/10-local.conf")"
+    # 来历判定（#908 三份在位文件逐一判定）：本体 sha = 目标已在外层放过；其余须是已知旧版（生产另认钉版旧 sha），
+    # 或按 --accept-unknown 逐 sha 放行。预发同样判，不再靠「差异白名单」代替来历。
+    local fsha; fsha="$(sha_of "$FRAG")"
+    if [[ ( "$ENVIRONMENT" == production && "$fsha" == "$PROD_OLD_UNIT_SHA" ) || -n "${KNOWN[$MONITOR_UNIT=$fsha]:-}" ]]; then :
+    elif [[ -n "${ACCEPT[$MONITOR_UNIT=$fsha]:-}" ]]; then say "[放行] 单元本体 $MONITOR_UNIT 在位 sha=$fsha 不是已知旧版，按 --accept-unknown $MONITOR_UNIT=$fsha 放行"
+    elif [[ "$ENVIRONMENT" == production ]]; then FAIL+=("生产在位单元本体 sha 既不是已知旧版也不是候选版")
+    else FAIL+=("预发在位单元本体 sha=$fsha 来历不明（不是目标、不在已知版本清单）；先读运维记录核对来历，确认后加 --accept-unknown $MONITOR_UNIT=$fsha"); fi
     if [[ "$ENVIRONMENT" == production ]]; then
-      local fsha; fsha="$(sha_of "$FRAG")"
-      if [[ "$fsha" == "$PROD_OLD_UNIT_SHA" || -n "${KNOWN[$MONITOR_UNIT=$fsha]:-}" ]]; then :
-      elif [[ -n "${ACCEPT[$MONITOR_UNIT=$fsha]:-}" ]]; then say "[放行] 单元本体 $MONITOR_UNIT 在位 sha=$fsha 不是已知旧版，按 --accept-unknown 放行"
-      else FAIL+=("生产在位单元本体 sha 既不是已知旧版也不是候选版"); fi
       [[ -z "$body_user" ]] || FAIL+=("生产在位单元本体含 User=（生产不许这类差异）")
     elif [[ -n "$body_user" && ! -e "$FRAG.d/10-local.conf" ]]; then
       NEED_LOCAL=1; LOCAL_USER="$body_user"; say "[预发] 本体带 User=、无 10-local.conf：apply 先写 10-local.conf（User= 同值）再换本体"

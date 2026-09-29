@@ -166,6 +166,11 @@ class HostMaintenanceFakeRootTest(unittest.TestCase):
             (_sha(CAND_MON), "host_health_alert.py"),
             (_sha(CAND_BAK), "db_backup.sh"),
             (hashlib.sha256("# 旧版巡检脚本\n".encode()).hexdigest(), "host_health_alert.py"),
+            # 预发在位的旧单元本体（F17 之前的仓库版）也是 Git 历史里出现过的已知版本
+            (
+                hashlib.sha256(_old_unit(user="deployer").encode()).hexdigest(),
+                "lingxi-host-monitor.service",
+            ),
             (
                 hashlib.sha256(b"#!/usr/bin/env bash\necho old-backup\n").hexdigest(),
                 "db_backup.sh",
@@ -322,6 +327,9 @@ class HostMaintenanceFakeRootTest(unittest.TestCase):
         self.mon.write_bytes(old_mon[-1])
         self.bak.write_bytes(old_bak[-1])
         shutil.copy2(self.make_bundle() / "KNOWN_SHAS", self.inputs / "KNOWN_SHAS")
+        # 假根里的旧单元本体是合成的（真实历史里没有这份），并入清单以免本用例被单元本体来历判定拦下
+        with (self.inputs / "KNOWN_SHAS").open("a", encoding="utf-8") as fh:
+            fh.write(f"{_sha(self.frag)}  lingxi-host-monitor.service\n")
         self.write_manifest()
         self.reset_before()
         checked = self.run_script("check")
@@ -661,11 +669,47 @@ class HostMaintenanceFakeRootTest(unittest.TestCase):
         self.assert_refused(result, "来源=环境变量 LINGXI_S30_HOST_CONTRACT")
         self.assert_ok(self.run_script("check", LINGXI_S30_HOST_CONTRACT=str(real)))
 
+    def test_stage_hand_edited_unit_body_needs_accept_unknown(self) -> None:
+        """#910 外审 F4：预发在位单元本体也做来历判定；手改过（不在已知清单）→ 拒绝，逐 sha 放行后通过。"""
+        if self.environment != "stage":
+            self.skipTest("预发专属；生产的单元本体来历由既有钉版 sha + 已知清单判定")
+        self.frag.write_text(_old_unit(user="deployer", handmade=True), encoding="utf-8")
+        self.reset_before()
+        arg = f"lingxi-host-monitor.service={_sha(self.frag)}"
+        refused = self.run_script("check")
+        self.assert_refused(refused, "预发在位单元本体 sha=")
+        self.assertIn("来历不明（不是目标、不在已知版本清单）", refused.stdout)
+        self.assertIn(f"--accept-unknown {arg}", refused.stdout)
+        self.assert_refused(self.run_script("apply", "--yes"), "来历不明")
+        wrong = "lingxi-host-monitor.service=" + "0" * 64
+        self.assert_refused(self.run_script("check", "--accept-unknown", wrong), "来历不明")
+        checked = self.run_script("check", "--accept-unknown", arg)
+        self.assert_ok(checked)
+        self.assertIn(f"按 --accept-unknown {arg} 放行", checked.stdout)
+        self.assertEqual(self.snapshot(), self.before, "check 零写入")
+        result = self.run_script("apply", "--accept-unknown", arg, "--yes")
+        self.assert_ok(result)
+        self.assert_installed()
+
+    def test_stage_unit_already_target_is_not_provenance_checked(self) -> None:
+        """预发在位单元本体已是目标版：不进来历判定（不会被拦）。"""
+        if self.environment != "stage":
+            self.skipTest("预发专属")
+        self.frag.write_bytes(CAND_UNIT.read_bytes())
+        self.py_dropin.unlink()
+        self.reset_before()
+        self.assert_ok(self.run_script("check"))
+
     def test_handmade_descriptive_keys_are_allowed_and_printed(self) -> None:
         user = "deployer" if self.environment == "stage" else None
         self.frag.write_text(_old_unit(user=user, handmade=True), encoding="utf-8")
         self.reset_before()
-        result = self.run_script("check")
+        accept = (
+            ("--accept-unknown", f"lingxi-host-monitor.service={_sha(self.frag)}")
+            if self.environment == "stage"
+            else ()
+        )
+        result = self.run_script("check", *accept)
         self.assert_ok(result)
         self.assertIn("[本体差异] StandardOutput：append:/var/log/hm.log → （无）", result.stdout)
         self.assertIn(
