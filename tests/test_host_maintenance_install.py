@@ -793,5 +793,100 @@ class HostMaintenanceProductionTest(HostMaintenanceFakeRootTest):
         self.assert_ok(self.run_script("check"))
 
 
+class BundleKnownFromMainTest(unittest.TestCase):
+    """#908 修复：release/* 由 squash 同步，已知版本清单须并入 main 历史（生成脚本的 ``--known-from``）。"""
+
+    PATHS = {
+        "host_maintenance_install.sh": "scripts/ops/host_maintenance_install.sh",
+        "lingxi-host-monitor.service": "deploy/monitoring-units/lingxi-host-monitor.service",
+        "host_health_alert.py": "scripts/ops/host_health_alert.py",
+        "db_backup.sh": "scripts/ops/db_backup.sh",
+    }
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory(prefix="lingxi-908-known-")
+        self.addCleanup(self._tmp.cleanup)
+        self.repo = Path(self._tmp.name) / "repo"
+        (self.repo / "scripts" / "ops").mkdir(parents=True)
+        shutil.copy2(BUNDLE, self.repo / "scripts" / "ops" / BUNDLE.name)
+        self.env = {
+            **os.environ,
+            "GIT_AUTHOR_NAME": "t",
+            "GIT_AUTHOR_EMAIL": "t@example.invalid",
+            "GIT_COMMITTER_NAME": "t",
+            "GIT_COMMITTER_EMAIL": "t@example.invalid",
+        }
+        self.git("init", "-q", "-b", "main")
+        self.commit("v1", monitor="monitor-v1")  # 两条历史的共同祖先
+        self.commit("main-only", monitor="monitor-main-only")  # main 上的中间版本（如已上生产的 #907）
+        self.git("checkout", "-q", "-b", "release", "HEAD~1")
+        self.commit("squash-sync", monitor="monitor-final")  # squash 形：release 历史里没有 main-only
+        self.git("checkout", "-q", "main")
+
+    def git(self, *args: str) -> str:
+        return subprocess.run(
+            ["git", "-C", str(self.repo), *args],
+            capture_output=True,
+            text=True,
+            check=True,
+            env=self.env,
+        ).stdout
+
+    def commit(self, message: str, *, monitor: str) -> None:
+        for name, repo_path in self.PATHS.items():
+            target = self.repo / repo_path
+            target.parent.mkdir(parents=True, exist_ok=True)
+            if name != "host_maintenance_install.sh":
+                target.write_text(monitor if name == "host_health_alert.py" else name, encoding="utf-8")
+            else:
+                target.write_text("#!/bin/sh\n", encoding="utf-8")
+        self.git("add", "-A")
+        self.git("commit", "-q", "-m", message)
+
+    def build(self, *args: str) -> subprocess.CompletedProcess[str]:
+        out = Path(self._tmp.name) / f"out-{len(list(Path(self._tmp.name).glob('out-*')))}"
+        result = subprocess.run(
+            ["bash", str(self.repo / "scripts" / "ops" / BUNDLE.name), "--out", str(out), *args],
+            capture_output=True,
+            text=True,
+            check=False,
+            env=self.env,
+        )
+        result.out = out  # type: ignore[attr-defined]
+        return result
+
+    @staticmethod
+    def monitor_line(text: str) -> str:
+        return f"{hashlib.sha256(text.encode()).hexdigest()}  host_health_alert.py"
+
+    def test_release_ref_bundle_includes_main_only_versions(self) -> None:
+        """--ref 取 squash 形 release：清单仍含 main 独有版本（缺省来源取本地 main）；输出打印两个来源与条数。"""
+        result = self.build("--ref", "release")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        known = (result.out / "KNOWN_SHAS").read_text(encoding="utf-8")  # type: ignore[attr-defined]
+        for version in ("monitor-v1", "monitor-main-only", "monitor-final"):
+            self.assertIn(self.monitor_line(version), known, version)
+        self.assertIn("已知版本来源：release 历史", result.stdout)
+        self.assertIn("main 历史", result.stdout)
+
+    def test_explicit_known_from_is_used(self) -> None:
+        self.git("branch", "-m", "main", "trunk")
+        self.assertNotEqual(self.build("--ref", "release").returncode, 0)
+        result = self.build("--ref", "release", "--known-from", "trunk")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        known = (result.out / "KNOWN_SHAS").read_text(encoding="utf-8")  # type: ignore[attr-defined]
+        self.assertIn(self.monitor_line("monitor-main-only"), known)
+
+    def test_missing_main_history_fails_instead_of_degrading(self) -> None:
+        self.git("branch", "-m", "main", "trunk")
+        result = self.build("--ref", "release")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("取不到 main 历史", result.stderr)
+        self.assertFalse((result.out / "KNOWN_SHAS").exists())  # type: ignore[attr-defined]
+        bad = self.build("--ref", "release", "--known-from", "no-such-ref")
+        self.assertNotEqual(bad.returncode, 0)
+        self.assertIn("找不到 --known-from", bad.stderr)
+
+
 if __name__ == "__main__":
     unittest.main()
