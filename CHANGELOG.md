@@ -6,9 +6,9 @@
 
 ## [Unreleased]
 
-## [2.6.2] - 未发布
+## [2.6.2] - 2026-09-29
 
-维护版（Trace [#913](https://github.com/Moshuiwang/lingxi/issues/913)）：装入 [#903](https://github.com/Moshuiwang/lingxi/issues/903) / [#908](https://github.com/Moshuiwang/lingxi/issues/908) / [#909](https://github.com/Moshuiwang/lingxi/issues/909) / [#910](https://github.com/Moshuiwang/lingxi/issues/910) / [#911](https://github.com/Moshuiwang/lingxi/issues/911) 多处改动，聚焦委托凭据并发正确性、宿主维护安装安全、管理群卡片辨识与时间标注，以及生产旧镜像自动清理。
+维护版（Trace [#913](https://github.com/Moshuiwang/lingxi/issues/913)）：装入 [#903](https://github.com/Moshuiwang/lingxi/issues/903) / [#908](https://github.com/Moshuiwang/lingxi/issues/908) / [#909](https://github.com/Moshuiwang/lingxi/issues/909) / [#910](https://github.com/Moshuiwang/lingxi/issues/910) / [#911](https://github.com/Moshuiwang/lingxi/issues/911) 多处改动，聚焦委托凭据并发正确性、宿主维护安装安全、管理群卡片辨识与时间标注，以及生产旧镜像自动清理。候选 `v2.6.2-rc.113` 经预发验收后由 Release Promotion 发布为正式版，生产由拉取代理 + 部署器无停机升级（2026-09-29，`verified`），迁移头不变；宿主维护由产品负责人在生产执行（已知旧版识别并升级），产品负责人真实问数 `success`；生产积存旧镜像一次性清理 51 个、根盘占用 44% → 24%。
 
 ### Added
 
