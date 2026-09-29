@@ -12,8 +12,12 @@
 # 为什么不并进 db_backup_install.sh：那份的 monitor-script 只换脚本、不换单元本体、不等下一轮、失败不自动回装；
 # 它的输入文件还带异机地址，本次维护用不上也不该经手。沿用它的约定：umask 077、覆盖前 cp -p 留副本、
 # 输入副本按清单 sha 判、测试形「非 root + 假根」、systemctl 可注入桩；宿主契约读法与 db_switch_to_local.sh 同一个 json_str。
-# 输入：本脚本同目录放 lingxi-host-monitor.service、host_health_alert.py、db_backup.sh 与清单 SHA256SUMS
-#（sha256sum 格式，由编排者从正式 tag 的仓库内容生成）；任一文件与清单不符即停，不动主机。
+# 输入：本脚本同目录放 lingxi-host-monitor.service、host_health_alert.py、db_backup.sh、已知版本清单 KNOWN_SHAS 与清单
+# SHA256SUMS（sha256sum 格式）。整个目录由 scripts/ops/build_host_maintenance_bundle.sh 从正式 tag 生成，不手工拼；
+# 任一文件与清单不符即停，不动主机。KNOWN_SHAS 也登记在 SHA256SUMS 里，被改动即停。
+# 来历判定（#908）：巡检脚本与备份脚本在位版本 = 目标 → already；属于 KNOWN_SHAS（该文件在 main 历史里出现过的版本）→
+# install（已知旧版 → 升级）；都不是 → 「前提不符」，check 非零、apply 零写入拒绝，须先读运维记录核对来历，
+# 再用 --accept-unknown <文件名>=<sha256> 逐文件逐 sha 放行（可重复）。缺 KNOWN_SHAS 同样判前提不符。
 # 路径不写死：环境取自宿主契约的 environment（契约路径依次取 LINGXI_S30_HOST_CONTRACT、拉取代理单元有效 ExecStart 的
 # --host-contract、缺省 /opt/lingxi/control/host-contract.json，打印来源）；单元本体位置取自
 # systemctl show -p FragmentPath；巡检脚本位置取自装后有效 ExecStart 的第二段；备份脚本位置取自
@@ -22,7 +26,7 @@
 # 或已是候选版，本体与候选的差异里不许有 User=；预发不钉旧版 sha，本体里的 User= 允许：10-local.conf 在位须同值，
 # 不在位则 apply 先写一份只含该 User= 的 10-local.conf（纳入备份清单，回装即删）。本体差异白名单：注释 / ExecStart /
 # TimeoutStartSec / User / Description / After / Wants / WorkingDirectory / StandardOutput / StandardError，后六个逐键打印旧值 → 新值。
-# 用法：sudo -n bash host_maintenance_install.sh <子命令>                                     到终态预计时长
+# 用法：sudo -n bash host_maintenance_install.sh <子命令> [--accept-unknown 文件名=sha256 ...]    到终态预计时长
 #   check          只读：前提逐项核对 + 计划（每步 already / install），零写入                         < 5 秒
 #   apply --yes    前提 → 对齐到整分后约 10 秒 → 备份 → ① → 等轮 → ② → 等轮 → ③ → ④ → 汇总；
 #                  任一步不符自动 restore 并以非零退出；各步已是目标 sha 的打印 already 跳过          ≤ 3 分钟
@@ -38,8 +42,20 @@ export LC_ALL=C
 umask 077
 
 SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-SUB="${1:-}"; CONFIRM="${2:-}"
+SUB="${1:-}"; CONFIRM=""; declare -A ACCEPT=()
 [[ -n "$SUB" ]] || { sed -n '/^# 用法：/,/^#   status /p' "${BASH_SOURCE[0]}" >&2; exit 2; }
+shift
+while (( $# )); do
+  case "$1" in
+    --yes) CONFIRM=--yes; shift ;;
+    --accept-unknown|--accept-unknown=*)
+      if [[ "$1" == --accept-unknown=* ]]; then acc="${1#--accept-unknown=}"; shift
+      else [[ $# -ge 2 ]] || { printf 'hm 错误：--accept-unknown 后须跟 <文件名>=<sha256>\n' >&2; exit 2; }; acc="$2"; shift 2; fi
+      [[ "$acc" =~ ^([A-Za-z0-9_.-]+)=([0-9a-f]{64})$ ]] || { printf 'hm 错误：--accept-unknown 参数须为 <文件名>=<64 位小写 sha256>\n' >&2; exit 2; }
+      ACCEPT["${BASH_REMATCH[1]}=${BASH_REMATCH[2]}"]=1 ;;
+    *) printf 'hm 错误：不认识的参数 %s\n' "$1" >&2; exit 2 ;;
+  esac
+done
 
 say() { printf 'hm %s\n' "$*"; }
 die() { printf 'hm 错误：%s\n' "$*" >&2; exit 1; }
@@ -60,7 +76,7 @@ PY_DROPIN_NAME="${LINGXI_HM_PY_DROPIN:-20-python312.conf}"
 BACKUP_ROOT="$ROOT${LINGXI_HM_BACKUP_ROOT:-/root/lingxi-884-backup}"
 PROD_OLD_UNIT_SHA="${LINGXI_HM_PROD_OLD_UNIT_SHA:-c14989d1d43e9eba62c423c70a9333de17102be9401f329f112b2569dfcac33b}"
 ROUND_TIMEOUT="${LINGXI_HM_ROUND_TIMEOUT:-150}"; POLL="${LINGXI_HM_POLL_SECONDS:-2}"; ALIGN="${LINGXI_HM_ALIGN:-1}"
-MANIFEST="$SELF_DIR/SHA256SUMS"
+MANIFEST="$SELF_DIR/SHA256SUMS"; KNOWN_FILE="$SELF_DIR/KNOWN_SHAS"
 CAND_UNIT="$SELF_DIR/$MONITOR_UNIT"; CAND_MON="$SELF_DIR/host_health_alert.py"; CAND_BAK="$SELF_DIR/db_backup.sh"
 [[ "$ROUND_TIMEOUT" =~ ^[0-9]+$ && "$POLL" =~ ^[0-9]+(\.[0-9]+)?$ ]] || die "LINGXI_HM_ROUND_TIMEOUT 须为整数、LINGXI_HM_POLL_SECONDS 须为数字"
 command -v "$SYSTEMCTL" >/dev/null 2>&1 || die "找不到 $SYSTEMCTL"
@@ -103,6 +119,27 @@ diff_keys() { # 两份单元里除注释 / 空行外逐行不同的键名（只�
 # ---------------- 前提（check / apply / status 共用；只读） ----------------
 FAIL=(); declare -A WANT=()
 NEED_LOCAL=0; LOCAL_USER=""; HOST_CONTRACT=""; CONTRACT_SOURCE=""; ENVIRONMENT=""; INJECT=""; FRAG=""; PRE_USER=""; PRE_ARGS=""; PY_DROPIN=""; MON_DST=""; BAK_DST=""; BK=""; DROPINS=()
+load_known() { # 已知版本清单：每行「sha256  文件名」；缺文件 → 前提不符，不回退到旧行为
+  local line n=0; KNOWN=()
+  if [[ ! -f "$KNOWN_FILE" ]]; then FAIL+=("同目录缺已知版本清单 KNOWN_SHAS（不回退到旧行为）"); return 0; fi
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    [[ -z "$line" ]] && continue
+    if [[ "$line" =~ ^([0-9a-f]{64})[[:space:]]+\*?([A-Za-z0-9_.-]+)$ ]]; then KNOWN["${BASH_REMATCH[2]}=${BASH_REMATCH[1]}"]=1; n=$((n + 1))
+    else FAIL+=("已知版本清单 KNOWN_SHAS 有不认识的行"); fi
+  done < "$KNOWN_FILE"
+  say "[已知版本] KNOWN_SHAS 共 $n 条"
+  (( n > 0 )) || FAIL+=("已知版本清单 KNOWN_SHAS 为空"); }
+# 在位文件的来历：不存在 / = 目标 / 已知旧版 / 已放行 → 通过；其余 → 前提不符。$1=标签 $2=在位路径 $3=清单里的文件名
+provenance() {
+  local sha; sha="$(sha_of "$2")"
+  if [[ "$sha" == absent ]]; then say "[来历] $1 $2 在位不存在 → 首次安装"
+  elif [[ "$sha" == "${WANT[$3]:-none}" ]]; then say "[来历] $1 sha=$sha = 目标 → already"
+  elif [[ -n "${KNOWN[$3=$sha]:-}" ]]; then say "[来历] $1 sha=$sha 是已知旧版 → 升级"
+  elif [[ -n "${ACCEPT[$3=$sha]:-}" ]]; then say "[放行] $1 $3 在位 sha=$sha 不在已知版本清单，按 --accept-unknown $3=$sha 放行"
+  else say "[来历] $1 $2 在位 sha=$sha 不是目标也不在已知版本清单 → 来历不明"
+    FAIL+=("$1在位文件 $3 sha=$sha 来历不明（不是目标、不在已知版本清单）；先读运维记录核对来历，确认后加 --accept-unknown $3=$sha")
+  fi; }
+declare -A KNOWN=()
 preflight() {
   local line name file py ver
   # 宿主契约
@@ -119,8 +156,9 @@ preflight() {
       if [[ "$(sha_of "$file")" == "${WANT[$name]}" ]]; then say "[输入] $name sha=${WANT[$name]} = 清单 → ok"
       else say "[输入] $name 在位 sha=$(sha_of "$file") ≠ 清单 ${WANT[$name]} → 不符"; FAIL+=("输入 $name 与清单不符"); fi
     done < "$MANIFEST"
-    for name in "$MONITOR_UNIT" host_health_alert.py db_backup.sh; do [[ -n "${WANT[$name]:-}" ]] || FAIL+=("清单缺 $name"); done
+    for name in "$MONITOR_UNIT" host_health_alert.py db_backup.sh KNOWN_SHAS; do [[ -n "${WANT[$name]:-}" ]] || FAIL+=("清单缺 $name"); done
   else FAIL+=("同目录缺清单 SHA256SUMS"); fi
+  load_known
   [[ -f "$CAND_UNIT" && -f "$CAND_MON" && -f "$CAND_BAK" ]] || { FAIL+=("同目录缺输入文件"); return 0; }
   # 注入点：候选单元自己的 ExecStart 第一段；须是链接且 3.11 以上
   INJECT="$(effective_from_files "$CAND_UNIT")"; INJECT="${INJECT%% *}"
@@ -162,7 +200,10 @@ preflight() {
     [[ -z "$(last_key User "$CAND_UNIT")" ]] || FAIL+=("候选单元本体不应含 User=")
     local body_user local_user; body_user="$(last_key User "$FRAG")"; local_user="$(last_key User "$FRAG.d/10-local.conf")"
     if [[ "$ENVIRONMENT" == production ]]; then
-      [[ "$(sha_of "$FRAG")" == "$PROD_OLD_UNIT_SHA" ]] || FAIL+=("生产在位单元本体 sha 既不是已知旧版也不是候选版")
+      local fsha; fsha="$(sha_of "$FRAG")"
+      if [[ "$fsha" == "$PROD_OLD_UNIT_SHA" || -n "${KNOWN[$MONITOR_UNIT=$fsha]:-}" ]]; then :
+      elif [[ -n "${ACCEPT[$MONITOR_UNIT=$fsha]:-}" ]]; then say "[放行] 单元本体 $MONITOR_UNIT 在位 sha=$fsha 不是已知旧版，按 --accept-unknown 放行"
+      else FAIL+=("生产在位单元本体 sha 既不是已知旧版也不是候选版"); fi
       [[ -z "$body_user" ]] || FAIL+=("生产在位单元本体含 User=（生产不许这类差异）")
     elif [[ -n "$body_user" && ! -e "$FRAG.d/10-local.conf" ]]; then
       NEED_LOCAL=1; LOCAL_USER="$body_user"; say "[预发] 本体带 User=、无 10-local.conf：apply 先写 10-local.conf（User= 同值）再换本体"
@@ -175,6 +216,7 @@ preflight() {
   bash -n "$CAND_BAK" 2>/dev/null || FAIL+=("候选 db_backup.sh bash -n 不通过")
   local bargv; bargv="$(exec_field argv "$BACKUP_UNIT")"; BAK_DST="$ROOT${bargv##* }"
   [[ -n "$(sv FragmentPath "$BACKUP_UNIT")" && "$BAK_DST" == */db_backup.sh ]] || FAIL+=("$BACKUP_UNIT 未装或 ExecStart 不指向 db_backup.sh")
+  provenance 巡检脚本 "$MON_DST" host_health_alert.py; provenance 备份脚本 "$BAK_DST" db_backup.sh
   return 0; }
 
 plan_steps() {
