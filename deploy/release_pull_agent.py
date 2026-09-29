@@ -42,7 +42,7 @@ sys.dont_write_bytecode = True
 
 # 代理程序自身的版本标记：自替换只在包内代理的标记严格大于在位标记时进行（单调，防降级）。
 # 标记按下面的正则从源码文本读出，不导入、不执行候选文件；代理行为有改动时同步加一。
-AGENT_VERSION = 3
+AGENT_VERSION = 4
 AGENT_VERSION_PATTERN = re.compile(r"^AGENT_VERSION = ([0-9]+)$", re.MULTILINE)
 AGENT_BUNDLE_PATH = "deploy/release_pull_agent.py"
 AGENT_FILE_LIMIT = 2 * 1024 * 1024
@@ -65,7 +65,7 @@ CONFIG_KEYS = frozenset(
 )
 # 可选配置键缺省即启用：预发 / 生产既有配置文件不含它们也必须通过校验，否则新代理首轮
 # 就会以 config_shape 拒绝启动。
-OPTIONAL_CONFIG_KEYS = frozenset({"agent_self_update", "pat_metadata_file"})
+OPTIONAL_CONFIG_KEYS = frozenset({"agent_self_update", "pat_metadata_file", "image_prune"})
 # 机器身份入口用的个人访问令牌（PAT）没有运行时接口可查到期日：到期日由引导安装写在
 # 令牌文件旁的元数据里，代理只读元数据、不读令牌文件。进入到期前窗口起每日提醒一次。
 PAT_METADATA_FILE_NAME = "gh.env.meta"
@@ -564,12 +564,19 @@ def validate_config(config: object) -> dict:
         raise AgentError("config_shape")
     if "pat_metadata_file" in config and not _safe_path(config["pat_metadata_file"]):
         raise AgentError("config_shape")
+    if type(_image_prune_enabled(config)) is not bool:
+        raise AgentError("config_shape")
     return config
 
 
 def _self_update_enabled(config: dict) -> object:
     """自替换开关缺省开启；键不在场就是 True。"""
     return config.get("agent_self_update", True)
+
+
+def _image_prune_enabled(config: dict) -> object:
+    """部署成功后按名单清理旧镜像的开关缺省开启；键不在场就是 True。"""
+    return config.get("image_prune", True)
 
 
 def _pat_metadata_path(config: dict) -> Path:
@@ -1697,6 +1704,29 @@ def notice_card_payload(title: str, tone: str, sections) -> dict:
     }
 
 
+NOTICE_PREFIX = "[lingxi] "
+# 旧版标题标签（如「[BI Plus 预发]」）：去掉 BI Plus 与方括号、保留标签内其余字样
+# （「预发」这类字样区分环境，不能丢），不出现两层方括号。
+_LEGACY_TITLE_TAG = re.compile(r"^\[BI Plus([^\]\n]*)\]\s*")
+
+
+def with_notice_prefix(line: str) -> str:
+    """管理群消息的标题或纯文本首行加项目名前缀；已带前缀不叠加，旧 BI Plus 标签改写。"""
+    if line.startswith(NOTICE_PREFIX):
+        return line
+    match = _LEGACY_TITLE_TAG.match(line)
+    if match is None:
+        return NOTICE_PREFIX + line
+    kept = match.group(1).strip()
+    return NOTICE_PREFIX + (kept + " " if kept else "") + line[match.end() :]
+
+
+def prefixed_text(text: str) -> str:
+    """纯文本（无卡片路径与卡片被拒的回落）只在首行开头加前缀，其余行不动。"""
+    first, newline, rest = text.partition("\n")
+    return with_notice_prefix(first) + newline + rest
+
+
 class AlertNotice(str):
     """告警正文本身（等价纯文本，与改造前逐字相同）外加同一内容的通知卡输入。
 
@@ -1710,7 +1740,9 @@ class AlertNotice(str):
     def __new__(cls, text: str, *, title: str, tone: str, sections: tuple):
         """保存正文与卡片的标题、色调、分段。"""
         notice = super().__new__(cls, text)
-        notice.title, notice.tone, notice.sections = title, tone, sections
+        # 标题前缀在这里加：卡片与共用通知卡类型的逐键对照用的是同一个 ``title``。
+        notice.title = with_notice_prefix(title)
+        notice.tone, notice.sections = tone, sections
         return notice
 
     def card_payload(self) -> dict:
@@ -1739,7 +1771,7 @@ def send_alert(message: str, env_file: Path, timeout_seconds: int) -> None:
         timeout_seconds,
     )
     chat_id = credentials["LINGXI_ADMIN_GROUP_CHAT_ID"]
-    text = {"text": str(message)}
+    text = {"text": prefixed_text(str(message))}
     if not isinstance(message, AlertNotice):
         _post_alert(token, chat_id, "text", text, timeout_seconds)
         return
@@ -3141,7 +3173,7 @@ def _run_locked(
             reason=deployer_reason,
         )
         verified = deployer_state == "verified"
-        return _finish(
+        code = _finish(
             state,
             host,
             config,
@@ -3160,6 +3192,402 @@ def _run_locked(
             remember_target=verified,
             reason=deployer_reason,
         )
+        # 状态账与通知已按部署结论收口后才清理：清理的任何结局都不回头改部署结果。
+        # 已在位的两条路径（already_in_place / already_in_place_external）不经过这里，不清理。
+        if verified:
+            _prune_after_verified(host, config, state_directory, plan)
+        return code
+
+
+# ---------------------------------------------------------------------------
+# 部署成功后按名单清理旧镜像（#910 第二步）
+#
+# 名单只由 ``image_prune_lists`` 一个纯函数计算，自动路径与单次命令共用。保留集 = 当次计划
+# ``old`` + ``new`` 两组四镜像摘要（部署器 preflight 要求 old 四镜像按摘要在位）+ 任何容器
+# （含已停止）引用的镜像；候选删除只限计划里出现的本产品四个镜像仓库，其他任何镜像（数据库、
+# 同机其他项目）永不进候选。删除只按镜像 ID 逐个 ``docker image rm``，不加 -f、不用任何
+# prune；清理的任何失败只记日志，不改部署结果、不改状态账。
+# ---------------------------------------------------------------------------
+
+PRUNE_REFUSED_OLD_MISSING = "old_release_missing"
+PRUNE_REFUSED_NEW_MISSING = "new_release_missing"
+PRUNE_REFUSED_FIRST_TAKEOVER = "first_takeover"
+PRUNE_REFUSED_OLD_SOURCE_UNKNOWN = "old_source_unknown"
+PRUNE_REFUSED_PREVIOUS_UNAVAILABLE = "previous_release_unavailable"
+_IMAGE_ID = re.compile(r"^sha256:[0-9a-f]{64}$")
+_CONTAINER_ID = re.compile(r"^[0-9a-f]{12,64}$")
+
+
+def _reference_repository(reference: object) -> str | None:
+    """镜像引用的仓库部分：去掉 ``@摘要`` 或末段 ``:标签``；``<none>`` 视为没有仓库。"""
+    if not isinstance(reference, str) or not reference:
+        return None
+    if "@" in reference:
+        repository = reference.split("@", 1)[0]
+    else:
+        slash = reference.rfind("/")
+        colon = reference.rfind(":")
+        repository = reference[:colon] if colon > slash else reference
+    return None if not repository or repository == "<none>" else repository
+
+
+def _reference_digest(reference: object) -> str | None:
+    if not isinstance(reference, str) or "@" not in reference:
+        return None
+    digest = reference.rsplit("@", 1)[1]
+    return digest if IMAGE_DIGEST.fullmatch(digest) else None
+
+
+def _release_image_refs(release: object) -> list[str] | None:
+    """一组发布的四镜像引用；缺服务、形状不符或摘要畸形都返回 None（宁可不删）。"""
+    if not isinstance(release, dict):
+        return None
+    images = release.get("images")
+    if not isinstance(images, dict) or set(images) != set(SERVICES):
+        return None
+    refs = [images[service] for service in SERVICES]
+    if any(_reference_digest(ref) is None or _reference_repository(ref) is None for ref in refs):
+        return None
+    return refs
+
+
+def _image_label(image: dict) -> tuple[str, str]:
+    """日志 / 名单里的镜像名与摘要前 12 位（无仓库摘要时退回镜像 ID 前 12 位）。"""
+    names = [tag for tag in image["repo_tags"] if _reference_repository(tag)]
+    names += [_reference_repository(ref) for ref in image["repo_digests"]]
+    name = next((item for item in names if item), "<none>")
+    digests = [_reference_digest(ref) for ref in image["repo_digests"]]
+    digest = next((item for item in digests if item), image["id"])
+    return name, digest.split(":", 1)[-1][:12]
+
+
+def image_prune_lists(
+    plan: object, old_source: object, images: list, container_image_ids: set
+) -> dict:
+    """纯函数：按计划与本机现状算保留集与候选删除名单，不做任何调用。
+
+    ``images`` 每项为 ``{"id", "repo_tags", "repo_digests", "size"}``；``container_image_ids``
+    为所有容器（含已停止）引用的镜像 ID。返回 ``refused``（拒绝原因或 None）、``keep``
+    （本机在位且被保留的本产品镜像，附保留原因）、``missing``（计划引用但本机不在位）、
+    ``candidates``（候选删除）。拒绝时候选恒为空。
+    """
+    result = {"refused": None, "keep": [], "missing": [], "candidates": []}
+    old_refs = _release_image_refs(plan.get("old") if isinstance(plan, dict) else None)
+    new_refs = _release_image_refs(plan.get("new") if isinstance(plan, dict) else None)
+    if old_refs is None:
+        result["refused"] = PRUNE_REFUSED_OLD_MISSING
+        return result
+    if new_refs is None:
+        result["refused"] = PRUNE_REFUSED_NEW_MISSING
+        return result
+    if old_source == "first_takeover":
+        result["refused"] = PRUNE_REFUSED_FIRST_TAKEOVER
+        return result
+    if not isinstance(old_source, str) or not old_source:
+        result["refused"] = PRUNE_REFUSED_OLD_SOURCE_UNKNOWN
+        return result
+    planned = {}
+    for side, refs in (("plan_old", old_refs), ("plan_new", new_refs)):
+        for ref in refs:
+            planned.setdefault(_reference_digest(ref), (side, ref))
+    product_repositories = {_reference_repository(ref) for ref in old_refs + new_refs}
+    present_digests = set()
+    for image in images:
+        digests = {_reference_digest(ref) for ref in image["repo_digests"]} - {None}
+        present_digests |= digests
+        repositories = {
+            _reference_repository(ref) for ref in image["repo_tags"] + image["repo_digests"]
+        } - {None}
+        # 只要沾一个非本产品仓库（或完全无仓库信息）就不在范围：不保留、不删除、不列出。
+        if not repositories or not repositories <= product_repositories:
+            continue
+        name, digest = _image_label(image)
+        entry = {"id": image["id"], "name": name, "digest": digest, "size": image["size"]}
+        planned_hits = sorted(planned[item][0] for item in digests if item in planned)
+        if planned_hits:
+            result["keep"].append(dict(entry, reason=planned_hits[0]))
+        elif image["id"] in container_image_ids:
+            result["keep"].append(dict(entry, reason="container"))
+        else:
+            result["candidates"].append(entry)
+    for digest, (side, ref) in planned.items():
+        if digest not in present_digests:
+            result["missing"].append(
+                {"name": _reference_repository(ref), "digest": digest[7:19], "reason": side}
+            )
+    return result
+
+
+class DockerImages:
+    """清理用到的全部 Docker 调用集中在此，测试以同名方法的桩对象替换。"""
+
+    def __init__(self, docker: str, timeout: int):
+        """绑定宿主契约里的 docker 命令与单次调用超时。"""
+        self.docker = docker
+        self.timeout = timeout
+
+    def list_images(self) -> list:
+        """本机全部顶层镜像（含无标签的悬空镜像）；任一步读不清即整体失败关闭。"""
+        try:
+            raw = _run_command(
+                [self.docker, "image", "ls", "-q", "--no-trunc"], timeout=self.timeout, env=None
+            )
+        except AgentError:
+            raise AgentError("docker_inspect_unavailable") from None
+        images = []
+        for identifier in dict.fromkeys(raw.split()):
+            if not _IMAGE_ID.fullmatch(identifier):
+                raise AgentError("docker_inspect_unavailable")
+            inspected = _run_inspect_command(
+                [
+                    self.docker,
+                    "image",
+                    "inspect",
+                    "--format",
+                    "{{json .Id}}\n{{json .RepoTags}}\n{{json .RepoDigests}}\n{{json .Size}}",
+                    identifier,
+                ],
+                self.timeout,
+            )
+            if inspected is None:
+                continue
+            lines = inspected.splitlines()
+            if len(lines) != 4:
+                raise AgentError("docker_inspect_unavailable")
+            try:
+                image_id, tags, digests, size = (json.loads(line) for line in lines)
+            except (UnicodeDecodeError, json.JSONDecodeError):
+                raise AgentError("docker_inspect_unavailable") from None
+            tags = tags or []
+            digests = digests or []
+            if (
+                image_id != identifier
+                or not isinstance(tags, list)
+                or not isinstance(digests, list)
+                or any(not isinstance(item, str) for item in tags + digests)
+                or type(size) is not int
+            ):
+                raise AgentError("docker_inspect_unavailable")
+            images.append(
+                {"id": image_id, "repo_tags": tags, "repo_digests": digests, "size": size}
+            )
+        return images
+
+    def container_image_ids(self) -> set:
+        """所有容器（任何项目、含已停止）引用的镜像 ID。"""
+        try:
+            raw = _run_command(
+                [self.docker, "ps", "-aq", "--no-trunc"], timeout=self.timeout, env=None
+            )
+        except AgentError:
+            raise AgentError("docker_inspect_unavailable") from None
+        result = set()
+        for identifier in raw.split():
+            if not _CONTAINER_ID.fullmatch(identifier):
+                raise AgentError("docker_inspect_unavailable")
+            inspected = _run_inspect_command(
+                [self.docker, "inspect", "--format", "{{json .Image}}", identifier], self.timeout
+            )
+            if inspected is None:
+                continue
+            try:
+                image_id = json.loads(inspected)
+            except (UnicodeDecodeError, json.JSONDecodeError):
+                raise AgentError("docker_inspect_unavailable") from None
+            if not isinstance(image_id, str) or not _IMAGE_ID.fullmatch(image_id):
+                raise AgentError("docker_inspect_unavailable")
+            result.add(image_id)
+        return result
+
+    def remove(self, image_id: str) -> bool:
+        """按镜像 ID 删一个；不加 -f，被容器引用或多仓库引用时 Docker 自己会拒绝。"""
+        if not _IMAGE_ID.fullmatch(image_id):
+            return False
+        try:
+            _run_command([self.docker, "image", "rm", image_id], timeout=self.timeout, env=None)
+        except AgentError:
+            return False
+        return True
+
+    def present(self, reference: str) -> bool:
+        """按摘要引用回读在位：``docker image inspect`` 退出码 0。"""
+        return (
+            _run_inspect_command(
+                [self.docker, "image", "inspect", "--format", "{{json .Id}}", reference],
+                self.timeout,
+            )
+            is not None
+        )
+
+
+def _size_mb(size: object) -> int:
+    return int(size) // (1024 * 1024) if type(size) is int else 0
+
+
+def _plan_old_source(state_directory: Path, plan: dict) -> str | None:
+    """部署器阶段账记下的 old 来源（``first_takeover`` / 上一次 verified 计划 ID）；读不到为 None。"""
+    try:
+        ledger = _read_json(state_directory / f"{plan['id']}.state.json", private=True)
+    except (AgentError, OSError, KeyError, TypeError):
+        return None
+    inventory = ledger.get("inventory") if isinstance(ledger, dict) else None
+    source = inventory.get("old_source") if isinstance(inventory, dict) else None
+    return source if isinstance(source, str) and source else None
+
+
+def run_image_prune(plan: dict, old_source: object, docker, *, dry_run: bool) -> dict:
+    """算名单并（非演练时）逐个删除、回读计划镜像在位；全程只写日志。"""
+    plan_id = plan.get("id") if isinstance(plan, dict) else None
+    lists = image_prune_lists(plan, old_source, docker.list_images(), docker.container_image_ids())
+    summary = {"refused": lists["refused"], "removed": [], "failed": [], "readback_missing": []}
+    if lists["refused"] is not None:
+        _log("image_prune", "refused", plan_id=plan_id, reason=lists["refused"])
+        return summary
+    for entry in lists["keep"]:
+        _log(
+            "image_prune",
+            "keep",
+            name=entry["name"],
+            digest=entry["digest"],
+            size_mb=_size_mb(entry["size"]),
+            reason=entry["reason"],
+        )
+    for entry in lists["missing"]:
+        _log(
+            "image_prune",
+            "keep_missing",
+            name=entry["name"],
+            digest=entry["digest"],
+            reason=entry["reason"],
+        )
+    for entry in lists["candidates"]:
+        _log(
+            "image_prune",
+            "candidate",
+            name=entry["name"],
+            digest=entry["digest"],
+            size_mb=_size_mb(entry["size"]),
+        )
+    if not dry_run:
+        for entry in lists["candidates"]:
+            removed = docker.remove(entry["id"])
+            (summary["removed"] if removed else summary["failed"]).append(entry)
+            _log(
+                "image_prune",
+                "removed" if removed else "rm_failed",
+                name=entry["name"],
+                digest=entry["digest"],
+                size_mb=_size_mb(entry["size"]),
+            )
+        for side in ("old", "new"):
+            for ref in _release_image_refs(plan[side]):
+                if not docker.present(ref):
+                    summary["readback_missing"].append(ref)
+                    _log(
+                        "image_prune",
+                        "readback_missing",
+                        name=_reference_repository(ref),
+                        digest=_reference_digest(ref)[7:19],
+                        reason="plan_" + side,
+                    )
+    _log(
+        "image_prune",
+        "dry_run" if dry_run else "summary",
+        plan_id=plan_id,
+        keep=len(lists["keep"]),
+        missing=len(lists["missing"]),
+        candidates=len(lists["candidates"]),
+        removed=len(summary["removed"]),
+        failed=len(summary["failed"]),
+        freed_mb=_size_mb(sum(entry["size"] for entry in summary["removed"])),
+        readback_missing=len(summary["readback_missing"]),
+    )
+    return summary
+
+
+def _prune_after_verified(host: dict, config: dict, state_directory: Path, plan: dict) -> None:
+    """部署器 verified 之后的自动清理：任何异常都只记一行日志，绝不外抛。"""
+    try:
+        if not _image_prune_enabled(config):
+            _log("image_prune", "disabled", plan_id=plan.get("id"))
+            return
+        run_image_prune(
+            plan,
+            _plan_old_source(state_directory, plan),
+            DockerImages(host["docker"], config["poll_timeout_seconds"]),
+            dry_run=False,
+        )
+    except AgentError as error:
+        _log("image_prune", "error", plan_id=plan.get("id"), reason=error.code)
+    except Exception:
+        _log("image_prune", "error", plan_id=plan.get("id"), reason=REASON_UNEXPECTED_EXCEPTION)
+
+
+def _manual_prune_plan(state: dict, state_directory: Path) -> dict | None:
+    """单次命令的名单来源：状态账最近一次由部署器 verified 的计划（new = 当前版、old = 上一正式版）。
+
+    只在状态账 ``deployer_state`` 为 verified、计划文件可读、计划 new 的标签等于 ``target_tag``
+    且其三个常驻服务摘要等于 ``verified_digests`` 时采用；外部在位推进过目标而计划没跟上、
+    或任何一项对不上，都取不到上一正式版，返回 None 由调用方拒绝执行。
+    """
+    if state.get("deployer_state") != "verified":
+        return None
+    plan = _previous_plan(state, state_directory)
+    if not isinstance(plan, dict) or not isinstance(plan.get("new"), dict):
+        return None
+    if plan["new"].get("tag") != state.get("target_tag"):
+        return None
+    if _release_image_refs(plan["new"]) is None or _release_image_refs(plan.get("old")) is None:
+        return None
+    try:
+        expected = _expected_digests(plan["new"])
+    except (KeyError, TypeError, AttributeError, IndexError):
+        return None
+    return plan if _state_digests(state) == expected else None
+
+
+def prune_images_once(
+    host_path: Path, config_path: Path, state_directory: Path, *, dry_run: bool
+) -> int:
+    """单次清理命令：不经部署直接按同一名单函数演练或真删；不写状态账、不发通知。"""
+    host_path, config_path, state_directory = (
+        _check_cli_path(host_path),
+        _check_cli_path(config_path),
+        _check_cli_path(state_directory),
+    )
+    host = validate_host(_read_json(host_path, private=True))
+    config = validate_config(_read_json(config_path, private=False))
+    if host["host"] != socket.gethostname():
+        _log("image_prune", "host_mismatch", host=host["host"])
+        return 1
+    if not state_directory.exists():
+        _log("image_prune", "refused", reason=PRUNE_REFUSED_PREVIOUS_UNAVAILABLE)
+        return 1
+    _private_directory(state_directory)
+
+    def _once() -> int:
+        state = _load_state(state_directory / "pull-agent.json", host)
+        plan = _manual_prune_plan(state, state_directory)
+        if plan is None:
+            _log("image_prune", "refused", reason=PRUNE_REFUSED_PREVIOUS_UNAVAILABLE)
+            return 1
+        summary = run_image_prune(
+            plan,
+            _plan_old_source(state_directory, plan),
+            DockerImages(host["docker"], config["poll_timeout_seconds"]),
+            dry_run=dry_run,
+        )
+        failed = summary["refused"] or summary["failed"] or summary["readback_missing"]
+        return 1 if failed else 0
+
+    if dry_run:
+        return _once()
+    try:
+        with _run_lock(state_directory):
+            return _once()
+    except AgentError as error:
+        _log("image_prune", error.code, host=host["host"])
+        return 1
 
 
 @contextlib.contextmanager
@@ -3271,9 +3699,19 @@ def main(argv: list[str] | None = None) -> int:
     sub = parser.add_subparsers(dest="operation", required=True)
     sub.add_parser("run", help="执行一轮发布拉取与部署接续")
     sub.add_parser("status", help="只读打印代理状态账")
+    prune = sub.add_parser(
+        "prune-images", help="按最近一次 verified 计划的名单清理旧镜像（不经部署）"
+    )
+    mode = prune.add_mutually_exclusive_group(required=True)
+    mode.add_argument("--dry-run", action="store_true", help="只打印保留集与候选删除，零写入")
+    mode.add_argument("--yes", action="store_true", help="按名单逐个删除并回读保留集在位")
     args = parser.parse_args(argv)
     if args.operation == "run":
         return run_once(args.host_contract, args.config, args.state_directory)
+    if args.operation == "prune-images":
+        return prune_images_once(
+            args.host_contract, args.config, args.state_directory, dry_run=args.dry_run
+        )
     return status_once(args.host_contract, args.config, args.state_directory)
 
 
