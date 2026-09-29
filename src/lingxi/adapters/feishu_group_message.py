@@ -18,7 +18,9 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import re
 from collections.abc import Callable, Mapping
+from dataclasses import replace
 from typing import Any
 
 from lingxi.adapters.feishu_directory import urllib_transport
@@ -57,7 +59,27 @@ DELIVERY_UUID_MAX_LENGTH = 50
 #: ``lxcard-``。长度不变，合法的文本前缀推出的卡片前缀必然也在 50 字符上限内。
 TEXT_UUID_PREFIX_HEAD = "lingxi-"
 CARD_UUID_PREFIX_HEAD = "lxcard-"
+#: 管理群消息统一带的项目名前缀；只加在发往管理群的消息上，个人私聊不经本出口。
+GROUP_TITLE_PREFIX = "[lingxi] "
+_LEGACY_LABEL_PATTERN = re.compile(r"^\[BI Plus\s*([^\]\n]*)\]\s*")
 SendOutcomeCallback = Callable[[str, bool], None]
+
+
+def _keep_label(match: re.Match[str]) -> str:
+    """旧标签去掉 ``BI Plus`` 与方括号，保留其余字样（如「运行告警」）并与后文隔一个空格。"""
+    label = match.group(1).strip()
+    return f"{label} " if label else ""
+
+
+def with_group_prefix(text: str) -> str:
+    """给管理群消息的标题或首行加 ``[lingxi] `` 前缀；已带则原样返回（幂等）。
+
+    首行以旧标签 ``[BI Plus …]`` 开头的，去掉 ``BI Plus`` 与方括号、保留标签内其余字样，
+    避免出现两层方括号。
+    """
+    if text.startswith(GROUP_TITLE_PREFIX):
+        return text
+    return GROUP_TITLE_PREFIX + _LEGACY_LABEL_PATTERN.sub(_keep_label, text, count=1)
 
 
 def delivery_uuid(chat_id: str, dedupe_key: str, *, prefix: str = DELIVERY_UUID_PREFIX) -> str:
@@ -239,7 +261,7 @@ class FeishuGroupMessages:
                     "receive_id": chat_id,
                     "msg_type": "text",
                     # 飞书把 content 定义成一段 **JSON 字符串**，不是对象。
-                    "content": json.dumps({"text": text}, ensure_ascii=False),
+                    "content": json.dumps({"text": with_group_prefix(text)}, ensure_ascii=False),
                     "uuid": delivery_uuid(chat_id, dedupe_key, prefix=self._uuid_prefix),
                 },
                 token=token,
@@ -290,7 +312,7 @@ class FeishuGroupMessages:
                     token,
                     chat_id=chat_id,
                     msg_type="interactive",
-                    content=card.to_payload(),
+                    content=replace(card, title=with_group_prefix(card.title)).to_payload(),
                     uuid=card_uuid,
                 )
             except FeishuGroupMessageError as error:
@@ -302,7 +324,7 @@ class FeishuGroupMessages:
                     token,
                     chat_id=chat_id,
                     msg_type="text",
-                    content={"text": card.fallback_text},
+                    content={"text": with_group_prefix(card.fallback_text)},
                     uuid=delivery_uuid(chat_id, dedupe_key, prefix=self._uuid_prefix),
                 )
         except Exception:

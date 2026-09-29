@@ -208,10 +208,8 @@ class AlertSignal:
             raise ValueError("只有飞书发送失败与投递链路故障事件可以标记为 final")
 
 
-#: 九类系统告警 → 中文标签：此前群消息是一行英文 key=value，运维之外的管理员读不
-#: 懂；照抄 ``scripts/ops/host_health_alert.py::render_message`` 的分行中文标签
-#: 范式，标题带 ``[BI Plus 运行告警]`` 前缀 + 告警/恢复动作，正文按"类型/范围/
-#: 次数/时间/追溯号"五个中文标签分行，与宿主监控脚本同一视觉范式。
+#: 九类系统告警 → 中文标签：照抄 ``scripts/ops/host_health_alert.py::render_message``
+#: 的分行中文标签范式：标题行 ``[BI Plus 运行告警]`` + 动作，正文按五个中文标签分行。
 _ALERT_KIND_LABEL: dict[AlertKind, str] = {
     AlertKind.PROCESS_INACTIVE: "进程无心跳",
     AlertKind.QUEUED_STUCK: "任务排队超时未领取",
@@ -256,6 +254,8 @@ class AlertNotice:
         render_message`` 的姊妹渲染函数。``event_type`` 这个"scope.kind"
         组合键仍通过 :attr:`event_type` 属性对外，只是不再原样拼进正文。
         """
+        from lingxi.core.alert_card import format_utc_with_beijing
+
         action_label = _NOTICE_ACTION_LABEL[self.action]
         kind_label = _ALERT_KIND_LABEL.get(self.kind, self.kind.value)
         trace = self.trace_id or "-"
@@ -269,7 +269,7 @@ class AlertNotice:
             f"类型：{kind_label}\n"
             f"范围：{self.scope}\n"
             f"次数：{self.count}\n"
-            f"时间：{self.observed_at.isoformat()}\n"
+            f"时间：{format_utc_with_beijing(self.observed_at)}\n"
             f"{label}：{trace}"
         )
 
