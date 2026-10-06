@@ -5,6 +5,10 @@
 路径、preflight 的来源连接串不外泄、来源连接串文件可改（预发保底导出替身库用）、install-pg 的幂等与
 回读判据、switch-dsn 在改任何文件之前的前置门、status 汇总。停写 / dump / restore / verify / postcheck
 依赖真实库，不在本文件范围（预发实跑见 #896）。
+
+用例结论不随真实运行者的 uid 变化：桩目录里的 ``id`` 桩把 ``id -u`` 固定成非 0，脚本据此一律走测试形。
+没有这个桩时，以 root 跑单测会让脚本改走正式形（属主设置、宿主 ``getent`` 解析探针都按真实宿主执行），
+拒绝路径用例根本走不到、其余用例卡在宿主解析上。
 """
 
 from __future__ import annotations
@@ -17,7 +21,12 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from support.fake_db_switch import base_env, install_recreate_docker, install_stubs
+from support.fake_db_switch import (
+    base_env,
+    install_recreate_docker,
+    install_stubs,
+    write_executable,
+)
 
 REPOSITORY_ROOT = Path(__file__).parents[1]
 SCRIPT = REPOSITORY_ROOT / "scripts" / "ops" / "db_switch_to_local.sh"
@@ -25,6 +34,13 @@ COMPOSE = REPOSITORY_ROOT / "deploy" / "compose.db.yaml"
 SECRET = "s30-sentinel-pw-7c1e"
 SOURCE_HOST = "source-host.invalid:6543"
 ENV_SERVICES = ("scheduler", "gateway", "worker", "worker-queue", "migrate", "reauthorize")
+
+# 只改写 `id -u`（脚本据此判定运行身份），其余调用交给真实 id；桩目录在 PATH 最前，去掉它再转交。
+FAKE_ID = r"""#!/usr/bin/env bash
+if [[ "$*" == "-u" ]]; then echo "${FAKE_UID:-1000}"; exit 0; fi
+PATH="${PATH#"${0%/*}":}"
+exec id "$@"
+"""
 
 
 def _sha(path: Path) -> str:
@@ -50,6 +66,7 @@ class _FakeRootBase(unittest.TestCase):
         self.root.mkdir()
         self.state.mkdir()
         self.stubs = install_stubs(self.bin)
+        self.stubs["id"] = write_executable(self.bin / "id", FAKE_ID)
         contract = self.root / "opt" / "lingxi" / "control" / "host-contract.json"
         contract.parent.mkdir(parents=True)
         contract.write_text(
