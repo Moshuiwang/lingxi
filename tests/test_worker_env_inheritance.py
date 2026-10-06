@@ -2,7 +2,9 @@
 
 事实链：
 
-- ``adapters/claude_agent_session.py`` 不传 ``options.env``；
+- ``adapters/claude_agent_session.py`` 传的 ``options.env`` 只有一个固定开关
+  （关闭 CLI 附件通道的 ``CLAUDE_CODE_DISABLE_ATTACHMENTS``），不含任何 ``LINGXI_``
+  变量，由 ``AdapterEnvCarriesOnlyTheAttachmentSwitchTest`` 钉住；
 - ``claude-agent-sdk`` 起 CLI 子进程时用
   ``inherited_env = {k: v for k, v in os.environ.items() if k != "CLAUDECODE"}``
   再叠 ``**self._options.env``（``_internal/transport/subprocess_cli.py``）——
@@ -277,6 +279,20 @@ class MainDoesNotMutateProcessEnvironmentTest(unittest.TestCase):
         self.assertNotIn("hunter2", combined, "启动日志不得回显连接串取值")
 
 
+class AdapterEnvCarriesOnlyTheAttachmentSwitchTest(unittest.TestCase):
+    """会话选项的 ``env`` 会被 SDK 叠回 CLI 子进程环境：入口摘掉的连接串不得从这里回来。
+
+    源码级断言：这一层要证明的是「适配器传给 SDK 的固定开关表里有什么」，不需要起 SDK。
+    """
+
+    def test_the_fixed_switch_table_has_exactly_one_entry_and_no_lingxi_variable(self) -> None:
+        from lingxi.adapters.claude_agent_session import SDK_SUBPROCESS_ENV
+
+        self.assertEqual(dict(SDK_SUBPROCESS_ENV), {"CLAUDE_CODE_DISABLE_ATTACHMENTS": "1"})
+        self.assertFalse([key for key in SDK_SUBPROCESS_ENV if key.startswith("LINGXI_")])
+        self.assertNotIn(DSN_VAR, SDK_SUBPROCESS_ENV)
+
+
 @unittest.skipUnless(
     importlib.util.find_spec("claude_agent_sdk"), "跳过：本环境未安装 claude-agent-sdk"
 )
@@ -299,6 +315,13 @@ class SdkOptionsEnvCannotDeleteAnInheritedVariableTest(unittest.TestCase):
 
         self.assertIn("os.environ.items()", text, "SDK 仍然整份继承 os.environ")
         self.assertIn("**self._options.env", text, "options.env 是叠加，不是替换")
+        # 叠加次序决定谁赢：options.env 必须排在继承来的环境之后，部署环境里即使
+        # 残留 CLAUDE_CODE_DISABLE_ATTACHMENTS=0，也会被会话选项里的 1 覆盖。
+        self.assertLess(
+            text.index("**inherited_env"),
+            text.index("**self._options.env"),
+            "options.env 必须覆盖继承来的同名变量，否则附件开关可能被部署环境改掉",
+        )
         self.assertNotIn(
             "process_env = dict(self._options.env)",
             text,

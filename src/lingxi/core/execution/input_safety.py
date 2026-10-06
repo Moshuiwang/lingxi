@@ -1,9 +1,9 @@
 """外部文本的角色边界与模型输出的最后一道约束。
 
 这不是通用内容审核器，也不是把模型行为假设成可靠的 prompt firewall。它只做三件
-确定性的事：把外部系统返回的自由文本包成不可伪造的「待分析内容」数据段；在用户
-问题交给执行层前把「第一个字符是 /」的文本中性化，防止底层 CLI 解析成系统斜杠
-命令（见 ``compose_agent_prompt``）；并在 worker 输出离开进程前移除已知的敏感值、
+确定性的事：把外部系统返回的自由文本包成不可伪造的「待分析内容」数据段；在交给
+执行层前中性化底层 CLI 会解析的两类语法——开头的 / 斜杠命令与 @ 文件提及（见
+``compose_agent_prompt``）；并在 worker 输出离开进程前移除已知的敏感值、
 内部工具标识和系统提示。工具能否执行仍由 ``ToolGateway`` 判定，这里不复制
 权限规则；模块保持在 ``core``，便于用固定夹具证明负向边界。出口约束的产品
 合同：1) 敏感片段只替换对应片段，一次命中不得让整段有效结论
@@ -271,17 +271,36 @@ def _neutralize_leading_slash(question: str) -> str:
     return question
 
 
+# 底层 CLI 把行首、空白或部分中文标点之后的 @ 当作文件 / MCP 资源 / 子代理提及，
+# 在 hook 之外直接读本机文件塞进模型上下文。这里取它的超集：除紧跟在 ASCII 字母
+# 数字之后（邮箱地址的形态，CLI 不认作提及）以外的 @ 一律换成全角 ＠。会话选项里
+# 同时关掉了 CLI 的附件通道，这里是不依赖那个开关的第二层。
+_AT_MENTION_TRIGGER = re.compile(r"(?<![A-Za-z0-9])@")
+_AT_MENTION_NEUTRALIZED = "＠"
+
+
+def _neutralize_at_mentions(text: str) -> str:
+    """把可能被 CLI 认作提及的 ``@`` 换成全角 ``＠``；邮箱形态的 ``@`` 原样保留。
+
+    作用于拼好的整段输入（用户问题与外部文本都在内），所以必须是最后一步：
+    之后再拼进去的任何文本都会绕过它。不含 ``@`` 的输入逐字节不变。
+    """
+    return _AT_MENTION_TRIGGER.sub(_AT_MENTION_NEUTRALIZED, text)
+
+
 def compose_agent_prompt(question: str, external_texts: ExternalTextItems | None = None) -> str:
     """为受控测试 / 编排调用构造带数据边界的 Agent 输入。
 
     ``question`` 在拼接外部上下文之前先经过 :func:`_neutralize_leading_slash`——
-    这一步只影响「/ 开头」的问题，其余输入不变。
+    这一步只影响「/ 开头」的问题；拼好的整段最后经过
+    :func:`_neutralize_at_mentions`，只影响会被认作提及的 ``@``。
     """
     if not isinstance(question, str):
         raise InputSafetyError("Agent 问题必须是字符串")
     safe_question = _neutralize_leading_slash(question)
     context = render_external_context(external_texts)
-    return safe_question if not context else f"{safe_question}\n\n{context}"
+    prompt = safe_question if not context else f"{safe_question}\n\n{context}"
+    return _neutralize_at_mentions(prompt)
 
 
 def constrain_output(

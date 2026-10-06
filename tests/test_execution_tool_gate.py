@@ -854,6 +854,134 @@ class DecisionSurvivesAuditFailureTest(unittest.TestCase):
         self.assertEqual(len(gateway.audit.summary().calls), 1)
 
 
+class PreToolUseFailsClosedTest(unittest.TestCase):
+    """`V-执行-29`：判定链路自己抛异常时，PreToolUse 必须按拒绝应答，不得把异常抛给 SDK。
+
+    锁定版 CLI 把 hook 回调异常当作「没有意见」，随后交给 ``dontAsk`` 与
+    ``allowed_tools`` 那一层；那一层不是严格白名单（工作目录内的读文件类内置工具
+    可以自行放行），因此「回调抛异常」在真实链路上等同于放行。
+    """
+
+    class _ExplodingPolicy(ToolPolicy):
+        def decide(self, tool_name, tool_input=None):  # type: ignore[override]
+            raise RuntimeError("SIMULATED_POLICY_FAULT: controlled test fault probe")
+
+    def _gateway(self, *, audit: TurnAudit | None = None, policy: ToolPolicy | None = None):
+        return ToolGateway(
+            policy=policy or self._ExplodingPolicy(allowed_tools=READ_ONLY_TOOLS[:1]),
+            audit=audit or TurnAudit(),
+        )
+
+    def _assert_deny_shape(self, result: dict) -> None:
+        from lingxi.core.execution.tool_policy import DENY_REASON_TEMPLATE
+
+        self.assertEqual(
+            result,
+            {
+                "hookSpecificOutput": {
+                    "hookEventName": "PreToolUse",
+                    "permissionDecision": "deny",
+                    "permissionDecisionReason": DENY_REASON_TEMPLATE,
+                }
+            },
+        )
+
+    def test_a_raising_policy_yields_a_deny_instead_of_an_exception(self) -> None:
+        """未知工具名、白名单内工具名都一样：判定没能完成，就不许放行。"""
+
+        for tool_name in ("Read", "mcp__bi-metric__list_metrics", "NeverHeardOfThisTool"):
+            with self.subTest(tool_name=tool_name):
+                gateway = self._gateway()
+
+                result = pre_tool_use(gateway, tool_name, {"file_path": "/etc/passwd"}, "t-fault")
+
+                self._assert_deny_shape(result)
+                summary = gateway.audit.summary()
+                self.assertEqual(len(summary.denied_calls), 1, "失败关闭必须在审计里记成拒绝")
+                denied = summary.denied_calls[0]
+                self.assertIs(denied.deny_reason_code, DenyReasonCode.GATE_FAULT)
+                self.assertEqual(denied.tool_name, tool_name)
+                self.assertEqual(denied.tool_use_id, "t-fault")
+                self.assertEqual(summary.ungated_calls, ())
+
+    def test_a_malformed_tool_name_is_not_echoed_into_the_fault_record(self) -> None:
+        from lingxi.core.execution.audit import GATE_FAULT_TOOL_NAME
+
+        gateway = self._gateway()
+
+        result = pre_tool_use(gateway, "LINGXI_FAKE_SECRET a1b2c3d4e5f6g7h8 /etc/passwd")
+
+        self._assert_deny_shape(result)
+        self.assertEqual(gateway.audit.summary().denied_calls[0].tool_name, GATE_FAULT_TOOL_NAME)
+
+    def test_a_late_fault_turns_an_already_recorded_allow_into_a_deny(self) -> None:
+        """异常发生在「放行已记账」之后：应答是拒绝，审计不得还留着一条「放行」。"""
+
+        class ExplodingFuseGateway(ToolGateway):
+            def _update_wrapper_denial_fuse(self, *, denied, tool_name):  # type: ignore[override]
+                raise RuntimeError("SIMULATED_FUSE_FAULT: controlled test fault probe")
+
+        gateway = ExplodingFuseGateway(policy=build_policy(), audit=TurnAudit())
+
+        result = pre_tool_use(gateway, "mcp__bi-metric__list_metrics", {}, "t-late")
+
+        self._assert_deny_shape(result)
+        calls = gateway.audit.summary().calls
+        self.assertEqual(len(calls), 1, "同一次调用只留一条记录，不得一条放行、一条拒绝")
+        self.assertIs(calls[0].allowed, False)
+        self.assertIs(calls[0].deny_reason_code, DenyReasonCode.GATE_FAULT)
+
+    def test_deny_survives_when_the_fault_record_itself_raises(self) -> None:
+        class ExplodingAudit(TurnAudit):
+            def record_gate_fault(self, **_: object) -> None:
+                raise RuntimeError("SIMULATED_AUDIT_FAULT: controlled test fault probe")
+
+        gateway = self._gateway(audit=ExplodingAudit())
+
+        result = pre_tool_use(gateway, "Read", {"file_path": "/etc/passwd"})
+
+        self._assert_deny_shape(result)
+        self.assertEqual(len(gateway.audit.summary().calls), 1, "退一步也要留下「明细丢失」")
+
+    def test_deny_survives_when_every_bookkeeping_path_raises(self) -> None:
+        """记账两条路全坏（含原有的「明细丢失」兜底）：此前异常会穿出回调，现在仍是拒绝。"""
+
+        class FullyBrokenAudit(TurnAudit):
+            def record_decision(self, **_: object) -> None:
+                raise RuntimeError("SIMULATED_AUDIT_FAULT: controlled test fault probe")
+
+            def record_audit_fault(self, **_: object) -> None:
+                raise RuntimeError("SIMULATED_AUDIT_FAULT: controlled test fault probe")
+
+            def record_gate_fault(self, **_: object) -> None:
+                raise RuntimeError("SIMULATED_AUDIT_FAULT: controlled test fault probe")
+
+        gateway = ToolGateway(policy=build_policy(), audit=FullyBrokenAudit())
+
+        for tool_name in ("Read", "mcp__bi-metric__list_metrics"):
+            with self.subTest(tool_name=tool_name):
+                self._assert_deny_shape(pre_tool_use(gateway, tool_name, {}))
+
+    def test_cancellation_is_not_swallowed(self) -> None:
+        class CancelledPolicy(ToolPolicy):
+            def decide(self, tool_name, tool_input=None):  # type: ignore[override]
+                raise asyncio.CancelledError
+
+        gateway = self._gateway(policy=CancelledPolicy(allowed_tools=READ_ONLY_TOOLS[:1]))
+
+        with self.assertRaises(asyncio.CancelledError):
+            pre_tool_use(gateway, "Read", {})
+        self.assertEqual(gateway.audit.summary().calls, ())
+
+    def test_the_normal_path_is_unchanged(self) -> None:
+        gateway = build_gateway()
+
+        self.assertEqual(pre_tool_use(gateway, "mcp__bi-metric__list_metrics", {}, "t-ok"), {})
+        self.assertEqual(deny_decision(pre_tool_use(gateway, "Read", {}, "t-no")), "deny")
+        reasons = [call.deny_reason_code for call in gateway.audit.summary().calls]
+        self.assertEqual(reasons, [None, DenyReasonCode.NOT_IN_WHITELIST])
+
+
 class CredentialsNeverReachTheAuditTest(unittest.TestCase):
     """产品合同：不在审计中保存凭据、完整令牌。这是绝对要求，不是尽力而为。
 
