@@ -5,6 +5,8 @@ name: Dependency Audit
 # 步骤与 ci.yml 的 audit 作业相同、判定走同一个 scripts/ci/pip_audit_check.py：判定逻辑只有
 # 一处，步骤重复可以接受。失败通知走 GitHub 对定时工作流失败的默认通知，不另建通道；
 # 结论同样写进作业摘要。不引入锁文件、不改镜像、不修依赖。
+# audit 作业扫 Python 进程依赖；npm-audit 作业扫 workers/oauth-bridge 的 npm 依赖，
+# 判定仍走同一个脚本与同一份豁免清单（--format npm-audit），严重度阈值与「未知判失败」语义不变。
 on:
   schedule:
     # 每周日 20:43 UTC = 每周一 04:43 北京时间；避开整点，GitHub 在整点排队最拥挤。
@@ -85,3 +87,48 @@ jobs:
             --audit-json "${RUNNER_TEMP}/audit-${GROUP}.json" \
             --allowlist scripts/ci/pip_audit_allowlist.txt \
             --label "${GROUP}"
+
+  # Cloudflare Worker（workers/oauth-bridge）的 npm 依赖。与 audit 作业同一做法：先产出结果
+  # 文件、再交给判定脚本——npm audit 发现漏洞与运行出错都退出 1，这里不据此下结论；
+  # 结果文件缺失、不是完整报告或是 npm 的报错对象，由脚本判「未知」失败。
+  npm-audit:
+    name: Dependency Audit / npm audit (oauth-bridge)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: 配置 Python 运行时
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: '3.12'
+
+      - name: 配置 Node 运行时
+        uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5.0.0
+        with:
+          node-version: 22
+
+      # --ignore-scripts：审计只读锁文件与公告库，不需要运行任何依赖的安装脚本。
+      - name: 按锁文件安装依赖（不执行安装脚本）
+        working-directory: workers/oauth-bridge
+        run: npm ci --ignore-scripts
+
+      # 含开发依赖（不加 --omit=dev）：wrangler 是开发依赖，却是带部署凭据运行的部署工具。
+      - name: 扫描 npm 依赖
+        working-directory: workers/oauth-bridge
+        run: |
+          status=0
+          npm audit --json > "${RUNNER_TEMP}/audit-npm.json" || status=$?
+          echo "npm audit 退出码 ${status}（0 = 无漏洞；1 = 发现漏洞或运行出错）；结论由判定脚本给出"
+
+      - name: 判定严重度与豁免（高 / 严重未豁免判红，取不到判未知）
+        run: |
+          python3 scripts/ci/pip_audit_check.py \
+            --format npm-audit \
+            --audit-json "${RUNNER_TEMP}/audit-npm.json" \
+            --allowlist scripts/ci/pip_audit_allowlist.txt \
+            --label "oauth-bridge (npm)"

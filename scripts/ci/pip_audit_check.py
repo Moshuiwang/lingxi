@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-"""依赖漏洞扫描的判定脚本：读 pip-audit 的 JSON 结果、取严重度、对照带到期日的豁免清单。
+"""依赖漏洞扫描的判定脚本：读 pip-audit / npm audit 的 JSON 结果、取严重度、对照带到期日的豁免清单。
 
-只做判定，不做扫描；扫描由 CI 作业里钉版的 pip-audit 完成。退出码三态：
+只做判定，不做扫描；扫描由 CI 作业里钉版的 pip-audit、或 npm 自带的 npm audit 完成。退出码三态：
   0 = 没有未豁免的高 / 严重漏洞（中 / 低只在摘要里告警）；
   1 = 存在未豁免（含豁免已到期）的高 / 严重漏洞；
   2 = 未知：结果文件读不到或解析不了、某条漏洞取不到严重度、豁免清单格式错。
@@ -11,6 +11,8 @@
 database_specific.severity 标签，其次 CVSS v3 向量算基础分（≥ 9.0 严重、≥ 7.0 高、
 ≥ 4.0 中、其余低），两者都有取更高者；只有 CVSS v4 向量或什么都没有 → 未知。
 测试用 --severity-file 注入同形状的记录，不走网络。
+--format npm-audit 时，每条公告自带的严重度标签与 CVSS v3 向量（npm 报告里的 via 条目）被包成同形状
+记录，走同一套取更高者规则，不另查 OSV；报告形状不符、npm 报了错、公告追溯不到的包一律「未知」。
 
 豁免清单是只读输入：每行「编号 到期日(YYYY-MM-DD) 理由」，到期日含当天、过期即失效；
 不接受环境变量或命令行追加条目，唤起方只能指定清单文件本身。
@@ -42,6 +44,18 @@ VULN_ID_PATTERN = re.compile(
     r"^(GHSA-[0-9a-z]{4}-[0-9a-z]{4}-[0-9a-z]{4}|PYSEC-\d{4}-\d+|CVE-\d{4}-\d{4,})$"
 )
 DATE_PATTERN = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+NPM_ADVISORY_URL_PATTERN = re.compile(
+    r"/advisories/(GHSA-[0-9a-z]{4}-[0-9a-z]{4}-[0-9a-z]{4})(?:[/?#]|$)"
+)
+NPM_REPORT_VERSION = 2
+# npm 的严重度比本脚本多一档 info，按低处理（只告警）；标签不在表内的当作没有标签。
+NPM_LEVELS = {
+    "INFO": "LOW",
+    "LOW": "LOW",
+    "MODERATE": "MODERATE",
+    "HIGH": "HIGH",
+    "CRITICAL": "CRITICAL",
+}
 OSV_VULN_URL = "https://api.osv.dev/v1/vulns/"
 DEFAULT_ALLOWLIST = Path(__file__).resolve().parent / "pip_audit_allowlist.txt"
 
@@ -205,7 +219,7 @@ def resolve_severity(finding: Finding, fetch: Callable[[str], dict | None]) -> S
         if severity is not None:
             return severity
     queried = "、".join(finding.lookup_order())
-    detail = f"OSV 记录无严重度标签也无 CVSS v3 向量，查过 {queried}"
+    detail = f"严重度记录无标签也无 CVSS v3 向量，查过 {queried}"
     if len(missing) == len(finding.ids):
         detail = f"OSV 查不到任何编号：{queried}"
     return Severity(level=None, detail=detail)
@@ -307,6 +321,107 @@ def load_findings(path: Path) -> tuple[list[Finding], int]:
     if skipped:
         raise AuditInputError("扫描器未能审计以下依赖，无法判定：\n  " + "\n  ".join(skipped))
     return findings, len(dependencies)
+
+
+def _npm_record(advisory: dict) -> dict:
+    """把 npm 公告的严重度标签与 CVSS v3 向量包成 OSV 同形状记录；两样都没有就是空记录。"""
+    record: dict = {}
+    label = advisory.get("severity")
+    if isinstance(label, str) and label.upper() in NPM_LEVELS:
+        record["database_specific"] = {"severity": NPM_LEVELS[label.upper()]}
+    cvss = advisory.get("cvss")
+    vector = cvss.get("vectorString") if isinstance(cvss, dict) else None
+    if isinstance(vector, str):
+        record["severity"] = [{"type": "CVSS_V3", "score": vector}]
+    return record
+
+
+def _npm_fix_text(fix_available: object) -> str:
+    if isinstance(fix_available, dict) and "name" in fix_available and "version" in fix_available:
+        major = "，跨主版本" if fix_available.get("isSemVerMajor") else ""
+        return f"{fix_available['name']}@{fix_available['version']}{major}"
+    return "npm audit fix 可修" if fix_available is True else "无"
+
+
+def _npm_traces_to_advisory(
+    name: str, vulnerabilities: dict, seen: frozenset = frozenset()
+) -> bool:
+    """via 里的字符串是「因依赖了另一个有漏洞的包而受影响」，顺着它必须走到一条真正的公告。"""
+    entry = vulnerabilities.get(name)
+    if name in seen or not isinstance(entry, dict):
+        return False
+    return any(
+        isinstance(via, dict)
+        or (isinstance(via, str) and _npm_traces_to_advisory(via, vulnerabilities, seen | {name}))
+        for via in entry["via"]
+    )
+
+
+def _npm_finding(package: str, advisory: dict, fix_text: str) -> tuple[Finding, dict]:
+    url_match = NPM_ADVISORY_URL_PATTERN.search(str(advisory.get("url", "")))
+    if url_match:
+        vuln_id = url_match.group(1)
+    elif "source" in advisory:
+        vuln_id = f"npm-advisory-{advisory['source']}"
+    else:
+        raise AuditInputError(f"npm 公告既无 GHSA 链接也无编号，无法识别：{package}：{advisory!r}")
+    finding = Finding(
+        package,
+        f"受影响范围 {advisory.get('range', '未给出')}",
+        (vuln_id,),
+        (fix_text,),
+        str(advisory.get("title", "")),
+    )
+    return finding, _npm_record(advisory)
+
+
+def load_npm_findings(path: Path) -> tuple[list[Finding], int, dict[str, dict]]:
+    """读 `npm audit --json` 的结果，返回（公告列表，依赖总数，编号到严重度记录的映射）。
+
+    npm 的 JSON 里，一个包的 via 既有公告对象，也有指向其他有漏洞的包的字符串；公告对象
+    只出现在它所属的那个包下，所以只收对象。npm 报错（没有网络、公告服务不可用）时顶层是
+    error 对象，同样判未知。
+    """
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as error:
+        raise AuditInputError(f"扫描结果读不到或不是 JSON：{path}：{error}") from error
+    if isinstance(data, dict) and isinstance(data.get("error"), dict):
+        error = data["error"]
+        parts = (error.get("code"), error.get("summary"), data.get("message"))
+        raise AuditInputError(
+            "npm audit 未给出审计结果（外部服务不可用或命令出错），非漏洞判定："
+            + (" ".join(str(part) for part in parts if part) or "无错误详情")
+        )
+    if not isinstance(data, dict) or data.get("auditReportVersion") != NPM_REPORT_VERSION:
+        raise AuditInputError(
+            f"扫描结果不是 auditReportVersion {NPM_REPORT_VERSION} 的报告：{path}"
+        )
+    vulnerabilities = data.get("vulnerabilities")
+    metadata = data.get("metadata") if isinstance(data.get("metadata"), dict) else {}
+    dependencies = metadata.get("dependencies")
+    counts = metadata.get("vulnerabilities")
+    total = dependencies.get("total") if isinstance(dependencies, dict) else None
+    counted = counts.get("total") if isinstance(counts, dict) else None
+    if not isinstance(vulnerabilities, dict) or not isinstance(total, int):
+        raise AuditInputError(f"扫描结果缺少 vulnerabilities 对象或依赖总数：{path}")
+    if counted != len(vulnerabilities):
+        raise AuditInputError(f"扫描结果的漏洞包数与 metadata 不一致，报告可能不完整：{path}")
+    for name, entry in vulnerabilities.items():
+        if not isinstance(entry, dict) or not isinstance(entry.get("via"), list):
+            raise AuditInputError(f"扫描结果里 {name} 的 via 形状不对")
+    findings: list[Finding] = []
+    records: dict[str, dict] = {}
+    for name, entry in vulnerabilities.items():
+        if not _npm_traces_to_advisory(name, vulnerabilities):
+            raise AuditInputError(f"扫描结果里 {name} 追溯不到任何公告，无法判定")
+        fix_text = _npm_fix_text(entry.get("fixAvailable"))
+        for advisory in (via for via in entry["via"] if isinstance(via, dict)):
+            finding, record = _npm_finding(str(advisory.get("name", name)), advisory, fix_text)
+            if records.setdefault(finding.primary_id, record) != record:
+                raise AuditInputError(f"同一公告 {finding.primary_id} 在报告里给出了不同的严重度")
+            findings.append(finding)
+    return findings, total, records
 
 
 def parse_allowlist(path: Path) -> list[Exemption]:
@@ -423,7 +538,13 @@ def render_summary(verdict: Verdict, label: str, today: date) -> str:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument(
-        "--audit-json", required=True, type=Path, help="pip-audit --format json 的输出"
+        "--audit-json", required=True, type=Path, help="扫描器的 JSON 输出（格式见 --format）"
+    )
+    parser.add_argument(
+        "--format",
+        choices=("pip-audit", "npm-audit"),
+        default="pip-audit",
+        help="扫描结果的来源：pip-audit --format json，或 npm audit --json",
     )
     parser.add_argument("--allowlist", type=Path, default=DEFAULT_ALLOWLIST, help="豁免清单文件")
     parser.add_argument("--today", default=None, help="判定日 YYYY-MM-DD（默认 UTC 今天）")
@@ -441,17 +562,26 @@ def _parse_today(text: str | None) -> date:
     return date.fromisoformat(text)
 
 
+def _load_report(args: argparse.Namespace) -> tuple[list[Finding], int, Callable]:
+    """按 --format 读扫描结果，同时给出取严重度记录的函数。"""
+    if args.format == "npm-audit":
+        findings, dependency_count, records = load_npm_findings(args.audit_json)
+        return findings, dependency_count, records.get
+    findings, dependency_count = load_findings(args.audit_json)
+    if args.severity_file:
+        return findings, dependency_count, load_severity_file(args.severity_file)
+    return findings, dependency_count, OsvClient(args.osv_url).fetch
+
+
 def main(argv: list[str] | None = None) -> int:
-    args = build_parser().parse_args(argv)
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    if args.format == "npm-audit" and args.severity_file:
+        parser.error("--severity-file 只用于 pip-audit 格式；npm-audit 的严重度取自报告本身")
     try:
         today = _parse_today(args.today)
-        findings, dependency_count = load_findings(args.audit_json)
+        findings, dependency_count, fetch = _load_report(args)
         exemptions = parse_allowlist(args.allowlist)
-        fetch = (
-            load_severity_file(args.severity_file)
-            if args.severity_file
-            else OsvClient(args.osv_url).fetch
-        )
         verdict = evaluate(findings, fetch, exemptions, today)
     except AuditInputError as error:
         message = (
