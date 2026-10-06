@@ -70,6 +70,7 @@ class StubAgentOptions:
         stderr=None,
         strict_mcp_config=None,
         max_buffer_size=None,
+        env=None,
     ) -> None:
         self.allowed_tools = allowed_tools
         self.max_turns = max_turns
@@ -84,6 +85,7 @@ class StubAgentOptions:
         self.stderr = stderr
         self.strict_mcp_config = strict_mcp_config
         self.max_buffer_size = max_buffer_size
+        self.env = env
 
 
 class StubTextBlock:

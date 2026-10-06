@@ -21,6 +21,7 @@ gateway 立即发布"与"次日 scheduler 日批重算"之间来回翻转——�
 
 from __future__ import annotations
 
+import importlib.util
 import json
 import sys
 import types
@@ -79,6 +80,11 @@ GATEWAY_ENV = {
 }
 
 NOW = datetime(2026, 9, 2, 12, 0, tzinfo=UTC)
+
+PSYCOPG_SKIP_REASON = (
+    "跳过：未安装 psycopg；本用例走真实落库代码，会延迟导入 psycopg.errors"
+    "（连接是假的、不需要数据库，只需要驱动）"
+)
 
 
 class _ExternalMapFixture(unittest.TestCase):
@@ -353,6 +359,7 @@ class PositionGrantPayloadTests(_ExternalMapFixture):
                 return json.loads(parameters[7])
         raise AssertionError("没有插入任何 pending_action 行")
 
+    @unittest.skipUnless(importlib.util.find_spec("psycopg"), PSYCOPG_SKIP_REASON)
     def test_a_metric_deleted_from_the_external_file_is_absent_from_the_payload(self) -> None:
         outcome = self._prepare(metric_map_path=self.external)
 
@@ -366,6 +373,7 @@ class PositionGrantPayloadTests(_ExternalMapFixture):
             "——说明这条路径读的仍然是随包默认那份映射",
         )
 
+    @unittest.skipUnless(importlib.util.find_spec("psycopg"), PSYCOPG_SKIP_REASON)
     def test_without_the_external_file_the_packaged_default_still_applies(self) -> None:
         """不配置外置文件仍然合法：随包默认照常展开，行为与本修复之前一致。"""
 

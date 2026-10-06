@@ -1,4 +1,5 @@
 # 依赖漏洞扫描的豁免清单（scripts/ci/pip_audit_check.py 的唯一豁免来源）。
+# pip-audit 与 workers/oauth-bridge 的 npm audit 共用本清单；npm 公告用它的 GHSA 编号。
 #
 # 每行三段，空白分隔：编号 到期日 理由
 #   编号   = GHSA-xxxx-xxxx-xxxx / PYSEC-YYYY-N / CVE-YYYY-N 任一别名（同一漏洞的别名互通）

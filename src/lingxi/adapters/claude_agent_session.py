@@ -17,6 +17,7 @@ import re
 import sys
 import time
 from collections.abc import Callable, Iterable, Mapping
+from types import MappingProxyType
 from typing import Any
 
 from lingxi.core.execution.hooks import ToolGateway
@@ -38,6 +39,13 @@ DEFAULT_MAX_SDK_MESSAGE_BYTES = 32 * 1024 * 1024
 _MESSAGE_BUFFER_OVERFLOW_PATTERN = re.compile(
     r"JSON message exceeded maximum buffer size of \d+ bytes"
 )
+
+
+# 叠加给 CLI 子进程的环境变量。CLI 的附件通道会把提示词里的 @路径 直接读成文件
+# 内容塞进模型上下文，不经过任何 hook，等于绕过 PreToolUse 白名单读同 uid 可见的
+# 文件（含他人的令牌配置），因此强制关闭。SDK 把它叠在继承的进程环境之上、只加
+# 不减，所以这里只放必须强制的开关，不放任何业务配置或凭据。
+SDK_SUBPROCESS_ENV: Mapping[str, str] = MappingProxyType({"CLAUDE_CODE_DISABLE_ATTACHMENTS": "1"})
 
 
 def is_message_buffer_overflow(error: BaseException) -> bool:
@@ -114,6 +122,8 @@ def build_agent_options(
         # 不传则落到 SDK 默认 1MiB，问数 MCP 的真实回执已经撞穿过一次
         # （见模块顶部 DEFAULT_MAX_SDK_MESSAGE_BYTES 的说明）。
         "max_buffer_size": DEFAULT_MAX_SDK_MESSAGE_BYTES,
+        # 每次给一份新副本：options 是可变对象，不与模块常量共享同一个字典。
+        "env": dict(SDK_SUBPROCESS_ENV),
     }
     # 未配置的字段一律不传，交给 SDK 自己的默认值；传 None 覆盖默认值是另一种错。
     if mcp_servers:

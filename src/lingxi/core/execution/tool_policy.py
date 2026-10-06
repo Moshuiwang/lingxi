@@ -56,6 +56,8 @@ class DenyReasonCode(str, Enum):
     SKILL_NOT_APPROVED = "skill_not_approved"
     MISSING_SKILL_NAME = "missing_skill_name"
     MALFORMED_TOOL_NAME = "malformed_tool_name"
+    # 不是白名单的结论，而是判定链路自己抛了异常、按拒绝收口（失败关闭）。
+    GATE_FAULT = "gate_fault"
 
 
 @dataclass(frozen=True)

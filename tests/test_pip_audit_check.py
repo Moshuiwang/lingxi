@@ -8,9 +8,14 @@
 3. 工作流形状——``ci.yml`` 的 audit 作业与 extras 同矢量、同 ``if``；``dependency-audit.yml``
    只由定时与手动触发、与 ci.yml 钉同一个 pip-audit 版本、判定都走同一个脚本；
    gate 上限 20 分。
+4. npm 公告（``--format npm-audit``）——与 pip-audit 同口径：高 / 严重判红、中 / 低与 info 只告警、
+   取不到严重度或报告不完整判未知；豁免走同一份清单；``dependency-audit.yml`` 的 npm-audit 作业
+   覆盖每一个受版本控制的 ``package-lock.json``、含开发依赖、安装不跑脚本、Action 引用与仓库已用的一致。
 
 变异实测：把 ``evaluate`` 里的 ``today <= e.expires`` 改成恒真，到期用例应判红；把
-``resolve_severity`` 末尾的未知返回改成默认 LOW，严重度取不到的用例应判红；还原后复绿。
+``resolve_severity`` 末尾的未知返回改成默认 LOW，严重度取不到的用例应判红；npm 侧把
+``NPM_LEVELS`` 的 HIGH 改成 LOW、让 ``_npm_traces_to_advisory`` 恒真、去掉 ``npm ci`` 的
+``--ignore-scripts``，对应用例应判红；还原后复绿。
 """
 
 from __future__ import annotations
@@ -29,6 +34,7 @@ ROOT = Path(__file__).resolve().parents[1]
 SCRIPT = ROOT / "scripts/ci/pip_audit_check.py"
 ALLOWLIST = ROOT / "scripts/ci/pip_audit_allowlist.txt"
 CI_WORKFLOW = ROOT / ".github/workflows/ci.yml"
+STORY_WORKFLOW = ROOT / ".github/workflows/story.yml"
 AUDIT_WORKFLOW = ROOT / ".github/workflows/dependency-audit.yml"
 SCHEDULING_TESTS = ROOT / "tests/test_ci_dispatch_scheduling.py"
 
@@ -331,6 +337,249 @@ class SeverityResolutionTests(unittest.TestCase):
         self.assertEqual(set(findings[1].ids), {MODERATE_GHSA, MODERATE_ID})
 
 
+NPM_HIGH_GHSA = "GHSA-gggg-hhhh-iiii"
+NPM_OTHER_HIGH_GHSA = "GHSA-mmmm-nnnn-oooo"
+NPM_MODERATE_GHSA = "GHSA-jjjj-kkkk-llll"
+CRITICAL_VECTOR = "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H"
+MODERATE_VECTOR = "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:N/I:L/A:N"
+CVSS4_VECTOR = "CVSS:4.0/AV:N/AC:L/AT:N/PR:N/UI:N/VC:H/VI:H/VA:H/SC:N/SI:N/SA:N"
+
+
+def _npm_advisory(
+    ghsa: str,
+    severity: str | None,
+    vector: str | None = None,
+    *,
+    source: int = 1000,
+    name: str = "examplepkg",
+) -> dict:
+    """与 npm audit 真实输出同形状的一条公告（via 里的对象）。"""
+    return {
+        "source": source,
+        "name": name,
+        "dependency": name,
+        "title": "示例公告",
+        "url": f"https://github.com/advisories/{ghsa}",
+        "severity": severity,
+        "cwe": [],
+        "cvss": {"score": 0, "vectorString": vector},
+        "range": "<2.0.0",
+    }
+
+
+def _npm_package(name: str, *via, severity: str = "high", fix=True) -> dict:
+    return {
+        "name": name,
+        "severity": severity,
+        "isDirect": False,
+        "via": list(via),
+        "effects": [],
+        "range": "<2.0.0",
+        "nodes": [f"node_modules/{name}"],
+        "fixAvailable": fix,
+    }
+
+
+def _npm_report(*packages: dict, total: int = 12) -> dict:
+    return {
+        "auditReportVersion": 2,
+        "vulnerabilities": {package["name"]: package for package in packages},
+        "metadata": {
+            "vulnerabilities": {"info": 0, "low": 0, "moderate": 0, "high": 0, "critical": 0}
+            | {"total": len(packages)},
+            "dependencies": {"prod": 1, "dev": total - 1, "total": total},
+        },
+    }
+
+
+class NpmAuditExitCodeTests(_Case):
+    def run_npm(self, report, allowlist: str = "", **kwargs) -> subprocess.CompletedProcess:
+        return self.run_check(
+            report, allowlist, severities=None, extra_args=["--format", "npm-audit"], **kwargs
+        )
+
+    def single(self, severity: str | None, vector: str | None = None) -> dict:
+        return _npm_report(
+            _npm_package("examplepkg", _npm_advisory(NPM_HIGH_GHSA, severity, vector))
+        )
+
+    def test_clean_report_passes(self) -> None:
+        result = self.run_npm(_npm_report())
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("通过（退出码 0）", result.stdout)
+        self.assertIn("扫描对象 12 个依赖", result.stdout)
+
+    def test_unexempted_high_is_red_once_even_with_dependents(self) -> None:
+        fix = {"name": "wrangler", "version": "4.200.0", "isSemVerMajor": True}
+        report = _npm_report(
+            _npm_package("examplepkg", _npm_advisory(NPM_HIGH_GHSA, "high"), fix=fix),
+            _npm_package("dependentpkg", "examplepkg", fix=True),
+        )
+        result = self.run_npm(report)
+        self.assertEqual(result.returncode, 1, result.stdout)
+        self.assertIn("去重后 1 条已公布漏洞；判红 1", result.stdout)
+        row = next(line for line in result.stdout.splitlines() if line.startswith("| examplepkg"))
+        for cell in (NPM_HIGH_GHSA, "HIGH", "<2.0.0", "wrangler@4.200.0，跨主版本"):
+            self.assertIn(cell, row)
+
+    def test_critical_is_red(self) -> None:
+        result = self.run_npm(self.single("critical"))
+        self.assertEqual(result.returncode, 1, result.stdout)
+        self.assertIn("CRITICAL", result.stdout)
+
+    def test_moderate_low_and_info_only_warn(self) -> None:
+        report = _npm_report(
+            _npm_package(
+                "moderatepkg", _npm_advisory(NPM_MODERATE_GHSA, "moderate", MODERATE_VECTOR)
+            ),
+            _npm_package("lowpkg", _npm_advisory("GHSA-pppp-qqqq-rrrr", "low", source=1001)),
+            _npm_package("infopkg", _npm_advisory("GHSA-ssss-tttt-uuuu", "info", source=1002)),
+        )
+        result = self.run_npm(report)
+        self.assertEqual(result.returncode, 0, result.stdout)
+        self.assertIn("判红 0、告警 3", result.stdout)
+        self.assertIn("告警（中 / 低，不判红）", result.stdout)
+
+    def test_label_and_cvss_vector_take_the_higher_level(self) -> None:
+        result = self.run_npm(self.single("moderate", CRITICAL_VECTOR))
+        self.assertEqual(result.returncode, 1, result.stdout)
+        self.assertIn("CRITICAL", result.stdout)
+        self.assertIn("CVSS 9.8", result.stdout)
+        # 向量为空（npm 对部分公告就是这样给）时单凭标签判定，不因取不到向量而放行或判未知。
+        self.assertEqual(self.run_npm(self.single("high", None)).returncode, 1)
+
+    def test_exemption_by_ghsa_is_honoured_until_the_day_it_expires(self) -> None:
+        report = self.single("high")
+        allow = f"{NPM_HIGH_GHSA} 2026-09-20 只在开发机上用，跟进 #999\n"
+        valid = self.run_npm(report, allow, today="2026-09-20")
+        self.assertEqual(valid.returncode, 0, valid.stdout)
+        self.assertIn("已豁免（未到期）", valid.stdout)
+        expired = self.run_npm(report, allow, today="2026-09-21")
+        self.assertEqual(expired.returncode, 1, expired.stdout)
+        self.assertIn("豁免已于 2026-09-20 到期", expired.stdout)
+
+    def test_exemption_covers_only_the_advisory_it_names(self) -> None:
+        report = _npm_report(
+            _npm_package(
+                "examplepkg",
+                _npm_advisory(NPM_HIGH_GHSA, "high"),
+                _npm_advisory(NPM_OTHER_HIGH_GHSA, "high", source=1001),
+            )
+        )
+        result = self.run_npm(report, f"{NPM_HIGH_GHSA} 2026-12-31 只豁免这一条\n")
+        self.assertEqual(result.returncode, 1, result.stdout)
+        self.assertIn("已豁免 1", result.stdout)
+        self.assertIn("判红 1", result.stdout)
+
+    def test_missing_severity_is_unknown_not_green(self) -> None:
+        for severity, vector in (("unknown", None), (None, None), ("", CVSS4_VECTOR)):
+            with self.subTest(severity=severity, vector=vector):
+                result = self.run_npm(self.single(severity, vector))
+                self.assertEqual(result.returncode, 2, result.stdout)
+                self.assertIn("未知（判失败", result.stdout)
+
+    def test_npm_error_object_is_unknown_and_not_a_vulnerability_verdict(self) -> None:
+        error = {"error": {"code": "ENOAUDIT", "summary": "Audit endpoint returned an error"}}
+        result = self.run_npm(error)
+        self.assertEqual(result.returncode, 2, result.stdout)
+        self.assertIn("非漏洞判定", result.stdout)
+        self.assertIn("ENOAUDIT", result.stdout)
+
+    def test_unreachable_registry_report_as_npm_really_writes_it_is_unknown(self) -> None:
+        # 公告服务连不上时 npm 写的就是这个形状：顶层 message 带原因，error 里的字段是空串。
+        unreachable = {
+            "message": "request to https://registry.invalid/-/npm/v1/security/audits/quick failed",
+            "error": {"summary": "", "detail": ""},
+        }
+        result = self.run_npm(unreachable)
+        self.assertEqual(result.returncode, 2, result.stdout)
+        self.assertIn("非漏洞判定", result.stdout)
+        self.assertIn("security/audits/quick failed", result.stdout)
+
+    def test_incomplete_or_foreign_reports_are_unknown(self) -> None:
+        good = self.single("high")
+        no_id = self.single("high")
+        advisory = no_id["vulnerabilities"]["examplepkg"]["via"][0]
+        advisory["url"] = "https://example.invalid/advisory"
+        del advisory["source"]
+        cases = {
+            "版本不是 2": {**good, "auditReportVersion": 3},
+            "vulnerabilities 不是对象": {**good, "vulnerabilities": []},
+            "缺 metadata": {k: v for k, v in good.items() if k != "metadata"},
+            "漏洞包数对不上": {
+                **good,
+                "metadata": {**good["metadata"], "vulnerabilities": {"total": 0}},
+            },
+            "依赖总数缺失": {**good, "metadata": {"vulnerabilities": {"total": 1}}},
+            "via 不是列表": _npm_report({**_npm_package("badpkg"), "via": "oops"}),
+            "追溯不到公告": _npm_report(_npm_package("orphanpkg", "missingpkg")),
+            "via 成环": _npm_report(_npm_package("apkg", "bpkg"), _npm_package("bpkg", "apkg")),
+            "公告无法识别": no_id,
+            "空对象": {},
+            "pip-audit 的报告": _audit_json(),
+        }
+        for name, report in cases.items():
+            with self.subTest(name):
+                result = self.run_npm(report)
+                self.assertEqual(result.returncode, 2, result.stdout)
+                self.assertIn("未知（判失败", result.stdout)
+        for name, raw in (("不是 JSON", "{not json"), ("空文件", "")):
+            with self.subTest(name):
+                self.assertEqual(self.run_npm(self.write("raw.json", raw)).returncode, 2)
+        self.assertEqual(self.run_npm(self.tmp / "absent.json").returncode, 2)
+
+    def test_npm_report_is_not_accepted_by_the_default_pip_audit_format(self) -> None:
+        result = self.run_check(self.single("high"), severities=SEVERITIES)
+        self.assertEqual(result.returncode, 2, result.stdout)
+
+    def test_advisory_without_ghsa_link_is_still_judged_by_severity(self) -> None:
+        report = self.single("high")
+        report["vulnerabilities"]["examplepkg"]["via"][0]["url"] = "https://example.invalid/1234"
+        result = self.run_npm(report)
+        self.assertEqual(result.returncode, 1, result.stdout)
+        self.assertIn("npm-advisory-1000", result.stdout)
+
+    def test_same_advisory_on_two_packages_is_two_findings_unless_severity_conflicts(self) -> None:
+        def pair(second_severity: str) -> dict:
+            second = _npm_advisory(NPM_HIGH_GHSA, second_severity, source=1001, name="twopkg")
+            return _npm_report(
+                _npm_package("onepkg", _npm_advisory(NPM_HIGH_GHSA, "high", name="onepkg")),
+                _npm_package("twopkg", second),
+            )
+
+        agreed = self.run_npm(pair("high"))
+        self.assertEqual(agreed.returncode, 1, agreed.stdout)
+        self.assertIn("判红 2", agreed.stdout)
+        conflicting = self.run_npm(pair("low"))
+        self.assertEqual(conflicting.returncode, 2, conflicting.stdout)
+
+    def test_severity_file_is_refused_with_npm_format(self) -> None:
+        result = self.run_check(
+            self.single("high"), severities=SEVERITIES, extra_args=["--format", "npm-audit"]
+        )
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("--severity-file", result.stderr)
+
+    def test_report_with_the_shape_npm_really_emits(self) -> None:
+        # 与 oauth-bridge 一次真实 npm audit 的结构对应：传递依赖只有字符串 via，
+        # undici 一个包下既有高也有中、低公告，sharp 的 CVSS 向量为空。
+        undici = [
+            _npm_advisory(NPM_MODERATE_GHSA, "moderate", MODERATE_VECTOR, name="undici", source=2),
+            _npm_advisory(NPM_OTHER_HIGH_GHSA, "high", CRITICAL_VECTOR, name="undici", source=3),
+            _npm_advisory("GHSA-pppp-qqqq-rrrr", "low", name="undici", source=4),
+        ]
+        report = _npm_report(
+            _npm_package("miniflare", "sharp", "undici"),
+            _npm_package("sharp", _npm_advisory(NPM_HIGH_GHSA, "high", name="sharp", source=1)),
+            _npm_package("undici", *undici),
+            _npm_package("wrangler", "miniflare"),
+            total=91,
+        )
+        result = self.run_npm(report)
+        self.assertEqual(result.returncode, 1, result.stdout)
+        self.assertIn("扫描对象 91 个依赖；去重后 4 条已公布漏洞；判红 2、告警 2", result.stdout)
+
+
 def _job_block(text: str, name: str) -> str:
     match = re.search(
         r"^  " + re.escape(name) + r":\n(.*?)(?=^  [a-z][a-z0-9_-]*:|\Z)", text, re.M | re.S
@@ -356,6 +605,7 @@ class WorkflowShapeTests(unittest.TestCase):
     def setUpClass(cls) -> None:
         cls.ci = CI_WORKFLOW.read_text(encoding="utf-8")
         cls.weekly = AUDIT_WORKFLOW.read_text(encoding="utf-8")
+        cls.story = STORY_WORKFLOW.read_text(encoding="utf-8")
         cls.audit = _job_block(cls.ci, "audit")
         cls.extras = _job_block(cls.ci, "extras")
 
@@ -436,6 +686,60 @@ class WorkflowShapeTests(unittest.TestCase):
         self.assertNotIn("push:", self.weekly)
         self.assertNotIn("secrets.", self.weekly)
         self.assertIn("timeout-minutes: 10", _job_block(self.weekly, "audit"))
+
+    def test_weekly_npm_audit_job_installs_without_scripts_scans_dev_dependencies_and_judges(
+        self,
+    ) -> None:
+        job = _job_block(self.weekly, "npm-audit")
+        self.assertIn("timeout-minutes: 10", job)
+        self.assertEqual(re.findall(r"npm (?:ci|install)[^\n]*", job), ["npm ci --ignore-scripts"])
+        self.assertEqual(job.count("working-directory: workers/oauth-bridge\n"), 2)
+        install, scan, judge = (
+            job.index(marker)
+            for marker in (
+                "npm ci --ignore-scripts",
+                "npm audit --json",
+                "scripts/ci/pip_audit_check.py",
+            )
+        )
+        self.assertLess(install, scan)
+        self.assertLess(scan, judge)
+        for flag in ("--format npm-audit", "--allowlist scripts/ci/pip_audit_allowlist.txt"):
+            self.assertIn(flag, job)
+        # wrangler 是带部署凭据运行的开发依赖：不得因省事把开发依赖排除出审计范围。
+        code = "\n".join(
+            line for line in self.weekly.splitlines() if not line.lstrip().startswith("#")
+        )
+        for forbidden in ("--omit", "--production", "--only=prod", "npm audit fix", "audit-level"):
+            self.assertNotIn(forbidden, code)
+        for forbidden in ("|| true", "|| echo", "continue-on-error"):
+            self.assertNotIn(forbidden, job)
+
+    def test_weekly_actions_are_pinned_to_shas_already_used_in_the_repository(self) -> None:
+        uses = re.findall(r"^\s*(?:- )?uses: (\S+ # v\S+)$", self.weekly, re.M)
+        self.assertEqual(len(uses), self.weekly.count("uses:"))
+        for use in uses:
+            with self.subTest(use=use):
+                self.assertRegex(use, r"^[\w./-]+@[0-9a-f]{40} # v\d+(\.\d+)*$")
+                self.assertIn(use, self.ci)
+        self.assertEqual(len(re.findall(r"actions/setup-node@", self.weekly)), 1)
+        self.assertIn(re.search(r"actions/setup-node@\S+ # v\S+", self.weekly).group(0), self.story)
+
+    def test_every_tracked_npm_lockfile_is_audited_in_the_weekly_workflow(self) -> None:
+        listing = subprocess.run(
+            ["git", "ls-files", "--", "*package-lock.json"],
+            cwd=ROOT,
+            capture_output=True,
+            text=True,
+            check=True,
+        ).stdout.split()
+        self.assertTrue(listing, "仓库里应至少有一个受版本控制的 package-lock.json")
+        job = _job_block(self.weekly, "npm-audit")
+        for lockfile in listing:
+            directory = Path(lockfile).parent.as_posix()
+            with self.subTest(directory=directory):
+                self.assertIn(f"working-directory: {directory}\n", job)
+                self.assertTrue((ROOT / directory / "package.json").is_file())
 
 
 class AllowlistFileTests(unittest.TestCase):

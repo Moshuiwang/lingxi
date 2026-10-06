@@ -12,7 +12,7 @@ from collections.abc import Callable, Mapping
 from typing import Any
 
 from .audit import TurnAudit
-from .tool_policy import ToolPolicy
+from .tool_policy import DENY_REASON_TEMPLATE, ToolPolicy
 
 # 需要注册的 hook 事件。``PostToolUseFailure`` 是工具抛错的唯一来源；
 # ``PermissionDenied`` / ``PermissionRequest`` 实测从不触发，保留注册只为持续
@@ -374,6 +374,31 @@ class ToolGateway:
             self._granted_mcp_count += 1
 
     def _on_pre_tool_use(
+        self, tool_name: Any, tool_input: Any, call_id: str | None
+    ) -> dict[str, Any]:
+        """PreToolUse 的失败关闭外壳：判定链路任何一步抛异常都按拒绝应答。
+
+        上游 CLI 把回调异常当作「没有意见」，随后交给 ``dontAsk`` 与 ``allowed_tools``
+        那一层，而那一层不是严格白名单（工作目录内的读文件类内置工具可自行放行）——
+        不在这里兜住，就等于异常即放行。``CancelledError`` 不属于 ``Exception``，照常向上传播。
+        """
+        try:
+            return self._decide_pre_tool_use(tool_name, tool_input, call_id)
+        except Exception:  # 见 docstring：判定失败必须关闭，不得落到 CLI 的第二层规则
+            return self._fail_closed_pre_tool_use(tool_name, call_id)
+
+    def _fail_closed_pre_tool_use(self, tool_name: Any, call_id: str | None) -> dict[str, Any]:
+        """判定链路异常时的拒绝应答；尽力留一条可回读的审计记录，留痕失败也不再抛。"""
+        try:
+            self._audit.record_gate_fault(tool_name=tool_name, tool_use_id=call_id)
+        except Exception:  # 留痕失败不得把这次拒绝一起带走，退一步只记「明细丢失」
+            try:
+                self._audit.record_audit_fault(tool_name="pre_tool_use", tool_use_id=call_id)
+            except Exception:  # 最后一道留痕也失败时，拒绝应答仍然必须返回
+                pass
+        return self._build_pre_tool_response(True, DENY_REASON_TEMPLATE)
+
+    def _decide_pre_tool_use(
         self, tool_name: Any, tool_input: Any, call_id: str | None
     ) -> dict[str, Any]:
         """PreToolUse 事件的完整处理：判定 → 通知观察者 → 应答 → 记账 → 更新熔断。"""

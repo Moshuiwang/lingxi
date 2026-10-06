@@ -34,6 +34,11 @@ from lingxi.core.permission.position_override import (
 
 SCRIPT = Path(__file__).parents[1] / "scripts" / "ops" / "preprovision.py"
 
+PSYCOPG_SKIP_REASON = (
+    "跳过：未安装 psycopg；本用例走真实落库代码，会延迟导入 psycopg.errors"
+    "（连接是假的、不需要数据库，只需要驱动）"
+)
+
 
 def _load_script():
     module_name = "preprovision_ops_under_test"
@@ -801,6 +806,7 @@ class SyntheticPendingActionTest(unittest.TestCase):
             initiated_by_open_id="ou_admin",
         )
 
+    @unittest.skipUnless(importlib.util.find_spec("psycopg"), PSYCOPG_SKIP_REASON)
     def test_the_synthetic_pending_action_carries_the_preprovision_reason(self) -> None:
         cursor = _FakeCursor()
         report = self._apply(cursor)
@@ -816,6 +822,7 @@ class SyntheticPendingActionTest(unittest.TestCase):
         self.assertIn("'executed'", inserts[0][0])
         self.assertIn("FALSE", inserts[0][0])
 
+    @unittest.skipUnless(importlib.util.find_spec("psycopg"), PSYCOPG_SKIP_REASON)
     def test_every_row_shares_one_group_id_and_carries_the_position_and_scope(self) -> None:
         """整组撤销要成立，本笔的全部行必须共享同一个组 ID 并带上职位与公司范围。"""
 
@@ -831,6 +838,7 @@ class SyntheticPendingActionTest(unittest.TestCase):
             self.assertIn("1011", params)
             self.assertIn(PREPROVISION_OVERRIDE_REASON, params)
 
+    @unittest.skipUnless(importlib.util.find_spec("psycopg"), PSYCOPG_SKIP_REASON)
     def test_a_multi_company_grant_is_one_group_one_pending_action(self) -> None:
         """#587：多公司仍是**一笔**——一条 pending_action、一个组 ID、每行带同一份范围原文。
 

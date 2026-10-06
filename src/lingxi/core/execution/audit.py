@@ -20,7 +20,12 @@ from dataclasses import dataclass
 from enum import Enum
 from typing import Any
 
-from .tool_policy import DenyReasonCode, PolicyVerdict, is_well_formed_tool_name
+from .tool_policy import (
+    DENY_REASON_TEMPLATE,
+    DenyReasonCode,
+    PolicyVerdict,
+    is_well_formed_tool_name,
+)
 
 # 前缀 [A-Za-z0-9_-]* 是为了盖住 access_key / x-auth-token / apiKey 这类变体。
 # 这套模式是**尽力而为**的兜底，不是完备保证：无键名上下文的裸 token 盖不住。
@@ -110,6 +115,7 @@ class ResultRules:
 
 UNGATED_TOOL_NAME = "<未经执行层判定>"
 AUDIT_FAULT_TOOL_NAME = "<审计记账失败>"
+GATE_FAULT_TOOL_NAME = "<执行层判定失败>"
 
 
 @dataclass(frozen=True)
@@ -282,6 +288,26 @@ class TurnAudit:
                 "result_kind": ToolResultKind.UNCLASSIFIED,
             }
         )
+
+    def record_gate_fault(self, *, tool_name: object, tool_use_id: str | None) -> None:
+        """记一次「判定链路抛异常、已按拒绝应答」：审计必须说它被拒，而不是本层未判定。
+
+        异常之前若已为同一次调用记过判定，就地改成拒绝，不另起一条互相矛盾的记录。
+        不碰入参；工具名只在是合法标识符时保留，否则记占位名——异常可能正是它引起的。
+        """
+        record = self._by_tool_use_id.get(tool_use_id) if tool_use_id else None
+        if record is None:
+            record = self._new_record(
+                tool_use_id=tool_use_id,
+                tool_name=tool_name
+                if is_well_formed_tool_name(tool_name)
+                else GATE_FAULT_TOOL_NAME,
+                tool_input=None,
+                allowed=False,
+            )
+        record["allowed"] = False
+        record["deny_reason_code"] = DenyReasonCode.GATE_FAULT
+        record["deny_reason_text"] = DENY_REASON_TEMPLATE
 
     def record_executed(self, *, tool_name: str, tool_use_id: str | None) -> None:
         """记录 ``PostToolUse``：工具确实执行完毕（不代表业务上成功）。

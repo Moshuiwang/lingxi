@@ -170,8 +170,16 @@ def check_worker_entry(expected_events: set[str]) -> str | None:
         return "必须注入 SDK 子进程 stderr 的脱敏回调，否则原始错误绕过出口纪律直接继承 fd 2"
     if getattr(options, "strict_mcp_config", None) is not True:
         return "必须显式 strict_mcp_config=True：否则项目/用户级 MCP 配置会被加载，白名单工具可能被同名服务器顶替"
-    from lingxi.adapters.claude_agent_session import DEFAULT_MAX_SDK_MESSAGE_BYTES
+    from lingxi.adapters.claude_agent_session import (
+        DEFAULT_MAX_SDK_MESSAGE_BYTES,
+        SDK_SUBPROCESS_ENV,
+    )
 
+    if dict(getattr(options, "env", None) or {}) != dict(SDK_SUBPROCESS_ENV):
+        return (
+            "会话选项的 env 必须恰好是关闭 CLI 附件通道的开关（CLAUDE_CODE_DISABLE_ATTACHMENTS=1）："
+            "否则提示词里的 @路径 会在 hook 之外被 CLI 直接读成文件内容"
+        )
     if getattr(options, "max_buffer_size", None) != DEFAULT_MAX_SDK_MESSAGE_BYTES:
         return (
             "必须显式抬高 max_buffer_size（2026-08-23 真实故障：问数 MCP 约 9.3MiB 的"

@@ -42,6 +42,7 @@ class StubAgentOptions:
         stderr=None,
         strict_mcp_config=None,
         max_buffer_size=None,
+        env=None,
     ) -> None:
         self.allowed_tools = allowed_tools
         self.max_turns = max_turns
@@ -56,6 +57,7 @@ class StubAgentOptions:
         self.stderr = stderr
         self.strict_mcp_config = strict_mcp_config
         self.max_buffer_size = max_buffer_size
+        self.env = env
 
 
 class StubTextBlock:
@@ -279,6 +281,56 @@ class AgentOptionsShapeTest(_StubSDK):
         self.assertEqual(full.setting_sources, [])
         self.assertIs(full.strict_mcp_config, True)
         self.assertEqual(full.permission_mode, "dontAsk")
+
+    def test_the_cli_attachment_channel_is_always_switched_off(self) -> None:
+        """`V-执行-28`：会话选项的 ``env`` 必须恰好是关闭 CLI 附件通道的那一个开关。
+
+        CLI 会把提示词里的 ``@<路径>`` 直接读成文件内容塞进模型上下文，不经过任何
+        hook；worker 所有用户同一个系统用户，这条通道等于绕过白名单读他人的令牌配置。
+        ``env`` 被 SDK 叠在继承的进程环境之上，因此这里只许有这个开关：多出来的任何
+        键（尤其是被入口摘掉的数据库连接串）都会被重新送进 CLI 子进程。
+        """
+
+        from lingxi.adapters.claude_agent_session import SDK_SUBPROCESS_ENV, build_agent_options
+
+        bare = build_agent_options(
+            self.gateway(), allowed_tools=("mcp__q__list",), stderr_sink=lambda line: None
+        )
+        full = build_agent_options(
+            self.gateway(),
+            allowed_tools=("mcp__q__list",),
+            stderr_sink=lambda line: None,
+            mcp_servers={"q": {"type": "http", "url": "https://example.invalid/mcp"}},
+            cwd="/tmp/lingxi-workspace",
+            model="claude-sonnet-4-5",
+            system_prompt="只读问数",
+            max_turns=7,
+        )
+
+        for options in (bare, full):
+            self.assertEqual(options.env, {"CLAUDE_CODE_DISABLE_ATTACHMENTS": "1"})
+            self.assertNotIn("LINGXI_POSTGRES_DSN", options.env)
+        self.assertIsNot(bare.env, full.env, "每份选项各持一份副本，改一份不得波及另一份")
+        bare.env["CLAUDE_CODE_DISABLE_ATTACHMENTS"] = "0"
+        self.assertEqual(SDK_SUBPROCESS_ENV["CLAUDE_CODE_DISABLE_ATTACHMENTS"], "1")
+        with self.assertRaises(TypeError):
+            SDK_SUBPROCESS_ENV["CLAUDE_CODE_DISABLE_ATTACHMENTS"] = "0"  # type: ignore[index]
+
+    def test_resumed_sessions_keep_the_attachment_switch(self) -> None:
+        """续用会话走的是派生出的选项副本，开关不得在这一步丢掉。"""
+
+        from lingxi.adapters.claude_agent_session import (
+            _resolve_session_options,
+            build_agent_options,
+        )
+
+        options = build_agent_options(
+            self.gateway(), allowed_tools=("mcp__q__list",), stderr_sink=lambda line: None
+        )
+
+        resumed = _resolve_session_options(options, "session-123")
+
+        self.assertEqual(resumed.env, {"CLAUDE_CODE_DISABLE_ATTACHMENTS": "1"})
 
     def test_optional_fields_are_only_passed_when_configured(self) -> None:
         from lingxi.adapters.claude_agent_session import build_agent_options
